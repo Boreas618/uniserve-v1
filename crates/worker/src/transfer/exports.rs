@@ -7,7 +7,7 @@ use uniserve_ipc::Locator;
 use super::transport::{Staged, Transport, TransportKind, Transports};
 use super::vmm::Exported;
 use super::{Retirement, Spans};
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -48,7 +48,7 @@ pub fn export(
         ));
     }
 
-    let device = matches!(source.device(), Device::Cuda(_)) && !host;
+    let device = matches!(source.device(), MemoryKind::Cuda(_)) && !host;
     let kinds: &[TransportKind] = if device && transports.exporter(TransportKind::CudaVmm).is_some()
     {
         &[TransportKind::Local, TransportKind::CudaVmm]
@@ -175,7 +175,7 @@ impl Exports {
     /// what it still stages. As [`Exports::locate`], call this once the
     /// issuer the export was given performed its work: the work addresses
     /// what this releases.
-    pub fn revoke(self) {
+    pub(crate) fn revoke(self) {
         revoke(&self.locations);
         discard(self.staged);
     }
@@ -233,11 +233,11 @@ mod tests {
     use crate::ffi::{Backing, DType};
     use crate::lane::Job;
     use crate::storage::memory::{Memory, StorageView};
-    use crate::transfer::{Capacity, TransportOptions, notify};
+    use crate::transfer::{TransferCapacity, TransportOptions};
 
     /// A rank whose only mechanism towards slot 1 is the rank channel.
     fn channel() -> Result<Transports> {
-        let capacity = Arc::new(Capacity::new(1 << 20, 8, notify)?);
+        let capacity = Arc::new(TransferCapacity::new(1 << 20, 8)?);
         Transports::new(
             &[TransportKind::Local, TransportKind::Channel],
             capacity,
@@ -267,7 +267,7 @@ mod tests {
         use uniserve_cuda::{DeviceId, Stream};
 
         let stream = Stream::new(DeviceId(0))?;
-        let capacity = Arc::new(Capacity::new(1 << 24, 8, notify)?);
+        let capacity = Arc::new(TransferCapacity::new(1 << 24, 8)?);
         let transports = Transports::new(
             &[TransportKind::Local, TransportKind::CudaVmm],
             capacity,
@@ -287,7 +287,7 @@ mod tests {
             },
         )?;
         let source = Spans::single(StorageView::contiguous(
-            Memory::device(0, 512)? as Arc<dyn Backing>,
+            Memory::device(DeviceId(0), 512)? as Arc<dyn Backing>,
             0,
             DType::F32,
             &[16, 8],

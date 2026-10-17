@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use uniserve_core::TokenLogprob;
-use uniserve_cuda::{Event, SourceOrder};
+use uniserve_cuda::{DeviceId, Event, SourceOrder};
 
-use crate::ffi::{Backing, DType, Device};
+use crate::ffi::{Backing, DType, MemoryKind};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::transfer::{Spans, copy_planner};
@@ -33,7 +33,7 @@ pub struct OutputStorage {
 
 impl OutputStorage {
     /// Host storage for `words` 64-bit words, pinned for `device`'s copies.
-    pub fn allocate(device: Option<i32>, words: usize) -> Result<Self> {
+    pub fn allocate(device: Option<DeviceId>, words: usize) -> Result<Self> {
         let bytes = words.max(1) * size_of::<i64>();
         let memory = match device {
             Some(device) => Memory::pinned(device, bytes)?,
@@ -42,17 +42,13 @@ impl OutputStorage {
         Ok(Self { memory, words })
     }
 
-    pub fn words(&self) -> usize {
-        self.words
-    }
-
     fn address(&self) -> u64 {
         self.memory.address()
     }
 }
 
 struct DeviceEvents {
-    device: i32,
+    device: DeviceId,
     start: Option<Arc<Event>>,
     copy: Option<Arc<Event>>,
     end: Option<Arc<Event>>,
@@ -88,7 +84,7 @@ pub struct OutputBuffer {
 }
 
 impl OutputBuffer {
-    pub fn new(storage: OutputStorage, rows: usize, devices: &[i32], timing: bool) -> Self {
+    pub fn new(storage: OutputStorage, rows: usize, devices: &[DeviceId], timing: bool) -> Self {
         Self {
             storage: Some(storage),
             rows: vec![false; rows],
@@ -122,11 +118,11 @@ impl OutputBuffer {
         }
     }
 
-    pub fn sealed(&self) -> bool {
+    pub(crate) fn sealed(&self) -> bool {
         self.sealed
     }
 
-    pub fn storage(&self) -> Result<&OutputStorage> {
+    pub(crate) fn storage(&self) -> Result<&OutputStorage> {
         self.storage
             .as_ref()
             .ok_or_else(|| Error::Invariant("output storage has retired".into()))
@@ -204,11 +200,11 @@ impl OutputBuffer {
         let source_spans = Spans::single(source.clone())?;
 
         match source.device() {
-            Device::Cuda(device) => {
+            MemoryKind::Cuda(device) => {
                 let producer = stream.stream().ok_or_else(|| {
                     Error::Invalid("a device capture requires its producing stream".into())
                 })?;
-                if producer.device().0 != device {
+                if producer.device() != device {
                     return Err(Error::Invalid(
                         "a capture stream must belong to its source device".into(),
                     ));
@@ -221,7 +217,7 @@ impl OutputBuffer {
                 // which the producer keeps until its stream passes this copy.
                 unsafe { stream.copy_strided(&plan) }?;
             }
-            Device::Cpu | Device::CudaHost => {
+            MemoryKind::Host | MemoryKind::PinnedHost => {
                 self.register_device(None)?;
                 self.copying.get_or_insert_with(Instant::now);
                 let mut plan = copy_planner(None, SourceOrder::Stream)?;
@@ -237,7 +233,7 @@ impl OutputBuffer {
 
     /// Reserve opposing word and byte ranges before submitting a copy. A failed
     /// copy abandons its batch, so its range must remain occupied until retirement.
-    pub fn reserve_tokens(&mut self, count: usize) -> Result<usize> {
+    pub(crate) fn reserve_tokens(&mut self, count: usize) -> Result<usize> {
         self.require_open()?;
         let available = (self.storage()?.words * 8 - self.bytes) / 8;
         let end = self
@@ -252,7 +248,7 @@ impl OutputBuffer {
         Ok(offset)
     }
 
-    pub fn reserve_bytes(&mut self, count: usize) -> Result<usize> {
+    pub(crate) fn reserve_bytes(&mut self, count: usize) -> Result<usize> {
         self.require_open()?;
         let capacity = self.storage()?.words * 8;
         self.bytes = self
@@ -265,7 +261,7 @@ impl OutputBuffer {
         Ok(capacity - self.bytes)
     }
 
-    pub fn token_range(&self, offset: usize, count: usize) -> Result<()> {
+    pub(crate) fn token_range(&self, offset: usize, count: usize) -> Result<()> {
         if !offset
             .checked_add(count)
             .is_some_and(|end| end <= self.tokens)
@@ -383,7 +379,7 @@ impl OutputBuffer {
             .ok_or(Error::State("logprob capture has no requested row"))
     }
 
-    pub fn register_device(&self, device: Option<i32>) -> Result<()> {
+    pub(crate) fn register_device(&self, device: Option<DeviceId>) -> Result<()> {
         self.require_open()?;
         if device.is_some_and(|device| !self.devices.iter().any(|events| events.device == device)) {
             return Err(Error::Invariant(
@@ -394,9 +390,9 @@ impl OutputBuffer {
     }
 
     /// Fence the start of `device`'s work for timing, once per batch.
-    pub fn begin_device(
+    pub(crate) fn begin_device(
         &mut self,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
@@ -415,9 +411,9 @@ impl OutputBuffer {
         Ok(())
     }
 
-    pub fn begin_copy(
+    pub(crate) fn begin_copy(
         &mut self,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: impl Issue,
         pool: &EventPool,
     ) -> Result<()> {
@@ -477,7 +473,7 @@ impl OutputBuffer {
         Ok(Some(self.events()))
     }
 
-    pub fn events(&self) -> Vec<Arc<Event>> {
+    pub(crate) fn events(&self) -> Vec<Arc<Event>> {
         self.devices
             .iter()
             .flat_map(|events| [&events.start, &events.copy, &events.end])
@@ -485,12 +481,12 @@ impl OutputBuffer {
             .collect()
     }
 
-    pub fn fences(&self) -> impl Iterator<Item = &Arc<Event>> {
+    pub(crate) fn fences(&self) -> impl Iterator<Item = &Arc<Event>> {
         self.devices.iter().filter_map(|events| events.end.as_ref())
     }
 
     /// Each fence with the device whose stream recorded it.
-    pub fn device_fences(&self) -> impl Iterator<Item = (i32, &Arc<Event>)> {
+    pub(crate) fn device_fences(&self) -> impl Iterator<Item = (DeviceId, &Arc<Event>)> {
         self.devices
             .iter()
             .filter_map(|events| Some((events.device, events.end.as_ref()?)))
@@ -500,7 +496,7 @@ impl OutputBuffer {
     /// while it has not: a lease without fences knows when it is sealed,
     /// one with fences when it is told ([`Self::fences_completed`],
     /// [`Self::copies_finished`]). The lease does not ask the driver.
-    pub fn ready_at(&self) -> Option<Instant> {
+    pub(crate) fn ready_at(&self) -> Option<Instant> {
         self.ready_at.filter(|_| self.sealed)
     }
 
@@ -535,12 +531,7 @@ impl OutputBuffer {
         Ok(timing)
     }
 
-    pub fn timing(&self) -> Result<[u64; 4]> {
-        self.timing
-            .ok_or_else(|| Error::Invariant("completion timing was read before observation".into()))
-    }
-
-    pub fn discard(&mut self, row: usize) {
+    pub(crate) fn discard(&mut self, row: usize) {
         if let Some(observed) = self.rows.get_mut(row)
             && !std::mem::replace(observed, true)
         {
@@ -548,17 +539,17 @@ impl OutputBuffer {
         }
     }
 
-    pub fn abandon(&mut self) {
+    pub(crate) fn abandon(&mut self) {
         self.abandoned = true;
     }
 
-    pub fn retain_reader(&mut self) -> Result<()> {
+    pub(crate) fn retain_reader(&mut self) -> Result<()> {
         self.storage()?;
         self.readers += 1;
         Ok(())
     }
 
-    pub fn release_reader(&mut self) -> Result<()> {
+    pub(crate) fn release_reader(&mut self) -> Result<()> {
         self.readers = self
             .readers
             .checked_sub(1)
@@ -611,10 +602,10 @@ fn micros(end: Instant, start: Instant) -> u64 {
 }
 
 /// The device of the stream `stream` issues on.
-fn device_of(stream: &impl Issue) -> Result<i32> {
+fn device_of(stream: &impl Issue) -> Result<DeviceId> {
     stream
         .stream()
-        .map(|stream| stream.device().0)
+        .map(|stream| stream.device())
         .ok_or_else(|| Error::Invariant("an output fence is recorded on a stream".into()))
 }
 
@@ -627,13 +618,13 @@ fn record(pool: &EventPool, stream: impl Issue, timing: bool) -> Result<Arc<Even
 }
 
 /// A batch's output buffer, shared by its pending results and the pool.
-pub type OutputLease = Arc<Mutex<OutputBuffer>>;
+pub(crate) type OutputLease = Arc<Mutex<OutputBuffer>>;
 
 /// Bounded output storage of one lane. Storage is reused only after every
 /// lease using it retired: its copies finished, every row was observed or
 /// the batch abandoned, and no CPU reader holds a byte capture.
-pub struct OutputPool {
-    device: Option<i32>,
+pub(crate) struct OutputPool {
+    device: Option<DeviceId>,
     capacity: usize,
     max_words: usize,
     active: Vec<OutputLease>,
@@ -644,7 +635,7 @@ pub struct OutputPool {
 impl OutputPool {
     /// `capacity` leases of at most `max_words` words, pinned for `device`
     /// copies (pageable for a CPU lane).
-    pub fn new(device: Option<i32>, capacity: usize, max_words: usize) -> Self {
+    pub(crate) fn new(device: Option<DeviceId>, capacity: usize, max_words: usize) -> Self {
         Self {
             device,
             capacity,
@@ -655,16 +646,8 @@ impl OutputPool {
         }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn max_words(&self) -> usize {
-        self.max_words
-    }
-
     /// Recycle the storage of retired leases; returns how many retired.
-    pub fn reap(&mut self) -> usize {
+    pub(crate) fn reap(&mut self) -> usize {
         let mut retired = 0;
         let mut index = 0;
         while index < self.active.len() {
@@ -690,11 +673,11 @@ impl OutputPool {
 
     /// Lease storage for a batch of `rows` result rows and `words` capture
     /// words, reusing retired storage or allocating the lane's maximum.
-    pub fn lease(
+    pub(crate) fn lease(
         &mut self,
         rows: usize,
         words: usize,
-        devices: &[i32],
+        devices: &[DeviceId],
         timing: bool,
     ) -> Result<OutputLease> {
         if self.closed {
@@ -726,18 +709,13 @@ impl OutputPool {
         Ok(lease)
     }
 
-    /// Host bytes held by allocated storage, for capacity accounting.
-    pub fn bytes(capacity: usize, max_words: usize) -> u64 {
-        (capacity * max_words.max(1) * size_of::<i64>()) as u64
-    }
-
-    pub fn begin_close(&mut self) {
+    pub(crate) fn begin_close(&mut self) {
         self.closed = true;
     }
 
     /// Release storage only after shutdown has drained its device writes.
     /// Leases still referenced by results keep their own storage alive.
-    pub fn finish_close(&mut self) {
+    pub(crate) fn finish_close(&mut self) {
         self.active.clear();
         self.available.clear();
     }

@@ -10,7 +10,7 @@ use crate::{Error, Result};
 /// Every CUDA device other than the primary one needs its own grant for its
 /// fixed storage plus graph capture. Cache sizing already charged the primary
 /// device's fixed storage.
-pub fn auxiliary(
+pub(crate) fn auxiliary(
     config: &WorkerConfig,
     fixed: &BTreeMap<Device, u64>,
     budget: &DeviceBudget,
@@ -39,7 +39,7 @@ pub fn auxiliary(
 /// storage not yet resident must fit its grant on every CUDA device.
 /// `resident_products` reports the product bytes already allocated on a
 /// device.
-pub fn startup(
+pub(crate) fn startup(
     config: &WorkerConfig,
     device_product_bytes: u64,
     resident_products: impl Fn(Device) -> u64,

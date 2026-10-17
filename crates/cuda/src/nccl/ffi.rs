@@ -100,13 +100,8 @@ pub(super) struct Api {
     pub(super) recv: PointToPoint,
     pub(super) group_start: unsafe extern "C" fn() -> NcclResult,
     pub(super) group_end: unsafe extern "C" fn() -> NcclResult,
-    // Entry points of newer releases (AlltoAll: 2.28; windows: 2.27).
+    // An entry point of newer releases (2.28).
     pub(super) all_to_all: Result<Collective>,
-    pub(super) window_register:
-        Result<unsafe extern "C" fn(Handle, Handle, usize, *mut Handle, i32) -> NcclResult>,
-    pub(super) window_deregister: Result<unsafe extern "C" fn(Handle, Handle) -> NcclResult>,
-    pub(super) mem_alloc: Result<unsafe extern "C" fn(*mut Handle, usize) -> NcclResult>,
-    pub(super) mem_free: Result<unsafe extern "C" fn(Handle) -> NcclResult>,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
 }
@@ -150,10 +145,6 @@ pub(super) fn api() -> Result<&'static Api> {
                 group_start: symbol(&library, "ncclGroupStart")?,
                 group_end: symbol(&library, "ncclGroupEnd")?,
                 all_to_all: symbol(&library, "ncclAlltoAll"),
-                window_register: symbol(&library, "ncclCommWindowRegister"),
-                window_deregister: symbol(&library, "ncclCommWindowDeregister"),
-                mem_alloc: symbol(&library, "ncclMemAlloc"),
-                mem_free: symbol(&library, "ncclMemFree"),
                 _library: library,
             })
         }

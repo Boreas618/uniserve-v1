@@ -1,6 +1,7 @@
 //! Per-request-slot state banks.
 
 use std::sync::Arc;
+use uniserve_cuda::DeviceId;
 
 use super::memory::{Memory, StorageView};
 use crate::ffi::{Backing, DType};
@@ -9,7 +10,7 @@ use crate::{Error, Result};
 /// One field of per-slot state a model declares: `shape` is one slot's
 /// extent; host fields live in page-locked host memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SlotField {
+pub(crate) struct SlotField {
     pub name: String,
     pub dtype: DType,
     pub shape: Vec<i64>,
@@ -35,7 +36,7 @@ impl SlotField {
 /// made once with its bank, so each row crosses to Python as one torch
 /// tensor for the bank's life. Contents are uninitialized until their owner
 /// writes them.
-pub struct RequestSlots {
+pub(crate) struct RequestSlots {
     capacity: u32,
     banks: Vec<Bank>,
 }
@@ -49,7 +50,7 @@ struct Bank {
 
 impl RequestSlots {
     /// Device and host bytes of the banks: `(device, host)`.
-    pub fn bytes(fields: &[SlotField], capacity: u32) -> Result<(u64, u64)> {
+    pub(crate) fn bytes(fields: &[SlotField], capacity: u32) -> Result<(u64, u64)> {
         let rows = capacity as u64 + 1;
         fields.iter().try_fold((0, 0), |(device, host), field| {
             let bytes = rows * field.slot_bytes()? as u64;
@@ -63,7 +64,11 @@ impl RequestSlots {
 
     /// Allocate banks for `capacity` slots on `device` (host memory for
     /// every field when `None`).
-    pub fn allocate(fields: &[SlotField], capacity: u32, device: Option<i32>) -> Result<Self> {
+    pub(crate) fn allocate(
+        fields: &[SlotField],
+        capacity: u32,
+        device: Option<DeviceId>,
+    ) -> Result<Self> {
         if capacity == 0 {
             return Err(Error::Invalid(
                 "request slots need a positive capacity".into(),
@@ -96,12 +101,8 @@ impl RequestSlots {
         Ok(Self { capacity, banks })
     }
 
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
     /// Every bank keyed by field name, as bindings receive them.
-    pub fn views(&self) -> Vec<(String, StorageView)> {
+    pub(crate) fn views(&self) -> Vec<(String, StorageView)> {
         self.banks
             .iter()
             .map(|bank| (bank.field.name.clone(), bank.view.clone()))
@@ -109,12 +110,12 @@ impl RequestSlots {
     }
 
     /// A field's whole bank.
-    pub fn bank(&self, name: &str) -> Result<&StorageView> {
+    pub(crate) fn bank(&self, name: &str) -> Result<&StorageView> {
         self.find(name).map(|bank| &bank.view)
     }
 
     /// One request slot's row of a field; slots are 1-based.
-    pub fn slot(&self, name: &str, slot: u32) -> Result<StorageView> {
+    pub(crate) fn slot(&self, name: &str, slot: u32) -> Result<StorageView> {
         if slot == 0 || slot > self.capacity {
             return Err(Error::Invalid(format!(
                 "request slot {slot} is outside capacity {}",

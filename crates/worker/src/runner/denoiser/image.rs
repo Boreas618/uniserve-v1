@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::ImageParams;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams, RequestKey};
 
 use crate::config::Device;
@@ -70,7 +70,7 @@ use crate::{Error, Result};
 /// The geometry of a captured denoising step: its rows of one image size,
 /// by the first sample row each reads (rows of one image share it).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DiffusionShape {
+pub(crate) struct DiffusionShape {
     pub height: u32,
     pub width: u32,
     pub samples: Vec<u32>,
@@ -78,7 +78,7 @@ pub struct DiffusionShape {
 
 impl DiffusionShape {
     /// The shape `rows` evaluate, when they share one image size.
-    pub fn of(rows: &[DenoiseRow]) -> Option<Self> {
+    pub(crate) fn of(rows: &[DenoiseRow]) -> Option<Self> {
         let first = rows.first()?;
         rows.iter()
             .all(|row| (row.height, row.width) == (first.height, first.width))
@@ -92,7 +92,7 @@ impl DiffusionShape {
 
 /// One denoising row: a guidance branch of one image.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DenoiseRow {
+pub(crate) struct DenoiseRow {
     /// The image's first latent row in the samples and its row count.
     pub sample: u32,
     pub units: u32,
@@ -111,7 +111,7 @@ pub struct DenoiseRow {
 /// A latent image inserted as conditioning: its K/V is written after the
 /// slot's visible tokens.
 #[derive(Clone, Debug)]
-pub struct ConditionRow {
+pub(crate) struct ConditionRow {
     /// The latent feature product (`[units, width]`).
     pub features: StorageView,
     pub height: u32,
@@ -125,7 +125,7 @@ pub struct ConditionRow {
 /// One image's solver update: its samples, slot, step and branch
 /// predictions.
 #[derive(Clone, Debug)]
-pub struct IntegrateRow {
+pub(crate) struct IntegrateRow {
     pub sample: u32,
     pub units: u32,
     /// The request slot whose timestep the solver reads.
@@ -141,7 +141,7 @@ pub struct IntegrateRow {
 
 /// The rows' predictions of one evaluation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Predicted {
+pub(crate) struct Predicted {
     pub mode: GraphMode,
     /// Each row's first prediction row.
     pub offsets: Vec<u32>,
@@ -149,7 +149,7 @@ pub struct Predicted {
 
 /// Capacity of a runner's columns.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DiffusionCapacity {
+pub(crate) struct DiffusionCapacity {
     /// Rows of one evaluation.
     pub rows: usize,
     /// Tokens of one evaluation (framed sequences).
@@ -164,7 +164,7 @@ pub struct DiffusionCapacity {
 }
 
 /// The resident tensors a runner is constructed over.
-pub struct DiffusionStorage {
+pub(crate) struct DiffusionStorage {
     /// The latent pool's step workspace `[units, width]`, on the
     /// denoiser's device.
     pub samples: StorageView,
@@ -226,7 +226,7 @@ impl DenoiserRunner {
     /// construct the Python half of the denoiser `setup` names over the
     /// prefix cache `cache`. Every step and sample update runs on the
     /// setup's stream.
-    pub fn image(
+    pub(crate) fn image(
         setup: &ImageSetup<'_>,
         cache: &Handle,
         layout: ImageDenoiserLayout,
@@ -271,7 +271,7 @@ impl DenoiserRunner {
                 tables: capacity.tables,
                 width: capacity.width,
             },
-            device.cuda_index(),
+            device.cuda(),
             stream.as_ref(),
         )?;
 
@@ -326,12 +326,12 @@ impl DenoiserRunner {
     }
 
     /// An image denoiser's layout.
-    pub fn layout(&self) -> Result<&ImageDenoiserLayout> {
+    pub(crate) fn layout(&self) -> Result<&ImageDenoiserLayout> {
         Ok(&self.family.image()?.layout)
     }
 
     /// An image denoiser's column capacity.
-    pub fn capacity(&self) -> Result<&DiffusionCapacity> {
+    pub(crate) fn capacity(&self) -> Result<&DiffusionCapacity> {
         Ok(&self.family.image()?.capacity)
     }
 
@@ -455,7 +455,7 @@ impl DenoiserRunner {
         &mut self,
         rows: &[DenoiseRow],
         prefix_cache: &mut PrefixCache,
-        capture: Option<&[Arc<GraphPool<Handle>>]>,
+        capture: Option<&[Arc<GraphPool>]>,
         job: &Job,
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
@@ -464,7 +464,7 @@ impl DenoiserRunner {
         let capture = match capture {
             None => None,
             Some(pools) => {
-                let (Some(ordinal), Some(stream)) = (self.device.cuda_index(), &stream) else {
+                let (Some(ordinal), Some(stream)) = (self.device.cuda(), &stream) else {
                     return Err(Error::Invariant(
                         "a denoiser captures on its CUDA stream".into(),
                     ));
@@ -475,7 +475,7 @@ impl DenoiserRunner {
                     .ok_or_else(|| {
                         Error::Invariant("a denoiser graph has no pool on its device".into())
                     })?;
-                let peers: Vec<(i32, Handle)> = pools
+                let peers: Vec<(DeviceId, Handle)> = pools
                     .iter()
                     .filter(|pool| pool.device != ordinal)
                     .map(|pool| (pool.device, pool.value.clone()))
@@ -554,9 +554,6 @@ impl DenoiserRunner {
                 GraphMode::Eager
             }
         };
-        if mode != GraphMode::Capture {
-            image.graphs.record(mode);
-        }
         Ok(Predicted { mode, offsets })
     }
 
@@ -680,7 +677,7 @@ impl DenoiserRunner {
         &mut self,
         rows: &[DenoiseRow],
         prefix_cache: &mut PrefixCache,
-        pools: &[Arc<GraphPool<Handle>>],
+        pools: &[Arc<GraphPool>],
         job: &Job,
     ) -> Result<Option<DiffusionShape>> {
         let shape = DiffusionShape::of(rows).ok_or_else(|| {
@@ -711,14 +708,13 @@ impl DenoiserRunner {
         }
         let image = self.family.image_mut()?;
         image.graphs.insert(shape, None, graph)?;
-        image.graphs.record(GraphMode::Capture);
         image.capturing = true;
         Ok(())
     }
 
     /// The graph pool's identity: the address of an image denoiser's
     /// positions column, which no other runner shares.
-    pub fn graph_key(&self) -> Result<usize> {
+    pub(crate) fn graph_key(&self) -> Result<usize> {
         Ok(self.family.image()?.positions.address() as usize)
     }
 }
@@ -814,12 +810,12 @@ impl ImageDenoiser {
 /// The denoiser serving a batch, with its device and stream.
 pub(crate) fn image_placement(
     image: &ImageParts<'_>,
-) -> Result<(Option<i32>, Option<Stream>, usize)> {
+) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
     let runner = image.denoiser().ok_or_else(|| {
         Error::Unsupported("image trajectories are served by an image denoiser".into())
     })?;
     let stream = runner.stream().cloned();
-    Ok((runner.device().cuda_index(), stream, 0))
+    Ok((runner.device().cuda(), stream, 0))
 }
 
 /// The denoising rows of one image size: the size, its rows and, per

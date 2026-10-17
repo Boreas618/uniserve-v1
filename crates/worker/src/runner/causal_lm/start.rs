@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use uniserve_cuda::{DeviceId, Stream};
+use uniserve_cuda::Stream;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::CausalLMRunners;
@@ -221,7 +221,7 @@ fn streams(
     device: Device,
     kinds: &[CallKind],
 ) -> Result<Vec<(Option<Stream>, Vec<CallKind>)>> {
-    let Some(index) = device.cuda_index() else {
+    let Some(index) = device.cuda() else {
         return Ok(vec![(None, kinds.to_vec())]);
     };
     let mut result: Vec<(Option<Stream>, Vec<CallKind>)> = Vec::new();
@@ -238,7 +238,7 @@ fn streams(
     }
     if streams.lanes().is_empty() {
         let stream = streams
-            .stream_for(kinds[0], DeviceId(index))
+            .stream_for(kinds[0], index)
             .ok_or(Error::State("text calls have no execution stream"))?;
         let stream = stream.stream()?.clone();
         result.push((Some(stream), kinds.to_vec()));
@@ -273,7 +273,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) components: &'a Components,
     /// The shared scratch of each stream the runners' contexts borrow.
     pub(crate) scratches: &'a mut Scratches,
-    pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
+    pub(crate) graphs: &'a mut GraphStorage,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
     /// The expert union, when forwards are expert steps: each lane gets
@@ -317,7 +317,7 @@ impl CausalLMRunners {
         })?;
         let config = startup.config;
         let device = texts[0].2;
-        let cuda = device.cuda_index();
+        let cuda = device.cuda();
         let bounds = TextBounds::new(
             config,
             startup.request_slots,
@@ -422,7 +422,7 @@ impl CausalLMRunners {
                 served,
                 exchange,
             } = target;
-            let ordinal = device.cuda_index();
+            let ordinal = device.cuda();
             let handle = stream.as_ref().map_or(0, Stream::raw);
             // The model's collectives on the runner's stream, which its
             // execution context routes its communicators to.
@@ -499,14 +499,8 @@ impl CausalLMRunners {
                 (Some(ordinal), false) => {
                     let key = buffers.column("logits")?.address() as usize;
                     let share = shared.get(&handle).copied();
-                    let pools = reserve_pools(
-                        startup.graphs,
-                        &create_pool,
-                        key,
-                        format!("text:{component}"),
-                        &[ordinal],
-                        share,
-                    )?;
+                    let pools =
+                        reserve_pools(startup.graphs, &create_pool, key, &[ordinal], share)?;
                     shared.entry(handle).or_insert(key);
                     pools.first().map(|pool| pool.value.clone())
                 }

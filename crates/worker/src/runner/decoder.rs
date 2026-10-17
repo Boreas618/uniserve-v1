@@ -41,12 +41,11 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::Canvas;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
-use crate::executor::batch::lock;
 use crate::executor::image::ImageParts;
 use crate::executor::image::{Encoding, ImageBatch, allocations};
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
@@ -56,6 +55,7 @@ use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::{Capture, Completion, Job};
+use crate::lock;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{
@@ -85,7 +85,7 @@ pub struct DecodeImage {
 
 impl DecodeImage {
     /// Bytes of the image's quantized pixels.
-    pub fn pixel_bytes(&self) -> usize {
+    pub(crate) fn pixel_bytes(&self) -> usize {
         self.height as usize * self.width as usize * 3
     }
 }
@@ -122,7 +122,7 @@ impl DecoderRunner {
         setup: RunnerSetup<'_>,
         capacity: DecodeCapacity,
         slots: u32,
-        pool: Option<Arc<GraphPool<Handle>>>,
+        pool: Option<Arc<GraphPool>>,
     ) -> Result<Self> {
         Ok(Self {
             family: Family::Video(Box::new(VideoDecoder::new(setup, capacity, slots, pool)?)),
@@ -136,7 +136,7 @@ impl DecoderRunner {
         setup: RunnerSetup<'_>,
         latent: [u64; 2],
         samples: u64,
-        pool: Option<Arc<GraphPool<Handle>>>,
+        pool: Option<Arc<GraphPool>>,
     ) -> Result<Self> {
         Ok(Self {
             family: Family::Audio(Box::new(AudioDecoder::new(setup, latent, samples, pool)?)),
@@ -164,7 +164,7 @@ impl DecoderRunner {
         }
     }
 
-    pub fn device(&self) -> Device {
+    pub(crate) fn device(&self) -> Device {
         match &self.family {
             Family::Image(image) => image.device,
             Family::Video(video) => Device::Cuda(video.device),
@@ -173,7 +173,7 @@ impl DecoderRunner {
     }
 
     /// The runner's stream; `None` on the host.
-    pub fn stream(&self) -> Option<&Stream> {
+    pub(crate) fn stream(&self) -> Option<&Stream> {
         match &self.family {
             Family::Image(image) => image.stream.as_ref(),
             Family::Video(video) => Some(&video.stream),
@@ -182,7 +182,7 @@ impl DecoderRunner {
     }
 
     /// An image decoder's pixel range, `(low, high)`.
-    pub fn range(&self) -> Result<(f32, f32)> {
+    pub(crate) fn range(&self) -> Result<(f32, f32)> {
         Ok(self.image_decoder()?.range)
     }
 
@@ -643,7 +643,7 @@ fn pixel_counts(images: &[DecodeImage]) -> Vec<i64> {
 pub(crate) fn image_placement(
     image: &ImageParts<'_>,
     plan: &BatchPlan,
-) -> Result<(Option<i32>, Option<Stream>, usize)> {
+) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
     let runner = image
         .decoder()
         .ok_or_else(|| Error::Unsupported("image decoding is served by an image decoder".into()))?;
@@ -657,7 +657,7 @@ pub(crate) fn image_placement(
         })
         .fold(0_usize, usize::saturating_add);
     Ok((
-        runner.device().cuda_index(),
+        runner.device().cuda(),
         stream,
         words.min(image.decoders.max_pixel_words),
     ))
@@ -1021,7 +1021,7 @@ struct VideoDecoder {
     class: RunnerClass,
     loaded: Handle,
     stream: Stream,
-    device: i32,
+    device: DeviceId,
     /// The runner of each segment, in preparation order.
     runners: Vec<(Segment, Methods)>,
     /// The retained overlap of each request slot (`[slots + 1, elements]`):
@@ -1043,7 +1043,7 @@ struct VideoDecoder {
     /// Captures a forward between its begin and end.
     capture: GraphFunctions,
     /// The graph pool captures allocate in; `None` serves forwards eagerly.
-    pool: Option<Arc<GraphPool<Handle>>>,
+    pool: Option<Arc<GraphPool>>,
 }
 
 impl VideoDecoder {
@@ -1051,7 +1051,7 @@ impl VideoDecoder {
         setup: RunnerSetup<'_>,
         capacity: DecodeCapacity,
         slots: u32,
-        pool: Option<Arc<GraphPool<Handle>>>,
+        pool: Option<Arc<GraphPool>>,
     ) -> Result<Self> {
         let (elements, dtype) = capacity.overlap;
         let overlap = RequestSlots::allocate(
@@ -1232,7 +1232,6 @@ impl VideoDecoder {
         completion: &mut Completion,
     ) -> Result<()> {
         self.graphs.insert(shape, None, completion.captured()?)?;
-        self.graphs.record(GraphMode::Capture);
         Ok(())
     }
 
@@ -1284,9 +1283,6 @@ impl VideoDecoder {
                 GraphMode::Eager
             }
         };
-        if mode != GraphMode::Capture {
-            self.graphs.record(mode);
-        }
         Ok(mode)
     }
 
@@ -1402,7 +1398,7 @@ pub(crate) struct TrackUnits {
 struct AudioDecoder {
     class: RunnerClass,
     stream: Stream,
-    device: i32,
+    device: DeviceId,
     /// The runner of each track length, by its latent frames.
     runners: BTreeMap<u32, Methods>,
     /// `[rows, width]` FP32: a request's complete audio latent.
@@ -1413,7 +1409,7 @@ struct AudioDecoder {
     /// Captures a forward between its begin and end.
     capture: GraphFunctions,
     /// The graph pool captures allocate in; `None` serves forwards eagerly.
-    pool: Option<Arc<GraphPool<Handle>>>,
+    pool: Option<Arc<GraphPool>>,
 }
 
 impl AudioDecoder {
@@ -1423,7 +1419,7 @@ impl AudioDecoder {
         setup: RunnerSetup<'_>,
         latent: [u64; 2],
         samples: u64,
-        pool: Option<Arc<GraphPool<Handle>>>,
+        pool: Option<Arc<GraphPool>>,
     ) -> Result<Self> {
         let capture = GraphFunctions::import()?;
         Ok(Self {
@@ -1505,7 +1501,6 @@ impl AudioDecoder {
         completion: &mut Completion,
     ) -> Result<()> {
         self.graphs.insert(units, None, completion.captured()?)?;
-        self.graphs.record(GraphMode::Capture);
         Ok(())
     }
 
@@ -1556,9 +1551,6 @@ impl AudioDecoder {
                 GraphMode::Eager
             }
         };
-        if mode != GraphMode::Capture {
-            self.graphs.record(mode);
-        }
         Ok(mode)
     }
 

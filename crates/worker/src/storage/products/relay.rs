@@ -1,33 +1,36 @@
 //! Relay lanes: scalar products stored per request slot and lane.
 
 use super::*;
-use crate::ffi::{DType, Device};
-use crate::storage::memory::{Memory, StorageView, device_name};
+use crate::ffi::{DType, MemoryKind};
+use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uniserve_core::CallId;
 use uniserve_ipc::{RequestKey, TensorRef};
 
-pub(crate) type LaneKey = (String, usize, usize);
+/// A relay lane: its memory, request slot and lane index.
+pub(crate) type LaneKey = (MemoryKind, usize, usize);
 
-pub(crate) type RelayKey = (LaneKey, String, usize);
+/// A relay element: its lane, the field's dtype and index.
+pub(crate) type RelayKey = (LaneKey, DType, usize);
 
-pub(crate) type ArenaKey = (String, String, usize);
+/// A relay arena: its memory, dtype and field index.
+pub(crate) type ArenaKey = (MemoryKind, DType, usize);
 
-pub(super) type RelayCall = (String, usize, RequestKey, CallId);
+pub(super) type RelayCall = (MemoryKind, usize, RequestKey, CallId);
 
 /// A call holds its relay lane until all scalar fields have retired.
 pub(super) struct Lane {
     pub(super) call: CallKey,
-    pub(super) fields: HashSet<(String, usize)>,
+    pub(super) fields: HashSet<(DType, usize)>,
 }
 
 impl ProductStore {
     pub(super) fn bind_relays(
         &self,
         state: &mut State,
-        bindings: &[(TensorRef, Device)],
+        bindings: &[(TensorRef, MemoryKind)],
         request_slots: &HashMap<RequestKey, usize>,
     ) -> Result<Vec<ProductBuffer>> {
         if state.request_capacity == 0 || state.relay_depth == 0 {
@@ -35,7 +38,7 @@ impl ProductStore {
         }
         self.reclaim(state)?;
         let mut seen = HashSet::new();
-        let mut fields = HashMap::<((String, usize, RequestKey, CallId), DType), usize>::new();
+        let mut fields = HashMap::<(RelayCall, DType), usize>::new();
         let mut buffers = Vec::new();
         let result = (|| -> Result<()> {
             for (reference, device) in bindings {
@@ -72,19 +75,18 @@ impl ProductStore {
                     ));
                 }
 
-                let name = device_name(*device);
+                let device = *device;
                 let dtype = product_dtype(reference.dtype)?;
-                let call = (name.clone(), slot, id.owner, id.producer_call_id);
+                let call = (device, slot, id.owner, id.producer_call_id);
                 let field = fields.entry((call, dtype)).or_default();
                 let field_index = *field;
                 *field += 1;
-                let lane = state.relay_lane(id, &name, slot)?;
-                let dtype_key = crate::storage::memory::dtype_name(dtype).to_owned();
-                let relay = ((name.clone(), slot, lane), dtype_key.clone(), field_index);
+                let lane = state.relay_lane(id, device, slot)?;
+                let relay = ((device, slot, lane), dtype, field_index);
                 let view = match state.views.get(&relay) {
                     Some(view) => view.clone(),
                     None => {
-                        let arena_key = (name, dtype_key, field_index);
+                        let arena_key = (device, dtype, field_index);
                         if !state.arenas.contains_key(&arena_key) {
                             let count = state
                                 .request_capacity
@@ -94,8 +96,8 @@ impl ProductStore {
                             let bytes = count * dtype.bytes();
                             let projected = state.arena_capacity(bytes)?;
                             let memory = match device {
-                                Device::Cuda(index) => Memory::device(*index, bytes)?,
-                                Device::Cpu | Device::CudaHost => Memory::host(bytes),
+                                MemoryKind::Cuda(index) => Memory::device(index, bytes)?,
+                                MemoryKind::Host | MemoryKind::PinnedHost => Memory::host(bytes),
                             };
                             let arena = StorageView::contiguous(
                                 memory as Arc<dyn crate::ffi::Backing>,
@@ -103,26 +105,26 @@ impl ProductStore {
                                 dtype,
                                 &[count as i64],
                             )?;
-                            state.arenas.insert(arena_key.clone(), arena);
+                            state.arenas.insert(arena_key, arena);
                             state.allocated_bytes = projected;
                         }
                         let arena = state.arenas.get(&arena_key).ok_or_else(|| {
                             Error::Invariant("request-relay arena disappeared".into())
                         })?;
                         let view = arena.narrow(0, (slot * state.relay_depth + lane) as i64, 1)?;
-                        state.views.insert(relay.clone(), view.clone());
+                        state.views.insert(relay, view.clone());
                         view
                     }
                 };
                 let buffer = create_buffer(
                     reference,
-                    *device,
+                    device,
                     view.clone(),
                     view,
                     vec![1],
                     None,
                     false,
-                    Backing::Relay(relay.clone()),
+                    Backing::Relay(relay),
                 );
                 state.bind_relay(id, &relay)?;
                 state.buffers.insert(key, buffer.clone());

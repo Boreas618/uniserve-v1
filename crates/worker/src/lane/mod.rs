@@ -49,10 +49,10 @@ use crate::stream::CUDAStream;
 use crate::{Error, Result};
 
 pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job, Recorder, Value};
-pub use job::{Completion, JobId, JobQueue};
+pub(crate) use job::{Completion, JobId, JobQueue};
 
 /// One execution lane.
-pub struct Lane {
+pub(crate) struct Lane {
     /// The lane's SM partition and call kinds; `None` for the one lane of a
     /// rank without configured lanes, which serves every call kind.
     pub config: Option<LaneConfig>,
@@ -84,7 +84,7 @@ impl Lane {
     }
 
     /// Whether the lane serves calls of `kind`.
-    pub fn serves(&self, kind: CallKind) -> bool {
+    pub(crate) fn serves(&self, kind: CallKind) -> bool {
         self.config
             .as_ref()
             .is_none_or(|config| config.call_kinds.contains(&kind))
@@ -114,7 +114,7 @@ impl JobQueues {
 /// completions of what was submitted to either: the control thread's side
 /// of the execution and resource planes.
 #[derive(Clone)]
-pub struct JobQueues {
+pub(crate) struct JobQueues {
     shared: Arc<Shared>,
 }
 
@@ -162,20 +162,6 @@ impl JobQueues {
         }
     }
 
-    /// The queues of one lane of their own that serves every call kind:
-    /// for a caller that issues on streams of its own, outside a rank, and
-    /// needs a lane to wait for device events ([`Self::after`]). The lane's
-    /// thread ends with the last clone of the queues.
-    pub fn single_lane() -> Result<Self> {
-        let (posted, completions) = crossbeam_channel::unbounded();
-        let (queue, jobs) = JobQueue::new(posted.clone());
-        std::thread::Builder::new()
-            .name("lane-0".into())
-            .spawn(move || jobs.run())
-            .map_err(|error| Error::Transport(format!("execution thread: {error}")))?;
-        Ok(Self::new(vec![(None, queue)], posted, completions))
-    }
-
     fn arrived(&self) -> std::sync::MutexGuard<'_, VecDeque<(JobId, Completion)>> {
         self.shared
             .arrived
@@ -216,7 +202,7 @@ impl JobQueues {
     /// `device` and goes on. The control thread's wake is fired behind it.
     /// The events' records are made, or queued in jobs submitted to the
     /// same lane before: a wait on an event without a record passes.
-    pub fn after(
+    pub(crate) fn after(
         &self,
         kind: CallKind,
         device: DeviceId,
@@ -337,7 +323,7 @@ impl JobQueues {
 
     /// The next completion that arrived, without waiting: one kept while
     /// another job was waited for, or one posted since.
-    pub fn take(&self) -> Option<(JobId, Completion)> {
+    pub(crate) fn take(&self) -> Option<(JobId, Completion)> {
         let kept = self.arrived().pop_front();
         kept.or_else(|| self.shared.completions.try_recv().ok())
     }

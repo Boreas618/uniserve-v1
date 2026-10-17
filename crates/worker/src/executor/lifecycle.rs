@@ -33,7 +33,7 @@ use crate::{Error, Result};
 /// The jobs a lifecycle command records: one per call kind the rank serves,
 /// performed by the lane serving that kind. An owner records work on a
 /// stream into the job of the kind whose lane owns the stream.
-pub struct LaneJobs {
+pub(crate) struct LaneJobs {
     jobs: HashMap<CallKind, Job>,
     /// The kind whose job takes work that belongs to no lane's stream
     /// (deferred work behind an event): the first the rank serves.
@@ -98,7 +98,7 @@ impl LaneJobs {
 
 /// Storage that request epochs and products own, driven by lifecycle
 /// commands. Methods run on the executor thread.
-pub trait RequestStorage {
+pub(crate) trait RequestStorage {
     /// Reset per-slot state of newly admitted request slots; the resets a
     /// device makes are recorded into `jobs`.
     fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
@@ -151,7 +151,7 @@ pub trait RequestStorage {
 }
 
 /// One batch's Finish and Free commands.
-pub struct Retirement {
+pub(crate) struct Retirement {
     requests: HashSet<RequestKey>,
     buffers: HashSet<BufferId>,
     retained: HashSet<BufferId>,
@@ -161,7 +161,7 @@ pub struct Retirement {
 }
 
 impl Retirement {
-    pub fn new(batch: &Batch) -> Self {
+    pub(crate) fn new(batch: &Batch) -> Self {
         let mut requests = HashSet::new();
         let mut buffers = HashSet::new();
         let mut retained = HashSet::new();
@@ -192,7 +192,11 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub fn admit(&self, storage: &mut [&mut dyn RequestStorage], jobs: &LaneJobs) -> Result<()> {
+    pub(crate) fn admit(
+        &self,
+        storage: &mut [&mut dyn RequestStorage],
+        jobs: &LaneJobs,
+    ) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
@@ -203,7 +207,7 @@ impl Retirement {
     }
 
     /// Start retiring after the batch launched.
-    pub fn begin(
+    pub(crate) fn begin(
         &mut self,
         requests: &RequestPool,
         storage: &mut [&mut dyn RequestStorage],
@@ -233,7 +237,7 @@ impl Retirement {
 
     /// Retire the finished epochs once their work and readers have drained.
     /// Returns whether retirement is complete.
-    pub fn poll(
+    pub(crate) fn poll(
         &mut self,
         requests: &mut RequestPool,
         storage: &mut [&mut dyn RequestStorage],

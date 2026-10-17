@@ -10,10 +10,8 @@
 //! imports it into the consumer (converting when the layouts differ) and
 //! adopts it, then retires every access and returns both caches' tensors.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 #[path = "harness/config.rs"]
-mod config;
+pub mod config;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,12 +21,11 @@ use config::Config;
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
 use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{BlockTable, BufferId, CallKind, ForwardMode, RequestKey, WorkerEndpoint};
+use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use uniserve_worker::ffi::{Function, Handle, Interpreter};
-use uniserve_worker::lane::JobQueues;
-use uniserve_worker::storage::memory::StorageView;
-use uniserve_worker::storage::{CachePlan, PrefixCache};
-use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
+use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView};
+use uniserve_worker::transfer::exports;
+use uniserve_worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 use uniserve_worker::{EventPool, Result};
 
 /// Named views as the map of DLPack tensors the test reads.
@@ -128,18 +125,15 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let num_units = config.count("num_units")? as u32;
     let tokens = config.count("tokens")? as u32;
     let devices = [
-        config.count("source_device")? as i32,
-        config.count("destination_device")? as i32,
+        DeviceId(config.count("source_device")? as i32),
+        DeviceId(config.count("destination_device")? as i32),
     ];
     let kind = TransportKind::parse(&config.string("transport")?)?;
     let fill: Function = Function::new("fill", config.get("fill")?);
     let source_units = units(config.value("source_units")?)?;
     let destination_units = units(config.value("destination_units")?)?;
 
-    let streams = [
-        Stream::new(DeviceId(devices[0]))?,
-        Stream::new(DeviceId(devices[1]))?,
-    ];
+    let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
     let width = 64;
     let mut source = PrefixCache::new(
         Arc::clone(&source_plan),
@@ -169,17 +163,10 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     let source_views = tensor_map(&source.views()?)?;
     fill.invoke(&[AnyView::from(&source_views)])?;
 
-    // The harness is its own control thread: a lane of its own waits for
-    // the events that deferred releases follow, and the harness hands the
-    // pool that lane's completions while it waits for retirement.
+    // No control loop takes job completions here: the deferred releases
+    // wait for their events on the host (`EventPool::drain`).
     let events = EventPool::new();
-    let jobs = JobQueues::single_lane()?;
-    let lane = jobs.clone();
-    events.set_submitter(Some(Box::new(move |device, _, events| {
-        lane.after(CallKind::Forward(ForwardMode::Decode), device, events)
-    })));
-
-    let capacity = Arc::new(Capacity::new(1 << 28, 16, notify)?);
+    let capacity = Arc::new(TransferCapacity::new(1 << 28, 16)?);
     let transports = Arc::new(Transports::new(
         &[kind],
         Arc::clone(&capacity),
@@ -235,13 +222,10 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
     // Retire every access: the producer's exports, then both caches.
     source.release_calls(&[(exported.owner, exported.producer_call_id)]);
     source.release_exports(&[exported]);
-    uniserve_worker::transfer::exports::release(&locations)?;
+    exports::release(&locations)?;
     wait(
         || {
-            events.submit_deferred()?;
-            while let Some((job, completion)) = jobs.take() {
-                events.complete(job, completion)?;
-            }
+            events.drain()?;
             transports.reap()?;
             destination.reap_imports()?;
             Ok(capacity.used() == 0 && import.retirement().done())
@@ -264,7 +248,9 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         (
             FfiString::from("transfer"),
             Any::from(FfiString::from(
-                serde_json::to_string(&transfer).unwrap().as_str(),
+                serde_json::to_string(&transfer)
+                    .map_err(|error| uniserve_worker::Error::Invalid(error.to_string()))?
+                    .as_str(),
             )),
         ),
     ]

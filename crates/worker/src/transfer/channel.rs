@@ -13,7 +13,7 @@ use uniserve_ipc::{Locator, TransferTransport};
 use super::read::{NativeRead, ReadCall, payload};
 use super::transport::{ExportView, Staged, Transport, producer, read_destination};
 use super::{Spans, copy_planner};
-use crate::ffi::{Backing, Device};
+use crate::ffi::{Backing, MemoryKind};
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -95,7 +95,7 @@ pub(super) fn locate(mut locator: Locator, staging: &Memory, bytes: usize) -> Re
 /// [`Transport::issue_fetch`]).
 pub(super) fn read(
     locator: &Locator,
-    device: Device,
+    device: MemoryKind,
     destination: Option<&Spans>,
     region: Option<&[Range<u64>]>,
 ) -> Result<ReadCall> {
@@ -147,15 +147,15 @@ impl ChannelPayload {
 }
 
 impl Backing for ChannelPayload {
-    fn device(&self) -> Device {
-        Device::Cpu
+    fn device(&self) -> MemoryKind {
+        MemoryKind::Host
     }
 
     fn address(&self) -> u64 {
         self.bytes().as_ptr() as u64
     }
 
-    fn len(&self) -> usize {
+    fn bytes(&self) -> usize {
         self.bytes().len()
     }
 }

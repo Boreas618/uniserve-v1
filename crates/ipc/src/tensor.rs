@@ -85,11 +85,6 @@ pub enum DType {
 }
 
 impl DType {
-    /// Name used by physical tensor storage and transfer locators.
-    pub fn storage_name(self) -> &'static str {
-        tensor_dtype(self).0
-    }
-
     /// Storage width of one element in bytes.
     pub fn element_bytes(self) -> u64 {
         tensor_dtype(self).1
@@ -1134,9 +1129,10 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
     Ok(())
 }
 
-/// Transport dtype name and element width in bytes of a declared dtype, used
-/// by both allocation and transfer validation. The names match the Python
-/// worker's `dtype_name`, which strips the `torch.` prefix.
+/// Transfer locator dtype name and element width in bytes of a declared
+/// dtype, used by both allocation and transfer validation. The names are the
+/// torch dtype names without the `torch.` prefix, as the worker's DLPack
+/// dtype spells them in the locators it writes.
 fn tensor_dtype(dtype: DType) -> (&'static str, u64) {
     match dtype {
         DType::U8 => ("uint8", 1),

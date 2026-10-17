@@ -25,7 +25,7 @@ mod loading;
 mod storage;
 
 pub(crate) use loading::LoadedModel;
-pub use storage::RankStorage;
+pub(crate) use storage::RankStorage;
 
 use std::collections::BTreeMap;
 
@@ -49,8 +49,7 @@ use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::transfer::TransferRuntime;
-use crate::ffi::Device as StorageDevice;
-use crate::ffi::{DType, Handle, Interpreter};
+use crate::ffi::{DType, Interpreter};
 use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
@@ -76,13 +75,13 @@ use crate::runner::start::{
 use crate::service::Service;
 use crate::storage::{BufferPool, CachePlan, GroupShape, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
-use crate::transfer::{Capacity, TransportKind, TransportOptions, Transports};
+use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, sequence_kind};
 
 /// One caching-allocator segment: device, graph pool id and bytes.
-type Segment = (i32, (u64, u64), u64);
+type Segment = (DeviceId, (u64, u64), u64);
 
 /// A startup failure, with the phase that failed.
 fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
@@ -114,7 +113,7 @@ fn phase(phase: &'static str) -> impl Fn(Error) -> WorkerError {
 }
 
 /// A rank.
-pub struct Worker {
+pub(crate) struct Worker {
     config: WorkerConfig,
     info: WorkerInfo,
     plan: Plan,
@@ -122,11 +121,11 @@ pub struct Worker {
     world: Option<World>,
     budget: Option<DeviceBudget>,
     streams: Streams,
-    graphs: GraphStorage<String, Handle>,
+    graphs: GraphStorage,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
     _scratches: Scratches,
-    executor: Option<Executor<WorkerBackend>>,
+    executor: Option<Executor>,
     hooks: Vec<Box<dyn WarmupHooks>>,
     /// Retained for the rank's lifetime: torch, the driver owners and the
     /// reclaimer all use the device's primary context.
@@ -139,20 +138,17 @@ impl Worker {
     /// Build the rank. On failure, everything built so far is released;
     /// the process world is abandoned, because peers may still be inside a
     /// collective.
-    pub fn start(launch: WorkerLaunch) -> std::result::Result<Self, WorkerError> {
+    pub(crate) fn start(launch: WorkerLaunch) -> std::result::Result<Self, WorkerError> {
         let device = launch.device();
         let context = match device {
-            Device::Cuda(index) => {
+            Device::Cuda(cuda) => {
                 let count = DeviceId::count().map_err(|error| phase("device")(error.into()))?;
-                if index >= count {
+                if cuda.0 >= count {
                     return Err(phase("device")(Error::Unsupported(format!(
                         "cuda device {device} is outside the {count} visible CUDA device(s)"
                     ))));
                 }
-                Some(
-                    PrimaryContext::retain(DeviceId(index))
-                        .map_err(|error| phase("device")(error.into()))?,
-                )
+                Some(PrimaryContext::retain(cuda).map_err(|error| phase("device")(error.into()))?)
             }
             Device::Cpu => None,
         };
@@ -270,7 +266,7 @@ impl Worker {
 
         let budgets = devices
             .iter()
-            .filter_map(|device| device.cuda_index())
+            .filter_map(|device| device.cuda())
             .map(|index| {
                 Ok((
                     index,
@@ -285,9 +281,7 @@ impl Worker {
         let storage =
             allocate_storage(&launch, &config, &plan, &streams).map_err(phase("storage"))?;
         let mut components = components;
-        let preparation = device
-            .cuda_index()
-            .and_then(|index| streams.preparation(DeviceId(index)));
+        let preparation = device.cuda().and_then(|cuda| streams.preparation(cuda));
         let preparation = preparation
             .map(CUDAStream::stream)
             .transpose()
@@ -431,10 +425,7 @@ impl Worker {
         if let Some(experts) = experts {
             backend.set_experts(experts);
         }
-        let cuda: Vec<i32> = devices
-            .iter()
-            .filter_map(|device| device.cuda_index())
-            .collect();
+        let cuda: Vec<DeviceId> = devices.iter().filter_map(|device| device.cuda()).collect();
         backend.set_transfer(
             TransferRuntime::start(
                 &streams,
@@ -452,7 +443,7 @@ impl Worker {
                     profile,
                     Interpreter::import("uniserve.profiling.start_profiler")?,
                     Interpreter::import("uniserve.profiling.stop_profiler")?,
-                    device.cuda_index(),
+                    device.cuda(),
                 ))
             })
             .transpose()
@@ -515,37 +506,8 @@ impl Worker {
         })
     }
 
-    pub fn info(&self) -> &WorkerInfo {
-        &self.info
-    }
-
-    pub fn config(&self) -> &WorkerConfig {
-        &self.config
-    }
-
-    pub fn plan(&self) -> &Plan {
-        &self.plan
-    }
-
-    pub fn world(&self) -> Option<&World> {
-        self.world.as_ref()
-    }
-
-    pub fn streams_mut(&mut self) -> &mut Streams {
-        &mut self.streams
-    }
-
-    pub fn backend_mut(&mut self) -> Option<&mut WorkerBackend> {
-        self.executor.as_mut().map(Executor::backend_mut)
-    }
-
-    /// Register a capability runtime's warmup work.
-    pub fn add_warmup(&mut self, hooks: Box<dyn WarmupHooks>) {
-        self.hooks.push(hooks);
-    }
-
     /// Run warmup once, before the first serving submission.
-    pub fn warmup(&mut self) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn warmup(&mut self) -> std::result::Result<(), WorkerError> {
         if self.warmed {
             return Ok(());
         }
@@ -632,7 +594,7 @@ impl Worker {
 
     /// Serve the channel until the engine closes the rank or a fatal
     /// response ends admission.
-    pub fn run(&mut self, channel: &mut Channel) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn run(&mut self, channel: &mut Channel) -> std::result::Result<(), WorkerError> {
         self.warmup()?;
         let info = self.info.clone();
         let executor = self
@@ -650,7 +612,7 @@ impl Worker {
     /// Release every owner in dependency order. An aborted close never
     /// waits for device work or peers: it abandons what may still be in use
     /// until the process exits.
-    pub fn close(&mut self, aborted: bool) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn close(&mut self, aborted: bool) -> std::result::Result<(), WorkerError> {
         if std::mem::replace(&mut self.closed, true) {
             return Ok(());
         }
@@ -759,9 +721,10 @@ impl Worker {
     }
 
     /// Bytes the caching allocator holds in each of its pools on `device`.
-    fn segments(&self, device: i32) -> Result<Vec<Segment>> {
+    fn segments(&self, device: DeviceId) -> Result<Vec<Segment>> {
         let function = "uniserve.cuda_graph.pool_bytes";
-        let pools = Interpreter::import(function)?.call_values(&[Any::from(i64::from(device))])?;
+        let pools =
+            Interpreter::import(function)?.call_values(&[Any::from(i64::from(device.0))])?;
         let pools =
             crate::ffi::integers(pools).map_err(|error| Error::numerical(function, &error))?;
         Ok(pools
@@ -780,11 +743,7 @@ impl Worker {
 
     /// Check graph residency, report memory and kernels, then seal.
     fn complete_startup(&mut self) -> std::result::Result<(), WorkerError> {
-        let cuda_devices: Vec<i32> = self
-            .config
-            .devices()
-            .filter_map(Device::cuda_index)
-            .collect();
+        let cuda_devices: Vec<DeviceId> = self.config.devices().filter_map(Device::cuda).collect();
         if let Some(budget) = &self.budget {
             let mut segments = Vec::new();
             for &device in &cuda_devices {
@@ -806,13 +765,13 @@ impl Worker {
                 let process = budget.process_bytes(device).map_err(phase("warmup"))?;
                 let reserved: i64 = Interpreter::import("torch.cuda.memory_reserved")
                     .and_then(|reserved| {
-                        reserved.call_as(&[(&Any::from(i64::from(device))).into()])
+                        reserved.call_as(&[(&Any::from(i64::from(device.0))).into()])
                     })
                     .map_err(phase("warmup"))?;
                 let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
                 tracing::info!(
                     target: crate::profiling::kernels::TARGET,
-                    "device storage on cuda:{device}: {:.2} GiB held by this process at startup, {:.2} GiB of it reserved by the caching allocator and {:.2} GiB of that in graph pools",
+                    "device storage on {device}: {:.2} GiB held by this process at startup, {:.2} GiB of it reserved by the caching allocator and {:.2} GiB of that in graph pools",
                     gib(process),
                     gib(reserved as u64),
                     gib(pools.get(&device).copied().unwrap_or(0)),
@@ -897,10 +856,9 @@ fn allocate_storage(
         .iter()
         .map(|name| TransportKind::parse(name))
         .collect::<Result<Vec<_>>>()?;
-    let capacity = Arc::new(Capacity::new(
+    let capacity = Arc::new(TransferCapacity::new(
         plan.arena.transfer_bytes,
         plan.arena.transfer_tickets,
-        storage::notify,
     )?);
     let options = TransportOptions {
         source: plan.info.endpoint.clone(),
@@ -927,10 +885,7 @@ fn allocate_storage(
     // Products: scheduler-placed buffers in the buffer pool and scalar relay
     // lanes, one per request slot and unresolved call, on the primary
     // device where every binding computes.
-    let devices = vec![match config.device {
-        Device::Cuda(index) => StorageDevice::Cuda(index),
-        Device::Cpu => StorageDevice::Cpu,
-    }];
+    let devices = vec![config.device.memory()];
     let physical = plan.physical_buffer_pool_bytes.max(1);
     let buffer_pool =
         BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
@@ -945,8 +900,8 @@ fn allocate_storage(
         Arc::clone(&events),
     )?;
 
-    let device = config.device.cuda_index();
-    let preparation = device.and_then(|index| streams.preparation(DeviceId(index)));
+    let device = config.device.cuda();
+    let preparation = device.and_then(|cuda| streams.preparation(cuda));
     let prefix_cache = match (&plan.cache, &plan.info.prefix_cache) {
         (Some(cache), Some(info)) => Some(PrefixCache::new(
             Arc::clone(cache),
@@ -964,8 +919,8 @@ fn allocate_storage(
     }
     // Slot releases order after the token batches that read them.
     let release_stream = match device {
-        Some(index) => streams
-            .stream_for(CallKind::Forward(ForwardMode::Decode), DeviceId(index))
+        Some(cuda) => streams
+            .stream_for(CallKind::Forward(ForwardMode::Decode), cuda)
             .map(|stream| stream.stream().cloned())
             .transpose()?,
         None => None,
@@ -1036,7 +991,7 @@ fn host_name() -> Result<String> {
 fn reserve_join_pools(
     config: &WorkerConfig,
     experts: &mut ExpertUnion,
-    graphs: &mut GraphStorage<String, Handle>,
+    graphs: &mut GraphStorage,
 ) -> Result<()> {
     if config.graph_policy == "off" || experts.has_pools() {
         return Ok(());
@@ -1048,14 +1003,7 @@ fn reserve_join_pools(
     let mut pools = Vec::new();
     for peer in 0..experts.microbatches() {
         let stream = experts.stream(peer).raw();
-        let reserved = reserve_pools(
-            graphs,
-            &create,
-            stream,
-            format!("experts:join:{peer}"),
-            &[device],
-            None,
-        )?;
+        let reserved = reserve_pools(graphs, &create, stream, &[device], None)?;
         pools.extend(reserved.first().map(|pool| pool.value.clone()));
     }
     experts.set_pools(pools);
@@ -1195,7 +1143,7 @@ fn plan(
         )
         .collect();
     let fabric_handles = match device {
-        Device::Cuda(index) => HandleType::probe(DeviceId(index))? == HandleType::Fabric,
+        Device::Cuda(cuda) => HandleType::probe(cuda)? == HandleType::Fabric,
         Device::Cpu => false,
     };
     let report = Report {

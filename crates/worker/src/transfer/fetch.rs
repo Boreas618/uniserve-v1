@@ -1,5 +1,6 @@
 //! Plan a logical tensor's reads from its locations and submit them.
 
+use crate::ffi::DType;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -8,13 +9,12 @@ use uniserve_ipc::{Locator, TensorTransfer};
 use super::read::Read;
 use super::transport::{Transport, TransportKind, Transports};
 use super::{ReadReservation, Spans, plan_reads};
-use crate::storage::memory::parse_dtype;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// One source's read: the region of its locator (in locator coordinates)
 /// and the destination piece it fills.
-pub struct PlannedRead {
+pub(crate) struct PlannedRead {
     transport: Arc<Transport>,
     locator: Arc<Locator>,
     source_region: Vec<Range<u64>>,
@@ -29,7 +29,7 @@ pub struct PlannedRead {
 /// plan, before any read is submitted. `locators` caches shared locators
 /// per location index across calls on one descriptor, so channel payloads
 /// are cloned once however many regions read them.
-pub fn plan(
+pub(crate) fn plan(
     tensor: &TensorTransfer,
     destination: &Spans,
     transports: &Transports,
@@ -41,7 +41,7 @@ pub fn plan(
         .first()
         .ok_or_else(|| Error::Invalid("tensor transfer has no locations".into()))?;
     let shape: Vec<u64> = region.iter().map(|range| range.end - range.start).collect();
-    destination.validate_destination(&shape, parse_dtype(&first.dtype)?, destination.device())?;
+    destination.validate_destination(&shape, DType::parse(&first.dtype)?, destination.device())?;
 
     let mut ordered: Vec<_> = tensor.locations.iter().enumerate().collect();
     ordered.sort_by_key(|(_, location)| TransportKind::of(location) != TransportKind::Local);
@@ -60,7 +60,7 @@ pub fn plan(
             .collect();
         let slot = bound.len();
         bound.push((Arc::clone(transport), index));
-        Some(Ok::<_, Error>((slot, covered)))
+        Some(Ok((slot, covered)))
     });
     let reads = plan_reads(region, locations)?.ok_or_else(|| {
         Error::Invalid("bound product locations do not cover the consumer region".into())
@@ -98,7 +98,7 @@ pub fn plan(
 /// The caller starts the returned reads ([`start`]) once `stream`
 /// performed its work: at once after a stream, from the job's completion
 /// on after a recorder.
-pub fn submit(
+pub(crate) fn submit(
     reads: &[PlannedRead],
     stream: impl Issue,
     mut retain: impl FnMut(&Arc<Read>) -> Result<()>,

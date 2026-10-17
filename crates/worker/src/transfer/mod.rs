@@ -1,10 +1,13 @@
 //! Transfer admission, transports, readable results, and physical retirement.
 //!
-//! The generic cores ([`TransferCapacity`], [`TransferTicket`],
-//! [`TransferPool`], [`BufferRegistry`], [`CacheImporter`]) own admission,
-//! cancellation and retirement rules; the native layer instantiates them with
-//! Rust-owned storage ([`Spans`] of [`crate::storage::memory::StorageView`]s),
-//! driver copies and the shared [`EventPool`].
+//! [`TransferCapacity`] holds a rank's transfer byte budget and read credits;
+//! each read's [`TransferTicket`] separates its consumable result from its
+//! physical retirement; the transfer pool runs reads on host threads; export
+//! tables register exported storage until its readers finished; the cache
+//! importer retains import destinations through their physical reads. All of
+//! them move Rust-owned storage ([`Spans`] of
+//! [`crate::storage::memory::StorageView`]s) with driver copies ordered by the
+//! rank's [`crate::EventPool`].
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -15,7 +18,8 @@ use uniserve_cuda::Event;
 use crate::{Completion, Error, Result};
 
 mod backing;
-pub mod cache_export;
+pub(crate) mod cache_export;
+pub use cache_export::CacheExport;
 mod cache_import;
 mod capacity;
 mod channel;
@@ -30,23 +34,23 @@ mod shm;
 mod spans;
 mod ticket;
 mod transport;
-pub mod vmm;
+pub(crate) mod vmm;
 
-pub use cache_import::{
-    CacheImport, CacheImporter, ImportBackend, ImportCopy, ImportEntry, ImportWorkspace,
+pub(crate) use cache_import::{
+    CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired,
 };
-pub(crate) use cache_import::{CacheImportBackend, ImportTask, Retired};
-pub use read::{Read, ReadRef};
-pub use registry::{BufferRegistry, RegisteredBuffer};
-pub use shm::{SHM_HEADER_BYTES, SharedBuffer, SharedMapping, SharedRead};
-pub use spans::{Spans, copy_on_host, copy_planner, submit_copy};
+pub use read::Read;
+pub(crate) use read::ReadRef;
+pub use shm::SharedRead;
+pub(crate) use shm::{SharedBuffer, SharedMapping};
+pub use spans::Spans;
+pub(crate) use spans::{copy_on_host, copy_planner, submit_copy};
 pub use transport::{Transport, TransportKind, TransportOptions, Transports};
-pub use vmm::{DescriptorGrants, PeerExchange, PeerStorage, fetch_descriptor};
+pub(crate) use vmm::{DescriptorGrants, PeerStorage};
 
 pub(crate) use capacity::ByteReservation;
 pub use capacity::{ReadReservation, TransferCapacity};
-pub use pool::{ReadBackend, TransferPool, TransferRead};
-pub use ticket::TransferTicket;
+pub(crate) use ticket::TransferTicket;
 
 /// A completion or readiness observer. Observers only notify (wake a
 /// submission or the service loop); they never block or call back into the
@@ -54,10 +58,7 @@ pub use ticket::TransferTicket;
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 /// The physical retirement signal of an export, a read or a cache import.
-pub type Retirement = Completion<Error, Notify>;
-
-/// A rank's shared transfer byte budget and read credits.
-pub type Capacity = TransferCapacity<Notify>;
+pub type Retirement = Completion<Notify>;
 
 /// Reader acknowledgment words in the header of a shared-memory segment or
 /// a pooled VMM chunk: one per consumer slot, which a reader sets to
@@ -89,7 +90,7 @@ pub(crate) fn drain_event(event: &Event, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-pub fn notify(callbacks: Vec<Notify>) {
+pub(crate) fn notify(callbacks: Vec<Notify>) {
     for callback in callbacks {
         callback();
     }
@@ -97,7 +98,7 @@ pub fn notify(callbacks: Vec<Notify>) {
 
 /// One source's contribution to a logical tensor fetch, in source-local and
 /// destination-local coordinates.
-pub struct ReadRegion {
+pub(crate) struct ReadRegion {
     pub location: usize,
     pub source: Vec<Range<u64>>,
     pub destination: Vec<Range<u64>>,
@@ -110,10 +111,10 @@ pub struct ReadRegion {
 /// plan, before any destination can be written. Return `None` for missing
 /// coverage, and stop asking for locations as soon as coverage is complete.
 /// An empty region needs no reads. Source lookup errors propagate unchanged.
-pub fn plan_reads<E>(
+pub(crate) fn plan_reads(
     region: &[Range<u64>],
-    locations: impl IntoIterator<Item = std::result::Result<(usize, Vec<Range<u64>>), E>>,
-) -> std::result::Result<Option<Vec<ReadRegion>>, E> {
+    locations: impl IntoIterator<Item = Result<(usize, Vec<Range<u64>>)>>,
+) -> Result<Option<Vec<ReadRegion>>> {
     if region.iter().any(Range::is_empty) {
         return Ok(Some(Vec::new()));
     }

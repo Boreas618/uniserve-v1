@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use uniserve_core::ImageParams;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
     MediaCall, RequestKey,
@@ -32,7 +32,7 @@ use crate::executor::batch::{
 };
 use crate::executor::products::{ProductOwners, Publications};
 use crate::executor::transfer::latents::{self, PendingExport};
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
@@ -46,7 +46,7 @@ use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
-use crate::storage::latent::Pool;
+use crate::storage::LatentPool;
 use crate::storage::{
     LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
 };
@@ -208,7 +208,7 @@ impl<'a> ImageBatch<'a> {
         requests: &'a mut RequestPool,
         plan: &'a BatchPlan,
         opening: Opening,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<Stream>,
         words: usize,
     ) -> Result<Self> {
@@ -259,7 +259,7 @@ impl<'a> ImageBatch<'a> {
     }
 
     /// The batch's product device.
-    pub(crate) fn target(&self) -> Device {
+    pub(crate) fn target(&self) -> MemoryKind {
         self.batch.target()
     }
 
@@ -513,7 +513,7 @@ impl ImageParts<'_> {
     }
 
     /// The latent pool and its storage, for trajectory transfers.
-    pub(crate) fn latent_pool(&mut self) -> Result<(&mut Pool, &LatentStorage)> {
+    pub(crate) fn latent_pool(&mut self) -> Result<(&mut LatentPool, &LatentStorage)> {
         let latents = self.latents_mut()?;
         Ok((&mut latents.pool, &latents.storage))
     }
@@ -572,7 +572,7 @@ fn placement(
     kind: CallKind,
     image: &ImageParts<'_>,
     plan: &BatchPlan,
-) -> Result<(Option<i32>, Option<Stream>, usize)> {
+) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
     match kind {
         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
             crate::runner::encoder::image_placement(image, plan)

@@ -23,17 +23,17 @@ pub(super) mod plan;
 pub(super) mod planes;
 mod transfers;
 
-pub use access::UnitAccesses;
+pub(crate) use access::UnitAccesses;
 use imports::Imports;
 pub use imports::PendingImport;
-pub use transfers::TransferBases;
+pub(crate) use transfers::TransferBases;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tvm_ffi::Any;
 use uniserve_core::CallId;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, CacheTransfer, RequestKey, Wake};
 
 use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
@@ -46,8 +46,8 @@ use crate::stream::Issue;
 use crate::transfer::cache_export::{self, CacheExport};
 use crate::transfer::exports::Location;
 use crate::transfer::{
-    CacheImport, CacheImportBackend, CacheImporter, ImportCopy, ImportEntry, ImportTask,
-    ImportWorkspace, Retired, Retirement, Transports,
+    CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired, Retirement,
+    Transports,
 };
 use crate::{Error, HostTask, Result};
 
@@ -59,21 +59,21 @@ pub struct PrefixCache {
     planes: Arc<CachePlanes>,
     storage: BlockTableStorage,
     tables: BlockTables,
-    accesses: UnitAccesses<Arc<Retirement>>,
+    accesses: UnitAccesses,
     bases: TransferBases,
     imports: Imports,
 }
 
 impl PrefixCache {
     /// Import workers for `capacity` concurrently admitted imports.
-    pub fn import_workers(capacity: usize) -> usize {
+    pub(crate) fn import_workers(capacity: usize) -> usize {
         capacity.clamp(1, IMPORT_WORKERS)
     }
 
     /// Fixed device bytes besides the pool itself: block tables, import
     /// scratch and per-stream unit columns (`unit_columns` streams besides
     /// the import workers').
-    pub fn fixed_bytes(
+    pub(crate) fn fixed_bytes(
         plan: &CachePlan,
         num_units: u32,
         request_pool_size: u32,
@@ -101,7 +101,7 @@ impl PrefixCache {
         request_pool_size: u32,
         width: u32,
         import_capacity: usize,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
@@ -135,15 +135,15 @@ impl PrefixCache {
         })
     }
 
-    pub fn planes(&self) -> &Arc<CachePlanes> {
+    pub(crate) fn planes(&self) -> &Arc<CachePlanes> {
         &self.planes
     }
 
-    pub fn plan(&self) -> &Arc<CachePlan> {
+    pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         self.planes.plan()
     }
 
-    pub fn storage(&self) -> &BlockTableStorage {
+    pub(crate) fn storage(&self) -> &BlockTableStorage {
         &self.storage
     }
 
@@ -153,7 +153,7 @@ impl PrefixCache {
 
     /// Select `rows`' attention pages. Every row that writes is checked
     /// against the live exports, imports and executions of its units.
-    pub fn prepare_attention(&mut self, rows: &[AttentionRow]) -> Result<Vec<TablePages>> {
+    pub(crate) fn prepare_attention(&mut self, rows: &[AttentionRow]) -> Result<Vec<TablePages>> {
         let accesses = &mut self.accesses;
         self.tables.prepare_attention(rows, |table, prefix, query| {
             accesses.require_writable(&table.spans(u64::from(prefix), u64::from(query))?)
@@ -163,7 +163,7 @@ impl PrefixCache {
     /// Retain `slot`'s extent below `length` tokens, from each group's first
     /// resident page, for `request` until `retirement`: the physical end of
     /// the batch that reads or writes it.
-    pub fn retain(
+    pub(crate) fn retain(
         &mut self,
         request: RequestKey,
         slot: u32,
@@ -184,13 +184,13 @@ impl PrefixCache {
     }
 
     /// The transfer resident under `buffer`.
-    pub fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
+    pub(crate) fn resident(&self, buffer: BufferId) -> Option<&Arc<CacheTransfer>> {
         self.bases.resident(buffer)
     }
 
     /// The conditioning export `buffer` of `request`, covered by `slot`'s
     /// installed keys and values (`visible` tokens).
-    pub fn validate_conditioning(
+    pub(crate) fn validate_conditioning(
         &self,
         request: RequestKey,
         buffer: BufferId,
@@ -227,17 +227,17 @@ impl PrefixCache {
     }
 
     /// Revoke `export`, which is not published ([`CacheExport::revoke`]).
-    pub fn revoke_export(&mut self, export: CacheExport) {
+    pub(crate) fn revoke_export(&mut self, export: CacheExport) {
         export.revoke(&mut self.accesses);
     }
 
     /// Whether any physical access is outstanding.
-    pub fn has_pending_accesses(&mut self) -> bool {
+    pub(crate) fn has_pending_accesses(&mut self) -> bool {
         self.accesses.has_pending_accesses()
     }
 
     /// The completions a batch writing `spans` waits for.
-    pub fn write_dependencies(&mut self, spans: &[(u32, u32, u32)]) -> Vec<Arc<Retirement>> {
+    pub(crate) fn write_dependencies(&mut self, spans: &[(u32, u32, u32)]) -> Vec<Arc<Retirement>> {
         self.accesses
             .write_dependencies(spans)
             .into_iter()
@@ -257,7 +257,7 @@ impl PrefixCache {
     }
 
     /// Release the imports and exports of `buffers`.
-    pub fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
+    pub(crate) fn release_buffers(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
         self.release_imports(buffers)?;
         self.accesses
             .release_exports(&buffers.iter().copied().collect::<Vec<_>>());
@@ -266,7 +266,7 @@ impl PrefixCache {
 
     /// Release the imports and exports of finished `requests`, except the
     /// `retained` buffers.
-    pub fn release_requests(
+    pub(crate) fn release_requests(
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
@@ -284,7 +284,7 @@ impl PrefixCache {
 
     /// Whether the physical accesses of `buffers` and of `requests` (but
     /// the `retained` buffers) have retired.
-    pub fn retirement_ready(
+    pub(crate) fn retirement_ready(
         &mut self,
         buffers: &HashSet<BufferId>,
         requests: &HashSet<RequestKey>,
@@ -295,13 +295,13 @@ impl PrefixCache {
 
     /// Keep `slot`, a guidance prefix slot `request` reads, until the
     /// request releases its prefixes.
-    pub fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
+    pub(crate) fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
         self.tables.retain_prefix(request, slot);
     }
 
     /// Forget a retired request epoch's resident transfers and accepted
     /// bases; its physical accesses have drained.
-    pub fn drop_request(&mut self, request: RequestKey) {
+    pub(crate) fn drop_request(&mut self, request: RequestKey) {
         self.bases.drop_request(request);
     }
 
@@ -316,7 +316,7 @@ impl PrefixCache {
     /// The attention layers' view of the unit pool (the library's `pool`
     /// over the plan, the unit count and the unit fields by name), which
     /// execution contexts read prefixes through.
-    pub fn pool(&self) -> Result<Handle> {
+    pub(crate) fn pool(&self) -> Result<Handle> {
         let mut arguments = vec![
             self.plan().handle.to_any(),
             Any::from(i64::from(self.planes.num_units())),
@@ -326,7 +326,7 @@ impl PrefixCache {
     }
 
     /// Bind the unit resets to another stream (one per executing lane).
-    pub fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
+    pub(crate) fn bind_units(&self, stream: Option<&Stream>) -> Result<UnitColumn> {
         UnitColumn::bind(&self.planes, stream)
     }
 
@@ -341,7 +341,7 @@ impl PrefixCache {
 
     /// Prepare newly assigned units for a new owner on `column`'s stream.
     /// Fails if an export, import or execution still overlaps any of them.
-    pub fn recycle(
+    pub(crate) fn recycle(
         &mut self,
         units: &[u32],
         column: &UnitColumn,
@@ -358,7 +358,7 @@ impl PrefixCache {
 
     /// Clear released slots' rows on `stream` (ordered after every batch
     /// that read them) and forget them on the host.
-    pub fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
+    pub(crate) fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
         let slots = self.tables.release_slots(slots)?;
         self.storage.clear(&slots, stream)?;
         self.tables.release(&slots);
@@ -367,7 +367,7 @@ impl PrefixCache {
 
     /// Clear guidance prefix slots `slots` of `request` on `stream`
     /// (ordered after every batch that read them) and forget them.
-    pub fn release_prefixes(
+    pub(crate) fn release_prefixes(
         &mut self,
         request: RequestKey,
         slots: &[u32],
@@ -380,7 +380,7 @@ impl PrefixCache {
     }
 
     /// Clear every guidance prefix slot `request` still holds.
-    pub fn release_request_prefixes(
+    pub(crate) fn release_request_prefixes(
         &mut self,
         request: RequestKey,
         stream: impl Issue,
@@ -461,7 +461,7 @@ impl PrefixCache {
         let write = Arc::new(CacheImport::new(export.source, slot as usize, copy));
         let entry = ImportEntry::new(Arc::clone(&write));
 
-        let withdraw = |task: &Option<Arc<HostTask<ImportTask>>>| {
+        let withdraw = |task: &Option<Arc<HostTask<ImportCopy>>>| {
             if let Some(task) = task
                 && let Err(cleanup) = task.cancel(true)
             {
@@ -469,20 +469,16 @@ impl PrefixCache {
             }
         };
         if let Some(task) = &task {
-            let configured = task.configure(ImportCopy::new(
-                Arc::clone(&self.imports.importer),
-                Arc::clone(&write),
-                CacheImportBackend {
-                    write: Arc::clone(&write),
-                    export: Arc::clone(&export),
-                    tables: tables.clone(),
-                    initialized: initialized.clone(),
-                    planes: Arc::clone(&self.planes),
-                    transports,
-                    importer: Arc::clone(&self.imports.importer),
-                    retired: Arc::clone(&self.imports.retired),
-                },
-            ));
+            let configured = task.configure(ImportCopy {
+                write: Arc::clone(&write),
+                export: Arc::clone(&export),
+                tables: tables.clone(),
+                initialized: initialized.clone(),
+                planes: Arc::clone(&self.planes),
+                transports,
+                importer: Arc::clone(&self.imports.importer),
+                retired: Arc::clone(&self.imports.retired),
+            });
             if let Err(error) = configured {
                 withdraw(&Some(Arc::clone(task)));
                 return Err(error);
@@ -552,7 +548,7 @@ impl PrefixCache {
 
     /// Give up an import: cancel its reads and release its destination once
     /// its physical accesses retire.
-    pub fn abandon_import(&mut self, import: &PendingImport) -> Result<()> {
+    pub(crate) fn abandon_import(&mut self, import: &PendingImport) -> Result<()> {
         if let Some(task) = &import.task {
             task.cancel(false)?;
         }
@@ -561,12 +557,12 @@ impl PrefixCache {
     }
 
     /// Cancel imports into released buffers.
-    pub fn release_imports(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
+    pub(crate) fn release_imports(&mut self, buffers: &HashSet<BufferId>) -> Result<()> {
         self.imports.cancel(self.imports.importer.release(buffers))
     }
 
     /// Cancel retired requests' imports, except retained buffers.
-    pub fn cancel_request_imports(
+    pub(crate) fn cancel_request_imports(
         &mut self,
         requests: &HashSet<RequestKey>,
         retained: &HashSet<BufferId>,
@@ -581,7 +577,7 @@ impl PrefixCache {
     }
 
     /// Install the service wake fired when imports finish or retire.
-    pub fn set_wake(&self, wake: Option<Wake>) {
+    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         self.imports.lane.set_wake(wake.clone());
         *self
             .imports
@@ -594,7 +590,7 @@ impl PrefixCache {
     /// Lend units `1..=count` as warmup scratch: no access may be pending,
     /// and the units are reset natively, issued to `stream`, now and when
     /// the scratch is returned.
-    pub fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
+    pub(crate) fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
         if self.accesses.has_pending_accesses() {
             return Err(Error::State("cache scratch requires an idle cache"));
         }
@@ -609,7 +605,7 @@ impl PrefixCache {
 
     /// Cancel every import and join the import copy threads, so no import
     /// reads through the transports any more. Idempotent.
-    pub fn stop_imports(&mut self) -> Result<()> {
+    pub(crate) fn stop_imports(&mut self) -> Result<()> {
         let cancelled = self.imports.cancel(self.imports.importer.stop());
         let mut stopped = Ok(());
         for error in self.imports.lane.close() {
@@ -636,18 +632,18 @@ impl PrefixCache {
 }
 
 /// Units `1..=count` lent to warmup batches.
-pub struct ScratchUnits {
+pub(crate) struct ScratchUnits {
     count: u32,
 }
 
 impl ScratchUnits {
-    pub fn units(&self) -> std::ops::RangeInclusive<u32> {
+    pub(crate) fn units(&self) -> std::ops::RangeInclusive<u32> {
         1..=self.count
     }
 
     /// Wait for the warmup's writes on `stream`, reset the units again and
     /// wait for the resets, all issued to `stream`.
-    pub fn finish(self, cache: &PrefixCache, stream: impl Issue) -> Result<()> {
+    pub(crate) fn finish(self, cache: &PrefixCache, stream: impl Issue) -> Result<()> {
         Issue::synchronize(&stream)?;
         cache.planes.zero_leading(self.count, stream)?;
         Issue::synchronize(&stream)

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
@@ -33,7 +33,7 @@ fn column_bytes(dtype: DType, shape: &[i64]) -> usize {
 /// A runner's columns in one allocation.
 pub(crate) struct InputBuffers<D: Columns> {
     pub(crate) dimensions: D,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     columns: Vec<(D::Name, StorageView)>,
 }
 
@@ -51,7 +51,7 @@ impl<D: Columns> InputBuffers<D> {
     /// them on `stream`, which drains before this returns.
     pub(crate) fn allocate(
         dimensions: D,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         let layout = dimensions.columns();
@@ -95,7 +95,7 @@ impl<D: Columns> InputBuffers<D> {
     }
 
     /// The CUDA device of the columns; `None` for host memory.
-    pub(crate) fn device(&self) -> Option<i32> {
+    pub(crate) fn device(&self) -> Option<DeviceId> {
         self.device
     }
 

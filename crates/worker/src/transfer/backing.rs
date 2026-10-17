@@ -7,16 +7,15 @@ use uniserve_cuda::Event;
 
 use super::vmm::pool::{PoolChunk, VmmPool};
 use super::{
-    ByteReservation, DRAIN_LIMIT, DescriptorGrants, Notify, Retirement, SharedBuffer, Spans,
-    drain_event, notify,
+    ByteReservation, DRAIN_LIMIT, DescriptorGrants, Retirement, SharedBuffer, Spans, drain_event,
+    notify,
 };
-use crate::host::{HostAction, HostTask};
-use crate::storage::memory::Memory;
+use crate::host::HostAction;
 use crate::{Error, EventPool, Outcome, Result};
 use std::time::Instant;
 
 /// A device's VMM export pool, shared by the exports placed in it.
-pub(crate) type SharedPool = Arc<Mutex<VmmPool<Arc<Memory>>>>;
+pub(crate) type SharedPool = Arc<Mutex<VmmPool>>;
 
 /// A CUDA VMM export: either the producer's own exportable storage, or a
 /// copy into a chunk of the device's export pool.
@@ -52,28 +51,24 @@ enum ExportBacking {
 pub(crate) struct TransportBuffer {
     /// Taken and returned by [`TransportBuffer::finish`], once the backing
     /// was released.
-    bytes: Mutex<Option<ByteReservation<Notify>>>,
+    bytes: Mutex<Option<ByteReservation>>,
     backing: Mutex<ExportBacking>,
 }
 
 impl TransportBuffer {
-    pub(crate) fn local(
-        source: Spans,
-        event: Option<Arc<Event>>,
-        bytes: ByteReservation<Notify>,
-    ) -> Self {
+    pub(crate) fn local(source: Spans, event: Option<Arc<Event>>, bytes: ByteReservation) -> Self {
         Self::new(ExportBacking::Local { source, event }, bytes)
     }
 
-    pub(crate) fn shared(storage: SharedBuffer, bytes: ByteReservation<Notify>) -> Self {
+    pub(crate) fn shared(storage: SharedBuffer, bytes: ByteReservation) -> Self {
         Self::new(ExportBacking::Shared(storage), bytes)
     }
 
-    pub(crate) fn cuda(source: CudaSource, bytes: ByteReservation<Notify>) -> Self {
+    pub(crate) fn cuda(source: CudaSource, bytes: ByteReservation) -> Self {
         Self::new(ExportBacking::Cuda(source), bytes)
     }
 
-    fn new(backing: ExportBacking, bytes: ByteReservation<Notify>) -> Self {
+    fn new(backing: ExportBacking, bytes: ByteReservation) -> Self {
         Self {
             bytes: Mutex::new(Some(bytes)),
             backing: Mutex::new(backing),
@@ -226,13 +221,6 @@ impl SourceRetirement {
 
 impl HostAction for SourceRetirement {
     type Output = ();
-    type Error = Error;
-    type Callback = Box<dyn FnOnce() + Send>;
-    type Wake = uniserve_ipc::Wake;
-
-    fn ready(&self) -> Result<bool> {
-        Ok(true)
-    }
 
     fn run(&self) -> Result<()> {
         self.finish()
@@ -242,37 +230,9 @@ impl HostAction for SourceRetirement {
         Ok(())
     }
 
-    fn input_outcome(&self) -> Option<Outcome<Error>> {
+    fn input_outcome(&self) -> Outcome {
         // A failed reclamation remains owned by its registry and its failed
         // completion. The host task has no separate input lease.
-        Some(Outcome::Success(()))
-    }
-
-    fn defer_release(_: Arc<HostTask<Self>>) -> Result<()> {
-        Err(Error::Invariant(
-            "transport reclamation has no deferred input".into(),
-        ))
-    }
-
-    fn notify(callbacks: Vec<Self::Callback>) {
-        for callback in callbacks {
-            callback();
-        }
-    }
-
-    fn wake(wake: &uniserve_ipc::Wake) {
-        wake.wake();
-    }
-
-    fn report(error: Error) {
-        tracing::warn!(target: "uniserve_worker.transfer", "transport storage retirement failed: {error}");
-    }
-
-    fn error(error: Error) -> Error {
-        error
-    }
-
-    fn note_cleanup(_: &mut Error, cleanup: Error) {
-        tracing::warn!(target: "uniserve_worker.transfer", "transport retirement cleanup also failed: {cleanup}");
+        Outcome::Success(())
     }
 }

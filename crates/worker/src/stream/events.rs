@@ -13,11 +13,11 @@ use crate::lane::{Completion, JobId};
 use crate::transfer::{DRAIN_LIMIT, drain_event};
 use crate::{Error, Result};
 
-type PoolKey = (i32, bool, bool);
+type PoolKey = (DeviceId, bool, bool);
 
 /// Work that runs once every event it waits on has completed: the release
 /// of storage that device work addressed, and its completion observers.
-pub type Deferred = Box<dyn FnOnce() -> Result<()> + Send>;
+pub(crate) type Deferred = Box<dyn FnOnce() -> Result<()> + Send>;
 
 /// Deferred work on its way to the pool: a job carries it from the call
 /// that recorded its events to the job's submission ([`Issue::defer`]).
@@ -32,7 +32,7 @@ pub(crate) struct Deferral {
 /// events' records are queued there, on any lane otherwise. The device is
 /// the one whose notification stream waits for the events. It is called
 /// with the pool locked, so it does not use the pool.
-pub type Submitter =
+pub(crate) type Submitter =
     Box<dyn Fn(DeviceId, Option<usize>, Vec<Arc<Event>>) -> Result<JobId> + Send + Sync>;
 
 /// What starts the job of deferred work a submitted job carried.
@@ -47,7 +47,7 @@ enum Status {
 
 struct ActiveEvent {
     event: Arc<Event>,
-    device: i32,
+    device: DeviceId,
     references: usize,
     /// Whether the lease was recorded, at once or into a job.
     recorded: bool,
@@ -136,7 +136,7 @@ impl EventPool {
 
     /// Install or clear the wake fired when work is deferred on another
     /// thread than the submitter's, which then starts the work's job.
-    pub fn set_wake(&self, wake: Option<Wake>) {
+    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         let previous = std::mem::replace(&mut self.lock().wake, wake);
         drop(previous);
     }
@@ -144,7 +144,7 @@ impl EventPool {
     /// Install or clear what starts the jobs of deferred work. The calling
     /// thread becomes the one that starts them: the thread that submits the
     /// lanes' jobs and takes their completions.
-    pub fn set_submitter(&self, submitter: Option<Submitter>) {
+    pub(crate) fn set_submitter(&self, submitter: Option<Submitter>) {
         let submitter = submitter.map(|submitter| (std::thread::current().id(), submitter));
         let previous = std::mem::replace(&mut self.lock().submitter, submitter);
         drop(previous);
@@ -153,7 +153,12 @@ impl EventPool {
     /// Acquires an unrecorded lease with no retained references. Storage
     /// owners retain their references before transferring them to release or
     /// deferral.
-    pub fn acquire(&self, device: i32, timing: bool, interprocess: bool) -> Result<Arc<Event>> {
+    pub(crate) fn acquire(
+        &self,
+        device: DeviceId,
+        timing: bool,
+        interprocess: bool,
+    ) -> Result<Arc<Event>> {
         let mut state = self.lock();
         require_open(&state)?;
 
@@ -189,7 +194,7 @@ impl EventPool {
     }
 
     /// Records this lease once on `stream`.
-    pub fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
+    pub(crate) fn record(&self, event: &Arc<Event>, stream: impl Issue) -> Result<()> {
         let mut state = self.lock();
         require_open(&state)?;
         let device = producer(&stream)?;
@@ -202,7 +207,7 @@ impl EventPool {
         Ok(())
     }
 
-    pub fn retain(&self, event: &Arc<Event>, device: i32, count: usize) -> Result<()> {
+    pub(crate) fn retain(&self, event: &Arc<Event>, device: DeviceId, count: usize) -> Result<()> {
         let mut state = self.lock();
         require_open(&state)?;
         if count == 0 {
@@ -214,7 +219,7 @@ impl EventPool {
 
     /// Acquire, record on `stream` and retain one reference: the fence of
     /// work just submitted to `stream`.
-    pub fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
+    pub(crate) fn fence(&self, stream: impl Issue, interprocess: bool) -> Result<Arc<Event>> {
         let device = producer(&stream)?;
         let event = self.acquire(device, false, interprocess)?;
         self.record(&event, stream)?;
@@ -226,7 +231,7 @@ impl EventPool {
     /// the caller established: the pool does not ask the driver. It knows
     /// only whether the lease was recorded, and rejects the final release
     /// of one that was not, preserving its references.
-    pub fn release(&self, event: &Arc<Event>, count: usize) -> Result<()> {
+    pub(crate) fn release(&self, event: &Arc<Event>, count: usize) -> Result<()> {
         let mut state = self.lock();
         // Shutdown already drained and released every lease. A completed
         // deferred owner may still release another retained event.
@@ -258,7 +263,7 @@ impl EventPool {
     ///
     /// Work deferred while a job is recorded goes through the job's
     /// recorder instead ([`Issue::defer`]).
-    pub fn defer(&self, events: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
+    pub(crate) fn defer(&self, events: Vec<Arc<Event>>, owner: Deferred) -> Result<()> {
         let mut state = self.lock();
         if state.status == Status::Closed || events.is_empty() {
             drop(state);
@@ -306,7 +311,7 @@ impl EventPool {
     /// Starts the jobs of the work that was deferred on other threads, or
     /// before the submitter was installed. Does nothing on a thread that is
     /// not the submitter's.
-    pub fn submit_deferred(&self) -> Result<()> {
+    pub(crate) fn submit_deferred(&self) -> Result<()> {
         let mut state = self.lock();
         let here = std::thread::current().id();
         if state.unsubmitted.is_empty()
@@ -348,7 +353,7 @@ impl EventPool {
     }
 
     /// Whether `job` is one that deferred work waits for.
-    pub fn owns(&self, job: JobId) -> bool {
+    pub(crate) fn owns(&self, job: JobId) -> bool {
         self.lock().deferred.contains_key(&job)
     }
 
@@ -357,7 +362,7 @@ impl EventPool {
     /// independent owners still run after one failed. A job that failed
     /// established nothing: its work stays deferred until shutdown and the
     /// job's failure is returned.
-    pub fn complete(&self, job: JobId, completion: Completion) -> Result<()> {
+    pub(crate) fn complete(&self, job: JobId, completion: Completion) -> Result<()> {
         completion.check().map_err(|failure| failure.error)?;
         let owners: Vec<Deferred> = {
             let mut state = self.lock();
@@ -382,7 +387,7 @@ impl EventPool {
     }
 
     /// The device of an active lease.
-    pub fn device(&self, event: &Arc<Event>) -> Result<i32> {
+    pub(crate) fn device(&self, event: &Arc<Event>) -> Result<DeviceId> {
         self.lock()
             .active
             .get(&key(event))
@@ -436,7 +441,7 @@ impl EventPool {
     /// [`DRAIN_LIMIT`], and runs all deferred work. Existing leases may
     /// still release afterwards. A lease that did not complete in time
     /// fails the close and keeps the pool's storage.
-    pub fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         let events: Vec<_> = {
             let mut state = self.lock();
             if state.status == Status::Open {
@@ -469,12 +474,6 @@ impl EventPool {
                 .collect()
         };
         run(owners)
-    }
-
-    /// Whether deferred work still waits for device completion.
-    pub fn pending(&self) -> bool {
-        let state = self.lock();
-        !state.deferred.is_empty() || !state.unsubmitted.is_empty()
     }
 }
 
@@ -551,7 +550,7 @@ fn device(state: &State, events: &[Arc<Event>]) -> Option<DeviceId> {
     events
         .first()
         .and_then(|event| state.active.get(&key(event)))
-        .map(|active| DeviceId(active.device))
+        .map(|active| active.device)
 }
 
 /// Start, through the installed submitter, the jobs one deferral made
@@ -647,11 +646,11 @@ fn run(owners: impl IntoIterator<Item = Deferred>) -> Result<()> {
 }
 
 /// The device of the stream `stream` records on.
-fn producer(stream: &impl Issue) -> Result<i32> {
+fn producer(stream: &impl Issue) -> Result<DeviceId> {
     let stream = stream
         .stream()
         .ok_or_else(|| invariant("a device event is recorded on a stream"))?;
-    Ok(stream.device().0)
+    Ok(stream.device())
 }
 
 fn require_open(state: &State) -> Result<()> {
@@ -664,7 +663,7 @@ fn require_open(state: &State) -> Result<()> {
 fn require<'a>(
     state: &'a mut State,
     event: &Arc<Event>,
-    device: i32,
+    device: DeviceId,
 ) -> Result<&'a mut ActiveEvent> {
     state
         .active
@@ -747,8 +746,8 @@ mod tests {
 
     /// A retained lease of device 0.
     fn fence(events: &EventPool) -> Result<Arc<Event>> {
-        let event = events.acquire(0, false, false)?;
-        events.retain(&event, 0, 1)?;
+        let event = events.acquire(DeviceId(0), false, false)?;
+        events.retain(&event, DeviceId(0), 1)?;
         Ok(event)
     }
 
@@ -775,13 +774,12 @@ mod tests {
         // long ago that job completed.
         events.defer(vec![Arc::clone(&event)], counting(&runs))?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert!(events.pending());
         let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
         assert!(events.owns(job));
 
         events.complete(job, completion)?;
         assert_eq!(runs.load(Ordering::Relaxed), 2);
-        assert!(!events.pending() && !events.owns(job));
+        assert!(!events.owns(job));
         // The work's reference went with it: the lease is returned.
         assert!(events.device(&event).is_err());
         Ok(())
@@ -863,7 +861,8 @@ mod tests {
         carrying
             .on(None)
             .defer(&events, vec![event], counting(&runs))?;
-        assert!(jobs.take().is_none() && !events.pending());
+        assert!(jobs.take().is_none());
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
 
         // Its submitter names the job that waits behind it.
         let carried = carrying.deferrals();
@@ -898,7 +897,7 @@ mod tests {
         // SAFETY: `descriptors` is a valid array of pollfd of the length given.
         let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 0) };
         assert!(ready > 0 && descriptors[1].revents & libc::POLLIN != 0);
-        assert!(events.pending());
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
 
         events.submit_deferred()?;
         let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
@@ -936,12 +935,10 @@ mod tests {
         let (job, completion) = jobs.take().ok_or(Error::State("no job was started"))?;
         assert!(events.complete(job, completion).is_err());
         assert_eq!(runs.load(Ordering::Relaxed), 0);
-        assert!(events.pending());
 
         // At shutdown the pool waits for the event itself.
         events.drain()?;
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert!(!events.pending());
         Ok(())
     }
 

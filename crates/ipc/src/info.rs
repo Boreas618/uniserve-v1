@@ -433,14 +433,6 @@ impl WorkerInfo {
         self.num_inference_steps
     }
 
-    /// Returns the advertised allocatable cache units, or zero when prefix cache is
-    /// unsupported.
-    pub fn cache_usable_units(&self) -> u32 {
-        self.prefix_cache
-            .as_ref()
-            .map_or(0, PrefixCacheInfo::usable_units)
-    }
-
     /// Returns total latent capacity in model-defined units.
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.latent_pages.saturating_sub(1))

@@ -11,7 +11,7 @@
 //!   per-(device, dtype, field) arena of `(request_capacity + 1) *
 //!   relay_depth` elements, indexed by request slot and lane.
 //! - **Writes.** Producers write the bound view (see
-//!   [`ProductStore::producer_view`]) and declare it produced, or hand a
+//!   [`ProductBuffer::view`]) and declare it produced, or hand a
 //!   value that is copied natively into it. Writes never convert dtypes: a
 //!   producer writes the store's dtype. A producer fence (an event on the
 //!   explicit producer stream) orders consumers after the write.
@@ -23,7 +23,7 @@
 //!   successfully retired, and every fence complete. Failed or unknown
 //!   completions keep the storage forever.
 //!
-//! [`StoreState`] is the store's bookkeeping core, which [`ProductStore`]
+//! [`State`] is the store's bookkeeping core, which [`ProductStore`]
 //! serializes changes to.
 //! Buffer and import handles share their state with read leases; only
 //! physical completion (events, transfer and export retirement) decides when
@@ -40,7 +40,6 @@ mod write;
 pub use export::ProductExport;
 pub use product::{Metadata, ProductBuffer, ValueRange};
 pub use read::ProductRead;
-pub use scalar::Scalar;
 pub use write::OutputPlacement;
 
 // The store's parts share their items through this module.
@@ -50,33 +49,23 @@ use read::*;
 use relay::*;
 use write::*;
 
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::storage::buffer::BufferPool;
-use crate::storage::memory::{Memory, StorageView, device_name};
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::transfer::exports::{self, Location};
-use crate::transfer::{ReadRef, Retirement};
-use crate::{Completion, Error, EventPool, Result};
+use crate::{Error, EventPool, Result, lock};
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use uniserve_core::CallId;
 use uniserve_cuda::Event;
 use uniserve_ipc::{BufferId, RequestKey, TensorRef};
 
-fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
-    // No user code runs under these locks; a panic cannot leave a partial
-    // update that later readers would misinterpret.
-    value.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-type State = StoreState<ProductBuffer, ImportHandle, StorageView>;
-
 /// The rank's cross-call tensor store.
 pub struct ProductStore {
     max_feature_bytes: usize,
-    devices: Vec<Device>,
-    buffer_pool: Mutex<BufferPool<Arc<Memory>>>,
+    devices: Vec<MemoryKind>,
+    buffer_pool: Mutex<BufferPool>,
     events: Arc<EventPool>,
     /// Committed export locations per local product, revoked on release.
     exports: Mutex<HashMap<BufferId, Vec<Location>>>,
@@ -87,24 +76,24 @@ pub(crate) type BufferKey = (RequestKey, CallId, u16);
 
 pub(crate) type CallKey = (RequestKey, CallId);
 
-/// Rank-local values and bounded scalar relay lanes. B and I are buffer and
-/// import handles; A holds an arena or a relay lane's view.
-pub(crate) struct StoreState<B, I, A> {
-    pub capacity: usize,
-    pub byte_capacity: usize,
-    pub request_capacity: usize,
-    pub relay_depth: usize,
-    pub buffers: HashMap<BufferKey, B>,
-    pub imports: HashMap<BufferKey, I>,
-    pub arenas: HashMap<ArenaKey, A>,
-    pub views: HashMap<RelayKey, A>,
-    pub allocated_bytes: usize,
+/// Rank-local values and bounded scalar relay lanes: the store's buffers
+/// and imports, the views of its arenas and of its relay lanes.
+struct State {
+    capacity: usize,
+    byte_capacity: usize,
+    request_capacity: usize,
+    relay_depth: usize,
+    buffers: HashMap<BufferKey, ProductBuffer>,
+    imports: HashMap<BufferKey, ImportHandle>,
+    arenas: HashMap<ArenaKey, StorageView>,
+    views: HashMap<RelayKey, StorageView>,
+    allocated_bytes: usize,
     calls: HashMap<CallKey, HashSet<BufferKey>>,
     lanes: HashMap<LaneKey, Lane>,
     call_lanes: HashMap<RelayCall, usize>,
 }
 
-impl<B, I, A> StoreState<B, I, A> {
+impl State {
     pub(crate) fn new(
         capacity: usize,
         byte_capacity: usize,
@@ -128,22 +117,19 @@ impl<B, I, A> StoreState<B, I, A> {
     }
 }
 
-impl<B, I, A, T, C> StoreState<B, I, A>
-where
-    B: Deref<Target = Mutex<Buffer<T, C>>>,
-{
+impl State {
     /// Check the whole allocation group before any view is created.
     pub(crate) fn validate_bindings(
         &self,
-        bindings: &[(BufferId, String)],
+        bindings: &[(BufferId, MemoryKind)],
         feature: bool,
     ) -> Result<()> {
         let mut seen = HashSet::new();
-        let mut counts = HashMap::<String, usize>::new();
+        let mut counts = HashMap::<MemoryKind, usize>::new();
         for buffer in self.buffers.values() {
             let buffer = lock(buffer);
             if !buffer.feature && matches!(buffer.backing, Some(Backing::Persistent(_))) {
-                *counts.entry(buffer.device.clone()).or_default() += 1;
+                *counts.entry(buffer.device).or_default() += 1;
             }
         }
 
@@ -155,7 +141,7 @@ where
                 ));
             }
             if !feature {
-                let count = counts.entry(device.clone()).or_default();
+                let count = counts.entry(*device).or_default();
                 *count += 1;
                 if *count > self.capacity {
                     return Err(Error::Resource(
@@ -175,7 +161,7 @@ where
             .ok_or(Error::Resource("device-product byte capacity is exhausted"))
     }
 
-    pub(crate) fn require_buffer(&self, buffer: &B) -> Result<()> {
+    pub(crate) fn require_buffer(&self, buffer: &ProductBuffer) -> Result<()> {
         let value = lock(buffer);
         if value.backing.is_none()
             || !self
@@ -190,7 +176,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn require_reference(&self, id: BufferId) -> Result<&B> {
+    pub(crate) fn require_reference(&self, id: BufferId) -> Result<&ProductBuffer> {
         let buffer = self.buffers.get(&buffer_key(id))
             .filter(|buffer| lock(buffer).state == WriteState::Committed)
             .ok_or_else(|| Error::Invalid(format!(
@@ -205,7 +191,7 @@ where
         Ok(buffer)
     }
 
-    pub(crate) fn commit_writes(&mut self, writes: &[B]) -> Result<()> {
+    pub(crate) fn commit_writes(&mut self, writes: &[ProductBuffer]) -> Result<()> {
         self.validate_writes(writes)?;
         let mut seen = HashSet::new();
         for write in writes {
@@ -234,7 +220,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn validate_writes(&self, writes: &[B]) -> Result<()> {
+    pub(crate) fn validate_writes(&self, writes: &[ProductBuffer]) -> Result<()> {
         for write in writes {
             self.require_buffer(write)?;
             lock(write).require_candidate()?;
@@ -242,7 +228,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn abandon_writes(&self, writes: &[B]) {
+    pub(crate) fn abandon_writes(&self, writes: &[ProductBuffer]) {
         for write in writes {
             if self.require_buffer(write).is_ok() {
                 lock(write).released = true;
@@ -320,11 +306,7 @@ where
 
     /// Return retired owners and their backing only after the full query pass.
     /// The caller releases pool bindings and event references after this call.
-    pub(crate) fn reclaim<TE, TC, CE, CC>(&mut self) -> Result<Vec<(B, Backing)>>
-    where
-        T: Deref<Target = Completion<TE, TC>>,
-        C: Deref<Target = Completion<CE, CC>>,
-    {
+    pub(crate) fn reclaim(&mut self) -> Result<Vec<(ProductBuffer, Backing)>> {
         let mut queried = HashMap::new();
         let mut ready = Vec::new();
         for (&key, buffer) in &self.buffers {
@@ -345,7 +327,7 @@ where
         Ok(retired)
     }
 
-    pub(crate) fn release_backing(&mut self, buffer: &B) -> Result<Backing> {
+    pub(crate) fn release_backing(&mut self, buffer: &ProductBuffer) -> Result<Backing> {
         let backing = lock(buffer)
             .backing
             .take()
@@ -355,24 +337,28 @@ where
                 .lanes
                 .get_mut(lane_key)
                 .ok_or_else(|| Error::Invariant("request-relay lane lost its owner".into()))?;
-            lane.fields.remove(&(dtype.clone(), *field));
+            lane.fields.remove(&(*dtype, *field));
             if lane.fields.is_empty() {
                 self.call_lanes
-                    .remove(&(lane_key.0.clone(), lane_key.1, lane.call.0, lane.call.1));
+                    .remove(&(lane_key.0, lane_key.1, lane.call.0, lane.call.1));
                 self.lanes.remove(lane_key);
             }
         }
         Ok(backing)
     }
 
-    pub(crate) fn relay_lane(&self, id: BufferId, device: &str, slot: usize) -> Result<usize> {
-        let call = (device.to_owned(), slot, id.owner, id.producer_call_id);
+    pub(crate) fn relay_lane(
+        &self,
+        id: BufferId,
+        device: MemoryKind,
+        slot: usize,
+    ) -> Result<usize> {
+        let call = (device, slot, id.owner, id.producer_call_id);
         self.call_lanes
             .get(&call)
             .copied()
             .or_else(|| {
-                (0..self.relay_depth)
-                    .find(|&lane| !self.lanes.contains_key(&(device.to_owned(), slot, lane)))
+                (0..self.relay_depth).find(|&lane| !self.lanes.contains_key(&(device, slot, lane)))
             })
             .ok_or(Error::Resource(
                 "request-relay unresolved window is exhausted",
@@ -381,22 +367,17 @@ where
 
     pub(crate) fn bind_relay(&mut self, id: BufferId, relay: &RelayKey) -> Result<()> {
         let (lane_key, dtype, field) = relay;
-        let lane = self.lanes.entry(lane_key.clone()).or_insert_with(|| Lane {
+        let lane = self.lanes.entry(*lane_key).or_insert_with(|| Lane {
             call: (id.owner, id.producer_call_id),
             fields: HashSet::new(),
         });
-        if !lane.fields.insert((dtype.clone(), *field)) {
+        if !lane.fields.insert((*dtype, *field)) {
             return Err(Error::Invariant(
                 "request-relay lane was assigned more than once".into(),
             ));
         }
         self.call_lanes.insert(
-            (
-                lane_key.0.clone(),
-                lane_key.1,
-                id.owner,
-                id.producer_call_id,
-            ),
+            (lane_key.0, lane_key.1, id.owner, id.producer_call_id),
             lane_key.2,
         );
         Ok(())
@@ -428,10 +409,10 @@ impl ProductStore {
         capacity: usize,
         byte_capacity: usize,
         max_feature_bytes: usize,
-        devices: Vec<Device>,
+        devices: Vec<MemoryKind>,
         request_capacity: usize,
         relay_depth: usize,
-        buffer_pool: BufferPool<Arc<Memory>>,
+        buffer_pool: BufferPool,
         events: Arc<EventPool>,
     ) -> Result<Self> {
         if max_feature_bytes == 0 || byte_capacity == 0 {
@@ -455,26 +436,6 @@ impl ProductStore {
                 relay_depth,
             )),
         })
-    }
-
-    pub fn max_feature_bytes(&self) -> usize {
-        self.max_feature_bytes
-    }
-
-    pub fn capacity(&self) -> usize {
-        lock(&self.state).capacity
-    }
-
-    pub fn byte_capacity(&self) -> usize {
-        lock(&self.state).byte_capacity
-    }
-
-    pub fn request_capacity(&self) -> usize {
-        lock(&self.state).request_capacity
-    }
-
-    pub fn relay_depth(&self) -> usize {
-        lock(&self.state).relay_depth
     }
 
     /// Return retired buffers' pool ranges and event references.
@@ -509,17 +470,17 @@ impl ProductStore {
     /// times (one reference per buffer it fences). Host values need none.
     fn producer_fence(
         &self,
-        device: Device,
+        device: MemoryKind,
         stream: impl Issue,
         count: usize,
     ) -> Result<Option<Fence>> {
-        let Device::Cuda(index) = device else {
+        let MemoryKind::Cuda(index) = device else {
             return Ok(None);
         };
         let producer = stream.stream().ok_or_else(|| {
             Error::Invalid("a device product write requires its producer stream".into())
         })?;
-        if producer.device().0 != index {
+        if producer.device() != index {
             return Err(Error::Invalid(
                 "a producer stream is on another device than its product".into(),
             ));
@@ -536,7 +497,7 @@ impl ProductStore {
 
     /// Order `stream` after the buffer's producer, once per fence.
     fn wait_producer(
-        buffer: &Buffer<ReadRef, Arc<Retirement>>,
+        buffer: &Buffer,
         stream: impl Issue,
         waited: &mut HashSet<usize>,
     ) -> Result<()> {
@@ -589,7 +550,7 @@ impl ProductStore {
     }
 
     /// The metadata of the committed product `reference` names.
-    pub fn metadata(&self, reference: &TensorRef) -> Result<Option<Metadata>> {
+    pub(crate) fn metadata(&self, reference: &TensorRef) -> Result<Option<Metadata>> {
         let state = lock(&self.state);
         Ok(Self::require_reference(&state, reference)?.metadata())
     }
@@ -612,7 +573,11 @@ impl ProductStore {
     /// Revoke the exports of released buffers and release the buffers.
     /// What follows a buffer's outstanding fences is deferred through
     /// `stream`.
-    pub fn release_buffers(&self, buffers: &HashSet<BufferId>, stream: impl Issue) -> Result<()> {
+    pub(crate) fn release_buffers(
+        &self,
+        buffers: &HashSet<BufferId>,
+        stream: impl Issue,
+    ) -> Result<()> {
         let revoked: Vec<_> = {
             let mut exports = lock(&self.exports);
             buffers
@@ -708,22 +673,9 @@ impl ProductStore {
             .any(|buffer| selected(&lock(buffer).id)))
     }
 
-    /// Bytes of relay arenas allocated on `device`.
-    pub fn resident_bytes(&self, device: Device) -> usize {
-        let name = device_name(device);
-        let state = lock(&self.state);
-        let mut allocations = HashMap::new();
-        for ((owner, _, _), arena) in &state.arenas {
-            if *owner == name {
-                allocations.insert(arena.memory().address(), arena.memory().len());
-            }
-        }
-        allocations.values().sum()
-    }
-
     /// Forget every product after physical accesses drained. Existing reads
     /// retain their views.
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         lock(&self.exports).clear();
         let retired = lock(&self.state).close();
         drop(retired);

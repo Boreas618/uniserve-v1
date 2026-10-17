@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream, memset_d32};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::memory::{Memory, StorageView};
@@ -78,7 +78,7 @@ impl DecodeState {
         vocab: usize,
         logits: DType,
         verified_lengths: StorageView,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         let rows = request_slots + 1;

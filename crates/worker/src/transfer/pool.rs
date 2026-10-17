@@ -2,117 +2,55 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::{Error, HostAction, HostLane, HostTask, Outcome, Result};
-
-use super::{ReadReservation, TransferCapacity, TransferTicket};
-
-/// Read execution and completion observers of one read.
-/// `read` returns after physical access ends. If completion cannot be established,
-/// it marks its ticket undrained and returns an error.
-/// Ticket access is serialized without invoking numerical code or observers.
-pub trait ReadBackend: Send + Sync + 'static {
-    type Value: Send + Sync;
-    type Error: Send + Sync;
-    type Callback: Send + Sync;
-
-    fn with_ticket<T>(
-        &self,
-        action: impl FnOnce(&mut TransferTicket<Self::Value, Self::Error, Self::Callback>) -> T,
-    ) -> T;
-
-    fn read(&self) -> std::result::Result<(), Self::Error>;
-
-    /// Release local source ownership after the read's physical accesses end.
-    /// This also runs for a queued read cancelled before numerical execution.
-    fn release(&self) -> std::result::Result<(), Self::Error>;
-
-    fn notify(callbacks: Vec<Self::Callback>);
-    fn wake(callback: &Self::Callback);
-    fn error(error: Error) -> Self::Error;
-    fn report(error: Self::Error);
-}
+use super::read::NativeRead;
+use super::{Notify, ReadReservation, TransferCapacity, notify};
+use crate::host::{HostAction, HostLane, HostTask};
+use crate::{Error, Outcome, Result};
 
 /// A read action submitted through the common native host executor.
-pub struct TransferRead<B: ReadBackend> {
-    backend: Arc<B>,
+pub(crate) struct TransferRead {
+    backend: Arc<NativeRead>,
 }
 
-impl<B: ReadBackend> HostAction for TransferRead<B> {
+impl HostAction for TransferRead {
     type Output = ();
-    type Error = B::Error;
-    type Callback = Box<dyn FnOnce() + Send>;
-    type Wake = ();
 
-    fn ready(&self) -> std::result::Result<bool, Self::Error> {
-        Ok(true)
-    }
-
-    fn run(&self) -> std::result::Result<(), Self::Error> {
+    fn run(&self) -> Result<()> {
         if self.backend.with_ticket(|ticket| ticket.is_cancelled()) {
-            return Err(B::error(Error::Resource("transfer read was cancelled")));
+            return Err(Error::Resource("transfer read was cancelled"));
         }
 
         let _range = crate::profiling::range(c"uniserve.transfer", None);
         self.backend.read()
     }
 
-    fn release(&self) -> std::result::Result<(), Self::Error> {
+    fn release(&self) -> Result<()> {
         Ok(())
     }
 
-    fn input_outcome(&self) -> Option<Outcome<Self::Error>> {
-        // Backend reads own their input accesses through read completion.
-        Some(Outcome::Success(()))
-    }
-
-    fn defer_release(_: Arc<HostTask<Self>>) -> std::result::Result<(), Self::Error> {
-        Err(B::error(Error::Invariant(
-            "transfer inputs retire with their read task".into(),
-        )))
-    }
-
-    fn notify(callbacks: Vec<Self::Callback>) {
-        for callback in callbacks {
-            callback();
-        }
-    }
-
-    fn wake(_: &()) {}
-
-    fn report(error: Self::Error) {
-        B::report(error);
-    }
-
-    fn error(error: Error) -> Self::Error {
-        B::error(error)
-    }
-
-    fn note_cleanup(_: &mut Self::Error, cleanup: Self::Error) {
-        B::report(cleanup);
+    fn input_outcome(&self) -> Outcome {
+        // Reads own their input accesses through read completion.
+        Outcome::Success(())
     }
 }
 
-struct PoolState<B: ReadBackend> {
-    error: Option<Arc<B::Error>>,
-    unretired: Vec<Arc<B>>,
-    wake: Option<Arc<B::Callback>>,
+struct PoolState {
+    error: Option<Arc<Error>>,
+    unretired: Vec<Arc<NativeRead>>,
+    wake: Option<Notify>,
 }
 
 /// Execute reads within the rank's shared byte and read budgets. Cancellation
 /// withdraws queued tasks; running reads retain credits until physical access
 /// ends. Late failures poison admission and unknown completion retains backing.
-pub struct TransferPool<B: ReadBackend> {
-    capacity: Arc<TransferCapacity<B::Callback>>,
-    lane: HostLane<TransferRead<B>>,
-    state: Mutex<PoolState<B>>,
+pub(crate) struct TransferPool {
+    capacity: Arc<TransferCapacity>,
+    lane: HostLane<TransferRead>,
+    state: Mutex<PoolState>,
 }
 
-impl<B: ReadBackend> TransferPool<B> {
-    pub fn new(
-        capacity: Arc<TransferCapacity<B::Callback>>,
-        workers: usize,
-        name: &str,
-    ) -> Result<Self> {
+impl TransferPool {
+    pub(crate) fn new(capacity: Arc<TransferCapacity>, workers: usize, name: &str) -> Result<Self> {
         let limit = capacity.ticket_capacity();
         Ok(Self {
             capacity,
@@ -125,28 +63,28 @@ impl<B: ReadBackend> TransferPool<B> {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, PoolState<B>> {
+    fn state(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn set_completion_wake(&self, wake: Option<B::Callback>) {
-        let previous = std::mem::replace(&mut self.state().wake, wake.map(Arc::new));
+    pub(crate) fn set_completion_wake(&self, wake: Option<Notify>) {
+        let previous = std::mem::replace(&mut self.state().wake, wake);
         drop(previous);
     }
 
-    pub fn completion_wake(&self) -> Option<Arc<B::Callback>> {
+    pub(crate) fn completion_wake(&self) -> Option<Notify> {
         self.state().wake.clone()
     }
 
     /// Reserve the read's credits and host task before numerical preparation.
     /// The caller then records destination handoff and submits the task, or
     /// abandons it after preparation fails. Cancellation returns unused credits.
-    pub fn reserve(
+    pub(crate) fn reserve(
         self: &Arc<Self>,
-        backend: B,
+        backend: NativeRead,
         nbytes: u64,
-        reservation: Option<&ReadReservation<B::Callback>>,
-    ) -> Result<Arc<HostTask<TransferRead<B>>>> {
+        reservation: Option<&ReadReservation>,
+    ) -> Result<Arc<HostTask<TransferRead>>> {
         if self.error().is_some() {
             return Err(Error::Resource("transfer pool has failed"));
         }
@@ -169,7 +107,7 @@ impl<B: ReadBackend> TransferPool<B> {
             backend: Arc::clone(&backend),
         }) {
             if let Err(cleanup) = task.cancel(true) {
-                B::report(cleanup);
+                report(&cleanup);
             }
             self.return_capacity(nbytes)?;
             return Err(error);
@@ -196,18 +134,18 @@ impl<B: ReadBackend> TransferPool<B> {
     }
 
     fn finished(
-        state: &Mutex<PoolState<B>>,
-        capacity: &TransferCapacity<B::Callback>,
-        backend: Arc<B>,
+        state: &Mutex<PoolState>,
+        capacity: &TransferCapacity,
+        backend: Arc<NativeRead>,
         nbytes: u64,
-        task: &HostTask<TransferRead<B>>,
+        task: &HostTask<TransferRead>,
     ) {
         let mut error = match task.completion.outcome() {
             Some(Outcome::Success(_)) => None,
             Some(Outcome::Failed(error)) => Some(error),
-            Some(Outcome::Cancelled) => Some(Arc::new(B::error(Error::Resource(
+            Some(Outcome::Cancelled) => Some(Arc::new(Error::Resource(
                 "transfer read was cancelled before submission",
-            )))),
+            ))),
             None => return,
         };
         let undrained = backend.with_ticket(|ticket| ticket.undrained());
@@ -221,15 +159,14 @@ impl<B: ReadBackend> TransferPool<B> {
             if error.is_none() {
                 error = Some(Arc::new(cleanup));
             } else {
-                B::report(cleanup);
+                report(&cleanup);
             }
         }
 
         let (late, callbacks) = backend.with_ticket(|ticket| {
-            let (late, callbacks) = error.as_ref().map_or((false, Vec::new()), |error| {
+            error.as_ref().map_or((false, Vec::new()), |error| {
                 ticket.fail_shared(Arc::clone(error))
-            });
-            (late, callbacks)
+            })
         });
         let wake = {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -243,9 +180,9 @@ impl<B: ReadBackend> TransferPool<B> {
             }
             late.then(|| state.wake.clone()).flatten()
         };
-        B::notify(callbacks);
+        notify(callbacks);
         if let Some(wake) = wake {
-            B::wake(&wake);
+            wake();
         }
 
         if !retained {
@@ -254,19 +191,19 @@ impl<B: ReadBackend> TransferPool<B> {
                 .and_then(|()| capacity.return_reads(1))
                 .and_then(|()| backend.with_ticket(|ticket| ticket.retire()));
             match retired {
-                Ok(callbacks) => B::notify(callbacks),
-                Err(error) => B::report(B::error(error)),
+                Ok(callbacks) => notify(callbacks),
+                Err(error) => report(&error),
             }
         }
     }
 
-    pub fn error(&self) -> Option<Arc<B::Error>> {
+    pub(crate) fn error(&self) -> Option<Arc<Error>> {
         self.state().error.clone()
     }
 
     /// Join reads before destroying their streams. Failed physical retirement
     /// remains retained and its original error is returned to the caller.
-    pub fn close(&self) -> Option<Arc<B::Error>> {
+    pub(crate) fn close(&self) -> Option<Arc<Error>> {
         let mut errors = self.lane.close().into_iter();
         let first = errors.next().map(Arc::new);
         let error = {
@@ -277,13 +214,13 @@ impl<B: ReadBackend> TransferPool<B> {
             state.error.clone()
         };
         for cleanup in errors {
-            B::report(cleanup);
+            report(&cleanup);
         }
         error
     }
 }
 
-impl<B: ReadBackend> Drop for TransferPool<B> {
+impl Drop for TransferPool {
     #[expect(
         clippy::mem_forget,
         reason = "unknown device completion retains backing until process teardown"
@@ -294,4 +231,9 @@ impl<B: ReadBackend> Drop for TransferPool<B> {
             std::mem::forget(read);
         }
     }
+}
+
+/// Log a read cleanup failure that has no caller left to return it to.
+fn report(error: &Error) {
+    tracing::warn!(target: "uniserve_worker.transfer", "transfer read cleanup failed: {error}");
 }

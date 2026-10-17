@@ -9,7 +9,6 @@ use super::image::{ConditionRow, DenoiseRow};
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
-use crate::ffi::Handle;
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
@@ -59,7 +58,7 @@ pub(crate) struct DenoiserRunners {
     /// device its modules run on (a generation tower). Empty when flow
     /// graphs are off.
     flow: Vec<FlowShape>,
-    flow_pools: Vec<Arc<GraphPool<Handle>>>,
+    flow_pools: Vec<Arc<GraphPool>>,
     /// Resets newly assigned cache units on the image denoiser's stream.
     pub(crate) units: Option<UnitColumn>,
 }
@@ -70,7 +69,7 @@ impl DenoiserRunners {
     pub(crate) fn image(
         denoiser: Option<(String, DenoiserRunner)>,
         flow: Vec<FlowShape>,
-        flow_pools: Vec<Arc<GraphPool<Handle>>>,
+        flow_pools: Vec<Arc<GraphPool>>,
         units: Option<UnitColumn>,
     ) -> Self {
         Self {
@@ -210,7 +209,7 @@ impl DenoiserRunners {
     fn capture_step(
         &mut self,
         shape: &FlowShape,
-        pools: &[Arc<GraphPool<Handle>>],
+        pools: &[Arc<GraphPool>],
         latents: &LatentCache,
         prefix_cache: &mut PrefixCache,
         lanes: &JobQueues,

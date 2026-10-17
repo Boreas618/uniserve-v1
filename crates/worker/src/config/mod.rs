@@ -6,9 +6,10 @@
 
 mod device;
 mod launch;
-pub mod placement;
+pub(crate) mod placement;
 
-pub use device::{Device, generation_device};
+pub use device::Device;
+// The resolved launch configuration the launch tests read.
 pub use launch::{
     AttentionOptions, DataPlane, ExpertUnion, IpcConfig, LoadOptions, ModelSource,
     RendezvousConfig, WorkerLaunch, resolve,
@@ -25,7 +26,7 @@ use crate::{Error, Result};
 pub struct DescriptorError(String);
 
 impl DescriptorError {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -143,12 +144,12 @@ impl Default for WorkerConfig {
 }
 
 /// Default decode buckets: dense small batches followed by strides of eight.
-pub fn default_decode_sizes() -> Vec<usize> {
+pub(crate) fn default_decode_sizes() -> Vec<usize> {
     (1..=32).chain((40..=128).step_by(8)).collect()
 }
 
 /// Default prefill buckets keep 64-token spacing through 4096, then 512.
-pub fn default_prefill_sizes() -> Vec<usize> {
+pub(crate) fn default_prefill_sizes() -> Vec<usize> {
     (4..=32)
         .step_by(4)
         .chain((48..=256).step_by(16))
@@ -159,10 +160,10 @@ pub fn default_prefill_sizes() -> Vec<usize> {
 }
 
 /// A prefill bucket reserves at least one inert padding sequence.
-pub const PREFILL_ROW_BUCKETS: &[usize] = &[8, 16, 32];
+pub(crate) const PREFILL_ROW_BUCKETS: &[usize] = &[8, 16, 32];
 
 /// Additional cache pages that the widest default graph padding may occupy.
-pub fn graph_padding_block_count(block_size: usize) -> usize {
+pub(crate) fn graph_padding_block_count(block_size: usize) -> usize {
     let decode = default_decode_sizes().into_iter().max().unwrap_or(1) - 1;
     let prefill = default_prefill_sizes()
         .into_iter()
@@ -184,7 +185,7 @@ impl WorkerConfig {
     /// as many concurrent requests as the queue holds slots, at most
     /// `max_batch_calls`, and at least two. Request storage is then sized
     /// by those slots instead of the token pool.
-    pub fn for_media_slots(&self, queue_depth: usize) -> Result<Self> {
+    pub(crate) fn for_media_slots(&self, queue_depth: usize) -> Result<Self> {
         let slots = self.max_batch_calls.min(queue_depth / 3);
         if slots < 2 {
             return Err(Error::Unsupported(format!(
@@ -205,7 +206,7 @@ impl WorkerConfig {
     }
 
     /// Distinct execution devices whose resident storage belongs to this rank.
-    pub fn devices(&self) -> impl Iterator<Item = Device> {
+    pub(crate) fn devices(&self) -> impl Iterator<Item = Device> {
         std::iter::once(self.device).chain(
             self.generation_device
                 .filter(|device| *device != self.device),
@@ -213,7 +214,7 @@ impl WorkerConfig {
     }
 
     /// Check process placement and physical resource bounds before allocation.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let invalid = |message: &str| Error::Invalid(message.into());
         if !matches!(self.graph_policy.as_str(), "off" | "auto" | "full") {
             return Err(invalid("graph policy must be off, auto, or full"));

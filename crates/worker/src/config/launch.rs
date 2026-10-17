@@ -51,7 +51,7 @@ pub struct ExpertUnion {
 
 impl ExpertUnion {
     /// Experts run on dedicated ranks separate from attention.
-    pub fn disaggregated(&self) -> bool {
+    pub(crate) fn disaggregated(&self) -> bool {
         self.attention_ranks > 0
     }
 }

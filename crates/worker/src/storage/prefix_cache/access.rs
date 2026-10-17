@@ -8,68 +8,60 @@
 //! failed or unknown completions keep their storage retained.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, Range};
+use std::ops::Range;
+use std::sync::Arc;
 
 use uniserve_ipc::{BufferId, RequestKey};
 
-use crate::{Completion, Error, Result};
+use crate::transfer::Retirement;
+use crate::{Error, Result};
 
 type Ranges = HashMap<u32, Range<u64>>;
 
-struct Execution<C> {
-    completion: C,
+struct Execution {
+    completion: Arc<Retirement>,
     requests: HashSet<RequestKey>,
     ranges: Ranges,
 }
 
-struct Export<C> {
+struct Export {
     ranges: Ranges,
-    retirements: Vec<C>,
+    retirements: Vec<Arc<Retirement>>,
     released: bool,
 }
 
-struct Import<C> {
+struct Import {
     ranges: Ranges,
-    retirement: C,
+    retirement: Arc<Retirement>,
 }
 
-/// The physical accesses to the prefix cache's units. Handles must keep
-/// their completion at a stable address, as `Arc` does.
-pub struct UnitAccesses<C> {
-    executions: HashMap<usize, Execution<C>>,
+/// The physical accesses to the prefix cache's units, each held by its
+/// physical retirement signal.
+#[derive(Default)]
+pub(crate) struct UnitAccesses {
+    executions: HashMap<usize, Execution>,
     units: HashMap<u32, HashSet<usize>>,
-    exports: HashMap<BufferId, Export<C>>,
-    imports: HashMap<BufferId, Import<C>>,
+    exports: HashMap<BufferId, Export>,
+    imports: HashMap<BufferId, Import>,
 }
 
-impl<C> Default for UnitAccesses<C> {
-    fn default() -> Self {
-        Self {
-            executions: HashMap::new(),
-            units: HashMap::new(),
-            exports: HashMap::new(),
-            imports: HashMap::new(),
-        }
-    }
-}
-
-impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
-    pub fn has_pending_accesses(&mut self) -> bool {
+impl UnitAccesses {
+    pub(crate) fn has_pending_accesses(&mut self) -> bool {
         self.reap();
         !self.executions.is_empty() || self.has_transfers()
     }
 
-    pub fn has_transfers(&self) -> bool {
+    pub(crate) fn has_transfers(&self) -> bool {
         !self.exports.is_empty() || !self.imports.is_empty()
     }
 
     /// Coalesce the ranges of calls sharing one batch completion. The caller
     /// reports an already finished completion's error before retaining it.
-    pub fn retain_execution(
+    pub(crate) fn retain_execution(
         &mut self,
         request: RequestKey,
         spans: &[(u32, u32, u32)],
-        completion: C,
+        completion: Arc<Retirement>,
     ) {
         if completion.succeeded() || spans.is_empty() {
             return;
@@ -97,7 +89,11 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         }
     }
 
-    pub fn reserve_export(&mut self, buffer: BufferId, spans: &[(u32, u32, u32)]) -> Result<()> {
+    pub(crate) fn reserve_export(
+        &mut self,
+        buffer: BufferId,
+        spans: &[(u32, u32, u32)],
+    ) -> Result<()> {
         self.reap();
         if spans.is_empty() || self.exports.contains_key(&buffer) {
             return Err(Error::Invalid(
@@ -116,7 +112,11 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         Ok(())
     }
 
-    pub fn retain_export(&mut self, buffer: BufferId, retirement: C) -> Result<()> {
+    pub(crate) fn retain_export(
+        &mut self,
+        buffer: BufferId,
+        retirement: Arc<Retirement>,
+    ) -> Result<()> {
         let export = self
             .exports
             .get_mut(&buffer)
@@ -126,7 +126,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         Ok(())
     }
 
-    pub fn release_exports(&mut self, buffers: &[BufferId]) {
+    pub(crate) fn release_exports(&mut self, buffers: &[BufferId]) {
         for buffer in buffers {
             if let Some(export) = self.exports.get_mut(buffer) {
                 export.released = true;
@@ -135,17 +135,17 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         self.reap();
     }
 
-    pub fn exported_buffers(&self) -> Vec<BufferId> {
+    pub(crate) fn exported_buffers(&self) -> Vec<BufferId> {
         self.exports.keys().copied().collect()
     }
 
     /// The import owner completes retirement after adoption or abandonment,
     /// once the copy stream and every transport reader have finished.
-    pub fn reserve_import(
+    pub(crate) fn reserve_import(
         &mut self,
         buffer: BufferId,
         spans: &[(u32, u32, u32)],
-        retirement: C,
+        retirement: Arc<Retirement>,
     ) -> Result<()> {
         self.require_reusable(spans)?;
         if self.imports.contains_key(&buffer) {
@@ -163,12 +163,10 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         Ok(())
     }
 
-    /// Roll back a reservation whose copy task was never submitted.
-    pub fn discard_import(&mut self, buffer: BufferId) {
-        self.imports.remove(&buffer);
-    }
-
-    pub fn write_dependencies(&mut self, spans: &[(u32, u32, u32)]) -> Vec<&C> {
+    pub(crate) fn write_dependencies(
+        &mut self,
+        spans: &[(u32, u32, u32)],
+    ) -> Vec<&Arc<Retirement>> {
         self.reap();
         let mut dependencies: Vec<_> = self
             .execution_keys(spans)
@@ -190,7 +188,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         dependencies
     }
 
-    pub fn require_writable(&mut self, spans: &[(u32, u32, u32)]) -> Result<()> {
+    pub(crate) fn require_writable(&mut self, spans: &[(u32, u32, u32)]) -> Result<()> {
         self.reap();
         if self
             .exports
@@ -213,7 +211,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         Ok(())
     }
 
-    pub fn require_reusable(&mut self, spans: &[(u32, u32, u32)]) -> Result<()> {
+    pub(crate) fn require_reusable(&mut self, spans: &[(u32, u32, u32)]) -> Result<()> {
         self.require_writable(spans)?;
         if !self.execution_keys(spans).is_empty() {
             return Err(Error::Resource(
@@ -223,38 +221,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
         Ok(())
     }
 
-    /// Borrow the selected owners' signals for backend error reporting.
-    /// Releasing a buffer does not retire other model accesses by its request.
-    pub fn retirement_completions(
-        &self,
-        buffers: &HashSet<BufferId>,
-        requests: &HashSet<RequestKey>,
-        retained: &HashSet<BufferId>,
-    ) -> Vec<&C> {
-        let selected = |buffer: &BufferId| {
-            buffers.contains(buffer)
-                || (requests.contains(&buffer.owner) && !retained.contains(buffer))
-        };
-        self.exports
-            .iter()
-            .filter(|(buffer, _)| selected(buffer))
-            .flat_map(|(_, export)| &export.retirements)
-            .chain(
-                self.imports
-                    .iter()
-                    .filter(|(buffer, _)| selected(buffer))
-                    .map(|(_, import)| &import.retirement),
-            )
-            .chain(
-                self.executions
-                    .values()
-                    .filter(|execution| !execution.requests.is_disjoint(requests))
-                    .map(|execution| &execution.completion),
-            )
-            .collect()
-    }
-
-    pub fn retirement_ready(
+    pub(crate) fn retirement_ready(
         &mut self,
         buffers: &HashSet<BufferId>,
         requests: &HashSet<RequestKey>,
@@ -272,7 +239,7 @@ impl<E, N, C: Deref<Target = Completion<E, N>>> UnitAccesses<C> {
                 .any(|execution| !execution.requests.is_disjoint(requests))
     }
 
-    pub fn require_retired(&mut self) -> Result<()> {
+    pub(crate) fn require_retired(&mut self) -> Result<()> {
         self.reap();
         if !self.executions.is_empty() {
             return Err(Error::Resource(
@@ -366,7 +333,7 @@ mod tests {
 
     use super::*;
 
-    type Fence = Arc<Completion<String, ()>>;
+    type Fence = Arc<Retirement>;
 
     fn buffer(request: u64) -> BufferId {
         BufferId {
@@ -418,16 +385,13 @@ mod tests {
         cache.release_exports(&[first]);
         left.complete(Ok(()))?;
         assert!(cache.require_reusable(&[(1, 0, 8)]).is_err());
-        right.complete(Err("reader completion unknown".into()))?;
+        right.complete(Err(Error::Transport("reader completion unknown".into())))?;
         assert!(cache.require_reusable(&[(1, 0, 8)]).is_err());
         assert!(cache.retirement_ready(
             &HashSet::new(),
             &HashSet::from([buffer(2).owner]),
             &HashSet::new()
         ));
-        let failures =
-            cache.retirement_completions(&HashSet::from([first]), &HashSet::new(), &HashSet::new());
-        assert!(failures.iter().any(|completion| matches!(completion.outcome(), Some(crate::Outcome::Failed(error)) if *error == "reader completion unknown")));
         assert!(cache.retirement_ready(
             &HashSet::new(),
             &HashSet::from([first.owner]),

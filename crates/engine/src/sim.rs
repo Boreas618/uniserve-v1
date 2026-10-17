@@ -1027,22 +1027,6 @@ impl SimEngine {
         self.results_on_wait = on;
     }
 
-    /// Configures EOS and expands the synthetic vocabulary for control tokens.
-    pub fn configure_control_tokens(&mut self, eos: u32, control_tokens: &[u32]) {
-        self.fake_eos = eos;
-        let max_token = control_tokens
-            .iter()
-            .copied()
-            .chain(std::iter::once(eos))
-            .max()
-            .unwrap_or(eos);
-        self.vocab = self.vocab.max(
-            usize::try_from(max_token)
-                .unwrap_or(usize::MAX)
-                .saturating_add(1),
-        );
-    }
-
     /// Replaces the simulator's cache groups.
     ///
     /// # Panics

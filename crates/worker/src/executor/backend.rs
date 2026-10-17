@@ -1,11 +1,12 @@
 //! The worker's execution backend: request state, lifecycle commands,
 //! batch validation, numerical dispatch and result delivery.
 //!
-//! [`WorkerBackend`] is the single [`Backend`] and [`ServiceBackend`] of a
-//! rank. It owns the request pool, the request storage owners (through
-//! [`RequestStorage`]) and the placed components with their bindings, and
-//! dispatches each batch's calls to the capability runtime that serves them
-//! ([`super::forward`]), whose forward it runs as jobs of the batch's lane.
+//! [`WorkerBackend`] does the work of each step the [`super::Executor`]
+//! orders and answers the rank service. It owns the request pool, the
+//! request storage owners (through [`RequestStorage`]) and the placed
+//! components with their bindings, and dispatches each batch's calls to the
+//! runner that serves them, whose forward it runs as jobs of the batch's
+//! lane.
 //! Lifecycle commands (Start, Finish, Free), batch admission, dependencies,
 //! retirement and result delivery are handled here for every batch, with or
 //! without calls.
@@ -22,7 +23,7 @@ use uniserve_ipc::{
 use super::batch::{self, Launched};
 use super::image::ImageParts;
 use super::lifecycle::{LaneJobs, RequestStorage, Retirement};
-use super::{Backend, BatchResult, Submission};
+use super::{BatchResult, Submission};
 use crate::config::placement::Components;
 use crate::error::WorkerError;
 use crate::host::HostLane;
@@ -41,13 +42,12 @@ use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
 use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
-use crate::service::ServiceBackend;
 use crate::storage::LatentCache;
 use crate::worker::RankStorage;
 use crate::{Error, OutputPool, Result};
 
 /// The backend of one rank.
-pub struct WorkerBackend {
+pub(crate) struct WorkerBackend {
     info: WorkerInfo,
     rank: usize,
     requests: RequestPool,
@@ -180,7 +180,7 @@ fn owners<'a>(
 }
 
 /// A submitted batch with its lifecycle and numerical state.
-pub struct WorkerBatch {
+pub(crate) struct WorkerBatch {
     plan: Arc<BatchPlan>,
     /// The accepted state call each call follows, by call.
     predecessors: Vec<Option<CallId>>,
@@ -218,7 +218,16 @@ pub struct WorkerBatch {
 }
 
 impl WorkerBatch {
-    pub fn new(plan: Arc<BatchPlan>) -> Self {
+    /// Attribute a failure to the batch's calls and its route.
+    pub(crate) fn attribute(&self, error: WorkerError) -> WorkerError {
+        let error = error.with_calls(self.identities());
+        match self.route() {
+            Some(kind) => error.with_route(kind.as_str()),
+            None => error,
+        }
+    }
+
+    pub(crate) fn new(plan: Arc<BatchPlan>) -> Self {
         let retirement = Retirement::new(&plan);
         Self {
             plan,
@@ -241,20 +250,16 @@ impl WorkerBatch {
         }
     }
 
-    pub fn plan(&self) -> &BatchPlan {
-        &self.plan
-    }
-
     pub(crate) fn shared_plan(&self) -> &Arc<BatchPlan> {
         &self.plan
     }
 
     /// The batch's call kind; `None` for a lifecycle-only batch.
-    pub fn route(&self) -> Option<CallKind> {
+    pub(crate) fn route(&self) -> Option<CallKind> {
         self.plan.calls.first().map(|call| call.code)
     }
 
-    pub fn predecessors(&self) -> &[Option<CallId>] {
+    pub(crate) fn predecessors(&self) -> &[Option<CallId>] {
         &self.predecessors
     }
 
@@ -315,11 +320,11 @@ impl WorkerBatch {
 
     /// Set the batch's result; capability runtimes call this once their
     /// outputs are materialized.
-    pub fn complete(&mut self, result: BatchResult) {
+    pub(crate) fn complete(&mut self, result: BatchResult) {
         self.output = Some(result);
     }
 
-    /// Hand launched work to materialization by [`Backend::poll`].
+    /// Hand launched work to materialization by [`WorkerBackend::poll`].
     pub(crate) fn launch(&mut self, running: Launched) {
         self.running = Some(running);
     }
@@ -367,7 +372,7 @@ impl WorkerBatch {
 }
 
 impl WorkerBackend {
-    pub fn new(info: WorkerInfo, rank: usize, components: Components) -> Result<Self> {
+    pub(crate) fn new(info: WorkerInfo, rank: usize, components: Components) -> Result<Self> {
         let lifecycle = LaneJobs::new(&info.supported_calls);
         Ok(Self {
             requests: RequestPool::new(info.request_slots as usize)?,
@@ -406,7 +411,7 @@ impl WorkerBackend {
     /// lane of its kind, without waiting for them: a lane performs them in
     /// the order of its jobs, so a forward submitted later finds their work
     /// done. Nothing goes on from their completions, which are taken with
-    /// the next one that arrives ([`Backend::completed`]); a failed one
+    /// the next one that arrives ([`WorkerBackend::completed`]); a failed one
     /// stops the rank there.
     fn perform_lifecycle(&mut self) -> Result<()> {
         for (kind, job) in self.lifecycle.take() {
@@ -423,7 +428,7 @@ impl WorkerBackend {
     /// The deferred work the job carries waits for events the job records.
     /// The job whose completion says they completed is started right
     /// behind it, on the same lane, and the event pool runs the work when
-    /// that completion arrives ([`Backend::completed`]). Started earlier,
+    /// that completion arrives ([`WorkerBackend::completed`]). Started earlier,
     /// that job would reach the lane before the records and pass at once.
     fn start(&self, kind: Option<CallKind>, job: Job, wake: bool) -> Result<JobId> {
         let deferrals = job.deferrals();
@@ -475,7 +480,7 @@ impl WorkerBackend {
     }
 
     /// Use the job queues of the rank's lanes for forward submission.
-    pub fn set_job_queues(&mut self, jobs: JobQueues) {
+    pub(crate) fn set_job_queues(&mut self, jobs: JobQueues) {
         // Lifecycle work that belongs to no lane's stream (deferred work
         // behind an event) is recorded for the first kind: one a lane
         // serves, where the rank has lanes, since only a lane waits for an
@@ -501,37 +506,33 @@ impl WorkerBackend {
         }
     }
 
-    pub fn info(&self) -> &WorkerInfo {
+    pub(crate) fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
-    pub fn requests(&self) -> &RequestPool {
+    pub(crate) fn requests(&self) -> &RequestPool {
         &self.requests
     }
 
-    pub fn requests_mut(&mut self) -> &mut RequestPool {
+    pub(crate) fn requests_mut(&mut self) -> &mut RequestPool {
         &mut self.requests
     }
 
-    pub fn components(&self) -> &Components {
+    pub(crate) fn components(&self) -> &Components {
         &self.components
     }
 
-    pub fn components_mut(&mut self) -> &mut Components {
-        &mut self.components
-    }
-
     /// Install the rank's storage owners.
-    pub fn set_rank_storage(&mut self, storage: RankStorage) {
+    pub(crate) fn set_rank_storage(&mut self, storage: RankStorage) {
         self.rank_storage = Some(storage);
         self.serve_events();
     }
 
-    pub fn rank_storage(&self) -> Option<&RankStorage> {
+    pub(crate) fn rank_storage(&self) -> Option<&RankStorage> {
         self.rank_storage.as_ref()
     }
 
-    pub fn rank_storage_mut(&mut self) -> Option<&mut RankStorage> {
+    pub(crate) fn rank_storage_mut(&mut self) -> Option<&mut RankStorage> {
         self.rank_storage.as_mut()
     }
 
@@ -702,9 +703,9 @@ impl WorkerBackend {
     pub(crate) fn transfer_stream(
         &self,
         kind: CallKind,
-        device: crate::ffi::Device,
+        device: crate::ffi::MemoryKind,
     ) -> Result<Option<uniserve_cuda::Stream>> {
-        if !matches!(device, crate::ffi::Device::Cuda(_)) {
+        if !matches!(device, crate::ffi::MemoryKind::Cuda(_)) {
             return Ok(None);
         }
         self.transfer
@@ -713,12 +714,6 @@ impl WorkerBackend {
                 Error::Unsupported("device transfers require the transfer runtime".into())
             })?
             .stream(kind, device)
-    }
-
-    /// Register another runtime's storage owner taking part in request
-    /// lifecycles.
-    pub fn add_storage(&mut self, storage: Box<dyn RequestStorage>) {
-        self.storage.push(storage);
     }
 
     /// Disjoint borrows for executing one batch.
@@ -749,22 +744,18 @@ impl WorkerBackend {
         }
     }
 
-    pub fn set_profiler(&mut self, profiler: Option<Profiler>) {
+    pub(crate) fn set_profiler(&mut self, profiler: Option<Profiler>) {
         self.profiler = profiler;
     }
 
-    pub fn profiler_mut(&mut self) -> Option<&mut Profiler> {
-        self.profiler.as_mut()
-    }
-
     /// Report kernel selections that change while serving.
-    pub fn watch_kernels(&mut self, watch: KernelWatch) {
+    pub(crate) fn watch_kernels(&mut self, watch: KernelWatch) {
         self.kernels = Some(watch);
     }
 
     /// Whether the rank serves a video model: its calls run as media
     /// batches on the rank's video runners.
-    pub fn serves_video(&self) -> bool {
+    pub(crate) fn serves_video(&self) -> bool {
         self.video.is_some()
     }
 
@@ -941,19 +932,13 @@ impl WorkerBackend {
 
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
-    pub fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+    pub(crate) fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
         self.jobs.set_wake(wake.clone());
         if let Some(storage) = &self.rank_storage {
             storage.set_wake(wake.clone());
         }
-        if let Some(text) = &self.text {
-            text.set_wake(wake.clone());
-        }
         if let Some(host) = &self.image_host {
             host.set_wake(wake.clone());
-        }
-        if let Some(transfer) = &self.transfer {
-            transfer.set_wake(wake.clone());
         }
         if let Some(media) = &self.media {
             media.lane.set_wake(wake.clone());
@@ -964,10 +949,10 @@ impl WorkerBackend {
     }
 
     /// Close every storage owner, newest first (other runtimes, a video
-    /// model's owners, the transfer runtime, the diffusion LM runners, the
-    /// image and text owners, then rank storage), after
-    /// the executor drained; returns the first failure.
-    pub fn close_storage(&mut self, aborted: bool) -> Result<()> {
+    /// model's owners, the transfer runtime, then rank storage), after the
+    /// executor drained and [`Self::close_runtimes`] closed the diffusion
+    /// LM, image and text runtimes; returns the first failure.
+    pub(crate) fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
         while let Some(mut owner) = self.storage.pop() {
             result = result.and(owner.close(aborted));
@@ -992,13 +977,6 @@ impl WorkerBackend {
         if let Some(mut transfer) = self.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        for mut runner in std::mem::take(&mut self.diffusion_lm) {
-            result = result.and(runner.close(aborted));
-        }
-        result = result.and(self.close_image(aborted));
-        if let Some(mut text) = self.text.take() {
-            result = result.and(text.close(aborted));
-        }
         if let Some(mut storage) = self.rank_storage.take() {
             result = result.and(storage.close(aborted));
         }
@@ -1008,7 +986,7 @@ impl WorkerBackend {
     /// Close the diffusion LM, image and text runtimes (graphs, then steps)
     /// before the bindings they run close; attempts every one before
     /// returning the first failure.
-    pub fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
         let mut diffusion_lm = Ok(());
         for mut runner in std::mem::take(&mut self.diffusion_lm) {
             diffusion_lm = diffusion_lm.and(runner.close(aborted));
@@ -1077,7 +1055,7 @@ impl WorkerBackend {
     }
 
     /// Release request references after the executor drained its work.
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.requests.close();
         if let Some(profiler) = &mut self.profiler {
             profiler.close();
@@ -1116,30 +1094,13 @@ fn kernel_calls(
     listed
 }
 
-impl Backend for WorkerBackend {
-    type Batch = WorkerBatch;
-    type Output = BatchResult;
-    type Error = WorkerError;
-    type Job = JobId;
-    type Completion = Completion;
-
-    fn error(&self, error: Error) -> WorkerError {
-        WorkerError::classify(error, None)
-    }
-
-    fn classify(&self, error: WorkerError, batch: &WorkerBatch, _context: &str) -> WorkerError {
-        let error = error.with_calls(batch.identities());
-        match batch.route() {
-            Some(kind) => error.with_route(kind.as_str()),
-            None => error,
-        }
-    }
-
-    fn note_cleanup(&self, error: &mut WorkerError, cleanup: WorkerError) {
-        error.note(&cleanup);
-    }
-
-    fn admit(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+/// The batch work of the executor: what each step of a batch's life does
+/// on this rank ([`super::Executor`] orders the steps).
+impl WorkerBackend {
+    pub(crate) fn admit(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
         let mut owners = owners(
@@ -1160,7 +1121,10 @@ impl Backend for WorkerBackend {
         Ok(self.perform_lifecycle()?)
     }
 
-    fn prepare(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn prepare(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<(), WorkerError> {
         self.validate_kinds(batch)?;
         self.admit_requests(batch)?;
         self.validate(&batch.plan)?;
@@ -1173,7 +1137,7 @@ impl Backend for WorkerBackend {
         Ok(())
     }
 
-    fn admit_inputs(
+    pub(crate) fn admit_inputs(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
@@ -1223,7 +1187,7 @@ impl Backend for WorkerBackend {
         admitted.map(|()| submitted)
     }
 
-    fn inputs_admitted(
+    pub(crate) fn inputs_admitted(
         &mut self,
         batch: &mut WorkerBatch,
         completion: Completion,
@@ -1255,7 +1219,7 @@ impl Backend for WorkerBackend {
         }
     }
 
-    fn prepare_inputs(
+    pub(crate) fn prepare_inputs(
         &mut self,
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
@@ -1276,7 +1240,7 @@ impl Backend for WorkerBackend {
         Ok(true)
     }
 
-    fn await_inputs(
+    pub(crate) fn await_inputs(
         &mut self,
         batch: &mut WorkerBatch,
         submission: &Arc<Submission>,
@@ -1284,11 +1248,11 @@ impl Backend for WorkerBackend {
         Ok(super::inputs::subscribe(self, batch, submission)?)
     }
 
-    fn lane(&self, batch: &WorkerBatch) -> Option<usize> {
+    pub(crate) fn lane(&self, batch: &WorkerBatch) -> Option<usize> {
         batch.route().and_then(|kind| self.jobs.lane(kind))
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
@@ -1368,7 +1332,7 @@ impl Backend for WorkerBackend {
         }
     }
 
-    fn complete(
+    pub(crate) fn complete(
         &mut self,
         batch: &mut WorkerBatch,
         job: JobId,
@@ -1391,7 +1355,7 @@ impl Backend for WorkerBackend {
         completed
     }
 
-    fn await_outputs(
+    pub(crate) fn await_outputs(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
@@ -1400,14 +1364,13 @@ impl Backend for WorkerBackend {
         };
         // The fences are named by the lease, which holds them whatever the
         // event pool has released since they were recorded.
-        let fences: Vec<_> = batch::lock(&running.buffer)
+        let fences: Vec<_> = crate::lock(&running.buffer)
             .device_fences()
             .map(|(device, fence)| (device, Arc::clone(fence)))
             .collect();
         let Some(&(device, _)) = fences.first() else {
             return Ok(None);
         };
-        let device = uniserve_cuda::DeviceId(device);
         let fences = fences.into_iter().map(|(_, fence)| fence).collect();
 
         // The job holds no operation: its completion is posted once the
@@ -1420,7 +1383,7 @@ impl Backend for WorkerBackend {
             .map_err(lane_lost)
     }
 
-    fn outputs_ready(
+    pub(crate) fn outputs_ready(
         &mut self,
         batch: &mut WorkerBatch,
         completion: Completion,
@@ -1429,12 +1392,14 @@ impl Backend for WorkerBackend {
             .check()
             .map_err(|failure| lane_lost(failure.error))?;
         if let Some(running) = &batch.running {
-            batch::lock(&running.buffer).fences_completed();
+            crate::lock(&running.buffer).fences_completed();
         }
         Ok(())
     }
 
-    fn completed(&mut self) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
+    pub(crate) fn completed(
+        &mut self,
+    ) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
             if let Some(storage) = &self.rank_storage {
                 storage.events.performed(job);
@@ -1481,7 +1446,7 @@ impl Backend for WorkerBackend {
         Ok(None)
     }
 
-    fn begin_retirement(
+    pub(crate) fn begin_retirement(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
@@ -1505,7 +1470,10 @@ impl Backend for WorkerBackend {
         Ok(self.perform_lifecycle()?)
     }
 
-    fn poll(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(bool, bool), WorkerError> {
+    pub(crate) fn poll(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<(bool, bool), WorkerError> {
         let mut advanced = false;
         if batch.output.is_none()
             && let Some(running) = batch.running.as_mut()
@@ -1539,7 +1507,10 @@ impl Backend for WorkerBackend {
         Ok((advanced || retired, retired))
     }
 
-    fn result(&mut self, batch: &mut WorkerBatch) -> std::result::Result<BatchResult, WorkerError> {
+    pub(crate) fn result(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<BatchResult, WorkerError> {
         let result = batch
             .output
             .as_mut()
@@ -1550,7 +1521,10 @@ impl Backend for WorkerBackend {
         })
     }
 
-    fn close(&mut self, batch: &mut WorkerBatch) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn close_batch(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<(), WorkerError> {
         // Calls become pending only when a capability runtime commits them;
         // unresolved launched work cancels its pending calls. Lifecycle
         // commands hold no resource beyond their retirement.
@@ -1564,7 +1538,7 @@ impl Backend for WorkerBackend {
         abandoned.and(closed)
     }
 
-    fn reap(&mut self) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn reap(&mut self) -> std::result::Result<(), WorkerError> {
         for owner in owners(
             &mut self.rank_storage,
             &mut self.text,
@@ -1596,12 +1570,9 @@ impl WorkerBackend {
     }
 }
 
-impl ServiceBackend for WorkerBackend {
-    fn batch(&self, plan: Arc<BatchPlan>) -> std::result::Result<WorkerBatch, WorkerError> {
-        Ok(WorkerBatch::new(plan))
-    }
-
-    fn response_error(
+/// What the rank service asks of the backend beyond the executor's steps.
+impl WorkerBackend {
+    pub(crate) fn response_error(
         &self,
         kind: RequestKind,
         error: WorkerError,
@@ -1633,11 +1604,11 @@ impl ServiceBackend for WorkerBackend {
         Ok(error.response())
     }
 
-    fn has_open_requests(&self) -> std::result::Result<bool, WorkerError> {
+    pub(crate) fn has_open_requests(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self.requests.has_open_requests()?)
     }
 
-    fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
+    pub(crate) fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self
             .rank_storage
             .as_ref()
@@ -1648,7 +1619,7 @@ impl ServiceBackend for WorkerBackend {
                 .any(|owner| owner.awaiting_acknowledgment()))
     }
 
-    fn join_expert_step(
+    pub(crate) fn join_expert_step(
         &mut self,
         leaving: bool,
     ) -> std::result::Result<Option<(bool, bool)>, WorkerError> {

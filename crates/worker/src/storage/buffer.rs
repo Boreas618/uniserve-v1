@@ -5,52 +5,40 @@ use std::sync::Arc;
 
 use uniserve_ipc::{BufferAllocation, BufferId};
 
-use crate::ffi::Device;
-use crate::storage::memory::{Memory, device_name};
+use crate::ffi::MemoryKind;
+use crate::storage::memory::Memory;
 use crate::{Error, Result};
 
 /// One pool-issued physical range. Views retain their allocation; this
 /// handle identifies the occupied range until all accesses retire.
 pub struct BufferBinding {
     buffer: BufferId,
-    device: String,
+    device: MemoryKind,
     physical_offset: u64,
     physical_bytes: u64,
 }
 
 impl BufferBinding {
-    pub fn buffer(&self) -> BufferId {
-        self.buffer
-    }
-
-    pub fn device(&self) -> &str {
-        &self.device
-    }
-
     pub fn physical_offset(&self) -> u64 {
         self.physical_offset
     }
-
-    pub fn physical_bytes(&self) -> u64 {
-        self.physical_bytes
-    }
 }
 
-struct Arena<A> {
-    backing: A,
+struct Arena {
+    backing: Arc<Memory>,
     active: HashMap<BufferId, Arc<BufferBinding>>,
 }
 
 /// Bind nonoverlapping ranges of fixed per-device arenas.
 /// The owner serializes binding, view creation and release.
-pub struct BufferPool<A> {
+pub struct BufferPool {
     byte_capacity: u64,
     compact: bool,
-    arenas: HashMap<String, Arena<A>>,
+    arenas: HashMap<MemoryKind, Arena>,
 }
 
-impl<A> BufferPool<A> {
-    pub fn new(byte_capacity: u64, compact: bool, arenas: HashMap<String, A>) -> Self {
+impl BufferPool {
+    fn new(byte_capacity: u64, compact: bool, arenas: HashMap<MemoryKind, Arc<Memory>>) -> Self {
         Self {
             byte_capacity,
             compact,
@@ -69,24 +57,16 @@ impl<A> BufferPool<A> {
         }
     }
 
-    pub fn byte_capacity(&self) -> u64 {
-        self.byte_capacity
-    }
-
-    pub fn compact(&self) -> bool {
-        self.compact
-    }
-
     /// Reserve a scheduler allocation and borrow its arena for view creation.
     /// Compact pools use the first aligned physical gap; other pools retain
     /// the scheduler offset. Release this handle if view creation fails.
     pub fn bind(
         &mut self,
         allocation: BufferAllocation,
-        device: &str,
+        device: MemoryKind,
         required: u64,
         element_bytes: u64,
-    ) -> Result<(Arc<BufferBinding>, &A)> {
+    ) -> Result<(Arc<BufferBinding>, &Arc<Memory>)> {
         if required == 0 || element_bytes == 0 {
             return Err(Error::Invalid(
                 "buffer tensor has an invalid byte extent".into(),
@@ -109,7 +89,7 @@ impl<A> BufferPool<A> {
         } else {
             allocation.bytes
         };
-        let arena = self.arenas.get_mut(device).ok_or_else(|| {
+        let arena = self.arenas.get_mut(&device).ok_or_else(|| {
             Error::Invalid("buffer allocation names an undeclared worker device".into())
         })?;
         if arena.active.contains_key(&allocation.buffer) {
@@ -137,7 +117,7 @@ impl<A> BufferPool<A> {
 
         let binding = Arc::new(BufferBinding {
             buffer: allocation.buffer,
-            device: device.to_owned(),
+            device,
             physical_offset: start,
             physical_bytes: extent,
         });
@@ -164,27 +144,9 @@ impl<A> BufferPool<A> {
         arena.active.remove(&binding.buffer);
         Ok(())
     }
-
-    /// The arena of `device`, if the pool holds one there.
-    pub fn backing(&self, device: &str) -> Option<&A> {
-        self.arenas.get(device).map(|arena| &arena.backing)
-    }
-
-    pub fn backings(&self) -> impl Iterator<Item = &A> {
-        self.arenas.values().map(|arena| &arena.backing)
-    }
-
-    /// After physical accesses retire, return arena owners for destruction
-    /// outside the pool lock. Existing views retain their storage.
-    pub fn close(&mut self) -> Vec<A> {
-        self.arenas
-            .drain()
-            .map(|(_, arena)| arena.backing)
-            .collect()
-    }
 }
 
-fn compact_offset<A>(arena: &Arena<A>, extent: u64, capacity: u64) -> Result<u64> {
+fn compact_offset(arena: &Arena, extent: u64, capacity: u64) -> Result<u64> {
     let mut spans: Vec<_> = arena
         .active
         .values()
@@ -217,22 +179,22 @@ fn align(bytes: u64) -> Option<u64> {
     bytes.checked_add(255).map(|bytes| bytes / 256 * 256)
 }
 
-impl BufferPool<Arc<Memory>> {
-    /// Allocate one arena of `byte_capacity` bytes per device, keyed by its
-    /// locator name (`cuda:<index>` or `cpu`). Device arenas are exportable
+impl BufferPool {
+    /// Allocate one arena of `byte_capacity` bytes per memory in `devices`.
+    /// Device arenas are exportable
     /// allocations, so CUDA VMM exports of persistent products are made in
     /// place; host arenas serve CPU lanes. Contents are uninitialized.
-    pub fn allocate(byte_capacity: u64, compact: bool, devices: &[Device]) -> Result<Self> {
+    pub fn allocate(byte_capacity: u64, compact: bool, devices: &[MemoryKind]) -> Result<Self> {
         let bytes = usize::try_from(byte_capacity)
             .map_err(|_| Error::Invalid("buffer pool capacity overflows".into()))?;
         let arenas = devices
             .iter()
             .map(|&device| {
                 let arena = match device {
-                    Device::Cuda(index) => Memory::exportable(index, bytes, &[])?,
-                    Device::Cpu | Device::CudaHost => Memory::host(bytes),
+                    MemoryKind::Cuda(index) => Memory::exportable(index, bytes, &[])?,
+                    MemoryKind::Host | MemoryKind::PinnedHost => Memory::host(bytes),
                 };
-                Ok((device_name(device), arena))
+                Ok((device, arena))
             })
             .collect::<Result<_>>()?;
         Ok(Self::new(byte_capacity, compact, arenas))

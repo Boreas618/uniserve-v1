@@ -23,12 +23,12 @@ use uniserve_ipc::{
 
 use crate::executor::PendingOutput;
 use crate::executor::products::Publications;
-use crate::storage::latent::Pool;
-use crate::storage::memory::{dtype_name, parse_dtype};
+use crate::ffi::DType;
+use crate::storage::LatentPool;
 use crate::storage::{LatentExport, LatentImport, LatentStorage};
 use crate::stream::Issue;
 use crate::transfer::exports;
-use crate::transfer::{Read, ReadRef, Retirement, Transports, fetch};
+use crate::transfer::{Read, ReadRef, Transports, fetch};
 use crate::{Error, Result};
 
 /// The `u32` pages of a scheduler page table.
@@ -43,7 +43,7 @@ fn shape(storage: &LatentStorage, params: &LatentParams) -> [u64; 2] {
 
 /// A latent version's export while the work it issued is outstanding.
 pub(crate) struct PendingExport {
-    source: Arc<LatentExport<Arc<Retirement>>>,
+    source: Arc<LatentExport>,
     exports: exports::Exports,
     export: TensorExport,
 }
@@ -73,7 +73,7 @@ impl PendingExport {
     reason = "one latent export's complete inputs"
 )]
 pub(crate) fn issue_export(
-    pool: &mut Pool,
+    pool: &mut LatentPool,
     storage: &LatentStorage,
     transports: &Transports,
     call: &Call,
@@ -85,8 +85,7 @@ pub(crate) fn issue_export(
     stream: impl Issue,
 ) -> Result<PendingExport> {
     let shape = shape(storage, params);
-    if !product.shape_bound.contains_shape(&shape)
-        || parse_dtype(product.dtype.storage_name())? != storage.dtype()
+    if !product.shape_bound.contains_shape(&shape) || DType::from(product.dtype) != storage.dtype()
     {
         return Err(Error::Invalid(
             "latent export disagrees with its declared representation".into(),
@@ -156,7 +155,7 @@ pub(crate) fn issue_export(
 /// call's completion products. Returns the exported version's buffer. On
 /// failure the version is released from the pool.
 pub(crate) fn locate_export(
-    pool: &Pool,
+    pool: &LatentPool,
     export: PendingExport,
     publications: &mut Publications,
     output: &mut PendingOutput,
@@ -186,7 +185,7 @@ pub(crate) fn locate_export(
 
 /// A latent version being read into a consuming request's slot.
 pub(crate) struct LatentInput {
-    write: Arc<LatentImport<ReadRef>>,
+    write: Arc<LatentImport>,
     reads: Vec<Arc<Read>>,
     step: u32,
     height: u32,
@@ -211,7 +210,7 @@ impl LatentInput {
 /// starts no read and leaves the slot free, so the same import can be
 /// admitted again once credits return.
 pub(crate) fn import(
-    pool: &mut Pool,
+    pool: &mut LatentPool,
     storage: &LatentStorage,
     transports: &Transports,
     export: &TensorExport,
@@ -247,7 +246,7 @@ pub(crate) fn import(
         .locations
         .first()
         .map(|location| location.dtype.as_str());
-    if tensor.shape != shape(storage, params) || dtype != Some(dtype_name(storage.dtype())) {
+    if tensor.shape != shape(storage, params) || dtype != Some(storage.dtype().name()) {
         return Err(Error::Invalid(
             "latent transfer does not match the destination pool layout".into(),
         ));
@@ -292,7 +291,7 @@ pub(crate) fn import(
 
 /// Make an imported version the consuming slot's committed trajectory:
 /// order `stream` after every read's copy, then adopt it.
-pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: impl Issue) -> Result<()> {
+pub(crate) fn adopt(pool: &mut LatentPool, input: &LatentInput, stream: impl Issue) -> Result<()> {
     let generation = i64::from(input.write.buffer.generation);
     let (step, height, width) = (
         i64::from(input.step),
@@ -309,7 +308,7 @@ pub(crate) fn adopt(pool: &mut Pool, input: &LatentInput, stream: impl Issue) ->
 
 /// Give up an import its batch did not adopt: cancel its reads; its pages
 /// return once they retire.
-pub(crate) fn abandon(pool: &Pool, input: &LatentInput) -> Result<()> {
+pub(crate) fn abandon(pool: &LatentPool, input: &LatentInput) -> Result<()> {
     let mut result = Ok(());
     for read in pool.abandon_import(&input.write)? {
         result = result.and(read.read().cancel());
@@ -331,11 +330,12 @@ mod tests {
     };
 
     use super::*;
+    use crate::EventPool;
+    use crate::executor::PendingOutput;
     use crate::ffi::DType;
     use crate::request::RequestProgress;
     use crate::storage::LatentUpdate;
-    use crate::transfer::{Capacity, TransportKind, TransportOptions, notify};
-    use crate::{EventPool, PendingOutput};
+    use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     const SLOT: usize = 1;
     /// Values per latent unit.
@@ -346,7 +346,7 @@ mod tests {
     }
 
     /// A pool of two slots and three usable two-unit pages on host memory.
-    fn pool() -> Result<(Pool, LatentStorage)> {
+    fn pool() -> Result<(LatentPool, LatentStorage)> {
         Ok((
             crate::storage::LatentPool::new(2, 4, 2)?,
             LatentStorage::allocate(2, 4, 2, WIDTH, DType::F32, false, None, None)?,
@@ -369,7 +369,7 @@ mod tests {
         };
         Transports::new(
             &[TransportKind::Local],
-            Arc::new(Capacity::new(1 << 20, 8, notify)?),
+            Arc::new(TransferCapacity::new(1 << 20, 8)?),
             EventPool::new(),
             &options,
         )
@@ -415,7 +415,7 @@ mod tests {
 
     /// Commit a first version (generation 1, step 0) of `SLOT`'s trajectory
     /// on `pages` holding `0..9`; returns its bank.
-    fn commit(pool: &mut Pool, storage: &LatentStorage, pages: &[u32]) -> Result<u8> {
+    fn commit(pool: &mut LatentPool, storage: &LatentStorage, pages: &[u32]) -> Result<u8> {
         let update = LatentUpdate {
             request_pool_idx: SLOT as i64,
             params: params(pages, 0),
@@ -453,7 +453,7 @@ mod tests {
     /// The export of `SLOT`'s committed version as tensor transfer output
     /// `latent(2)`.
     fn publish(
-        pool: &mut Pool,
+        pool: &mut LatentPool,
         storage: &LatentStorage,
         transports: &Transports,
         pages: &[u32],
@@ -588,15 +588,18 @@ mod tests {
         // pages return once its reads retired.
         abandon(&target, &input)?;
         assert!(!input.adopted());
-        for read in input.reads() {
-            read.retirement()
-                .wait(Some(std::time::Duration::from_secs(10)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while input.reads().iter().any(|read| !read.retirement().done())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         transports.reap()?;
         target.reap();
         target.release_slots(&[SLOT as i64])?;
         target.reap();
-        assert!(target.idle());
+        // The slot and the import's pages are free for a new trajectory.
+        target.require_initial(SLOT, &[1, 2])?;
         publications.revoke()?;
         transports.close()
     }

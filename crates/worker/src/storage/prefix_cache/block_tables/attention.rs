@@ -7,7 +7,7 @@ use super::{BlockTables, GroupShape, GroupTable};
 use crate::{Error, Result};
 
 /// Host lengths and placement of one numerical attention row.
-pub struct AttentionRow {
+pub(crate) struct AttentionRow {
     pub slot: u32,
     pub prefix: u32,
     pub query: u32,
@@ -17,7 +17,7 @@ pub struct AttentionRow {
 /// Borrowed pages for one numerical block table, in batch row order.
 /// Device gathers need only the lengths and first pages. Physical units are
 /// expanded only for callers that build an attention tensor on the host.
-pub struct TablePages {
+pub(crate) struct TablePages {
     pub shape: GroupShape,
     pub starts: Vec<u32>,
     pub lengths: Vec<usize>,
@@ -26,11 +26,11 @@ pub struct TablePages {
 }
 
 impl TablePages {
-    pub fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.lengths.iter().copied().max().unwrap_or(0).max(1)
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = impl Iterator<Item = u32> + '_> + '_ {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = impl Iterator<Item = u32> + '_> + '_ {
         self.tables.iter().enumerate().map(|(row, table)| {
             let first = (self.starts[row] - table.start_page) as usize;
             let step = self.shape.units_per_page as usize;
@@ -73,7 +73,7 @@ impl GroupTable {
 }
 
 /// Select the same page ranges for resident execution and startup scratch prefix cache.
-pub fn table_pages(
+pub(crate) fn table_pages(
     tables: &[Vec<Arc<GroupTable>>],
     prefixes: &[u32],
     queries: &[u32],
@@ -127,7 +127,7 @@ impl BlockTables {
     /// Resolve an attention batch while checking scheduler-assigned capacity.
     /// The caller supplies the cache's write check over the batch's physical
     /// intervals.
-    pub fn prepare_attention(
+    pub(crate) fn prepare_attention(
         &self,
         rows: &[AttentionRow],
         mut require_writable: impl FnMut(&GroupTable, u32, u32) -> Result<()>,

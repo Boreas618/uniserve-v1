@@ -1,10 +1,10 @@
 //! A product's buffer: its views, metadata and shape.
 
 use super::*;
-use crate::ffi::{DType, Device};
-use crate::storage::memory::{StorageView, device_name, parse_dtype};
+use crate::ffi::{DType, MemoryKind};
+use crate::storage::memory::StorageView;
 use crate::transfer::{ReadRef, Retirement};
-use crate::{BufferBinding, Completion, Error, Result};
+use crate::{BufferBinding, Error, Result};
 use std::collections::HashMap;
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -75,7 +75,7 @@ pub(super) struct BufferViews {
 }
 
 pub(super) struct StoredBuffer {
-    pub(super) state: Mutex<Buffer<ReadRef, Arc<Retirement>>>,
+    pub(super) state: Mutex<Buffer>,
     pub(super) views: Mutex<BufferViews>,
 }
 
@@ -85,7 +85,7 @@ pub(super) struct StoredBuffer {
 pub struct ProductBuffer(pub(super) Arc<StoredBuffer>);
 
 impl Deref for ProductBuffer {
-    type Target = Mutex<Buffer<ReadRef, Arc<Retirement>>>;
+    type Target = Mutex<Buffer>;
 
     fn deref(&self) -> &Self::Target {
         &self.0.state
@@ -93,12 +93,8 @@ impl Deref for ProductBuffer {
 }
 
 impl ProductBuffer {
-    pub fn id(&self) -> BufferId {
+    pub(crate) fn id(&self) -> BufferId {
         lock(self).id
-    }
-
-    pub fn reference(&self) -> TensorRef {
-        lock(&self.0.views).reference.clone()
     }
 
     /// The bound view producers write.
@@ -106,18 +102,12 @@ impl ProductBuffer {
         lock(&self.0.views).view.clone()
     }
 
-    pub fn region(&self) -> Option<Vec<Range<u64>>> {
+    pub(crate) fn region(&self) -> Option<Vec<Range<u64>>> {
         lock(&self.0.views).region.clone()
     }
 
-    pub fn metadata(&self) -> Option<Metadata> {
+    pub(crate) fn metadata(&self) -> Option<Metadata> {
         lock(&self.0.views).metadata
-    }
-
-    /// A write deferred to a later call and not yet released.
-    pub fn deferred(&self) -> bool {
-        let buffer = lock(self);
-        buffer.state == WriteState::Deferred && !buffer.released
     }
 
     pub(super) fn views(&self) -> MutexGuard<'_, BufferViews> {
@@ -127,7 +117,7 @@ impl ProductBuffer {
 
 /// The element type of a protocol product dtype.
 pub(super) fn product_dtype(dtype: uniserve_ipc::DType) -> Result<DType> {
-    parse_dtype(dtype.storage_name())
+    Ok(DType::from(dtype))
 }
 
 /// Static extents and the device-actual axis at its bound; a scalar product
@@ -203,7 +193,7 @@ pub(super) fn value_view(view: &StorageView, shape: &[u64], extent: u64) -> Resu
 )]
 pub(super) fn create_buffer(
     reference: &TensorRef,
-    device: Device,
+    device: MemoryKind,
     view: StorageView,
     storage: StorageView,
     logical_shape: Vec<u64>,
@@ -214,7 +204,7 @@ pub(super) fn create_buffer(
     ProductBuffer(Arc::new(StoredBuffer {
         state: Mutex::new(Buffer::new(
             reference.buffer_id(),
-            device_name(device),
+            device,
             logical_shape
                 .iter()
                 .map(|&extent| extent as usize)
@@ -236,42 +226,43 @@ pub(crate) fn buffer_key(id: BufferId) -> BufferKey {
     (id.owner, id.producer_call_id, id.output_index)
 }
 
-pub enum Backing {
+pub(crate) enum Backing {
     Persistent(Arc<BufferBinding>),
     Relay(RelayKey),
 }
 
 /// A value's event and the stream on which its producer will record it.
 #[derive(Clone)]
-pub struct Fence {
+pub(crate) struct Fence {
     pub event: Arc<Event>,
     pub stream: usize,
 }
 
 /// One allocation-backed value. The owning store protects mutations, while
 /// read handles retain the same buffer through logical release and reuse.
-/// T and C retain transfers and exports and borrow their completions.
-pub struct Buffer<T, C> {
-    pub id: BufferId,
-    pub device: String,
-    pub logical_shape: Vec<usize>,
-    pub feature: bool,
-    pub backing: Option<Backing>,
-    pub state: WriteState,
-    pub extent: usize,
-    pub value_shape: Vec<usize>,
-    pub producer: Option<Fence>,
-    pub readers: usize,
-    pub reader_events: Vec<Arc<Event>>,
-    pub transfers: Vec<T>,
-    pub exports: Vec<C>,
-    pub released: bool,
+/// The reads writing it and the exports reading it retain it until their
+/// physical retirement.
+pub struct Buffer {
+    pub(crate) id: BufferId,
+    pub(crate) device: MemoryKind,
+    pub(crate) logical_shape: Vec<usize>,
+    pub(crate) feature: bool,
+    pub(crate) backing: Option<Backing>,
+    pub(crate) state: WriteState,
+    pub(crate) extent: usize,
+    pub(crate) value_shape: Vec<usize>,
+    pub(crate) producer: Option<Fence>,
+    pub(crate) readers: usize,
+    pub(crate) reader_events: Vec<Arc<Event>>,
+    pub(crate) transfers: Vec<ReadRef>,
+    pub(crate) exports: Vec<Arc<Retirement>>,
+    pub(crate) released: bool,
 }
 
-impl<T, C> Buffer<T, C> {
-    pub fn new(
+impl Buffer {
+    pub(crate) fn new(
         id: BufferId,
-        device: String,
+        device: MemoryKind,
         logical_shape: Vec<usize>,
         feature: bool,
         backing: Backing,
@@ -294,7 +285,7 @@ impl<T, C> Buffer<T, C> {
         }
     }
 
-    pub fn require_candidate(&self) -> Result<()> {
+    pub(crate) fn require_candidate(&self) -> Result<()> {
         if self.backing.is_none() || self.state == WriteState::Committed {
             return Err(Error::Invariant(
                 "device-product candidate is not live".into(),
@@ -308,7 +299,7 @@ impl<T, C> Buffer<T, C> {
         Ok(())
     }
 
-    pub fn defer(&mut self) -> Result<()> {
+    pub(crate) fn defer(&mut self) -> Result<()> {
         if self.state.produced() {
             return Err(Error::Invariant(
                 "a published write cannot be deferred".into(),
@@ -318,14 +309,14 @@ impl<T, C> Buffer<T, C> {
         Ok(())
     }
 
-    pub fn produced(&mut self, shape: Vec<usize>, extent: usize, fence: Option<Fence>) {
+    pub(crate) fn produced(&mut self, shape: Vec<usize>, extent: usize, fence: Option<Fence>) {
         self.value_shape = shape;
         self.extent = extent;
         self.producer = fence;
         self.state = WriteState::Produced;
     }
 
-    pub fn retain_reader(&mut self, event: &Arc<Event>) -> bool {
+    pub(crate) fn retain_reader(&mut self, event: &Arc<Event>) -> bool {
         if self
             .reader_events
             .iter()
@@ -337,7 +328,7 @@ impl<T, C> Buffer<T, C> {
         true
     }
 
-    pub fn events(&self) -> impl Iterator<Item = &Arc<Event>> {
+    pub(crate) fn events(&self) -> impl Iterator<Item = &Arc<Event>> {
         self.producer
             .iter()
             .map(|fence| &fence.event)
@@ -346,11 +337,7 @@ impl<T, C> Buffer<T, C> {
 
     /// Cancellation is not physical completion. A failed transfer or export
     /// retains its backing until the worker's failure shutdown drains access.
-    pub fn access_retired<TE, TC, CE, CC>(&self, queried: &mut HashMap<usize, bool>) -> Result<bool>
-    where
-        T: Deref<Target = Completion<TE, TC>>,
-        C: Deref<Target = Completion<CE, CC>>,
-    {
+    pub(crate) fn access_retired(&self, queried: &mut HashMap<usize, bool>) -> Result<bool> {
         if !self.released
             || self.readers != 0
             || self.transfers.iter().any(|transfer| !transfer.succeeded())
@@ -375,21 +362,8 @@ impl<T, C> Buffer<T, C> {
         Ok(true)
     }
 
-    pub fn retain_export<E, F>(&mut self, retirement: C)
-    where
-        C: Deref<Target = Completion<E, F>>,
-    {
+    pub(crate) fn retain_export(&mut self, retirement: Arc<Retirement>) {
         self.exports.retain(|export| !export.succeeded());
         self.exports.push(retirement);
-    }
-
-    pub fn retain_transfer(&mut self, ticket: T) -> Result<()> {
-        if self.state.produced() || self.released {
-            return Err(Error::Invariant(
-                "transfer destination already has a producer".into(),
-            ));
-        }
-        self.transfers.push(ticket);
-        Ok(())
     }
 }

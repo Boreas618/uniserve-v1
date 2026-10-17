@@ -5,15 +5,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use uniserve_core::ComponentConfig;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{CallKind, MediaCall, WorkerInfo};
 
 use crate::capacity::video::VideoCapacity;
-use crate::config::WorkerConfig;
 use crate::config::placement::Capability;
 use crate::config::placement::Placed;
+use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphPool, GraphStorage};
-use crate::ffi::{Device, Handle, Interpreter};
+use crate::ffi::{Handle, Interpreter};
 use crate::runner::denoiser::VideoModel;
 use crate::stream::Streams;
 use crate::{Error, Result};
@@ -71,7 +71,7 @@ pub(crate) struct VideoSetup<'a> {
     pub(crate) info: &'a WorkerInfo,
     pub(crate) config: &'a WorkerConfig,
     pub(crate) streams: &'a mut Streams,
-    pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
+    pub(crate) graphs: &'a mut GraphStorage,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
 }
@@ -83,12 +83,7 @@ impl VideoSetup<'_> {
     /// graphs address.
     pub(crate) fn stream(&mut self, kind: MediaCall, device: Device) -> Result<(Stream, Handle)> {
         let streams = &mut *self.streams;
-        let Device::Cuda(index) = device else {
-            return Err(Error::Unsupported(
-                "video components compute on CUDA devices".into(),
-            ));
-        };
-        let forked = streams.fork_module(CallKind::Media(kind), uniserve_cuda::DeviceId(index))?;
+        let forked = streams.fork_module(CallKind::Media(kind), cuda_device(device)?)?;
         let stream = forked.stream()?.clone();
         let scratch = Handle::new(
             Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[])?,
@@ -96,39 +91,23 @@ impl VideoSetup<'_> {
         Ok((stream, scratch))
     }
 
-    /// The graph pool of `owner` on `device` under graph storage `key`;
-    /// `None` on the host and when graphs are off.
+    /// The graph pool on `device` under graph storage `key`; `None` on the
+    /// host and when graphs are off.
     pub(crate) fn graph_pool(
         &mut self,
         key: usize,
-        owner: &str,
         device: Device,
-    ) -> Result<Option<Arc<GraphPool<Handle>>>> {
+    ) -> Result<Option<Arc<GraphPool>>> {
         let capture = self.config.graph_policy != "off" && self.config.device.is_cuda();
-        let Device::Cuda(index) = device else {
+        let Device::Cuda(device) = device else {
             return Ok(None);
         };
         if !capture {
             return Ok(None);
         }
         let create = Interpreter::import("uniserve.cuda_graph.pool")?;
-        let pools = crate::cuda_graph::reserve_pools(
-            self.graphs,
-            &create,
-            key,
-            owner.to_owned(),
-            &[index],
-            None,
-        )?;
+        let pools = crate::cuda_graph::reserve_pools(self.graphs, &create, key, &[device], None)?;
         Ok(pools.into_iter().next())
-    }
-}
-
-/// The device a placed component computes on.
-pub(crate) fn placed_device(placed: &Placed) -> Device {
-    match placed.device {
-        crate::config::Device::Cuda(index) => Device::Cuda(index),
-        crate::config::Device::Cpu => Device::Cpu,
     }
 }
 
@@ -148,14 +127,11 @@ pub(crate) fn call_path(placed: &Placed, capability: Capability) -> Result<&str>
         })
 }
 
-/// The CUDA ordinal of a component's device.
-pub(crate) fn device_index(device: Device) -> Result<i32> {
-    match device {
-        Device::Cuda(index) => Ok(index),
-        Device::Cpu | Device::CudaHost => Err(Error::Unsupported(
-            "video components compute on CUDA devices".into(),
-        )),
-    }
+/// The CUDA device a video component computes on.
+pub(crate) fn cuda_device(device: Device) -> Result<DeviceId> {
+    device
+        .cuda()
+        .ok_or_else(|| Error::Unsupported("video components compute on CUDA devices".into()))
 }
 
 #[cfg(test)]

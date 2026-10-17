@@ -25,7 +25,7 @@
 //! and [`export`] publishes a written one.
 
 use crate::executor::PendingOutput;
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, ProductStore};
 use crate::stream::Issue;
 use crate::transfer::Transports;
@@ -165,7 +165,7 @@ pub(crate) struct OutputShape {
 pub(crate) fn bind_outputs(
     store: &ProductStore,
     outputs: &[OutputShape],
-    device: Device,
+    device: MemoryKind,
     placement: &Placement<'_>,
 ) -> Result<Vec<ProductBuffer>> {
     if outputs.is_empty() {
@@ -184,7 +184,7 @@ pub(crate) fn bind_outputs(
                 .map(|region| (output.product.buffer_id(), region))
         })
         .collect();
-    let bindings: Vec<(TensorRef, Device)> = outputs
+    let bindings: Vec<(TensorRef, MemoryKind)> = outputs
         .iter()
         .map(|output| (output.product.clone(), device))
         .collect();

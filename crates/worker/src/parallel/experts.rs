@@ -13,14 +13,14 @@
 //! sources announce zero.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tvm_ffi::{Any, AnyView};
 
 use super::host::HostGroup;
 use crate::profiling::range;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// Bytes of one agreement record: `(tokens, leaving, kind)` as little-endian
 /// `i64` words.
@@ -41,7 +41,7 @@ pub enum ExpertTransport {
 impl ExpertTransport {
     /// Parse a launch exchange name. Weight prefetch (`dwdp`) moves no
     /// tokens and has no transport.
-    pub fn parse(name: &str) -> Result<Option<Self>> {
+    pub(crate) fn parse(name: &str) -> Result<Option<Self>> {
         match name {
             "alltoall" => Ok(Some(Self::AllToAll)),
             "deepep" => Ok(Some(Self::DeepEp)),
@@ -52,7 +52,7 @@ impl ExpertTransport {
     }
 
     /// The transport name the numerical library constructs.
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::AllToAll => "alltoall",
             Self::DeepEp => "deepep",
@@ -73,7 +73,7 @@ impl ExpertTransport {
 /// ready. Other sources and expert-only ranks participate without local rows.
 /// The caller supplies gathered host records; selection performs no
 /// communication.
-pub struct ExpertExchange {
+pub(crate) struct ExpertExchange {
     rank: usize,
     ranks: usize,
     sources: Vec<Vec<usize>>,
@@ -88,7 +88,7 @@ impl ExpertExchange {
     /// Memberships use global ranks. `rank` is the local index in `ranks`.
     /// Fused transports retain maximum-sized symmetric storage; other
     /// transports use power-of-two capacities plus the configured maximum.
-    pub fn new(
+    pub(crate) fn new(
         ranks: &[usize],
         rank: usize,
         memberships: &[Vec<usize>],
@@ -167,7 +167,7 @@ impl ExpertExchange {
     /// The accessor borrows the fixed receive buffer without copying it into
     /// a second record array. It must return stable values throughout this
     /// call. Ready kinds rotate in increasing cyclic order.
-    pub fn select(&mut self, record: impl Fn(usize) -> (usize, bool, i64)) -> Result<usize> {
+    pub(crate) fn select(&mut self, record: impl Fn(usize) -> (usize, bool, i64)) -> Result<usize> {
         self.active = false;
         self.released = (0..self.ranks).all(|rank| {
             let (tokens, leaving, _) = record(rank);
@@ -216,12 +216,12 @@ impl ExpertExchange {
     }
 
     /// Step capacities, ascending.
-    pub fn capacities(&self) -> &[usize] {
+    pub(crate) fn capacities(&self) -> &[usize] {
         &self.capacities
     }
 
     /// The smallest capacity holding `tokens`.
-    pub fn capacity_for(&self, tokens: usize) -> Result<usize> {
+    pub(crate) fn capacity_for(&self, tokens: usize) -> Result<usize> {
         self.capacities
             .iter()
             .copied()
@@ -234,15 +234,11 @@ impl ExpertExchange {
             })
     }
 
-    pub fn kind(&self) -> i64 {
-        self.kind
-    }
-
-    pub fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         self.active
     }
 
-    pub fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         self.released
     }
 }
@@ -262,7 +258,7 @@ pub struct Agreement {
 
 /// The sizes of one expert layer, as the library's `layers` lists them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExpertLayer {
+pub(crate) struct ExpertLayer {
     pub num_experts: usize,
     pub top_k: usize,
     pub hidden_size: usize,
@@ -272,7 +268,7 @@ pub struct ExpertLayer {
 /// collectives: step capacities, microbatches and the expert layer
 /// sequence on every rank, and the source ranks' warmup and capture plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExpertPlan {
+pub(crate) struct ExpertPlan {
     pub capacities: Vec<usize>,
     pub microbatches: usize,
     pub layers: Vec<ExpertLayer>,
@@ -285,7 +281,6 @@ pub struct ExpertParallel {
     host: Arc<Mutex<HostGroup>>,
     control: Mutex<Control>,
     attention_ranks: usize,
-    transport: ExpertTransport,
     max_tokens: usize,
     capacities: Vec<usize>,
 }
@@ -369,58 +364,44 @@ impl ExpertParallel {
                 records: vec![0; RECORD_BYTES * size],
             }),
             attention_ranks,
-            transport,
             max_tokens,
         })
     }
 
-    pub fn transport(&self) -> ExpertTransport {
-        self.transport
-    }
-
     /// Leading source-only members; zero for colocated experts.
-    pub fn attention_ranks(&self) -> usize {
+    pub(crate) fn attention_ranks(&self) -> usize {
         self.attention_ranks
     }
 
     /// Tokens each rank may send per step.
-    pub fn max_tokens(&self) -> usize {
+    pub(crate) fn max_tokens(&self) -> usize {
         self.max_tokens
     }
 
     /// Step capacities, ascending.
-    pub fn capacities(&self) -> &[usize] {
+    pub(crate) fn capacities(&self) -> &[usize] {
         &self.capacities
     }
 
     /// The smallest step capacity holding `tokens`.
-    pub fn capacity_for(&self, tokens: usize) -> Result<usize> {
-        self.control().exchange.capacity_for(tokens)
+    pub(crate) fn capacity_for(&self, tokens: usize) -> Result<usize> {
+        lock(&self.control).exchange.capacity_for(tokens)
     }
 
     /// The step capacities a forward that sends `tokens` tokens can run at:
     /// every capacity holding them. Fixed at startup, so the thread that
     /// prepares a step reads them without the agreement's lock.
-    pub fn capacities_for(&self, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn capacities_for(&self, tokens: usize) -> impl Iterator<Item = usize> + '_ {
         self.capacities
             .iter()
             .copied()
             .filter(move |&capacity| capacity >= tokens.max(1))
     }
 
-    /// The union's host group, shared with the transports' bootstrap.
-    pub fn host(&self) -> &Arc<Mutex<HostGroup>> {
-        &self.host
-    }
-
     /// This rank's member index and the union size.
-    pub fn member(&self) -> (usize, usize) {
+    pub(crate) fn member(&self) -> (usize, usize) {
         let group = lock(&self.host);
         (group.rank(), group.size())
-    }
-
-    fn control(&self) -> MutexGuard<'_, Control> {
-        self.control.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Agree with the union on the next step.
@@ -438,7 +419,7 @@ impl ExpertParallel {
         local[8..16].copy_from_slice(&i64::from(leaving).to_le_bytes());
         local[16..].copy_from_slice(&kind.to_le_bytes());
 
-        let mut control = self.control();
+        let mut control = lock(&self.control);
         let Control { exchange, records } = &mut *control;
         lock(&self.host).all_gather_fixed(&local, records)?;
         let word = |rank: usize, field: usize| {
@@ -468,7 +449,7 @@ impl ExpertParallel {
     /// rank returns its value, so expert ranks execute the same layer
     /// sequence. Colocated ranks run identical warmup plans and need no
     /// announcement: the value is returned unchanged.
-    pub fn warmup(&self, capacity: usize) -> Result<usize> {
+    pub(crate) fn warmup(&self, capacity: usize) -> Result<usize> {
         if self.attention_ranks == 0 {
             return Ok(capacity);
         }
@@ -490,7 +471,7 @@ impl ExpertParallel {
     /// Compare every rank's plan before warmup enters collectives. Every
     /// rank must declare the same capacities, microbatches and expert layer
     /// sequence; source ranks also the same warmup and capture plan.
-    pub fn compare_plans(&self, plan: &ExpertPlan) -> Result<()> {
+    pub(crate) fn compare_plans(&self, plan: &ExpertPlan) -> Result<()> {
         let encoded = serde_json::to_vec(plan)
             .map_err(|error| Error::Invariant(format!("expert plan encoding: {error}")))?;
         let plans = lock(&self.host).all_gather_bytes(&encoded)?;
@@ -527,10 +508,6 @@ impl ExpertParallel {
     }
 }
 
-fn lock(host: &Mutex<HostGroup>) -> MutexGuard<'_, HostGroup> {
-    host.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Host collectives over `host`, for numerical transports that bootstrap
 /// their own device communicators (FlashInfer's communication backend,
 /// DeepEP and NVSHMEM unique ids, barriers): the arguments of the library's
@@ -542,7 +519,7 @@ fn lock(host: &Mutex<HostGroup>) -> MutexGuard<'_, HostGroup> {
 /// arguments for the subgroup. Callers run the functions in the same order
 /// on every member and never concurrently with the expert step agreement,
 /// which shares the connections. TVM-FFI releases the GIL while they block.
-pub fn host_bootstrap(host: &Arc<Mutex<HostGroup>>) -> Vec<Any> {
+pub(crate) fn host_bootstrap(host: &Arc<Mutex<HostGroup>>) -> Vec<Any> {
     let (rank, size) = {
         let group = lock(host);
         (group.rank(), group.size())
@@ -646,12 +623,12 @@ mod tests {
                 (0, false, 0),
             ];
             assert_eq!(exchange.select(|rank| records[rank]).unwrap(), 8);
-            assert_eq!(exchange.kind(), 0);
+            assert_eq!(exchange.kind, 0);
             assert_eq!(exchange.active(), rank == 1);
 
             records[2].0 = 64;
             assert_eq!(exchange.select(|rank| records[rank]).unwrap(), 192);
-            assert_eq!(exchange.kind(), 2);
+            assert_eq!(exchange.kind, 2);
             assert_eq!(exchange.active(), rank == 0 || rank == 2);
             assert_eq!(exchange.select(|rank| records[rank]).unwrap(), 8);
 

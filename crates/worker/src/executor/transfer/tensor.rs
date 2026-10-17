@@ -23,8 +23,7 @@ use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef}
 use super::TransferBatch;
 use super::latents;
 use crate::executor::image::ImageParts;
-use crate::ffi::Device;
-use crate::storage::memory::parse_dtype;
+use crate::ffi::{DType, MemoryKind};
 use crate::storage::{OutputPlacement, ProductBuffer};
 use crate::worker::RankStorage;
 use crate::{Error, Result};
@@ -188,9 +187,9 @@ impl TransferBatch<'_> {
         &mut self,
         transfers: &[(usize, &TensorRef, &TensorRef, Placement)],
         allocations: &HashMap<BufferId, BufferAllocation>,
-        target: Device,
+        target: MemoryKind,
     ) -> Result<Vec<ProductBuffer>> {
-        let features: Vec<(TensorRef, Device)> = transfers
+        let features: Vec<(TensorRef, MemoryKind)> = transfers
             .iter()
             .filter(|transfer| transfer.3 == Placement::Feature)
             .map(|transfer| (transfer.2.clone(), target))
@@ -202,7 +201,7 @@ impl TransferBatch<'_> {
         )?;
         self.recorded.batch.writes.extend(bound.iter().cloned());
 
-        let mut groups: IndexMap<(Placement, ProductDType, String), Vec<(TensorRef, Device)>> =
+        let mut groups: IndexMap<(Placement, ProductDType, String), Vec<(TensorRef, MemoryKind)>> =
             IndexMap::new();
         for &(_, _, output, placement) in transfers {
             if placement == Placement::Feature {
@@ -254,5 +253,5 @@ impl TransferBatch<'_> {
 }
 
 fn product_dtype(dtype: ProductDType) -> Result<crate::ffi::DType> {
-    parse_dtype(dtype.storage_name())
+    Ok(DType::from(dtype))
 }

@@ -130,7 +130,7 @@ pub(crate) struct ExpertUnion {
     parallel: Arc<ExpertParallel>,
     pub(super) functions: ExpertFunctions,
     pub(super) graphs: Option<GraphFunctions>,
-    pub(super) device: i32,
+    pub(super) device: DeviceId,
     /// This rank holds only routed experts and runs no forward of its own.
     pub(super) dedicated: bool,
     pub(super) microbatches: Vec<Microbatch>,
@@ -314,12 +314,12 @@ pub(crate) struct ExpertStart<'a> {
 
 /// The stream the rank's forwards (and the first microbatch) run on: its
 /// only execution lane, or the device stream.
-fn primary_stream(streams: &Streams, device: i32) -> Result<Stream> {
+fn primary_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
     let stream = match streams.lanes() {
         [] => streams
             .stream_for(
                 uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Prefill),
-                DeviceId(device),
+                device,
             )
             .ok_or(Error::State("expert parallelism requires a CUDA stream"))?,
         [lane] => &lane.stream,
@@ -461,7 +461,7 @@ impl ExpertUnion {
                     device,
                     bytes as usize,
                     start.node,
-                    &*host
+                    &host
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 )?)
@@ -497,7 +497,7 @@ impl ExpertUnion {
                     Any::from(union.attention_ranks as i64),
                     bootstrap.clone(),
                     Any::from(max_tokens as i64),
-                    Any::from(i64::from(device)),
+                    Any::from(i64::from(device.0)),
                     Any::from(stream.raw() as i64),
                     yield_turn.clone().unwrap_or_default(),
                     storage,
@@ -519,7 +519,7 @@ impl ExpertUnion {
             // forward runs on, so each microbatch thread makes this call
             // itself.
             lanes.each(Arc::new(move |_| {
-                crate::ffi::cooperative(|| warm.invoke(&[(&Any::from(i64::from(device))).into()]))
+                crate::ffi::cooperative(|| warm.invoke(&[(&Any::from(i64::from(device.0))).into()]))
             }))?;
             runtime.lanes = Some(lanes);
         }

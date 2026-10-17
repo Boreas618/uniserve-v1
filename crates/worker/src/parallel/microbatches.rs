@@ -28,13 +28,13 @@ struct State {
 /// Each index runs on its own persistent host lane. Calls start in index order,
 /// yield to the next active index and leave the rotation when they return.
 /// The caller joins all host tasks before ending an invocation or closing.
-pub struct Microbatches {
+pub(crate) struct Microbatches {
     state: Mutex<State>,
     ready: Condvar,
 }
 
 impl Microbatches {
-    pub fn new(count: usize) -> Result<Self> {
+    pub(crate) fn new(count: usize) -> Result<Self> {
         if count == 0 {
             return Err(Error::Invalid(
                 "microbatches require at least one context".into(),
@@ -58,7 +58,7 @@ impl Microbatches {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn begin(&self, count: usize) -> Result<()> {
+    pub(crate) fn begin(&self, count: usize) -> Result<()> {
         let mut state = self.state();
         if count != state.active.len() {
             return Err(Error::Invalid(
@@ -80,14 +80,16 @@ impl Microbatches {
         Ok(())
     }
 
-    /// Execute one admitted index, once per invocation. The caller starts
-    /// every index before joining any of them. Waiting and yielding require
-    /// no language runtime lock; only the numerical callback acquires it.
-    pub fn run<T, E>(
+    /// Execute one admitted index, once per invocation: wait for its turn,
+    /// then run `call`. An aborted invocation fails before `call` runs. The
+    /// caller starts every index before joining any of them. Waiting and
+    /// yielding require no language runtime lock; only the numerical
+    /// callback acquires it.
+    pub(crate) fn run<T>(
         self: &Arc<Self>,
         index: usize,
-        call: impl FnOnce() -> std::result::Result<T, E>,
-    ) -> Result<std::result::Result<T, E>> {
+        call: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let previous = CURRENT.replace(Some((Arc::clone(self), index)));
         let mut turn = Turn {
             owner: Arc::clone(self),
@@ -98,7 +100,7 @@ impl Microbatches {
         self.wait(index, self.state())?;
         let result = call();
         turn.failed = result.is_err();
-        Ok(result)
+        result
     }
 
     fn wait(&self, index: usize, state: MutexGuard<'_, State>) -> Result<()> {
@@ -121,7 +123,7 @@ impl Microbatches {
 
     /// Interrupt suspended calls. True means this is the first failure;
     /// otherwise the failing task remains the source of the invocation error.
-    pub fn abort(&self) -> bool {
+    pub(crate) fn abort(&self) -> bool {
         let mut state = self.state();
         let first = !state.aborted;
         state.aborted = true;
@@ -129,19 +131,19 @@ impl Microbatches {
         first
     }
 
-    pub fn failure(&self) -> Option<usize> {
+    pub(crate) fn failure(&self) -> Option<usize> {
         self.state().failure
     }
 
     /// Complete an invocation after joining its host turns and device streams.
-    pub fn end(&self) {
+    pub(crate) fn end(&self) {
         let mut state = self.state();
         state.running = false;
         state.active.fill(false);
         state.failure = None;
     }
 
-    pub fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         let mut state = self.state();
         if state.running {
             return Err(Error::State("cannot close running microbatches"));
@@ -256,13 +258,13 @@ impl MicrobatchLanes {
         })
     }
 
-    pub fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.threads.len()
     }
 
     /// Run `call(index)` once on every lane thread, outside the rotation,
     /// for thread-local preparation.
-    pub fn each(&self, call: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>) -> Result<()> {
+    pub(crate) fn each(&self, call: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>) -> Result<()> {
         let calls: Vec<MicrobatchCall<()>> = (0..self.count())
             .map(|index| {
                 let call = Arc::clone(&call);
@@ -338,7 +340,7 @@ impl MicrobatchLanes {
             let job: Job = Box::new(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match &rotation {
-                        Some(control) => control.run(index, call).and_then(|result| result),
+                        Some(control) => control.run(index, call),
                         None => call(),
                     }
                 }))
@@ -517,5 +519,96 @@ impl ExpertUnion {
             .iter()
             .map(|peer| peer.stream.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn uneven_calls_keep_collective_submission_order() -> Result<()> {
+        let owner = Arc::new(Microbatches::new(3)?);
+        let dispatches = Mutex::new(Vec::new());
+        owner.begin(3)?;
+
+        let outputs = thread::scope(|scope| {
+            let tasks: Vec<_> = [3, 1, 2]
+                .into_iter()
+                .enumerate()
+                .map(|(index, count)| {
+                    let owner = &owner;
+                    let dispatches = &dispatches;
+                    scope.spawn(move || {
+                        owner.run(index, || {
+                            for layer in 0..count {
+                                dispatches
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .push((index, layer));
+                                yield_microbatch()?;
+                            }
+                            Ok::<_, Error>(count)
+                        })
+                    })
+                })
+                .collect();
+
+            tasks
+                .into_iter()
+                .map(|task| {
+                    task.join()
+                        .map_err(|_| Error::State("numerical thread panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert_eq!(outputs, [3, 1, 2]);
+        owner.end();
+
+        // Collective peers must observe the same order even when individual
+        // calls finish before the others; a finished call has no further turn.
+        assert_eq!(
+            *dispatches.lock().unwrap_or_else(PoisonError::into_inner),
+            [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unwinding_wakes_peers_and_allows_a_later_invocation() -> Result<()> {
+        let owner = Arc::new(Microbatches::new(2)?);
+        owner.begin(2)?;
+
+        let peer = thread::scope(|scope| {
+            let peer = scope.spawn(|| owner.run(0, yield_microbatch));
+            let failed = scope
+                .spawn(|| owner.run(1, || -> Result<()> { panic!("numerical callback failed") }));
+            assert!(failed.join().is_err());
+            peer.join()
+                .map_err(|_| Error::State("peer thread panicked"))
+        })?;
+        assert!(peer.is_err());
+        assert_eq!(owner.failure(), Some(1));
+        owner.end();
+
+        owner.begin(2)?;
+        thread::scope(|scope| -> Result<()> {
+            let first = scope.spawn(|| owner.run(0, || Ok::<_, Error>(7)));
+            let second = scope.spawn(|| owner.run(1, || Ok::<_, Error>(11)));
+            let first = first
+                .join()
+                .map_err(|_| Error::State("first thread panicked"))??;
+            let second = second
+                .join()
+                .map_err(|_| Error::State("second thread panicked"))??;
+            assert_eq!(first, 7);
+            assert_eq!(second, 11);
+            Ok(())
+        })?;
+        owner.end();
+        owner.close()
     }
 }

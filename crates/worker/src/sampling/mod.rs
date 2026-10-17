@@ -17,12 +17,12 @@ pub(crate) use metadata::{
 };
 
 /// Token relays carry continuation in bit 31 and the token in the low 31 bits.
-pub const TOKEN_CONTINUATION_BIT: u32 = 1 << 31;
-pub const TOKEN_VALUE_MASK: u32 = TOKEN_CONTINUATION_BIT - 1;
+pub(crate) const TOKEN_CONTINUATION_BIT: u32 = 1 << 31;
+pub(crate) const TOKEN_VALUE_MASK: u32 = TOKEN_CONTINUATION_BIT - 1;
 
 /// Numerical selectors supported by the worker's batched sampler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SamplingPath {
+pub(crate) enum SamplingPath {
     Greedy { suppressed: bool },
     TopK(u32),
     Categorical,
@@ -167,7 +167,7 @@ impl SamplingControls {
 }
 
 /// Merge admitted stop tokens with the current branch's terminal tokens.
-pub fn finish_token_ids(call: &Call, admitted: &[u32]) -> Vec<u32> {
+pub(crate) fn finish_token_ids(call: &Call, admitted: &[u32]) -> Vec<u32> {
     let local = call
         .sampling_state
         .as_ref()

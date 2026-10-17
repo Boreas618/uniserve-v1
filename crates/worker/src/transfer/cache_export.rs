@@ -20,10 +20,9 @@ use uniserve_ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView, dtype_name};
+use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
-use crate::transfer::Retirement;
 use crate::{Error, Result};
 
 /// The pages a token interval touches: `(absolute page, offset, length)`.
@@ -94,9 +93,9 @@ impl CacheExport {
     /// location is revoked and the reservation released. The returned
     /// transfer becomes resident only when the batch commits it
     /// (`PrefixCache::validate_transfers` then `apply_transfers`).
-    pub fn locate(
+    pub(crate) fn locate(
         self,
-        accesses: &mut UnitAccesses<Arc<Retirement>>,
+        accesses: &mut UnitAccesses,
     ) -> Result<(CacheTransfer, Vec<Location>)> {
         let Self {
             buffer,
@@ -144,7 +143,7 @@ impl CacheExport {
     /// Revoke an export that is not published and release its reservation.
     /// As for [`Self::locate`], only once the issuer performed its work:
     /// the copies into an export's storage ran before it is given back.
-    pub fn revoke(self, accesses: &mut UnitAccesses<Arc<Retirement>>) {
+    pub(crate) fn revoke(self, accesses: &mut UnitAccesses) {
         self.exports
             .into_iter()
             .flatten()
@@ -163,8 +162,8 @@ impl CacheExport {
 /// [`CacheExport::locate`] gives the transfer and its locations once the
 /// issuer's work was performed.
 #[expect(clippy::too_many_arguments, reason = "one export's complete inputs")]
-pub fn export(
-    accesses: &mut UnitAccesses<Arc<Retirement>>,
+pub(crate) fn export(
+    accesses: &mut UnitAccesses,
     bases: &TransferBases,
     tables: &crate::storage::BlockTables,
     planes: &CachePlanes,
@@ -218,7 +217,7 @@ pub fn export(
         base,
         base_extent,
         exported_extent: visible,
-        compute_dtype: dtype_name(planes.plan().compute_dtype()).to_owned(),
+        compute_dtype: planes.plan().compute_dtype().name().to_owned(),
         groups,
     };
 
@@ -266,7 +265,7 @@ pub fn export(
     reason = "one group's complete export inputs"
 )]
 fn export_group(
-    accesses: &mut UnitAccesses<Arc<Retirement>>,
+    accesses: &mut UnitAccesses,
     planes: &CachePlanes,
     export: &GroupExport<'_>,
     buffer: BufferId,

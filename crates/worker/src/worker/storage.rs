@@ -17,21 +17,14 @@ use crate::Result;
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::storage::{PrefixCache, ProductStore};
 use crate::stream::EventPool;
-use crate::transfer::{Notify, Transports};
-
-/// Deliver transfer-capacity notifications.
-pub(super) fn notify(callbacks: Vec<Notify>) {
-    for callback in callbacks {
-        callback();
-    }
-}
+use crate::transfer::Transports;
 
 /// The call kind whose lane owns the stream slot releases are ordered on:
 /// token calls, which read the rows a release clears.
 const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
 
 /// The storage owners of a rank.
-pub struct RankStorage {
+pub(crate) struct RankStorage {
     pub events: Arc<EventPool>,
     pub tensors: ProductStore,
     /// Shared with the cache import copy tasks that read through them.
@@ -48,7 +41,7 @@ pub struct RankStorage {
 }
 
 impl RankStorage {
-    pub fn new(
+    pub(crate) fn new(
         events: Arc<EventPool>,
         tensors: ProductStore,
         transports: Arc<Transports>,
@@ -67,7 +60,7 @@ impl RankStorage {
     }
 
     /// Release the products (and cache exports) of finished calls.
-    pub fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
+    pub(crate) fn release_calls(&mut self, calls: &[(RequestKey, CallId)]) -> Result<()> {
         if calls.is_empty() {
             return Ok(());
         }

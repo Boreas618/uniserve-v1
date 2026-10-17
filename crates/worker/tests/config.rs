@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use serde_json::{Value, json};
+use uniserve_cuda::DeviceId;
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
 use uniserve_worker::config::{Device, WorkerLaunch, resolve};
 
@@ -103,9 +104,12 @@ fn two_rank_model() -> Value {
 fn the_tower_placement_resolves_the_generation_device() {
     for mesh in ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"] {
         let launch = resolved(json!({"device": "cuda:0", "mesh": mesh})).unwrap();
-        assert_eq!(launch.execution.device, Device::Cuda(0));
-        assert_eq!(launch.execution.generation_device, Some(Device::Cuda(1)));
-        assert_eq!(launch.device(), Device::Cuda(0));
+        assert_eq!(launch.execution.device, Device::Cuda(DeviceId(0)));
+        assert_eq!(
+            launch.execution.generation_device,
+            Some(Device::Cuda(DeviceId(1)))
+        );
+        assert_eq!(launch.device(), Device::Cuda(DeviceId(0)));
     }
     for mesh in ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"] {
         assert!(

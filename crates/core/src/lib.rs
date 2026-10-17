@@ -869,23 +869,6 @@ impl Default for ImageParams {
     }
 }
 
-/// Classifier-free-guidance configuration attached to image-generation calls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CfgParams {
-    /// Number of active guidance branches in `1..=3`.
-    pub branch_count: u8,
-    /// Text-conditioning guidance scale.
-    pub text_scale: f32,
-    /// Image-conditioning guidance scale.
-    pub img_scale: f32,
-    /// Stable renormalization strategy name.
-    pub renorm_type: String,
-    /// Minimum renormalization factor.
-    pub renorm_min: f32,
-    /// Inclusive normalized denoising interval where guidance is active.
-    pub interval: (f32, f32),
-}
-
 /// History retention policy of a cache group.
 ///
 /// A model whose layers read different histories (for example full and

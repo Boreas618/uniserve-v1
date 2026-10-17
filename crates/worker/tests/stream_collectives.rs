@@ -16,9 +16,9 @@ use uniserve_worker::CUDAStream;
 use uniserve_worker::ffi::DType;
 use uniserve_worker::parallel::host::{HostGroup, Rendezvous};
 use uniserve_worker::parallel::{CollectiveGroup, StreamCollectives};
-use uniserve_worker::storage::memory::{Memory, StorageView};
+use uniserve_worker::storage::{Memory, StorageView};
 
-fn upload(values: &[f32], device: i32, stream: &CUDAStream) -> StorageView {
+fn upload(values: &[f32], device: DeviceId, stream: &CUDAStream) -> StorageView {
     let memory = Memory::device(device, values.len() * 4).unwrap();
     let view = StorageView::whole(memory, DType::F32).unwrap();
     unsafe {
@@ -68,10 +68,10 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                     None => Rendezvous::connect(address.clone()),
                 };
                 scope.spawn(move || {
-                    let device = rank as i32;
+                    let device = DeviceId(rank as i32);
                     let host =
                         HostGroup::connect(rendezvous, rank, 2, Duration::from_secs(60)).unwrap();
-                    let stream = CUDAStream::create(DeviceId(device)).unwrap();
+                    let stream = CUDAStream::create(device).unwrap();
                     // Logical order differs from world order: world rank 1
                     // is the first member.
                     let groups = [CollectiveGroup {

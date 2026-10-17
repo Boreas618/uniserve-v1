@@ -1060,9 +1060,8 @@ impl WorkerGroup {
     /// failed are resolved, at most one per invocation. When a rank that
     /// succeeded still holds unjoined calls, the ranks disagree: the batch is
     /// retired and a plain error returned. Otherwise every error must be
-    /// identical, or a plain error is returned. A fatal error, a
-    /// `SchedulerBug` or `InvariantViolation` code, or a batch carrying a
-    /// `Free` command returns the `WorkerExecError` itself; `poll_batch`
+    /// identical, or a plain error is returned. A fatal error, an
+    /// `InvariantViolation` code, or a batch carrying a `Free` command returns the `WorkerExecError` itself; `poll_batch`
     /// answers these and the plain errors with recovery. Any other error
     /// retires the batch and returns a `WorkerFailure` naming its unjoined
     /// calls and affected requests, which `poll_batch` returns without
@@ -1116,10 +1115,7 @@ impl WorkerGroup {
             }
             let batch = &self.pending_batches[&batch_id].batch;
             if canonical.fatal
-                || matches!(
-                    canonical.code.as_deref(),
-                    Some("SchedulerBug" | "InvariantViolation")
-                )
+                || canonical.code.as_deref() == Some("InvariantViolation")
                 || batch
                     .commands
                     .iter()
@@ -1849,21 +1845,6 @@ impl WorkerGroup {
     /// Reports and clears whether recovery or close ran since the last call.
     pub(crate) fn take_readiness_change(&mut self) -> bool {
         std::mem::take(&mut self.readiness_changed)
-    }
-
-    /// Returns each rank's host and whether its device exports a fabric handle.
-    ///
-    /// A transfer edge crosses hosts when its endpoints report different hosts,
-    /// and it can only do so if both devices export a handle the other host can
-    /// import.
-    pub fn rank_fabric_reach(&self) -> Vec<(String, bool)> {
-        self.workers
-            .iter()
-            .map(|rank| {
-                let info = rank.info();
-                (info.endpoint.node.clone(), info.fabric_handles)
-            })
-            .collect()
     }
 
     /// Returns the group's agreed worker metadata.

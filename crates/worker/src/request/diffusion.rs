@@ -29,7 +29,7 @@ use crate::{Error, Result};
 
 /// A classifier-free guidance branch (`uniserve.diffusion.Branch`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Branch {
+pub(crate) enum Branch {
     Conditioned,
     TextUnconditional,
     ImageUnconditional,
@@ -37,7 +37,7 @@ pub enum Branch {
 
 impl Branch {
     /// Every branch in evaluation order: conditioned first.
-    pub const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 3] = [
         Self::Conditioned,
         Self::TextUnconditional,
         Self::ImageUnconditional,
@@ -53,7 +53,7 @@ impl Branch {
 
     /// The prefix this branch conditions on; `image_unconditional` is the
     /// denoiser's source for its image-unconditional branch.
-    pub fn source(self, image_unconditional: BranchSource) -> BranchSource {
+    pub(crate) fn source(self, image_unconditional: BranchSource) -> BranchSource {
         match self {
             Self::Conditioned => BranchSource::Conditioning,
             Self::TextUnconditional => BranchSource::NegativeOrStart,
@@ -64,13 +64,13 @@ impl Branch {
 
 /// The branches one denoising step evaluates, in evaluation order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct BranchSet(u8);
+pub(crate) struct BranchSet(u8);
 
 impl BranchSet {
     /// A set from its mask: bit 0 conditioned, bit 1 text-unconditional,
     /// bit 2 image-unconditional. The conditioned branch is always
     /// evaluated.
-    pub fn from_mask(mask: u8) -> Result<Self> {
+    pub(crate) fn from_mask(mask: u8) -> Result<Self> {
         if mask & Branch::Conditioned.bit() == 0 || mask > 7 {
             return Err(Error::Interface(format!(
                 "guidance branch mask {mask:#b} omits the conditioned branch"
@@ -79,33 +79,29 @@ impl BranchSet {
         Ok(Self(mask))
     }
 
-    pub fn mask(self) -> u8 {
+    pub(crate) fn mask(self) -> u8 {
         self.0
     }
 
-    pub fn contains(self, branch: Branch) -> bool {
+    pub(crate) fn contains(self, branch: Branch) -> bool {
         self.0 & branch.bit() != 0
     }
 
     /// The branches in evaluation order.
-    pub fn iter(self) -> impl Iterator<Item = Branch> {
+    pub(crate) fn iter(self) -> impl Iterator<Item = Branch> {
         Branch::ALL
             .into_iter()
             .filter(move |&branch| self.contains(branch))
     }
 
-    pub fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         self.0.count_ones() as usize
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
     }
 }
 
 /// What a guidance branch conditions on (`uniserve.processing.BranchSource`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BranchSource {
+pub(crate) enum BranchSource {
     /// The image prompt, or the request's own context when blank.
     Conditioning,
     /// The negative prompt (or admitted negative tokens), else the start.
@@ -115,7 +111,7 @@ pub enum BranchSource {
 }
 
 impl BranchSource {
-    pub fn parse(name: &str) -> Result<Self> {
+    pub(crate) fn parse(name: &str) -> Result<Self> {
         match name {
             "conditioning" => Ok(Self::Conditioning),
             "negative_or_start" => Ok(Self::NegativeOrStart),
@@ -126,7 +122,7 @@ impl BranchSource {
         }
     }
 
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Conditioning => "conditioning",
             Self::NegativeOrStart => "negative_or_start",
@@ -137,7 +133,7 @@ impl BranchSource {
 
 /// A guidance prefix: its tokens, or the request's own context.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Prefix {
+pub(crate) struct Prefix {
     pub tokens: Arc<[u32]>,
     /// The branch attends to the request's own conditioning prefix cache.
     pub reuses_conditioning: bool,
@@ -146,7 +142,7 @@ pub struct Prefix {
 /// Cache coordinates of a request slot: its visible tokens and its allocated
 /// token capacity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Coordinates {
+pub(crate) struct Coordinates {
     pub slot: u32,
     pub visible: u64,
     pub capacity: u32,
@@ -164,7 +160,7 @@ impl From<(u32, u64, u32)> for Coordinates {
 
 /// One scheduler forward descriptor of a denoising call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForwardSlot {
+pub(crate) struct ForwardSlot {
     pub slot: u32,
     pub seq_len: u32,
     pub query_len: u32,
@@ -174,7 +170,7 @@ pub struct ForwardSlot {
 /// `tokens` written as prefix cache from position zero of `slot`, causally, with the
 /// hidden states selected (and discarded).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrefixFill {
+pub(crate) struct PrefixFill {
     pub slot: u32,
     pub tokens: Arc<[u32]>,
 }
@@ -183,7 +179,7 @@ pub struct PrefixFill {
 /// timesteps, with the image parameters its schedules and guidance are made
 /// from, which the solver update combines predictions with.
 #[derive(Clone, Debug)]
-pub struct GuidancePlan {
+pub(crate) struct GuidancePlan {
     /// The image parameters (`DenoiserRunner.plan`).
     pub params: Arc<ImageParams>,
     /// The model timestep of each solver step.
@@ -193,12 +189,12 @@ pub struct GuidancePlan {
 }
 
 impl GuidancePlan {
-    pub fn steps(&self) -> usize {
+    pub(crate) fn steps(&self) -> usize {
         self.branches.len()
     }
 
     /// The branches and timestep of `step`.
-    pub fn step(&self, step: usize) -> Result<(BranchSet, f32)> {
+    pub(crate) fn step(&self, step: usize) -> Result<(BranchSet, f32)> {
         match (self.branches.get(step), self.timesteps.get(step)) {
             (Some(&branches), Some(&time)) => Ok((branches, time)),
             _ => Err(Error::Invalid(format!(
@@ -211,7 +207,7 @@ impl GuidancePlan {
 
 /// One image request's open trajectory.
 #[derive(Clone, Debug)]
-pub struct ImageTrajectory {
+pub(crate) struct ImageTrajectory {
     pub key: RequestKey,
     /// Image height and width in pixels.
     pub size: (u32, u32),
@@ -228,7 +224,7 @@ pub struct ImageTrajectory {
 impl ImageTrajectory {
     /// A trajectory of `plan` whose guidance branches condition on
     /// `prefixes`, by source.
-    pub fn new(
+    pub(crate) fn new(
         key: RequestKey,
         size: (u32, u32),
         plan: GuidancePlan,
@@ -246,7 +242,7 @@ impl ImageTrajectory {
 
     /// Start a denoising call: the request's conditioning coordinates are
     /// current and every branch's coordinates resolve again.
-    pub fn begin_call(&mut self, conditioning: Coordinates) {
+    pub(crate) fn begin_call(&mut self, conditioning: Coordinates) {
         self.conditioning = conditioning;
         self.branches.clear();
     }
@@ -263,7 +259,7 @@ impl ImageTrajectory {
     /// `coordinates` reads a slot's allocated coordinates. Branches sharing
     /// a physical prefix submit one prefill. A branch whose source the
     /// trajectory was opened without is refused.
-    pub fn resolve_branches(
+    pub(crate) fn resolve_branches(
         &mut self,
         set: BranchSet,
         image_unconditional: BranchSource,
@@ -330,7 +326,7 @@ impl ImageTrajectory {
     }
 
     /// Record that a prefix prefill made `count` tokens visible in `slot`.
-    pub fn prefilled(&mut self, slot: u32, count: u64) {
+    pub(crate) fn prefilled(&mut self, slot: u32, count: u64) {
         for coordinates in self.branches.values_mut() {
             if coordinates.slot == slot && coordinates.visible == 0 {
                 coordinates.visible = count;
@@ -342,7 +338,7 @@ impl ImageTrajectory {
     /// with its temporal position. The conditioned branch continues the
     /// request's logical position; an unconditional branch follows its
     /// prefix.
-    pub fn branch_rows(
+    pub(crate) fn branch_rows(
         &self,
         set: BranchSet,
         logical_position: u64,
@@ -366,25 +362,29 @@ impl ImageTrajectory {
 
 /// The open trajectory of each request slot.
 #[derive(Debug, Default)]
-pub struct Trajectories {
+pub(crate) struct Trajectories {
     slots: HashMap<usize, ImageTrajectory>,
 }
 
 impl Trajectories {
     /// The open trajectory of the request at `slot`, if it is still that
     /// request's (a reused slot never sees an earlier request's trajectory).
-    pub fn get(&mut self, slot: usize, key: RequestKey) -> Option<&mut ImageTrajectory> {
+    pub(crate) fn get(&mut self, slot: usize, key: RequestKey) -> Option<&mut ImageTrajectory> {
         self.slots
             .get_mut(&slot)
             .filter(|trajectory| trajectory.key == key)
     }
 
-    pub fn open(&mut self, slot: usize, trajectory: ImageTrajectory) -> &mut ImageTrajectory {
+    pub(crate) fn open(
+        &mut self,
+        slot: usize,
+        trajectory: ImageTrajectory,
+    ) -> &mut ImageTrajectory {
         self.slots.entry(slot).insert_entry(trajectory).into_mut()
     }
 
     /// Forget the trajectories of slots whose requests retired or restarted.
-    pub fn release(&mut self, slots: &[usize]) {
+    pub(crate) fn release(&mut self, slots: &[usize]) {
         for slot in slots {
             self.slots.remove(slot);
         }

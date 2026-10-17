@@ -5,17 +5,20 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId};
+use uniserve_cuda::Stream;
 use uniserve_ipc::{
     BufferAllocation, BufferId, Call, CallKind, DType as WireDType, DimBound, MediaCall,
     RequestKey, ShapeBound, TensorRef, TransferHandle, WorkerEndpoint,
 };
-use uniserve_worker::ffi::Device;
-use uniserve_worker::storage::memory::StorageView;
-use uniserve_worker::storage::{OutputPlacement, Scalar};
-use uniserve_worker::transfer::{Capacity, TransportKind, TransportOptions, Transports, notify};
-use uniserve_worker::{BufferPool, EventPool, ProductBuffer, ProductStore, Result};
+use uniserve_worker::ffi::MemoryKind;
+use uniserve_worker::storage::{
+    BufferPool, OutputPlacement, ProductBuffer, ProductStore, StorageView,
+};
+use uniserve_worker::transfer::exports;
+use uniserve_worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
+use uniserve_worker::{EventPool, Result};
 
-const CPU: Device = Device::Cpu;
+const CPU: MemoryKind = MemoryKind::Host;
 
 fn request() -> RequestKey {
     RequestKey::new(1, RequestId(1), 1)
@@ -79,7 +82,7 @@ fn transports(bytes: u64) -> Result<Transports> {
     };
     Transports::new(
         &[TransportKind::Local],
-        Arc::new(Capacity::new(bytes, 8, notify)?),
+        Arc::new(TransferCapacity::new(bytes, 8)?),
         EventPool::new(),
         &options,
     )
@@ -130,7 +133,7 @@ fn publish(
     values: &[f32],
     shape: &[u64],
 ) -> Result<()> {
-    fill(&store.producer_view(buffer)?, values);
+    fill(&buffer.view(), values);
     store.produced(buffer, shape, None, None)?;
     store.commit_writes(std::slice::from_ref(buffer))
 }
@@ -194,7 +197,6 @@ fn deferred_writes_stay_undiscoverable_until_produced_and_committed() -> Result<
     let product = reference(1, 0, WireDType::F32, &[2]);
     let buffer = persistent(&store, &product, allocation(&product, 0, 8), None)?;
     store.defer_write(&buffer)?;
-    assert!(buffer.deferred());
     store.commit_writes(std::slice::from_ref(&buffer))?;
     assert!(
         store
@@ -241,10 +243,8 @@ fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
     let buffer = store
         .bind_outputs(&[(first.clone(), CPU)], placement)?
         .remove(0);
-    store.write_scalar(&buffer, Scalar::Int(-3), None)?;
+    store.write_scalar(&buffer, -3, None::<&Stream>)?;
     store.commit_writes(std::slice::from_ref(&buffer))?;
-    // One element per (slot + 1) x depth of one int32 field.
-    assert_eq!(store.resident_bytes(CPU), 3 * 4);
 
     let lease = store.consume(&first, CallId::new(5, 0), None, None)?;
     // SAFETY: host relay element written above.
@@ -351,7 +351,7 @@ fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Resul
             .is_err()
     );
     assert_eq!(transports.capacity().used(), 24);
-    uniserve_worker::transfer::exports::release(&locations)?;
+    exports::release(&locations)?;
     assert_eq!(transports.capacity().used(), 0);
     Ok(())
 }

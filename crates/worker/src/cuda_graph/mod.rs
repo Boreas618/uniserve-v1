@@ -39,20 +39,21 @@ use uniserve_cuda::{GraphExec, Stream};
 use crate::ffi::Handle;
 use crate::{Error, Result};
 
-pub use pool::{GraphPool, GraphPools, GraphStorage, graph_storage_budget_bytes, reserve_pools};
+pub use pool::GraphPool;
+pub(crate) use pool::{GraphStorage, graph_storage_budget_bytes, reserve_pools};
 pub(crate) use shape_key::{PrefillShape, ShapeKey, TextShapes, prefill_shapes};
-pub use table::{Capacity, GraphCounts, GraphTable, Lookup};
+pub(crate) use table::{GraphTable, Lookup};
 
 /// How one numerical invocation ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GraphMode {
+pub(crate) enum GraphMode {
     Eager,
     Capture,
     Replay,
 }
 
 impl GraphMode {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Eager => "eager",
             Self::Capture => "graph_capture",
@@ -95,7 +96,7 @@ impl GraphBreaks {
 /// with a graph break between two segments: work a graph cannot record. The
 /// Python graph owns the executables and the memory their nodes address.
 #[derive(Clone)]
-pub struct CUDAGraph {
+pub(crate) struct CUDAGraph {
     /// One executable per segment, in launch order.
     segments: Arc<[GraphExec]>,
     /// The work between segments `i` and `i + 1`, for a graph whose breaks
@@ -111,7 +112,7 @@ impl CUDAGraph {
     /// Take the result of a capture function: the array
     /// `[graph, executables]` of the Python graph and the raw `CUgraphExec`
     /// handle of each of its segments in launch order.
-    pub fn captured(result: Any) -> Result<Self> {
+    pub(crate) fn captured(result: Any) -> Result<Self> {
         let malformed = || Error::Interface("a capture returns [graph, executables]".into());
         let fields = tvm_ffi::Array::<Any>::try_from(result).map_err(|_| malformed())?;
         let field = |index: usize| fields.get(index).map_err(|_| malformed());
@@ -144,7 +145,7 @@ impl CUDAGraph {
     }
 
     /// The Python graph.
-    pub fn handle(&self) -> &Handle {
+    pub(crate) fn handle(&self) -> &Handle {
         &self.graph
     }
 
@@ -152,7 +153,7 @@ impl CUDAGraph {
     /// it: every segment in order, and after each segment the break that
     /// follows it. The inputs the graph reads were written on `stream`
     /// before, and its outputs are read on `stream` after.
-    pub fn launch(&self, stream: &Stream) -> Result<()> {
+    pub(crate) fn launch(&self, stream: &Stream) -> Result<()> {
         for (index, segment) in self.segments.iter().enumerate() {
             segment.launch(stream)?;
             if let Some(work) = self.breaks.get(index) {
@@ -165,14 +166,14 @@ impl CUDAGraph {
 
 /// The smallest configured size holding `count`, or `None` when every size
 /// is smaller. `sizes` need not be sorted.
-pub fn bucket(sizes: &[usize], count: usize) -> Option<usize> {
+pub(crate) fn bucket(sizes: &[usize], count: usize) -> Option<usize> {
     sizes.iter().copied().filter(|&size| size >= count).min()
 }
 
 /// Order shapes for capture: largest `footprint` first, ties in their given
 /// order, duplicates removed. Pool blocks freed by a large capture are
 /// reused by the smaller ones that follow.
-pub fn capture_order<T, F>(shapes: impl IntoIterator<Item = T>, footprint: F) -> Vec<T>
+pub(crate) fn capture_order<T, F>(shapes: impl IntoIterator<Item = T>, footprint: F) -> Vec<T>
 where
     T: PartialEq,
     F: Fn(&T) -> (usize, usize),

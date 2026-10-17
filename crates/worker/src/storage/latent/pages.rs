@@ -1,12 +1,12 @@
 //! Paged diffusion trajectories and the physical lifetime of their two banks.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use uniserve_ipc::{BufferId, Call, CallKind, LatentParams, MediaCall, RequestKey};
 
-use crate::{Completion, Error, Result};
+use crate::transfer::{ReadRef, Retirement};
+use crate::{Error, Result};
 
 #[derive(Default)]
 struct LatentSlot {
@@ -22,7 +22,7 @@ struct LatentSlot {
 /// A batch's prepared trajectory commit or release. The executor validates
 /// all updates before making any result visible, then applies the same values.
 #[derive(Clone)]
-pub struct LatentUpdate {
+pub(crate) struct LatentUpdate {
     pub request_pool_idx: i64,
     pub params: LatentParams,
     pub expected_generation: i64,
@@ -36,7 +36,7 @@ impl LatentUpdate {
     /// Derive a completed numerical call's trajectory change from its plan.
     /// Standalone media keeps one slot-local trajectory, versioned by step;
     /// transferred image trajectories use the call's explicit generations.
-    pub fn for_call(slot: usize, call: &Call, params: &LatentParams) -> Result<Self> {
+    pub(crate) fn for_call(slot: usize, call: &Call, params: &LatentParams) -> Result<Self> {
         let start = i64::from(params.start_step);
         let end = start + i64::from(params.step_count);
         let (expected_generation, expected_step, generation, step, release) = match call.code {
@@ -85,71 +85,60 @@ impl LatentUpdate {
     }
 }
 
-struct ImportState<T> {
-    transfers: Vec<Arc<T>>,
+struct ImportState {
+    transfers: Vec<Arc<ReadRef>>,
     adopted: bool,
     released: bool,
 }
 
 /// Destination pages retained until adoption or abandonment and physical
-/// completion. Imported values occupy bank zero. T retains a transfer and
-/// dereferences its native physical completion, independently of its result.
-pub struct LatentImport<T> {
+/// completion of the reads writing them. Imported values occupy bank zero.
+pub(crate) struct LatentImport {
     pub buffer: BufferId,
     pub request_pool_idx: usize,
     pub pages: Vec<usize>,
     pub units: usize,
-    state: Mutex<ImportState<T>>,
+    state: Mutex<ImportState>,
 }
 
-impl<T> LatentImport<T> {
-    pub fn adopted(&self) -> bool {
+impl LatentImport {
+    pub(crate) fn adopted(&self) -> bool {
         self.state().adopted
     }
 
-    pub fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         self.state().released
     }
 
-    /// Retain handles outside the import lock before invoking transport work.
-    pub fn transfers(&self) -> Vec<Arc<T>> {
-        self.state().transfers.clone()
-    }
-
-    fn state(&self) -> MutexGuard<'_, ImportState<T>> {
+    fn state(&self) -> MutexGuard<'_, ImportState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-struct ExportState<C> {
-    retirements: Vec<Arc<C>>,
+struct ExportState {
+    retirements: Vec<Arc<Retirement>>,
     released: bool,
 }
 
 /// An immutable page-bank version retained by transport readers, including
 /// versions exported before the first trajectory commit.
-pub struct LatentExport<C> {
+pub(crate) struct LatentExport {
     pub buffer: BufferId,
     pub request_pool_idx: usize,
     pub bank: u8,
     pub pages: Vec<usize>,
-    state: Mutex<ExportState<C>>,
+    state: Mutex<ExportState>,
 }
 
-impl<C> LatentExport<C> {
-    pub fn retirements(&self) -> Vec<Arc<C>> {
+impl LatentExport {
+    pub(crate) fn retirements(&self) -> Vec<Arc<Retirement>> {
         self.state().retirements.clone()
     }
 
-    fn state(&self) -> MutexGuard<'_, ExportState<C>> {
+    fn state(&self) -> MutexGuard<'_, ExportState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
 
-impl<F, M, C> LatentExport<C>
-where
-    C: Deref<Target = Completion<F, M>>,
-{
     /// Whether transport readers may still read this version: it is not
     /// released, or a reader has not completed successfully (a failed or
     /// cancelled read establishes nothing about the device).
@@ -164,21 +153,24 @@ where
 }
 
 /// Own scheduler-assigned pages, committed trajectories and transfer access.
-/// I and S retain import/export objects at stable addresses, as Arc does.
 /// [`LatentStorage`](super::LatentStorage) holds the pages' memory.
-pub struct LatentPool<I, S> {
+pub(crate) struct LatentPool {
     request_pool_size: usize,
     num_pages: usize,
     page_units: usize,
     slots: Vec<LatentSlot>,
     owners: Vec<usize>,
-    imports: HashMap<usize, I>,
-    exports: HashMap<BufferId, S>,
+    imports: HashMap<usize, Arc<LatentImport>>,
+    exports: HashMap<BufferId, Arc<LatentExport>>,
     retiring: HashSet<usize>,
 }
 
-impl<I, S> LatentPool<I, S> {
-    pub fn new(request_pool_size: usize, num_pages: usize, page_units: usize) -> Result<Self> {
+impl LatentPool {
+    pub(crate) fn new(
+        request_pool_size: usize,
+        num_pages: usize,
+        page_units: usize,
+    ) -> Result<Self> {
         if request_pool_size == 0 || num_pages < 2 || page_units == 0 {
             return Err(Error::Invalid(
                 "latent-pool shape must contain slots, pages, and elements".into(),
@@ -199,7 +191,7 @@ impl<I, S> LatentPool<I, S> {
         })
     }
 
-    pub fn slot(&self, slot: i64) -> Result<usize> {
+    pub(crate) fn slot(&self, slot: i64) -> Result<usize> {
         if slot < 1 || slot as usize > self.request_pool_size {
             return Err(Error::Invalid(
                 "latent request slot is outside physical capacity".into(),
@@ -208,23 +200,15 @@ impl<I, S> LatentPool<I, S> {
         Ok(slot as usize)
     }
 
-    pub fn request_pool_size(&self) -> usize {
-        self.request_pool_size
-    }
-
-    pub fn num_pages(&self) -> usize {
-        self.num_pages
-    }
-
-    pub fn page_units(&self) -> usize {
+    pub(crate) fn page_units(&self) -> usize {
         self.page_units
     }
 
-    pub fn capacity_units(&self) -> usize {
+    pub(crate) fn capacity_units(&self) -> usize {
         (self.num_pages - 1) * self.page_units
     }
 
-    pub fn validate_pages(&self, pages: &[i64], units: i64) -> Result<Vec<usize>> {
+    pub(crate) fn validate_pages(&self, pages: &[i64], units: i64) -> Result<Vec<usize>> {
         if units < 1
             || pages.len() != (units as usize).div_ceil(self.page_units)
             || pages
@@ -239,16 +223,10 @@ impl<I, S> LatentPool<I, S> {
         Ok(pages.iter().map(|&page| page as usize).collect())
     }
 
-    pub fn idle(&self) -> bool {
-        self.slots.iter().all(|slot| slot.pages.is_empty())
-            && self.imports.is_empty()
-            && self.exports.is_empty()
-    }
-
     /// Return page tables and their contiguous scratch offset. Occupied views
     /// supply their logical pages and offset in the shared page-index buffer;
     /// callers retain them through numerical completion.
-    pub fn bind(
+    pub(crate) fn bind(
         &self,
         page_tables: &[Vec<i64>],
         latent_units: &[i64],
@@ -303,32 +281,13 @@ impl<I, S> LatentPool<I, S> {
         Ok((tables, offset))
     }
 
-    pub fn imports(&self) -> impl Iterator<Item = &I> {
-        self.imports.values()
-    }
-
-    pub fn exports(&self) -> impl Iterator<Item = &S> {
+    pub(crate) fn exports(&self) -> impl Iterator<Item = &Arc<LatentExport>> {
         self.exports.values()
     }
 
-    pub fn require_retired(&self) -> Result<()> {
-        if !self.imports.is_empty() || !self.exports.is_empty() {
-            return Err(Error::Resource(
-                "latent physical reads must retire before pool shutdown",
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl<T, C, I, S> LatentPool<I, S>
-where
-    I: Deref<Target = LatentImport<T>>,
-    S: Deref<Target = LatentExport<C>>,
-{
     /// Check the trajectory addressed by a call and return its committed bank.
     #[allow(clippy::too_many_arguments)]
-    pub fn current_bank(
+    pub(crate) fn current_bank(
         &self,
         slot: usize,
         step: i64,
@@ -359,19 +318,19 @@ where
         Ok(current.bank)
     }
 
-    pub fn next_bank(&self, slot: usize) -> u8 {
+    pub(crate) fn next_bank(&self, slot: usize) -> u8 {
         1 - self.slots[slot].bank
     }
 
     /// Prepare an export before the backend constructs its numerical views.
     /// Register it before allowing another owner operation on this pool.
-    pub fn prepare_export(
+    pub(crate) fn prepare_export(
         &self,
         buffer: BufferId,
         slot: usize,
         bank: u8,
         pages: Vec<usize>,
-    ) -> Result<LatentExport<C>> {
+    ) -> Result<LatentExport> {
         if self.exports.contains_key(&buffer) {
             return Err(Error::Invalid(
                 "latent export generation is already registered".into(),
@@ -391,11 +350,15 @@ where
     }
 
     /// Install the prepared object after numerical view creation succeeds.
-    pub fn register_export(&mut self, source: S) {
+    pub(crate) fn register_export(&mut self, source: Arc<LatentExport>) {
         self.exports.insert(source.buffer, source);
     }
 
-    pub fn retain_export(&self, source: &LatentExport<C>, retirement: C) -> Result<()> {
+    pub(crate) fn retain_export(
+        &self,
+        source: &LatentExport,
+        retirement: Arc<Retirement>,
+    ) -> Result<()> {
         let mut state = source.state();
         if state.released
             || self
@@ -407,11 +370,11 @@ where
                 "latent export reservation is no longer active".into(),
             ));
         }
-        state.retirements.push(Arc::new(retirement));
+        state.retirements.push(retirement);
         Ok(())
     }
 
-    pub fn release_exports(&self, buffers: &[BufferId]) {
+    pub(crate) fn release_exports(&self, buffers: &[BufferId]) {
         for buffer in buffers {
             if let Some(source) = self.exports.get(buffer) {
                 source.state().released = true;
@@ -419,7 +382,7 @@ where
         }
     }
 
-    pub fn write_dependencies(&self, slot: usize, pages: &[usize]) -> Vec<Arc<C>> {
+    pub(crate) fn write_dependencies(&self, slot: usize, pages: &[usize]) -> Vec<Arc<Retirement>> {
         let bank = self.next_bank(slot);
         self.exports
             .values()
@@ -433,13 +396,13 @@ where
     /// Prepare bank-zero ownership before any numerical write. The owner may
     /// build views and initialize padding, then installs the returned object
     /// without changing pool assignments between these operations.
-    pub fn prepare_import(
+    pub(crate) fn prepare_import(
         &self,
         buffer: BufferId,
         slot: usize,
         pages: Vec<usize>,
         units: usize,
-    ) -> Result<LatentImport<T>> {
+    ) -> Result<LatentImport> {
         self.require_empty(slot)?;
         self.require_owners(&pages, 0, None)?;
 
@@ -457,7 +420,7 @@ where
     }
 
     /// Install the prepared import after destination views are constructed.
-    pub fn register_import(&mut self, write: I) {
+    pub(crate) fn register_import(&mut self, write: Arc<LatentImport>) {
         let slot = write.request_pool_idx;
         for &page in &write.pages {
             self.owners[page] = slot;
@@ -466,7 +429,7 @@ where
         self.imports.insert(slot, write);
     }
 
-    pub fn retain_transfer(&self, write: &LatentImport<T>, transfer: T) -> Result<()> {
+    pub(crate) fn retain_transfer(&self, write: &LatentImport, transfer: ReadRef) -> Result<()> {
         self.require_import(write)?;
         let mut state = write.state();
         if state.adopted {
@@ -478,9 +441,9 @@ where
         Ok(())
     }
 
-    pub fn validate_adoption(
+    pub(crate) fn validate_adoption(
         &self,
-        write: &LatentImport<T>,
+        write: &LatentImport,
         generation: i64,
         step: i64,
         height: i64,
@@ -502,9 +465,9 @@ where
 
     /// Apply a validated adoption after every transfer result has ordered its
     /// producer fence on the consuming stream. Readiness alone is insufficient.
-    pub fn adopt_import(
+    pub(crate) fn adopt_import(
         &mut self,
-        write: &LatentImport<T>,
+        write: &LatentImport,
         generation: i64,
         step: i64,
         height: i64,
@@ -521,7 +484,7 @@ where
     }
 
     /// Revoke the import and return transfers to cancel outside native locks.
-    pub fn abandon_import(&self, write: &LatentImport<T>) -> Result<Vec<Arc<T>>> {
+    pub(crate) fn abandon_import(&self, write: &LatentImport) -> Result<Vec<Arc<ReadRef>>> {
         if write.released() {
             return Ok(Vec::new());
         }
@@ -537,7 +500,7 @@ where
         Ok(state.transfers.clone())
     }
 
-    pub fn cancel_imports(&self, requests: &HashSet<RequestKey>) -> Vec<Arc<T>> {
+    pub(crate) fn cancel_imports(&self, requests: &HashSet<RequestKey>) -> Vec<Arc<ReadRef>> {
         let mut transfers = Vec::new();
         for write in self.imports.values() {
             if !requests.contains(&write.buffer.owner) {
@@ -553,7 +516,7 @@ where
     }
 
     /// Validate all changes without partially committing a rejected batch.
-    pub fn validate_updates(&self, updates: &[LatentUpdate]) -> Result<()> {
+    pub(crate) fn validate_updates(&self, updates: &[LatentUpdate]) -> Result<()> {
         let mut slots = HashSet::new();
         let mut claimed = HashSet::new();
         for update in updates {
@@ -636,7 +599,7 @@ where
     /// Apply the previously validated updates. The executor must not mutate
     /// assignments or updates between validation and application. Returned
     /// transfers belong to released slots and must be cancelled by their owner.
-    pub fn apply_updates(&mut self, updates: &[LatentUpdate]) -> Vec<Arc<T>> {
+    pub(crate) fn apply_updates(&mut self, updates: &[LatentUpdate]) -> Vec<Arc<ReadRef>> {
         let mut transfers = Vec::new();
         for update in updates {
             let params = &update.params;
@@ -667,7 +630,7 @@ where
         transfers
     }
 
-    pub fn release_slots(&mut self, slots: &[i64]) -> Result<Vec<Arc<T>>> {
+    pub(crate) fn release_slots(&mut self, slots: &[i64]) -> Result<Vec<Arc<ReadRef>>> {
         let slots = slots
             .iter()
             .map(|&slot| self.slot(slot))
@@ -683,7 +646,7 @@ where
             .collect())
     }
 
-    pub fn retirement_ready(&self, requests: &HashSet<RequestKey>) -> bool {
+    pub(crate) fn retirement_ready(&self, requests: &HashSet<RequestKey>) -> bool {
         !self
             .imports
             .values()
@@ -753,7 +716,7 @@ where
         Ok(())
     }
 
-    fn require_import(&self, write: &LatentImport<T>) -> Result<()> {
+    fn require_import(&self, write: &LatentImport) -> Result<()> {
         if write.released()
             || self
                 .imports
@@ -767,7 +730,7 @@ where
         Ok(())
     }
 
-    fn clear_slot(&mut self, slot: usize) -> Vec<Arc<T>> {
+    fn clear_slot(&mut self, slot: usize) -> Vec<Arc<ReadRef>> {
         self.retiring.insert(slot);
         if let Some(write) = self.imports.get(&slot) {
             let mut state = write.state();
@@ -778,16 +741,8 @@ where
         }
         Vec::new()
     }
-}
 
-impl<E, N, F, M, T, C, I, S> LatentPool<I, S>
-where
-    T: Deref<Target = Completion<E, N>>,
-    C: Deref<Target = Completion<F, M>>,
-    I: Deref<Target = LatentImport<T>>,
-    S: Deref<Target = LatentExport<C>>,
-{
-    pub fn require_initial(&self, slot: usize, pages: &[usize]) -> Result<()> {
+    pub(crate) fn require_initial(&self, slot: usize, pages: &[usize]) -> Result<()> {
         self.require_empty(slot)?;
         self.require_owners(pages, 0, None)?;
         self.require_writable(1, pages)
@@ -799,7 +754,7 @@ where
     /// readers' completions are applied by the owning thread in their own
     /// order, and a write that waited for them may be recorded before the
     /// next reap.
-    pub fn require_writable(&self, bank: u8, pages: &[usize]) -> Result<()> {
+    pub(crate) fn require_writable(&self, bank: u8, pages: &[usize]) -> Result<()> {
         if self.exports.values().any(|source| {
             source.bank == bank
                 && source.pages.iter().any(|page| pages.contains(page))
@@ -814,7 +769,7 @@ where
 
     /// Failed or cancelled physical completions retain their pages. Logical
     /// cancellation revokes visibility; it never establishes physical reuse.
-    pub fn reap(&mut self) {
+    pub(crate) fn reap(&mut self) {
         self.exports.retain(|_, source| source.retained());
         self.imports.retain(|&slot, write| {
             let state = write.state();
@@ -846,5 +801,181 @@ where
             *current = LatentSlot::default();
             false
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use uniserve_core::{CallId, RequestId};
+    use uniserve_ipc::{BufferId, LatentParams, RequestKey};
+
+    use super::*;
+    use crate::EventPool;
+    use crate::transfer::{Read, ReadRef, Retirement};
+
+    fn buffer(slot: u64) -> BufferId {
+        BufferId {
+            owner: RequestKey::new(1, RequestId(slot), 1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+        }
+    }
+
+    /// A transport read of an import, whose physical retirement the test
+    /// completes.
+    fn read() -> ReadRef {
+        ReadRef::new(&Read::new(EventPool::new(), None))
+    }
+
+    fn initial(slot: i64, pages: &[u32], units: u32) -> LatentUpdate {
+        LatentUpdate {
+            request_pool_idx: slot,
+            params: LatentParams {
+                request_key: buffer(slot as u64).owner,
+                call_id: CallId::new(1, 0),
+                page_table: pages.to_vec(),
+                latent_units: units,
+                height: 16,
+                width: units * 16,
+                start_step: 0,
+                step_count: 1,
+            },
+            expected_generation: 0,
+            expected_step: 0,
+            generation: 1,
+            step: 0,
+            release: false,
+        }
+    }
+
+    #[test]
+    fn buffers_preserve_page_order_and_rejected_commits_leave_slots_available() -> Result<()> {
+        let mut pool = LatentPool::new(2, 5, 4)?;
+        let (first, offset) = pool.bind(&[vec![3, 1]], &[7], &[])?;
+        let occupied = [(first[0].clone(), offset)];
+        let (second, second_offset) = pool.bind(&[vec![4, 2]], &[7], &occupied)?;
+        assert_eq!(first, [vec![3, 1]]);
+        assert_eq!(second, [vec![4, 2]]);
+        assert!(second_offset >= offset + 2);
+        assert!(pool.bind(&[vec![1]], &[4], &occupied).is_err());
+
+        let rejected = [initial(1, &[3, 1], 7), initial(2, &[1], 4)];
+        assert!(pool.validate_updates(&rejected).is_err());
+        pool.require_initial(1, &first[0])?;
+        pool.require_initial(2, &second[0])?;
+
+        let updates = [initial(1, &[3, 1], 7), initial(2, &[4, 2], 7)];
+        pool.validate_updates(&updates)?;
+        pool.apply_updates(&updates);
+        assert_eq!(pool.current_bank(1, 0, 1, 7, 16, 112, &[3, 1])?, 1);
+        assert_eq!(pool.current_bank(2, 0, 1, 7, 16, 112, &[4, 2])?, 1);
+        assert!(pool.current_bank(1, 0, 1, 7, 16, 112, &[1, 3]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_exported_bank_waits_for_all_readers_across_trajectory_commits() -> Result<()> {
+        let mut pool = LatentPool::new(2, 3, 4)?;
+        pool.require_initial(1, &[1])?;
+        let source = Arc::new(pool.prepare_export(buffer(1), 1, 1, vec![1])?);
+        pool.register_export(Arc::clone(&source));
+        let readers = [
+            Arc::new(Retirement::default()),
+            Arc::new(Retirement::default()),
+        ];
+        for reader in &readers {
+            pool.retain_export(&source, Arc::clone(reader))?;
+        }
+        assert!(pool.require_initial(2, &[1]).is_err());
+
+        let mut update = initial(1, &[1], 4);
+        pool.validate_updates(std::slice::from_ref(&update))?;
+        pool.apply_updates(std::slice::from_ref(&update));
+        let bank = pool.current_bank(1, 0, 1, 4, 16, 64, &[1])?;
+        pool.require_writable(1 - bank, &[1])?;
+        update.expected_generation = 1;
+        update.generation = 2;
+        update.step = 1;
+        pool.validate_updates(std::slice::from_ref(&update))?;
+        pool.apply_updates(&[update]);
+
+        pool.release_exports(&[buffer(1)]);
+        readers[0].complete(Ok(()))?;
+        pool.reap();
+        assert!(pool.require_writable(pool.next_bank(1), &[1]).is_err());
+        assert!(
+            pool.write_dependencies(1, &[1])
+                .iter()
+                .any(|signal| !signal.done())
+        );
+        readers[1].complete(Ok(()))?;
+        pool.reap();
+        pool.require_writable(pool.next_bank(1), &[1])?;
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_and_adopted_imports_keep_pages_until_physical_completion() -> Result<()> {
+        let mut pool = LatentPool::new(2, 3, 4)?;
+        let write = Arc::new(pool.prepare_import(buffer(1), 1, vec![1], 4)?);
+        pool.register_import(Arc::clone(&write));
+        let transfer = read();
+        let retirement = transfer.read().retirement();
+        pool.retain_transfer(&write, transfer)?;
+        pool.abandon_import(&write)?;
+        pool.reap();
+        assert!(write.released());
+        assert!(pool.prepare_import(buffer(2), 2, vec![1], 4).is_err());
+
+        retirement.complete(Ok(()))?;
+        pool.reap();
+        let replacement = Arc::new(pool.prepare_import(buffer(2), 2, vec![1], 4)?);
+        pool.register_import(Arc::clone(&replacement));
+        assert!(pool.retain_transfer(&write, read()).is_err());
+
+        let transfer = read();
+        let retirement = transfer.read().retirement();
+        pool.retain_transfer(&replacement, transfer)?;
+        pool.validate_adoption(&replacement, 1, 0, 16, 64)?;
+        // The consumer orders the producer fences before exposing the bank;
+        // the copy may still be executing when its stream-ordered consumers
+        // are admitted.
+        pool.adopt_import(&replacement, 1, 0, 16, 64);
+        assert!(replacement.adopted());
+        assert_eq!(pool.current_bank(2, 0, 1, 4, 16, 64, &[1])?, 0);
+        pool.release_slots(&[2])?;
+        pool.reap();
+        assert!(pool.require_initial(1, &[1]).is_err());
+
+        retirement.complete(Ok(()))?;
+        pool.reap();
+        pool.require_initial(1, &[1])
+    }
+
+    #[test]
+    fn failed_export_retirement_retains_only_its_own_pages() -> Result<()> {
+        let mut pool = LatentPool::new(2, 3, 4)?;
+        let source = Arc::new(pool.prepare_export(buffer(1), 1, 1, vec![1])?);
+        pool.register_export(Arc::clone(&source));
+        let retirement = Arc::new(Retirement::default());
+        pool.retain_export(&source, Arc::clone(&retirement))?;
+        retirement.complete(Err(Error::Transport("reader completion unknown".into())))?;
+        pool.release_exports(&[buffer(1)]);
+        pool.release_slots(&[1])?;
+        pool.reap();
+
+        assert!(pool.require_initial(2, &[1]).is_err());
+        assert!(!pool.retirement_ready(&HashSet::from([buffer(1).owner])));
+        pool.require_initial(2, &[2])?;
+        let updates = [initial(2, &[2], 4)];
+        pool.validate_updates(&updates)?;
+        pool.apply_updates(&updates);
+        assert_eq!(pool.current_bank(2, 0, 1, 4, 16, 64, &[2])?, 1);
+        assert!(pool.retirement_ready(&HashSet::from([buffer(2).owner])));
+        Ok(())
     }
 }

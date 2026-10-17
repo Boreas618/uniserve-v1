@@ -15,7 +15,7 @@
 //! results. The runner writes host values into them with [`ColumnWrites`]
 //! and gathers bank rows into the state rows natively ([`Banks::gather`]).
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 
 use super::calls::Sequence;
 use crate::ffi::DType;
@@ -87,7 +87,7 @@ impl Banks {
     /// returning. Every slot's state starts zero, and slot zero stays zero.
     pub(super) fn allocate(
         layout: BankLayout,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
         if layout.slots == 0 || layout.length == 0 || layout.hidden == 0 {

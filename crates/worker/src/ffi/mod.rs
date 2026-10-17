@@ -22,8 +22,10 @@ mod function;
 mod handle;
 mod interpreter;
 
-pub use dlpack::{Backing, DType, Device, contiguous_strides, export};
-pub use function::{DeferredCall, Function, integer_list, integers, is_none, list, strings, texts};
+pub use dlpack::{Backing, DType, MemoryKind};
+pub(crate) use dlpack::{contiguous_strides, export};
+pub use function::{DeferredCall, Function, integer_list, integers, is_none};
+pub(crate) use function::{list, strings, texts};
 pub use handle::Handle;
 pub use interpreter::{Interpreter, cooperative};
-pub use tvm_ffi::{Array, Map, Shape, Tensor};
+pub(crate) use tvm_ffi::{Shape, Tensor};

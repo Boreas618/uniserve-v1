@@ -21,10 +21,9 @@ use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::Stream;
 use uniserve_ipc::{CacheTransfer, Locator, Wake};
 
-use super::copy::{ImportBackend, ImportCopy};
 use super::{CacheImport, CacheImporter};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::storage::memory::{Memory, StorageView, dtype_name, parse_dtype};
+use crate::storage::memory::{Memory, StorageView};
 use crate::storage::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
@@ -32,7 +31,7 @@ use crate::transfer::{Notify, Retirement, Spans, Transports, notify};
 use crate::{Error, Result};
 
 /// One import thread's stream, scratch and bound numerical operations.
-pub struct ImportWorkspace {
+pub(crate) struct ImportWorkspace {
     stream: Option<Arc<Stream>>,
     scratch: Arc<Memory>,
     elements: u64,
@@ -49,18 +48,18 @@ impl ImportWorkspace {
     /// Scratch bytes of one workspace: two raw source pages of up to 8-byte
     /// elements, one FP32 conversion page and the FP32 source scales:
     /// `20 E + 8 S` for `E` page elements and `S` page scale entries.
-    pub fn scratch_bytes(elements: u64, scales: u64) -> u64 {
+    pub(crate) fn scratch_bytes(elements: u64, scales: u64) -> u64 {
         20 * elements + 8 * scales
     }
 
     /// Allocate a workspace for `planes` on its own ordinary stream and
     /// construct the unit resets and the page conversion on it.
-    pub fn bind(planes: &CachePlanes) -> Result<Self> {
+    pub(crate) fn bind(planes: &CachePlanes) -> Result<Self> {
         let (elements, scales) = planes.plan().page_extents();
         let bytes = Self::scratch_bytes(elements, scales) as usize;
         let (stream, scratch) = match planes.device() {
             Some(device) => (
-                Some(Arc::new(Stream::new(uniserve_cuda::DeviceId(device))?)),
+                Some(Arc::new(Stream::new(device)?)),
                 Memory::device(device, bytes.max(1))?,
             ),
             None => (None, Memory::host(bytes.max(1))),
@@ -111,20 +110,20 @@ impl ImportWorkspace {
 
 /// A reserved import as the importer retains it.
 #[derive(Clone)]
-pub struct ImportEntry {
-    write: Arc<CacheImport<ReadRef, ImportWorkspace>>,
+pub(crate) struct ImportEntry {
+    write: Arc<CacheImport>,
     retirement: Arc<Retirement>,
 }
 
 impl ImportEntry {
-    pub(crate) fn new(write: Arc<CacheImport<ReadRef, ImportWorkspace>>) -> Self {
+    pub(crate) fn new(write: Arc<CacheImport>) -> Self {
         Self {
             write,
             retirement: Arc::new(Retirement::default()),
         }
     }
 
-    pub(crate) fn write(&self) -> &Arc<CacheImport<ReadRef, ImportWorkspace>> {
+    pub(crate) fn write(&self) -> &Arc<CacheImport> {
         &self.write
     }
 
@@ -134,7 +133,7 @@ impl ImportEntry {
 }
 
 impl Deref for ImportEntry {
-    type Target = CacheImport<ReadRef, ImportWorkspace>;
+    type Target = CacheImport;
 
     fn deref(&self) -> &Self::Target {
         &self.write
@@ -143,7 +142,7 @@ impl Deref for ImportEntry {
 
 /// Notifies retired imports' observers and the service wake.
 pub(crate) struct Retired {
-    pub(crate) importer: Weak<CacheImporter<ImportEntry, ImportWorkspace>>,
+    pub(crate) importer: Weak<CacheImporter>,
     pub(crate) wake: Mutex<Option<Wake>>,
 }
 
@@ -175,35 +174,31 @@ impl Retired {
     }
 }
 
-/// One import's copy work.
-pub(crate) struct CacheImportBackend {
-    pub(crate) write: Arc<CacheImport<ReadRef, ImportWorkspace>>,
+/// One import's copy work, the action of a host task of the cache's import
+/// lane ([`HostAction`](crate::host::HostAction) in `copy.rs`). Workspace
+/// admission, cancellation and physical retirement belong to the importer.
+pub(crate) struct ImportCopy {
+    pub(crate) write: Arc<CacheImport>,
     pub(crate) export: Arc<CacheTransfer>,
     pub(crate) tables: Vec<Arc<GroupTable>>,
     pub(crate) initialized: Vec<u32>,
     pub(crate) planes: Arc<CachePlanes>,
     pub(crate) transports: Arc<Transports>,
-    pub(crate) importer: Arc<CacheImporter<ImportEntry, ImportWorkspace>>,
+    pub(crate) importer: Arc<CacheImporter>,
     pub(crate) retired: Arc<Retired>,
 }
 
-/// A copy task of the native host lane.
-pub(crate) type ImportTask = ImportCopy<CacheImportBackend>;
-
-impl ImportBackend for CacheImportBackend {
-    type Error = Error;
-    type Callback = Notify;
-    type Read = ReadRef;
-    type Workspace = ImportWorkspace;
-    type Import = ImportEntry;
-
-    fn reset(&self, workspace: &ImportWorkspace) -> Result<()> {
+impl ImportCopy {
+    /// Reset newly allocated destination units on the workspace's stream.
+    pub(super) fn reset(&self, workspace: &ImportWorkspace) -> Result<()> {
         workspace
             .units
             .zero(&self.planes, &self.initialized, workspace.stream())
     }
 
-    fn copy(&self, workspace: &ImportWorkspace) -> Result<()> {
+    /// Copy cache values and retain every physical transport read on the
+    /// import.
+    pub(super) fn copy(&self, workspace: &ImportWorkspace) -> Result<()> {
         let plan = self.planes.plan();
         for (index, group) in self.export.groups.iter().enumerate() {
             let Some(first) = group.tensors.first() else {
@@ -217,7 +212,7 @@ impl ImportBackend for CacheImportBackend {
                 head..head + u64::from(target.num_kv_heads),
                 0..u64::from(target.head_dim),
             ];
-            let source_dtype = parse_dtype(
+            let source_dtype = DType::parse(
                 &first
                     .locations
                     .first()
@@ -244,7 +239,7 @@ impl ImportBackend for CacheImportBackend {
                 let page_tokens = self.tables[index].shape.page_tokens;
                 direct = group.page_tokens == page_tokens
                     && group.start.is_multiple_of(page_tokens)
-                    && self.export.compute_dtype == dtype_name(target.compute_dtype)
+                    && self.export.compute_dtype == target.compute_dtype.name()
                     && head / scale_heads
                         == (head + u64::from(target.num_kv_heads) - 1) / scale_heads;
             }
@@ -271,34 +266,19 @@ impl ImportBackend for CacheImportBackend {
         Ok(())
     }
 
-    fn drain(&self, workspace: &ImportWorkspace) -> Result<()> {
+    /// Wait for the workspace stream's accesses. An error leaves their
+    /// completion unknown.
+    pub(super) fn drain(&self, workspace: &ImportWorkspace) -> Result<()> {
         if let Some(stream) = workspace.stream() {
             stream.synchronize()?;
         }
         Ok(())
     }
-
-    fn retired(&self, imports: Vec<ImportEntry>) -> Result<()> {
-        self.retired.notify(imports)
-    }
-
-    fn error(error: Error) -> Error {
-        error
-    }
-
-    fn report(error: Error) {
-        tracing::warn!(target: "uniserve_worker.transfer", "KV import cleanup failed: {error}");
-    }
-
-    fn note_cleanup(error: &mut Error, cleanup: Error) {
-        let message = format!("{error}; cache import cleanup also failed: {cleanup}");
-        *error = Error::Transport(message);
-    }
 }
 
 /// The copy of one transferred group.
 struct GroupCopy<'a> {
-    backend: &'a CacheImportBackend,
+    backend: &'a ImportCopy,
     workspace: &'a ImportWorkspace,
     index: usize,
     /// This rank's global layers, KV heads and head width in the transfer.
@@ -544,7 +524,7 @@ impl GroupCopy<'_> {
                 .collect();
             let arguments = (
                 self.index as i64,
-                tvm_ffi::String::from(dtype_name(self.source_dtype)),
+                tvm_ffi::String::from(self.source_dtype.name()),
                 tvm_ffi::String::from(backend.export.compute_dtype.as_str()),
                 count as i64,
                 offset as i64,

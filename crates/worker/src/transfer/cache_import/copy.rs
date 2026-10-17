@@ -1,144 +1,62 @@
 //! Cache copy actions on the shared native host executor.
 
-use std::ops::Deref;
-use std::sync::Arc;
+use crate::host::HostAction;
+use crate::{Error, Outcome, Result};
 
-use crate::{Completion, Error, HostAction, HostTask, Outcome};
+use super::ImportCopy;
 
-use super::{CacheImport, CacheImporter};
-
-/// The copy work of one import. Workspace admission, cancellation and
-/// physical retirement belong to the importer.
-pub trait ImportBackend: Send + Sync + 'static {
-    type Error: Send + Sync;
-    type Callback: Send + Sync;
-    type Read: Deref<Target = Completion<Self::Error, Self::Callback>> + Send + Sync;
-    type Workspace: Send + Sync;
-    type Import: Deref<Target = CacheImport<Self::Read, Self::Workspace>> + Send + Sync;
-
-    /// Reset newly allocated destination units on the workspace's stream.
-    fn reset(&self, workspace: &Self::Workspace) -> Result<(), Self::Error>;
-
-    /// Copy cache values and retain any physical transport reads on the import.
-    fn copy(&self, workspace: &Self::Workspace) -> Result<(), Self::Error>;
-
-    /// Wait for numerical accesses. An error leaves their completion unknown.
-    fn drain(&self, workspace: &Self::Workspace) -> Result<(), Self::Error>;
-
-    /// Notify observers of physical retirement after the importer unlocks.
-    fn retired(&self, imports: Vec<Self::Import>) -> Result<(), Self::Error>;
-    fn error(error: Error) -> Self::Error;
-    fn report(error: Self::Error);
-    fn note_cleanup(error: &mut Self::Error, cleanup: Self::Error);
-}
-
-/// One cache import's copy task. The importer retains its workspace and reads
-/// independently of the task result until their physical accesses end.
-pub struct ImportCopy<B: ImportBackend> {
-    importer: Arc<CacheImporter<B::Import, B::Workspace>>,
-    write: Arc<CacheImport<B::Read, B::Workspace>>,
-    backend: B,
-}
-
-impl<B: ImportBackend> ImportCopy<B> {
-    pub fn new(
-        importer: Arc<CacheImporter<B::Import, B::Workspace>>,
-        write: Arc<CacheImport<B::Read, B::Workspace>>,
-        backend: B,
-    ) -> Self {
-        Self {
-            importer,
-            write,
-            backend,
-        }
-    }
-}
-
-impl<B: ImportBackend> HostAction for ImportCopy<B> {
+impl HostAction for ImportCopy {
     type Output = ();
-    type Error = B::Error;
-    type Callback = Box<dyn FnOnce() + Send>;
-    type Wake = uniserve_ipc::Wake;
 
-    fn ready(&self) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-
-    fn run(&self) -> Result<(), Self::Error> {
+    fn run(&self) -> Result<()> {
         let _range = crate::profiling::range(c"uniserve.cache_import", None);
         self.write.start();
         let workspace = match self.importer.acquire(&self.write) {
             Ok(workspace) => workspace,
             Err(error) => {
                 self.write.finish(true);
-                return Err(B::error(error));
+                return Err(error);
             }
         };
 
         let copied = (|| {
-            self.importer
-                .require_active(&self.write)
-                .map_err(B::error)?;
+            self.importer.require_active(&self.write)?;
             // Transport reads run on other streams, but each records its
             // handoff on the workspace stream after this reset, and every
             // transport copy waits on its handoff before writing.
-            self.backend.reset(&workspace)?;
-            self.backend.copy(&workspace)
+            self.reset(&workspace)?;
+            self.copy(&workspace)
         })();
 
-        let drained = self.backend.drain(&workspace);
+        let drained = self.drain(&workspace);
         self.write.finish(drained.is_ok());
-        if let Err(mut error) = drained {
-            if let Err(cause) = copied {
-                B::note_cleanup(&mut error, cause);
-            }
-            return Err(error);
+        if let Err(error) = drained {
+            // The drain's failure leaves the copy's completion unknown; the
+            // copy's own failure, if any, is reported with it.
+            return Err(match copied {
+                Ok(()) => error,
+                Err(cause) => Error::Transport(format!(
+                    "{error}; cache import cleanup also failed: {cause}"
+                )),
+            });
         }
 
         copied
     }
 
-    fn input_outcome(&self) -> Option<Outcome<Self::Error>> {
+    fn input_outcome(&self) -> Outcome {
         // Queued cancellation has no numerical access to drain. Failed DMA
         // retains this action and its backing through the host lane's common
         // unknown-completion handling.
         self.write.task_done();
-        Some(if self.write.drained() {
+        if self.write.drained() {
             Outcome::Success(())
         } else {
             Outcome::Cancelled
-        })
-    }
-
-    fn release(&self) -> Result<(), Self::Error> {
-        self.backend.retired(self.importer.reap())
-    }
-
-    fn defer_release(_: Arc<HostTask<Self>>) -> Result<(), Self::Error> {
-        Err(B::error(Error::Invariant(
-            "cache copy input completion is known after its action".into(),
-        )))
-    }
-
-    fn notify(callbacks: Vec<Self::Callback>) {
-        for callback in callbacks {
-            callback();
         }
     }
 
-    fn wake(wake: &Self::Wake) {
-        wake.wake();
-    }
-
-    fn error(error: Error) -> Self::Error {
-        B::error(error)
-    }
-
-    fn report(error: Self::Error) {
-        B::report(error);
-    }
-
-    fn note_cleanup(error: &mut Self::Error, cleanup: Self::Error) {
-        B::note_cleanup(error, cleanup);
+    fn release(&self) -> Result<()> {
+        self.retired.notify(self.importer.reap())
     }
 }

@@ -40,28 +40,6 @@ pub struct PrefixCacheStats {
     pub preempted_hits: u64,
 }
 
-/// Token-source breakdown for scheduled prefill work.
-///
-/// The value serializes as a map with stable field names.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrefillStats {
-    /// Total number of tokens to be prefilled.
-    #[serde(default)]
-    pub num_prompt_tokens: u32,
-    /// Tokens to be prefilled locally (actual compute work).
-    #[serde(default)]
-    pub num_computed_tokens: u32,
-    /// Tokens to be prefilled without actual compute work.
-    #[serde(default)]
-    pub num_cached_tokens: u32,
-    /// Tokens to be prefilled from local prefix cache.
-    #[serde(default)]
-    pub num_local_cached_tokens: u32,
-    /// Tokens to be prefilled from external cache transfer.
-    #[serde(default)]
-    pub num_external_cached_tokens: u32,
-}
-
 /// Worker-local forward/kernel counters folded into scheduler stats.
 ///
 /// In a worker batch result (`BatchOutput::forward_stats` in the worker

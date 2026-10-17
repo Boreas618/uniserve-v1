@@ -12,8 +12,8 @@ use super::backing::TransportBuffer;
 use super::export_table::ExportTable;
 use super::read::{self, NativeRead, Read, ReadCall};
 use super::transport::{ExportView, Transport, producer, read_destination, within};
-use super::{ByteReservation, Notify, ReadReservation, Spans};
-use crate::ffi::Device;
+use super::{ByteReservation, ReadReservation, Spans};
+use crate::ffi::MemoryKind;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -23,7 +23,7 @@ impl Transport {
         view: &ExportView<'_>,
         endpoint: &Arc<ExportTable>,
         next: &AtomicU64,
-        bytes: ByteReservation<Notify>,
+        bytes: ByteReservation,
         stream: impl Issue,
     ) -> Result<Locator> {
         let event = match producer(view.spans, stream.stream())? {
@@ -47,10 +47,10 @@ impl Transport {
     pub(super) fn fetch_local(
         &self,
         locator: &Locator,
-        device: Device,
+        device: MemoryKind,
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
-        reservation: Option<&ReadReservation<Notify>>,
+        reservation: Option<&ReadReservation>,
         stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if let Some(error) = self.reads.error() {

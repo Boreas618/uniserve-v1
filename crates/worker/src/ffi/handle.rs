@@ -51,17 +51,17 @@ impl Handle {
         Self(Any::default())
     }
 
-    pub fn view(&self) -> AnyView<'_> {
+    pub(crate) fn view(&self) -> AnyView<'_> {
         AnyView::from(&self.0)
     }
 
     /// The handle as an argument value.
-    pub fn to_any(&self) -> Any {
+    pub(crate) fn to_any(&self) -> Any {
         self.0.clone()
     }
 
     /// Whether Python returned `None` instead of an object.
-    pub fn is_none(&self) -> bool {
+    pub(crate) fn is_none(&self) -> bool {
         is_none(&self.0)
     }
 }

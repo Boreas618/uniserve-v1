@@ -8,9 +8,7 @@ use crate::Result;
 use crate::config::placement::Placed;
 use crate::executor::video::extent;
 use crate::runner::RunnerSetup;
-use crate::runner::component::{
-    Component, TEXT_GRAPHS, VideoSetup, call_path, device_index, placed_device,
-};
+use crate::runner::component::{Component, TEXT_GRAPHS, VideoSetup, call_path, cuda_device};
 
 impl EncoderRunners {
     /// Build the text encoder of a placed component and, when the component
@@ -19,7 +17,7 @@ impl EncoderRunners {
         let (loaded, config) = (setup.loaded, setup.config);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
-        let device = placed_device(placed);
+        let device = placed.device;
         // The media reader packs a request's vision blocks into the
         // rows of `vision_pixels`; a deployment without conditioned
         // tasks declares none.
@@ -37,12 +35,12 @@ impl EncoderRunners {
             .map(|call| call.path.clone())
             .unwrap_or_default();
         let (stream, scratch) = setup.stream(MediaCall::TextEncoding, device)?;
-        self.text_pool = setup.graph_pool(TEXT_GRAPHS, &placed.name, device)?;
+        self.text_pool = setup.graph_pool(TEXT_GRAPHS, device)?;
         let (runner, tower) = EncoderRunner::text(TextSetup {
             loaded,
             component: &placed.name,
             path: &path,
-            device: device_index(device)?,
+            device: cuda_device(device)?,
             stream,
             scratch,
             attention: attention.clone(),
@@ -79,14 +77,14 @@ impl EncoderRunners {
     ) -> Result<()> {
         let loaded = setup.loaded;
         let attention = setup.attention.clone();
-        let device = placed_device(placed);
+        let device = placed.device;
         let (stream, scratch) = setup.stream(MediaCall::LatentEncoding, device)?;
         let setup = |capability| -> Result<RunnerSetup<'_>> {
             Ok(RunnerSetup {
                 loaded,
                 path: call_path(placed, capability)?,
                 stream: stream.clone(),
-                device: device_index(device)?,
+                device: cuda_device(device)?,
                 attention: attention.clone(),
                 scratch: scratch.clone(),
             })

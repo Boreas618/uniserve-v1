@@ -43,11 +43,11 @@
 //! its launch as a [`HostStage`].
 
 use std::collections::HashMap;
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use uniserve_core::CallId;
-use uniserve_cuda::Stream;
+use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
     ForwardStats, MediaCall, RequestKey, TensorRef, WorkerInfo,
@@ -58,16 +58,15 @@ use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
 use crate::request::RequestPool;
 use crate::storage::{
-    OutputBuffer, OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead,
-    ProductStore, Scalar,
+    OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, ProductStore,
 };
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
-use crate::{Error, Result};
+use crate::{Error, Result, lock};
 
 /// Where a batch's forward stands between its jobs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -147,7 +146,7 @@ impl<F: Default> Opening<F> {
         info: &WorkerInfo,
         rank: usize,
         plan: &BatchPlan,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         job: Recorder<'_>,
         gated: impl Fn(&Call) -> bool,
     ) -> Result<Self> {
@@ -245,7 +244,7 @@ pub(crate) struct Batch<F = ()> {
     pub(crate) retirement: Arc<Retirement>,
     /// The stream and device the batch's device work runs on.
     pub(crate) stream: Option<Stream>,
-    pub(crate) device: Option<i32>,
+    pub(crate) device: Option<DeviceId>,
     /// This rank reports the component's host results.
     pub(crate) reports: bool,
     pub(crate) started: Instant,
@@ -260,7 +259,7 @@ impl<F> Batch<F> {
         outputs: &mut OutputPool,
         words: usize,
         stream: Option<Stream>,
-        device: Option<i32>,
+        device: Option<DeviceId>,
         events: &EventPool,
         job: &Job,
     ) -> Result<Self> {
@@ -270,7 +269,7 @@ impl<F> Batch<F> {
             started,
             ..
         } = opening;
-        let devices: Vec<i32> = device.into_iter().collect();
+        let devices: Vec<DeviceId> = device.into_iter().collect();
         let buffer = outputs.lease(calls.len(), words.max(1), &devices, false)?;
         if let Some(stream) = &stream
             && let Err(error) = lock(&buffer).begin_device(device, job.on(Some(stream)), events)
@@ -297,8 +296,8 @@ impl<F> Batch<F> {
     }
 
     /// The device the batch's products live on.
-    pub(crate) fn target(&self) -> Device {
-        self.device.map_or(Device::Cpu, Device::Cuda)
+    pub(crate) fn target(&self) -> MemoryKind {
+        self.device.map_or(MemoryKind::Host, MemoryKind::Cuda)
     }
 
     /// Indices of the calls that execute.
@@ -326,7 +325,7 @@ impl<F> Batch<F> {
         job: &Job,
     ) -> Result<()> {
         let target = self.target();
-        let flags: Vec<(TensorRef, Device)> = plan
+        let flags: Vec<(TensorRef, MemoryKind)> = plan
             .calls
             .iter()
             .filter_map(|call| call.completion_output.clone())
@@ -356,7 +355,7 @@ impl<F> Batch<F> {
                 .ok_or_else(|| Error::Invariant("a completion flag names no call".into()))?;
             let state = &mut self.calls[index];
             if !state.active {
-                tensors.write_scalar(&write, Scalar::Int(0), job.on(self.stream.as_ref()))?;
+                tensors.write_scalar(&write, 0, job.on(self.stream.as_ref()))?;
             }
             state.completion_write = Some(write);
         }
@@ -385,7 +384,7 @@ impl<F> Batch<F> {
     pub(crate) fn set_flags(&self, tensors: &ProductStore, job: &Job) -> Result<()> {
         for state in self.calls.iter().filter(|state| state.active) {
             if let Some(write) = &state.completion_write {
-                tensors.write_scalar(write, Scalar::Int(1), job.on(self.stream.as_ref()))?;
+                tensors.write_scalar(write, 1, job.on(self.stream.as_ref()))?;
             }
         }
         Ok(())
@@ -406,8 +405,9 @@ impl<F> Batch<F> {
     /// Seal the lease in `job` and complete the batch's retirement (the
     /// physical end of its storage accesses) once the lease's fences
     /// complete. The executor learns of their completion from the job it
-    /// submits for them ([`crate::executor::Backend::await_outputs`]),
-    /// which also wakes the service.
+    /// submits for them
+    /// ([`crate::executor::backend::WorkerBackend::await_outputs`]), which
+    /// also wakes the service.
     pub(crate) fn seal(&self, events: &EventPool, job: &Job) -> Result<()> {
         let stream = job.on(self.stream.as_ref());
         // A lease of host storage is sealed on no stream.
@@ -507,10 +507,10 @@ pub(crate) fn request_flag(
     tensors: &ProductStore,
     call: &Call,
     predicate: &TensorRef,
-    device: Option<i32>,
+    device: Option<DeviceId>,
     job: Recorder<'_>,
 ) -> Result<()> {
-    let read = tensors.consume(predicate, call.call_id, device.map(Device::Cuda), job)?;
+    let read = tensors.consume(predicate, call.call_id, device.map(MemoryKind::Cuda), job)?;
     // One byte of a committed product, which the read lease keeps until
     // the reader's fence that ends it below.
     job.read(read.value().address(), 1);
@@ -562,11 +562,6 @@ pub(crate) trait HostStage {
 
     /// Withdraw work of a batch that will not be materialized.
     fn cancel(&mut self);
-}
-
-/// Lock a batch's output buffer; a poisoned lock keeps its state.
-pub(crate) fn lock(buffer: &OutputLease) -> MutexGuard<'_, OutputBuffer> {
-    buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The rank that reports a component's host results: its first member.

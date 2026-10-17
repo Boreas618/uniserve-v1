@@ -60,7 +60,7 @@ pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 pub(crate) use runners::{CausalLMRunners, Pending, Step, complete, forward};
 
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
+use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::ForwardMode;
 
 use super::TokenSelection;
@@ -233,7 +233,7 @@ struct Plan {
 
 /// One lane binding of a causal language model.
 pub(crate) struct CausalLMRunner {
-    device: Option<i32>,
+    device: Option<DeviceId>,
     stream: Option<Stream>,
     methods: Methods,
     functions: Functions,
@@ -255,7 +255,7 @@ pub(crate) struct CausalLMRunner {
 pub(crate) struct RunnerParts {
     /// Names the runner in errors.
     pub(crate) component: String,
-    pub(crate) device: Option<i32>,
+    pub(crate) device: Option<DeviceId>,
     pub(crate) stream: Option<Stream>,
     pub(crate) methods: Methods,
     pub(crate) functions: Functions,
@@ -291,7 +291,7 @@ impl CausalLMRunner {
         }
     }
 
-    pub(crate) fn device(&self) -> Option<i32> {
+    pub(crate) fn device(&self) -> Option<DeviceId> {
         self.device
     }
 
@@ -661,7 +661,6 @@ impl CausalLMRunner {
             self.graphs
                 .insert(key.clone(), capacity, completion.captured()?)?;
         }
-        self.graphs.record(mode);
         Ok(Executed {
             mode,
             live_tokens: plan.live_tokens,

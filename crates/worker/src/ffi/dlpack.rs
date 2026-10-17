@@ -12,30 +12,50 @@ use std::sync::Arc;
 
 use tvm_ffi::tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, DLTensor};
 use tvm_ffi::{Any, Tensor};
+use uniserve_cuda::DeviceId;
 
 use crate::{Error, Result};
 
-/// Where a view's bytes live.
+/// The kind of memory a view's bytes live in: host memory, page-locked
+/// host memory, or the memory of one CUDA device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Device {
-    Cpu,
+pub enum MemoryKind {
+    Host,
     /// Page-locked host memory, readable by CUDA copies.
-    CudaHost,
-    Cuda(i32),
+    PinnedHost,
+    Cuda(DeviceId),
 }
 
-impl Device {
-    /// The CUDA ordinal of device memory.
-    pub fn cuda_index(self) -> Option<i32> {
+impl MemoryKind {
+    /// The CUDA device of device memory.
+    pub(crate) fn cuda(self) -> Option<DeviceId> {
         match self {
-            Self::Cuda(index) => Some(index),
-            Self::Cpu | Self::CudaHost => None,
+            Self::Cuda(device) => Some(device),
+            Self::Host | Self::PinnedHost => None,
         }
+    }
+
+    /// The device spelling of transfer locators (`cuda:<ordinal>`, or
+    /// `cpu` for host memory of either kind), which consumers read back
+    /// with [`Self::from_locator`].
+    pub(crate) fn locator_name(self) -> String {
+        match self {
+            Self::Cuda(device) => device.to_string(),
+            Self::Host | Self::PinnedHost => "cpu".to_owned(),
+        }
+    }
+
+    /// The memory a transfer locator's device names: CUDA memory for
+    /// `cuda:<ordinal>`, host memory otherwise.
+    pub(crate) fn from_locator(name: &str) -> Self {
+        name.strip_prefix("cuda:")
+            .and_then(|ordinal| ordinal.parse().ok())
+            .map_or(Self::Host, |ordinal| Self::Cuda(DeviceId(ordinal)))
     }
 
     fn to_dlpack(self) -> DLDevice {
         match self {
-            Self::Cpu => DLDevice {
+            Self::Host => DLDevice {
                 device_type: DLDeviceType::kDLCPU,
                 device_id: 0,
             },
@@ -43,13 +63,13 @@ impl Device {
             // `kDLCUDAHost` tensor, and it recognizes the pages as pinned
             // from the pointer itself, so non-blocking copies stay
             // asynchronous.
-            Self::CudaHost => DLDevice {
+            Self::PinnedHost => DLDevice {
                 device_type: DLDeviceType::kDLCPU,
                 device_id: 0,
             },
             Self::Cuda(device) => DLDevice {
                 device_type: DLDeviceType::kDLCUDA,
-                device_id: device,
+                device_id: device.0,
             },
         }
     }
@@ -84,7 +104,7 @@ impl DType {
     }
 
     /// Parse a torch dtype name (`bfloat16`, `torch.int64`, ...).
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name.trim_start_matches("torch.") {
             "bool" => Self::Bool,
             "uint8" => Self::U8,
@@ -103,8 +123,15 @@ impl DType {
         })
     }
 
-    /// The torch spelling of this dtype.
-    pub fn name(self) -> &'static str {
+    /// Parse a torch dtype name, failing for any other.
+    pub(crate) fn parse(name: &str) -> Result<Self> {
+        Self::from_name(name)
+            .ok_or_else(|| Error::Invalid(format!("unknown element type {name:?}")))
+    }
+
+    /// The torch spelling of this dtype, which transfer locators and the
+    /// Python interface use.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Bool => "bool",
             Self::U8 => "uint8",
@@ -146,18 +173,55 @@ impl DType {
     }
 }
 
+/// The storage element type of a head-to-rank message's dtype; messages keep
+/// their own serialized enum, converted here once.
+impl From<uniserve_ipc::DType> for DType {
+    fn from(dtype: uniserve_ipc::DType) -> Self {
+        match dtype {
+            uniserve_ipc::DType::U8 => Self::U8,
+            uniserve_ipc::DType::I16 => Self::I16,
+            uniserve_ipc::DType::I32 => Self::I32,
+            uniserve_ipc::DType::I64 => Self::I64,
+            uniserve_ipc::DType::F16 => Self::F16,
+            uniserve_ipc::DType::BF16 => Self::BF16,
+            uniserve_ipc::DType::F32 => Self::F32,
+        }
+    }
+}
+
+/// The message dtype of a storage element type, for the element types
+/// messages carry.
+impl TryFrom<DType> for uniserve_ipc::DType {
+    type Error = Error;
+
+    fn try_from(dtype: DType) -> Result<Self> {
+        Ok(match dtype {
+            DType::U8 => Self::U8,
+            DType::I16 => Self::I16,
+            DType::I32 => Self::I32,
+            DType::I64 => Self::I64,
+            DType::F16 => Self::F16,
+            DType::BF16 => Self::BF16,
+            DType::F32 => Self::F32,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "{} has no message dtype",
+                    other.name()
+                )));
+            }
+        })
+    }
+}
+
 /// Memory a view can borrow. Implementors keep the bytes valid and unmoved
 /// for as long as the value is alive.
 pub trait Backing: Send + Sync + 'static {
-    fn device(&self) -> Device;
+    fn device(&self) -> MemoryKind;
     /// Base address: a device pointer for CUDA memory, a host pointer
     /// otherwise.
     fn address(&self) -> u64;
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    /// Length of the allocation in bytes.
+    fn bytes(&self) -> usize;
 }
 
 #[repr(C)]
@@ -194,7 +258,7 @@ unsafe extern "C" fn release(managed: *mut DLManagedTensorVersioned) {
 
 /// Export `shape`/`strides` (in elements) starting `offset` bytes into
 /// `backing` as a TVM-FFI tensor that retains `backing`.
-pub fn export(
+pub(crate) fn export(
     backing: Arc<dyn Backing>,
     offset: usize,
     dtype: DType,
@@ -206,7 +270,7 @@ pub fn export(
             "a view needs one stride per dimension".to_owned(),
         ));
     }
-    check_bounds(backing.len(), offset, dtype, shape, strides)?;
+    check_bounds(backing.bytes(), offset, dtype, shape, strides)?;
 
     let device = backing.device().to_dlpack();
     let data = backing.address() as *mut c_void;
@@ -297,7 +361,7 @@ fn check_bounds(
 }
 
 /// Contiguous strides, in elements, for `shape`.
-pub fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
+pub(crate) fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
     let mut strides = vec![1; shape.len()];
     for index in (0..shape.len().saturating_sub(1)).rev() {
         strides[index] = strides[index + 1] * shape[index + 1].max(1);

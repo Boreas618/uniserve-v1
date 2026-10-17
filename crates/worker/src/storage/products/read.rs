@@ -1,15 +1,15 @@
 //! Read leases of committed products.
 
 use super::*;
-use crate::ffi::Device;
-use crate::storage::memory::{StorageView, device_name};
+use crate::ffi::MemoryKind;
+use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use uniserve_core::CallId;
-use uniserve_cuda::{Event, Stream};
+use uniserve_cuda::{DeviceId, Event, Stream};
 use uniserve_ipc::TensorRef;
 
 /// One consumer's lease of a product. The value view stays stable even when
@@ -18,7 +18,7 @@ pub struct ProductRead {
     pub(super) value: StorageView,
     pub(super) region: Option<Vec<Range<u64>>>,
     pub(super) metadata: Option<Metadata>,
-    pub(super) lease: Mutex<TensorRead<ProductBuffer, ImportHandle>>,
+    pub(super) lease: Mutex<TensorRead>,
 }
 
 impl ProductRead {
@@ -26,11 +26,11 @@ impl ProductRead {
         &self.value
     }
 
-    pub fn region(&self) -> Option<&[Range<u64>]> {
+    pub(crate) fn region(&self) -> Option<&[Range<u64>]> {
         self.region.as_deref()
     }
 
-    pub fn metadata(&self) -> Option<Metadata> {
+    pub(crate) fn metadata(&self) -> Option<Metadata> {
         self.metadata
     }
 
@@ -39,7 +39,8 @@ impl ProductRead {
     }
 
     /// The transport reads materializing an import (empty for an ordinary
-    /// lease); callers wait for them before `ProductStore::wait_import`.
+    /// lease); callers start them and wait for them before
+    /// [`ProductStore::complete_import`] publishes the import.
     pub fn reads(&self) -> Vec<Arc<crate::transfer::Read>> {
         let imported = lock(&self.lease).imported.clone();
         imported.map_or_else(Vec::new, |imported| {
@@ -54,19 +55,15 @@ impl ProductRead {
 
 /// One consumer's access. The consumer keeps a stable tensor view even when
 /// another import extends the buffer's resident coverage.
-pub(crate) struct TensorRead<B, I> {
-    pub buffer: B,
+pub(crate) struct TensorRead {
+    pub buffer: ProductBuffer,
     pub consumer: Option<CallId>,
-    pub imported: Option<I>,
+    pub imported: Option<ImportHandle>,
     pub complete: bool,
 }
 
-impl<B, I> TensorRead<B, I> {
-    pub(crate) fn complete<T, C>(&mut self) -> Option<I>
-    where
-        B: Deref<Target = Mutex<Buffer<T, C>>>,
-        I: Deref<Target = Mutex<TensorImport<B, T>>>,
-    {
+impl TensorRead {
+    pub(crate) fn complete(&mut self) -> Option<ImportHandle> {
         if self.complete {
             return None;
         }
@@ -89,10 +86,10 @@ impl ProductStore {
     /// Lease committed products for consumer calls. The whole batch is
     /// resolved before any lease is taken. `stream` (required for device
     /// products) waits on each producer fence once.
-    pub fn consume_batch(
+    pub(crate) fn consume_batch(
         &self,
-        requests: &[(TensorRef, CallId, Option<Device>)],
-        device: Option<Device>,
+        requests: &[(TensorRef, CallId, Option<MemoryKind>)],
+        device: Option<MemoryKind>,
         stream: impl Issue,
     ) -> Result<Vec<Arc<ProductRead>>> {
         let state = lock(&self.state);
@@ -114,7 +111,7 @@ impl ProductStore {
                 ));
             }
             if let Some(target) = device.or(*requested)
-                && device_name(target) != value.device
+                && target != value.device
             {
                 return Err(Error::Invalid(
                     "device product consumer names a different device".into(),
@@ -154,7 +151,7 @@ impl ProductStore {
         &self,
         reference: &TensorRef,
         consumer: CallId,
-        device: Option<Device>,
+        device: Option<MemoryKind>,
         stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
         let mut reads =
@@ -185,8 +182,9 @@ impl ProductStore {
         for read in &pending {
             let buffer = lock(&read.lease).buffer.clone();
             state.require_buffer(&buffer)?;
-            if let (Some(consumer), Device::Cuda(device)) = (stream.stream(), read.value.device())
-                && consumer.device().0 != device
+            if let (Some(consumer), MemoryKind::Cuda(device)) =
+                (stream.stream(), read.value.device())
+                && consumer.device() != device
             {
                 return Err(Error::Invariant(
                     "device-product reader completed on a different device".into(),
@@ -200,18 +198,14 @@ impl ProductStore {
             let value = lock(write);
             if let Some(fence) = &value.producer {
                 write_fences
-                    .entry((
-                        value.id.producer_call_id,
-                        value.device.clone(),
-                        fence.stream,
-                    ))
+                    .entry((value.id.producer_call_id, value.device, fence.stream))
                     .or_insert_with(|| Arc::clone(&fence.event));
             }
         }
 
-        let mut recorded = HashMap::<i32, Arc<Event>>::new();
+        let mut recorded = HashMap::<DeviceId, Arc<Event>>::new();
         for read in &pending {
-            let Device::Cuda(device) = read.value.device() else {
+            let MemoryKind::Cuda(device) = read.value.device() else {
                 continue;
             };
             let raw = stream.stream().map(Stream::raw).ok_or_else(|| {
@@ -221,9 +215,9 @@ impl ProductStore {
                 let lease = lock(&read.lease);
                 (lease.buffer.clone(), lease.consumer)
             };
-            let name = lock(&buffer).device.clone();
+            let memory = lock(&buffer).device;
             let event = consumer
-                .and_then(|consumer| write_fences.get(&(consumer, name, raw)))
+                .and_then(|consumer| write_fences.get(&(consumer, memory, raw)))
                 .cloned();
             let event = match event {
                 Some(event) => event,

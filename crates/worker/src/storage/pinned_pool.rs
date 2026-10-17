@@ -10,9 +10,10 @@
 //! device work reads a block retains a reference until that work completed.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use uniserve_cuda::DeviceId;
 
 use crate::Result;
-use crate::ffi::{Backing, Device};
+use crate::ffi::{Backing, MemoryKind};
 use crate::storage::memory::Memory;
 
 /// The smallest block, so that small inputs share block sizes.
@@ -22,13 +23,13 @@ const MIN_BLOCK: usize = 1 << 16;
 pub struct PinnedPool {
     /// The device the blocks are page-locked for; `None` for pageable host
     /// memory.
-    device: Option<i32>,
+    device: Option<DeviceId>,
     /// Blocks no user holds.
     free: Mutex<Vec<Arc<Memory>>>,
 }
 
 impl PinnedPool {
-    pub fn new(device: Option<i32>) -> Arc<Self> {
+    pub(crate) fn new(device: Option<DeviceId>) -> Arc<Self> {
         Arc::new(Self {
             device,
             free: Mutex::new(Vec::new()),
@@ -42,13 +43,13 @@ impl PinnedPool {
     /// Lease a block of at least `bytes`: the smallest free block that
     /// holds them, or a new one of the next power of two. Contents are
     /// whatever the block last held.
-    pub fn lease(self: &Arc<Self>, bytes: usize) -> Result<Arc<PinnedBlock>> {
+    pub(crate) fn lease(self: &Arc<Self>, bytes: usize) -> Result<Arc<PinnedBlock>> {
         let reused = {
             let mut free = self.free();
             free.iter()
                 .enumerate()
-                .filter(|(_, memory)| memory.len() >= bytes)
-                .min_by_key(|(_, memory)| memory.len())
+                .filter(|(_, memory)| memory.bytes() >= bytes)
+                .min_by_key(|(_, memory)| memory.bytes())
                 .map(|(index, _)| index)
                 .map(|index| free.swap_remove(index))
         };
@@ -72,7 +73,7 @@ impl PinnedPool {
 
 /// A leased block: the leading `len()` bytes of a pool block, which returns
 /// to its pool when the lease drops.
-pub struct PinnedBlock {
+pub(crate) struct PinnedBlock {
     pool: Weak<PinnedPool>,
     /// Taken back by the pool on drop.
     memory: Option<Arc<Memory>>,
@@ -80,17 +81,17 @@ pub struct PinnedBlock {
 }
 
 impl Backing for PinnedBlock {
-    fn device(&self) -> Device {
+    fn device(&self) -> MemoryKind {
         self.memory
             .as_ref()
-            .map_or(Device::Cpu, |memory| memory.device())
+            .map_or(MemoryKind::Host, |memory| memory.device())
     }
 
     fn address(&self) -> u64 {
         self.memory.as_ref().map_or(0, |memory| memory.address())
     }
 
-    fn len(&self) -> usize {
+    fn bytes(&self) -> usize {
         self.bytes
     }
 }
@@ -112,7 +113,7 @@ mod tests {
         let pool = PinnedPool::new(None);
         let first = pool.lease(100)?;
         let address = first.address();
-        assert_eq!(first.len(), 100);
+        assert_eq!(first.bytes(), 100);
 
         // A live block is never leased twice.
         let second = pool.lease(100)?;
@@ -132,7 +133,7 @@ mod tests {
         drop(small);
         let large = pool.lease(4 * MIN_BLOCK)?;
         assert_ne!(large.address(), address);
-        assert_eq!(large.len(), 4 * MIN_BLOCK);
+        assert_eq!(large.bytes(), 4 * MIN_BLOCK);
         Ok(())
     }
 }

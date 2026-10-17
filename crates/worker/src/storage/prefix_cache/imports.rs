@@ -8,9 +8,7 @@ use uniserve_ipc::{BufferId, CacheTransfer};
 
 use super::block_tables::GroupTable;
 use crate::host::HostLane;
-use crate::transfer::{
-    CacheImporter, ImportEntry, ImportTask, ImportWorkspace, Retired, Retirement,
-};
+use crate::transfer::{CacheImporter, ImportCopy, ImportEntry, Retired, Retirement};
 use crate::{Error, HostTask, Outcome, Result};
 
 /// A reserved cache import: the destination tables and units it resets, the
@@ -19,24 +17,24 @@ pub struct PendingImport {
     pub(super) entry: ImportEntry,
     pub(super) tables: Vec<Arc<GroupTable>>,
     pub(super) export: Arc<CacheTransfer>,
-    pub(super) task: Option<Arc<HostTask<ImportTask>>>,
+    pub(super) task: Option<Arc<HostTask<ImportCopy>>>,
 }
 
 impl PendingImport {
-    pub fn buffer(&self) -> BufferId {
+    pub(crate) fn buffer(&self) -> BufferId {
         self.entry.buffer
     }
 
-    pub fn slot(&self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         self.entry.request_pool_idx
     }
 
-    pub fn export(&self) -> &Arc<CacheTransfer> {
+    pub(crate) fn export(&self) -> &Arc<CacheTransfer> {
         &self.export
     }
 
     /// Whether an install call adopted the import as its slot's prefix.
-    pub fn adopted(&self) -> bool {
+    pub(crate) fn adopted(&self) -> bool {
         self.entry.write().released()
     }
 
@@ -52,7 +50,7 @@ impl PendingImport {
     }
 
     /// Run `callback` once the copy task finished.
-    pub fn subscribe(&self, callback: Box<dyn FnOnce() + Send>) {
+    pub(crate) fn subscribe(&self, callback: Box<dyn FnOnce() + Send>) {
         match &self.task {
             Some(task) => {
                 if let Some(callback) = task.completion.subscribe(callback) {
@@ -83,8 +81,8 @@ impl PendingImport {
 
 /// Import workspaces, their copy lane and the retirement observers.
 pub(super) struct Imports {
-    pub(super) importer: Arc<CacheImporter<ImportEntry, ImportWorkspace>>,
-    pub(super) lane: HostLane<ImportTask>,
+    pub(super) importer: Arc<CacheImporter>,
+    pub(super) lane: HostLane<ImportCopy>,
     pub(super) retired: Arc<Retired>,
 }
 

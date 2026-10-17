@@ -33,18 +33,17 @@
 //! own. A batch a rule keeps from starting is started when the forward it
 //! waits for completed.
 
-pub mod backend;
+pub(crate) mod backend;
 pub(crate) mod batch;
 pub(crate) mod image;
 pub(crate) mod inputs;
-pub mod lifecycle;
+pub(crate) mod lifecycle;
 mod pending;
 pub(crate) mod products;
 pub(crate) mod transfer;
 pub(crate) mod video;
 
-pub use inputs::{BatchInputs, InputReady, InputWait};
-pub use pending::{BatchResult, PendingOutput, request_output};
+pub(crate) use pending::{BatchResult, PendingOutput, request_output};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
@@ -53,116 +52,19 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use indexmap::IndexMap;
 use uniserve_ipc::Wake;
 
+use self::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
+use crate::error::WorkerError;
+use crate::lane::{Completion, JobId};
 use crate::profiling::range;
 
-/// A job's name and what was posted for it when it was performed.
-pub type Completed<B> = (<B as Backend>::Job, <B as Backend>::Completion);
-
-/// Execution resources and numerical operations borrowed by one executor.
-///
-/// Methods run on the executor thread. Readiness callbacks may only notify a
-/// submission; they never invoke the backend or advance another batch.
-pub trait Backend {
-    type Batch;
-    type Output;
-    type Error;
-    /// Names a job from its submission to its completion.
-    type Job: Copy + Eq;
-    /// What a lane posts when it has performed a job.
-    type Completion;
-
-    fn error(&self, error: Error) -> Self::Error;
-    fn classify(&self, error: Self::Error, batch: &Self::Batch, context: &str) -> Self::Error;
-    fn note_cleanup(&self, error: &mut Self::Error, cleanup: Self::Error);
-
-    /// Revoke explicit Free commands before this batch can wait for storage.
-    fn admit(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
-
-    /// Bind request storage and reserve numerical inputs once per batch.
-    fn prepare(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
-
-    /// Submit the job that issues, on the batch's lane, what admitting its
-    /// inputs needs there (the imports of what other calls published).
-    /// `None` when nothing is to be issued now. Called each time the batch
-    /// is started, before [`Self::prepare_inputs`]; the batch goes on once
-    /// the job's completion was applied ([`Self::inputs_admitted`]).
-    fn admit_inputs(&mut self, batch: &mut Self::Batch) -> Result<Option<Self::Job>, Self::Error>;
-
-    /// Apply the completion of the job [`Self::admit_inputs`] submitted.
-    fn inputs_admitted(
-        &mut self,
-        batch: &mut Self::Batch,
-        completion: Self::Completion,
-    ) -> Result<(), Self::Error>;
-
-    /// Submit ready reads and report whether all numerical inputs are ready.
-    fn prepare_inputs(
-        &mut self,
-        batch: &mut Self::Batch,
-        submission: &Arc<Submission>,
-    ) -> Result<bool, Self::Error>;
-
-    /// Arrange a readiness notice when pending inputs can advance.
-    fn await_inputs(
-        &mut self,
-        batch: &mut Self::Batch,
-        submission: &Arc<Submission>,
-    ) -> Result<(), Self::Error>;
-
-    /// The lane the batch's forward runs on; `None` for a batch without a
-    /// forward or without a lane.
-    fn lane(&self, batch: &Self::Batch) -> Option<usize>;
-
-    /// Prepare the next job of the batch's forward and submit it without
-    /// waiting for it. `None` once the forward has nothing left to submit.
-    /// The job's completion arrives through [`Self::completed`] and is
-    /// applied by [`Self::complete`] before this is called again.
-    fn forward(&mut self, batch: &mut Self::Batch) -> Result<Option<Self::Job>, Self::Error>;
-
-    /// Apply the completion of the job [`Self::forward`] submitted last.
-    fn complete(
-        &mut self,
-        batch: &mut Self::Batch,
-        job: Self::Job,
-        completion: Self::Completion,
-    ) -> Result<(), Self::Error>;
-
-    /// Submit the job whose completion says that the device finished the
-    /// batch's launched work, so its outputs can be read. `None` when they
-    /// can be read already.
-    fn await_outputs(&mut self, batch: &mut Self::Batch) -> Result<Option<Self::Job>, Self::Error>;
-
-    /// Apply the completion of the job [`Self::await_outputs`] submitted.
-    /// The batch is not polled before.
-    fn outputs_ready(
-        &mut self,
-        batch: &mut Self::Batch,
-        completion: Self::Completion,
-    ) -> Result<(), Self::Error>;
-
-    /// The next completion that arrived, without waiting for one.
-    fn completed(&mut self) -> Result<Option<Completed<Self>>, Self::Error>;
-
-    fn begin_retirement(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
-
-    /// Materialize outputs and retire physical accesses. Returns (progress,
-    /// complete), where complete allows the executor to deliver this result.
-    fn poll(&mut self, batch: &mut Self::Batch) -> Result<(bool, bool), Self::Error>;
-    fn result(&mut self, batch: &mut Self::Batch) -> Result<Self::Output, Self::Error>;
-
-    /// Release or abandon resources; may follow cleanup after a failed call.
-    fn close(&mut self, batch: &mut Self::Batch) -> Result<(), Self::Error>;
-    fn reap(&mut self) -> Result<(), Self::Error>;
-}
-
 /// A submitted batch and the resources used by its numerical backend.
-pub struct Batch<B: Backend> {
+pub(crate) struct Batch {
     id: u64,
     collective_seq: Option<u64>,
     requests: HashSet<u64>,
     producers: HashSet<u64>,
-    data: B::Batch,
+    data: WorkerBatch,
     submission: Option<Arc<Submission>>,
     /// The lane its forward runs on.
     lane: Option<usize>,
@@ -173,21 +75,21 @@ pub struct Batch<B: Backend> {
     /// Its forward has jobs to run or in flight.
     forwarding: bool,
     /// The job of its forward that is in flight.
-    forward: Option<B::Job>,
+    forward: Option<JobId>,
     /// Its forward completed: every job ran and its host state is
     /// committed.
     launched: bool,
     /// The job that admits its inputs on its lane, while it is in flight.
-    inputs: Option<B::Job>,
+    inputs: Option<JobId>,
     /// The job whose completion says its outputs can be read.
-    outputs: Option<B::Job>,
+    outputs: Option<JobId>,
     complete: bool,
-    error: Option<B::Error>,
+    error: Option<WorkerError>,
 }
 
-impl<B: Backend> Batch<B> {
+impl Batch {
     /// Bind backend data to the scheduler's request and producer dependencies.
-    pub fn from_plan(plan: &uniserve_ipc::Batch, data: B::Batch) -> Self {
+    pub(crate) fn from_plan(plan: &uniserve_ipc::Batch, data: WorkerBatch) -> Self {
         let requests = plan
             .calls
             .iter()
@@ -221,12 +123,12 @@ impl<B: Backend> Batch<B> {
     /// `requests` includes calls and lifecycle commands. `producers` names
     /// batches supplying tensor, predicate, or cache inputs on this rank.
     /// A lifecycle-only batch has no collective sequence.
-    pub fn new(
+    pub(crate) fn new(
         id: u64,
         collective_seq: Option<u64>,
         requests: HashSet<u64>,
         producers: HashSet<u64>,
-        data: B::Batch,
+        data: WorkerBatch,
     ) -> Self {
         Self {
             id,
@@ -251,7 +153,7 @@ impl<B: Backend> Batch<B> {
     #[expect(clippy::expect_used, reason = "only submitted batches are advanced")]
     fn advance_execution(
         &mut self,
-        backend: &mut B,
+        backend: &mut WorkerBackend,
         last_sequence: &mut Option<u64>,
         distributed: bool,
     ) {
@@ -285,10 +187,13 @@ impl<B: Backend> Batch<B> {
                 {
                     // Other ranks may already be inside this collective. A
                     // local refusal makes the rank unsafe for further work.
-                    return Err(backend.error(Error::Invariant(format!(
-                        "collective sequence does not advance: batch {} carries {} after {}",
-                        self.id, sequence, previous
-                    ))));
+                    return Err(WorkerError::classify(
+                        Error::Invariant(format!(
+                            "collective sequence does not advance: batch {} carries {} after {}",
+                            self.id, sequence, previous
+                        )),
+                        None,
+                    ));
                 }
                 *last_sequence = Some(sequence);
             }
@@ -298,14 +203,14 @@ impl<B: Backend> Batch<B> {
         })();
 
         if let Err(error) = result {
-            self.fail(backend, error, "execute");
+            self.fail(backend, error);
         }
     }
 
     /// Submit the next job of the batch's forward and return; once the
     /// forward has none left, begin the batch's retirement and ask for the
     /// notice that its outputs can be read.
-    fn advance_forward(&mut self, backend: &mut B) -> Result<(), B::Error> {
+    fn advance_forward(&mut self, backend: &mut WorkerBackend) -> Result<(), WorkerError> {
         {
             let _range = range(c"uniserve.worker.execute", Some(self.id));
             self.forward = backend.forward(&mut self.data)?;
@@ -326,7 +231,12 @@ impl<B: Backend> Batch<B> {
 
     /// Apply the completion of the forward's job in flight and go on with
     /// the forward.
-    fn complete_forward(&mut self, backend: &mut B, job: B::Job, completion: B::Completion) {
+    fn complete_forward(
+        &mut self,
+        backend: &mut WorkerBackend,
+        job: JobId,
+        completion: Completion,
+    ) {
         self.forward = None;
         if self.complete {
             return;
@@ -335,23 +245,23 @@ impl<B: Backend> Batch<B> {
             .complete(&mut self.data, job, completion)
             .and_then(|()| self.advance_forward(backend));
         if let Err(error) = advanced {
-            self.fail(backend, error, "execute");
+            self.fail(backend, error);
         }
     }
 
     /// Apply the completion of the job that says the batch's outputs can
     /// be read.
-    fn complete_outputs(&mut self, backend: &mut B, completion: B::Completion) {
+    fn complete_outputs(&mut self, backend: &mut WorkerBackend, completion: Completion) {
         self.outputs = None;
         if self.complete {
             return;
         }
         if let Err(error) = backend.outputs_ready(&mut self.data, completion) {
-            self.fail(backend, error, "completion");
+            self.fail(backend, error);
         }
     }
 
-    fn advance_completion(&mut self, backend: &mut B) -> bool {
+    fn advance_completion(&mut self, backend: &mut WorkerBackend) -> bool {
         // While the device has not finished what the batch launched, there
         // is nothing to materialize or retire.
         if self.complete || !self.launched || self.outputs.is_some() {
@@ -369,17 +279,17 @@ impl<B: Backend> Batch<B> {
                 advanced || complete
             }
             Err(error) => {
-                self.fail(backend, error, "completion materialization");
+                self.fail(backend, error);
                 true
             }
         }
     }
 
-    fn fail(&mut self, backend: &mut B, error: B::Error, context: &str) {
+    fn fail(&mut self, backend: &mut WorkerBackend, error: WorkerError) {
         let _range = range(c"uniserve.worker.close", Some(self.id));
-        let mut error = backend.classify(error, &self.data, context);
-        if let Err(cleanup) = backend.close(&mut self.data) {
-            backend.note_cleanup(&mut error, cleanup);
+        let mut error = self.data.attribute(error);
+        if let Err(cleanup) = backend.close_batch(&mut self.data) {
+            error.note(&cleanup);
         }
 
         self.error = Some(error);
@@ -393,18 +303,14 @@ impl<B: Backend> Batch<B> {
 /// Weak notifications cannot keep abandoned numerical resources alive. The
 /// executor ignores notices from consumed batches, including warmup handles
 /// whose batch numbers have since been reused by serving.
-pub struct Submission {
+pub(crate) struct Submission {
     batch_id: u64,
     ready: Sender<Weak<Submission>>,
     completion_wake: Option<Wake>,
 }
 
 impl Submission {
-    pub fn batch_id(&self) -> u64 {
-        self.batch_id
-    }
-
-    pub fn notify_ready(self: &Arc<Self>) {
+    pub(crate) fn notify_ready(self: &Arc<Self>) {
         let _ = self.ready.send(Arc::downgrade(self));
         if let Some(wake) = &self.completion_wake {
             wake.wake();
@@ -413,12 +319,12 @@ impl Submission {
 }
 
 /// Own admission, dependency order, launch order, and one result per batch.
-pub struct Executor<B: Backend> {
-    backend: B,
+pub(crate) struct Executor {
+    backend: WorkerBackend,
     capacity: usize,
     distributed: bool,
     collective: bool,
-    batches: IndexMap<u64, Batch<B>>,
+    batches: IndexMap<u64, Batch>,
     last_batch: Option<u64>,
     last_sequence: Option<u64>,
     ready_sender: Sender<Weak<Submission>>,
@@ -427,20 +333,21 @@ pub struct Executor<B: Backend> {
     closed: bool,
 }
 
-impl<B: Backend> Executor<B> {
+impl Executor {
     /// Collective components serialize until prior results are consumed.
     /// Other distributed workers preserve launch order while overlapping
     /// completion; single-rank workers may prepare independent requests.
-    pub fn new(
-        backend: B,
+    pub(crate) fn new(
+        backend: WorkerBackend,
         capacity: usize,
         distributed: bool,
         collective: bool,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, WorkerError> {
         if capacity == 0 {
-            return Err(backend.error(Error::Invalid(
-                "worker admission capacity must be positive".into(),
-            )));
+            return Err(WorkerError::classify(
+                Error::Invalid("worker admission capacity must be positive".into()),
+                None,
+            ));
         }
 
         let (ready_sender, ready_receiver) = unbounded();
@@ -459,11 +366,11 @@ impl<B: Backend> Executor<B> {
         })
     }
 
-    pub fn backend(&self) -> &B {
+    pub(crate) fn backend(&self) -> &WorkerBackend {
         &self.backend
     }
 
-    pub fn backend_mut(&mut self) -> &mut B {
+    pub(crate) fn backend_mut(&mut self) -> &mut WorkerBackend {
         &mut self.backend
     }
 
@@ -473,11 +380,11 @@ impl<B: Backend> Executor<B> {
         self.completion_wake = wake;
     }
 
-    pub fn has_work(&self) -> bool {
+    pub(crate) fn has_work(&self) -> bool {
         !self.batches.is_empty()
     }
 
-    pub fn started(&self) -> bool {
+    pub(crate) fn started(&self) -> bool {
         self.last_batch.is_some()
     }
 
@@ -485,24 +392,28 @@ impl<B: Backend> Executor<B> {
     /// A full queue does not consume the ID. Other accepted IDs cannot be
     /// reused, including failed batches. Immediate failures are consumed and
     /// raised here when `propagate_errors` is set.
-    pub fn admit(
+    pub(crate) fn admit(
         &mut self,
-        mut batch: Batch<B>,
+        mut batch: Batch,
         propagate_errors: bool,
-    ) -> Result<Arc<Submission>, B::Error> {
+    ) -> Result<Arc<Submission>, WorkerError> {
         self.require_open()?;
         if let Some(previous) = self.last_batch
             && batch.id <= previous
         {
-            return Err(self.backend.error(Error::Invalid(format!(
-                "batch id {} must exceed previously submitted id {}",
-                batch.id, previous
-            ))));
+            return Err(WorkerError::classify(
+                Error::Invalid(format!(
+                    "batch id {} must exceed previously submitted id {}",
+                    batch.id, previous
+                )),
+                None,
+            ));
         }
         if self.batches.len() == self.capacity {
-            return Err(self
-                .backend
-                .error(Error::Resource("worker admission queue is full")));
+            return Err(WorkerError::classify(
+                Error::Resource("worker admission queue is full"),
+                None,
+            ));
         }
 
         self.last_batch = Some(batch.id);
@@ -535,7 +446,7 @@ impl<B: Backend> Executor<B> {
     }
 
     /// Progress ready inputs and physical completions on the owning thread.
-    pub fn advance(&mut self) -> Result<bool, B::Error> {
+    pub(crate) fn advance(&mut self) -> Result<bool, WorkerError> {
         self.require_open()?;
         {
             let _range = range(c"uniserve.worker.reap", None);
@@ -591,7 +502,7 @@ impl<B: Backend> Executor<B> {
     /// their admission, or its outputs. The completion of a job whose batch
     /// is gone (closed, or failed and consumed) has nothing left to apply
     /// to.
-    pub fn complete(&mut self, job: B::Job, completion: B::Completion) {
+    pub(crate) fn complete(&mut self, job: JobId, completion: Completion) {
         let Some(batch) = self.batches.values_mut().find(|batch| {
             batch.forward == Some(job) || batch.outputs == Some(job) || batch.inputs == Some(job)
         }) else {
@@ -618,18 +529,22 @@ impl<B: Backend> Executor<B> {
                 batch.startable = true;
                 self.start(id);
             }
-            Err(error) => batch.fail(&mut self.backend, error, "input admission"),
+            Err(error) => batch.fail(&mut self.backend, error),
         }
     }
 
     /// Consume one completed result without submitting numerical work.
     #[expect(clippy::expect_used, reason = "ownership was checked before removal")]
-    pub fn poll(&mut self, submission: &Arc<Submission>) -> Result<Option<B::Output>, B::Error> {
+    pub(crate) fn poll(
+        &mut self,
+        submission: &Arc<Submission>,
+    ) -> Result<Option<BatchResult>, WorkerError> {
         self.require_open()?;
         if !self.owns(submission) {
-            return Err(self.backend.error(Error::Invalid(
-                "poll names a batch no longer owned by this Worker".into(),
-            )));
+            return Err(WorkerError::classify(
+                Error::Invalid("poll names a batch no longer owned by this Worker".into()),
+                None,
+            ));
         }
         if !self.batches[&submission.batch_id].complete {
             return Ok(None);
@@ -648,9 +563,9 @@ impl<B: Backend> Executor<B> {
         };
 
         let _range = range(c"uniserve.worker.close", Some(batch.id));
-        match (result, self.backend.close(&mut batch.data)) {
+        match (result, self.backend.close_batch(&mut batch.data)) {
             (Err(mut error), Err(cleanup)) => {
-                self.backend.note_cleanup(&mut error, cleanup);
+                error.note(&cleanup);
                 Err(error)
             }
             (Ok(_), Err(error)) => Err(error),
@@ -659,12 +574,13 @@ impl<B: Backend> Executor<B> {
     }
 
     /// Reset startup numbering only after every warmup result is consumed.
-    pub fn reset(&mut self) -> Result<(), B::Error> {
+    pub(crate) fn reset(&mut self) -> Result<(), WorkerError> {
         self.require_open()?;
         if self.has_work() {
-            return Err(self
-                .backend
-                .error(Error::State("warmup completed with pending batches")));
+            return Err(WorkerError::classify(
+                Error::State("warmup completed with pending batches"),
+                None,
+            ));
         }
 
         self.last_batch = None;
@@ -674,14 +590,14 @@ impl<B: Backend> Executor<B> {
     }
 
     /// Attempt every batch cleanup before returning the first failure.
-    pub fn close(&mut self) -> Result<(), B::Error> {
+    pub(crate) fn close(&mut self) -> Result<(), WorkerError> {
         self.closed = true;
-        let mut failure = None;
+        let mut failure: Option<WorkerError> = None;
         for (_, mut batch) in self.batches.drain(..) {
             let _range = range(c"uniserve.worker.close", Some(batch.id));
-            if let Err(error) = self.backend.close(&mut batch.data) {
+            if let Err(error) = self.backend.close_batch(&mut batch.data) {
                 match &mut failure {
-                    Some(first) => self.backend.note_cleanup(first, error),
+                    Some(first) => first.note(&error),
                     None => failure = Some(error),
                 }
             }
@@ -750,269 +666,14 @@ impl<B: Backend> Executor<B> {
             .is_some_and(|owned| Arc::ptr_eq(owned, submission))
     }
 
-    fn require_open(&self) -> Result<(), B::Error> {
+    fn require_open(&self) -> Result<(), WorkerError> {
         if self.closed {
-            Err(self
-                .backend
-                .error(Error::State("worker executor is closed")))
+            Err(WorkerError::classify(
+                Error::State("worker executor is closed"),
+                None,
+            ))
         } else {
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A batch of the test backend: its name in the log, the lane its
-    /// forward runs on, the admission job it submits first and the jobs of
-    /// its forward still to submit.
-    struct Planned {
-        name: &'static str,
-        lane: Option<usize>,
-        admission: Option<u32>,
-        jobs: Vec<u32>,
-    }
-
-    /// A backend that submits the jobs its batches plan and logs what the
-    /// executor asks of it.
-    #[derive(Default)]
-    struct Recording {
-        log: Vec<String>,
-    }
-
-    impl Backend for Recording {
-        type Batch = Planned;
-        type Output = ();
-        type Error = Error;
-        type Job = u32;
-        type Completion = ();
-
-        fn error(&self, error: Error) -> Error {
-            error
-        }
-
-        fn classify(&self, error: Error, _batch: &Planned, _context: &str) -> Error {
-            error
-        }
-
-        fn note_cleanup(&self, _error: &mut Error, _cleanup: Error) {}
-
-        fn admit(&mut self, _batch: &mut Planned) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn prepare(&mut self, batch: &mut Planned) -> Result<(), Error> {
-            self.log.push(format!("{} prepared", batch.name));
-            Ok(())
-        }
-
-        fn admit_inputs(&mut self, batch: &mut Planned) -> Result<Option<u32>, Error> {
-            Ok(batch.admission.take())
-        }
-
-        fn inputs_admitted(&mut self, batch: &mut Planned, _completion: ()) -> Result<(), Error> {
-            self.log.push(format!("{} inputs admitted", batch.name));
-            Ok(())
-        }
-
-        fn prepare_inputs(
-            &mut self,
-            batch: &mut Planned,
-            _submission: &Arc<Submission>,
-        ) -> Result<bool, Error> {
-            self.log.push(format!("{} inputs ready", batch.name));
-            Ok(true)
-        }
-
-        fn await_inputs(
-            &mut self,
-            _batch: &mut Planned,
-            _submission: &Arc<Submission>,
-        ) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn lane(&self, batch: &Planned) -> Option<usize> {
-            batch.lane
-        }
-
-        fn forward(&mut self, batch: &mut Planned) -> Result<Option<u32>, Error> {
-            if batch.jobs.is_empty() {
-                self.log.push(format!("{} forwarded", batch.name));
-                return Ok(None);
-            }
-            let job = batch.jobs.remove(0);
-            self.log.push(format!("{} submits {job}", batch.name));
-            Ok(Some(job))
-        }
-
-        fn complete(
-            &mut self,
-            batch: &mut Planned,
-            job: u32,
-            _completion: (),
-        ) -> Result<(), Error> {
-            self.log.push(format!("{} completes {job}", batch.name));
-            Ok(())
-        }
-
-        fn await_outputs(&mut self, _batch: &mut Planned) -> Result<Option<u32>, Error> {
-            Ok(None)
-        }
-
-        fn outputs_ready(&mut self, _batch: &mut Planned, _completion: ()) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn completed(&mut self) -> Result<Option<Completed<Self>>, Error> {
-            Ok(None)
-        }
-
-        fn begin_retirement(&mut self, _batch: &mut Planned) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn poll(&mut self, _batch: &mut Planned) -> Result<(bool, bool), Error> {
-            Ok((true, true))
-        }
-
-        fn result(&mut self, _batch: &mut Planned) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn close(&mut self, _batch: &mut Planned) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn reap(&mut self) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-
-    /// A batch of one request of its own, so no batch follows another.
-    fn batch(id: u64, data: Planned) -> Batch<Recording> {
-        Batch::new(id, None, HashSet::from([id]), HashSet::new(), data)
-    }
-
-    /// The log entries since the last call.
-    fn logged(executor: &mut Executor<Recording>) -> Vec<String> {
-        std::mem::take(&mut executor.backend_mut().log)
-    }
-
-    #[test]
-    fn a_batch_goes_on_from_the_completion_of_its_input_admission() -> Result<(), Error> {
-        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
-        let planned = Planned {
-            name: "a",
-            lane: None,
-            admission: Some(7),
-            jobs: Vec::new(),
-        };
-        let submission = executor.admit(batch(1, planned), true)?;
-
-        // The admission job is in flight: the batch has not gone further,
-        // and advancing does not start it again.
-        executor.advance()?;
-        assert_eq!(logged(&mut executor), ["a prepared"]);
-        assert!(executor.poll(&submission)?.is_none());
-
-        // A completion of no job of the batch changes nothing; the
-        // admission's completion lets the batch run to its result.
-        executor.complete(8, ());
-        assert!(logged(&mut executor).is_empty());
-        executor.complete(7, ());
-        assert_eq!(
-            logged(&mut executor),
-            ["a inputs admitted", "a inputs ready", "a forwarded"]
-        );
-        executor.advance()?;
-        assert!(executor.poll(&submission)?.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn a_forward_is_submitted_job_by_job_from_each_completion() -> Result<(), Error> {
-        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
-        let planned = Planned {
-            name: "a",
-            lane: Some(0),
-            admission: None,
-            jobs: vec![10, 11],
-        };
-        let submission = executor.admit(batch(1, planned), true)?;
-
-        // The executor returned with the first job in flight; without its
-        // completion nothing more is submitted and the batch has no result.
-        assert_eq!(
-            logged(&mut executor),
-            ["a prepared", "a inputs ready", "a submits 10"]
-        );
-        executor.advance()?;
-        assert!(logged(&mut executor).is_empty());
-        assert!(executor.poll(&submission)?.is_none());
-
-        // Each completion is applied and the next job submitted from it.
-        executor.complete(10, ());
-        assert_eq!(logged(&mut executor), ["a completes 10", "a submits 11"]);
-        executor.complete(11, ());
-        assert_eq!(logged(&mut executor), ["a completes 11", "a forwarded"]);
-        executor.advance()?;
-        assert!(executor.poll(&submission)?.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn a_batch_starts_when_no_other_forward_is_in_flight() -> Result<(), Error> {
-        let mut executor = Executor::new(Recording::default(), 4, false, false)?;
-        let planned = |name, lane, jobs| Planned {
-            name,
-            lane: Some(lane),
-            admission: None,
-            jobs,
-        };
-
-        // A forward is in flight on lane 0.
-        executor.admit(batch(1, planned("a", 0, vec![10, 11])), true)?;
-        assert_eq!(
-            logged(&mut executor),
-            ["a prepared", "a inputs ready", "a submits 10"]
-        );
-
-        // Batches admitted meanwhile are not started, on another lane or
-        // on the same one, however often the executor passes.
-        let other = executor.admit(batch(2, planned("b", 1, vec![20])), true)?;
-        let same = executor.admit(batch(3, planned("c", 0, vec![30])), true)?;
-        executor.complete(10, ());
-        executor.advance()?;
-        assert_eq!(logged(&mut executor), ["a completes 10", "a submits 11"]);
-
-        // The forward completed: the oldest waiting batch starts at the
-        // executor's next pass, and the next one behind its forward.
-        executor.complete(11, ());
-        assert_eq!(logged(&mut executor), ["a completes 11", "a forwarded"]);
-        executor.advance()?;
-        assert_eq!(
-            logged(&mut executor),
-            ["b prepared", "b inputs ready", "b submits 20"]
-        );
-        executor.complete(20, ());
-        executor.advance()?;
-        assert_eq!(
-            logged(&mut executor),
-            [
-                "b completes 20",
-                "b forwarded",
-                "c prepared",
-                "c inputs ready",
-                "c submits 30"
-            ]
-        );
-        executor.complete(30, ());
-        executor.advance()?;
-        assert!(executor.poll(&other)?.is_some());
-        assert!(executor.poll(&same)?.is_some());
-        Ok(())
     }
 }

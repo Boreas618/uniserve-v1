@@ -4,19 +4,18 @@
 //! device storage; [`checks`] verifies auxiliary devices and the final
 //! startup footprint against the grant.
 
-pub mod checks;
-pub mod device;
-pub mod plan;
+pub(crate) mod checks;
+pub(crate) mod device;
+pub(crate) mod plan;
 pub(crate) mod video;
 
 use crate::{Error, Result};
 
-pub const DEFAULT_NUM_UNITS: u64 = 4096;
+pub(crate) const DEFAULT_NUM_UNITS: u64 = 4096;
 
 /// The physical unit pool that fits beside a rank's fixed allocations.
 #[derive(Clone, Copy, Debug)]
-pub struct CacheCapacity {
-    pub unit_bytes: u64,
+pub(crate) struct CacheCapacity {
     pub num_units: u64,
 }
 
@@ -25,7 +24,7 @@ impl CacheCapacity {
     /// Automatic sizing gives the pool the remaining complete units; both
     /// modes must leave room for the sentinel and one page of every group.
     #[allow(clippy::too_many_arguments)]
-    pub fn derive(
+    pub(crate) fn derive(
         pages: &[(u32, u32)],
         tokens: Option<u64>,
         unit_bytes: u64,
@@ -82,15 +81,12 @@ impl CacheCapacity {
             ));
         }
 
-        Ok(Self {
-            unit_bytes,
-            num_units,
-        })
+        Ok(Self { num_units })
     }
 }
 
 /// Count whole token pages across all cache groups, rounding down per group.
-pub fn units_for_tokens(pages: &[(u32, u32)], tokens: u64) -> u64 {
+pub(crate) fn units_for_tokens(pages: &[(u32, u32)], tokens: u64) -> u64 {
     pages
         .iter()
         .map(|&(page, units)| tokens / u64::from(page) * u64::from(units))
@@ -99,7 +95,7 @@ pub fn units_for_tokens(pages: &[(u32, u32)], tokens: u64) -> u64 {
 
 /// Unresolved calls of a token worker, including a producer and its consumer
 /// when a depth-one batch can contain both.
-pub fn call_window(depth: usize, calls: usize) -> Result<usize> {
+pub(crate) fn call_window(depth: usize, calls: usize) -> Result<usize> {
     if depth == 0 || calls == 0 {
         return Err(Error::Invalid(
             "call-window sizing requires positive bounds".into(),
@@ -110,7 +106,7 @@ pub fn call_window(depth: usize, calls: usize) -> Result<usize> {
 }
 
 /// Media slots keep two unresolved outputs and one position for retirement.
-pub fn request_tensor_window(depth: usize, slots: usize) -> Result<usize> {
+pub(crate) fn request_tensor_window(depth: usize, slots: usize) -> Result<usize> {
     if slots == 0 || depth / slots < 3 {
         return Err(Error::Invalid(
             "request tensor pipeline requires two unresolved outputs per slot".into(),
@@ -122,8 +118,7 @@ pub fn request_tensor_window(depth: usize, slots: usize) -> Result<usize> {
 
 /// Storage and concurrency bounds consumed by the worker's physical owners.
 #[derive(Clone, Copy, Debug)]
-pub struct ArenaCapacity {
-    pub latent_pool_bytes: u64,
+pub(crate) struct ArenaCapacity {
     pub tensor_store: usize,
     pub device_product_bytes: u64,
     pub transfer_bytes: u64,
@@ -136,12 +131,11 @@ impl ArenaCapacity {
     /// submitted window until its last reader retires. Scalar backing comes
     /// from the numerical store's dtype schema, in bytes per product slot.
     #[allow(clippy::too_many_arguments)]
-    pub fn for_tokens(
+    pub(crate) fn for_tokens(
         depth: usize,
         calls: usize,
         requests: usize,
         scalar_bytes: u64,
-        latent_pool_bytes: u64,
         transfer_bytes_per_read: u64,
     ) -> Result<Self> {
         let window = call_window(depth, calls)?;
@@ -150,7 +144,6 @@ impl ArenaCapacity {
         let transfer_tickets = slots.min(256);
 
         Ok(Self {
-            latent_pool_bytes,
             tensor_store,
             device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes),
             transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
@@ -162,7 +155,7 @@ impl ArenaCapacity {
     /// A media rank retains every local product in full. Read tickets also
     /// cover assembly across all producing ranks, including stateless ranks.
     #[allow(clippy::too_many_arguments)]
-    pub fn for_requests(
+    pub(crate) fn for_requests(
         depth: usize,
         calls: usize,
         requests: usize,
@@ -170,14 +163,12 @@ impl ArenaCapacity {
         scalar_bytes: u64,
         product_bytes_per_request: u64,
         concurrent_imports: usize,
-        latent_pool_bytes: u64,
     ) -> Result<Self> {
         let window = request_tensor_window(depth, requests)?;
         let slots = (depth * calls).max(requests * concurrent_imports);
         let tensor_store = 6 * (slots + calls);
 
         Ok(Self {
-            latent_pool_bytes,
             tensor_store,
             device_product_bytes: product_bytes(tensor_store, requests, window, scalar_bytes),
             transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
@@ -194,9 +185,9 @@ fn product_bytes(products: usize, requests: usize, window: usize, scalar_bytes: 
     products as u64 * (scalar_bytes + 1) + ((requests + 1) * (window + 1) * 18) as u64
 }
 
-/// Device storage for two latent banks, optional step workspace, page indices
-/// and a float32 timestep for each one-based request slot.
-pub fn latent_pool_bytes(
+/// Device storage for two latent banks, an optional step workspace and a
+/// float32 timestep for each one-based request slot.
+pub(crate) fn latent_pool_bytes(
     requests: usize,
     pages: usize,
     page_units: usize,
@@ -214,8 +205,5 @@ pub fn latent_pool_bytes(
     } else {
         0
     };
-    Ok(2 * pages as u64 * page_bytes
-        + workspace
-        + (pages - 1) as u64 * 8
-        + (requests + 1) as u64 * 4)
+    Ok(2 * pages as u64 * page_bytes + workspace + (requests + 1) as u64 * 4)
 }

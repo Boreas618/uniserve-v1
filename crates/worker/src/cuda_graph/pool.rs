@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use uniserve_cuda::DeviceId;
 
 use indexmap::IndexMap;
 use tvm_ffi::Any;
@@ -9,17 +10,12 @@ use tvm_ffi::Any;
 use crate::ffi::{Function, Handle};
 use crate::{Error, Result};
 
-/// The numerical allocator's pool handle and its backing owner.
-pub struct GraphPool<P> {
-    pub device: i32,
+/// One allocator pool of the numerical library (`uniserve.cuda_graph.pool`)
+/// on a device: the library's pool handle and its allocator id.
+pub struct GraphPool {
+    pub device: DeviceId,
     pub id: (u64, u64),
-    pub value: P,
-}
-
-/// A numerical execution and the pools retained for its captures.
-pub struct GraphPools<O, P> {
-    pub owner: O,
-    pub pools: Vec<Arc<GraphPool<P>>>,
+    pub value: Handle,
 }
 
 /// Pool sharing, startup residency and byte limits across numerical owners.
@@ -27,14 +23,15 @@ pub struct GraphPools<O, P> {
 /// Capture catalogs remain with the numerical backend. It supplies allocator
 /// snapshots and process usage at preparation boundaries; replay needs no
 /// allocator inspection. Owners sharing pools must serialize graph replay.
-pub struct GraphStorage<O, P> {
-    owners: IndexMap<usize, GraphPools<O, P>>,
-    budgets: BTreeMap<i32, u64>,
-    outside: BTreeMap<i32, i128>,
+pub(crate) struct GraphStorage {
+    /// The pools retained for each owner's captures.
+    owners: IndexMap<usize, Vec<Arc<GraphPool>>>,
+    budgets: BTreeMap<DeviceId, u64>,
+    outside: BTreeMap<DeviceId, i128>,
 }
 
-impl<O, P> GraphStorage<O, P> {
-    pub fn new(budgets: BTreeMap<i32, u64>) -> Self {
+impl GraphStorage {
+    pub(crate) fn new(budgets: BTreeMap<DeviceId, u64>) -> Self {
         Self {
             owners: IndexMap::new(),
             budgets,
@@ -44,7 +41,11 @@ impl<O, P> GraphStorage<O, P> {
 
     /// Borrow shared pools before allocating the remaining devices.
     /// The caller commits only after all numerical allocations succeed.
-    pub fn prepare(&self, owner: usize, share: Option<usize>) -> Result<Vec<Arc<GraphPool<P>>>> {
+    pub(crate) fn prepare(
+        &self,
+        owner: usize,
+        share: Option<usize>,
+    ) -> Result<Vec<Arc<GraphPool>>> {
         if self.owners.contains_key(&owner) {
             return Err(Error::State("graph storage owner is already registered"));
         }
@@ -53,58 +54,33 @@ impl<O, P> GraphStorage<O, P> {
             Some(share) => self
                 .owners
                 .get(&share)
-                .map(|owner| owner.pools.clone())
+                .cloned()
                 .ok_or(Error::State("shared graph storage owner is not registered")),
             None => Ok(Vec::new()),
         }
     }
 
     /// Install successfully allocated pools and defaults for unbudgeted devices.
-    pub fn commit(
+    pub(crate) fn commit(
         &mut self,
         key: usize,
-        owner: O,
-        pools: Vec<Arc<GraphPool<P>>>,
-        defaults: impl IntoIterator<Item = (i32, u64)>,
+        pools: Vec<Arc<GraphPool>>,
+        defaults: impl IntoIterator<Item = (DeviceId, u64)>,
     ) {
         for (device, amount) in defaults {
             self.budgets.entry(device).or_insert(amount);
         }
-        self.owners.insert(key, GraphPools { owner, pools });
-    }
-
-    pub fn pools(&self, owner: usize) -> Result<&[Arc<GraphPool<P>>]> {
-        self.owners
-            .get(&owner)
-            .map(|owner| owner.pools.as_slice())
-            .ok_or(Error::State("graph storage owner is not registered"))
-    }
-
-    pub fn owners(&self) -> impl Iterator<Item = &GraphPools<O, P>> {
-        self.owners.values()
-    }
-
-    pub fn owner(&self, key: usize) -> &O {
-        &self.owners[&key].owner
-    }
-
-    pub fn has_pools(&self) -> bool {
-        self.owners.values().any(|owner| !owner.pools.is_empty())
-    }
-
-    pub fn bound_devices(&self) -> impl Iterator<Item = i32> + '_ {
-        self.outside.keys().copied()
-    }
-
-    pub fn needs_pool_sizes(&self) -> bool {
-        self.budgets.len() > self.outside.len()
+        self.owners.insert(key, pools);
     }
 
     /// Attribute a shared pool once, to its first remaining numerical owner.
-    pub fn owner_bytes(&self, segments: &[(i32, (u64, u64), u64)]) -> BTreeMap<(usize, i32), u64> {
+    pub(crate) fn owner_bytes(
+        &self,
+        segments: &[(DeviceId, (u64, u64), u64)],
+    ) -> BTreeMap<(usize, DeviceId), u64> {
         let mut owners = HashMap::new();
         for (&key, owner) in &self.owners {
-            for pool in &owner.pools {
+            for pool in owner {
                 owners.entry((pool.device, pool.id)).or_insert(key);
             }
         }
@@ -118,7 +94,10 @@ impl<O, P> GraphStorage<O, P> {
         sizes
     }
 
-    pub fn pool_bytes(&self, segments: &[(i32, (u64, u64), u64)]) -> BTreeMap<i32, u64> {
+    pub(crate) fn pool_bytes(
+        &self,
+        segments: &[(DeviceId, (u64, u64), u64)],
+    ) -> BTreeMap<DeviceId, u64> {
         let mut sizes: BTreeMap<_, _> = self.budgets.keys().map(|&device| (device, 0)).collect();
         for ((_, device), used) in self.owner_bytes(segments) {
             *sizes.entry(device).or_default() += used;
@@ -127,18 +106,18 @@ impl<O, P> GraphStorage<O, P> {
     }
 
     /// Bind the process footprint outside graph pools at the start of capture.
-    pub fn set_budget(&mut self, device: i32, amount: u64, process: u64, pooled: u64) {
+    pub(crate) fn set_budget(&mut self, device: DeviceId, amount: u64, process: u64, pooled: u64) {
         self.outside
             .insert(device, i128::from(process) - i128::from(pooled));
         self.budgets.insert(device, amount);
     }
 
     /// Account for process growth while preparing, and only pools after seal.
-    pub fn resident_bytes(
+    pub(crate) fn resident_bytes(
         &self,
-        pools: &BTreeMap<i32, u64>,
-        mut process: impl FnMut(i32) -> u64,
-    ) -> BTreeMap<i32, i128> {
+        pools: &BTreeMap<DeviceId, u64>,
+        mut process: impl FnMut(DeviceId) -> u64,
+    ) -> BTreeMap<DeviceId, i128> {
         self.budgets
             .keys()
             .map(|&device| {
@@ -151,12 +130,12 @@ impl<O, P> GraphStorage<O, P> {
             .collect()
     }
 
-    pub fn check(&self, residency: &BTreeMap<i32, i128>) -> Result<()> {
+    pub(crate) fn check(&self, residency: &BTreeMap<DeviceId, i128>) -> Result<()> {
         for (&device, &used) in residency {
             let budget = self.budgets[&device];
             if used > i128::from(budget) {
                 return Err(Error::Invalid(format!(
-                    "graph residency on cuda:{device} exceeds its byte budget ({used}>{budget})"
+                    "graph residency on {device} exceeds its byte budget ({used}>{budget})"
                 )));
             }
         }
@@ -164,23 +143,18 @@ impl<O, P> GraphStorage<O, P> {
     }
 
     /// Serving growth belongs to the worker grant, not the sealed graph pools.
-    pub fn seal(&mut self) {
+    pub(crate) fn seal(&mut self) {
         self.outside.clear();
     }
 
-    /// The caller drains graphs and views before releasing their pool owner.
-    pub fn release(&mut self, owner: usize) -> Option<GraphPools<O, P>> {
-        self.owners.shift_remove(&owner)
-    }
-
-    pub fn close(&mut self) -> Vec<GraphPools<O, P>> {
+    pub(crate) fn close(&mut self) -> Vec<Vec<Arc<GraphPool>>> {
         self.outside.clear();
-        self.owners.drain(..).map(|(_, owner)| owner).collect()
+        self.owners.drain(..).map(|(_, pools)| pools).collect()
     }
 }
 
 /// The worker reserves the same graph share when planning and allocating.
-pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
+pub(crate) fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
 }
 
@@ -191,21 +165,20 @@ pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
 /// has no pool on get a new one. `create` is `uniserve.cuda_graph.pool`,
 /// returning `[pool, id_a, id_b, total_bytes]`. The owner is registered only
 /// after every pool exists, so a failure leaves the storage unchanged.
-pub fn reserve_pools(
-    storage: &mut GraphStorage<String, Handle>,
+pub(crate) fn reserve_pools(
+    storage: &mut GraphStorage,
     create: &Function,
     key: usize,
-    owner: String,
-    devices: &[i32],
+    devices: &[DeviceId],
     share: Option<usize>,
-) -> Result<Vec<Arc<GraphPool<Handle>>>> {
+) -> Result<Vec<Arc<GraphPool>>> {
     let shared = storage.prepare(key, share)?;
     let mut pools = Vec::new();
     let mut defaults = Vec::new();
     for &device in devices {
         if pools
             .iter()
-            .any(|pool: &Arc<GraphPool<Handle>>| pool.device == device)
+            .any(|pool: &Arc<GraphPool>| pool.device == device)
         {
             continue;
         }
@@ -214,7 +187,7 @@ pub fn reserve_pools(
             continue;
         }
         let value: tvm_ffi::Array<Any> =
-            create.call_as(&[(&Any::from(i64::from(device))).into()])?;
+            create.call_as(&[(&Any::from(i64::from(device.0))).into()])?;
         let item = |index: usize| {
             value
                 .get(index)
@@ -237,6 +210,6 @@ pub fn reserve_pools(
             value: Handle::new(item(0)?)?,
         }));
     }
-    storage.commit(key, owner, pools.clone(), defaults);
+    storage.commit(key, pools.clone(), defaults);
     Ok(pools)
 }

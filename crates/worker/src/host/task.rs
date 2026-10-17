@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tvm_ffi::{Any, AnyView};
 use uniserve_core::VideoCondition;
 
+use super::HostAction;
 use super::mux::{MuxSession, frame_unit};
 use super::reader::{ConditionProducts, ConditionReader};
-use super::{HostAction, HostTask};
-use crate::ffi::{Backing, DType, Device, Function, Interpreter};
+use crate::ffi::{Backing, DType, Function, Interpreter, MemoryKind};
 use crate::storage::memory::StorageView;
 use crate::transfer::{SharedMapping, SharedRead};
-use crate::{Error, Outcome};
+use crate::{Error, Outcome, Result};
 
 /// A borrowed shared-memory payload exposed as host bytes. The mapping
 /// stays alive through every tensor viewing it.
@@ -29,15 +29,15 @@ struct MappedBytes {
 }
 
 impl Backing for MappedBytes {
-    fn device(&self) -> Device {
-        Device::Cpu
+    fn device(&self) -> MemoryKind {
+        MemoryKind::Host
     }
 
     fn address(&self) -> u64 {
         (self.mapping.address() + self.offset) as u64
     }
 
-    fn len(&self) -> usize {
+    fn bytes(&self) -> usize {
         self.bytes
     }
 }
@@ -133,9 +133,6 @@ pub(crate) enum TaskOutput {
     Media(Vec<u8>),
 }
 
-/// Observers of a task's completion.
-pub(crate) type TaskCallback = Box<dyn FnOnce() + Send>;
-
 impl MediaTask {
     fn execute(&self) -> crate::Result<TaskOutput> {
         match self {
@@ -162,7 +159,7 @@ impl MediaTask {
                         AnyView::from(&Any::from(i64::from(*frame_rate))),
                     ])
                 })?;
-                if row.device() != Device::Cpu || !row.is_contiguous() {
+                if row.device() != MemoryKind::Host || !row.is_contiguous() {
                     return Err(Error::Invariant(
                         "an encoded unit row is not contiguous host memory".into(),
                     ));
@@ -205,57 +202,22 @@ impl MediaTask {
 
 impl HostAction for MediaTask {
     type Output = TaskOutput;
-    type Error = Arc<Error>;
-    type Callback = TaskCallback;
-    type Wake = uniserve_ipc::Wake;
 
-    fn ready(&self) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-
-    fn run(&self) -> Result<TaskOutput, Self::Error> {
+    fn run(&self) -> Result<TaskOutput> {
         let _range = crate::profiling::range(c"uniserve.host.media", None);
-        self.execute().map_err(Arc::new)
+        self.execute()
     }
 
-    fn release(&self) -> Result<(), Self::Error> {
+    fn release(&self) -> Result<()> {
         if let Self::EncodeUnit { frames, .. } = self {
             frames.release();
         }
         Ok(())
     }
 
-    fn input_outcome(&self) -> Option<Outcome<Self::Error>> {
+    fn input_outcome(&self) -> Outcome {
         // Inputs are host memory read on the task's own thread: they are
         // released as soon as the action returns or is withdrawn.
-        Some(Outcome::Success(()))
-    }
-
-    fn defer_release(_: Arc<HostTask<Self>>) -> Result<(), Self::Error> {
-        Err(Arc::new(Error::Invariant(
-            "a media task's inputs are released with its action".into(),
-        )))
-    }
-
-    fn notify(callbacks: Vec<Self::Callback>) {
-        for callback in callbacks {
-            callback();
-        }
-    }
-
-    fn wake(wake: &Self::Wake) {
-        wake.wake();
-    }
-
-    fn report(error: Self::Error) {
-        tracing::error!(target: "uniserve_worker.media", "host media task failed: {error}");
-    }
-
-    fn error(error: Error) -> Self::Error {
-        Arc::new(error)
-    }
-
-    fn note_cleanup(_error: &mut Self::Error, cleanup: Self::Error) {
-        tracing::warn!(target: "uniserve_worker.media", "host media cleanup failed: {cleanup}");
+        Outcome::Success(())
     }
 }

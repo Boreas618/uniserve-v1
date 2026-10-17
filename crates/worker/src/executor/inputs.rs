@@ -48,7 +48,7 @@ use super::batch::{flag, request_flag};
 use super::transfer::latents::{self, LatentInput};
 use crate::error::WorkerError;
 use crate::executor::Submission;
-use crate::ffi::Device;
+use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job};
 use crate::storage::{
     Metadata, OutputPlacement, PendingImport, PrefixCache, ProductRead, ProductStore, ValueRange,
@@ -59,39 +59,27 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use uniserve_ipc::{
-    Batch as BatchPlan, BufferId, CacheTransfer, Call, CallId, CallKind, DType, MediaCall,
-    TensorExport, TensorRef, TransferHandle, TransferMode, TransferTransport,
+    Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, DType, MediaCall, TensorExport,
+    TensorRef, TransferHandle, TransferMode, TransferTransport,
 };
 
-/// A borrowed resource reports consumability; physical retirement remains
-/// the responsibility of its storage owner. Queries neither submit work nor
-/// invoke completion observers while the caller is borrowing its input set.
-pub trait InputReady {
-    type Error;
-
-    fn ready(&self) -> std::result::Result<bool, Self::Error>;
-}
-
-/// Input leases and preparation progress for one scheduler batch. Backends
-/// retain their numerical views in I and their completion owners in D.
-pub struct BatchInputs<I, D> {
-    pub inputs: HashMap<BufferId, I>,
-    pub tasks: HashMap<CallId, D>,
-    pub dependencies: Vec<D>,
-    pub predicate: Option<D>,
-    pub started: usize,
-    pub submitted: bool,
-    pub awaiting_reads: bool,
+/// Input leases and preparation progress for one scheduler batch: its
+/// imported inputs and the physical accesses its storage writes wait for.
+/// Readiness queries neither submit work nor invoke completion observers.
+pub(crate) struct BatchInputs {
+    pub(crate) inputs: HashMap<BufferId, Input>,
+    pub(crate) dependencies: Vec<Hazard>,
+    pub(crate) started: usize,
+    pub(crate) submitted: bool,
+    pub(crate) awaiting_reads: bool,
     closed: Arc<AtomicBool>,
 }
 
-impl<I, D> Default for BatchInputs<I, D> {
+impl Default for BatchInputs {
     fn default() -> Self {
         Self {
             inputs: HashMap::new(),
-            tasks: HashMap::new(),
             dependencies: Vec::new(),
-            predicate: None,
             started: 0,
             submitted: false,
             awaiting_reads: false,
@@ -100,75 +88,46 @@ impl<I, D> Default for BatchInputs<I, D> {
     }
 }
 
-impl<I, D> BatchInputs<I, D> {
-    pub fn closed(&self) -> bool {
+impl BatchInputs {
+    pub(crate) fn closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
     /// Claim cleanup before releasing any resource. A failed release does
     /// not prevent the remaining owners from being closed by the backend.
-    pub fn close(&self) -> bool {
+    pub(crate) fn close(&self) -> bool {
         !self.closed.swap(true, Ordering::AcqRel)
     }
 
     /// The extra arrival prevents an already-complete dependency from firing
     /// the observer before registration has finished.
-    pub fn wait(&self, dependencies: usize) -> Arc<InputWait> {
+    pub(crate) fn wait(&self, dependencies: usize) -> Arc<InputWait> {
         Arc::new(InputWait {
             remaining: AtomicUsize::new(dependencies + 1),
             closed: Arc::clone(&self.closed),
         })
     }
-}
 
-impl<I, D> BatchInputs<I, D>
-where
-    I: InputReady,
-    D: InputReady<Error = I::Error>,
-{
-    pub fn storage_ready(&self) -> std::result::Result<bool, I::Error> {
-        for dependency in &self.dependencies {
-            if !dependency.ready()? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+    /// Whether every physical access the batch's writes wait for finished.
+    pub(crate) fn storage_ready(&self) -> bool {
+        self.dependencies.iter().all(Hazard::ready)
     }
 
-    pub fn ready(&self) -> std::result::Result<bool, I::Error> {
-        if !self.submitted || !self.storage_ready()? {
-            return Ok(false);
-        }
-        for task in self.tasks.values() {
-            if !task.ready()? {
-                return Ok(false);
-            }
-        }
-        for input in self.inputs.values() {
-            if !input.ready()? {
-                return Ok(false);
-            }
-        }
-        if let Some(predicate) = &self.predicate {
-            return predicate.ready();
-        }
-        Ok(true)
-    }
-
-    pub fn input_ready(&self, buffer: &BufferId) -> std::result::Result<bool, I::Error> {
-        self.inputs.get(buffer).map_or(Ok(false), InputReady::ready)
+    /// Whether every input is consumable once admission was submitted.
+    pub(crate) fn ready(&self) -> bool {
+        self.submitted && self.storage_ready() && self.inputs.values().all(Input::ready)
     }
 }
 
 /// One snapshot of input dependencies. Each dependency arrives exactly once;
 /// only the last arrival may notify the executor, and closing suppresses it.
-pub struct InputWait {
+pub(crate) struct InputWait {
     remaining: AtomicUsize,
     closed: Arc<AtomicBool>,
 }
 
 impl InputWait {
-    pub fn arrive(&self) -> bool {
+    pub(crate) fn arrive(&self) -> bool {
         self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 && !self.closed.load(Ordering::Acquire)
     }
 }
@@ -178,46 +137,48 @@ pub(crate) enum Input {
     /// A product read into this rank's tensor store on `device`.
     Tensor {
         read: Arc<ProductRead>,
-        device: Device,
+        device: MemoryKind,
     },
     /// A cache transfer copied into its install call's pages.
     Cache(PendingImport),
     /// A latent trajectory version read into the consuming call's slot,
     /// on `device`.
-    Latent { input: LatentInput, device: Device },
+    Latent {
+        input: LatentInput,
+        device: MemoryKind,
+    },
     /// A product a host media call reads in place from a location on this
     /// node; importing it would read unused capacity.
     Borrowed,
 }
 
-impl InputReady for Input {
-    type Error = Error;
-
-    fn ready(&self) -> Result<bool> {
-        Ok(match self {
+impl Input {
+    /// Whether the input is consumable: its reads or its cache copy
+    /// finished.
+    fn ready(&self) -> bool {
+        match self {
             Self::Tensor { read, .. } => read.reads().iter().all(|read| read.ready()),
             Self::Cache(import) => import.done(),
             Self::Latent { input, .. } => input.reads().iter().all(|read| read.ready()),
             Self::Borrowed => true,
-        })
+        }
     }
 }
 
 /// A physical access a batch's cache writes wait for.
 pub(crate) struct Hazard(Arc<Retirement>);
 
-impl InputReady for Hazard {
-    type Error = Error;
-
-    fn ready(&self) -> Result<bool> {
-        Ok(self.0.done())
+impl Hazard {
+    /// Whether the access finished (successfully or not).
+    fn ready(&self) -> bool {
+        self.0.done()
     }
 }
 
 /// A batch's imported inputs and their preparation progress.
 #[derive(Default)]
 pub(crate) struct Inputs {
-    state: BatchInputs<Input, Hazard>,
+    state: BatchInputs,
     /// The storage hazards were resolved.
     resolved: bool,
     /// Resident cache exports the batch's install calls read.
@@ -275,12 +236,12 @@ impl Inputs {
 }
 
 /// The device a component's calls run on.
-pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Result<Device> {
+pub(crate) fn component_device(backend: &WorkerBackend, component: &str) -> Result<MemoryKind> {
     let placed = backend
         .components()
         .get(component)
         .ok_or_else(|| Error::Invalid(format!("call targets unplaced component {component:?}")))?;
-    Ok(placed.device.cuda_index().map_or(Device::Cpu, Device::Cuda))
+    Ok(placed.device.memory())
 }
 
 /// Admit the batch's product imports that can be admitted now, recording
@@ -371,7 +332,7 @@ fn admit_products(
     if std::mem::take(&mut batch.inputs_mut().refused) {
         return Ok(());
     }
-    if batch.inputs().state.submitted || !batch.inputs().state.storage_ready()? {
+    if batch.inputs().state.submitted || !batch.inputs().state.storage_ready() {
         return Ok(());
     }
     require_storage(&batch.inputs().state)?;
@@ -402,13 +363,13 @@ fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPla
         // The hazards were resolved and the products admitted by `admit`,
         // unless a hazard or a refused import still holds them up.
         let inputs = batch.inputs();
-        if !inputs.state.storage_ready()? || inputs.state.started < plan.input_products.len() {
+        if !inputs.state.storage_ready() || inputs.state.started < plan.input_products.len() {
             return Ok(false);
         }
         import_cache(backend, batch, plan)?;
         batch.inputs_mut().state.submitted = true;
     }
-    batch.inputs().state.ready()
+    Ok(batch.inputs().state.ready())
 }
 
 /// What a batch's cache transfers and writes depend on.
@@ -507,11 +468,7 @@ fn latent_hazards(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<Vec<A
             .iter()
             .map(|&page| page as usize)
             .collect();
-        hazards.extend(
-            pool.write_dependencies(slot, &pages)
-                .iter()
-                .map(|retirement| Arc::clone(&**retirement)),
-        );
+        hazards.extend(pool.write_dependencies(slot, &pages));
     }
     Ok(hazards)
 }
@@ -578,7 +535,7 @@ fn write_spans(
 }
 
 /// Fail when an overlapping access ended without retiring its storage.
-fn require_storage(state: &BatchInputs<Input, Hazard>) -> Result<()> {
+fn require_storage(state: &BatchInputs) -> Result<()> {
     for Hazard(retirement) in &state.dependencies {
         match retirement.outcome() {
             Some(Outcome::Success(())) => {}
@@ -1181,7 +1138,7 @@ fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job) -> Result<()>
         &storage.tensors,
         call,
         predicate,
-        device.cuda_index(),
+        device.cuda(),
         job.on(stream.as_ref()),
     )
 }
@@ -1217,7 +1174,7 @@ fn publish(
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(
-    &mut crate::storage::latent::Pool,
+    &mut crate::storage::LatentPool,
     &crate::storage::LatentStorage,
 )> {
     let latents = backend
@@ -1267,7 +1224,7 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
         .collect();
     inputs.state.dependencies.clear();
     let mut result = Ok(());
-    let mut reads: HashMap<Device, Vec<Arc<ProductRead>>> = HashMap::new();
+    let mut reads: HashMap<MemoryKind, Vec<Arc<ProductRead>>> = HashMap::new();
     for input in taken {
         match input {
             Input::Tensor { read, device } => reads.entry(device).or_default().push(read),
@@ -1336,6 +1293,39 @@ mod tests {
             tensor,
         };
         assert_eq!(metadata(&plain)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_dependencies_notify_once_unless_the_inputs_closed() -> Result<()> {
+        let inputs = BatchInputs::default();
+        let wait = inputs.wait(8);
+        // The registering caller's own arrival is the extra one.
+        assert!(!wait.arrive());
+
+        let notified = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let wait = Arc::clone(&wait);
+                    scope.spawn(move || usize::from(wait.arrive()))
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .map_err(|_| Error::State("input completion thread panicked"))
+                })
+                .sum::<Result<usize>>()
+        })?;
+        assert_eq!(notified, 1);
+
+        let pending = inputs.wait(1);
+        assert!(!pending.arrive());
+        assert!(inputs.close());
+        assert!(!inputs.close());
+        assert!(!pending.arrive());
         Ok(())
     }
 }

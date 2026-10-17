@@ -9,10 +9,8 @@
 //! one runner operation and returns the Rust-owned results as DLPack
 //! tensors.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 #[path = "harness/config.rs"]
-mod config;
+pub mod config;
 
 use std::sync::Arc;
 
@@ -21,7 +19,7 @@ use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
 use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter};
-use uniserve_worker::storage::memory::{Memory, StorageView};
+use uniserve_worker::storage::{Memory, StorageView};
 use uniserve_worker::{
     DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool,
     ImagePreparation, ImageSetup, Result, Tower,
@@ -52,7 +50,7 @@ fn module_path(root: &str, path: &str) -> String {
 
 fn arena(device: Device) -> Result<StorageView> {
     let memory: Arc<dyn Backing> = match device {
-        Device::Cuda(index) => Memory::device(index, ARENA_BYTES)?,
+        Device::Cuda(cuda) => Memory::device(cuda, ARENA_BYTES)?,
         Device::Cpu => Memory::host(ARENA_BYTES),
     };
     StorageView::contiguous(memory, 0, DType::U8, &[ARENA_BYTES as i64])
@@ -106,11 +104,11 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             None => vec![(0..payloads.len()).collect()],
         };
         let device = match config.optional::<i64>("device")? {
-            Some(index) if index >= 0 => Device::Cuda(index as i32),
+            Some(index) if index >= 0 => Device::Cuda(DeviceId(index as i32)),
             _ => Device::Cpu,
         };
         let stream = match device {
-            Device::Cuda(index) => Some(Stream::new(DeviceId(index))?),
+            Device::Cuda(cuda) => Some(Stream::new(cuda)?),
             Device::Cpu => None,
         };
         let root = config.string("root")?;
@@ -132,12 +130,12 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let products = arena(device)?;
         let mut runner = EncoderRunner::image(&setup, info, &settings)?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
-            let Device::Cuda(index) = device else {
+            let Device::Cuda(cuda) = device else {
                 return Err(uniserve_worker::Error::Invalid(
                     "capture requires a CUDA device".into(),
                 ));
             };
-            let pool = pool(index)?;
+            let pool = pool(cuda)?;
             runner.capture(Some(&pool), &mut || Ok(()))?;
         }
         runner.seal();
@@ -162,7 +160,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let dtype = match runner.info() {
+        let dtype = match info {
             EncoderInfo::Vision(vision) => vision.output_dtype,
             EncoderInfo::Latent(latent) => latent.output_dtype,
             EncoderInfo::Text(text) => text.output_dtype,
@@ -202,9 +200,9 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
 }
 
 /// A graph allocator pool on CUDA `device` (`uniserve.cuda_graph.pool`).
-fn pool(device: i32) -> Result<Arc<GraphPool<Handle>>> {
+fn pool(device: DeviceId) -> Result<Arc<GraphPool>> {
     let value: Array<Any> = Interpreter::import("uniserve.cuda_graph.pool")?
-        .call_as(&[(&Any::from(i64::from(device))).into()])?;
+        .call_as(&[(&Any::from(i64::from(device.0))).into()])?;
     let number = |index: usize| -> Result<u64> {
         let value = value.get(index).map_err(|error| {
             uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error)
@@ -285,7 +283,9 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let mut results = Vec::new();
         for (image, pixels) in images.iter().zip(staged) {
             results.push(Any::from(pixels.to_tensor()?));
-            let product = image.product.as_ref().expect("product");
+            let product = image.product.as_ref().ok_or_else(|| {
+                uniserve_worker::Error::Invariant("a decoded image lost its product".into())
+            })?;
             results.push(Any::from(view(
                 product,
                 &[3, i64::from(image.height), i64::from(image.width)],

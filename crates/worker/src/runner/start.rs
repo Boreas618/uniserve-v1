@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use uniserve_cuda::{DeviceId, Stream};
+use uniserve_cuda::Stream;
 use uniserve_ipc::{CallKind, MediaCall};
 
 use crate::capacity::plan::LatentPlan;
@@ -14,7 +14,7 @@ use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::executor::batch::decodes_video;
-use crate::ffi::{Handle, Interpreter};
+use crate::ffi::Interpreter;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::runner::ImageSetup;
@@ -105,7 +105,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) components: &'a Components,
     /// The shared work areas of the rank's streams.
     pub(crate) scratches: &'a mut Scratches,
-    pub(crate) graphs: &'a mut GraphStorage<String, Handle>,
+    pub(crate) graphs: &'a mut GraphStorage,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
 }
@@ -121,11 +121,11 @@ struct Target {
 
 /// The lane stream serving `kind` on `device`.
 fn stream(streams: &Streams, kind: CallKind, device: Device) -> Result<Option<Stream>> {
-    let Some(index) = device.cuda_index() else {
+    let Some(index) = device.cuda() else {
         return Ok(None);
     };
     let stream = streams
-        .stream_for(kind, DeviceId(index))
+        .stream_for(kind, index)
         .ok_or(Error::State("image calls have no execution stream"))?;
     Ok(Some(stream.stream()?.clone()))
 }
@@ -301,7 +301,7 @@ impl ImageOwners {
                     width,
                     dtype,
                     true,
-                    device.cuda_index(),
+                    device.cuda(),
                     startup.preparation,
                 )?;
                 let pool =
@@ -331,7 +331,7 @@ impl ImageOwners {
         for target in &targets {
             let scratch = startup.scratches.get(
                 target.stream.as_ref().map_or(0, Stream::raw),
-                target.device.cuda_index(),
+                target.device.cuda(),
             )?;
             let setup = ImageSetup {
                 loaded,
@@ -428,7 +428,7 @@ impl ImageOwners {
         if let (Some((_, runner)), Some(latents)) = (&diffusion, &latents)
             && config.graph_policy != "off"
             && config.flow_cuda_graph
-            && let Some(ordinal) = runner.device().cuda_index()
+            && let Some(ordinal) = runner.device().cuda()
         {
             flow = flow_shapes(
                 config,
@@ -442,14 +442,13 @@ impl ImageOwners {
                 devices.extend(
                     config
                         .devices()
-                        .filter_map(Device::cuda_index)
+                        .filter_map(Device::cuda)
                         .filter(|&device| device != ordinal),
                 );
                 flow_pools = reserve_pools(
                     startup.graphs,
                     &Interpreter::import("uniserve.cuda_graph.pool")?,
                     runner.graph_key()?,
-                    "image:denoiser".to_owned(),
                     &devices,
                     None,
                 )?;
@@ -461,18 +460,11 @@ impl ImageOwners {
         if config.graph_policy != "off" {
             let create_pool = Interpreter::import("uniserve.cuda_graph.pool")?;
             for (index, runner) in encoders.iter().enumerate() {
-                let (Some(key), Some(ordinal)) = (runner.graph_key(), runner.device().cuda_index())
+                let (Some(key), Some(ordinal)) = (runner.graph_key(), runner.device().cuda())
                 else {
                     continue;
                 };
-                let reserved = reserve_pools(
-                    startup.graphs,
-                    &create_pool,
-                    key,
-                    format!("image:encoder{index}"),
-                    &[ordinal],
-                    None,
-                )?;
+                let reserved = reserve_pools(startup.graphs, &create_pool, key, &[ordinal], None)?;
                 if let Some(pool) = reserved.into_iter().next() {
                     pools.insert(index, pool);
                 }
@@ -481,7 +473,7 @@ impl ImageOwners {
 
         // Completion words per call plus every image's pixels.
         let max_pixel_words = (max_image_pixels(layout.as_ref()) * 3).div_ceil(8) * max_calls;
-        let device = config.device.cuda_index();
+        let device = config.device.cuda();
         let outputs = OutputPool::new(
             device,
             startup.queue_depth.max(1) * 2,

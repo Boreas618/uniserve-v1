@@ -10,25 +10,28 @@
 //! | cuda_vmm | export in place or copy into a VMM pool chunk | map the handle, then copy |
 //! | channel | copy into the locator's payload bytes | stage on the host, then copy |
 //!
-//! All transports of a rank share one [`Capacity`]: export bytes are held
-//! until physical retirement, and reads hold a read credit plus their bytes
-//! until their copy drains.
+//! All transports of a rank share one [`TransferCapacity`]: export bytes
+//! are held until physical retirement, and reads hold a read credit plus
+//! their bytes until their copy drains.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use uniserve_cuda::{Event, Stream};
+use uniserve_cuda::{DeviceId, Event, Stream};
 use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::backing::TransportBuffer;
 use super::export_table::ExportTable;
-use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext, ReadPool};
+use super::pool::TransferPool;
+use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext};
 use super::vmm::{CudaExports, Exported};
-use super::{ByteReservation, Capacity, Notify, ReadReservation, Retirement, Spans, notify};
-use crate::ffi::Device;
-use crate::storage::memory::{Memory, device_name, dtype_name, parse_dtype};
+use super::{
+    ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
+};
+use crate::ffi::{DType, MemoryKind};
+use crate::storage::memory::Memory;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result};
 
@@ -45,7 +48,7 @@ pub enum TransportKind {
 }
 
 impl TransportKind {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Shm => "shm",
@@ -112,9 +115,9 @@ pub(super) enum Backend {
 /// One mechanism's exports and reads.
 pub struct Transport {
     pub(super) source: WorkerEndpoint,
-    pub(super) capacity: Arc<Capacity>,
+    pub(super) capacity: Arc<TransferCapacity>,
     pub(super) events: Arc<EventPool>,
-    pub(super) reads: Arc<ReadPool>,
+    pub(super) reads: Arc<TransferPool>,
     pub(super) context: Arc<ReadContext>,
     pub(super) borrowed: Arc<BorrowedReads>,
     pub(super) backend: Backend,
@@ -154,10 +157,10 @@ impl<'a> ExportView<'a> {
             source: source.clone(),
             transport,
             nbytes: self.nbytes,
-            dtype: dtype_name(self.spans.dtype()).to_owned(),
+            dtype: self.spans.dtype().name().to_owned(),
             shape: self.shape.clone(),
             offset: self.offset.clone(),
-            device: device_name(self.spans.device()),
+            device: self.spans.device().locator_name(),
         }
     }
 }
@@ -194,13 +197,13 @@ pub(crate) enum Staged {
 pub(super) fn producer<'s>(
     spans: &Spans,
     stream: Option<&'s Stream>,
-) -> Result<Option<(i32, &'s Stream)>> {
-    let Device::Cuda(device) = spans.device() else {
+) -> Result<Option<(DeviceId, &'s Stream)>> {
+    let MemoryKind::Cuda(device) = spans.device() else {
         return Ok(None);
     };
     let stream = stream
         .ok_or_else(|| Error::Invalid("a device export requires its producer stream".into()))?;
-    if stream.device().0 != device {
+    if stream.device() != device {
         return Err(Error::Invalid(
             "an export's producer stream is on another device".into(),
         ));
@@ -209,9 +212,9 @@ pub(super) fn producer<'s>(
 }
 
 impl Transport {
-    pub fn new(
+    pub(crate) fn new(
         kind: TransportKind,
-        capacity: Arc<Capacity>,
+        capacity: Arc<TransferCapacity>,
         events: Arc<EventPool>,
         options: &TransportOptions,
     ) -> Result<Self> {
@@ -247,7 +250,7 @@ impl Transport {
             },
         };
         let workers = if kind == TransportKind::Channel { 1 } else { 2 };
-        let reads = Arc::new(ReadPool::new(
+        let reads = Arc::new(TransferPool::new(
             Arc::clone(&capacity),
             workers,
             &format!("uniserve-{}-read", kind.name()),
@@ -263,7 +266,7 @@ impl Transport {
         })
     }
 
-    pub fn kind(&self) -> TransportKind {
+    pub(crate) fn kind(&self) -> TransportKind {
         match self.backend {
             Backend::Local { .. } => TransportKind::Local,
             Backend::Shared { .. } => TransportKind::Shm,
@@ -272,7 +275,7 @@ impl Transport {
         }
     }
 
-    pub fn capacity(&self) -> &Arc<Capacity> {
+    pub(crate) fn capacity(&self) -> &Arc<TransferCapacity> {
         &self.capacity
     }
 
@@ -294,14 +297,14 @@ impl Transport {
 
     /// Whether this mechanism reads `locator`: a location of its kind, which
     /// for a POSIX segment must be on this rank's node.
-    pub fn reads(&self, locator: &Locator) -> bool {
+    pub(crate) fn reads(&self, locator: &Locator) -> bool {
         TransportKind::of(locator) == self.kind()
             && (self.kind() != TransportKind::Shm || locator.source.node == self.source.node)
     }
 
     /// Whether this mechanism reaches any of `consumers` (every mechanism
     /// serves an export without declared consumers).
-    pub fn serves(&self, consumers: &[usize]) -> bool {
+    pub(crate) fn serves(&self, consumers: &[usize]) -> bool {
         if consumers.is_empty() {
             return true;
         }
@@ -415,43 +418,24 @@ impl Transport {
         }
     }
 
-    /// Read `region` (in the locator's own coordinates, the whole export by
-    /// default) into `destination` on `device`, or borrow a process-local
-    /// export in place when no destination is given.
+    /// Issue a read of `region` (in the locator's own coordinates, the whole
+    /// export by default) into `destination` on `device`, or a borrow of a
+    /// process-local export in place when no destination is given.
     ///
-    /// A device destination records its handoff on `stream`, the stream
-    /// that orders the destination's earlier writes; transport copies start
-    /// after it. `reservation` supplies the read's credit when the read is
-    /// part of a planned fan-out.
-    ///
-    /// The read is issued on `stream` and started at once
-    /// ([`Self::issue_fetch`], [`Read::start`]).
-    pub fn fetch(
-        &self,
-        locator: &Locator,
-        device: Device,
-        destination: Option<&Spans>,
-        region: Option<&[Range<u64>]>,
-        reservation: Option<&ReadReservation<Notify>>,
-        stream: Option<&Stream>,
-    ) -> Result<Arc<Read>> {
-        let read = self.issue_fetch(locator, device, destination, region, reservation, stream)?;
-        read.start()?;
-        Ok(read)
-    }
-
-    /// Issue a read as [`Self::fetch`] describes it, with its handoff fence
-    /// issued to `stream`. The caller starts the read ([`Read::start`])
-    /// once that issuer performed its work, so the fence's record is made
-    /// before the read reaches its transport thread: at once after a
-    /// stream, from the job's completion on after a recorder.
+    /// A device destination's handoff fence is issued to `stream`, the
+    /// stream that orders the destination's earlier writes; transport copies
+    /// start after it. `reservation` supplies the read's credit when the read
+    /// is part of a planned fan-out. The caller starts the read
+    /// ([`Read::start`]) once that issuer performed its work, so the fence's
+    /// record is made before the read reaches its transport thread: at once
+    /// after a stream, from the job's completion on after a recorder.
     pub fn issue_fetch(
         &self,
         locator: &Locator,
-        device: Device,
+        device: MemoryKind,
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
-        reservation: Option<&ReadReservation<Notify>>,
+        reservation: Option<&ReadReservation>,
         stream: impl Issue,
     ) -> Result<Arc<Read>> {
         if TransportKind::of(locator) != self.kind() {
@@ -485,7 +469,7 @@ impl Transport {
         call: ReadCall,
         nbytes: u64,
         stream: impl Issue,
-        reservation: Option<&ReadReservation<Notify>>,
+        reservation: Option<&ReadReservation>,
     ) -> Result<Arc<Read>> {
         let backend = NativeRead {
             read: Read::new(Arc::clone(&self.events), None),
@@ -508,7 +492,7 @@ impl Transport {
     }
 
     /// The physical retirement signal of an export.
-    pub fn retirement(&self, locator: &Locator) -> Result<Arc<Retirement>> {
+    pub(crate) fn retirement(&self, locator: &Locator) -> Result<Arc<Retirement>> {
         match self.endpoint() {
             Some(endpoint) => endpoint.retirement(locator),
             None => {
@@ -533,7 +517,7 @@ impl Transport {
     }
 
     /// Install the service wake fired when reads complete or exports retire.
-    pub fn set_wake(&self, wake: Option<Wake>) {
+    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         if let Some(endpoint) = self.endpoint() {
             endpoint.set_wake(wake.clone());
         }
@@ -541,7 +525,7 @@ impl Transport {
             .set_completion_wake(wake.map(|wake| -> Notify { Arc::new(move || wake.wake()) }));
     }
 
-    pub fn reap(&self) -> Result<()> {
+    pub(crate) fn reap(&self) -> Result<()> {
         match &self.backend {
             Backend::Shared { endpoint, .. } => endpoint.reap(),
             Backend::Cuda(cuda) => {
@@ -555,7 +539,7 @@ impl Transport {
 
     /// Whether remote readers still hold exports; their acknowledgments have
     /// no wake source, so the service polls while this holds.
-    pub fn awaiting_acknowledgment(&self) -> bool {
+    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
         match &self.backend {
             Backend::Shared { endpoint, .. } => endpoint.awaiting_acknowledgment(),
             Backend::Cuda(cuda) => cuda.awaiting_acknowledgment(),
@@ -565,7 +549,7 @@ impl Transport {
 
     /// Join reads, drain borrowed consumers and retire every export. Fails,
     /// retaining storage, while remote readers still hold exports.
-    pub fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         let borrowed = self
             .borrowed
             .lock()
@@ -615,7 +599,7 @@ pub(super) fn within(region: &[Range<u64>], shape: &[u64]) -> Result<()> {
 /// Validate a read's destination against the region of the export it reads.
 pub(super) fn read_destination(
     locator: &Locator,
-    device: Device,
+    device: MemoryKind,
     destination: Option<&Spans>,
     region: Option<&[Range<u64>]>,
 ) -> Result<Spans> {
@@ -629,14 +613,14 @@ pub(super) fn read_destination(
         }
         None => locator.shape.clone(),
     };
-    destination.validate_destination(&shape, parse_dtype(&locator.dtype)?, device)?;
+    destination.validate_destination(&shape, DType::parse(&locator.dtype)?, device)?;
     Ok(destination.clone())
 }
 
 /// The byte offset and length of whole leading rows of a shared export;
 /// `region`'s leading range is in logical coordinates.
 pub(super) fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Result<(usize, usize)> {
-    let element = parse_dtype(&locator.dtype)?.bytes() as u64;
+    let element = DType::parse(&locator.dtype)?.bytes() as u64;
     let shape = &locator.shape;
     let rows = shape.first().copied().unwrap_or(1);
     let row_bytes = element * shape.iter().skip(1).product::<u64>();
@@ -676,13 +660,13 @@ pub(super) fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Resu
 pub struct Transports {
     transports: BTreeMap<TransportKind, Arc<Transport>>,
     exports: BTreeSet<TransportKind>,
-    capacity: Arc<Capacity>,
+    capacity: Arc<TransferCapacity>,
 }
 
 impl Transports {
     pub fn new(
         kinds: &[TransportKind],
-        capacity: Arc<Capacity>,
+        capacity: Arc<TransferCapacity>,
         events: Arc<EventPool>,
         options: &TransportOptions,
     ) -> Result<Self> {
@@ -708,7 +692,7 @@ impl Transports {
     }
 
     /// Publish products only over `kinds`, each of which must be configured.
-    pub fn with_exports(mut self, kinds: &[TransportKind]) -> Result<Self> {
+    pub(crate) fn with_exports(mut self, kinds: &[TransportKind]) -> Result<Self> {
         if let Some(kind) = kinds
             .iter()
             .find(|kind| !self.transports.contains_key(kind))
@@ -727,39 +711,39 @@ impl Transports {
     }
 
     /// The transport of `kind` when the rank publishes over it.
-    pub fn exporter(&self, kind: TransportKind) -> Option<&Arc<Transport>> {
+    pub(crate) fn exporter(&self, kind: TransportKind) -> Option<&Arc<Transport>> {
         self.exports
             .contains(&kind)
             .then(|| self.transports.get(&kind))
             .flatten()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.transports.is_empty()
     }
 
     /// Whether the rank publishes over no mechanism.
-    pub fn exports_nothing(&self) -> bool {
+    pub(crate) fn exports_nothing(&self) -> bool {
         self.exports.is_empty()
     }
 
     /// Whether the rank publishes over a mechanism other ranks can read:
     /// anything but the process-local registry.
-    pub fn exports_remotely(&self) -> bool {
+    pub(crate) fn exports_remotely(&self) -> bool {
         self.exports
             .iter()
             .any(|&kind| kind != TransportKind::Local)
     }
 
-    pub fn capacity(&self) -> &Arc<Capacity> {
+    pub fn capacity(&self) -> &Arc<TransferCapacity> {
         &self.capacity
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<Transport>> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<Transport>> {
         self.transports.values()
     }
 
-    pub fn set_wake(&self, wake: Option<Wake>) {
+    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         for transport in self.iter() {
             transport.set_wake(wake.clone());
         }
@@ -769,7 +753,7 @@ impl Transports {
         self.iter().try_for_each(|transport| transport.reap())
     }
 
-    pub fn awaiting_acknowledgment(&self) -> bool {
+    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
         self.iter()
             .any(|transport| transport.awaiting_acknowledgment())
     }

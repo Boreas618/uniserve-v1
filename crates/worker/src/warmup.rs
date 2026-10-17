@@ -33,7 +33,7 @@ const WARMUP_ENGINE: u64 = u64::MAX;
 
 /// Warmup work of one capability runtime. Every method runs on every rank
 /// of the group in the same order.
-pub trait WarmupHooks {
+pub(crate) trait WarmupHooks {
     /// Prepare modules that serve several sizes and run their placeholder
     /// steps.
     fn prepare(&mut self, _backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
@@ -60,15 +60,15 @@ pub trait WarmupHooks {
 /// runtime's warmup collectives order identically on every rank; request
 /// slots are taken downward from the highest, so prefix and request rows of
 /// one scenario never collide.
-pub struct Scenarios<'a> {
-    executor: &'a mut Executor<WorkerBackend>,
+pub(crate) struct Scenarios<'a> {
+    executor: &'a mut Executor,
     next_batch: u64,
     next_slot: u32,
     next_request: u64,
 }
 
 impl<'a> Scenarios<'a> {
-    pub fn new(executor: &'a mut Executor<WorkerBackend>) -> Self {
+    pub(crate) fn new(executor: &'a mut Executor) -> Self {
         let slots = executor.backend().info().request_slots;
         Self {
             executor,
@@ -78,19 +78,19 @@ impl<'a> Scenarios<'a> {
         }
     }
 
-    pub fn backend(&mut self) -> &mut WorkerBackend {
+    pub(crate) fn backend(&mut self) -> &mut WorkerBackend {
         self.executor.backend_mut()
     }
 
     /// The next batch id and its collective sequence.
-    pub fn batch_id(&mut self) -> (u64, u64) {
+    pub(crate) fn batch_id(&mut self) -> (u64, u64) {
         let id = self.next_batch;
         self.next_batch += 1;
         (id, 16 * id + 1)
     }
 
     /// A fresh request slot, counting down from the highest.
-    pub fn slot(&mut self) -> Result<u32> {
+    pub(crate) fn slot(&mut self) -> Result<u32> {
         if self.next_slot == 0 {
             return Err(Error::Resource(
                 "warmup scenarios exhausted the request slots",
@@ -102,7 +102,7 @@ impl<'a> Scenarios<'a> {
     }
 
     /// A fresh warmup request identity.
-    pub fn request_key(&mut self) -> RequestKey {
+    pub(crate) fn request_key(&mut self) -> RequestKey {
         let key = RequestKey::new(WARMUP_ENGINE, RequestId(self.next_request), 0);
         self.next_request += 1;
         key
@@ -112,7 +112,7 @@ impl<'a> Scenarios<'a> {
     /// completions of the batch's jobs by polling, since no wake is
     /// installed before the rank serves. A batch that has no result at the
     /// deadline fails the warmup.
-    pub fn run(&mut self, plan: BatchPlan) -> std::result::Result<BatchResult, WorkerError> {
+    pub(crate) fn run(&mut self, plan: BatchPlan) -> std::result::Result<BatchResult, WorkerError> {
         let plan = Arc::new(plan);
         let batch = Batch::from_plan(&plan, WorkerBatch::new(Arc::clone(&plan)));
         let submission = self.executor.admit(batch, true)?;
@@ -133,7 +133,7 @@ impl<'a> Scenarios<'a> {
 
     /// Admit one request and finish it: the executor's admission,
     /// retirement and result paths, with no numerical work.
-    pub fn lifecycle(&mut self) -> std::result::Result<(), WorkerError> {
+    pub(crate) fn lifecycle(&mut self) -> std::result::Result<(), WorkerError> {
         let slot = self.slot()?;
         let key = self.request_key();
         let admission = NewRequest::new(
@@ -169,7 +169,7 @@ impl<'a> Scenarios<'a> {
 
     /// Forget a retired warmup request, returning its slot. Serving starts
     /// with no resident request.
-    pub fn release(&mut self, key: RequestKey) {
+    pub(crate) fn release(&mut self, key: RequestKey) {
         let requests = self.executor.backend_mut().requests_mut();
         if requests.peek(key.request_id.0).is_some() {
             requests.remove(key.request_id.0);

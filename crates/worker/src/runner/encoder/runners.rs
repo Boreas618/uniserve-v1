@@ -7,7 +7,6 @@ use uniserve_ipc::{CallKind, MediaCall};
 
 use super::EncoderRunner;
 use crate::cuda_graph::GraphPool;
-use crate::ffi::Handle;
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::component::Component;
@@ -41,7 +40,7 @@ pub(crate) struct EncoderRunners {
     /// The vision tower bound with the text encoder, for conditioned tasks.
     pub(crate) vision: Option<EncoderRunner>,
     /// The text encoder's graph pool, when graphs are captured.
-    pub(crate) text_pool: Option<Arc<GraphPool<Handle>>>,
+    pub(crate) text_pool: Option<Arc<GraphPool>>,
     /// A video model's condition latent encoders.
     pub(crate) latent: Option<Component<EncoderRunner>>,
     /// An image model's encoders, in construction order.
@@ -49,7 +48,7 @@ pub(crate) struct EncoderRunners {
     /// The image encoder serving each component's call kind.
     routes: HashMap<(String, CallKind), usize>,
     /// Graph pools of packed vision encoders, by encoder.
-    pools: HashMap<usize, Arc<GraphPool<Handle>>>,
+    pools: HashMap<usize, Arc<GraphPool>>,
 }
 
 impl EncoderRunners {
@@ -58,7 +57,7 @@ impl EncoderRunners {
     pub(crate) fn image(
         encoders: Vec<EncoderRunner>,
         routes: HashMap<(String, CallKind), usize>,
-        pools: HashMap<usize, Arc<GraphPool<Handle>>>,
+        pools: HashMap<usize, Arc<GraphPool>>,
     ) -> Self {
         Self {
             image: encoders,

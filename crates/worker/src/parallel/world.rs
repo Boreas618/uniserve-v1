@@ -27,7 +27,7 @@ use super::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT, bind_beside};
 use super::topology::{ComponentGroups, GroupPlan, MeshBinding, PlanInputs};
 
 /// One component's bound meshes on this rank.
-pub struct ComponentMeshes {
+pub(crate) struct ComponentMeshes {
     pub plan: ComponentGroups,
     /// The numerical `DeviceMesh` handle, for a member.
     pub mesh: Option<Handle>,
@@ -36,7 +36,7 @@ pub struct ComponentMeshes {
 }
 
 /// The rank's process world.
-pub struct World {
+pub(crate) struct World {
     /// Host collectives over this worker's ranks.
     pub host: HostGroup,
     /// Host collectives over the expert-parallel union.
@@ -50,7 +50,7 @@ pub struct World {
 
 impl World {
     /// Form the host groups and the torch world.
-    pub fn initialize(launch: &WorkerLaunch, timeout: Duration) -> Result<Self> {
+    pub(crate) fn initialize(launch: &WorkerLaunch, timeout: Duration) -> Result<Self> {
         let execution = &launch.execution;
         let (host, union, store) = match &launch.expert_parallel {
             Some(union) => {
@@ -122,7 +122,7 @@ impl World {
         })
     }
 
-    pub fn torch(&self) -> &Handle {
+    pub(crate) fn torch(&self) -> &Handle {
         &self.torch
     }
 
@@ -130,7 +130,7 @@ impl World {
     ///
     /// A rank that holds no component fails only after every group exists,
     /// so its peers are never left waiting in a creation collective.
-    pub fn bind_components(
+    pub(crate) fn bind_components(
         &mut self,
         launch: &WorkerLaunch,
         declarations: &Declarations,
@@ -212,7 +212,11 @@ impl World {
     /// The multi-member groups of `component`'s numerical mesh this rank
     /// belongs to, in creation order, for stream collectives.
     /// `first` is the process-world rank of this worker's first rank.
-    pub fn collective_groups(&self, component: &str, first: usize) -> Vec<super::CollectiveGroup> {
+    pub(crate) fn collective_groups(
+        &self,
+        component: &str,
+        first: usize,
+    ) -> Vec<super::CollectiveGroup> {
         self.components
             .iter()
             .filter(|meshes| meshes.plan.name == component && meshes.plan.member)
@@ -228,7 +232,7 @@ impl World {
     }
 
     /// The meshes of a component this rank is a member of.
-    pub fn meshes(&self, component: &str) -> (Option<Handle>, Option<Handle>) {
+    pub(crate) fn meshes(&self, component: &str) -> (Option<Handle>, Option<Handle>) {
         self.components
             .iter()
             .find(|meshes| meshes.plan.name == component)
@@ -276,7 +280,7 @@ impl World {
     /// An aborted close keeps them until the process exits: a failed peer
     /// may never join the teardown.
     #[allow(clippy::mem_forget)]
-    pub fn close(&mut self, aborted: bool) -> Result<()> {
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let Some(destroy) = self.destroy.take() else {
             return Ok(());
         };
@@ -342,6 +346,6 @@ fn store(group: &HostGroup, rendezvous: &RendezvousConfig) -> Result<Store> {
 }
 
 /// How long startup collectives wait for every member.
-pub const fn startup_timeout() -> Duration {
+pub(crate) const fn startup_timeout() -> Duration {
     STARTUP_TIMEOUT
 }

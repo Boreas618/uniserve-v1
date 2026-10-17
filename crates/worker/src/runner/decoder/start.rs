@@ -10,7 +10,7 @@ use crate::ffi::DType;
 use crate::request::video::VideoSize;
 use crate::runner::RunnerSetup;
 use crate::runner::component::{
-    AUDIO_GRAPHS, Component, DECODER_GRAPHS, VideoSetup, call_path, device_index, placed_device,
+    AUDIO_GRAPHS, Component, DECODER_GRAPHS, VideoSetup, call_path, cuda_device,
 };
 use crate::{Error, Result};
 
@@ -24,9 +24,9 @@ impl DecoderRunners {
         let (loaded, model) = (setup.loaded, setup.model);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
-        let device = placed_device(placed);
+        let device = placed.device;
         let (stream, scratch) = setup.stream(MediaCall::VideoDecoding, device)?;
-        let graph_pool = setup.graph_pool(DECODER_GRAPHS, &placed.name, device)?;
+        let graph_pool = setup.graph_pool(DECODER_GRAPHS, device)?;
         let mut capacity = DecodeCapacity {
             latent: [0, 0],
             frames: [0, 0, 0],
@@ -61,7 +61,7 @@ impl DecoderRunners {
                 loaded,
                 path: call_path(placed, Capability::VideoDecoder)?,
                 stream,
-                device: device_index(device)?,
+                device: cuda_device(device)?,
                 attention: attention.clone(),
                 scratch,
             },
@@ -87,9 +87,9 @@ impl DecoderRunners {
         let (loaded, model) = (setup.loaded, setup.model);
         let plan = &setup.capacity.media;
         let attention = setup.attention.clone();
-        let device = placed_device(placed);
+        let device = placed.device;
         let (stream, scratch) = setup.stream(MediaCall::AudioDecoding, device)?;
-        let graph_pool = setup.graph_pool(AUDIO_GRAPHS, &placed.name, device)?;
+        let graph_pool = setup.graph_pool(AUDIO_GRAPHS, device)?;
         // A track's latent does not depend on the canvas.
         let layout = model.layout_size(&VideoSize::plain(
             plan.max_frames(),
@@ -105,7 +105,7 @@ impl DecoderRunners {
                 loaded,
                 path: call_path(placed, Capability::AudioDecoder)?,
                 stream,
-                device: device_index(device)?,
+                device: cuda_device(device)?,
                 attention: attention.clone(),
                 scratch,
             },

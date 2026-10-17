@@ -3,26 +3,27 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::{Notify, notify};
 use crate::{Error, Result};
 
-struct CapacityState<C> {
+struct CapacityState {
     used: u64,
     reads_free: usize,
     returns: u64,
-    waiters: Vec<C>,
+    waiters: Vec<Notify>,
 }
 
 /// Shared byte reservations and physical read credits for one worker rank.
-/// The backend dispatches notifications after the capacity lock is released.
-pub struct TransferCapacity<C> {
+/// Waiters for returned credits are notified after the capacity lock is
+/// released.
+pub struct TransferCapacity {
     capacity: u64,
     ticket_capacity: usize,
-    state: Mutex<CapacityState<C>>,
-    notify: fn(Vec<C>),
+    state: Mutex<CapacityState>,
 }
 
-impl<C> TransferCapacity<C> {
-    pub fn new(capacity: u64, ticket_capacity: usize, notify: fn(Vec<C>)) -> Result<Self> {
+impl TransferCapacity {
+    pub fn new(capacity: u64, ticket_capacity: usize) -> Result<Self> {
         if capacity == 0 || ticket_capacity == 0 {
             return Err(Error::Invalid(
                 "transfer byte and read capacities must be positive".into(),
@@ -38,19 +39,18 @@ impl<C> TransferCapacity<C> {
                 returns: 0,
                 waiters: Vec::new(),
             }),
-            notify,
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, CapacityState<C>> {
+    fn state(&self) -> MutexGuard<'_, CapacityState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn capacity(&self) -> u64 {
+    pub(crate) fn capacity(&self) -> u64 {
         self.capacity
     }
 
-    pub fn ticket_capacity(&self) -> usize {
+    pub(crate) fn ticket_capacity(&self) -> usize {
         self.ticket_capacity
     }
 
@@ -58,7 +58,7 @@ impl<C> TransferCapacity<C> {
         self.state().used
     }
 
-    pub fn acquire(&self, amount: u64) -> Result<()> {
+    pub(crate) fn acquire(&self, amount: u64) -> Result<()> {
         let mut state = self.state();
         if amount > self.capacity - state.used {
             return Err(Error::Resource("transfer byte capacity is exhausted"));
@@ -68,7 +68,7 @@ impl<C> TransferCapacity<C> {
         Ok(())
     }
 
-    pub fn release(&self, amount: u64) -> Result<()> {
+    pub(crate) fn release(&self, amount: u64) -> Result<()> {
         let mut state = self.state();
         if amount > state.used {
             return Err(Error::State(
@@ -82,7 +82,7 @@ impl<C> TransferCapacity<C> {
 
     /// Take the complete fan-out before starting any reads. Backpressure
     /// includes the return sequence used to subscribe without missing a wake.
-    pub fn take_reads(&self, count: usize) -> Result<()> {
+    pub(crate) fn take_reads(&self, count: usize) -> Result<()> {
         if count == 0 {
             return Err(Error::Invalid(
                 "a read ticket reservation takes at least one".into(),
@@ -107,7 +107,7 @@ impl<C> TransferCapacity<C> {
     }
 
     /// Admit one borrowed or copied read from the rank's shared reservation.
-    pub fn take_read(self: &Arc<Self>, reservation: Option<&ReadReservation<C>>) -> Result<()> {
+    pub(crate) fn take_read(self: &Arc<Self>, reservation: Option<&ReadReservation>) -> Result<()> {
         if let Some(reservation) = reservation {
             if !Arc::ptr_eq(reservation.capacity(), self) {
                 return Err(Error::Invalid(
@@ -121,7 +121,7 @@ impl<C> TransferCapacity<C> {
     }
 
     /// Return credits only after a physical read retires, or if unused.
-    pub fn return_reads(&self, count: usize) -> Result<()> {
+    pub(crate) fn return_reads(&self, count: usize) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -136,13 +136,13 @@ impl<C> TransferCapacity<C> {
         let callbacks = std::mem::take(&mut state.waiters);
         drop(state);
 
-        (self.notify)(callbacks);
+        notify(callbacks);
         Ok(())
     }
 
     /// Register for a credit return, or return the callback for immediate
     /// dispatch if credits have already returned since the refused fetch.
-    pub fn notify_reads_returned(&self, callback: C, after: u64) -> Option<C> {
+    pub(crate) fn notify_reads_returned(&self, callback: Notify, after: u64) -> Option<Notify> {
         let mut state = self.state();
         if state.returns != after {
             return Some(callback);
@@ -156,13 +156,13 @@ impl<C> TransferCapacity<C> {
 /// Bytes of a rank's transfer budget held by one export. The bytes return
 /// when the reservation is released or dropped: an attempt that fails on any
 /// path gives them back, and an export's backing keeps them until it retires.
-pub(crate) struct ByteReservation<C> {
-    capacity: Arc<TransferCapacity<C>>,
+pub(crate) struct ByteReservation {
+    capacity: Arc<TransferCapacity>,
     bytes: u64,
 }
 
-impl<C> ByteReservation<C> {
-    pub(crate) fn new(capacity: &Arc<TransferCapacity<C>>, bytes: u64) -> Result<Self> {
+impl ByteReservation {
+    pub(crate) fn new(capacity: &Arc<TransferCapacity>, bytes: u64) -> Result<Self> {
         capacity.acquire(bytes)?;
         Ok(Self {
             capacity: Arc::clone(capacity),
@@ -177,7 +177,7 @@ impl<C> ByteReservation<C> {
     }
 }
 
-impl<C> Drop for ByteReservation<C> {
+impl Drop for ByteReservation {
     fn drop(&mut self) {
         if self.bytes == 0 {
             return;
@@ -190,13 +190,13 @@ impl<C> Drop for ByteReservation<C> {
 
 /// A fetch's reserved read credits. Each submission takes one credit; close
 /// and destruction return only those which have not been handed to a read.
-pub struct ReadReservation<C> {
-    capacity: Arc<TransferCapacity<C>>,
+pub struct ReadReservation {
+    capacity: Arc<TransferCapacity>,
     unused: AtomicUsize,
 }
 
-impl<C> ReadReservation<C> {
-    pub fn new(capacity: Arc<TransferCapacity<C>>, count: usize) -> Result<Self> {
+impl ReadReservation {
+    pub(crate) fn new(capacity: Arc<TransferCapacity>, count: usize) -> Result<Self> {
         capacity.take_reads(count)?;
         Ok(Self {
             capacity,
@@ -204,11 +204,11 @@ impl<C> ReadReservation<C> {
         })
     }
 
-    pub fn capacity(&self) -> &Arc<TransferCapacity<C>> {
+    pub(crate) fn capacity(&self) -> &Arc<TransferCapacity> {
         &self.capacity
     }
 
-    pub fn use_read(&self) -> Result<()> {
+    pub(crate) fn use_read(&self) -> Result<()> {
         self.unused
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |unused| {
                 unused.checked_sub(1)
@@ -217,17 +217,149 @@ impl<C> ReadReservation<C> {
             .map_err(|_| Error::State("read reservation has no ticket left"))
     }
 
-    pub fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         // Only the counter crosses threads; read storage has its own fences.
         let unused = self.unused.swap(0, Ordering::Relaxed);
         self.capacity.return_reads(unused)
     }
 }
 
-impl<C> Drop for ReadReservation<C> {
+impl Drop for ReadReservation {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
             tracing::warn!(target: "uniserve_worker.transfer", "failed to return unused read credits: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn refused_reservations_leave_byte_and_read_budgets_available() -> Result<()> {
+        let capacity = Arc::new(TransferCapacity::new(8, 2)?);
+        capacity.acquire(4)?;
+        assert!(matches!(
+            capacity.acquire(u64::MAX),
+            Err(Error::Resource(_))
+        ));
+        assert_eq!(capacity.used(), 4);
+        capacity.acquire(4)?;
+        assert!(capacity.release(9).is_err());
+        assert_eq!(capacity.used(), 8);
+        capacity.release(8)?;
+
+        capacity.take_reads(1)?;
+        assert!(matches!(
+            ReadReservation::new(Arc::clone(&capacity), 2),
+            Err(Error::ReadBackpressure { .. })
+        ));
+        assert!(matches!(
+            ReadReservation::new(Arc::clone(&capacity), 3),
+            Err(Error::Unsupported(_))
+        ));
+
+        // The refused fan-out must not consume its available first read.
+        let remaining = ReadReservation::new(Arc::clone(&capacity), 1)?;
+        remaining.use_read()?;
+        assert!(remaining.use_read().is_err());
+        remaining.close()?;
+        capacity.return_reads(2)?;
+        assert!(capacity.return_reads(1).is_err());
+        capacity.take_reads(2)?;
+        capacity.return_reads(2)?;
+
+        let other = Arc::new(TransferCapacity::new(8, 2)?);
+        let reservation = ReadReservation::new(Arc::clone(&capacity), 1)?;
+        assert!(other.take_read(Some(&reservation)).is_err());
+        capacity.take_read(Some(&reservation))?;
+        capacity.return_reads(1)?;
+        other.take_reads(2)?;
+        other.return_reads(2)
+    }
+
+    #[test]
+    fn dropping_unused_credits_wakes_reentrant_and_late_subscribers() -> Result<()> {
+        let capacity = Arc::new(TransferCapacity::new(8, 2)?);
+        let reservation = ReadReservation::new(Arc::clone(&capacity), 2)?;
+        reservation.use_read()?;
+
+        let Err(Error::ReadBackpressure { returns }) = capacity.take_reads(1) else {
+            return Err(Error::State(
+                "the reserved fan-out must occupy both read credits",
+            ));
+        };
+        let (tx, rx) = mpsc::channel();
+        let retry_capacity = Arc::clone(&capacity);
+        // The subscriber reserves again from inside the notification.
+        let retry: Notify = Arc::new(move || {
+            let _ = tx.send(ReadReservation::new(Arc::clone(&retry_capacity), 1));
+        });
+        assert!(capacity.notify_reads_returned(retry, returns).is_none());
+
+        thread::spawn(move || drop(reservation))
+            .join()
+            .map_err(|_| Error::State("reservation cleanup panicked"))?;
+        let retry = rx
+            .recv()
+            .map_err(|_| Error::State("the returned credit woke no subscriber"))??;
+        assert!(matches!(
+            capacity.take_reads(1),
+            Err(Error::ReadBackpressure { .. })
+        ));
+
+        // A subscriber arriving after the return is told to run at once.
+        let late: Notify = Arc::new(|| {});
+        assert!(capacity.notify_reads_returned(late, returns).is_some());
+
+        retry.close()?;
+        retry.close()?;
+        // The submitted read still owns one credit after both reservations
+        // close.
+        assert!(matches!(
+            capacity.take_reads(2),
+            Err(Error::ReadBackpressure { .. })
+        ));
+        capacity.return_reads(1)?;
+        capacity.take_reads(2)?;
+        capacity.return_reads(2)
+    }
+
+    #[test]
+    fn closing_a_reservation_racing_submission_returns_each_unused_credit_once() -> Result<()> {
+        let capacity = Arc::new(TransferCapacity::new(8, 8)?);
+        let reservation = ReadReservation::new(Arc::clone(&capacity), 8)?;
+        let barrier = Barrier::new(9);
+
+        let submitted = thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        reservation.use_read().is_ok()
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            reservation.close()?;
+            threads
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .map(usize::from)
+                        .map_err(|_| Error::State("read submission panicked"))
+                })
+                .sum::<Result<usize>>()
+        })?;
+
+        capacity.return_reads(submitted)?;
+        capacity.take_reads(8)?;
+        capacity.return_reads(8)
     }
 }

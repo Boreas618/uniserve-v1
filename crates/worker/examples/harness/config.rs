@@ -1,37 +1,34 @@
 //! The configuration map a harness function receives from its Python test,
-//! read by key with errors that name the function and the key.
-
-#![allow(
-    dead_code,
-    reason = "each harness example uses a subset of the readers"
-)]
+//! read by key with errors that name the function and the key. Each harness
+//! library declares this module public, so the readers it does not call
+//! remain part of its interface.
 
 use tvm_ffi::{Any, Array, Map};
 use uniserve_worker::ffi::is_none;
 use uniserve_worker::{Error, Result};
 
 /// The keyword configuration of one harness call.
-pub(crate) struct Config {
+pub struct Config {
     /// The harness function, named in errors.
     owner: String,
     fields: Map<tvm_ffi::String, Any>,
 }
 
 impl Config {
-    pub(crate) fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
+    pub fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
         let owner = owner.into();
         let fields = Map::try_from(value).map_err(|error| Error::numerical(&owner, &error))?;
         Ok(Self { owner, fields })
     }
 
     /// The raw value of a required field.
-    pub(crate) fn value(&self, key: &str) -> Result<Any> {
+    pub fn value(&self, key: &str) -> Result<Any> {
         self.optional_value(key)?
             .ok_or_else(|| self.mismatch(key, "is missing"))
     }
 
     /// The raw value of a field, `None` when absent or `None` in Python.
-    pub(crate) fn optional_value(&self, key: &str) -> Result<Option<Any>> {
+    pub fn optional_value(&self, key: &str) -> Result<Option<Any>> {
         let value = self
             .fields
             .get(&tvm_ffi::String::from(key))
@@ -39,14 +36,14 @@ impl Config {
         Ok(value.filter(|value| !is_none(value)))
     }
 
-    pub(crate) fn get<T>(&self, key: &str) -> Result<T>
+    pub fn get<T>(&self, key: &str) -> Result<T>
     where
         T: TryFrom<Any, Error = tvm_ffi::Error>,
     {
         T::try_from(self.value(key)?).map_err(|error| self.mismatch(key, error.message()))
     }
 
-    pub(crate) fn optional<T>(&self, key: &str) -> Result<Option<T>>
+    pub fn optional<T>(&self, key: &str) -> Result<Option<T>>
     where
         T: TryFrom<Any, Error = tvm_ffi::Error>,
     {
@@ -56,23 +53,23 @@ impl Config {
     }
 
     /// A non-negative integer field.
-    pub(crate) fn count(&self, key: &str) -> Result<usize> {
+    pub fn count(&self, key: &str) -> Result<usize> {
         let value: i64 = self.get(key)?;
         usize::try_from(value).map_err(|_| self.mismatch(key, "must be non-negative"))
     }
 
-    pub(crate) fn string(&self, key: &str) -> Result<String> {
+    pub fn string(&self, key: &str) -> Result<String> {
         Ok(self.get::<tvm_ffi::String>(key)?.as_str().to_owned())
     }
 
     /// A list of values (a Python list or tuple).
-    pub(crate) fn list(&self, key: &str) -> Result<Vec<Any>> {
+    pub fn list(&self, key: &str) -> Result<Vec<Any>> {
         let values: Array<Any> = self.get(key)?;
         Ok(values.iter().collect())
     }
 
     /// A list of strings.
-    pub(crate) fn strings(&self, key: &str) -> Result<Vec<String>> {
+    pub fn strings(&self, key: &str) -> Result<Vec<String>> {
         self.list(key)?
             .into_iter()
             .map(|value| {

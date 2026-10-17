@@ -59,7 +59,7 @@ pub fn register(arguments: &Arguments) -> Result<(Channel, LaunchDescriptor)> {
 /// and runs no teardown, as a termination signal before serving does.
 /// Dropping the watch stops it; the rank does so when it begins to serve,
 /// from where its service observes the connection.
-pub struct HeadWatch {
+pub(crate) struct HeadWatch {
     /// Closing this end cancels the watch thread's wait.
     cancel: Option<UnixStream>,
     thread: Option<JoinHandle<()>>,
@@ -67,7 +67,7 @@ pub struct HeadWatch {
 
 impl HeadWatch {
     /// Start watching the connection `hangup` observes.
-    pub fn start(hangup: Hangup) -> Result<Self> {
+    pub(crate) fn start(hangup: Hangup) -> Result<Self> {
         let failed = |error| Error::Transport(format!("starting the head watch: {error}"));
         let (cancel, cancelled) = UnixStream::pair().map_err(failed)?;
         let thread = std::thread::Builder::new()
