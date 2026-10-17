@@ -485,12 +485,214 @@ fn export_group(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use uniserve_core::{CallId, PrefixCacheDtype, RequestId, UnitId};
+    use uniserve_ipc::{BlockTable, RequestKey, TransferTransport, WorkerEndpoint};
+
     use super::*;
+    use crate::EventPool;
+    use crate::lane::Job;
+    use crate::storage::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
+    use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     #[test]
     fn pages_split_intervals_at_page_boundaries() {
         assert_eq!(pages(6, 6, 4), vec![]);
         assert_eq!(pages(6, 13, 4), vec![(1, 2, 2), (2, 0, 4), (3, 0, 1)]);
         assert_eq!(pages(8, 12, 4), vec![(2, 0, 4)]);
+    }
+
+    /// Set in the child process that runs the recorded FP8 export.
+    const FROZEN_CHILD: &str = "UNISERVE_TEST_FROZEN_EXPORT_CHILD";
+
+    /// The byte of FP8 element `[token, column, head, dim]` of `field`.
+    fn value(field: usize, index: [usize; 4]) -> u8 {
+        let [token, column, head, dim] = index;
+        ((field * 101 + token * 31 + column * 17 + head * 7 + dim) % 251) as u8
+    }
+
+    /// The scale of `field` in `column`.
+    fn scale(field: usize, column: usize) -> f32 {
+        1.5 + (field * 2 + column) as f32
+    }
+
+    /// A host FP8 cache export recorded into a job carries the values and
+    /// scales its job froze, though no export mechanism of the rank retains
+    /// the frozen views: the rank channel copies them out, in the job.
+    ///
+    /// The export runs in a child process in which every allocation of
+    /// 64 KiB or more is its own mapping, returned to the system when it is
+    /// freed, so a job that copied into staging released before it ran
+    /// faults instead of writing memory that is no longer the export's.
+    #[test]
+    fn a_recorded_fp8_export_carries_what_its_job_froze() -> Result<()> {
+        if std::env::var_os(FROZEN_CHILD).is_none() {
+            let executable = std::env::current_exe()
+                .map_err(|error| Error::Invalid(format!("no test executable: {error}")))?;
+            let status = std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "transfer::cache_export::tests::a_recorded_fp8_export_carries_what_its_job_froze",
+                    "--nocapture",
+                ])
+                .env(FROZEN_CHILD, "1")
+                .env("MALLOC_MMAP_THRESHOLD_", "65536")
+                .status()
+                .map_err(|error| Error::Invalid(format!("cannot run the export: {error}")))?;
+            assert!(status.success(), "the recorded FP8 export failed: {status}");
+            return Ok(());
+        }
+
+        // One group of two layers in two columns: a unit holds an 8-token
+        // page of 2 KV heads of 4096 FP8 elements per layer, so each frozen
+        // field is 128 KiB.
+        let (tokens, columns, heads, dims) = (8_usize, 2_usize, 2_usize, 4096_usize);
+        let plane_bytes = (tokens * heads * dims) as u64;
+        let plan = Arc::new(CachePlan {
+            columns: columns as u32,
+            plane_bytes,
+            quantized: true,
+            unit_bytes: 2 * columns as u64 * (plane_bytes + 1 + 4),
+            dtype: PrefixCacheDtype::Float8E4m3Fn,
+            groups: vec![CacheGroupPlan {
+                window: None,
+                page_tokens: tokens as u32,
+                units_per_page: 1,
+                layers: vec!["a".into(), "b".into()],
+                layer_ids: vec![0, 1],
+                axis: GroupAxis {
+                    offset: 0,
+                    total: 2,
+                },
+                num_kv_heads: heads as u32,
+                total_kv_heads: heads as u32,
+                kv_head_offset: 0,
+                head_dim: dims as u32,
+                dtype: DType::F8E4M3,
+                compute_dtype: DType::BF16,
+            }],
+            handle: crate::ffi::Handle::none(),
+        });
+        let planes = CachePlanes::allocate(Arc::clone(&plan), None, 2, None)?;
+        let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
+        let update = tables.prepare(&[BlockTable {
+            request_pool_idx: 1,
+            group_id: 0,
+            start_page: 0,
+            unit_ids: vec![UnitId(1)],
+            allocated_tokens: tokens as u32,
+        }])?;
+        tables.commit(update);
+
+        // Unit 1's page and scales, written through the pool's own views.
+        for field in 0..2 {
+            let page = planes.page(field, 0, 1, 0, tokens as u32)?;
+            let strides = page.strides().to_vec();
+            for token in 0..tokens {
+                for column in 0..columns {
+                    for head in 0..heads {
+                        for dim in 0..dims {
+                            let offset = [token, column, head, dim]
+                                .iter()
+                                .zip(&strides)
+                                .map(|(&index, &stride)| index as i64 * stride)
+                                .sum::<i64>();
+                            // SAFETY: the element lies in the pool's host
+                            // values, which nothing else accesses here.
+                            unsafe {
+                                *((page.address() as i64 + offset) as *mut u8) =
+                                    value(field, [token, column, head, dim]);
+                            }
+                        }
+                    }
+                }
+            }
+            for column in 0..columns {
+                let address = planes.scale_address(field, column as u32, 1)?;
+                // SAFETY: one f32 of the pool's host scales.
+                unsafe { *(address as *mut f32) = scale(field, column) };
+            }
+        }
+
+        // The rank reaches consumer 1 only over the rank channel.
+        let transports = Transports::new(
+            &[TransportKind::Channel],
+            Arc::new(TransferCapacity::new(1 << 24, 8)?),
+            EventPool::new(),
+            &TransportOptions {
+                source: WorkerEndpoint {
+                    worker_id: "worker".into(),
+                    rank: 0,
+                    node: "node".into(),
+                    address_space: "space".into(),
+                    incarnation: "incarnation".into(),
+                },
+                acknowledgment_slot: 0,
+                host_slots: HashSet::new(),
+                cross_host_consumers: true,
+                vmm_pool_bytes: 1 << 20,
+            },
+        )?;
+        let buffer = BufferId {
+            owner: RequestKey::new(1, RequestId(7), 1),
+            producer_call_id: CallId::new(2, 0),
+            output_index: 0,
+            generation: 2,
+        };
+        let mut accesses = UnitAccesses::default();
+
+        // The freeze and the channel's copies are recorded; the job
+        // performs them after the export returned.
+        let job = Job::new();
+        let recorded = export(
+            &mut accesses,
+            &TransferBases::default(),
+            &tables,
+            &planes,
+            1,
+            tokens as u32,
+            "target",
+            buffer,
+            &transports,
+            &[1],
+            job.on(None),
+        )?;
+        job.perform().check().map_err(|failure| failure.error)?;
+        let (transfer, _) = recorded.locate(&mut accesses)?;
+
+        let payloads = |tensor: usize| -> Vec<Vec<u8>> {
+            transfer.groups[0].tensors[tensor]
+                .locations
+                .iter()
+                .filter_map(|locator| match &locator.transport {
+                    TransferTransport::Channel { payload, .. } => Some(payload.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for field in 0..2 {
+            let mut expected = Vec::with_capacity(tokens * columns * heads * dims);
+            for token in 0..tokens {
+                for column in 0..columns {
+                    for head in 0..heads {
+                        for dim in 0..dims {
+                            expected.push(value(field, [token, column, head, dim]));
+                        }
+                    }
+                }
+            }
+            assert_eq!(payloads(field), [expected], "field {field} values");
+        }
+        // One scale row [page, K/V, layers, head group] per field.
+        let scales: Vec<Vec<u8>> = (0..2)
+            .map(|field| {
+                (0..columns)
+                    .flat_map(|column| scale(field, column).to_ne_bytes())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(payloads(2), scales);
+        Ok(())
     }
 }
