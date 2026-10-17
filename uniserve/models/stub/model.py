@@ -6,10 +6,15 @@ and the head maps each ID to a fixed successor (see ``_Head``). The single
 backbone layer passes features through and writes zero scalar K/V. Vision
 features are per-patch pixel means, the latent encoder's latents are the
 pixels themselves cast to BF16 and patchified, and the denoiser predicts zero.
+
+On a CPU rank, a forward that embeds ``STUB_STALL_TOKEN_ID`` never returns:
+it stands in for a device call that does not return, so a rank's lane
+stays inside one job until its process ends.
 """
 
 from __future__ import annotations
 
+import threading
 from types import MappingProxyType
 
 import torch
@@ -38,6 +43,9 @@ from .denoiser import Denoiser
 # can be served with a real Qwen tokenizer.
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
+# Above every ID a Qwen2.5 or Qwen3 tokenizer produces (Qwen3's last added
+# token is 151668), so no tokenized prompt holds it by chance.
+STUB_STALL_TOKEN_ID = 151669
 
 _VOCAB_SIZE = STUB_IMG_START_TOKEN_ID + 1
 
@@ -59,6 +67,13 @@ class _Embedding(nn.Module):
         )
 
     def forward(self, tokens):
+        # Only a CPU forward reads its tokens on the host: on a device that
+        # would synchronize every forward and could not be captured.
+        if tokens.device.type == "cpu" and bool(
+            (tokens == STUB_STALL_TOKEN_ID).any()
+        ):
+            threading.Event().wait()
+
         # [tokens] -> [tokens, 4]. Three base-128 digits recover the ID
         # losslessly below 128**3, and every digit there is an integer below
         # 128, which BF16 represents exactly. A constant fourth digit fills

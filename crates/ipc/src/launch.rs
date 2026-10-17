@@ -105,6 +105,10 @@ pub struct LaunchDescriptor {
     /// Largest encoded message in bytes, in either direction. The rank sizes
     /// the storage it stages a batch's inputs in from it.
     pub ipc_payload_cap: usize,
+    /// How long, in milliseconds, one job may run on a lane before the
+    /// rank reports the lane stalled
+    /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)); positive.
+    pub stall_bound_ms: u64,
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,

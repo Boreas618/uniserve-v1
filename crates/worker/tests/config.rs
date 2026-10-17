@@ -18,6 +18,7 @@ fn defaults() -> Value {
         "products_cross_hosts": false,
         "queue_depth": 2,
         "ipc_payload_cap": 65536,
+        "stall_bound_ms": 150000,
         "model": "model",
         "device": "cpu",
         "rank": 0,

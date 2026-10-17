@@ -2124,6 +2124,19 @@ fn response_fixtures() -> Vec<WorkerResponse> {
                 ],
             },
         },
+        WorkerResponse::Stalled {
+            stall: Stall {
+                lane: Some("decode".into()),
+                batch_id: Some(12),
+                route: Some("decode".into()),
+                method: Some("uniserve.runner.forward".into()),
+                calls: vec![ErrorCallIdentity {
+                    request_key: key_for_request(101),
+                    call_id: CallId::new(12, 0),
+                }],
+                running_ms: 150_000,
+            },
+        },
     ]
 }
 
@@ -2154,6 +2167,7 @@ fn every_response_kind_round_trips_through_ipc() {
         ResponseKind::Result,
         ResponseKind::Ok,
         ResponseKind::Error,
+        ResponseKind::Stalled,
     ] {
         assert!(
             fixtures.iter().any(|response| response.kind() == kind),

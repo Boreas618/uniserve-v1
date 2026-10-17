@@ -133,11 +133,12 @@ fn serve(arguments: &Arguments, signals: &Signals) -> std::result::Result<(), Fa
         .map_err(|error| crate::Error::Transport(error.to_string()))?;
     let mut starting = Some(HeadWatch::start(hangup)?);
 
+    let stall_bound = launch.ipc.stall_bound;
     let mut worker = Worker::start(launch)?;
     let served = worker.warmup().and_then(|()| {
         starting.take();
         signals.serving();
-        worker.run(&mut channel)
+        worker.run(&mut channel, stall_bound)
     });
     // An orderly failure of the startup closes the rank below, not the watch.
     drop(starting);
