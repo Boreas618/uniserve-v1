@@ -16,7 +16,7 @@
 //! | SIGTERM before serving | signal death |
 //! | the head's connection closing before serving | 1, at once |
 //! | startup or serving failure, or the head's connection closing while serving | 1, after an aborted close |
-//! | close by the head, or after a fatal response | 0 |
+//! | close by the head, or after a fatal response | 0, after the rank's device contexts are destroyed |
 
 mod arguments;
 mod registration;
@@ -93,7 +93,8 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 }
 
 /// Run the rank on a control thread while the calling thread serves its
-/// Python calls.
+/// Python calls, then destroy the rank's device contexts after an orderly
+/// close.
 fn run(
     arguments: &Arguments,
     import: tvm_ffi::Function,
@@ -116,7 +117,25 @@ fn run(
         interpreter.run(&outcome).unwrap_or_else(|| {
             Err(crate::Error::State("the control thread ended without a result").into())
         })
-    })
+    })?;
+
+    // The worker closed in order and was dropped, the control thread has
+    // finished and this thread makes no Python call again, so nothing uses a
+    // device any more. PyTorch's references keep every context alive until
+    // the process ends, and the driver removes the shared memory behind a
+    // context's interprocess events only when the context is destroyed, not
+    // when the process exits: the contexts are destroyed here. A rank whose
+    // close was aborted skips this: destroying a context waits for the work
+    // queued in it, and work an aborted close abandons may never complete.
+    // SAFETY: as above, nothing in the process uses a device after this.
+    let devices =
+        unsafe { uniserve_cuda::PrimaryContext::reset_all() }.map_err(crate::Error::from)?;
+    tracing::debug!(
+        target: "uniserve_worker.launch",
+        ?devices,
+        "destroyed the device contexts"
+    );
+    Ok(())
 }
 
 /// The rank's life on the control thread: register with the head, start,
