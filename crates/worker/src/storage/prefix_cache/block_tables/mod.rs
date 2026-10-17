@@ -74,12 +74,22 @@ impl GroupTable {
 
     /// The physical units at one position in each logical page.
     pub(crate) fn row(&self, position: usize) -> Vec<u32> {
+        self.row_units(position).collect()
+    }
+
+    /// The physical units at one position in each logical page, in page
+    /// order.
+    pub(crate) fn row_units(&self, position: usize) -> impl Iterator<Item = u32> + '_ {
         self.units
             .iter()
             .skip(position)
             .step_by(self.shape.units_per_page as usize)
             .map(|unit| unit.0)
-            .collect()
+    }
+
+    /// The logical pages the table holds.
+    pub(crate) fn pages(&self) -> usize {
+        self.units.len() / self.shape.units_per_page as usize
     }
 
     /// Map absolute tokens to `(unit, token offset, token count)` intervals.
@@ -116,19 +126,26 @@ impl GroupTable {
 }
 
 /// Changed rows and lengths to write to the device tables in one batch.
-/// Rows are unpadded; [`BlockTableStorage::install`] writes them at full
-/// width, which clears the tail of a longer previous row.
+/// Rows are read from the accepted tables; [`BlockTableStorage::install`]
+/// writes them at full width, which clears the tail of a longer previous
+/// row.
 pub struct BlockTableUpdate {
-    pub rows: Vec<Vec<u32>>,
-    pub row_tables: Vec<usize>,
-    pub row_slots: Vec<u32>,
-    pub start_groups: Vec<u32>,
-    pub start_slots: Vec<u32>,
-    pub start_values: Vec<u32>,
-    pub length_slots: Vec<u32>,
-    pub length_values: Vec<u32>,
+    rows: Vec<RowUpdate>,
+    /// Changed first pages: group, slot and page.
+    starts: Vec<(u32, u32, u32)>,
+    /// Changed visible lengths: slot and token extent.
+    extents: Vec<(u32, u32)>,
+    /// The accepted tables by slot and group.
     tables: Vec<((u32, u32), Arc<GroupTable>)>,
     lengths: BTreeMap<u32, u32>,
+}
+
+/// One changed device row: the units at `position` of every page of the
+/// accepted table `tables[table]`, written to device table `target`.
+struct RowUpdate {
+    table: usize,
+    position: usize,
+    target: usize,
 }
 
 /// Host ownership of the device block tables, including alternative prefixes.
@@ -295,23 +312,25 @@ impl BlockTables {
     /// Borrow a slot's tables before a batch installs its assignments.
     /// Supplied groups replace resident groups only in this returned view.
     pub fn for_batch(&self, slot: u32, assignments: &[BlockTable]) -> Result<Vec<Arc<GroupTable>>> {
-        let supplied: HashMap<_, _> = assignments
-            .iter()
-            .filter(|table| table.request_pool_idx == slot)
-            .map(|table| (table.group_id, table))
-            .collect();
-
         self.groups
             .iter()
             .enumerate()
-            .map(|(group, &shape)| match supplied.get(&(group as u32)) {
-                Some(table) => Ok(Arc::new(GroupTable {
-                    shape,
-                    start_page: table.start_page,
-                    units: table.unit_ids.clone(),
-                    allocated_tokens: table.allocated_tokens,
-                })),
-                None => self.table(slot, group as u32),
+            .map(|(group, &shape)| {
+                let group = group as u32;
+                // The last assignment of a group is the one that counts.
+                let supplied = assignments
+                    .iter()
+                    .rev()
+                    .find(|table| table.request_pool_idx == slot && table.group_id == group);
+                match supplied {
+                    Some(table) => Ok(Arc::new(GroupTable {
+                        shape,
+                        start_page: table.start_page,
+                        units: table.unit_ids.clone(),
+                        allocated_tokens: table.allocated_tokens,
+                    })),
+                    None => self.table(slot, group),
+                }
             })
             .collect()
     }
@@ -352,32 +371,25 @@ impl BlockTables {
 
         let mut update = BlockTableUpdate {
             rows: Vec::new(),
-            row_tables: Vec::new(),
-            row_slots: Vec::new(),
-            start_groups: Vec::new(),
-            start_slots: Vec::new(),
-            start_values: Vec::new(),
-            length_slots: Vec::new(),
-            length_values: Vec::new(),
+            starts: Vec::new(),
+            extents: Vec::new(),
             tables: accepted,
             lengths: BTreeMap::new(),
         };
-        for (key, table) in &update.tables {
+        for (index, (key, table)) in update.tables.iter().enumerate() {
             let (slot, group) = *key;
             let previous = self.tables.get(&(slot, group));
             if previous.is_none_or(|previous| previous.units != table.units) {
                 for position in 0..table.shape.units_per_page as usize {
-                    update.rows.push(table.row(position));
-                    update
-                        .row_tables
-                        .push(self.first_table[group as usize] + position);
-                    update.row_slots.push(slot);
+                    update.rows.push(RowUpdate {
+                        table: index,
+                        position,
+                        target: self.first_table[group as usize] + position,
+                    });
                 }
             }
             if previous.is_none_or(|previous| previous.start_page != table.start_page) {
-                update.start_groups.push(group);
-                update.start_slots.push(slot);
-                update.start_values.push(table.start_page);
+                update.starts.push((group, slot, table.start_page));
             }
 
             update
@@ -402,8 +414,7 @@ impl BlockTables {
         }
         for (&slot, &length) in &update.lengths {
             if self.lengths.get(&slot) != Some(&length) {
-                update.length_slots.push(slot);
-                update.length_values.push(length);
+                update.extents.push((slot, length));
             }
         }
 

@@ -95,7 +95,10 @@ impl DecoderRunners {
         let workspace = latents.workspace()?;
         let job = Job::new();
         let issue = job.on(decoder.stream());
-        workspace.narrow(0, 0, i64::from(units))?.zero(issue)?;
+        // SAFETY: the latent cache keeps its workspace past this warmup,
+        // whose jobs are performed before it returns; nothing else uses the
+        // workspace before serving starts.
+        unsafe { workspace.narrow(0, 0, i64::from(units))?.zero(issue) }?;
         let mut returns = Vec::new();
         // The staged pixels are discarded.
         decoder.record_decode(

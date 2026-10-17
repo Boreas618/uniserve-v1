@@ -67,26 +67,48 @@ use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
-/// The geometry of a captured denoising step: its rows of one image size,
-/// by the first sample row each reads (rows of one image share it).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// The geometry of a captured denoising step, which fixes the first sample
+/// row each of its rows reads: `images` images of one size, each evaluating
+/// `branches` consecutive guidance rows over its latents, which start at
+/// sample row `image * stride` of the step workspace (the placement startup
+/// captures and serving uses). Each such sequence of first sample rows has
+/// exactly one shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DiffusionShape {
     pub height: u32,
     pub width: u32,
-    pub samples: Vec<u32>,
+    pub images: u32,
+    pub branches: u32,
+    /// Sample rows from one image's first latent row to the next image's;
+    /// zero for one image.
+    pub stride: u32,
 }
 
 impl DiffusionShape {
-    /// The shape `rows` evaluate, when they share one image size.
+    /// The shape `rows` evaluate, when they are rows of one image size in
+    /// that placement. Other rows have no shape: no graph evaluates them.
     pub(crate) fn of(rows: &[DenoiseRow]) -> Option<Self> {
         let first = rows.first()?;
-        rows.iter()
-            .all(|row| (row.height, row.width) == (first.height, first.width))
-            .then(|| Self {
-                height: first.height,
-                width: first.width,
-                samples: rows.iter().map(|row| row.sample).collect(),
-            })
+        // The first image's rows share its first sample row, zero; the next
+        // image starts at one stride.
+        let branches = rows
+            .iter()
+            .take_while(|row| row.sample == first.sample)
+            .count();
+        let stride = rows.get(branches).map_or(0, |row| row.sample);
+        let placed = first.sample == 0
+            && rows.len().is_multiple_of(branches)
+            && rows.iter().enumerate().all(|(index, row)| {
+                (row.height, row.width) == (first.height, first.width)
+                    && u64::from(row.sample) == (index / branches) as u64 * u64::from(stride)
+            });
+        placed.then(|| Self {
+            height: first.height,
+            width: first.width,
+            images: (rows.len() / branches) as u32,
+            branches: branches as u32,
+            stride,
+        })
     }
 }
 
@@ -212,7 +234,9 @@ fn allocate(
         Device::Cpu => Memory::host(bytes),
     };
     let view = StorageView::contiguous(memory, 0, dtype, shape)?;
-    view.zero(stream)?;
+    // SAFETY: a new allocation the denoiser keeps until it closes after
+    // its stream drained; its launches run behind the fill on that stream.
+    unsafe { view.zero(stream) }?;
     Ok(view)
 }
 
@@ -681,7 +705,10 @@ impl DenoiserRunner {
         job: &Job,
     ) -> Result<Option<DiffusionShape>> {
         let shape = DiffusionShape::of(rows).ok_or_else(|| {
-            Error::Invalid("a captured denoising step evaluates rows of one image size".into())
+            Error::Invalid(
+                "a captured denoising step evaluates rows of one image size in its placement"
+                    .into(),
+            )
         })?;
         if self.family.image()?.graphs.contains(&shape, None) {
             return Ok(None);
@@ -765,12 +792,18 @@ impl ImageDenoiser {
                 described.len()
             )));
         }
-        for (axis, values) in axes.iter().enumerate() {
-            self.positions
-                .select(0, axis as i64)?
-                .upload(bytes(values), stream)?;
+        // SAFETY: the denoiser's position and timestep inputs, kept until it
+        // closes after its stream drained; the launches reading them run on
+        // `stream`, the earlier steps' before these writes and this step's
+        // after them.
+        unsafe {
+            for (axis, values) in axes.iter().enumerate() {
+                self.positions
+                    .select(0, axis as i64)?
+                    .upload(bytes(values), stream)?;
+            }
+            self.timesteps.upload(bytes(&times), stream)?;
         }
-        self.timesteps.upload(bytes(&times), stream)?;
         Ok((tokens, offsets, described))
     }
 
@@ -1812,5 +1845,58 @@ impl ImageBatch<'_> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows of 32x32 images reading these first sample rows.
+    fn rows(samples: &[u32]) -> Vec<DenoiseRow> {
+        samples
+            .iter()
+            .map(|&sample| DenoiseRow {
+                sample,
+                units: 4,
+                height: 32,
+                width: 32,
+                slot: 1,
+                prefix: 8,
+                temporal: 8,
+                timestep: 0.5,
+            })
+            .collect()
+    }
+
+    fn shape(images: u32, branches: u32, stride: u32) -> Option<DiffusionShape> {
+        Some(DiffusionShape {
+            height: 32,
+            width: 32,
+            images,
+            branches,
+            stride,
+        })
+    }
+
+    #[test]
+    fn a_step_has_a_shape_only_in_the_captured_placement() {
+        // Two images of three branches, four sample rows apart; one image.
+        assert_eq!(
+            DiffusionShape::of(&rows(&[0, 0, 0, 4, 4, 4])),
+            shape(2, 3, 4)
+        );
+        assert_eq!(DiffusionShape::of(&rows(&[0, 0])), shape(1, 2, 0));
+
+        // Unequal branch counts, unequal strides and a later start read
+        // other samples than any captured step.
+        assert_eq!(DiffusionShape::of(&rows(&[0, 0, 4])), None);
+        assert_eq!(DiffusionShape::of(&rows(&[0, 4, 12])), None);
+        assert_eq!(DiffusionShape::of(&rows(&[4, 4])), None);
+
+        // Rows of two image sizes are no captured step either.
+        let mut mixed = rows(&[0, 4]);
+        mixed[1].height = 64;
+        assert_eq!(DiffusionShape::of(&mixed), None);
     }
 }
