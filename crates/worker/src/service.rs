@@ -8,6 +8,7 @@
 //! return, is reported to the head ([`WorkerResponse::Stalled`]) with the
 //! batch the job belongs to, and the channel goes on being served.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +24,22 @@ const EXPERT_POLL: Duration = Duration::from_micros(200);
 // joining an empty expert step. The engine needs time to consume the result
 // and schedule its next batch even when it still has admitted requests.
 const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
+
+/// How a serving run ended other than by a failure of the rank's own.
+pub(crate) enum Ending {
+    /// The head closed the rank, or a fatal response ended admission.
+    Closed,
+    /// The head's channel failed (the error says how) while nothing was in
+    /// flight: no admitted batch was unfinished and no job given to a lane
+    /// or the Python thread was without its completion, so nothing the rank
+    /// issued can still run on a device.
+    Orphaned(WorkerError),
+    /// The head's channel failed (the error says how) while work was in
+    /// flight. Nothing can deliver its results, and it may never complete:
+    /// it may wait on a peer that stopped or abandoned its own work, and
+    /// the Python thread may wait in it for good.
+    Abandoned(WorkerError),
+}
 
 enum PendingResponse {
     Ready(Box<WorkerResponse>),
@@ -49,6 +66,9 @@ pub(crate) struct Service<'a> {
     /// A stalled lane was reported. The head fails the rank on the report,
     /// so it is made once.
     stalled: bool,
+    /// The head's channel failed: it closed, or a send or receive on it
+    /// did.
+    channel_failed: Cell<bool>,
 }
 
 impl<'a> Service<'a> {
@@ -71,12 +91,58 @@ impl<'a> Service<'a> {
             last_result: Instant::now(),
             stall_bound,
             stalled: false,
+            channel_failed: Cell::new(false),
         }
+    }
+
+    /// Serve until the head closes the rank or a fatal response ends
+    /// admission, which is [`Ending::Closed`].
+    ///
+    /// Once the head's channel fails nothing more can be admitted or
+    /// delivered: the run ends [`Ending::Orphaned`] when nothing was in
+    /// flight at that moment, and [`Ending::Abandoned`] otherwise.
+    pub(crate) fn run(&mut self) -> Result<Ending, WorkerError> {
+        let error = match self.serve() {
+            Ok(()) => return Ok(Ending::Closed),
+            Err(error) if self.channel_failed.get() => error,
+            Err(error) => return Err(error),
+        };
+        if self.settled() {
+            tracing::warn!(
+                target: "uniserve_worker.launch",
+                "the head's channel failed with nothing in flight; the rank closes without its peers"
+            );
+            return Ok(Ending::Orphaned(error));
+        }
+        tracing::warn!(
+            target: "uniserve_worker.launch",
+            unfinished_batches = self.executor.has_work(),
+            jobs_in_flight = self.executor.backend().oldest_job().is_some(),
+            "the head's channel failed with work in flight, which the rank abandons"
+        );
+        Ok(Ending::Abandoned(error))
+    }
+
+    /// Whether nothing the rank issued can still run on a device: no
+    /// admitted batch is unfinished and every job given to a lane or the
+    /// Python thread has completed.
+    ///
+    /// A job counts as in flight until its completion is taken, so the
+    /// completions that arrived while the rank waited are taken first, as
+    /// serving would have; with no batch admitted, taking them starts
+    /// nothing.
+    fn settled(&mut self) -> bool {
+        if self.executor.has_work() {
+            return false;
+        }
+        self.executor.advance().is_ok()
+            && !self.executor.has_work()
+            && self.executor.backend().oldest_job().is_none()
     }
 
     /// Drain accepted results before acknowledging Close. A fatal result stops
     /// admission too, while preserving responses already owed to the engine.
-    pub(crate) fn run(&mut self) -> Result<(), WorkerError> {
+    fn serve(&mut self) -> Result<(), WorkerError> {
         loop {
             let advanced = self.executor.advance()?;
             if self.send_ready()? || advanced {
@@ -302,6 +368,7 @@ impl<'a> Service<'a> {
     }
 
     fn channel_error(&self, error: IpcError) -> WorkerError {
+        self.channel_failed.set(true);
         WorkerError::classify(Error::Transport(error.to_string()), None)
     }
 }
@@ -322,7 +389,7 @@ mod tests {
         RequestKey, WorkerRequest, WorkerResponse,
     };
 
-    use super::Service;
+    use super::{Ending, Service};
     use crate::error::WorkerError;
     use crate::executor::tests::rank;
     use crate::{Error, ErrorCode};
@@ -338,10 +405,10 @@ mod tests {
 
     /// The rank's end of a connection whose head end runs `head` on its
     /// own thread, and the head's outcome once `serve` returned.
-    fn connect<T: Send + 'static>(
+    fn connect<T: Send + 'static, S>(
         head: impl FnOnce(Channel) -> Result<T> + Send + 'static,
-        serve: impl FnOnce(&mut Channel) -> Result<()>,
-    ) -> Result<(Result<()>, Result<T>)> {
+        serve: impl FnOnce(&mut Channel) -> Result<S>,
+    ) -> Result<(Result<S>, Result<T>)> {
         let listener = Listener::bind(&["127.0.0.1:0"]).map_err(transport)?;
         let address = listener.addresses()[0].clone();
         let head = std::thread::spawn(move || head(Channel::connect(&address).map_err(transport)?));
@@ -425,7 +492,7 @@ mod tests {
     /// two batches. No job of these batches stays in flight, so the stall
     /// bound (here the default, half the head's 300 s result deadline)
     /// is never reached.
-    fn serve(channel: &mut Channel) -> Result<()> {
+    fn serve(channel: &mut Channel) -> Result<Ending> {
         let mut executor = rank(2, false)?;
         let info = executor.backend().info().clone();
         Service::new(
@@ -505,12 +572,14 @@ mod tests {
 
         let (served, head) = connect(head, serve)?;
         head?;
-        served
+        assert!(matches!(served?, Ending::Closed));
+        Ok(())
     }
 
     #[test]
     fn the_service_stops_once_the_head_has_closed_its_connection() -> Result<()> {
-        // The head goes away without asking for anything.
+        // The head goes away without asking for anything, so nothing is in
+        // flight: the rank is orphaned, and the failure names the channel.
         let (served, head) = connect(
             |channel: Channel| {
                 drop(channel);
@@ -519,10 +588,25 @@ mod tests {
             serve,
         )?;
         head?;
-        let Err(error) = served else {
-            return Err(Error::State("the service outlived its head").into());
+        let Ending::Orphaned(error) = served? else {
+            return Err(Error::State("the service did not end orphaned").into());
         };
         assert_eq!(error.code, ErrorCode::ComputeError);
+        Ok(())
+    }
+
+    #[test]
+    fn a_head_that_closes_after_its_answer_orphans_the_rank() -> Result<()> {
+        // The head's batch was answered, so nothing is in flight when it
+        // goes away.
+        let head = |mut channel: Channel| -> Result<()> {
+            let result = ask(&mut channel, submit(1, 1, 7, 1)?)?;
+            assert!(matches!(result, WorkerResponse::Result { .. }));
+            Ok(())
+        };
+        let (served, head) = connect(head, serve)?;
+        head?;
+        assert!(matches!(served?, Ending::Orphaned(_)));
         Ok(())
     }
 
@@ -535,7 +619,7 @@ mod tests {
             Ok(receive(&mut channel)?.is_none())
         };
         let (served, unanswered) = connect(head, serve)?;
-        assert!(served.is_err());
+        assert!(matches!(served?, Ending::Orphaned(_)));
         assert!(unanswered?, "the rank answered a message it could not read");
         Ok(())
     }
