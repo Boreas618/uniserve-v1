@@ -8,7 +8,7 @@ import pytest
 import torch
 from uniserve_kernels.attention.merge import merge_attention_states
 
-from uniserve.backends.attention import resolve
+from uniserve.backends.attention import flashinfer, resolve
 from uniserve.backends.attention.torch import Backend as TorchBackend
 from uniserve.bindings.context import TensorBuffers
 from uniserve.models import TextSize
@@ -132,6 +132,80 @@ def test_native_attention_matches_declared_visibility(
             else batch
         )
         reference(q, k, v, reference_batch, scale=0.125, out=expected)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.inference_mode()
+def test_flashinfer_serves_a_capacity_beyond_its_configured_workspace():
+    # FlashInfer's graph-stable plans keep split-KV partial outputs for every
+    # query tile of a layer's prepared capacity and for the device's split
+    # bound: 1024 rows of eight query heads over one KV head need about
+    # 160 MB on GB200, far beyond the configured 1 MiB. The layer still plans
+    # and computes a full-capacity batch.
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(41)
+    q = torch.randn(
+        1024, 8, 128, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    k, v = (
+        torch.randn(
+            1024, 1, 128, dtype=q.dtype, device=device, generator=generator
+        )
+        for _ in range(2)
+    )
+    cache_layout = Config({"attention": mha.Config(1, 128, (0,), q.dtype)})
+    cache = UnitPool.allocate(
+        cache_layout, num_units=72, block_size=16, device=device
+    )
+    state = cache.state("attention")
+    # Two causal prompts of 600 and 424 rows fill the token capacity.
+    batch = PagedInput.from_blocks(
+        blocks=(tuple(range(38)), tuple(range(38, 65))),
+        query_lengths=(600, 424),
+        prefix_lengths=(0, 0),
+        block_size=16,
+        causal=True,
+        device=device,
+    )
+    arguments = {
+        "num_heads": 8,
+        "num_kv_heads": 1,
+        "head_dim": 128,
+        "dtype": q.dtype,
+        "size": TextSize(1024, 2),
+        "cache": state,
+    }
+    providers = (
+        flashinfer.Backend(flashinfer.Config(workspace_size=1 << 20)),
+        TorchBackend(),
+    )
+    operators = []
+    with ExitStack() as stack:
+        for provider in providers:
+            # Each provider receives exactly the workspace it declares.
+            requirements = provider.workspace_buffers(**arguments)
+            buffers = stack.enter_context(
+                TensorBuffers.allocate(requirements, device=device)
+            )
+            operator = provider.prepare(
+                **arguments, workspace=buffers.view(requirements)
+            )
+            stack.callback(operator.close)
+            operators.append(operator)
+        native, reference = operators
+
+        native.bind(batch)
+        actual, expected = torch.empty_like(q), torch.empty_like(q)
+        native(q, k, v, batch, scale=128**-0.5, out=actual)
+        # The native call committed the rows; the reference only reads them.
+        reference(
+            q,
+            k,
+            v,
+            replace(batch, write_indices=None),
+            scale=128**-0.5,
+            out=expected,
+        )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
