@@ -32,13 +32,20 @@ from uniserve.models import Condition, ConditionRole
 
 __all__ = [
     "AUDIO_CHANNELS",
+    "AUDIO_HOP",
+    "AUDIO_LATENTS_PER_SECOND",
+    "AUDIO_SAMPLE_RATE",
     "AUDIO_TAG",
     "CANVAS_MULTIPLE",
+    "CLIP_FRAMES",
+    "CLIP_LATENTS",
     "DensePacking",
+    "FPS",
     "Segment",
     "SegmentKind",
     "TEXT_TAG",
     "VIDEO_TAG",
+    "align_num_frames",
     "audio_latent_frames",
     "condition_segments",
     "dense_packing",
@@ -57,10 +64,18 @@ VIDEO_TAG = 0
 TEXT_TAG = 1
 AUDIO_TAG = 2
 AUDIO_CHANNELS = 2
+
+# The H3 timeline: packing, encoding and reconstruction all count frames,
+# samples and latents on it. Video runs at FPS. The video VAE encodes clips
+# of CLIP_FRAMES frames (its ``clip_length``) into CLIP_LATENTS latent
+# frames, so H3 generates ``CLIP_FRAMES * n + CLIP_LATENTS`` frames, ``n``
+# positive. The audio VAE hops AUDIO_HOP samples at AUDIO_SAMPLE_RATE.
 FPS = 24
+CLIP_FRAMES = 17
+CLIP_LATENTS = 5
+AUDIO_SAMPLE_RATE = 32_000
 AUDIO_LATENTS_PER_SECOND = 40
-# The audio VAE's 32 kHz samples per latent.
-AUDIO_HOP = 32_000 // AUDIO_LATENTS_PER_SECOND
+AUDIO_HOP = AUDIO_SAMPLE_RATE // AUDIO_LATENTS_PER_SECOND
 ROPE_FRAME_RESCALE = 5.0 / 3.0
 # Output frames covered by each of the five latent frames of one 17-frame
 # clip: 1 + 4 * 4 = 17.
@@ -202,19 +217,36 @@ def latent_raster(canvas: image.Config) -> tuple[int, int]:
     return canvas.height // 16, canvas.width // 16
 
 
+def align_num_frames(num_frames: int) -> int:
+    """Round a frame count up to the next one H3 generates.
+
+    The result is the next ``17 * n + 5`` with ``n`` positive, so at least
+    22.
+    """
+    return max(
+        CLIP_FRAMES + CLIP_LATENTS,
+        num_frames + (CLIP_LATENTS - num_frames) % CLIP_FRAMES,
+    )
+
+
 def video_latent_frames(num_frames: int) -> int:
     """Convert a valid H3 output-frame count into temporal video-VAE latents.
 
-    Each 17-frame unit contributes five latent frames and the trailing
+    Each 17-frame clip contributes five latent frames and the trailing
     5-frame overlap two more.
 
     Raises:
         ValueError: ``num_frames`` is not an int of the form ``17 * n + 5``
             with ``n`` positive.
     """
-    if type(num_frames) is not int or num_frames < 22 or num_frames % 17 != 5:
+    if (
+        type(num_frames) is not int
+        or num_frames < CLIP_FRAMES + CLIP_LATENTS
+        or num_frames % CLIP_FRAMES != CLIP_LATENTS
+    ):
         raise ValueError("H3 frame count must have the form 17 * n + 5")
-    return (num_frames - 5) // 17 * 5 + 2
+    clips = (num_frames - CLIP_LATENTS) // CLIP_FRAMES
+    return clips * CLIP_LATENTS + 2
 
 
 def audio_latent_frames(num_frames: int) -> int:
