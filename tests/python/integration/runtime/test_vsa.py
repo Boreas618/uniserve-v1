@@ -141,7 +141,7 @@ def test_large_hopper_key_domain_preserves_head_values_on_graph_replay(stream):
 
 
 @pytest.mark.parametrize(
-    "provider", ["cute", "flashinfer", "triton"], indirect=True
+    "provider", ["cute", "sm120", "flashinfer", "triton"], indirect=True
 )
 @torch.inference_mode()
 def test_selection_compression_and_projected_chunks(provider, stream):
@@ -198,7 +198,9 @@ def test_selection_compression_and_projected_chunks(provider, stream):
 
 
 @pytest.mark.parametrize(
-    "provider", ["sm100", "cute", "flashinfer", "triton"], indirect=True
+    "provider",
+    ["sm100", "cute", "sm120", "flashinfer", "triton"],
+    indirect=True,
 )
 @torch.inference_mode()
 def test_projected_chunks_apply_the_layer_softmax_scale(provider, stream):
@@ -327,7 +329,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
 
 
 @pytest.mark.parametrize(
-    "provider", ["cute", "flashinfer", "triton"], indirect=True
+    "provider", ["cute", "sm120", "flashinfer", "triton"], indirect=True
 )
 @pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("owners", [1, 2])
@@ -421,7 +423,9 @@ def test_row_production_over_many_intervals_matches_one_call(
 
 
 @pytest.mark.parametrize(
-    "provider", ["sm100", "cute", "flashinfer", "triton"], indirect=True
+    "provider",
+    ["sm100", "cute", "sm120", "flashinfer", "triton"],
+    indirect=True,
 )
 @torch.inference_mode()
 def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
@@ -522,3 +526,64 @@ def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
             rtol=2e-2,
             atol=2e-2,
         )
+
+
+@torch.inference_mode()
+def test_sm120_attends_strided_projections_in_place():
+    """SM120 reads strided projection views exactly as contiguous copies.
+
+    Segment attention passes the query, key and value as views of one
+    ``[rows, q | k | v | gate]`` matrix. The provider launches FlashInfer's
+    kernel on those views, which must give the output and log-sum-exp the
+    public wrapper gives on contiguous copies, bit for bit.
+    """
+    from uniserve.backends.attention.vsa import sm120
+
+    device = torch.device("cuda")
+    if not sm120.available(device):
+        pytest.skip("the SM120 provider is unavailable on this device")
+    torch.manual_seed(1201)
+    tiles, heads, tile = 9, 4, 64
+    rows = tiles * tile
+    projections = torch.randn(
+        rows, 4, heads, 128, device=device, dtype=torch.bfloat16
+    )
+    q, k, v, _ = projections.unbind(1)
+    assert all(sm120._in_place(value) for value in (q, k, v))
+    sizes = torch.tensor(
+        (64, 17, 64, 40, 0, 64, 23, 64, 1), device=device, dtype=torch.int32
+    )
+    # Every query tile of every head keeps a random leading share of a
+    # random order of the key tiles.
+    indices = torch.stack(
+        [
+            torch.stack([torch.randperm(tiles) for _ in range(tiles)])
+            for _ in range(heads)
+        ]
+    ).to(device=device, dtype=torch.int32)
+    counts = torch.randint(
+        1, tiles + 1, (heads, tiles), device=device, dtype=torch.int32
+    )
+    scale = 128**-0.5
+
+    out = torch.empty_like(q)
+    lse = torch.empty((1, heads, rows), device=device, dtype=torch.float32)
+    sm120._launch(
+        q, k, v, indices, counts, sizes, scale=scale, out=out, lse=lse
+    )
+    want = torch.empty_like(out)
+    want_lse = torch.empty_like(lse)
+    sm120.bsa_attn_sm120_blk64_fwd(
+        q.contiguous().unsqueeze(0),
+        k.contiguous().unsqueeze(0),
+        v.contiguous().unsqueeze(0),
+        indices.unsqueeze(0),
+        tiles,
+        block_sizes=sizes,
+        q2k_block_nums=counts.unsqueeze(0),
+        softmax_scale=scale,
+        out=want.unsqueeze(0),
+        lse=want_lse,
+    )
+    assert torch.equal(out, want)
+    assert torch.equal(lse, want_lse)

@@ -240,7 +240,7 @@ def resolve(backend, *, device, tile):
     Raises:
         RuntimeError: No installed provider (or not the named one) serves
             ``tile``-row tiles on ``device``. Only SM100 (data-center
-            Blackwell) devices serve 128-row tiles.
+            Blackwell) and SM120 devices serve 128-row tiles.
         ValueError: An unknown backend name.
     """
     if isinstance(backend, Backend):
@@ -248,7 +248,7 @@ def resolve(backend, *, device, tile):
     # Every provider runs CUDA kernels; other devices have none to probe.
     cuda = torch.device(device).type == "cuda"
     if backend == "auto":
-        for name in ("sm100", "flashinfer", "triton"):
+        for name in ("sm100", "sm120", "flashinfer", "triton"):
             candidate = import_module(f"{__name__}.{name}")
             if cuda and tile in candidate.TILES and candidate.available(device):
                 return candidate.Backend()
@@ -256,13 +256,13 @@ def resolve(backend, *, device, tile):
             f"no installed VSA backend serves {tile}-row tiles on {device}"
             + (
                 "; 128-row tiles require an SM100 (data-center Blackwell) "
-                "device"
+                "or SM120 device"
                 if tile == 128
                 else ""
             )
         )
 
-    if backend not in {"sm100", "cute", "flashinfer", "triton"}:
+    if backend not in {"sm100", "sm120", "cute", "flashinfer", "triton"}:
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
     if not cuda or tile not in module.TILES or not module.available(device):
