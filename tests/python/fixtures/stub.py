@@ -25,7 +25,6 @@ def read_config(**overrides):
     arguments = {
         "stub": True,
         "path": None,
-        "base_model": None,
         "io_format": "auto",
         "io_mode": "eager",
         "download_dir": None,

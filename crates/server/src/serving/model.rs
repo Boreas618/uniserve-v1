@@ -155,13 +155,11 @@ impl ModelConfig {
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
         // is resolved. A component export reads the components its pinned
-        // base supplies from `base_model`, or from the Hub cache at the
-        // pinned revision, as its workers do; `base_model` is refused for
-        // any other checkpoint. A family that a root `config.json` describes
-        // is selected by that file alone, even when the checkpoint publishes
-        // an index beside it.
-        let base_model = config.base_model.as_deref();
-        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model, base_model).await? {
+        // base supplies from the Hub cache at the pinned revision, as its
+        // workers do. A family that a root `config.json` describes is
+        // selected by that file alone, even when the checkpoint publishes an
+        // index beside it.
+        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
                     class_name: pipeline.class_name().to_owned(),

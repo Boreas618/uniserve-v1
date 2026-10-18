@@ -141,7 +141,6 @@ impl Default for WorkerProcessArgs {
             launcher_timeout: std::time::Duration::from_secs(120),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
-            base_model: None,
             ranks: vec![crate::WorkerRank {
                 node: "localhost".into(),
                 device: "cuda:0".into(),
@@ -294,7 +293,6 @@ impl WorkerProcessArgs {
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
-            base_model: self.base_model.as_deref().map(path),
             device: self.ranks[rank as usize].device.clone(),
             rank,
             local_rank: self.host_slot(rank)?.0,
@@ -458,37 +456,15 @@ mod tests {
     use std::ffi::OsString;
     use uniserve_ipc::LaneConfig;
 
-    /// A rank receives the operator's local base checkpoint, and none when
-    /// the operator named none, so the worker then reads the base from the
-    /// Hugging Face cache.
-    #[test]
-    fn the_launch_descriptor_carries_a_named_base_checkpoint() {
-        let mut args = WorkerProcessArgs {
-            model: "/models/FastH3-OmniRef".into(),
-            ..WorkerProcessArgs::default()
-        };
-        let descriptor = args
-            .launch_descriptor(0, None, None, None)
-            .expect("descriptor");
-        assert_eq!(descriptor.base_model, None);
-
-        args.base_model = Some("/models/MiniMax-H3".into());
-        let descriptor = args
-            .launch_descriptor(0, None, None, None)
-            .expect("descriptor");
-        assert_eq!(descriptor.base_model.as_deref(), Some("/models/MiniMax-H3"));
-    }
-
     /// The head answers a rank's registration with its launch descriptor as
     /// one frame, so every field must survive the frame's encoding, with and
     /// without the values that are optional.
     #[test]
     fn the_launch_descriptor_round_trips_through_a_frame() {
-        let mut args = WorkerProcessArgs::default();
-        for base_model in [None, Some("/models/MiniMax-H3".into())] {
-            args.base_model = base_model;
+        let args = WorkerProcessArgs::default();
+        for (rendezvous, generation) in [(None, None), (Some("127.0.0.1:29500"), Some(7))] {
             let descriptor = args
-                .launch_descriptor(0, Some("127.0.0.1:29500"), Some(7), None)
+                .launch_descriptor(0, rendezvous, generation, None)
                 .expect("descriptor");
             let frame = uniserve_ipc::Frame::encode(&descriptor).expect("a frame");
             let received: uniserve_ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
