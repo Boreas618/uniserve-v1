@@ -32,8 +32,6 @@ const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Draw-space values match the IPC `DrawLayout` discriminants and isolate
 /// semantic streams so activity in one stream cannot shift another.
 pub const DRAW_LAYOUT_TARGET: u64 = 0;
-/// Draw-space identifier for speculative proposal sampling.
-pub const DRAW_LAYOUT_PROPOSAL: u64 = 1;
 /// Draw-space identifier for diffusion flow noise.
 pub const DRAW_LAYOUT_FLOW_NOISE: u64 = 2;
 
@@ -180,7 +178,7 @@ mod tests {
         );
         assert_ne!(
             seeded,
-            request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_PROPOSAL)
+            request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_FLOW_NOISE)
         );
         // Unseeded requests keep one stream per lineage.
         let unseeded = request_sampling_key(None, 1, 2, 3, DRAW_LAYOUT_TARGET);
@@ -199,14 +197,14 @@ mod tests {
     }
 
     #[test]
-    fn draw_layout_separates_the_proposal_and_target_spaces() {
+    fn draw_layout_separates_the_target_and_flow_noise_spaces() {
         let session_seed = 0x0102_0304_0506_0708;
         let target = sampling_key(session_seed, 1, 2, 3, DRAW_LAYOUT_TARGET);
-        let proposal = sampling_key(session_seed, 1, 2, 3, DRAW_LAYOUT_PROPOSAL);
-        assert_ne!(target, proposal);
+        let noise = sampling_key(session_seed, 1, 2, 3, DRAW_LAYOUT_FLOW_NOISE);
+        assert_ne!(target, noise);
         assert_ne!(
             sampling_uniform(target, 5, 0, 0),
-            sampling_uniform(proposal, 5, 0, 0)
+            sampling_uniform(noise, 5, 0, 0)
         );
     }
 }
