@@ -60,10 +60,7 @@ pub use input::{
 };
 pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
-pub use model::{
-    InputProcessor, ModelSupport, ServedEndpoint, ServedFeature, ServedModality,
-    ServedSamplingControl, WorkerCapabilities, validate_video_capacity,
-};
+pub use model::{InputProcessor, WorkerCapabilities, validate_video_capacity};
 pub use preprocessing::chat_image_urls;
 
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};

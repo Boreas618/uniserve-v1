@@ -26,9 +26,7 @@ use uniserve_server::serving::media::{
     ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
 };
 use uniserve_server::serving::video::VideoService;
-use uniserve_server::serving::{
-    InputProcessor, ResponseOptions, ServeRequestId, ServedFeature, chat_image_urls,
-};
+use uniserve_server::serving::{InputProcessor, ResponseOptions, ServeRequestId, chat_image_urls};
 
 /// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
@@ -237,7 +235,6 @@ fn try_resolved_model(
         Some(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits,
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
         },
         video,
@@ -746,7 +743,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             None,
             uniserve_server::serving::WorkerCapabilities {
                 limits: runtime_limits(),
-                sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
                 max_model_tokens: 4096,
             },
             Some(video_service(
@@ -866,7 +862,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             None,
             uniserve_server::serving::WorkerCapabilities {
                 limits: runtime_limits(),
-                sampling_controls: Vec::new(),
                 max_model_tokens: 4096,
             },
             None,
@@ -893,7 +888,6 @@ fn worker_context_capacity_limits_preprocessed_requests() {
         Some(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 8,
         },
         None,
@@ -1201,7 +1195,6 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
         Some(renderer),
         uniserve_server::serving::WorkerCapabilities {
             limits: runtime_limits(),
-            sampling_controls: uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
         },
         None,
@@ -1226,13 +1219,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
     });
     for model_type in ["qwen3", "qwen3_moe"] {
         let json_calls = with_template(model_type, QWEN3_TEMPLATE);
-        assert!(
-            json_calls
-                .support()
-                .features
-                .contains(&ServedFeature::ToolCalling),
-            "{model_type}"
-        );
+        assert!(json_calls.supports_tool_calling(), "{model_type}");
         json_calls
             .preprocess_chat_request(
                 ServeRequestId::new("json-tools"),
@@ -1243,13 +1230,7 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 
         for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
             let other = with_template(model_type, template);
-            assert!(
-                !other
-                    .support()
-                    .features
-                    .contains(&ServedFeature::ToolCalling),
-                "{model_type}"
-            );
+            assert!(!other.supports_tool_calling(), "{model_type}");
             let error = other
                 .preprocess_chat_request(
                     ServeRequestId::new("other-tools"),
