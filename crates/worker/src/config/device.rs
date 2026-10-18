@@ -5,8 +5,6 @@
 //! because a rank scoped by `CUDA_VISIBLE_DEVICES` owns the visible device
 //! zero.
 
-use std::collections::BTreeMap;
-
 use uniserve_cuda::DeviceId;
 
 use super::DescriptorError;
@@ -69,69 +67,41 @@ impl std::fmt::Display for Device {
     }
 }
 
-/// Resolve the generation (flow) tower device from `--mesh`.
+/// Resolve the generation (flow) tower device from `--worker-mesh`.
 ///
-/// The only key is `tower=text:<device>;gen:<device>`. The text tower must
-/// be the rank's device and the generation tower a different one.
+/// The declaration is `tower=gen:<device>`: the text tower runs on the
+/// rank's device, and model loading places the flow route, denoiser and
+/// image decoder modules on `<device>`, which must differ from it. An empty
+/// declaration places no tower apart.
 pub(crate) fn generation_device(
     mesh: &str,
     device: Device,
 ) -> Result<Option<Device>, DescriptorError> {
-    if mesh.trim().is_empty() {
+    let mesh = mesh.trim();
+    if mesh.is_empty() {
         return Ok(None);
     }
 
-    let mut generation = None;
-    for entry in mesh.split(',') {
-        let (key, value) = entry.split_once('=').ok_or_else(|| {
+    let target = mesh
+        .split_once('=')
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("tower"))
+        .and_then(|(_, selection)| selection.split_once(':'))
+        .filter(|(name, target)| {
+            name.trim().eq_ignore_ascii_case("gen") && !target.trim().is_empty()
+        })
+        .map(|(_, target)| target.trim())
+        .ok_or_else(|| {
             DescriptorError::new(format!(
-                "invalid --mesh entry {entry:?}; expected key=value"
+                "--worker-mesh must be tower=gen:<device>, got {mesh:?}"
             ))
         })?;
-        let key = key.trim().to_lowercase().replace('_', "-");
-        if key != "tower" {
-            return Err(DescriptorError::new(format!("unknown --mesh key {key:?}")));
-        }
-        if generation.is_some() {
-            return Err(DescriptorError::new("duplicate --mesh key tower"));
-        }
-
-        let shape = || DescriptorError::new("tower params must use text:<device>;gen:<device>");
-        let mut parameters = BTreeMap::new();
-        for part in value.split(';') {
-            let (name, target) = part.split_once(':').ok_or_else(shape)?;
-            let name = name.trim().to_lowercase();
-            if !matches!(name.as_str(), "text" | "gen") || target.trim().is_empty() {
-                return Err(shape());
-            }
-            if parameters.insert(name.clone(), target.trim()).is_some() {
-                return Err(DescriptorError::new(format!(
-                    "duplicate tower params {name:?}"
-                )));
-            }
-        }
-
-        let target = parameters
-            .get("gen")
-            .ok_or_else(|| DescriptorError::new("tower params requires gen:<device>"))?;
-        let text = match parameters.get("text") {
-            Some(text) => Device::parse(text, "--mesh tower text")?,
-            None => device,
-        };
-        if text != device {
-            return Err(DescriptorError::new(
-                "text expert device must match the Worker rank device",
-            ));
-        }
-        let target = Device::parse(target, "--mesh tower gen")?;
-        if target == text {
-            return Err(DescriptorError::new(
-                "tower text and gen devices must be different",
-            ));
-        }
-        generation = Some(target);
+    let generation = Device::parse(target, "--worker-mesh tower gen")?;
+    if generation == device {
+        return Err(DescriptorError::new(
+            "--worker-mesh tower gen must name a device other than the rank's",
+        ));
     }
-    Ok(generation)
+    Ok(Some(generation))
 }
 
 #[cfg(test)]
@@ -153,16 +123,18 @@ mod tests {
         assert!(Device::parse("cuda:-1", "--device").is_err());
     }
 
+    /// `tower=gen:<device>` places the generation tower on another device
+    /// than the rank's; the text tower always runs on the rank's own.
     #[test]
     fn tower_placement_requires_a_distinct_generation_device() {
-        let text = Device::Cuda(DeviceId(0));
+        let rank = Device::Cuda(DeviceId(0));
         assert_eq!(
-            generation_device("tower=text:cuda:0;gen:cuda:1", text).ok(),
+            generation_device("tower=gen:cuda:1", rank).ok(),
             Some(Some(Device::Cuda(DeviceId(1))))
         );
-        assert!(generation_device("tower=gen:cuda:0", text).is_err());
-        assert!(generation_device("tower=text:cuda:1;gen:cuda:2", text).is_err());
-        assert!(generation_device("other=1", text).is_err());
-        assert_eq!(generation_device(" ", text).ok(), Some(None));
+        assert!(generation_device("tower=gen:cuda:0", rank).is_err());
+        assert!(generation_device("tower=text:cuda:0;gen:cuda:1", rank).is_err());
+        assert!(generation_device("other=1", rank).is_err());
+        assert_eq!(generation_device(" ", rank).ok(), Some(None));
     }
 }

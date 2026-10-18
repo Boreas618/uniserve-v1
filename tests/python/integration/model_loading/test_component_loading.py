@@ -1,6 +1,5 @@
 """Independent checkpoint modules retain their values, buffers and placement."""
 
-import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -82,7 +81,6 @@ def component_checkpoint(tmp_path):
             "scale": torch.tensor([0.5, 2.0]),
         },
     }
-    hashes = {}
     for name, values in tensors.items():
         directory = tmp_path / name
         directory.mkdir()
@@ -91,12 +89,7 @@ def component_checkpoint(tmp_path):
         (directory / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": dict.fromkeys(values, path.name)})
         )
-        hashes[path.relative_to(tmp_path).as_posix()] = hashlib.sha256(
-            path.read_bytes()
-        ).hexdigest()
-    manifest = tmp_path / "sha256.json"
-    manifest.write_text(json.dumps({"files": hashes}))
-    return tmp_path, loading.Config(checksum_manifest=manifest)
+    return tmp_path, loading.Config()
 
 
 def _load(
@@ -134,16 +127,6 @@ def test_component_directories_preserve_namespaces_and_persistent_buffers(
     torch.testing.assert_close(
         result.model(torch.tensor([[1.0, 2.0]])), torch.tensor([[5.0, 66.0]])
     )
-
-
-def test_checksum_covers_each_component_source(component_checkpoint):
-    root, io = component_checkpoint
-    save_file(
-        {"weight": torch.eye(2), "scale": torch.ones(2)},
-        root / "decoder" / "model.safetensors",
-    )
-    with pytest.raises(ValueError, match="checksum mismatch.*decoder/"):
-        _load(root, io)
 
 
 def test_missing_serialized_buffer_rejects_incomplete_component(

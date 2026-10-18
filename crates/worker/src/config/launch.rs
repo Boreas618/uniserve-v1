@@ -1,8 +1,9 @@
 //! Resolve a launch descriptor once, before model loading and collectives.
 //!
-//! [`resolve`] validates every descriptor value and produces the immutable
-//! [`WorkerLaunch`] the rank runs with. All deployment decisions are made
-//! here; the numerical library receives only resolved values.
+//! [`resolve`] reads every descriptor value into the immutable
+//! [`WorkerLaunch`] the rank runs with, checking only what the rank alone
+//! knows. All deployment decisions are made here; the numerical library
+//! receives only resolved values.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -10,7 +11,10 @@ use uniserve_core::ComponentConfig;
 use uniserve_ipc::LaunchDescriptor;
 
 use super::device::{Device, generation_device};
-use super::{DescriptorError, WorkerConfig};
+use super::{
+    DEFAULT_FLOW_GRAPH_BATCH_SIZES, DEFAULT_FLOW_GRAPH_SHAPES, DescriptorError, WorkerConfig,
+    default_decode_sizes, default_prefill_sizes,
+};
 
 /// Channel and product-publication settings of the rank.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +82,6 @@ pub struct LoadOptions {
     pub mode: String,
     pub download_dir: Option<String>,
     pub num_threads: Option<u32>,
-    pub checksum_manifest: Option<String>,
 }
 
 /// FlashInfer attention options passed to the attention backend.
@@ -132,22 +135,18 @@ impl WorkerLaunch {
     }
 }
 
-/// Validate and resolve a launch descriptor.
+/// Resolve a launch descriptor.
 ///
-/// Fails with the first violated rule. Messages name the launch option the
-/// operator sets, because the engine reports them as the rank's exit cause.
+/// The command line and the engine validate the launch values they own
+/// before they write the descriptor, so this checks only what the rank
+/// alone knows: its device, the transports it can bind, the precisions its
+/// device computes, and the text values it parses (`--worker-mesh`, the
+/// graph catalogs, the lanes taken together). Fails with the first
+/// violated rule; messages name the launch option the operator sets,
+/// because the engine reports them as the rank's exit cause.
 pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorError> {
     let role = descriptor.role.trim().to_owned();
-    let experts = expert_parallel(&descriptor, &role)?;
-    if role == "experts"
-        && experts
-            .as_ref()
-            .is_none_or(|union| !union.disaggregated() || union.rank < union.attention_ranks)
-    {
-        return Err(DescriptorError::new(
-            "expert workers require a disaggregated expert union",
-        ));
-    }
+    let experts = expert_parallel(&descriptor)?;
 
     let device = Device::parse(&descriptor.device, "--device")?;
     let generation = generation_device(descriptor.mesh.as_deref().unwrap_or_default(), device)?;
@@ -164,33 +163,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         ));
     }
 
-    let quantization = match &descriptor.quantization_config {
-        serde_json::Value::Object(fields) => fields.clone(),
-        _ => {
-            return Err(DescriptorError::new(
-                "--quantization-config must be a JSON object",
-            ));
-        }
-    };
-    // A cache dtype in the precision selectors overrides `--kv-cache-dtype`, so
-    // capacity planning and loading see one resolved value.
-    let prefix_cache_dtype_override = match quantization.get("kv_cache_dtype") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(dtype)) => Some(dtype.clone()),
-        Some(_) => return Err(DescriptorError::new("worker KV dtype is unsupported")),
-    };
-
-    if descriptor.queue_depth == 0 {
-        return Err(DescriptorError::new("--queue-depth must be positive"));
-    }
-    if descriptor.ipc_payload_cap == 0 {
-        return Err(DescriptorError::new("--ipc-payload-cap must be positive"));
-    }
-    if descriptor.watchdog_timeout_ms < 2 {
-        return Err(DescriptorError::new(
-            "--watchdog-timeout must leave a positive lane stall bound",
-        ));
-    }
     let stub = descriptor.no_model;
     let model = text(Some(&descriptor.model));
     if !stub && model.is_none() {
@@ -199,15 +171,10 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         ));
     }
 
-    let rendezvous = rendezvous(&descriptor)?;
+    let rendezvous = rendezvous(&descriptor);
     let load = load_options(&descriptor)?;
     let attention = attention_options(&descriptor)?;
-    let components = components(&descriptor, &role)?;
-    let mut execution = execution(&descriptor, device, generation, &role, experts.as_ref())?;
-    if prefix_cache_dtype_override.is_some() {
-        execution.prefix_cache_dtype = prefix_cache_dtype_override;
-        execution.validate().map_err(DescriptorError::from)?;
-    }
+    let execution = execution(&descriptor, device, generation, &role, experts.as_ref())?;
 
     Ok(WorkerLaunch {
         worker_id: descriptor.worker_id.clone(),
@@ -230,14 +197,14 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         model: model.map(|path| ModelSource {
             path,
             base_model: text(descriptor.base_model.as_deref()),
-            quantization: serde_json::Value::Object(quantization).to_string(),
+            quantization: descriptor.quantization_config.to_string(),
         }),
         data_plane: DataPlane { backends, exports },
         execution,
         attention,
         load,
         stub,
-        components,
+        components: descriptor.components,
     })
 }
 
@@ -272,105 +239,28 @@ fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {
     Ok(names)
 }
 
-fn rendezvous(descriptor: &LaunchDescriptor) -> Result<Option<RendezvousConfig>, DescriptorError> {
-    let address = text(descriptor.rendezvous_address.as_deref());
-    let fd = descriptor.rendezvous_listen_fd;
-    let Some(address) = address else {
-        if fd.is_some() {
-            return Err(DescriptorError::new(
-                "a rendezvous socket requires its address",
-            ));
-        }
-        return Ok(None);
-    };
-    let first = descriptor.rank == 0;
-    if first != fd.is_some() {
-        return Err(DescriptorError::new(if first {
-            "the first rank must inherit its rendezvous socket"
-        } else {
-            "only the first rank inherits a rendezvous socket"
-        }));
-    }
-    store_address(&address)?;
-    Ok(Some(RendezvousConfig {
+/// Where this rank's group forms its host-collective mesh.
+///
+/// The process that spawns the group's first rank, the engine or the
+/// launcher of that rank's host, binds the rendezvous socket before the
+/// rank exists and names it in that rank's descriptor alone.
+fn rendezvous(descriptor: &LaunchDescriptor) -> Option<RendezvousConfig> {
+    text(descriptor.rendezvous_address.as_deref()).map(|address| RendezvousConfig {
         address,
-        listen_fd: fd,
-    }))
+        listen_fd: descriptor.rendezvous_listen_fd,
+    })
 }
 
-/// Check that a rendezvous address names a host and a port.
-fn store_address(address: &str) -> Result<(), DescriptorError> {
-    let (_, port) = address
-        .rsplit_once(':')
-        .ok_or_else(|| DescriptorError::new("store address must be host:port"))?;
-    port.parse::<u16>()
-        .map_err(|error| DescriptorError::new(format!("invalid store port: {error}")))?;
-    Ok(())
-}
-
-/// Validate the expert-parallel union membership.
-fn expert_parallel(
-    descriptor: &LaunchDescriptor,
-    role: &str,
-) -> Result<Option<ExpertUnion>, DescriptorError> {
+/// This rank's place in the expert-parallel union, when the launch names
+/// one. The engine places the union and validates its shape before it
+/// launches a rank.
+fn expert_parallel(descriptor: &LaunchDescriptor) -> Result<Option<ExpertUnion>, DescriptorError> {
     let Some(value) = &descriptor.expert_parallel else {
         return Ok(None);
     };
-    let (rank, size, attention) = (
-        i64::from(value.rank),
-        i64::from(value.size),
-        i64::from(value.attention_ranks),
-    );
-    let exchange = value.exchange.as_str();
-    if !matches!(exchange, "alltoall" | "megamoe" | "dwdp" | "deepep") {
-        return Err(DescriptorError::new(format!(
-            "unknown expert exchange {exchange:?}; expected alltoall, megamoe, dwdp or deepep"
-        )));
-    }
-    if size < 2 {
-        return Err(DescriptorError::new(
-            "an expert-parallel world spans at least two ranks",
-        ));
-    }
-    if rank >= size {
-        return Err(DescriptorError::new(
-            "expert-parallel rank must satisfy 0 <= rank < size",
-        ));
-    }
-    if attention >= size {
-        return Err(DescriptorError::new(
-            "attention ranks must leave at least one expert rank",
-        ));
-    }
-    let start = rank - i64::from(descriptor.rank);
-    let world_size = i64::from(descriptor.world_size);
-    let stop = start + world_size;
-    if start < 0 || stop > size || (start < attention && attention < stop) {
-        return Err(DescriptorError::new(
-            "worker ranks must fit within one role in the expert union",
-        ));
-    }
-    if attention != 0
-        && (!matches!(exchange, "deepep" | "megamoe")
-            || ((rank >= attention) != (role == "experts")))
-    {
-        return Err(DescriptorError::new(
-            "disaggregated role or expert exchange disagrees with placement",
-        ));
-    }
-    if attention == 0 && (world_size != 1 || exchange == "deepep") {
-        return Err(DescriptorError::new(
-            "an expert-parallel replica joins its world with its only rank",
-        ));
-    }
-    let address = text(value.address.as_deref())
-        .ok_or_else(|| DescriptorError::new("store address must be host:port"))?;
-    store_address(&address)?;
-    if (rank == 0) != value.listen_fd.is_some() {
-        return Err(DescriptorError::new(
-            "exactly the expert-parallel world's rank 0 serves its store",
-        ));
-    }
+    let address = text(value.address.as_deref()).ok_or_else(|| {
+        DescriptorError::new("an expert-parallel union requires its store address")
+    })?;
     Ok(Some(ExpertUnion {
         rank: value.rank as usize,
         size: value.size as usize,
@@ -383,6 +273,9 @@ fn expert_parallel(
     }))
 }
 
+/// Separate the descriptor's one checkpoint reader selector into a file
+/// format and a loading mode: a file format loads eagerly; `dummy` and
+/// `layered` select a mode and leave the format to detection.
 fn load_options(descriptor: &LaunchDescriptor) -> Result<LoadOptions, DescriptorError> {
     let selected = descriptor.load_format.as_str();
     let (format, mode) = match selected {
@@ -399,7 +292,6 @@ fn load_options(descriptor: &LaunchDescriptor) -> Result<LoadOptions, Descriptor
         mode: mode.to_owned(),
         download_dir: text(descriptor.download_dir.as_deref()),
         num_threads: descriptor.load_threads,
-        checksum_manifest: text(descriptor.checksum_manifest.as_deref()),
     })
 }
 
@@ -413,31 +305,6 @@ fn attention_options(descriptor: &LaunchDescriptor) -> Result<AttentionOptions, 
             _ => Err(DescriptorError::new("expected an optional bool token")),
         })
         .transpose()?;
-    if descriptor.flashinfer_workspace_size == 0 {
-        return Err(DescriptorError::new(
-            "FlashInfer workspace size must be positive",
-        ));
-    }
-    for (name, tile) in [
-        ("decode", descriptor.flashinfer_decode_split_tile_size),
-        ("prefill", descriptor.flashinfer_prefill_split_tile_size),
-    ] {
-        if tile == Some(0) {
-            return Err(DescriptorError::new(format!(
-                "FlashInfer {name} split tile size must be positive"
-            )));
-        }
-    }
-    for backend in [
-        &descriptor.flashinfer_decode_backend,
-        &descriptor.flashinfer_prefill_backend,
-    ] {
-        if !matches!(backend.as_str(), "auto" | "fa2" | "fa3") {
-            return Err(DescriptorError::new(format!(
-                "unsupported FlashInfer backend {backend:?}"
-            )));
-        }
-    }
     Ok(AttentionOptions {
         workspace_size: descriptor.flashinfer_workspace_size,
         decode_backend: descriptor.flashinfer_decode_backend.clone(),
@@ -449,43 +316,8 @@ fn attention_options(descriptor: &LaunchDescriptor) -> Result<AttentionOptions, 
     })
 }
 
-/// Resolve rank placement once, before any collective begins.
-fn components(
-    descriptor: &LaunchDescriptor,
-    role: &str,
-) -> Result<BTreeMap<String, ComponentConfig>, DescriptorError> {
-    if role == "experts" {
-        if !descriptor.components.is_empty() {
-            return Err(DescriptorError::new(
-                "expert workers have no request components",
-            ));
-        }
-        return Ok(BTreeMap::new());
-    }
-    if descriptor.components.is_empty() {
-        return Err(DescriptorError::new(
-            "component configuration must not be empty",
-        ));
-    }
-    for (name, component) in &descriptor.components {
-        component
-            .validate()
-            .map_err(|error| DescriptorError::new(error.to_string()))?;
-        if name.is_empty()
-            || component
-                .ranks
-                .iter()
-                .any(|&rank| rank >= descriptor.world_size as usize)
-        {
-            return Err(DescriptorError::new(
-                "component contains ranks outside the process world or an empty name",
-            ));
-        }
-    }
-    Ok(descriptor.components.clone())
-}
-
-/// The execution settings, including bucket lists and lanes.
+/// The execution settings: every launch value as the descriptor states it,
+/// and the rank's own graph catalogs where the descriptor leaves them unset.
 fn execution(
     descriptor: &LaunchDescriptor,
     device: Device,
@@ -493,84 +325,55 @@ fn execution(
     role: &str,
     experts: Option<&ExpertUnion>,
 ) -> Result<WorkerConfig, DescriptorError> {
-    let positive = |value: Option<u64>| -> Result<Option<usize>, DescriptorError> {
-        match value {
-            Some(0) => Err(DescriptorError::new(
-                "optional integer tuning values must be positive when set",
-            )),
-            value => Ok(value.map(|value| value as usize)),
-        }
-    };
-    let prefix_cache_dtype = descriptor
-        .prefix_cache_dtype
-        .as_deref()
-        .map(|dtype| {
-            let dtype = dtype.trim();
-            if dtype.is_empty() {
-                return Err(DescriptorError::new(
-                    "an explicitly provided string setting must not be empty",
-                ));
-            }
-            Ok(dtype.to_owned())
-        })
-        .transpose()?;
-
+    let expert_exchange =
+        experts.map_or_else(|| "alltoall".to_owned(), |union| union.exchange.clone());
     let mut config = WorkerConfig {
         device,
         generation_device: generation,
         rank: descriptor.rank as usize,
         world_size: descriptor.world_size as usize,
-        role: if role.is_empty() {
-            "model".into()
-        } else {
-            role.to_owned()
-        },
+        role: role.to_owned(),
+        expert_exchange,
         expert_microbatches: descriptor.expert_microbatches as usize,
+        block_size: descriptor.block_size.map(|size| size as usize),
+        max_total_tokens: descriptor.max_total_tokens.map(|tokens| tokens as usize),
+        attention_backend: descriptor.attention_backend.clone(),
         max_batch_calls: descriptor.max_batch_calls as usize,
         max_batch_tokens: descriptor.max_batch_tokens as usize,
-        max_request_pool_size: descriptor.max_request_pool_size as usize,
         max_model_len: descriptor.max_model_len as usize,
         max_video_seconds: descriptor.max_video_seconds,
         max_condition_rows: descriptor.max_condition_rows as usize,
-        encoder_cache_entries: descriptor.encoder_cache_entries as usize,
         ffmpeg: descriptor.ffmpeg.clone(),
         min_video_seconds: descriptor.min_video_seconds,
+        video_text_capacities: Vec::new(),
         video_canvases: descriptor.video_canvases.clone(),
         deployment_components: descriptor.deployment_components.clone(),
+        canvas_sampling: None,
+        max_request_pool_size: descriptor.max_request_pool_size as usize,
+        encoder_cache_entries: descriptor.encoder_cache_entries as usize,
+        pool_storage_bytes: None,
         model_dtype: descriptor.model_dtype.clone(),
+        prefix_cache_dtype: descriptor.prefix_cache_dtype.clone(),
         mem_fraction_static: descriptor.mem_fraction_static,
+        lanes: descriptor.lane.clone(),
+        graph_policy: descriptor.graph_policy.clone(),
+        decode_graph_batch_sizes: default_decode_sizes(),
         prefill_cuda_graph: descriptor.prefill_cuda_graph,
         prefill_outputs: descriptor.prefill_outputs,
+        prefill_graph_token_sizes: default_prefill_sizes(),
         flow_cuda_graph: descriptor.flow_cuda_graph,
-        graph_policy: descriptor.graph_policy.clone(),
-        attention_backend: descriptor.attention_backend.clone(),
-        block_size: positive(descriptor.block_size.map(u64::from))?,
-        max_total_tokens: positive(descriptor.max_total_tokens)?,
-        prefix_cache_dtype,
-        lanes: descriptor.lane.clone(),
-        ..WorkerConfig::default()
+        flow_graph_batch_sizes: DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
+        flow_graph_shapes: DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
     };
 
-    if let Some(experts) = experts {
-        config.expert_exchange = experts.exchange.clone();
-        if config.expert_microbatches > 1 && !experts.disaggregated() {
-            return Err(DescriptorError::new(
-                "expert microbatches require disaggregated experts",
-            ));
-        }
-        if config.expert_exchange == "alltoall" {
-            // Each local graph also captures larger transfer capacities.
-            // Geometric small buckets, then 512-token spacing, bound that
-            // product.
-            config.prefill_graph_token_sizes = [4, 8, 16, 32, 64, 128, 256, 512]
-                .into_iter()
-                .chain((1024..=16384).step_by(512))
-                .collect();
-        }
-    } else if config.expert_microbatches > 1 {
-        return Err(DescriptorError::new(
-            "expert microbatches require disaggregated experts",
-        ));
+    if config.expert_exchange == "alltoall" && experts.is_some() {
+        // Each local graph also captures larger transfer capacities.
+        // Geometric small buckets, then 512-token spacing, bound that
+        // product.
+        config.prefill_graph_token_sizes = [4, 8, 16, 32, 64, 128, 256, 512]
+            .into_iter()
+            .chain((1024..=16384).step_by(512))
+            .collect();
     }
 
     for (value, buckets) in [
@@ -624,15 +427,6 @@ fn execution(
         config.canvas_sampling = Some(sampling);
     }
     config.validate().map_err(DescriptorError::from)?;
-
-    // The service uses a 24-fps clock; model windows may extend it by
-    // sixteen frames. Keep the resolved count within the IPC frame index.
-    let frames = (config.max_video_seconds * 24.0).round_ties_even();
-    if !(1.0..=f64::from(u32::MAX - 16)).contains(&frames) {
-        return Err(DescriptorError::new(
-            "max-video-seconds must resolve to a supported frame count",
-        ));
-    }
     Ok(config)
 }
 

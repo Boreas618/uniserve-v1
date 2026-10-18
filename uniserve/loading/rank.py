@@ -185,7 +185,6 @@ def read_config(
     io_mode: str,
     download_dir: str | None,
     num_threads: int | None,
-    checksum_manifest: str | None,
     device: str,
     generation_device: str | None,
     components: str,
@@ -199,8 +198,8 @@ def read_config(
         stub: Describe the stub model instead of a checkpoint.
         path: The checkpoint directory.
         base_model: The base checkpoint an adapter refers to.
-        io_format, io_mode, download_dir, num_threads, checksum_manifest:
-            How weights are read (``uniserve.loading.Config``).
+        io_format, io_mode, download_dir, num_threads: How weights are read
+            (``uniserve.loading.Config``).
         device: The rank's primary device.
         generation_device: The device of a generation tower placed apart.
         components: The launch's component placement as JSON object text:
@@ -221,9 +220,6 @@ def read_config(
         mode=cast(Literal["eager", "layered", "dummy"], str(io_mode)),
         download_dir=None if download_dir is None else Path(str(download_dir)),
         num_threads=None if num_threads is None else int(num_threads),
-        checksum_manifest=None
-        if checksum_manifest is None
-        else Path(str(checksum_manifest)),
     )
     path, base = _text(path), _text(base_model)
     rank, role = int(rank), str(role)

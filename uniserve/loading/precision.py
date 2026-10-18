@@ -19,7 +19,6 @@ _KEYS = {
     "quant_method",
     "components",
     "ignored_layers",
-    "kv_cache_dtype",
 }
 
 # Formats a generic ``quant_method`` applies to every module.
@@ -39,7 +38,6 @@ def weight_config(
     generic formats, applied to every module; or, with no selector, the
     checkpoint's own weights. ``ignored_layers`` then maps each listed module
     path to no quantization, and the dtype comes from ``model_dtype``.
-    ``kv_cache_dtype`` is accepted here and resolved by the worker.
 
     Raises:
         ValueError: An unknown key, both ``mode`` and ``quant_method``,
