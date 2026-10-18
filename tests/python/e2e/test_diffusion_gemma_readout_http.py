@@ -59,6 +59,16 @@ CHECKPOINTS = {
     "bf16": "UNISERVE_DIFFUSION_GEMMA_MODEL",
     "nvfp4": "UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL",
 }
+# Each deployment a test may be served by: its checkpoint precision and the
+# serve options it adds.
+DEPLOYMENTS = {
+    "bf16": ("bf16", []),
+    "nvfp4": ("nvfp4", []),
+    "bf16-compact": (
+        "bf16",
+        ["--readout-layout", "independent", "--readout-canvas", "compact"],
+    ),
+}
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 FIXTURE = FIXTURES / "diffusion_gemma_readout_prompts.json"
 # The worker's default encoder cache budget, in retained feature products.
@@ -120,18 +130,16 @@ def _serve(
 
 @pytest.fixture(scope="module", params=sorted(CHECKPOINTS))
 def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
-    """Serve one precision's checkpoint; yield its URL and directory."""
-    yield from _serve(request.param, tmp_path_factory, [])
+    """Serve one deployment; yield its URL and checkpoint directory.
 
-
-@pytest.fixture(scope="module")
-def compact_served(tmp_path_factory) -> Iterator[tuple[str, Path]]:
-    """Serve the BF16 checkpoint with one compact canvas per question."""
-    yield from _serve(
-        "bf16",
-        tmp_path_factory,
-        ["--readout-layout", "independent", "--readout-canvas", "compact"],
-    )
+    By default the deployments are each precision's checkpoint as it ships.
+    Every deployment is a parameter of this one module-scoped fixture, so
+    pytest stops one deployment's server before it starts the next and a
+    single server holds the device at a time. A test served by another
+    deployment names it with indirect parametrization.
+    """
+    precision, options = DEPLOYMENTS[request.param]
+    yield from _serve(precision, tmp_path_factory, options)
 
 
 def _readout(base_url: str, body: dict) -> dict:
@@ -215,40 +223,6 @@ def test_a_fact_before_the_sliding_window_is_read_back(served, length):
     answer = response["answers"]["color"]
     _assert_well_formed(answer)
     assert _choice(answer) == "green"
-
-
-def test_more_questions_than_a_readout_graph_holds_are_answered(compact_served):
-    """Every one of 48 questions about one state is answered.
-
-    Each question has a compact canvas of its own, which costs few tokens, so
-    the engine reads all 48 canvases in one pass: more than the widest
-    readout graph holds, which the worker sizes for full canvases (8192
-    batched tokens over 256-token canvases make 32). The pass runs without
-    a graph and answers each question from the state.
-    """
-    base_url, _ = compact_served
-    questions = {
-        f"color_{index}": {
-            "type": "choice",
-            "instructions": "What is the secret color named in the state?",
-            "criteria": dict.fromkeys(COLORS),
-        }
-        for index in range(48)
-    }
-
-    response = _readout(
-        base_url,
-        {
-            "model": SERVED_MODEL,
-            "state": "The secret color is green.",
-            "questions": questions,
-        },
-    )
-
-    assert list(response["answers"]) == list(questions)
-    for answer in response["answers"].values():
-        _assert_well_formed(answer)
-        assert _choice(answer) == "green"
 
 
 def _png(color: tuple[int, int, int], size: tuple[int, int]) -> str:
@@ -337,3 +311,38 @@ def test_distinct_images_beyond_the_encoder_cache_are_read(served):
             answer = response.json()["answers"]["color"]
             _assert_well_formed(answer)
             assert _choice(answer) == color, (index, answer)
+
+
+@pytest.mark.parametrize("served", ["bf16-compact"], indirect=True)
+def test_more_questions_than_a_readout_graph_holds_are_answered(served):
+    """Every one of 48 questions about one state is answered.
+
+    Each question has a compact canvas of its own, which costs few tokens, so
+    the engine reads all 48 canvases in one pass: more than the widest
+    readout graph holds, which the worker sizes for full canvases (8192
+    batched tokens over 256-token canvases make 32). The pass runs without
+    a graph and answers each question from the state.
+    """
+    base_url, _ = served
+    questions = {
+        f"color_{index}": {
+            "type": "choice",
+            "instructions": "What is the secret color named in the state?",
+            "criteria": dict.fromkeys(COLORS),
+        }
+        for index in range(48)
+    }
+
+    response = _readout(
+        base_url,
+        {
+            "model": SERVED_MODEL,
+            "state": "The secret color is green.",
+            "questions": questions,
+        },
+    )
+
+    assert list(response["answers"]) == list(questions)
+    for answer in response["answers"].values():
+        _assert_well_formed(answer)
+        assert _choice(answer) == "green"
