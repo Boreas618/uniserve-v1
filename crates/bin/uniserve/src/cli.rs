@@ -221,8 +221,8 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long = "max-total-tokens", value_name = "KV_TOKEN_CAPACITY")]
-    pub cache_token_capacity: Option<u64>,
+    #[arg(long)]
+    pub max_total_tokens: Option<u64>,
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long = "disable-prefix-cache")]
     pub disable_prefix_reuse: bool,
@@ -275,7 +275,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// power of two; every other group's page holds as many tokens as fit
     /// the same unit plane. Unset, the worker chooses the largest size, at
     /// most 64, whose pages its attention kernels read in every cache group.
-    #[arg(long = "page-size", value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: Option<u32>,
     /// This instance's host identity. Ranks are placed on it by name, and the
     /// engine owns exactly the ranks whose node matches it.
@@ -490,7 +490,7 @@ impl SharedRuntimeArgs {
         worker_process.queue_depth = queue_depth;
         worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
         worker_process.max_message_bytes = self.max_message_bytes;
-        worker_process.cache_token_capacity = self.cache_token_capacity;
+        worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
 
@@ -614,15 +614,11 @@ pub(crate) struct WorkerProcessOptions {
     pub quantization_config: serde_json::Value,
     #[arg(long = "kv-cache-dtype", value_name = "KV_CACHE_DTYPE")]
     pub prefix_cache_dtype: Option<PrefixCacheDtype>,
-    /// Each worker rank's share of its device's total storage, in (0, 1].
-    /// A deployment file's `memory_fraction` overrides it for one worker.
-    #[arg(
-        long = "mem-fraction-static",
-        default_value = "0.70",
-        value_parser = parse_storage_fraction,
-        value_name = "KV_STORAGE_FRACTION"
-    )]
-    pub cache_storage_fraction: f64,
+    /// Each worker rank's share of its device's total memory for static
+    /// allocations, weights and KV cache, in (0, 1]. A deployment file's
+    /// `mem_fraction_static` overrides it for one worker.
+    #[arg(long, default_value = "0.70", value_parser = parse_mem_fraction_static)]
+    pub mem_fraction_static: f64,
     /// Parallelism mesh forwarded to the worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1`.
     #[arg(long, hide = true)]
@@ -696,7 +692,7 @@ impl WorkerProcessOptions {
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
             prefix_cache_dtype: self.prefix_cache_dtype,
-            cache_storage_fraction: self.cache_storage_fraction,
+            mem_fraction_static: self.mem_fraction_static,
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
@@ -729,13 +725,13 @@ fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
-/// Parses a device storage fraction for clap, refusing a value outside the
-/// range `WorkerConfig::validate_storage_fraction` accepts.
-fn parse_storage_fraction(value: &str) -> Result<f64, String> {
+/// Parses a static memory fraction for clap, refusing a value outside the
+/// range `WorkerConfig::validate_mem_fraction_static` accepts.
+fn parse_mem_fraction_static(value: &str) -> Result<f64, String> {
     let fraction = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid storage fraction {value:?}: {error}"))?;
-    WorkerConfig::validate_storage_fraction(fraction).map_err(|error| error.to_string())?;
+        .map_err(|error| format!("invalid mem_fraction_static {value:?}: {error}"))?;
+    WorkerConfig::validate_mem_fraction_static(fraction).map_err(|error| error.to_string())?;
     Ok(fraction)
 }
 
@@ -757,12 +753,12 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_zero_page_size() {
+    fn serve_rejects_zero_block_size() {
         let result = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
-            "--page-size",
+            "--block-size",
             "0",
         ]);
         assert!(result.is_err());
@@ -785,7 +781,7 @@ mod tests {
     #[test]
     fn serve_accepts_runtime_configuration() {
         let configuration = written_configuration(
-            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"memory_fraction":0.25}]"#,
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"components":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1,"mem_fraction_static":0.25}]"#,
         );
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
@@ -795,7 +791,7 @@ mod tests {
             "cpu",
             "--worker-ranks",
             "2",
-            "--page-size",
+            "--block-size",
             "128",
             "--queue-depth",
             "3",
@@ -842,8 +838,7 @@ mod tests {
         let workers = args.runtime.workers.expect("the configuration was read");
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id.0, "text");
-        // The file's `memory_fraction` key deserializes into `storage_fraction`.
-        assert_eq!(workers[0].storage_fraction, Some(0.25));
+        assert_eq!(workers[0].mem_fraction_static, Some(0.25));
         assert_eq!(workers[0].components["model"].ranks, vec![0, 1]);
         assert_eq!(
             workers[0].components["model"]
@@ -854,10 +849,10 @@ mod tests {
     }
 
     /// `--mem-fraction-static` is each rank's share of its device's total
-    /// storage, so the parser accepts exactly the finite values in (0, 1]
-    /// that the worker accepts, and refuses the rest before any rank starts.
+    /// memory, so the parser accepts exactly the finite values in (0, 1]
+    /// and refuses the rest before any rank starts.
     #[test]
-    fn serve_accepts_only_a_storage_fraction_in_the_unit_interval() {
+    fn serve_accepts_only_a_mem_fraction_static_in_the_unit_interval() {
         let serve = |fraction: &str| {
             <Cli as clap::Parser>::try_parse_from([
                 "uniserve",

@@ -507,10 +507,7 @@ impl Worker {
         }
         if text_warmup {
             hooks.push(Box::new(CausalLMWarmup {
-                row_tokens: config
-                    .max_sequence_tokens
-                    .min(config.max_batch_tokens)
-                    .max(1),
+                row_tokens: config.max_model_len.min(config.max_batch_tokens).max(1),
             }));
         }
         if diffusion_lm_warmup {
@@ -710,7 +707,7 @@ impl Worker {
             } else {
                 0
             };
-            let measured = budget.budget(index, self.config.cache_storage_fraction)?;
+            let measured = budget.budget(index, self.config.mem_fraction_static)?;
             let segments = self.segments(index)?;
             let pooled = self
                 .graphs

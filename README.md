@@ -120,10 +120,10 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
 | `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--page-size` | Chosen by the worker | Base KV page size supported by every cache group's attention readers. |
+| `--block-size` | Chosen by the worker | Tokens per KV block of the widest cache group, supported by every cache group's attention readers |
 | `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a request with an input image whose vision feature block holds more tokens is refused |
 | `--chunked-prefill-size` | `8192` | Per-request prefill bound |
-| `--mem-fraction-static` | `0.70` | Each rank's share of device storage |
+| `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto` captures graphs when serving captures the attention provider's calls (every provider but `torch`) and otherwise serves every call eagerly, `full` requires those graphs, `off` serves every call eagerly |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
 | `--attention-backend` | `auto` | Attention provider: `auto` selects a native kernel for each call from the device and the installed kernel libraries; `flashinfer`, `trtllm` (TensorRT-LLM kernels shipped with FlashInfer), `flash_attn_4` (FlashAttention-4), `torch` (portable SDPA), `prefix_block` (UniServe's SM100 prefix-block kernels), `flash_attn` (FlashAttention-2) or `sgl_kernel` (SGLang's FlashAttention-3, SM90) serves every call, and startup refuses a model with a call that provider does not compute. The ranks resolve the name when they load their model and refuse a name these are not. The `gpu` extra installs neither FlashAttention-2 nor SGLang's kernels |

@@ -259,7 +259,7 @@ pub(super) fn allocate_storage(
             Arc::clone(cache),
             info.num_units,
             plan.info.request_slots,
-            cache_width(&cache.group_shapes()?, config.max_sequence_tokens),
+            cache_width(&cache.group_shapes()?, config.max_model_len),
             plan.info.max_unresolved_calls as usize,
             device,
             preparation.map(CUDAStream::stream).transpose()?,
