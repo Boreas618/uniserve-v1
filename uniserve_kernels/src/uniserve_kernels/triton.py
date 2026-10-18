@@ -77,9 +77,12 @@ def dependent_launch(device: torch.device) -> bool:
     preceding kernel to complete. CUDA graph capture records the dependency
     as a programmatic edge, so graph replays overlap the same boundaries.
 
-    PDL is enabled on compute capability 10.x; serving latency improvements
-    have been measured on GB200. Other devices launch every kernel in
-    ordinary stream order.
+    The launch attribute and the ``griddepcontrol`` instructions need
+    compute capability 9.0 or newer (CUDA programming guide, programmatic
+    dependent launch). PDL is enabled on compute capability 10.x only, the
+    devices on which it has been validated and measured (GB200); Hopper
+    supports it but stays in ordinary stream order until it is validated
+    there, as do all other devices.
     """
     major, _minor = torch.cuda.get_device_capability(device)
     return major == 10
