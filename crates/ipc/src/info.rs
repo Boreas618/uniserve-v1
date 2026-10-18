@@ -265,15 +265,15 @@ impl WorkerEndpoint {
 
 /// What the video denoiser a deployment places serves.
 ///
-/// The denoiser fixes its schedule, so requests may only restate it; the
-/// tasks, canvases, condition packing and sequence capacity bound what
+/// The denoiser fixes its schedule, and with it every request's step count;
+/// the tasks, canvases, condition packing and sequence capacity bound what
 /// admission accepts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
     pub tasks: Vec<String>,
     /// Sigma points of the fixed schedule, the clean endpoint included: one
-    /// more than the network evaluations (`WorkerInfo::num_inference_steps`).
+    /// more than the network evaluations ([`Self::denoise_steps`]).
     pub schedule_points: u32,
     /// Shift of the video schedule.
     pub video_shift: f64,
@@ -292,6 +292,12 @@ pub struct VideoDenoiserInfo {
 }
 
 impl VideoDenoiserInfo {
+    /// The network evaluations of the fixed schedule: one fewer than its
+    /// sigma points, and the step count of every request.
+    pub fn denoise_steps(&self) -> u32 {
+        self.schedule_points.saturating_sub(1)
+    }
+
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, every canvas and the capacity are
     /// positive, and condition tiles are video tiles of their row count.
@@ -383,8 +389,6 @@ impl ImageWarmup {
 pub struct WorkerInfo {
     /// Model-declared finite terminal-media computation, when supported.
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
-    /// Effective number of diffusion predictions advertised by the loaded model.
-    pub num_inference_steps: u32,
     /// What the deployment's video denoiser serves, when the model has one.
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Image shapes this rank's image denoiser was prepared for, one per
@@ -447,11 +451,6 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
-    /// Returns the fixed prediction count from the model-declared plan.
-    pub fn denoise_steps(&self) -> u32 {
-        self.num_inference_steps
-    }
-
     /// Returns total latent capacity in model-defined units.
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.latent_pages.saturating_sub(1))
@@ -520,10 +519,6 @@ impl WorkerInfo {
         }
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
-            ensure_valid!(
-                video.schedule_points == self.num_inference_steps + 1,
-                "a video denoiser's schedule points disagree with its evaluations"
-            );
         }
         ensure_valid!(
             self.max_batch_calls > 0
@@ -565,7 +560,6 @@ impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
             media_components: Default::default(),
-            num_inference_steps: 0,
             video_denoiser: None,
             image_warmups: Vec::new(),
             diffusion_lm_step_rows: 0,

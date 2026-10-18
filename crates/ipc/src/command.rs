@@ -226,8 +226,7 @@ impl NewRequest {
             ensure_valid!(
                 diffusion.num_frames > 0
                     && diffusion.video_units > 0
-                    && self.prompt_token_ids.len() <= u32::MAX as usize
-                    && diffusion.num_inference_steps > 0,
+                    && self.prompt_token_ids.len() <= u32::MAX as usize,
                 "diffusion parameters are invalid"
             );
         }

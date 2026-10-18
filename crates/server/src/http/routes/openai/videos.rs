@@ -376,7 +376,12 @@ pub(crate) async fn videos_create(
         status: "queued",
         phase: "queued".to_owned(),
         completed_steps: 0,
-        total_steps: sampling.num_inference_steps,
+        // The deployment's denoiser fixes every request's step count.
+        total_steps: state
+            .runtime()
+            .model()
+            .video_service()
+            .map_or(0, |video| video.num_inference_steps()),
         inference_time_s: None,
         stage_durations: None,
         error: None,

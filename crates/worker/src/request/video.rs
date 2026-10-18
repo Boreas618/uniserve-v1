@@ -676,9 +676,7 @@ impl VideoRequests {
                 )
             })?;
         let units = Arc::clone(&duration.units);
-        if media.video_units as usize != units.len()
-            || media.num_inference_steps != self.model.facts.num_steps
-        {
+        if media.video_units as usize != units.len() {
             return Err(Error::Invalid(
                 "video request has invalid computation bounds".into(),
             ));
