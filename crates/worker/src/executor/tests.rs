@@ -20,7 +20,7 @@ use uniserve_ipc::{
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::{Batch, Executor, Submission};
-use crate::config::placement::Components;
+use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
 use crate::ffi::MemoryKind;
 use crate::storage::{BufferPool, OutputPlacement, ProductRead, ProductStore};
@@ -39,10 +39,13 @@ const SLOTS: u32 = 4;
 pub(crate) fn rank(capacity: usize, distributed: bool) -> Result<Executor> {
     let info = WorkerInfo {
         request_slots: SLOTS,
-        queue_depth: capacity as u32,
         ..WorkerInfo::default()
     };
-    let backend = WorkerBackend::new(info, 0, Components::default())?;
+    let placement = GroupPlacement {
+        world_size: 1,
+        ..GroupPlacement::default()
+    };
+    let backend = WorkerBackend::new(info, 0, placement, Components::default())?;
     Executor::new(backend, capacity, distributed, false)
 }
 

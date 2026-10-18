@@ -186,7 +186,7 @@ impl<'a> Service<'a> {
                 return Ok(());
             }
 
-            if !self.closing && self.pending.len() < self.info.queue_depth as usize {
+            if !self.closing && self.pending.len() < self.executor.capacity() {
                 let request = self.channel.try_recv().map_err(|e| self.channel_error(e))?;
                 if let Some(request) = request {
                     self.accept(request)?;
@@ -527,7 +527,10 @@ mod tests {
             )?;
             assert!(matches!(
                 info,
-                WorkerResponse::Info { message_id: Some(1), info } if info.queue_depth == 2
+                WorkerResponse::Info {
+                    message_id: Some(1),
+                    ..
+                }
             ));
 
             // An admitted batch is answered with its result.

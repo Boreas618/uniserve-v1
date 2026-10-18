@@ -69,6 +69,8 @@ pub(crate) struct VideoSetup<'a> {
     pub(crate) model: &'a VideoModel,
     pub(crate) capacity: &'a VideoCapacity,
     pub(crate) info: &'a WorkerInfo,
+    /// Unresolved batches the rank's launch admits at once.
+    pub(crate) queue_depth: usize,
     pub(crate) config: &'a WorkerConfig,
     pub(crate) streams: &'a mut Streams,
     pub(crate) graphs: &'a mut GraphStorage,

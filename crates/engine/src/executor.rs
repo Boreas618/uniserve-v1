@@ -7,8 +7,9 @@
 //! drives worker processes, and `SimExecutor` (`crate::sim`).
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
-//! [`ExecutorInfo`], which merges the pools' reported capabilities into the
-//! single capacity view the scheduler plans against; the result types a poll
+//! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
+//! the placement the engine launched them with, into the single capacity view
+//! the scheduler plans against; the result types a poll
 //! returns; and [`TransferConfig`], the directed transfer edges between worker
 //! ranks and the placement they resolve against, from which the head derives
 //! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
@@ -36,11 +37,33 @@ mod batch;
 
 pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
 
+/// What the engine launched one pool with.
+///
+/// The engine decides these values and hands them to the pool's ranks at
+/// launch, so the ranks' reports do not carry them back.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolPlacement {
+    /// Unresolved physical batches the pool admits at once, counted as at
+    /// least one.
+    pub queue_depth: usize,
+    /// Ranks the pool was launched with, counted as at least one.
+    pub ranks: usize,
+    /// The pool's components by name, each with its member ranks, parallel
+    /// degrees and distribution.
+    pub components: BTreeMap<String, ComponentConfig>,
+}
+
 /// Concrete pool information reported through the execution boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(WorkerId, WorkerInfo)>,
+    /// For each pool, what the engine launched it with. A pool absent from
+    /// the map is placed with no components and a queue depth of one.
+    ///
+    /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
+    /// launch; `from_workers` leaves it empty.
+    pub placements: BTreeMap<WorkerId, PoolPlacement>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
@@ -56,8 +79,9 @@ pub struct ExecutorInfo {
     /// media buffers rank by rank.
     ///
     /// `WorkerExecutor::try_new` fills this from its ranks; a pool absent
-    /// from it, as `single` and `from_workers` leave every pool, has
-    /// `world_size` ranks that each back its reported `buffer_pool_bytes`.
+    /// from it, as `from_workers` and `SimExecutor` leave every pool, has
+    /// its launched ranks (`PoolPlacement::ranks`, one when it has no
+    /// placement), each backing its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
 }
 
@@ -91,9 +115,14 @@ impl ExecutorInfo {
         }
         Ok(Self {
             workers: pools,
-            video_codecs: BTreeMap::new(),
-            rank_buffer_bytes: BTreeMap::new(),
+            ..Self::default()
         })
+    }
+
+    /// Returns the configuration the engine placed component `name` with on
+    /// `worker`, or `None` when the pool was launched with no such component.
+    pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
+        self.placements.get(worker)?.components.get(name)
     }
 
     /// The persistent buffer bytes each rank of `worker` backs, in rank
@@ -102,10 +131,14 @@ impl ExecutorInfo {
         if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
             return bytes.clone();
         }
+        let ranks = self
+            .placements
+            .get(worker)
+            .map_or(1, |placement| placement.ranks.max(1));
         self.workers
             .iter()
             .find(|(id, _)| id == worker)
-            .map(|(_, info)| vec![info.buffer_pool_bytes; info.world_size.max(1) as usize])
+            .map(|(_, info)| vec![info.buffer_pool_bytes; ranks])
             .unwrap_or_default()
     }
 
@@ -163,8 +196,8 @@ impl ExecutorInfo {
     /// record is cloned from the first pool that serves a cache forward call (or
     /// the first pool when none does), so fields the merge does not set, such
     /// as the endpoint, come from that pool. Call support and
-    /// media routing are unions, queue depth is a sum, and most batch, slot,
-    /// and storage limits take the smallest nonzero value any pool reports.
+    /// media routing are unions, and most batch, slot, and storage limits
+    /// take the smallest nonzero value any pool reports.
     /// The exceptions are the prefix cache, whose layout the cache pools must share
     /// and whose block count is their smallest and per-token footprint their
     /// largest; request slots of a deployment that muxes video,
@@ -275,20 +308,13 @@ impl ExecutorInfo {
             merged.prefix_cache = None;
         }
 
-        // A call is supported when any pool serves it. Each pool contributes
-        // its own queue depth, counted as at least one. Unless noted at the
-        // field, the remaining limits take the smallest nonzero value, and are
-        // zero only when every pool reports zero.
+        // A call is supported when any pool serves it. Unless noted at the
+        // field, the limits take the smallest nonzero value, and are zero
+        // only when every pool reports zero.
         merged.supported_calls = CallKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
             .collect();
-        merged.queue_depth = self
-            .workers
-            .iter()
-            .map(|(_, info)| info.queue_depth.max(1))
-            .try_fold(0u32, |total, depth| total.checked_add(depth))
-            .context("worker capacity exceeds the engine window")?;
         merged.max_batch_calls = self
             .workers
             .iter()
@@ -1351,7 +1377,6 @@ mod tests {
             .into_iter()
             .map(|name| uniserve_ipc::ComponentInfo {
                 name: name.to_owned(),
-                config: ComponentConfig::parallel(vec![0], ParallelConfig::default()),
                 outputs: Vec::new(),
             })
             .collect();
@@ -1446,8 +1471,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
-            rank_buffer_bytes: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), 8);
@@ -1483,8 +1507,7 @@ mod tests {
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],
-                video_codecs: BTreeMap::new(),
-                rank_buffer_bytes: BTreeMap::new(),
+                ..ExecutorInfo::default()
             }
         };
 
@@ -1516,8 +1539,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model.clone()),
                 (WorkerId("host".to_owned()), host),
             ],
-            video_codecs: BTreeMap::new(),
-            rank_buffer_bytes: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()
@@ -1531,8 +1553,7 @@ mod tests {
                 (WorkerId("model".to_owned()), model),
                 (WorkerId("other".to_owned()), other),
             ],
-            video_codecs: BTreeMap::new(),
-            rank_buffer_bytes: BTreeMap::new(),
+            ..ExecutorInfo::default()
         };
         let message = info
             .media_routing()

@@ -132,8 +132,6 @@ impl LatentPlan {
 /// Model-independent values of the report.
 pub(crate) struct Report {
     pub endpoint: WorkerEndpoint,
-    pub device: String,
-    pub transfer_backends: Vec<String>,
     /// The rank publishes device products over CUDA VMM, which keeps an
     /// export pool on its primary device.
     pub device_exports: bool,
@@ -217,19 +215,15 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::Invalid(format!("{name} exceeds the protocol range")))
 }
 
-fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Result<WorkerInfo> {
+fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
     Ok(WorkerInfo {
         media_components: report.media_components,
         num_inference_steps: 0,
         video_denoiser: None,
         endpoint: report.endpoint,
-        device: report.device,
-        transfer_backends: report.transfer_backends,
         fabric_handles: report.fabric_handles,
-        world_size: narrow(config.world_size, "world size")?,
         components: report.components,
         supported_calls: report.supported_calls,
-        queue_depth: narrow(queue_depth, "queue depth")?,
         max_batch_calls: narrow(config.max_batch_calls, "max batch calls")?,
         max_batch_tokens: narrow(config.max_batch_tokens, "max batch tokens")?,
         request_slots: narrow(config.max_request_pool_size, "request slots")?,
@@ -266,7 +260,7 @@ impl TokenLayout {
         facts: &TokenFacts,
     ) -> Result<Self> {
         let device_exports = report.device_exports;
-        let mut info = base_info(report, config, queue_depth)?;
+        let mut info = base_info(report, config)?;
         let latent_bytes = facts
             .latent
             .map(|plan| plan.bytes())
@@ -414,7 +408,7 @@ pub(crate) fn request_layout(
     host_components: bool,
 ) -> Result<Plan> {
     let device_exports = report.device_exports;
-    let mut info = base_info(report, config, queue_depth)?;
+    let mut info = base_info(report, config)?;
     let slots = info.request_slots as usize;
     info.max_unresolved_calls = narrow(
         request_tensor_window(queue_depth, slots)?,
@@ -568,8 +562,6 @@ pub(crate) mod tests {
                 address_space: "1:a".into(),
                 incarnation: "b".into(),
             },
-            device: "cuda:0".into(),
-            transfer_backends: vec!["local".into()],
             device_exports: false,
             fabric_handles: false,
             supported_calls: vec![CallKind::Forward(uniserve_ipc::ForwardMode::Prefill)],

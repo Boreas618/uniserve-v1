@@ -165,7 +165,7 @@ impl Opening {
     /// host-gated predicate: the job's completion carries one byte each.
     pub(super) fn open(
         owners: &mut Owners<'_>,
-        info: &uniserve_ipc::WorkerInfo,
+        placement: &crate::config::placement::GroupPlacement,
         rank: usize,
         job: &Job,
     ) -> Result<Self> {
@@ -201,7 +201,7 @@ impl Opening {
         let mut calls = crate::executor::batch::Opening::<TokenCall>::open(
             owners.requests,
             &owners.storage.tensors,
-            info,
+            placement,
             rank,
             plan,
             device,

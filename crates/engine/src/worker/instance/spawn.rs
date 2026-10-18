@@ -371,8 +371,8 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must report valid info naming its launched rank, the group's
-    /// world size and worker identity. The group takes rank 0's report: the
+    /// Every rank must report valid info naming its launched rank and the
+    /// group's worker identity. The group takes rank 0's report: the
     /// ranks derive every shared capacity (page size, request slots, cache
     /// units) collectively before they report, so the reports differ only in
     /// the fields reconciled here. The muxer must run on the head's host, and
@@ -387,8 +387,6 @@ impl WorkerGroup {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
-        let world_size =
-            u32::try_from(n).context("process world size exceeds the IPC representation")?;
 
         // Rank 0's report becomes the group's.
         let mut info = workers[0].info().clone();
@@ -461,10 +459,9 @@ impl WorkerGroup {
                 .validate()
                 .with_context(|| format!("physical rank {rank} reported invalid worker info"))?;
             anyhow::ensure!(
-                rank_info.endpoint.rank == rank as u32 && rank_info.world_size == world_size,
-                "physical rank {rank} reported topology ({}/{}) for launched topology ({rank}/{world_size})",
+                rank_info.endpoint.rank == rank as u32,
+                "physical rank {rank} reported rank {}",
                 rank_info.endpoint.rank,
-                rank_info.world_size,
             );
             anyhow::ensure!(
                 rank_info.endpoint.worker_id == process_args.worker_id,
@@ -547,7 +544,8 @@ impl WorkerGroup {
             worker.check_worker("WorkerGroup readiness")?;
         }
 
-        let depth = info.queue_depth.max(1) as usize;
+        // The group admits the batches it launched its ranks to hold.
+        let depth = process_args.queue_depth.max(1);
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
             launchers,

@@ -599,7 +599,7 @@ fn record(
     inputs: &mut Option<Inputs>,
 ) -> std::result::Result<Step, WorkerError> {
     let Parts {
-        info,
+        placement: group,
         rank,
         requests,
         storage,
@@ -672,7 +672,7 @@ fn record(
             let opened = Opening::open(
                 requests,
                 &storage.tensors,
-                info,
+                group,
                 rank,
                 plan,
                 device,

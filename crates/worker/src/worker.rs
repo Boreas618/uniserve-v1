@@ -43,7 +43,7 @@ use uniserve_ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::Plan;
-use crate::config::placement::Components;
+use crate::config::placement::{Components, GroupPlacement};
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
@@ -388,6 +388,7 @@ impl Worker {
                         model: &video,
                         capacity: &capacity,
                         info: &info,
+                        queue_depth: launch.ipc.queue_depth,
                         config: &config,
                         streams: &mut streams,
                         graphs: &mut graphs,
@@ -400,7 +401,7 @@ impl Worker {
                     crate::config::Device::Cuda(index) => Some(index),
                     crate::config::Device::Cpu => None,
                 };
-                let leases = 2 * info.queue_depth as usize + 2;
+                let leases = 2 * launch.ipc.queue_depth + 2;
                 let words = info.max_batch_calls.max(1) as usize;
                 Some((
                     VideoRequests::new(video, capacity.media).map_err(phase("storage"))?,
@@ -432,8 +433,12 @@ impl Worker {
                 .unwrap_or(0);
             info
         };
-        let mut backend =
-            WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
+        let placement = GroupPlacement {
+            components: launch.components.clone(),
+            world_size: config.world_size,
+        };
+        let mut backend = WorkerBackend::new(info.clone(), config.rank, placement, components)
+            .map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
         backend.set_job_queues(streams.job_queues());
         let text_warmup = text.is_some();

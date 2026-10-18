@@ -23,7 +23,7 @@ use uniserve_ipc::{
 
 use super::image::ImageParts;
 use super::lifecycle::{LaneJobs, RequestStorage};
-use crate::config::placement::Components;
+use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
@@ -51,6 +51,8 @@ use steps::lane_lost;
 pub(crate) struct WorkerBackend {
     info: WorkerInfo,
     rank: usize,
+    /// The placement the rank's group was launched with.
+    placement: GroupPlacement,
     requests: RequestPool,
     /// What serves the rank's components, beside the request pool and the
     /// lifecycle jobs every lifecycle command borrows with its owners.
@@ -171,7 +173,7 @@ impl Runtimes {
 
 /// Disjoint borrows of a backend for one batch's execution.
 pub(crate) struct Parts<'a> {
-    pub info: &'a WorkerInfo,
+    pub placement: &'a GroupPlacement,
     pub rank: usize,
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut RankStorage>,
@@ -183,12 +185,18 @@ pub(crate) struct Parts<'a> {
 }
 
 impl WorkerBackend {
-    pub(crate) fn new(info: WorkerInfo, rank: usize, components: Components) -> Result<Self> {
+    pub(crate) fn new(
+        info: WorkerInfo,
+        rank: usize,
+        placement: GroupPlacement,
+        components: Components,
+    ) -> Result<Self> {
         let lifecycle = LaneJobs::new(&info.supported_calls);
         Ok(Self {
             requests: RequestPool::new(info.request_slots as usize)?,
             info,
             rank,
+            placement,
             runtimes: Runtimes::default(),
             components,
             profiler: None,
@@ -539,7 +547,7 @@ impl WorkerBackend {
     /// Disjoint borrows for executing one batch.
     pub(crate) fn parts(&mut self) -> Parts<'_> {
         Parts {
-            info: &self.info,
+            placement: &self.placement,
             rank: self.rank,
             requests: &mut self.requests,
             storage: self.runtimes.rank_storage.as_mut(),
@@ -626,6 +634,7 @@ impl WorkerBackend {
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
             info: &self.info,
+            placement: &self.placement,
             rank: self.rank,
             video: self.runtimes.video.as_mut().ok_or_else(unserved)?,
             encoders: &mut self.runtimes.encoders,
@@ -694,11 +703,9 @@ impl WorkerBackend {
                 unsupported.into_iter().collect::<Vec<_>>()
             )));
         }
-        if !self.info.components.is_empty() {
+        if !self.placement.components.is_empty() {
             for call in &plan.calls {
-                if !self.info.components.iter().any(|component| {
-                    component.name == call.component && component.config.ranks.contains(&self.rank)
-                }) {
+                if !self.placement.holds(self.rank, &call.component) {
                     return Err(Error::Invalid(format!(
                         "call targets component {:?} outside this rank",
                         call.component

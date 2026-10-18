@@ -114,12 +114,20 @@ impl Scheduler {
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
             .map(|(id, worker)| {
+                // The ranks back the results of the components the engine
+                // placed on them, not a component list a rank reports.
+                let components = executor
+                    .info()
+                    .placements
+                    .get(id)
+                    .map(|placement| placement.components.clone())
+                    .unwrap_or_default();
                 (
                     id.clone(),
                     MediaStorage::new(
                         worker.request_slots as usize,
                         &executor.info().rank_buffer_bytes(id),
-                        &worker.components,
+                        &components,
                         &info.media_components,
                     ),
                 )

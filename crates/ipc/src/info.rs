@@ -1,10 +1,14 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`WorkerInfo`]. The engine
-//! validates it, checks it against the launch configuration, and requires a
-//! replacement rank to report an identical description apart from its
-//! endpoint. The executor then derives the capacity view the scheduler plans
-//! against from the descriptions of all workers (`ExecutorInfo::runtime_info`).
+//! A rank answers the engine's `Info` request with a [`WorkerInfo`]: what only
+//! the loaded rank knows (its endpoint, supported calls, capacities and
+//! component outputs). The engine launched the rank and keeps what it launched
+//! it with (world, devices, transfer mechanisms, queue depth and component
+//! placement), so the report does not echo those back. The engine requires
+//! every rank of a group to describe the group alike and a replacement rank to
+//! report an identical description apart from its endpoint; the executor then
+//! derives the capacity view the scheduler plans against from the
+//! descriptions of all workers (`ExecutorInfo::runtime_info`).
 
 use super::*;
 use uniserve_core::ConditionTiles;
@@ -170,14 +174,12 @@ impl PrefixCacheInfo {
     }
 }
 
-/// One component's finalized configuration shared by all worker descriptions.
+/// The tensor results one placed component declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentInfo {
     /// Component name; `WorkerInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
-    /// Rank membership and parallel layout of the component.
-    pub config: uniserve_core::ComponentConfig,
     /// Named tensor results declared by the loaded computation. Their order
     /// defines product output indices independently of Worker grouping.
     pub outputs: Vec<OutputInfo>,
@@ -375,10 +377,9 @@ impl ImageWarmup {
 
 /// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency. The engine's
-/// `RankProcess::finish_startup` additionally checks the description against
-/// the launch: `queue_depth`, rank and world size, and component
-/// configuration.
+/// [`WorkerInfo::validate`] checks only internal consistency. Launch values
+/// (world size, devices, transfer mechanisms, queue depth and component
+/// placement) are the engine's and are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
     /// Model-declared finite terminal-media computation, when supported.
@@ -403,25 +404,16 @@ pub struct WorkerInfo {
     pub image_unconditional_token_ids: Option<Vec<u32>>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
-    /// Rank-local primary compute device used to bind physical transfer edges.
-    pub device: String,
-    /// Physical transfer mechanisms initialized by this rank.
-    pub transfer_backends: Vec<String>,
     /// Whether this rank's device exports a fabric allocation handle.
     ///
     /// A fabric handle is importable from another host inside the fabric
     /// domain; a descriptor handle reaches only the host that created it, so
     /// this is what decides whether a transfer edge may cross hosts.
     pub fabric_handles: bool,
-    /// Number of physical members in this Worker.
-    pub world_size: u32,
-    /// Finalized component membership and logical degrees.
+    /// The tensor results of each component the rank places.
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum unresolved physical runs. It must equal the depth the engine
-    /// launched the rank with and connects its channel with.
-    pub queue_depth: u32,
     /// Maximum calls in one run. A prefill or decode run that no captured
     /// graph holds runs eagerly, so the captured graphs bound no run.
     pub max_batch_calls: u32,
@@ -472,28 +464,11 @@ impl WorkerInfo {
         self.prefix_cache.is_some()
     }
 
-    /// Validates worker identity, capacity, call, and rank invariants.
+    /// Validates worker identity, capacity and call invariants.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Identity and physical transfer capabilities.
         self.endpoint.validate()?;
-        ensure_valid!(
-            !self.device.is_empty()
-                && !self.transfer_backends.is_empty()
-                && self.transfer_backends.iter().all(|name| matches!(
-                    name.as_str(),
-                    "local" | "posix_shm" | "cuda_vmm" | "channel"
-                ))
-                && self.transfer_backends.iter().collect::<HashSet<_>>().len()
-                    == self.transfer_backends.len(),
-            "worker physical transfer capabilities are incomplete"
-        );
-        ensure_valid!(
-            self.world_size > 0 && self.endpoint.rank < self.world_size,
-            "worker process rank is outside its world"
-        );
 
-        // Components: unique names and outputs, membership within the world,
-        // and parallel degrees consistent with membership.
+        // Components: unique names, each with unique valid outputs.
         let mut names = HashSet::new();
         for component in &self.components {
             ensure_valid!(
@@ -508,30 +483,6 @@ impl WorkerInfo {
                     "component repeats a tensor result name"
                 );
             }
-            let params = &component.config;
-            ensure_valid!(
-                !params.ranks.is_empty()
-                    && params
-                        .ranks
-                        .iter()
-                        .all(|&rank| rank < self.world_size as usize),
-                "component membership is outside the process world"
-            );
-            params
-                .validate()
-                .map_err(|error| invalid_message!("{error}"))?;
-            let degree = params
-                .parallel_config
-                .world_size()
-                .map_err(|error| invalid_message!("{error}"))?;
-            ensure_valid!(
-                degree <= u32::MAX as usize,
-                "parallel degrees exceed protocol range"
-            );
-            ensure_valid!(
-                params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
-                "component unit capacity is outside protocol range"
-            );
         }
 
         // A collective-only participant owns no request components or prefix cache.
@@ -583,7 +534,6 @@ impl WorkerInfo {
                 && self.transfer_tickets > 0,
             "worker info declare a zero scheduling bound"
         );
-        ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
 
         // Advertised call families require their corresponding pools; every
         // token-model forward reads or extends a request's prefix cache.
@@ -629,15 +579,11 @@ impl Default for WorkerInfo {
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
-            world_size: 1,
-            device: "cpu".into(),
-            transfer_backends: vec!["local".into()],
             components: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),
             ],
-            queue_depth: 1,
             max_batch_calls: 1,
             max_batch_tokens: 8192,
             request_slots: 128,

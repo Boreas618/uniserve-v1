@@ -205,6 +205,25 @@ impl WorkerGroup {
         (&self.process_args.ranks, &self.process_args.components)
     }
 
+    /// Ranks in the group, as launched.
+    pub(crate) fn world_size(&self) -> usize {
+        self.process_args.ranks.len()
+    }
+
+    /// Whether the group placed rank `rank` on a CUDA device.
+    pub(crate) fn rank_on_cuda(&self, rank: usize) -> bool {
+        self.process_args
+            .ranks
+            .get(rank)
+            .is_some_and(|placed| placed.device.starts_with("cuda"))
+    }
+
+    /// Batches the group admits at once: the queue depth it launched its
+    /// ranks with, at least one.
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.depth
+    }
+
     /// States the deployment-wide media routing once every worker reported.
     pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_ipc::MediaCall, String>) {
         self.media_routing = routing;

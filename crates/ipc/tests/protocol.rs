@@ -1550,7 +1550,83 @@ fn batch_allows_a_duplicate_identical_command() {
 
 #[test]
 fn worker_info_round_trips() {
+    let info = WorkerInfo {
+        prefix_cache: Some(PrefixCacheInfo {
+            groups: vec![CacheGroup {
+                layer_ids: (11..20).collect(),
+                ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
+            }],
+            ..WorkerInfo::default().prefix_cache.unwrap()
+        }),
+        components: vec![ComponentInfo {
+            name: "denoiser".into(),
+            outputs: vec![
+                OutputInfo {
+                    name: "conditioning".into(),
+                    dtype: DType::BF16,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Static(1),
+                            DimBound::Device { max: 16384 },
+                            DimBound::Static(2560),
+                        ],
+                    },
+                    raster_axes: None,
+                },
+                // A product laid out at the request's raster names it.
+                OutputInfo {
+                    name: "video_units".into(),
+                    dtype: DType::U8,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Device { max: 8 },
+                            DimBound::Static(22),
+                            DimBound::Static(1344),
+                            DimBound::Static(1536),
+                            DimBound::Static(3),
+                        ],
+                    },
+                    raster_axes: Some(RasterAxes {
+                        height: 2,
+                        width: 3,
+                    }),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    let response = WorkerResponse::info(info.clone());
+    let decoded = round_trip(&response);
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
+    };
+    assert_eq!(decoded, info);
+}
+
+/// A component's distribution is omitted from its encoding when absent, so
+/// both forms must decode, each with its own units per rank.
+#[test]
+fn a_component_round_trips_with_and_without_a_distribution() {
+    use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig};
+
+    let grouped = ComponentConfig::parallel(vec![0], ParallelConfig::default());
+    let distributed = ComponentConfig {
+        distribution: Some(ComponentDistribution::TemporalUnits),
+        units_per_rank: 3,
+        ..grouped.clone()
+    };
+    for config in [grouped, distributed] {
+        assert_eq!(round_trip(&config), config);
+    }
+}
+
+/// A component's placement reaches its ranks in the launch descriptor with
+/// every sequence-parallel strategy, a Ulysses group's head projection
+/// included.
+#[test]
+fn a_component_round_trips_with_every_sequence_parallel_strategy() {
     use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
+
     let strategies = [
         SequenceParallel::Local,
         SequenceParallel::Ulysses {
@@ -1567,94 +1643,13 @@ fn worker_info_round_trips() {
         },
     ];
     for sequence_parallel in strategies {
-        let config = ParallelConfig {
+        let parallel = ParallelConfig {
             sequence_parallel,
             ..Default::default()
         };
-        let count = config.world_size().unwrap();
-        let info = WorkerInfo {
-            world_size: count as u32,
-            prefix_cache: Some(PrefixCacheInfo {
-                groups: vec![CacheGroup {
-                    layer_ids: (11..20).collect(),
-                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
-                }],
-                ..WorkerInfo::default().prefix_cache.unwrap()
-            }),
-            components: vec![ComponentInfo {
-                name: "denoiser".into(),
-                config: ComponentConfig::parallel((0..count).rev().collect(), config),
-                outputs: vec![
-                    OutputInfo {
-                        name: "conditioning".into(),
-                        dtype: DType::BF16,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Static(1),
-                                DimBound::Device { max: 16384 },
-                                DimBound::Static(2560),
-                            ],
-                        },
-                        raster_axes: None,
-                    },
-                    // A product laid out at the request's raster names it.
-                    OutputInfo {
-                        name: "video_units".into(),
-                        dtype: DType::U8,
-                        shape_bound: ShapeBound {
-                            dims: vec![
-                                DimBound::Device { max: 8 },
-                                DimBound::Static(22),
-                                DimBound::Static(1344),
-                                DimBound::Static(1536),
-                                DimBound::Static(3),
-                            ],
-                        },
-                        raster_axes: Some(RasterAxes {
-                            height: 2,
-                            width: 3,
-                        }),
-                    },
-                ],
-            }],
-            ..Default::default()
-        };
-        let response = WorkerResponse::info(info.clone());
-        let decoded = round_trip(&response);
-        let WorkerResponse::Info { info: decoded, .. } = decoded else {
-            panic!("decoded response must preserve its info variant");
-        };
-        assert_eq!(decoded, info);
-    }
-}
-
-/// A component's distribution is omitted from its encoding when absent, so
-/// both forms must decode, each with its own units per rank.
-#[test]
-fn a_component_round_trips_with_and_without_a_distribution() {
-    use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig};
-
-    let grouped = ComponentConfig::parallel(vec![0], ParallelConfig::default());
-    let distributed = ComponentConfig {
-        distribution: Some(ComponentDistribution::TemporalUnits),
-        units_per_rank: 3,
-        ..grouped.clone()
-    };
-    for config in [grouped, distributed] {
-        let info = WorkerInfo {
-            components: vec![ComponentInfo {
-                name: "decoder".into(),
-                config,
-                outputs: Vec::new(),
-            }],
-            ..WorkerInfo::default()
-        };
-        let WorkerResponse::Info { info: decoded, .. } =
-            round_trip(&WorkerResponse::info(info.clone()))
-        else {
-            panic!("decoded response must preserve its info variant");
-        };
-        assert_eq!(decoded, info);
+        let count = parallel.world_size().unwrap();
+        let config = ComponentConfig::parallel((0..count).rev().collect(), parallel);
+        assert_eq!(round_trip(&config), config);
     }
 }
 
@@ -1964,8 +1959,6 @@ fn full_caps() -> WorkerInfo {
             rank: 1,
             ..WorkerInfo::default().endpoint
         },
-        world_size: 2,
-        queue_depth: 2,
         max_batch_calls: 64,
         max_batch_tokens: 4096,
         request_slots: 96,
@@ -2242,25 +2235,6 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
         matches!(received, Err(IpcError::Encoding(_))),
         "{received:?}"
     );
-}
-
-#[test]
-fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
-    let mut info = WorkerInfo {
-        transfer_backends: vec![
-            "cuda_vmm".to_owned(),
-            "posix_shm".to_owned(),
-            "channel".to_owned(),
-        ],
-        ..WorkerInfo::default()
-    };
-    assert!(info.validate().is_ok());
-
-    // `socket` is not a transfer mechanism name (`local`, `posix_shm`, `cuda_vmm`,
-    // or `channel`).
-    info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
-    let error = info.validate().unwrap_err().to_string();
-    assert!(error.contains("transfer capabilities"), "{error}");
 }
 
 #[test]

@@ -21,8 +21,8 @@ use std::time::Duration;
 use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
-    logical_result,
+    BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
+    PoolPlacement, WorkerId, logical_result,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -91,13 +91,8 @@ pub enum BatchEvent {
 }
 
 impl SimExecutor {
-    /// Starts an asynchronous simulator with its advertised queue depth.
-    pub fn new(engine: SimEngine) -> Self {
-        let depth = (engine.info().queue_depth as usize).max(1);
-        Self::with_depth(engine, depth)
-    }
-
-    /// Starts an asynchronous simulator with an explicit in-flight batch limit.
+    /// Starts an asynchronous simulator that admits as many batches in
+    /// flight as the pool's launched queue depth.
     ///
     /// # Panics
     ///
@@ -106,10 +101,11 @@ impl SimExecutor {
         clippy::expect_used,
         reason = "a simulator without its thread cannot run; documented under Panics"
     )]
-    pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
+    pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
+        let placement = engine.placement.clone();
         let results_on_wait = engine.results_on_wait;
-        let depth = depth.max(1);
+        let depth = placement.queue_depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
@@ -145,10 +141,13 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         Self {
-            executor_info: ExecutorInfo {
-                workers: vec![(WorkerId("sim".to_owned()), info.clone())],
-                video_codecs: BTreeMap::new(),
-                rank_buffer_bytes: BTreeMap::new(),
+            executor_info: {
+                let id = WorkerId("sim".to_owned());
+                ExecutorInfo {
+                    workers: vec![(id.clone(), info.clone())],
+                    placements: BTreeMap::from([(id, placement)]),
+                    ..ExecutorInfo::default()
+                }
             },
             depth,
             to_worker,
@@ -649,6 +648,10 @@ fn select_token(
 /// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
+    /// What the simulated pool is launched with: its queue depth and its
+    /// components' placement, which `SimExecutor` states to the scheduler as
+    /// the engine's own launch, as `WorkerExecutor` does.
+    placement: PoolPlacement,
     /// Synthetic tokens sampled before `fake_eos` dominates.
     text_len: usize,
     fake_eos: u32,
@@ -706,9 +709,10 @@ impl SimEngine {
 
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
-        // Unset fields, including the prefix cache and a queue depth of one, come
-        // from `WorkerInfo::default`. One latent page is the reserved sentinel
-        // page that `latent_capacity_units` excludes.
+        // Unset fields, including the prefix cache, come from
+        // `WorkerInfo::default`. One latent page is the reserved sentinel
+        // page that `latent_capacity_units` excludes. The pool is launched
+        // with a queue depth of one and no placed components.
         let info = WorkerInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
@@ -725,6 +729,11 @@ impl SimEngine {
         };
         Self {
             info,
+            placement: PoolPlacement {
+                queue_depth: 1,
+                ranks: 1,
+                components: BTreeMap::new(),
+            },
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
@@ -1224,9 +1233,21 @@ impl SimEngine {
         }
     }
 
-    /// Sets the advertised unresolved-batch capacity, clamped to at least one.
+    /// Sets the unresolved-batch capacity the pool is launched with, clamped
+    /// to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
-        self.info.queue_depth = depth.max(1);
+        self.placement.queue_depth = (depth as usize).max(1);
+    }
+
+    /// Places the pool's components, as a launch places a worker group's,
+    /// and launches the pool with the ranks they span.
+    pub fn place_components(&mut self, components: BTreeMap<String, ComponentConfig>) {
+        self.placement.ranks = components
+            .values()
+            .flat_map(|component| component.ranks.iter().copied())
+            .max()
+            .map_or(1, |last| last + 1);
+        self.placement.components = components;
     }
 
     /// Sets the number of synthetic tokens emitted before the configured EOS.
