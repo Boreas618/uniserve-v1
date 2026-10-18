@@ -873,11 +873,10 @@ fn reserve_join_pools(
     Ok(())
 }
 
-/// The rank's identity for transfers: host, process and incarnation.
-fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
+/// The rank's identity for transfers: host, process and incarnation. The
+/// engine knows which worker and rank the incarnation serves.
+fn endpoint() -> Result<WorkerEndpoint> {
     Ok(WorkerEndpoint {
-        worker_id: worker_id.to_owned(),
-        rank: rank as u32,
         node: host_name()?,
         address_space: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4().simple()),
         incarnation: uuid::Uuid::new_v4().simple().to_string(),

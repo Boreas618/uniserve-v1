@@ -30,8 +30,9 @@ use crate::LaneConfig;
 /// The command that starts one rank with the interpreter `python`.
 ///
 /// argv carries the address of the head the rank connects to and what its
-/// registration states: the rank's identity, its worker group and its rank,
-/// and the `generation` of the group's launch it belongs to. The caller adds
+/// registration states: its worker group and its rank, and the `generation`
+/// of the group's launch it belongs to. They are the rank's only statement of
+/// its identity; the launch descriptor repeats none of them. The caller adds
 /// the environment and any inherited sockets.
 pub fn rank_command(
     python: impl AsRef<OsStr>,
@@ -378,8 +379,6 @@ impl NcclSegments {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchDescriptor {
-    /// Logical worker this rank belongs to.
-    pub worker_id: String,
     /// This rank's word in every published product's acknowledgment array.
     pub acknowledgment_slot: u32,
     /// Acknowledgment slots of the ranks on this rank's host.

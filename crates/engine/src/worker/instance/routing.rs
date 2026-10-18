@@ -10,6 +10,7 @@ use uniserve_ipc::Batch;
 
 use super::WorkerGroup;
 use crate::executor::RankBuffer;
+use crate::worker::IncarnationRegistry;
 
 /// Refuses a placement whose muxer or media reader is not on the head's host.
 ///
@@ -222,6 +223,16 @@ impl WorkerGroup {
     /// ranks with, at least one.
     pub(crate) fn queue_depth(&self) -> usize {
         self.depth
+    }
+
+    /// Joins this group's ranks to the deployment's registry of live rank
+    /// incarnations, which every group of the deployment then shares.
+    pub(crate) fn share_incarnations(&mut self, incarnations: IncarnationRegistry) {
+        incarnations.assign(
+            &crate::WorkerId(self.process_args.worker_id.clone()),
+            self.workers.iter().map(|worker| &worker.info().endpoint),
+        );
+        self.incarnations = incarnations;
     }
 
     /// States the deployment-wide media routing once every worker reported.

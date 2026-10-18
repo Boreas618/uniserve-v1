@@ -63,8 +63,6 @@ fn store(pool_bytes: u64, request_capacity: usize, relay_depth: usize) -> Result
 fn transports(bytes: u64) -> Result<Transports> {
     let options = TransportOptions {
         source: WorkerEndpoint {
-            worker_id: "worker".into(),
-            rank: 0,
             node: "node".into(),
             address_space: "process".into(),
             incarnation: "incarnation".into(),

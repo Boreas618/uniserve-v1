@@ -65,8 +65,6 @@ fn fetch(
 
 fn endpoint(address_space: &str) -> WorkerEndpoint {
     WorkerEndpoint {
-        worker_id: "worker".into(),
-        rank: 0,
         node: "node".into(),
         address_space: address_space.into(),
         incarnation: "incarnation".into(),

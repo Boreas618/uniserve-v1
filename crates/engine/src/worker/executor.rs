@@ -27,7 +27,7 @@ use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use super::{BatchSubmitError, WorkerGroup};
+use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
     RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
@@ -168,6 +168,9 @@ pub struct WorkerExecutor {
     /// Worker identity to its index in `workers`.
     routing: HashMap<WorkerId, usize>,
     workers: Vec<(WorkerId, WorkerGroup)>,
+    /// The worker and rank of every live rank incarnation, which the groups
+    /// keep current as they replace ranks.
+    incarnations: IncarnationRegistry,
     executor_info: ExecutorInfo,
     /// Sum of the workers' queue depths; `submit` refuses a batch with
     /// `WouldBlock` while this many logical batches are pending.
@@ -248,8 +251,8 @@ impl WorkerExecutor {
     /// Binds launched worker groups into one executor.
     ///
     /// Fails when the command wake cannot be created, `workers` is empty, a
-    /// worker identity repeats or disagrees with its loaded instance, a group
-    /// was initialized with transfer bindings other than `transfer`, a worker
+    /// worker identity repeats, a group was initialized with transfer
+    /// bindings other than `transfer`, a worker
     /// reports invalid capabilities, the workers expose different outputs for
     /// a replicated component, the media routing or video codec pairing is
     /// refused, a transfer edge names an unbound worker or rank, repeats a
@@ -271,10 +274,6 @@ impl WorkerExecutor {
             anyhow::ensure!(
                 executor.transfer_config() == &transfer,
                 "WorkerGroup {id} was initialized with different transfer bindings"
-            );
-            anyhow::ensure!(
-                executor.info().endpoint.worker_id == id.0,
-                "worker binding {id} disagrees with its loaded instance identity"
             );
             anyhow::ensure!(
                 routing.insert(id.clone(), index).is_none(),
@@ -327,8 +326,13 @@ impl WorkerExecutor {
                 (id.clone(), placement)
             })
             .collect();
+        // Every group registers its live incarnations in one table, so a
+        // publication's source resolves to its worker and rank whichever
+        // group produced it.
+        let incarnations = IncarnationRegistry::default();
         for (_, worker) in &mut workers {
             worker.set_media_routing(media_routing.clone());
+            worker.share_incarnations(incarnations.clone());
         }
 
         // Every edge expands to the physical (source rank, destination rank)
@@ -447,6 +451,7 @@ impl WorkerExecutor {
         Ok(Self {
             routing,
             workers,
+            incarnations,
             executor_info,
             depth,
             command_wake,
@@ -761,7 +766,7 @@ impl WorkerExecutor {
             }
         }
 
-        // Drop every location whose source endpoint is not the current
+        // Drop every location whose source endpoint is not a live
         // incarnation of a bound rank.
         let tensors = wire
             .input_products
@@ -774,16 +779,9 @@ impl WorkerExecutor {
                     .flat_map(|export| export.tensors_mut()),
             );
         for tensor in tensors {
-            tensor.locations.retain(|location| {
-                self.routing
-                    .get(&WorkerId(location.source.worker_id.clone()))
-                    .and_then(|index| {
-                        self.workers[*index]
-                            .1
-                            .rank_info(location.source.rank as usize)
-                    })
-                    .is_some_and(|owner| owner.endpoint == location.source)
-            });
+            tensor
+                .locations
+                .retain(|location| self.incarnations.position(&location.source).is_some());
         }
 
         // Routing stays on the head: the group names each call's reading

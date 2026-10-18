@@ -556,8 +556,6 @@ pub(crate) mod tests {
     fn report() -> Report {
         Report {
             endpoint: WorkerEndpoint {
-                worker_id: "worker".into(),
-                rank: 0,
                 node: "node".into(),
                 address_space: "1:a".into(),
                 incarnation: "b".into(),

@@ -107,7 +107,6 @@ pub struct DataPlane {
 /// Everything a rank runs with, resolved from its launch descriptor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerLaunch {
-    pub worker_id: String,
     pub ipc: IpcConfig,
     /// Rank index among the worker's ranks on this host.
     pub local_rank: usize,
@@ -178,7 +177,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     let execution = execution(&descriptor, device, generation, &role, experts.as_ref())?;
 
     Ok(WorkerLaunch {
-        worker_id: descriptor.worker_id.clone(),
         ipc: IpcConfig {
             acknowledgment_slot: descriptor.acknowledgment_slot,
             host_slots: descriptor.host_slots.clone(),
