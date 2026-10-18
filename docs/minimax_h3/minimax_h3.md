@@ -96,7 +96,7 @@ uniserve serve "$OMNIREF_EXPORT" --base-model "$OMNIREF_BASE" \
   --max-condition-rows 49152 --media-directory /srv/media
 ```
 
-A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding and one video and audio decoding unit per rank in a `model` worker, and a CPU `host` worker that holds the H.264 encoders and the muxer, plus the media reader that decodes condition media in the `minimax_h3` files. Check a running server with:
+A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding and one video and audio decoding unit per rank in a `model` worker, and a CPU `host` worker that holds the H.264 encoders and the muxer, plus the media reader that decodes condition media in the `minimax_h3` files. The media reader runs on a rank of the head's host. On a CPU rank its decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the head's host. Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health

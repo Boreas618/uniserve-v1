@@ -66,7 +66,7 @@ use crate::runner::encoder::ConditionSetup;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
 use crate::storage::ProductExport;
-use crate::stream::Issue;
+use crate::stream::{CUDAStream, Issue};
 use crate::worker::RankStorage;
 use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, ProductRead, ProductStore, Result};
 
@@ -78,8 +78,12 @@ const MATERIALIZE: &str = "video_materialize";
 
 /// How a call publishes what its host tasks wrote.
 pub(crate) enum Publication {
-    /// Products the task wrote whole, exported as host products.
-    Products(Vec<(TensorRef, ProductBuffer)>),
+    /// Products the task wrote whole: host products, or device products the
+    /// task copied there on `stream`, exported over the device transport.
+    Products {
+        written: Vec<(TensorRef, ProductBuffer)>,
+        stream: Option<Arc<CUDAStream>>,
+    },
     /// One encoded unit per task in consecutive rows of one product, each
     /// exported up to its framed length.
     Encoded {
@@ -407,7 +411,7 @@ impl HostCall {
             output.output.status = CallStatus::Error;
             output.output.error_code = Some(ErrorCode::ComputeError);
             let writes: Vec<ProductBuffer> = match self.publication {
-                Some(Publication::Products(written)) => {
+                Some(Publication::Products { written, .. }) => {
                     written.into_iter().map(|(_, write)| write).collect()
                 }
                 Some(Publication::Encoded { write, .. }) => vec![write],
@@ -420,13 +424,23 @@ impl HostCall {
         // committed, exported and its exports registered at once.
         let mut publications = Publications::default();
         match self.publication {
-            Some(Publication::Products(written)) => {
+            Some(Publication::Products { written, stream }) => {
+                // A device product's write and export record their fences on
+                // the stream its copy drained on.
+                let stream = stream.as_deref().map(CUDAStream::stream).transpose()?;
                 for (product, write) in written {
                     let view = write.view();
-                    owners.store.write(&write, &view, None, None)?;
+                    owners.store.write(&write, &view, stream, None)?;
                     owners.store.commit_writes(std::slice::from_ref(&write))?;
-                    let (exported, locations) =
-                        export(owners, call, &product, &write, true, None, None)?;
+                    let (exported, locations) = export(
+                        owners,
+                        call,
+                        &product,
+                        &write,
+                        stream.is_none(),
+                        None,
+                        stream,
+                    )?;
                     publications.accept(write.id(), locations, exported, output)?;
                     publications.register(owners.store)?;
                 }

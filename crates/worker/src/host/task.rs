@@ -12,11 +12,14 @@ use std::sync::{Arc, Mutex};
 use tvm_ffi::{Any, AnyView};
 use uniserve_core::VideoCondition;
 
+use uniserve_cuda::{CopyBatch, SourceOrder};
+
 use super::HostAction;
 use super::mux::{MuxSession, frame_unit};
 use super::reader::{ConditionProducts, ConditionReader};
 use crate::ffi::{Backing, DType, Function, Interpreter, MemoryKind};
 use crate::storage::memory::StorageView;
+use crate::stream::CUDAStream;
 use crate::transfer::{SharedMapping, SharedRead};
 use crate::{Error, Outcome, Result, lock};
 
@@ -91,11 +94,13 @@ impl UnitFrames {
 
 /// One host-lane action.
 pub(crate) enum MediaTask {
-    /// Decode a conditioned request's media into its products.
+    /// Decode a conditioned request's media into its products, or into
+    /// page-locked staging that `upload` then copies to device products.
     Read {
         reader: Arc<ConditionReader>,
         conditions: Arc<[VideoCondition]>,
         products: ConditionProducts,
+        upload: Option<Upload>,
     },
     /// Encode one media unit and frame it into its `encoded_units` row.
     EncodeUnit {
@@ -122,6 +127,45 @@ pub(crate) enum MediaTask {
     Finalize { session: Arc<MuxSession> },
 }
 
+/// The copies that move a device rank's decoded condition media from its
+/// page-locked staging into its device products.
+pub(crate) struct Upload {
+    /// The reader's copy stream, whose only issuer is the host lane.
+    pub(crate) stream: Arc<CUDAStream>,
+    /// `(staging, product)` views of equal bytes, both contiguous.
+    pub(crate) copies: Vec<(StorageView, StorageView)>,
+}
+
+impl Upload {
+    /// Copy every staging view into its product and wait for the copies, so
+    /// the products are complete when the task finishes.
+    fn perform(&self) -> Result<()> {
+        let mut batch = CopyBatch::new(SourceOrder::Stream);
+        for (staging, product) in &self.copies {
+            if staging.nbytes() != product.nbytes()
+                || !staging.is_contiguous()
+                || !product.is_contiguous()
+            {
+                return Err(Error::Invariant(
+                    "condition staging disagrees with its device product".into(),
+                ));
+            }
+            batch.push(
+                product.address(),
+                staging.address(),
+                product.nbytes() as usize,
+            );
+        }
+        let stream = self.stream.stream()?;
+        // SAFETY: each product is this call's reserved device product, which
+        // no reader sees until the call publishes it after this task, and
+        // its staging is page-locked memory the task holds until the copies
+        // drained below.
+        unsafe { batch.submit(stream) }?;
+        self.stream.synchronize()
+    }
+}
+
 /// What a finished task produced.
 pub(crate) enum TaskOutput {
     Done,
@@ -138,8 +182,12 @@ impl MediaTask {
                 reader,
                 conditions,
                 products,
+                upload,
             } => {
                 reader.read(conditions, products)?;
+                if let Some(upload) = upload {
+                    upload.perform()?;
+                }
                 Ok(TaskOutput::Done)
             }
             Self::EncodeUnit {
