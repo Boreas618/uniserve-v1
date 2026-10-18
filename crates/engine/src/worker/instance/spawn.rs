@@ -371,8 +371,8 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must report valid info; the group registers each rank's
-    /// incarnation as the rank it launched. The group takes rank 0's report:
+    /// Each rank validated the report it built; the group registers each
+    /// rank's incarnation as the rank it launched. The group takes rank 0's report:
     /// the ranks derive every shared capacity (page size, request slots,
     /// cache units) collectively before they report, so the reports differ
     /// only in the fields reconciled here. The muxer must run on the head's
@@ -452,13 +452,6 @@ impl WorkerGroup {
         info.image_warmups = image_warmups;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
-
-        for (rank, worker) in workers.iter().enumerate() {
-            let rank_info = worker.info();
-            rank_info
-                .validate()
-                .with_context(|| format!("physical rank {rank} reported invalid worker info"))?;
-        }
 
         refuse_shared_storage_off_head(
             &process_args.host,

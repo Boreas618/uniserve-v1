@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 use super::registry::Registry;
 use super::{BatchSubmitError, IncarnationRegistry, RankProcess};
 use crate::executor::{RankBuffer, WorkerExecError, WorkerFailure};
-use anyhow::Context;
 use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
@@ -671,9 +670,6 @@ fn validate_replacement_info(
     actual: &WorkerInfo,
     rank: usize,
 ) -> anyhow::Result<()> {
-    actual
-        .validate()
-        .with_context(|| format!("replacement rank {rank} reported invalid worker info"))?;
     let mut normalized_expected = expected.clone();
     anyhow::ensure!(
         actual.endpoint.incarnation != expected.endpoint.incarnation,
@@ -777,10 +773,8 @@ impl WorkerGroup {
         if !self.is_ready() || self.pending_batches.len() >= self.depth {
             return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
-        batch
-            .validate_unplaced()
-            .map_err(anyhow::Error::from)
-            .map_err(BatchSubmitError::Failed)?;
+        // The batch was validated where it was lowered; each rank's
+        // projection is validated where it is built (`rank_projection`).
         let rank_batches = rank_projection(
             &batch,
             &self.process_args.components,
