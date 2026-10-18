@@ -58,3 +58,11 @@ def test_sliding_window_checkpoints_are_refused(tmp_path, fields):
 
     with pytest.raises(ValueError, match="sliding-window attention"):
         _read(tmp_path, metadata)
+
+
+def test_an_activation_without_a_gated_form_is_refused(tmp_path):
+    metadata = neo_metadata()
+    metadata["llm_config"]["hidden_act"] = "relu"
+
+    with pytest.raises(ValueError, match="unsupported SenseNova hidden_act"):
+        _read(tmp_path, metadata)
