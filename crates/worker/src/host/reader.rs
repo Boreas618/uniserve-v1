@@ -19,6 +19,12 @@
 //! packing are the model library's (`media.reader.read_image`,
 //! `media.reader.read_audio`, `EncoderRunner.pack_pixels`). Every product
 //! must be filled exactly.
+//!
+//! Each condition's rows of each product follow from the plan before
+//! anything is decoded, so the conditions decode in any order: every
+//! reference video's FFmpeg process starts first, on a thread of its own,
+//! and the library's calls (images, tracks, then each video's patches once
+//! its frames arrived) run on the Python thread meanwhile.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -72,12 +78,23 @@ pub(crate) struct ConditionProducts {
     pub(crate) patches: Option<StorageView>,
 }
 
-/// Rows of each product filled so far.
+/// Rows of each product taken so far.
 #[derive(Default)]
 struct Cursor {
     pixels: i64,
     samples: i64,
     patches: i64,
+}
+
+/// Where one condition's decoded media lands: its rows of each product.
+#[derive(Default)]
+struct Rows {
+    /// The pixels the video encoder encodes.
+    pixels: Option<StorageView>,
+    /// The conditioner's patch rows, for a condition it reads.
+    patches: Option<StorageView>,
+    /// The condition's audio track, a video's soundtrack included.
+    samples: Option<StorageView>,
 }
 
 /// The next `rows` rows of a product, advancing its cursor.
@@ -98,6 +115,11 @@ fn take(
     let view = product.narrow(0, *cursor, rows)?;
     *cursor += rows;
     Ok(view)
+}
+
+/// A condition's media has no rows taken for it.
+fn missing_rows() -> Error {
+    Error::Invariant("a condition's product rows were not taken".into())
 }
 
 /// A host view over `bytes`.
@@ -154,29 +176,39 @@ impl ConditionReader {
         }
     }
 
-    /// Decode every condition in request order, filling each product
-    /// exactly from its first row.
+    /// Decode every condition into its rows of the products, which together
+    /// fill each product exactly from its first row, in request order.
+    ///
+    /// Every reference video's FFmpeg decode runs on a thread of its own
+    /// from the start, beside the library's calls on the Python thread:
+    /// each image and audio track in request order, then each video's
+    /// patches once its frames arrived.
     pub(crate) fn read(
         &self,
         conditions: &[VideoCondition],
         products: &ConditionProducts,
     ) -> Result<()> {
-        let mut cursor = Cursor::default();
-        for condition in conditions {
-            match &condition.media {
-                ConditionMedia::Image(fit) => {
-                    let (height, width) = (fit.size.height, fit.size.width);
-                    let pixels = take(
-                        products.pixels.as_ref(),
-                        &mut cursor.pixels,
-                        u64::from(height) * u64::from(width),
-                        "pixels",
-                    )?
-                    .reshape(DType::U8, &[1, i64::from(height), i64::from(width), 3])?;
+        let rows = Self::rows(conditions, products)?;
+        std::thread::scope(|scope| {
+            let videos: Vec<_> = conditions
+                .iter()
+                .map(|condition| match &condition.media {
+                    ConditionMedia::Video { clip, .. } => {
+                        Some(scope.spawn(move || self.read_video(&condition.source, clip)))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            for (condition, rows) in conditions.iter().zip(&rows) {
+                if let ConditionMedia::Image(fit) = &condition.media {
+                    let pixels = rows.pixels.as_ref().ok_or_else(missing_rows)?;
                     let data = host_bytes(read_bytes(&condition.source)?)?;
                     let resized =
                         integer_list([fit.resized.width, fit.resized.height].map(i64::from));
-                    let window = integer_list([fit.left, fit.top, width, height].map(i64::from));
+                    let window = integer_list(
+                        [fit.left, fit.top, fit.size.width, fit.size.height].map(i64::from),
+                    );
                     // The views' wrappings and the call take one handoff.
                     Interpreter::execute(|| {
                         self.functions.read_image.invoke(&[
@@ -186,29 +218,79 @@ impl ConditionReader {
                             pixels.handle()?.view(),
                         ])
                     })?;
-                    self.pack(condition, &pixels, products, &mut cursor)?;
+                    self.pack(condition, pixels, rows)?;
                 }
-                ConditionMedia::Video { clip, soundtrack } => {
-                    let frames = self.read_video(&condition.source, clip)?;
+                if let Some(track) = condition.media.audio() {
+                    let samples = rows.samples.as_ref().ok_or_else(missing_rows)?;
+                    self.read_track(&condition.source, track, samples)?;
+                }
+            }
+
+            for ((condition, rows), video) in conditions.iter().zip(&rows).zip(videos) {
+                let (Some(video), ConditionMedia::Video { clip, .. }) = (video, &condition.media)
+                else {
+                    continue;
+                };
+                let frames = video.join().map_err(|_| {
+                    Error::Invariant("a reference video's decode panicked".into())
+                })??;
+                // The video encoder encodes the leading kept frames.
+                let encoded = frames.narrow(0, 0, i64::from(clip.vae_frames))?;
+                copy_host(&encoded, rows.pixels.as_ref().ok_or_else(missing_rows)?)?;
+                self.pack(condition, &frames, rows)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Each condition's rows of each product, taken in request order, which
+    /// must fill every product exactly.
+    fn rows(conditions: &[VideoCondition], products: &ConditionProducts) -> Result<Vec<Rows>> {
+        let mut cursor = Cursor::default();
+        let mut taken = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            let mut rows = Rows::default();
+            match &condition.media {
+                ConditionMedia::Image(fit) => {
+                    let (height, width) = (fit.size.height, fit.size.width);
+                    rows.pixels = Some(
+                        take(
+                            products.pixels.as_ref(),
+                            &mut cursor.pixels,
+                            u64::from(height) * u64::from(width),
+                            "pixels",
+                        )?
+                        .reshape(DType::U8, &[1, i64::from(height), i64::from(width), 3])?,
+                    );
+                }
+                ConditionMedia::Video { clip, .. } => {
                     let area = u64::from(clip.canvas.height) * u64::from(clip.canvas.width);
-                    let pixels = take(
+                    rows.pixels = Some(take(
                         products.pixels.as_ref(),
                         &mut cursor.pixels,
                         u64::from(clip.vae_frames) * area,
                         "pixels",
-                    )?;
-                    // The video encoder encodes the leading kept frames.
-                    let encoded = frames.narrow(0, 0, i64::from(clip.vae_frames))?;
-                    copy_host(&encoded, &pixels)?;
-                    self.pack(condition, &frames, products, &mut cursor)?;
-                    if let Some(track) = soundtrack {
-                        self.read_track(&condition.source, track, products, &mut cursor)?;
-                    }
+                    )?);
                 }
-                ConditionMedia::Audio(track) => {
-                    self.read_track(&condition.source, track, products, &mut cursor)?;
-                }
+                ConditionMedia::Audio(_) => {}
             }
+            if let Some(vision) = &condition.vision {
+                rows.patches = Some(take(
+                    products.patches.as_ref(),
+                    &mut cursor.patches,
+                    vision.grid.patches(),
+                    "patches",
+                )?);
+            }
+            if let Some(track) = condition.media.audio() {
+                rows.samples = Some(take(
+                    products.samples.as_ref(),
+                    &mut cursor.samples,
+                    track.samples,
+                    "samples",
+                )?);
+            }
+            taken.push(rows);
         }
         for (name, product, filled) in [
             ("pixels", &products.pixels, cursor.pixels),
@@ -224,27 +306,16 @@ impl ConditionReader {
                 )));
             }
         }
-        Ok(())
+        Ok(taken)
     }
 
     /// Pack the conditioner's patch rows of a condition it reads from its
-    /// decoded `frames`.
-    fn pack(
-        &self,
-        condition: &VideoCondition,
-        frames: &StorageView,
-        products: &ConditionProducts,
-        cursor: &mut Cursor,
-    ) -> Result<()> {
+    /// decoded `frames` into its `rows`.
+    fn pack(&self, condition: &VideoCondition, frames: &StorageView, rows: &Rows) -> Result<()> {
         let Some(vision) = &condition.vision else {
             return Ok(());
         };
-        let patches = take(
-            products.patches.as_ref(),
-            &mut cursor.patches,
-            vision.grid.patches(),
-            "patches",
-        )?;
+        let patches = rows.patches.as_ref().ok_or_else(missing_rows)?;
         let indices = integer_list(vision.frame_indices.iter().map(|&index| i64::from(index)));
         let grid = integer_list([vision.grid.t, vision.grid.h, vision.grid.w].map(i64::from));
         Interpreter::execute(|| {
@@ -258,19 +329,13 @@ impl ConditionReader {
         })
     }
 
+    /// Decode an audio track into its `samples` rows.
     fn read_track(
         &self,
         source: &MediaLocator,
         track: &AudioClip,
-        products: &ConditionProducts,
-        cursor: &mut Cursor,
+        samples: &StorageView,
     ) -> Result<()> {
-        let samples = take(
-            products.samples.as_ref(),
-            &mut cursor.samples,
-            track.samples,
-            "samples",
-        )?;
         let data = host_bytes(read_bytes(source)?)?;
         Interpreter::execute(|| {
             self.functions.read_audio.invoke(&[
@@ -423,4 +488,119 @@ fn copy_host(source: &StorageView, destination: &StorageView) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use uniserve_core::{
+        Canvas, ConditionRole, ConditionVision, ImageFit, MediaLocator, VisionGrid,
+    };
+
+    use super::*;
+
+    fn product(rows: i64, width: i64, dtype: DType) -> StorageView {
+        let bytes = (rows * width) as usize * dtype.bytes();
+        StorageView::contiguous(
+            Memory::host(bytes) as Arc<dyn Backing>,
+            0,
+            dtype,
+            &[rows, width],
+        )
+        .unwrap()
+    }
+
+    fn condition(media: ConditionMedia, vision: Option<u32>) -> VideoCondition {
+        VideoCondition {
+            role: ConditionRole::Reference,
+            source: MediaLocator {
+                name: "uniserve-media-0".to_owned(),
+                bytes: 1,
+            },
+            media,
+            vision: vision.map(|patches| ConditionVision {
+                grid: VisionGrid {
+                    t: 1,
+                    h: 1,
+                    w: patches,
+                },
+                tokens: patches,
+                frame_indices: Vec::new(),
+            }),
+            latent_units: Vec::new(),
+            audio_rows: 0,
+        }
+    }
+
+    /// Where `view` starts in `product`, in rows.
+    fn row(view: Option<&StorageView>, product: &StorageView) -> Option<u64> {
+        let bytes = product.nbytes() / product.shape()[0] as u64;
+        view.map(|view| (view.address() - product.address()) / bytes)
+    }
+
+    /// Each condition's rows of each product follow the conditions before
+    /// it in request order, whatever order the conditions decode in, and
+    /// together fill every product; a product left short is refused.
+    #[test]
+    fn conditions_take_their_product_rows_in_request_order() {
+        let canvas = Canvas {
+            width: 2,
+            height: 2,
+        };
+        let track = |samples| AudioClip {
+            sample_rate: 32_000,
+            start_sample: 0,
+            source_samples: samples,
+            samples,
+        };
+        let conditions = [
+            condition(
+                ConditionMedia::Video {
+                    clip: uniserve_core::VideoClip {
+                        canvas,
+                        start_frame: 0,
+                        frames: 7,
+                        vae_frames: 5,
+                    },
+                    soundtrack: Some(track(10)),
+                },
+                Some(6),
+            ),
+            condition(
+                ConditionMedia::Image(ImageFit {
+                    resized: canvas,
+                    left: 0,
+                    top: 0,
+                    size: canvas,
+                }),
+                Some(2),
+            ),
+            condition(ConditionMedia::Audio(track(3)), None),
+        ];
+        let products = ConditionProducts {
+            pixels: Some(product(5 * 4 + 4, 3, DType::U8)),
+            samples: Some(product(13, 2, DType::F32)),
+            patches: Some(product(8, 4, DType::F32)),
+        };
+        let rows = ConditionReader::rows(&conditions, &products).unwrap();
+
+        let pixels = products.pixels.as_ref().unwrap();
+        let samples = products.samples.as_ref().unwrap();
+        let patches = products.patches.as_ref().unwrap();
+        let at = |index: usize| {
+            (
+                row(rows[index].pixels.as_ref(), pixels),
+                row(rows[index].samples.as_ref(), samples),
+                row(rows[index].patches.as_ref(), patches),
+            )
+        };
+        assert_eq!(at(0), (Some(0), Some(0), Some(0)));
+        assert_eq!(at(1), (Some(20), None, Some(6)));
+        assert_eq!(at(2), (None, Some(10), None));
+
+        let short = ConditionProducts {
+            samples: Some(product(14, 2, DType::F32)),
+            ..products
+        };
+        assert!(ConditionReader::rows(&conditions, &short).is_err());
+    }
 }
