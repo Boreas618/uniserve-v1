@@ -19,4 +19,4 @@ pub(crate) use expert_union::{ExpertStart, ExpertUnion, ExpertWarmup};
 pub use experts::{Agreement, ExpertParallel, ExpertTransport};
 pub(crate) use microbatches::MicrobatchForward;
 pub use microbatches::{MicrobatchCall, MicrobatchLanes, yield_microbatch};
-pub(crate) use weight_prefetch::DwdpManager;
+pub(crate) use weight_prefetch::{DwdpManager, HostWeights};

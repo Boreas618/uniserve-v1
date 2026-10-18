@@ -1,22 +1,151 @@
-//! Local double-buffered expert-weight reads from immutable peer storage.
+//! Layer weights copied into a ring of device slots ahead of their use.
+//!
+//! Two owners share one mechanism, [`SlotCopies`]: a copy stream, one copy
+//! plan per layer and, per slot, an event the copy records once the slot is
+//! readable and an event a computing stream records once it has read the
+//! slot. Layer `i` lives in slot `i % slots`. Distributed expert weights
+//! (DWDP, [`DwdpManager`]) read the other ranks' shards of the next expert
+//! layer from peer memory into two slots; host weights ([`HostWeights`])
+//! stream the projections of a repeated layer stack from page-locked host
+//! memory into a few slots.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use indexmap::IndexMap;
-use uniserve_cuda::{CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream};
+use uniserve_core::ComponentWeights;
+use uniserve_cuda::{
+    CaptureStatus, CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream,
+};
 
 use std::sync::Arc;
 
 use tvm_ffi::{Any, AnyView};
 
 use super::world::World;
+use crate::config::placement::Components;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
-use crate::ffi::{Function, Handle, Interpreter};
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
+use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result, lock};
+
+/// Copies of each layer's weights into its slot, ordered by events against
+/// the streams that read the slots.
+///
+/// `copies[i]` fills layer `i`'s slot. A copy waits for the slot's last
+/// recorded read and records the slot's readiness; a reader waits for that
+/// readiness and records its read. `backing` retains every address the
+/// copies use until [`close`](Self::close) drains the copy stream.
+struct SlotCopies<B> {
+    device: DeviceId,
+    copies: Vec<CopyBatch>,
+    stream: Stream,
+    /// Recorded on the copy stream once a slot holds its newest copy.
+    ready: Vec<Event>,
+    /// Recorded on a computing stream once it has read a slot.
+    consumed: Vec<Event>,
+    /// `None` once closed.
+    backing: Mutex<Option<B>>,
+}
+
+impl<B> SlotCopies<B> {
+    fn new(device: DeviceId, slots: usize, copies: Vec<CopyBatch>, backing: B) -> Result<Self> {
+        if slots == 0 || copies.is_empty() {
+            return Err(Error::Invalid(
+                "slot copies need a slot and one copy plan per layer".into(),
+            ));
+        }
+        // External events order the slots across CUDA graph segments.
+        let external = || {
+            Event::new(EventFlags {
+                external: true,
+                ..EventFlags::default()
+            })
+        };
+        Ok(Self {
+            device,
+            copies,
+            stream: Stream::new(device)?,
+            ready: (0..slots).map(|_| external()).collect(),
+            consumed: (0..slots).map(|_| external()).collect(),
+            backing: Mutex::new(Some(backing)),
+        })
+    }
+
+    fn slot(&self, index: usize) -> usize {
+        index % self.ready.len()
+    }
+
+    fn closed(&self) -> bool {
+        lock(&self.backing).is_none()
+    }
+
+    /// Copy layer `index` into its slot after the slot's last read. No host
+    /// synchronization is performed.
+    fn copy(&self, index: usize) -> Result<()> {
+        if self.closed() {
+            return Err(Error::State("layer weight copies are closed"));
+        }
+        let copy = self
+            .copies
+            .get(index)
+            .ok_or_else(|| Error::Invalid("layer is outside the copy plan".into()))?;
+        let slot = self.slot(index);
+        self.stream.wait_event(&self.consumed[slot])?;
+        // SAFETY: `backing` retains every source and destination until close
+        // drains this stream.
+        unsafe { copy.submit(&self.stream) }?;
+        self.ready[slot].record(&self.stream)?;
+        Ok(())
+    }
+
+    /// Make layer `index`'s slot readable on `compute`.
+    fn wait(&self, index: usize, compute: &Stream) -> Result<()> {
+        compute.wait_event(&self.ready[self.slot(index)])?;
+        Ok(())
+    }
+
+    /// Release layer `index`'s slot after its reads on `compute`.
+    fn release(&self, index: usize, compute: &Stream) -> Result<()> {
+        self.consumed[self.slot(index)].record(compute)?;
+        Ok(())
+    }
+
+    /// Order every slot's next copy after the work `compute` has queued.
+    fn release_all(&self, compute: &Stream) -> Result<()> {
+        for event in &self.consumed {
+            event.record(compute)?;
+        }
+        Ok(())
+    }
+
+    /// The caller retires the slots' readers first. Drain the copy stream
+    /// and return the backing, for destruction outside owner locks.
+    fn close(&self) -> Result<Option<B>> {
+        if self.closed() {
+            return Ok(None);
+        }
+        self.stream.synchronize()?;
+        Ok(lock(&self.backing).take())
+    }
+}
+
+impl<B> Drop for SlotCopies<B> {
+    fn drop(&mut self) {
+        // After a failed close the copies' completion is unknown: the memory
+        // they address stays until the process exits.
+        if self.close().is_err() {
+            let backing = self
+                .backing
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner);
+            crate::leak(backing.take());
+        }
+    }
+}
 
 #[derive(Default)]
 struct Call {
@@ -25,25 +154,15 @@ struct Call {
     last: Option<usize>,
 }
 
-struct State {
-    backing: Option<WeightStorage>,
-    calls: Vec<Call>,
-    closed: bool,
-}
-
 /// Prefetch the next expert layer into alternating remote-weight slots.
 ///
 /// The numerical backend supplies immutable source mappings and destination
 /// views. Calls serialize on their execution stream. External events protect
 /// both copy-before-read and read-before-overwrite across CUDA graph segments.
 pub(crate) struct WeightPrefetch {
-    device: DeviceId,
     layers: HashMap<usize, usize>,
-    copies: Vec<CopyBatch>,
-    stream: Stream,
-    ready: [Event; 2],
-    consumed: [Event; 2],
-    state: Mutex<State>,
+    slots: SlotCopies<WeightStorage>,
+    calls: Mutex<Vec<Call>>,
 }
 
 impl WeightPrefetch {
@@ -61,39 +180,25 @@ impl WeightPrefetch {
             ));
         }
 
-        let external = || {
-            Event::new(EventFlags {
-                external: true,
-                ..EventFlags::default()
-            })
-        };
-
         Ok(Self {
-            device,
             layers: layers
                 .into_iter()
                 .enumerate()
                 .map(|(i, layer)| (layer, i))
                 .collect(),
-            copies: copies.into_iter().map(plan).collect(),
-            stream: Stream::new(device)?,
-            ready: std::array::from_fn(|_| external()),
-            consumed: std::array::from_fn(|_| external()),
-            state: Mutex::new(State {
-                backing: Some(backing),
-                calls: Vec::new(),
-                closed: false,
-            }),
+            // The slots of layer `i` serve layer `i + 2`.
+            slots: SlotCopies::new(device, 2, copies.into_iter().map(plan).collect(), backing)?,
+            calls: Mutex::new(Vec::new()),
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        lock(&self.state)
+    fn calls(&self) -> MutexGuard<'_, Vec<Call>> {
+        lock(&self.calls)
     }
 
     /// The device the weights and their copy stream live on.
     pub(crate) fn device(&self) -> DeviceId {
-        self.device
+        self.slots.device
     }
 
     fn index(&self, module: usize) -> Result<usize> {
@@ -104,24 +209,22 @@ impl WeightPrefetch {
     }
 
     pub(crate) fn begin(&self) -> Result<()> {
-        let mut state = self.state();
-        if state.closed {
+        if self.slots.closed() {
             return Err(Error::State("DWDP weight owner is closed"));
         }
-        state.calls.push(Call::default());
+        self.calls().push(Call::default());
         Ok(())
     }
 
     /// Join a speculative tail copy even if the call omitted its last layer.
     pub(crate) fn end(&self, compute: &Stream) -> Result<()> {
         let last = self
-            .state()
-            .calls
+            .calls()
             .pop()
             .ok_or(Error::State("DWDP expert call requires an active context"))?
             .last;
         if let Some(last) = last {
-            compute.wait_event(&self.ready[last % 2])?;
+            self.slots.wait(last, compute)?;
         }
         Ok(())
     }
@@ -137,9 +240,8 @@ impl WeightPrefetch {
     ) -> Result<()> {
         let index = self.index(module)?;
         let (started, queued) = {
-            let mut state = self.state();
-            let call = state
-                .calls
+            let mut calls = self.calls();
+            let call = calls
                 .last_mut()
                 .ok_or(Error::State("DWDP expert call requires an active context"))?;
             let started = std::mem::replace(&mut call.started, true);
@@ -147,22 +249,19 @@ impl WeightPrefetch {
         };
 
         // A default-stream handle resolves against the current context.
-        let _device = DeviceGuard::new(self.device)?;
+        let _device = DeviceGuard::new(self.device())?;
         if !started {
-            for event in &self.consumed {
-                event.record(compute)?;
-            }
+            self.slots.release_all(compute)?;
         }
 
         if queued != Some(index) {
             self.prefetch(index, &mut submit)?;
         }
 
-        compute.wait_event(&self.ready[index % 2])?;
+        self.slots.wait(index, compute)?;
 
-        let next = (index + 1 < self.copies.len()).then_some(index + 1);
-        self.state()
-            .calls
+        let next = (index + 1 < self.slots.copies.len()).then_some(index + 1);
+        self.calls()
             .last_mut()
             .ok_or(Error::State("DWDP expert call requires an active context"))?
             .queued = next;
@@ -173,67 +272,34 @@ impl WeightPrefetch {
     }
 
     fn prefetch(&self, index: usize, submit: &mut impl FnMut(usize) -> Result<()>) -> Result<()> {
-        let mut state = self.state();
-        let call = state
-            .calls
+        self.calls()
             .last_mut()
-            .ok_or(Error::State("DWDP expert call requires an active context"))?;
-        call.last = Some(index);
-        drop(state);
+            .ok_or(Error::State("DWDP expert call requires an active context"))?
+            .last = Some(index);
         submit(index)
     }
 
     pub(crate) fn after(&self, module: usize, compute: &Stream) -> Result<()> {
         let index = self.index(module)?;
-        self.consumed[index % 2].record(compute)?;
-        Ok(())
+        self.slots.release(index, compute)
     }
 
     /// Replay a recorded peer read, preserving the same two-slot dependencies
     /// as eager execution. No host synchronization is performed.
     pub(crate) fn copy(&self, index: usize) -> Result<()> {
-        if self.state().closed {
+        if self.slots.closed() {
             return Err(Error::State("DWDP weight owner is closed"));
         }
-
-        let copy = self
-            .copies
-            .get(index)
-            .ok_or_else(|| Error::Invalid("expert layer is outside the copy plan".into()))?;
-        self.stream.wait_event(&self.consumed[index % 2])?;
-        // SAFETY: `backing` retains every source mapping and destination view
-        // until close drains this stream.
-        unsafe { copy.submit(&self.stream) }?;
-        self.ready[index % 2].record(&self.stream)?;
-        Ok(())
+        self.slots.copy(index)
     }
 
     /// The caller retires numerical readers first. Drain the copy stream and
     /// return backing for destruction outside owner locks and binding borrows.
     pub(crate) fn close(&self) -> Result<Option<WeightStorage>> {
-        let mut state = self.state();
-        if state.backing.is_none() {
-            return Ok(None);
-        }
-        if !state.calls.is_empty() {
+        if !self.calls().is_empty() {
             return Err(Error::State("cannot close active weight prefetch"));
         }
-        state.closed = true;
-        drop(state);
-
-        self.stream.synchronize()?;
-        Ok(self.state().backing.take())
-    }
-}
-
-impl Drop for WeightPrefetch {
-    fn drop(&mut self) {
-        // After a failed close the copies' completion is unknown: the peer
-        // mappings they read stay until the process exits.
-        if self.close().is_err() {
-            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-            crate::leak(state.backing.take());
-        }
+        self.slots.close()
     }
 }
 
@@ -798,4 +864,380 @@ fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBre
         unit(weights.after(count(layer)?, &compute(weights, stream)?))
     })));
     vec![begin, end, before, after]
+}
+
+/// The library module of host-resident layer weights.
+const HOST_WEIGHTS: &str = "uniserve.loading.host_weights";
+
+/// Which layer each slot of a host-weight stack holds, and which layers may
+/// still read their slots.
+///
+/// Evaluation order makes two layers live at once: a layer's projections
+/// start while the previous layer's feed-forward still produces rows, and
+/// that layer completes before the next one attends. With `slots` slots,
+/// `slots - 2` layers can therefore be copied ahead. `slots` divides the
+/// layer count, so a repeated pass (the next denoising step) finds every
+/// layer in its own slot; a copy never targets a slot whose layer is live,
+/// and a layer whose copy was not enqueued in time (the first pass, or one
+/// after an interrupted pass) is copied when first used. A pass acquires
+/// its layers in order, so a first use that does not follow the newest live
+/// layer starts a new pass.
+#[derive(Debug)]
+struct Ring {
+    layers: usize,
+    slots: usize,
+    /// The layer whose copy each slot last received.
+    loaded: Vec<Option<usize>>,
+    /// The layers whose projections may still run, newest last.
+    live: Vec<usize>,
+}
+
+impl Ring {
+    /// The fewest slots, at least four, that divide `layers`.
+    fn new(layers: usize) -> Result<Self> {
+        let slots = (4..=layers)
+            .find(|count| layers.is_multiple_of(*count))
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "no slot count of at least four divides {layers} streamed layers"
+                ))
+            })?;
+        Ok(Self {
+            layers,
+            slots,
+            loaded: vec![None; slots],
+            live: Vec::new(),
+        })
+    }
+
+    fn occupied(&self, slot: usize) -> bool {
+        self.live.iter().any(|layer| layer % self.slots == slot)
+    }
+
+    /// Begin `layer`'s use. Returns the layers to copy, in order (`layer`
+    /// itself first when its slot does not hold it), then the following
+    /// layers whose slots no live layer reads; `None` when `layer` is
+    /// already live and its slot was made readable.
+    fn acquire(&mut self, layer: usize) -> Result<Option<Vec<usize>>> {
+        if layer >= self.layers {
+            return Err(Error::Invalid("layer is outside the streamed stack".into()));
+        }
+        if self.live.contains(&layer) {
+            return Ok(None);
+        }
+        if self
+            .live
+            .last()
+            .is_some_and(|newest| layer != (newest + 1) % self.layers)
+        {
+            // Another layer starts a new pass: the previous one, complete
+            // or interrupted, has enqueued every read of its layers.
+            self.live.clear();
+        }
+        let slot = layer % self.slots;
+        if self.occupied(slot) {
+            return Err(Error::Invariant(
+                "a streamed layer shares its slot with a live layer".into(),
+            ));
+        }
+
+        let mut copies = Vec::new();
+        if self.loaded[slot] != Some(layer) {
+            self.loaded[slot] = Some(layer);
+            copies.push(layer);
+        }
+        let previous = self.live.last().copied();
+        self.live = previous.into_iter().chain([layer]).collect();
+        // Copy the following layers into slots no live layer reads; every
+        // read of their previous layers is already enqueued.
+        for step in 1..=self.slots - 2 {
+            let following = (layer + step) % self.layers;
+            let target = following % self.slots;
+            if self.loaded[target] != Some(following) && !self.occupied(target) {
+                self.loaded[target] = Some(following);
+                copies.push(following);
+            }
+        }
+        Ok(Some(copies))
+    }
+}
+
+/// What the copies of a host-weight stack address: its page-locked host
+/// copy of every layer and the device slots.
+struct HostStorage {
+    _host: Arc<Memory>,
+    _slots: Vec<Arc<Memory>>,
+}
+
+/// The dense projection weights of one repeated layer stack, kept in
+/// page-locked host memory and streamed through a ring of device slots.
+///
+/// The library rebinds every layer's projection matrices to views of its
+/// slot (`uniserve.loading.host_weights.bind`); its hooks call
+/// [`before`](Self::before) ahead of each projection call and
+/// [`after`](Self::after) after it, on the computing stream. The stack's
+/// calls cannot be captured: copies are scheduled by the host as layers are
+/// reached.
+pub(crate) struct HostWeights {
+    copies: SlotCopies<HostStorage>,
+    ring: Mutex<Ring>,
+}
+
+impl HostWeights {
+    /// Make `layer` readable on `compute` and copy the layers after it
+    /// ahead.
+    fn before(&self, layer: usize, compute: &Stream) -> Result<()> {
+        if compute.capture_status()? != CaptureStatus::None {
+            return Err(Error::Unsupported(
+                "host-streamed layer weights cannot be captured".into(),
+            ));
+        }
+        let Some(copies) = lock(&self.ring).acquire(layer)? else {
+            return Ok(());
+        };
+        // A default-stream handle resolves against the current context.
+        let _device = DeviceGuard::new(self.copies.device)?;
+        for index in copies {
+            self.copies.copy(index)?;
+        }
+        self.copies.wait(layer, compute)
+    }
+
+    /// Record that `compute` has read `layer`'s slot.
+    fn after(&self, layer: usize, compute: &Stream) -> Result<()> {
+        self.copies.release(layer, compute)
+    }
+
+    /// Drain the copy stream and release the host copy and the slots, after
+    /// every reader retired.
+    pub(crate) fn close(&self) -> Result<()> {
+        drop(self.copies.close()?);
+        Ok(())
+    }
+
+    /// Stream the layer stacks of this rank's components placed with
+    /// `"weights": "host"`.
+    ///
+    /// Runs after loading and before any numerical operator binds the
+    /// layers' parameters and before capacity planning, so the device
+    /// memory the streamed matrices release becomes capacity. Each outermost
+    /// declared module path of such a component streams its repeated layer
+    /// stack.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when a component off CUDA keeps host weights or
+    /// a module cannot stream its layers.
+    pub(crate) fn start(model: &LoadedModel, components: &Components) -> Result<Vec<Arc<Self>>> {
+        let mut owners = Vec::new();
+        for placed in components.placed() {
+            if placed.config.weights != ComponentWeights::Host {
+                continue;
+            }
+            let Device::Cuda(device) = placed.device else {
+                return Err(Error::Unsupported(format!(
+                    "component {} streams host weights to a CUDA device, not {:?}",
+                    placed.name, placed.device
+                )));
+            };
+            for path in model.declarations.roots(&placed.name) {
+                let owner = Self::stream(model, device, &path).map_err(|error| {
+                    Error::Unsupported(format!(
+                        "component {} cannot stream {path:?} from host memory: {error}",
+                        placed.name
+                    ))
+                })?;
+                owners.push(owner);
+            }
+        }
+        Ok(owners)
+    }
+
+    fn stream(model: &LoadedModel, device: DeviceId, path: &str) -> Result<Arc<Self>> {
+        let function = format!("{HOST_WEIGHTS}.layout");
+        let layout = crate::ffi::integers(Interpreter::import(&function)?.call_values(&[
+            model.handle().to_any(),
+            Any::from(tvm_ffi::String::from(path)),
+        ])?)
+        .map_err(|error| Error::numerical(&function, &error))?;
+        let [layers, layer_bytes] = layout[..] else {
+            return Err(Error::Interface(
+                "a streamed stack's layout names its layers and layer bytes".into(),
+            ));
+        };
+        let (layers, layer_bytes) = (
+            usize::try_from(layers)
+                .map_err(|_| Error::Interface("streamed layers are a count".into()))?,
+            usize::try_from(layer_bytes)
+                .map_err(|_| Error::Interface("streamed layer bytes are a count".into()))?,
+        );
+        let ring = Ring::new(layers)?;
+
+        // One page-locked region of exactly every layer's bytes, and one
+        // device slot per ring position.
+        let host = Memory::pinned(device, layers * layer_bytes)?;
+        let slots = (0..ring.slots)
+            .map(|_| Memory::device(device, layer_bytes))
+            .collect::<Result<Vec<_>>>()?;
+        let view = |memory: &Arc<Memory>| {
+            StorageView::whole(Arc::clone(memory) as Arc<dyn Backing>, DType::U8)
+        };
+        let host_view = view(&host)?;
+        let slot_views = slots.iter().map(view).collect::<Result<Vec<_>>>()?;
+        let copies = (0..layers)
+            .map(|layer| {
+                let mut batch = CopyBatch::new(SourceOrder::Stream);
+                batch.push(
+                    slot_views[layer % ring.slots].address(),
+                    host_view.address() + (layer * layer_bytes) as u64,
+                    layer_bytes,
+                );
+                batch
+            })
+            .collect();
+        let slot_count = ring.slots;
+        let owner = Arc::new(Self {
+            copies: SlotCopies::new(
+                device,
+                slot_count,
+                copies,
+                HostStorage {
+                    _host: host,
+                    _slots: slots,
+                },
+            )?,
+            ring: Mutex::new(ring),
+        });
+
+        let bind = Interpreter::import(&format!("{HOST_WEIGHTS}.bind"))?;
+        // The views' wrappings and the call take one handoff.
+        Interpreter::execute(|| -> Result<()> {
+            let (before, after) = host_hooks(&owner);
+            let mut arguments = vec![
+                model.handle().to_any(),
+                Any::from(tvm_ffi::String::from(path)),
+                before,
+                after,
+                host_view.handle()?.to_any(),
+            ];
+            for slot in &slot_views {
+                arguments.push(slot.handle()?.to_any());
+            }
+            bind.call_values(&arguments).map(drop)
+        })?;
+        tracing::info!(
+            "streaming {layers} layers of {path:?} from host memory through {slot_count} device slots of {layer_bytes} bytes"
+        );
+        Ok(owner)
+    }
+}
+
+/// The hooks of a host-weight stack as TVM-FFI functions closed over its
+/// owner: `before(layer, stream)` and `after(layer, stream)`, on the calling
+/// CUDA stream handle.
+fn host_hooks(owner: &Arc<HostWeights>) -> (Any, Any) {
+    type Hook = fn(&HostWeights, usize, &Stream) -> Result<()>;
+    let function = |call: Hook| {
+        let owner = Arc::clone(owner);
+        Any::from(tvm_ffi::Function::from_packed(
+            move |args: &[AnyView<'_>]| {
+                let [layer, stream] = args else {
+                    return Err(ffi_error(&Error::Invalid(
+                        "a layer hook takes a layer and a stream".into(),
+                    )));
+                };
+                // SAFETY: the hook names the stream its layer computes on,
+                // which the rank's lanes own until the weights close.
+                let stream =
+                    unsafe { crate::stream::external(owner.copies.device, count(stream)?) }
+                        .map_err(|error| ffi_error(&error))?;
+                call(&owner, count(layer)?, &stream)
+                    .map(|()| Any::default())
+                    .map_err(|error| ffi_error(&error))
+            },
+        ))
+    };
+    (function(HostWeights::before), function(HostWeights::after))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ring;
+
+    /// Drive one pass over `layers` in order, as a forward reaches them,
+    /// and return the copies each first use enqueued.
+    fn pass(ring: &mut Ring, layers: impl IntoIterator<Item = usize>) -> Vec<Vec<usize>> {
+        layers
+            .into_iter()
+            .map(|layer| ring.acquire(layer).unwrap().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn the_ring_is_the_fewest_slots_of_at_least_four_dividing_the_stack() {
+        assert_eq!(Ring::new(10).unwrap().slots, 5);
+        assert_eq!(Ring::new(50).unwrap().slots, 5);
+        assert_eq!(Ring::new(48).unwrap().slots, 4);
+        assert_eq!(Ring::new(7).unwrap().slots, 7);
+        assert!(Ring::new(3).is_err());
+    }
+
+    #[test]
+    fn a_first_pass_copies_each_layer_once_ahead_of_its_use() {
+        let mut ring = Ring::new(10).unwrap();
+        let copies = pass(&mut ring, 0..10);
+        // The first layer and the three after it, then one more layer per
+        // step: two slots hold live layers.
+        assert_eq!(copies[0], vec![0, 1, 2, 3]);
+        for (layer, copied) in copies.iter().enumerate().skip(1) {
+            assert_eq!(copied, &vec![(layer + 3) % 10], "layer {layer}");
+        }
+        let mut copied: Vec<usize> = copies.concat();
+        copied.truncate(10);
+        copied.sort_unstable();
+        assert_eq!(copied, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_layer_already_live_needs_no_copy_or_wait() {
+        let mut ring = Ring::new(8).unwrap();
+        assert!(ring.acquire(0).unwrap().is_some());
+        assert_eq!(ring.acquire(0).unwrap(), None);
+        assert!(ring.acquire(1).unwrap().is_some());
+        // The previous layer stays live while the next one starts.
+        assert_eq!(ring.acquire(0).unwrap(), None);
+    }
+
+    #[test]
+    fn no_copy_targets_the_slot_of_a_live_layer() {
+        let mut ring = Ring::new(10).unwrap();
+        for _ in 0..3 {
+            for layer in 0..10 {
+                let copies = ring.acquire(layer).unwrap().unwrap_or_default();
+                // The layer before stays live while this one starts.
+                assert!(ring.live.len() <= 2 && ring.live.last() == Some(&layer));
+                for copied in copies.iter().filter(|&&copied| copied != layer) {
+                    assert!(
+                        ring.live.iter().all(|live| live % 5 != copied % 5),
+                        "layer {layer} copied {copied} over a live slot"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_interrupted_pass_restarts_and_recopies_what_it_lacks() {
+        let mut ring = Ring::new(10).unwrap();
+        pass(&mut ring, 0..6);
+        // A new pass starts at layer 0, whose slot now holds layer 5.
+        let copies = ring.acquire(0).unwrap().unwrap();
+        assert_eq!(copies[0], 0);
+        assert_eq!(ring.live, vec![0]);
+        // The remaining layers of the new pass are each in their slot when
+        // first used.
+        for layer in 1..10 {
+            ring.acquire(layer).unwrap();
+            assert_eq!(ring.loaded[layer % 5], Some(layer));
+        }
+    }
 }

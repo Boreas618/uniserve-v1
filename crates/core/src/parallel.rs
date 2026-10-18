@@ -162,6 +162,21 @@ pub enum ComponentDistribution {
     TemporalUnits,
 }
 
+/// Where a component keeps its weights while it serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentWeights {
+    /// Every weight stays in device memory.
+    #[default]
+    Device,
+    /// The dense projection weights of the component's repeated layer stack
+    /// stay in page-locked host memory, and each rank copies them into a few
+    /// layer-sized device slots ahead of each layer's use. Every other
+    /// weight stays in device memory. The rank serves the component's calls
+    /// without CUDA graphs.
+    Host,
+}
+
 /// Rank membership and parallel layout of one named component in a worker
 /// group.
 ///
@@ -181,6 +196,11 @@ pub struct ComponentConfig {
     /// positive.
     #[serde(default = "one")]
     pub units_per_rank: usize,
+    /// Residency of the component's weights; the rank refuses `Host` for a
+    /// component without a repeated layer stack. Always written, so the
+    /// positional encoding keeps `distribution` last.
+    #[serde(default)]
+    pub weights: ComponentWeights,
     /// How independent units are spread over `ranks`; `None` runs the
     /// component as one model-parallel group.
     ///
@@ -247,6 +267,7 @@ impl ComponentConfig {
             parallel_config,
             distribution: None,
             units_per_rank: 1,
+            weights: ComponentWeights::Device,
         }
     }
 
@@ -292,5 +313,18 @@ mod tests {
         let mut distributed = ComponentConfig::parallel(vec![0, 1, 2, 3], Default::default());
         distributed.distribution = Some(ComponentDistribution::TemporalUnits);
         assert!(distributed.publishes_on_every_rank());
+    }
+
+    #[test]
+    fn a_deployment_names_where_a_component_keeps_its_weights() {
+        let host: ComponentConfig =
+            serde_json::from_str(r#"{"ranks": [0], "weights": "host"}"#).unwrap();
+        assert_eq!(host.weights, ComponentWeights::Host);
+        let device: ComponentConfig = serde_json::from_str(r#"{"ranks": [0]}"#).unwrap();
+        assert_eq!(device.weights, ComponentWeights::Device);
+        assert!(
+            serde_json::from_str::<ComponentConfig>(r#"{"ranks": [0], "weights": "disk"}"#)
+                .is_err()
+        );
     }
 }

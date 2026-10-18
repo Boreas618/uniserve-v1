@@ -101,6 +101,9 @@ pub(crate) struct Runtimes {
     experts: Option<Arc<crate::parallel::ExpertUnion>>,
     /// Distributed expert weights, on ranks that prefetch them.
     weights: Option<crate::parallel::DwdpManager>,
+    /// Layer stacks streamed from host memory, on ranks of components that
+    /// keep their weights there.
+    host_weights: Vec<std::sync::Arc<crate::parallel::HostWeights>>,
     /// The transfer runtime: tensor transfers, cache exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<super::transfer::TransferRuntime>,
@@ -453,6 +456,14 @@ impl WorkerBackend {
         self.runtimes.weights = Some(weights);
     }
 
+    /// Install the layer stacks streamed from host memory.
+    pub(crate) fn set_host_weights(
+        &mut self,
+        weights: Vec<std::sync::Arc<crate::parallel::HostWeights>>,
+    ) {
+        self.runtimes.host_weights = weights;
+    }
+
     pub(crate) fn experts(&self) -> Option<&Arc<crate::parallel::ExpertUnion>> {
         self.runtimes.experts.as_ref()
     }
@@ -475,8 +486,9 @@ impl WorkerBackend {
         &self.jobs
     }
 
-    /// Release the expert runtime after the bindings and graphs using its
-    /// transports retired; collective unless `aborted`.
+    /// Release the expert runtime and the weights copied ahead of their
+    /// layers after the bindings and graphs using them retired; collective
+    /// unless `aborted`.
     pub(crate) fn close_experts(&mut self, aborted: bool) -> Result<()> {
         let experts = match self.experts_mut() {
             Ok(Some(experts)) => experts.close(aborted),
@@ -487,7 +499,17 @@ impl WorkerBackend {
             Some(weights) => weights.close(aborted),
             None => Ok(()),
         };
-        experts.and(weights)
+        // Host weights' copies run on their own streams; an aborted close
+        // keeps their memory until exit, since copies may still be queued.
+        let mut host = Ok(());
+        for streamed in std::mem::take(&mut self.runtimes.host_weights) {
+            if aborted {
+                crate::leak(streamed);
+            } else {
+                host = host.and(streamed.close());
+            }
+        }
+        experts.and(weights).and(host)
     }
 
     /// Install the transfer runtime.
