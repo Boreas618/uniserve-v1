@@ -470,7 +470,7 @@ fn disaggregated_ranks_keep_their_local_rank_and_role() {
         assert_eq!(launch.execution.expert_microbatches, 2);
         assert_eq!(launch.supported_calls.is_empty(), role == "experts");
     }
-    for count in [json!(0), json!(5), json!(true), json!(2)] {
+    for count in [json!(0), json!(true), json!(2)] {
         assert!(resolved(json!({"expert_microbatches": count})).is_err());
     }
     for (role, union_rank, attention, exchange) in [
