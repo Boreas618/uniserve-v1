@@ -232,6 +232,8 @@ pub(super) mod tests {
             tasks: VideoTask::ALL.to_vec(),
             max_video_seconds: 15.0,
             canvases: None,
+            // The fixture's requests follow the released pipeline.
+            references: uniserve_core::video::plan::ReferenceConfig::RELEASED,
         }
     }
 

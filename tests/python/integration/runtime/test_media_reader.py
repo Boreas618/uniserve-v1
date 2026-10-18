@@ -92,11 +92,14 @@ def _plan(root: Path, case: str):
                 frame_index=item.get("frame_index"),
             )
         )
+    # The recorded runs come from the reference pipeline, which enlarges
+    # small references.
     planned = processing.plan_request(
         processing.Task(request["task"]),
         processing.Target(**request["target"]),
         conditions,
         _VISION,
+        references=processing.ReferenceConfig(enlarge=True),
     )
     return planned, paths
 

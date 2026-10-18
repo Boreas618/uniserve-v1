@@ -42,6 +42,7 @@ __all__ = [
     "PlanError",
     "Presentation",
     "ReferenceBounds",
+    "ReferenceConfig",
     "RequestPlan",
     "Role",
     "Target",
@@ -151,13 +152,16 @@ class AudioFacts:
 
 @dataclass(frozen=True, slots=True)
 class VideoFacts:
-    """A video's display aspect, frame rate, frame count and soundtrack.
+    """A video's display aspect and size, frame rate, frames and soundtrack.
 
     Attributes:
         display_width: Width of the displayed aspect. Only the ratio to
             ``display_height`` matters; a probe passes the coded size scaled
             by the sample aspect ratio and turned by the display rotation.
         display_height: Height of the displayed aspect.
+        width: Displayed width in pixels: the coded width scaled by the
+            sample aspect ratio, turned with ``height`` by the rotation.
+        height: Displayed height in pixels.
         frame_rate: The container's average frame rate.
         frames: Decoded frames of the whole video.
         soundtrack: The first audio stream, when the video has one.
@@ -165,6 +169,8 @@ class VideoFacts:
 
     display_width: int
     display_height: int
+    width: int
+    height: int
     frame_rate: Fraction
     frames: int
     soundtrack: AudioFacts | None = None
@@ -524,6 +530,28 @@ def named_canvas(task: Task, target: Target) -> image.Config | None:
     return None if values is None else _canvases(values)[0]
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceConfig:
+    """How ``ref2va`` references are sized: the video processor's options.
+
+    A reference is only ever reduced by default: an image whose short edge
+    exceeds ``image_short_edge`` scales down to it and a video with more
+    pixels than the canvas of its aspect scales down to that canvas, while
+    smaller references keep their own size on the 32-pixel grid.
+    ``enlarge`` also enlarges smaller ones to those sizes, as the released
+    pipeline does.
+
+    Attributes:
+        image_short_edge: Short edge, in pixels, an image reference is
+            encoded at, at most: a multiple of 32 up to 2048.
+        enlarge: Whether smaller references are enlarged to their encoding
+            size.
+    """
+
+    image_short_edge: int = 2048
+    enlarge: bool = False
+
+
 def plan_request(
     task: Task,
     target: Target,
@@ -533,6 +561,7 @@ def plan_request(
     tasks: Sequence[Task] = tuple(Task),
     max_seconds: float | None = None,
     canvases: Sequence[image.Config] | None = None,
+    references: ReferenceConfig = ReferenceConfig(),
 ) -> RequestPlan:
     """Validate a request and resolve every size it implies.
 
@@ -545,6 +574,8 @@ def plan_request(
         max_seconds: The longest duration served; by default the model's
             15 seconds.
         canvases: The only canvases the checkpoint serves, when restricted.
+        references: How references are sized; by default the server's
+            default sizing, which never enlarges.
 
     Raises:
         PlanError: The request breaks a rule; ``field`` names the culprit.
@@ -566,6 +597,7 @@ def plan_request(
             else [
                 side for size in canvases for side in (size.width, size.height)
             ],
+            [int(references.image_short_edge), int(references.enlarge)],
         ],
     )
     _raise(rejection)
@@ -716,6 +748,8 @@ def _condition(condition: Condition) -> list[Any]:
             [
                 media.display_width,
                 media.display_height,
+                media.width,
+                media.height,
                 rate.numerator,
                 rate.denominator,
                 media.frames,

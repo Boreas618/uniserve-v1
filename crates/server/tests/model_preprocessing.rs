@@ -87,6 +87,7 @@ fn video_service(
         None,
         1,
         &VideoMediaSettings::default(),
+        Default::default(),
         Arc::clone(tokenizer),
     )
     .unwrap()
