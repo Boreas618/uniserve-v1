@@ -494,9 +494,10 @@ impl Scheduler {
     /// validation; the worker reports no muxing component or no video
     /// denoiser; the denoiser does not serve the request's task; the request's
     /// inference-step count differs from the loaded model's; its call graph
-    /// cannot be built; `media_outputs` cannot bound its products; or the
-    /// worker has fewer than two request slots. A served task's calls all
-    /// have components: the executor checked them at startup. Rejects with
+    /// cannot be built; or `media_outputs` cannot bound its products. A
+    /// served task's calls all have components: the executor checked them at
+    /// startup. The two resident request slots a video decoder needs are the
+    /// rank's to require: it refuses to start with fewer. Rejects with
     /// `RejectionKind::Overloaded` when the waiting bound is reached. A
     /// rejection's send result is ignored.
     pub(super) fn enqueue_media(
@@ -565,13 +566,6 @@ impl Scheduler {
             reject(
                 RejectionKind::Invalid,
                 format!("loaded media components cannot hold the request: {error}"),
-            );
-            return;
-        }
-        if self.info.request_slots < 2 {
-            reject(
-                RejectionKind::Invalid,
-                "worker does not provide two resident media state slots".to_string(),
             );
             return;
         }
