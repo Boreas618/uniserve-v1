@@ -237,7 +237,7 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
         let (mut client, mut child) = RawHead::launch("127.0.0.1:0", &stub_launch_descriptor())?;
         let result = (|| -> anyhow::Result<()> {
             let request = |mut request: WorkerRequest, message_id| {
-                request.set_call_id(Some(message_id));
+                request.set_message_id(Some(message_id));
                 request
             };
 
@@ -336,7 +336,7 @@ fn a_serving_rank_leaves_interrupt_and_termination_to_its_head() -> anyhow::Resu
     let (mut client, mut child) = RawHead::launch(&address, &stub_launch_descriptor())?;
     let result = (|| -> anyhow::Result<()> {
         let request = |mut request: WorkerRequest, message_id| {
-            request.set_call_id(Some(message_id));
+            request.set_message_id(Some(message_id));
             request
         };
         let mut serve = |batch_id: u64, request_id: u64, slot: u32| -> anyhow::Result<()> {
@@ -480,7 +480,7 @@ fn a_rank_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
     // Serving: a rank that has answered Info waits for its next request.
     let (mut head, child) = RawHead::launch(&address("serving.sock"), &stub_launch_descriptor())?;
     let mut info = uniserve_ipc::WorkerRequest::info();
-    info.set_call_id(Some(1));
+    info.set_message_id(Some(1));
     let info = head.send(&info)?;
     let answered = head.response(info, Duration::from_secs(60))?;
     anyhow::ensure!(
@@ -520,7 +520,7 @@ fn lose_head(
             UnitId(1),
             0,
         ));
-        request.set_call_id(Some(1));
+        request.set_message_id(Some(1));
         head.send(&request)?;
         // A stalled job's report answers no request, so it carries no
         // identity.
@@ -796,7 +796,7 @@ fn a_stalled_lane_is_reported_while_its_rank_serves_on() -> anyhow::Result<()> {
     let (mut head, mut child) = RawHead::launch(&address, &descriptor)?;
     let result = (|| -> anyhow::Result<()> {
         let request = |mut request: WorkerRequest, message_id| {
-            request.set_call_id(Some(message_id));
+            request.set_message_id(Some(message_id));
             request
         };
 
@@ -2505,7 +2505,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
                             assert!(!independent_returned);
                             independent_returned = true;
                         }
-                        computation => panic!("unexpected completed computation {computation:?}"),
+                        kind => panic!("unexpected completed call {kind:?}"),
                     }
                 }
             }
@@ -2651,7 +2651,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
     Ok(())
 }
 
-/// Independent instances accepting the same computation must retain
+/// Independent instances accepting the same call must retain
 /// separate capacity.
 #[test]
 fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow::Result<()> {

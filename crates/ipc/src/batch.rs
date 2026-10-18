@@ -95,7 +95,7 @@ impl CacheUnitAllocation {
 /// Aligned columns defining the model's forward rows, independent of wire framing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardBatch {
-    /// Physical call index for each row; logical computation IDs remain unchanged.
+    /// Physical call index for each row; logical call IDs remain unchanged.
     pub call_indices: Vec<u32>,
     /// Scheduler-owned request slots, including alternative CFG prefixes.
     pub request_pool_indices: Vec<u32>,
@@ -335,7 +335,7 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// Constructs a run with admissions and calls using default metadata.
+    /// Constructs a batch with admissions and calls using default metadata.
     ///
     /// `collective_seq` is `batch_id`, or one when `batch_id` is zero;
     /// [`Self::validate`] requires it to be positive.
@@ -366,12 +366,12 @@ impl Batch {
         self.calls.iter()
     }
 
-    /// Returns the number of calls in this run.
+    /// Returns the number of calls in this batch.
     pub fn call_count(&self) -> usize {
         self.calls.len()
     }
 
-    /// Attaches ordered control commands to the run.
+    /// Attaches ordered control commands to the batch.
     pub fn with_commands(mut self, commands: Vec<BatchCommand>) -> Self {
         self.commands.extend(commands);
         self
@@ -417,30 +417,30 @@ impl Batch {
 
     /// Validates the batch, and its buffer spans when `placed`.
     fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
-        // Establish the run envelope before validating relationships within it.
+        // Establish the batch envelope before validating relationships within it.
         ensure_valid!(
             !self.calls.is_empty() || !self.commands.is_empty(),
             "a submission batch must carry at least one call or control"
         );
         ensure_valid!(
             self.collective_seq > 0,
-            "run collective sequence must be positive"
+            "batch collective sequence must be positive"
         );
 
-        let mut computation_ids = HashSet::with_capacity(self.calls.len());
+        let mut call_ids = HashSet::with_capacity(self.calls.len());
         for call in &self.calls {
             call.validate()?;
             ensure_valid!(
                 call.call_id.batch_id == self.batch_id,
-                "computation identity belongs to another logical batch"
+                "call identity belongs to another logical batch"
             );
             ensure_valid!(
-                computation_ids.insert(call.call_id),
-                "a submission batch repeats a computation identity"
+                call_ids.insert(call.call_id),
+                "a submission batch repeats a call identity"
             );
         }
         // A batch is one numerical call on one component: every call in it
-        // performs the same computation through the same component, so a rank
+        // performs the same kind of call through the same component, so a rank
         // executes it as a single homogeneous group and returns one result.
         ensure_valid!(
             self.calls.windows(2).all(|pair| {
@@ -461,7 +461,7 @@ impl Batch {
             table.validate()?;
             ensure_valid!(
                 table_ids.insert((table.request_pool_idx, table.group_id)),
-                "run repeats a block table"
+                "batch repeats a block table"
             );
         }
 
@@ -477,7 +477,7 @@ impl Batch {
             let identity = (allocation.request_pool_idx, allocation.group_id);
             ensure_valid!(
                 allocation_ids.insert(identity),
-                "run repeats a cache-unit allocation"
+                "batch repeats a cache-unit allocation"
             );
             let table = tables.get(&identity).ok_or_else(|| {
                 invalid_message!("cache-unit allocation has no matching block table")
@@ -494,7 +494,7 @@ impl Batch {
 
         self.forward.validate(self.calls.len())?;
 
-        // Latent pages are exclusive across every trajectory placed in a run.
+        // Latent pages are exclusive across every trajectory placed in a batch.
         let mut latent_ids = HashSet::with_capacity(self.latent_params.len());
         let mut latent_pages = HashSet::new();
         for params in &self.latent_params {
@@ -502,11 +502,11 @@ impl Batch {
             let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 latent_ids.insert(identity),
-                "run repeats a latent params identity"
+                "batch repeats a latent params identity"
             );
             let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("latent params does not name a run call"))?;
+                .ok_or_else(|| invalid_message!("latent params does not name a batch call"))?;
             ensure_valid!(
                 call.addresses_latent_pages(),
                 "latent params names work without a trajectory"
@@ -516,7 +516,7 @@ impl Batch {
                     .page_table
                     .iter()
                     .all(|page| latent_pages.insert(*page)),
-                "run latent allocations overlap physical pages"
+                "batch latent allocations overlap physical pages"
             );
         }
 
@@ -536,11 +536,11 @@ impl Batch {
             let identity = (params.request_key, params.call_id);
             ensure_valid!(
                 decode_ids.insert(identity),
-                "run repeats a decode params identity"
+                "batch repeats a decode params identity"
             );
             let call = calls
                 .get(&identity)
-                .ok_or_else(|| invalid_message!("decode params does not name a run call"))?;
+                .ok_or_else(|| invalid_message!("decode params does not name a batch call"))?;
             // A video request's latent encoding also covers a range: the
             // visual condition units of one round, or its single audio call.
             ensure_valid!(
@@ -600,7 +600,7 @@ impl Batch {
                     params.validate()?;
                     ensure_valid!(
                         buffer_ids.insert(params.buffer),
-                        "run repeats a buffer params identity"
+                        "batch repeats a buffer params identity"
                     );
                     Ok((params.offset, params.offset + params.bytes))
                 })
@@ -609,7 +609,7 @@ impl Batch {
 
             ensure_valid!(
                 buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-                "run buffer allocations overlap"
+                "batch buffer allocations overlap"
             );
 
             for call in &self.calls {
@@ -719,7 +719,7 @@ impl Batch {
             export.validate()?;
             ensure_valid!(
                 cache_sources.insert(export.source),
-                "run repeats a cache input"
+                "batch repeats a cache input"
             );
             let consumers = self
                 .calls()
