@@ -18,13 +18,13 @@ from torch.nn import functional as F
 from uniserve.diffusion import block_grid, fuse_heads
 from uniserve.loading import checkpoint, weights
 from uniserve.models import qwen3_vl
-from uniserve.nn import Modulation
+from uniserve.nn import AdaLNCache
 
 from . import audio_vae, video_vae
 from .checkpoint import DENOISER_DIRECTORIES
 from .conditioning import assignments as conditioning_assignments
 from .config import DenoiserConfig, PddGrid
-from .denoiser import modulation_timesteps, schedules
+from .denoiser import adaln_timesteps, schedules
 from .modulation import TimestepEmbedding
 from .transformer import StepProjection
 
@@ -161,7 +161,7 @@ def transformer_assignments(model, reader):
 
 
 @torch.inference_mode()
-def _prepare_modulation(model, config: DenoiserConfig, reader):
+def _prepare_adaln_cache(model, config: DenoiserConfig, reader):
     """Precompute the resident layers' modulation products for the schedule.
 
     Runs as the transformer mapping's post-load hook, after the resident
@@ -169,7 +169,7 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
     embedding and SiLU for each step's group timesteps, keeps one row per
     distinct timestep value, projects the rows through each resident layer's
     ``adaln_proj`` and, on the last stage, ``norm_out`` in BF16, and stores
-    the products on ``model.modulation``.
+    the products on ``model.adaln_cache``.
     """
     # These temporary learned projections belong to loading. Only their fixed
     # step products remain with the numerical transformer after this function.
@@ -193,7 +193,7 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
     # schedule without repeated values projects exactly the [step, group]
     # rows. ``activated`` is [entry, time_dim].
     values = schedules(config, device="cpu")
-    steps, entries, groups = modulation_timesteps(config, values)
+    steps, entries, groups = adaln_timesteps(config, values)
     activated = torch.cat([F.silu(embedding(row.to(device))) for row in steps])
     del embedding
     first = []
@@ -212,7 +212,7 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
             for field in ("weight", "bias")
         )
 
-    prepared = Modulation.from_projections(
+    prepared = AdaLNCache.from_projections(
         activated,
         (
             projection(f"transformer_blocks.{index}.adaln_proj.linear")
@@ -226,9 +226,9 @@ def _prepare_modulation(model, config: DenoiserConfig, reader):
     )
     # Keep the existing module identity so the loader can retain its buffers
     # along the same selected-component and device bindings as the model.
-    model.modulation.products = prepared.products
-    model.modulation.output_products = prepared.output_products
-    model.modulation.groups = prepared.groups
+    model.adaln_cache.products = prepared.products
+    model.adaln_cache.output_products = prepared.output_products
+    model.adaln_cache.groups = prepared.groups
 
 
 @torch.inference_mode()
@@ -309,7 +309,7 @@ def transformer_component(model, config: DenoiserConfig, source: str):
         prefixes.extend(_OUTPUT_TENSORS)
 
     def post_load(reader):
-        _prepare_modulation(model, config, reader)
+        _prepare_adaln_cache(model, config, reader)
         if fused and model.output_norm is not None:
             assert isinstance(config.schedule, PddGrid)
             _prepare_heads(model, config.schedule, reader)

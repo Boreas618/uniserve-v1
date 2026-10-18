@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from .layers import DiagonalGaussian
-from .spatial import SpatialEncoder
+from .tiled import TiledEncoder
 
 
 class LatentEncoder(nn.Module):
@@ -14,9 +14,9 @@ class LatentEncoder(nn.Module):
 
     The inverse of ``LatentDecoder``. ``encoder`` maps its native input to
     posterior moments, or directly to latents when ``posterior`` is None; a
-    ``SpatialEncoder`` encodes its raster as overlapping tiles. The posterior
+    ``TiledEncoder`` encodes its raster as overlapping tiles. The posterior
     turns the moments into latents, which pass through ``latent_dtype``, the
-    representation in which the codec's reference keeps its latents, before
+    representation in which the VAE's reference keeps its latents, before
     ``(latent - mean) / std`` in FP32. Mean and standard deviation broadcast
     against the latent. Derived constants retain real values during meta
     construction; loading moves their backing with the encoder.
@@ -69,7 +69,7 @@ class LatentEncoder(nn.Module):
         a sampling posterior adds, with the kept mean's shape; without it the
         posterior draws its own.
         """
-        if isinstance(self.encoder, SpatialEncoder):
+        if isinstance(self.encoder, TiledEncoder):
             values = self.encoder.encode(inputs, tiled=True)
         else:
             values = self.encoder(inputs)

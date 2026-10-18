@@ -143,7 +143,7 @@ def timestep_groups(config: DenoiserConfig) -> int:
     return 2 if config.tasks == ("t2va",) else 4
 
 
-def modulation_timesteps(
+def adaln_timesteps(
     config: DenoiserConfig, values: Mapping[str, Schedule]
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
     """Enumerate each step's group timesteps and their distinct entries.
@@ -206,7 +206,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         )
         self.config = config
         host = schedules(config, device="cpu")
-        _, entries, table = modulation_timesteps(config, host)
+        _, entries, table = adaln_timesteps(config, host)
         self.transformer = Transformer(
             config.transformer,
             attention=config.attention,

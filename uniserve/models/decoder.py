@@ -215,7 +215,7 @@ class AudioDecoder(nn.Module):
     """Decode media units of a packed latent timeline into sample-major PCM.
 
     Subclasses define ``latent_frames``, ``latent_rate``, ``latent_halo`` and
-    ``unpack_latents`` from their codec's compression and channel layout. A
+    ``unpack_latents`` from their VAE's compression and channel layout. A
     media unit is a contiguous span of latent frames; because the decoder is
     convolutional, decoding a unit together with ``latent_halo`` frames of
     context on each side and discarding that context reproduces the whole-track
@@ -256,7 +256,7 @@ class AudioDecoder(nn.Module):
         raise NotImplementedError
 
     def unpack_latents(self, latent, num_samples, *, window, workspace):
-        """Return the codec's native channel and time representation.
+        """Return the VAE's native channel and time representation.
 
         ``window`` selects the contiguous latent frames to unpack, including
         the halo the caller added around the media unit.

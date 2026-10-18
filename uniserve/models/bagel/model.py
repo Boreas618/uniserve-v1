@@ -26,10 +26,10 @@ from .vision import Encoder
 
 
 class Model(nn.Module):
-    """Compose text, denoising, vision, and latent codec over one backbone.
+    """Compose text, denoising, vision, and VAE over one backbone.
 
     The text LM and the image denoiser share the same MoT transformer; the
-    vision encoder feeds SigLIP features into it, and the latent codec maps
+    vision encoder feeds SigLIP features into it, and the VAE maps
     between pixels and the VAE latents the denoiser predicts. ``text.backbone``
     and ``denoiser.backbone`` are one module instance, as are
     ``latent_encoder`` and ``image_decoder.decoder``, so each shared part
@@ -82,8 +82,8 @@ def entry_points(config: Config):
     keeps the vocabulary head on; both join only the tensor-parallel group.
     The backbone forwards join the tensor, sequence and pipeline groups. The
     media methods declare no group: the vision tower communicates over the
-    tensor-parallel group its layers are partitioned on, and the latent
-    codec, whose convolutions and attention are replicated, over none.
+    tensor-parallel group its layers are partitioned on, and the VAE,
+    whose convolutions and attention are replicated, over none.
     """
     return MappingProxyType(
         {

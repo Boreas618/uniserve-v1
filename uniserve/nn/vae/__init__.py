@@ -1,4 +1,4 @@
-"""Shared latent codecs and spatial numerical layers."""
+"""Shared VAE numerical layers: encoders, decoders and tiling."""
 
 from .decoder import LatentDecoder
 from .encoder import LatentEncoder
@@ -10,13 +10,13 @@ from .layers import (
     Upsample,
 )
 from .patch import PatchAutoencoder, RGBDecoder
-from .spatial import SpatialDecoder, SpatialEncoder
+from .tiled import TiledDecoder, TiledEncoder
 
 __all__ = [
     "LatentDecoder",
     "LatentEncoder",
-    "SpatialDecoder",
-    "SpatialEncoder",
+    "TiledDecoder",
+    "TiledEncoder",
     "AttentionBlock",
     "DiagonalGaussian",
     "Downsample",
