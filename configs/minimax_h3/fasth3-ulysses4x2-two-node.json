@@ -142,6 +142,6 @@
         "parallel_config": {}
       }
     },
-    "queue_depth": 6
+    "queue_depth": 12
   }
 ]
