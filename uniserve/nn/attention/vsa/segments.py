@@ -70,6 +70,15 @@ def select(
     tile's kept tiles first in ascending order, and ``[heads, tiles]`` int32
     counts. Entries past a count are unread; they hold the unkept tiles.
     """
+    if scores.is_cuda:
+        from uniserve_kernels.attention import vsa_segments
+
+        return vsa_segments.select_tiles(
+            scores.contiguous(),
+            segments.tile_segments,
+            segments.valid_sizes,
+            segments.segment_keep,
+        )
     tiles = segments.tiles
     device = scores.device
     tile_segments = segments.tile_segments.long()
