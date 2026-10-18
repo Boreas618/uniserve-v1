@@ -136,3 +136,37 @@ def test_export_without_a_local_base_reads_the_pinned_hub_revision(
 
     assert set(config.model.denoisers) == {"reference_denoiser"}
     assert config.tokenizer == snapshot / "tokenizer"
+
+
+def test_offline_export_reads_its_base_from_the_cached_snapshot(
+    checkpoints, tmp_path, monkeypatch
+):
+    """Offline, the cached snapshot of the pinned commit is the base."""
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        OfflineModeIsEnabled,
+    )
+
+    export, base = checkpoints
+    snapshot = tmp_path / "hub" / REVISION
+    shutil.copytree(base, snapshot)
+
+    # The offline Hub client resolves cached files and reaches no server.
+    def download(*, repo_id, filename, cache_dir, revision):
+        assert (repo_id, revision) == ("MiniMaxAI/MiniMax-H3", REVISION)
+        if not (snapshot / filename).is_file():
+            raise EntryNotFoundError(f"{filename} is not cached")
+        return str(snapshot / filename)
+
+    def files(self, *, repo_id, revision):
+        raise OfflineModeIsEnabled("offline mode is enabled")
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", True)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    config = models.read_config(
+        export, io=IOConfig(mode="dummy"), modules=frozenset()
+    )
+
+    assert set(config.model.denoisers) == {"reference_denoiser"}
+    assert config.tokenizer == snapshot / "tokenizer"

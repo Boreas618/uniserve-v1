@@ -229,9 +229,21 @@ def _inventory(root, repository, revision, io):
             if path.is_file()
         )
     else:
-        from huggingface_hub import HfApi
+        from huggingface_hub import HfApi, constants
 
-        names = HfApi().list_repo_files(repo_id=repository, revision=revision)
+        if constants.HF_HUB_OFFLINE:
+            # Offline, the cached snapshot of the commit is the whole
+            # checkpoint: a file it lacks cannot be fetched, so loading a
+            # component that needs one fails when it opens that file.
+            names = (
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+        else:
+            names = HfApi().list_repo_files(
+                repo_id=repository, revision=revision
+            )
 
     return frozenset(
         name
