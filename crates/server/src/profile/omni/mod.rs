@@ -1,14 +1,18 @@
 //! Shared contracts and model-specific profiles for multimodal generation.
 //!
 //! The SenseNova and Bagel profiles fix each family's control tokens, prompt
-//! framing, output filters, image-generation defaults, and runtime limit
-//! ceilings. They also predict the cache tokens an input or generated image
-//! occupies from its pixel dimensions, and the request carries that count as
-//! an exact `ImageEncoderInput::num_cache_tokens`. The predictions replicate the
-//! worker's image resize arithmetic (`PixelBounds` and `StrideResize` in
-//! `uniserve/processing.py`, configured by each family's `image_processor`)
-//! and must stay in step with it: the engine scheduler rejects a worker result whose cache length differs
-//! from the declared count (`image_kv_mismatch`).
+//! framing, output filters, image-generation defaults, and runtime sizing.
+//! They also compute the cache tokens an input or generated image occupies
+//! from its pixel dimensions, and the request carries that count as an exact
+//! `ImageEncoderInput::num_cache_tokens`. The engine plans from it before any
+//! worker encodes: it reserves the request's cache units at admission and
+//! projects the extents of every later call from it, so the count is an input
+//! to scheduling, not a check. The computation replicates the worker's image
+//! resize arithmetic (`PixelBounds` and `StrideResize` in
+//! `uniserve/processing.py`, configured by each family's `image_processor`;
+//! the shared `bagel_image_resize.json` and `sensenova_image_resize.json`
+//! fixtures pin both sides), and the engine scheduler rejects a worker result
+//! whose cache length differs from the declared count (`image_kv_mismatch`).
 
 pub mod bagel;
 pub mod resolution;
