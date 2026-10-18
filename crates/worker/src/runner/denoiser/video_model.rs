@@ -129,8 +129,8 @@ struct SizingMethods {
     /// owners, names, dtypes, ranks, extents, variable and raster axes.
     output_columns: [Function; 7],
     unit_frames: Function,
-    segment: Function,
-    window_rows: Function,
+    clip_output: Function,
+    clip_rows: Function,
     overlap_elements: Function,
     overlap_dtype: Function,
     track_samples: Function,
@@ -244,8 +244,8 @@ impl VideoModel {
             .try_into()
             .map_err(|_| Error::Invariant("the outputs have seven columns".into()))?,
             unit_frames: of_decoder("unit_frames")?,
-            segment: of_decoder("segment")?,
-            window_rows: of_decoder("window_rows")?,
+            clip_output: of_decoder("clip_output")?,
+            clip_rows: of_decoder("clip_rows")?,
             overlap_elements: of_decoder("overlap_elements")?,
             overlap_dtype: of_decoder("overlap_dtype")?,
             track_samples: of_decoder("track_samples")?,
@@ -603,9 +603,15 @@ impl VideoModel {
         })
     }
 
-    /// The `(frames, canvas)` segment unit `unit` of a video decodes to.
-    pub(crate) fn segment(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<(u32, Canvas)> {
-        let method = &self.methods.segment;
+    /// The `(frames, canvas)` clip output unit `unit` of a video decodes
+    /// to: the native output of the video's clip of that index.
+    pub(crate) fn clip_output(
+        &self,
+        frames: u32,
+        canvas: Canvas,
+        unit: u32,
+    ) -> Result<(u32, Canvas)> {
+        let method = &self.methods.clip_output;
         let value = self.decoder(
             method,
             vec![
@@ -618,22 +624,22 @@ impl VideoModel {
         let values = self.integers(method, value)?;
         let [frames, width, height] = values[..] else {
             return Err(Error::Interface(
-                "a segment is [frames, width, height]".into(),
+                "a clip output is [frames, width, height]".into(),
             ));
         };
         Ok((
-            narrow(frames, "segment")?,
+            narrow(frames, "clip output")?,
             Canvas {
-                width: narrow(width, "segment")?,
-                height: narrow(height, "segment")?,
+                width: narrow(width, "clip output")?,
+                height: narrow(height, "clip output")?,
             },
         ))
     }
 
-    /// Latent rows the window of unit `unit` of a `frames`-frame video at
-    /// `canvas` reads.
-    pub(crate) fn window_rows(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<u64> {
-        let method = &self.methods.window_rows;
+    /// Latent rows the clip input of unit `unit` of a `frames`-frame video
+    /// at `canvas` reads.
+    pub(crate) fn clip_rows(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<u64> {
+        let method = &self.methods.clip_rows;
         let value = self.decoder(
             method,
             vec![

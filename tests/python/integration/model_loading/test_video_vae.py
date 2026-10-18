@@ -189,10 +189,10 @@ def test_unit_encoding_assembles_the_native_whole_video_conditioning(
     noise = torch.empty(model.posterior_shape(size))
     model.draw_noise(size, noise)
     assembled = torch.full(layout.shape, torch.nan)
-    for unit in reversed(model.frame_slices(num_frames)):
+    for clip in reversed(model.clips(num_frames)):
         (result,) = model.encode(
-            (pixels[unit],),
-            frames=(unit,),
+            (pixels[clip],),
+            clips=(clip,),
             num_frames=(num_frames,),
             noise=(noise,),
         )

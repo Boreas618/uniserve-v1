@@ -848,10 +848,7 @@ class DenoiserRunner:
                     "raster_axes": None,
                 },
             )
-        lengths = [
-            window.stop - window.start
-            for window in decoder.frame_slices(frames)
-        ]
+        lengths = [clip.stop - clip.start for clip in decoder.clips(frames)]
         decoders = [
             name
             for name, entry in loaded.description.entries.items()

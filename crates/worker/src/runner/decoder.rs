@@ -8,14 +8,14 @@
 //! **Video and audio.** A video decoding round hands each rank of the
 //! decoder's unit ring one media unit. The runner launches the Python
 //! half's `decode` for it:
-//! the forward unpacks the unit's window of the request's packed latent,
-//! decodes it at its segment and cross-fades and quantizes it into the
+//! the forward unpacks the unit's clip input from the request's packed latent,
+//! decodes it at its clip output and cross-fades and quantizes it into the
 //! unit's RGB frames, exchanging decoded overlaps with its ring neighbours.
 //! It is captured into one graph per unit shape and launched natively. The
 //! request's retained overlap lives in its slot's row of the overlap bank.
 //! An audio decoder decodes a contiguous run of audio units into their
 //! sample span. A Python runner serves one module at one size, so the
-//! runner holds one per size it serves: a video decoder per segment, an
+//! runner holds one per size it serves: a video decoder per clip output, an
 //! audio decoder per track length.
 //!
 //! **Images.**
@@ -60,7 +60,7 @@ pub(crate) use audio::{TrackUnits, decode_audio};
 use image::ImageDecoder;
 pub(crate) use image::image_placement;
 use video::VideoDecoder;
-pub(crate) use video::{DecodeCapacity, Segment, UnitShape, decode_video};
+pub(crate) use video::{ClipOutput, DecodeCapacity, UnitShape, decode_video};
 
 const DECODER: &str = "uniserve.runner.decoder.DecoderRunner";
 
@@ -271,20 +271,20 @@ impl DecoderRunner {
             .quantize(image, range, stage, job, returns)
     }
 
-    /// Construct a video decoder's Python runner of every segment, the
+    /// Construct a video decoder's Python runner of every clip output, the
     /// largest first.
-    pub(crate) fn prepare_segments(&mut self, segments: &[Segment]) -> Result<()> {
-        self.video_decoder()?.prepare(segments)
+    pub(crate) fn prepare_clip_outputs(&mut self, clip_outputs: &[ClipOutput]) -> Result<()> {
+        self.video_decoder()?.prepare(clip_outputs)
     }
 
-    /// Read from the model the window rows of unit `unit` of a
+    /// Read from the model the clip rows of unit `unit` of a
     /// `frames`-frame video at `canvas`, which a decode of the unit takes.
-    pub(crate) fn read_window(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
-        self.video_decoder()?.read_window(frames, canvas, unit)
+    pub(crate) fn read_clip_rows(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
+        self.video_decoder()?.read_clip_rows(frames, canvas, unit)
     }
 
     /// Record into `job` the decode and reconstruction of a zero latent as
-    /// a media unit of `shape` whose window reads `rows` rows, so kernels
+    /// a media unit of `shape` whose clip input reads `rows` rows, so kernels
     /// compile and the ring's exchange of the round shape is prepared.
     /// Every ring member holding a unit of the round records it, in the
     /// same order.
