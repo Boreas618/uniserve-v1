@@ -805,7 +805,6 @@ impl SimEngine {
                         call.request_key.engine_id,
                         request_id.0,
                         call.request_key.request_epoch,
-                        philox::DRAW_LAYOUT_TARGET,
                     );
                     philox::sampling_uniform(key, position, 0, 0)
                 } else {
