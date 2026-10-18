@@ -29,15 +29,9 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
-logger = logging.getLogger(__name__)
+import torch
 
-torch: Any | None
-try:
-    import torch as _torch_module
-except ImportError:
-    torch = None
-else:
-    torch = _torch_module
+logger = logging.getLogger(__name__)
 
 # Whether NVTX spans are requested for this process. The switch is the one
 # the native executor reads (``crates/worker/src/profiling``), with the same
@@ -51,9 +45,7 @@ _NVTX_RANGES = os.environ.get("UNISERVE_NVTX", "").strip().lower() in {
 
 # Whether a torch profiler window is open; windows open and close at run
 # time, so this is asked per span.
-_profiler_enabled: Callable[[], bool] = (
-    torch.autograd._profiler_enabled if torch is not None else lambda: False
-)
+_profiler_enabled: Callable[[], bool] = torch.autograd._profiler_enabled
 
 _NULL_CONTEXT = nullcontext()
 
@@ -79,7 +71,7 @@ def _nvtx_available() -> bool:
     Asked once, and only once spans are requested, so importing this module
     never initializes the CUDA driver.
     """
-    return torch is not None and torch.cuda.is_available()
+    return torch.cuda.is_available()
 
 
 @contextmanager
@@ -90,7 +82,6 @@ def _profile_range_impl(
 
     Around one code region.
     """
-    assert torch is not None
     with ExitStack() as stack:
         if record:
             stack.enter_context(torch.profiler.record_function(debug_name))
@@ -114,9 +105,6 @@ def start_profiler(
         The started profiler, or ``None`` when no requested activity is
         available.
     """
-    # A profiler window needs torch, which spans only use when present.
-    import torch
-
     requested = {str(name) for name in activities}
     selected = []
     if "CPU" in requested:
