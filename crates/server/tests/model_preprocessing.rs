@@ -592,8 +592,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     };
 
     // The t2va presentation is the prompt tokenized without chat framing.
-    // The seed defaults to the reference's 42, and the denoiser evaluates
-    // the schedule's 49 intervals. Five seconds are 120 frames at 24 fps,
+    // The seed defaults to the reference's 42. Five seconds are 120 frames at 24 fps,
     // which extend upward to the next count of the form `17n + 5`: 124
     // frames, decoded as seven 17-frame units plus a tail.
     let accepted = prepare(serde_json::json!({})).await.unwrap();
@@ -603,7 +602,6 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     );
     let sampling = accepted.request.sampling;
     assert_eq!(sampling.seed, 42);
-    assert_eq!(sampling.num_inference_steps, 49);
     assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
     assert_eq!((sampling.width, sampling.height), (1344, 768));
     assert_eq!(accepted.duration_seconds, 5.0);
@@ -822,7 +820,8 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         .await
         .unwrap();
     assert_eq!(prepared.request.sampling.num_frames, 243);
-    assert_eq!(prepared.request.sampling.num_inference_steps, 8);
+    // The checkpoint's nine sigma points fix eight evaluations per request.
+    assert_eq!(model.video_service().unwrap().num_inference_steps(), 8);
     assert_eq!(prepared.canvas, canvas(1344, 768));
 
     // A 480 short edge names the 480p training bucket of the ratio.

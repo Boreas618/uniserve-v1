@@ -670,18 +670,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
         return self.latent_shape(modality, size)
 
-    def make_schedules(
-        self, steps: int, *, shift: float | None, device
-    ) -> Mapping[str, Schedule]:
-        if (
-            type(steps) is not int
-            or steps != self.num_steps
-            or shift is not None
-        ):
-            raise ValueError(
-                f"H3 requires {self.num_steps} evaluations with its trained "
-                "modality shifts"
-            )
+    def make_schedules(self, *, device) -> Mapping[str, Schedule]:
+        # The checkpoint's grid fixes the evaluations and the trained
+        # modality shifts.
         return schedules(self.config, device=device)
 
     def _sample_ranges(self, size: DenoiserSize) -> Mapping[str, slice]:

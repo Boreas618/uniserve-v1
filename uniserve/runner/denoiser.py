@@ -494,9 +494,7 @@ class DenoiserRunner:
         )
         self._maximum = _layout(network, maximum)
         self._context.prepare(self._maximum)
-        self._schedules = network.make_schedules(
-            network.num_steps, shift=None, device=self._device
-        )
+        self._schedules = network.make_schedules(device=self._device)
         self._modalities = tuple(network.modalities)
         self._draw_noise: Callable[..., None] = self._video_draw_noise
         self._prepare_latents: Callable[..., None] = self._video_prepare_latents

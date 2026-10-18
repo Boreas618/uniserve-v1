@@ -177,16 +177,6 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def make_schedules(
-        self, steps: int, *, shift: float | None, device: torch.device | str
-    ) -> Mapping[str, Schedule]:
-        """Construct complete schedules.
-
-        Using this network's time parameterization.
-        """
-        raise NotImplementedError
-
     def layout_size(self, size: SizeT) -> SizeT:
         """Return the smallest layout that holds ``size``.
 
@@ -309,6 +299,17 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     @property
     def num_steps(self) -> int:
         """Number of denoising steps in the network's fixed schedule."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def make_schedules(
+        self, *, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Construct each modality's fixed schedule.
+
+        The checkpoint determines the step count and the shifts, so a request
+        chooses neither.
+        """
         raise NotImplementedError
 
     @property
@@ -440,6 +441,17 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
     framing_tokens: int = 0
     image_unconditional: BranchSource = BranchSource.START
     rope_advance: int
+
+    @abstractmethod
+    def make_schedules(
+        self, steps: int, *, shift: float | None, device: torch.device | str
+    ) -> Mapping[str, Schedule]:
+        """Construct complete schedules of ``steps`` evaluations.
+
+        Using this network's time parameterization; ``None`` keeps the
+        network's default shift.
+        """
+        raise NotImplementedError
 
     @property
     def max_sequence_tokens(self) -> int:

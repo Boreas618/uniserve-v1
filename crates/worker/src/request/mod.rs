@@ -459,7 +459,6 @@ mod tests {
                 diffusion: Some(DiffusionSamplingParams {
                     num_frames: 1,
                     video_units: 1,
-                    num_inference_steps: 3,
                     seed: 0,
                     width: 16,
                     height: 16,

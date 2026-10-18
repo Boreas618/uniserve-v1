@@ -244,7 +244,6 @@ impl VideoCapacity {
             _ => 0,
         };
         Ok(MediaFacts {
-            num_steps: model.facts.num_steps,
             video_denoiser: Some(model.denoiser_info(&self.media.admitted)?),
             state_bytes: self.envelope.as_ref().map_or(0, StateEnvelope::slot_bytes)
                 + self.overlap_bytes,
