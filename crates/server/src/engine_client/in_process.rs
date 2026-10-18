@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::error::{Error, Result};
-use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily};
+use uniserve_core::{GenerationLimits, Request, RequestId, RuntimeFamily};
 use uniserve_engine::{EngineCore, EventRx, Executor, SubmitError};
 
 /// In-process engine client owned by the server layer.
@@ -235,11 +235,6 @@ impl EngineClient {
     /// reported at startup; `None` for a model without one.
     pub fn video_denoiser(&self) -> Option<uniserve_engine::VideoDenoiserInfo> {
         self.first().info().video_denoiser.clone()
-    }
-
-    /// Returns the worker's effective model dtype.
-    pub fn model_dtype(&self) -> ModelDtype {
-        self.first().model_dtype()
     }
 
     /// Returns whether the engine can accept requests: whether any replica's
