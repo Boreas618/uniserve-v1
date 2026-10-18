@@ -13,7 +13,7 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::video::plan::VisionConfig;
+use uniserve_core::video::plan::ProcessorConfig;
 use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::VideoMediaSettings;
@@ -75,7 +75,7 @@ fn video_service(
 ) -> VideoService {
     VideoService::new(
         denoiser,
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
