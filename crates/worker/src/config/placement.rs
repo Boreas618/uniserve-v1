@@ -228,7 +228,7 @@ impl CallDecl {
 pub(crate) fn host_kinds(name: &str) -> &'static [MediaCall] {
     match name {
         "media_reader" => &[MediaCall::MediaReading],
-        "video_codec" => &[MediaCall::VideoEncoding],
+        uniserve_ipc::VIDEO_CODEC_COMPONENT => &[MediaCall::VideoEncoding],
         "muxer" => &[MediaCall::AudioEncoding, MediaCall::Muxing],
         _ => &[],
     }
@@ -414,7 +414,9 @@ impl Declarations {
                         "the media reader reads one request's conditions on one rank and is not distributed".into(),
                     ));
                 }
-                if name == "video_codec" && (!temporal || placement.units_per_rank != 1) {
+                if name == uniserve_ipc::VIDEO_CODEC_COMPONENT
+                    && (!temporal || placement.units_per_rank != 1)
+                {
                     return Err(Error::Unsupported(
                         "video encoding distributes by temporal_units with one media unit per rank, each rank one codec slot".into(),
                     ));
