@@ -217,7 +217,7 @@ impl InputProcessor {
         // Canvases occupy whole blocks of positions after the prompt, so the
         // reply may use only the whole canvases that fit the context.
         let prompt_len = u32::try_from(expanded.len()).unwrap_or(u32::MAX);
-        let max_model_len = self.config.max_model_tokens();
+        let max_model_len = self.config.max_model_len;
         let canvas = profile.canvas_length;
         let room = max_model_len.saturating_sub(prompt_len) / canvas * canvas;
         if room == 0 {
@@ -345,7 +345,7 @@ mod tests {
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
             sampling_defaults: SamplingDefaults::default(),
-            max_model_tokens: Some(4096),
+            max_model_len: 4096,
             primary_eos_token_id: None,
             eos_token_ids: BTreeSet::new(),
         };
@@ -353,7 +353,6 @@ mod tests {
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
         let mut config = EngineConfig::sim("sim-model");
-        config.runtime_family = model.runtime_family();
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
         let client = Arc::new(
             EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))
@@ -372,7 +371,6 @@ mod tests {
             ),
             crate::serving::WorkerCapabilities {
                 limits: client.generation_limits(),
-                max_model_tokens: 4096,
             },
             None,
             false,

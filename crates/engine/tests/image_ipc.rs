@@ -196,7 +196,7 @@ fn run(engine: &EngineCore, request: GenerationRequest) -> anyhow::Result<Outcom
         .enable_time()
         .build()?;
     let id = request.request_id;
-    let mut events = engine.submit(Request::Umm(request))?;
+    let mut events = engine.submit(Request::from(request))?;
     let mut outcome = Outcome::default();
     loop {
         let event = runtime
