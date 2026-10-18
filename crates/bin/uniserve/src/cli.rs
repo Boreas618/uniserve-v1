@@ -316,6 +316,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// `0` disables graceful drain (terminate immediately).
     #[arg(long, default_value_t = 30)]
     pub shutdown_timeout: u64,
+    /// Seconds a submitted batch may run without any rank making progress
+    /// before the worker group is treated as hung and replaced, failing its
+    /// requests. A rank that exits is detected at once; this bounds one that
+    /// is alive but stuck, and a rank reports a lane stalled after half of
+    /// it. A batch that legitimately runs longer, such as the first
+    /// evaluation of a layout prepared on arrival, needs a larger value.
+    #[arg(long = "watchdog-timeout", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    pub watchdog_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
     /// for the specified model.
@@ -479,6 +487,7 @@ impl SharedRuntimeArgs {
         worker_process.base_model = self.base_model.clone();
         let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
+        worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
         worker_process.max_message_bytes = self.max_message_bytes;
         worker_process.cache_token_capacity = self.cache_token_capacity;
         worker_process.block_size = self.block_size;

@@ -103,7 +103,7 @@ impl Default for WorkerProcessArgs {
             worker_id: "worker".into(),
             python: Self::default_python(),
             launcher_timeout: std::time::Duration::from_secs(120),
-            result_deadline: std::time::Duration::from_secs(300),
+            watchdog_timeout: std::time::Duration::from_secs(300),
             model: String::new(),
             base_model: None,
             ranks: vec![crate::WorkerRank {
@@ -259,8 +259,9 @@ impl WorkerProcessArgs {
             products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
             queue_depth: depth,
             ipc_payload_cap: max_payload,
-            // Half the group's deadline: see `WorkerProcessArgs::result_deadline`.
-            stall_bound_ms: u64::try_from((self.result_deadline / 2).as_millis())
+            // The rank reports a stalled lane after half of it: see
+            // `WorkerProcessArgs::watchdog_timeout`.
+            watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
             base_model: self.base_model.as_deref().map(path),

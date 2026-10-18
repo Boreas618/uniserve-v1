@@ -390,10 +390,13 @@ pub struct LaunchDescriptor {
     /// Largest encoded message in bytes, in either direction. The rank sizes
     /// the storage it stages a batch's inputs in from it.
     pub ipc_payload_cap: usize,
-    /// How long, in milliseconds, one job may run on a lane before the
-    /// rank reports the lane stalled
-    /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)); positive.
-    pub stall_bound_ms: u64,
+    /// The head's watchdog timeout in milliseconds (`--watchdog-timeout`):
+    /// how long a batch may go without progress of the group's ranks before
+    /// the head replaces them. The rank reports a lane stalled
+    /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)) once one job has
+    /// run on it for half of it, so the report precedes the head's expiry;
+    /// at least two.
+    pub watchdog_timeout_ms: u64,
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
