@@ -6,7 +6,7 @@ use uniserve_ipc::Locator;
 
 use super::transport::{Staged, Transport, TransportKind, Transports};
 use super::vmm::Exported;
-use super::{Retirement, Spans};
+use super::{ByteReservation, Retirement, Spans};
 use crate::ffi::MemoryKind;
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -18,6 +18,11 @@ pub type Location = (Arc<Transport>, Locator);
 /// consumers: local plus CUDA VMM for device memory when the rank exports
 /// over VMM (unless `host` forces host mechanisms), otherwise local, shared
 /// memory and the rank channel.
+///
+/// The export reserves its bytes from the rank's transfer budget once,
+/// whatever number of mechanisms publish it: they are locations of one
+/// product, which the rank's budget counts once (`ArenaCapacity`). Each
+/// mechanism's backing holds a share until it retires.
 ///
 /// `consumers` are the acknowledgment slots of the other ranks that read the
 /// export. This rank reads its own exports through the local mechanism, which
@@ -66,6 +71,7 @@ pub fn export(
         .cloned()
         .collect();
 
+    let bytes = ByteReservation::new(transports.capacity(), source.nbytes())?;
     let mut locations = Vec::new();
     let mut staged = Vec::new();
     // One attempt: a mechanism that fails gives its storage back, and the
@@ -73,7 +79,7 @@ pub fn export(
     // work a failed export recorded.
     let result = stream.attempt(|| -> Result<()> {
         for transport in selected {
-            match transport.export(source, offset, consumers, stream)? {
+            match transport.export(source, offset, consumers, bytes.share(), stream)? {
                 Exported::Located(locator) => {
                     accept(&transport, *locator, &mut retain, &mut locations)?;
                 }
@@ -88,7 +94,7 @@ pub fn export(
                         if !fallback.serves(consumers) {
                             continue;
                         }
-                        match fallback.export(source, offset, consumers, stream)? {
+                        match fallback.export(source, offset, consumers, bytes.share(), stream)? {
                             Exported::Located(locator) => {
                                 accept(fallback, *locator, &mut retain, &mut locations)?;
                                 carried = true;
@@ -256,6 +262,72 @@ mod tests {
                 vmm_pool_bytes: 1 << 20,
             },
         )
+    }
+
+    /// A product published through several mechanisms holds its bytes of
+    /// the rank's transfer budget once: a budget of exactly one product
+    /// publishes it locally and over shared memory to a same-host reader,
+    /// and refuses a second product while the first is held.
+    #[test]
+    fn an_export_through_several_mechanisms_holds_its_bytes_once() -> Result<()> {
+        let capacity = Arc::new(TransferCapacity::new(64, 8)?);
+        let transports = Transports::new(
+            &[TransportKind::Local, TransportKind::PosixShm],
+            Arc::clone(&capacity),
+            EventPool::new(),
+            &TransportOptions {
+                source: WorkerEndpoint {
+                    worker_id: "worker".into(),
+                    rank: 0,
+                    node: "node".into(),
+                    address_space: "space".into(),
+                    incarnation: "incarnation".into(),
+                },
+                acknowledgment_slot: 0,
+                host_slots: HashSet::from([0, 1]),
+                cross_host_consumers: false,
+                vmm_pool_bytes: 1 << 20,
+            },
+        )?;
+        let product = || {
+            Spans::single(StorageView::contiguous(
+                Memory::host(64) as Arc<dyn Backing>,
+                0,
+                DType::F32,
+                &[16],
+            )?)
+        };
+
+        let first = export(
+            &transports,
+            &product()?,
+            None,
+            &[1],
+            false,
+            None,
+            |_| Ok(()),
+        )?;
+        let locations = first.locate(|_| Ok(()))?;
+        let kinds: Vec<_> = locations
+            .iter()
+            .map(|(transport, _)| transport.kind())
+            .collect();
+        assert_eq!(kinds, [TransportKind::Local, TransportKind::PosixShm]);
+        assert_eq!(capacity.used(), 64);
+
+        assert!(matches!(
+            export(
+                &transports,
+                &product()?,
+                None,
+                &[1],
+                false,
+                None,
+                |_| Ok(())
+            ),
+            Err(Error::Resource(_))
+        ));
+        release(&locations)
     }
 
     /// A same-host reader waits on a CUDA VMM export through the handle of

@@ -330,17 +330,23 @@ fn fetches_cover_regions_from_shards_and_reject_missing_coverage() -> Result<()>
 
 #[test]
 fn a_failed_export_revokes_every_accepted_location() -> Result<()> {
-    // Room for one export only: the second mechanism's reservation fails.
+    // The storage owner retains the first mechanism's location and refuses
+    // the second's, which fails the export after one location was accepted.
     let (transports, capacity) =
-        host_transports(&[TransportKind::Local, TransportKind::PosixShm], 24)?;
+        host_transports(&[TransportKind::Local, TransportKind::PosixShm], 1 << 12)?;
     let source = counting(&[2, 3])?;
     let accepted = AtomicUsize::new(0);
     let result = located(&transports, &source, None, &[0], None, |_| {
-        accepted.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        if accepted.fetch_add(1, Ordering::Relaxed) == 0 {
+            Ok(())
+        } else {
+            Err(Error::Resource(
+                "the storage owner retains no second location",
+            ))
+        }
     });
     assert!(result.is_err());
-    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
     while capacity.used() != 0 {
         transports.reap()?;
         std::thread::yield_now();
