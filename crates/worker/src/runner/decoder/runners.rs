@@ -158,7 +158,7 @@ impl DecoderRunners {
                     while cursor < total {
                         let count = width.min(total - cursor);
                         let round = (canvas, cursor == 0, cursor + count == total, count);
-                        let run = decoder.units(rank, cursor, count)?;
+                        let run = decoder.units(&[], rank, cursor, count)?;
                         if warmed.insert(round) && !run.is_empty() {
                             let unit = run.start;
                             let shape = UnitShape {
@@ -205,7 +205,7 @@ impl DecoderRunners {
                 let layout =
                     model.layout_size(&VideoSize::plain(frames, canvas, plan.max_text_tokens))?;
                 let rows = model.latent_shape("audio", &layout)?[0];
-                let run = audio.units(rank, 0, total)?;
+                let run = audio.units(&[], rank, 0, total)?;
                 if !run.is_empty() {
                     let spans = model.audio_units(samples, total)?;
                     let units = TrackUnits {

@@ -817,7 +817,7 @@ fn condition_input(
                 ));
             }
             let round = &all[cursor..cursor + count];
-            let run = latent.units(parts.rank, 0, count as u32)?;
+            let run = latent.units(&range.ranks, parts.rank, 0, count as u32)?;
             if run.is_empty() {
                 return Err(Error::Invalid(
                     "condition encoding assigns this rank no unit".into(),
@@ -862,8 +862,9 @@ fn condition_input(
             }))
         }
         "condition_audio_latents" => {
-            // The audio call is one unit, the component's first rank's.
-            if latent.units(parts.rank, 0, 1)?.is_empty() {
+            // The audio call is one unit, the first of its dealt ranks'.
+            let range = decode_range(plan, call)?;
+            if latent.units(&range.ranks, parts.rank, 0, 1)?.is_empty() {
                 return Ok(None);
             }
             let lengths: Vec<u64> = conditions
