@@ -41,7 +41,7 @@ pub use service::{ProcessedVideo, VideoService};
 
 use uniserve_core::VideoTask;
 use uniserve_core::video::plan::{
-    self, ConditionSpec, PlanLimits, RequestPlan, Target, VideoInputError, VisionConfig,
+    self, ConditionSpec, PlanLimits, ProcessorConfig, RequestPlan, Target, VideoInputError,
 };
 use uniserve_core::video::presentation::{self, Presentation};
 
@@ -107,7 +107,7 @@ pub struct ProcessedVideoRequest {
 pub struct VideoProcessor {
     fetcher: MediaFetcher,
     prober: MediaProber,
-    vision: VisionConfig,
+    vision: ProcessorConfig,
     limits: PlanLimits,
     tokenizer: DynTokenizer,
 }
@@ -118,7 +118,7 @@ impl VideoProcessor {
     pub fn new(
         fetcher: MediaFetcher,
         prober: MediaProber,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         limits: PlanLimits,
         tokenizer: DynTokenizer,
     ) -> Self {
@@ -203,8 +203,8 @@ pub(super) mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_core::VideoTask;
     use uniserve_core::video::plan::{
-        ConditionSpec, ConditionType, PlanLimits, Prepared, RequestField, Role, Target,
-        VideoInputError, VisionConfig,
+        ConditionSpec, ConditionType, PlanLimits, Prepared, ProcessorConfig, RequestField, Role,
+        Target, VideoInputError,
     };
     use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
 
@@ -225,7 +225,7 @@ pub(super) mod tests {
     }
 
     /// The MiniMax-H3 checkpoint's vision processor geometry.
-    pub(in crate::serving::video) fn vision() -> VisionConfig {
+    pub(in crate::serving::video) fn vision() -> ProcessorConfig {
         serde_json::from_value(fixture()["vision"].clone()).unwrap()
     }
 

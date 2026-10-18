@@ -25,7 +25,7 @@ use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, VisionConfig};
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig};
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -101,7 +101,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             canvases: Vec::new(),
             max_sequence_rows: None,
         },
-        VisionConfig {
+        ProcessorConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,

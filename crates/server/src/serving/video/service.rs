@@ -20,7 +20,7 @@ use uniserve_core::video::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
     MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
-    ReferenceConfig, Target, VIDEO_FPS, VisionConfig,
+    ProcessorConfig, ReferenceConfig, Target, VIDEO_FPS,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -77,7 +77,7 @@ impl VideoService {
     /// the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
-        vision: VisionConfig,
+        vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,

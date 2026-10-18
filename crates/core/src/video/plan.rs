@@ -265,9 +265,9 @@ pub enum RuleError {
     VideoCanvas(CanvasError),
 }
 
-/// A checkpoint's processor configs that [`VisionConfig::read`] cannot use.
+/// A checkpoint's processor configs that [`ProcessorConfig::read`] cannot use.
 #[derive(Debug, thiserror::Error)]
-pub enum VisionConfigError {
+pub enum ProcessorConfigError {
     /// A config file could not be read.
     #[error("reading {}", path.display())]
     Read {
@@ -774,10 +774,13 @@ impl PlanLimits {
 
 /// The Qwen3-VL processor geometry: patching and pixel budgets.
 ///
-/// Read from the checkpoint's `processor/preprocessor_config.json` and
-/// `processor/video_preprocessor_config.json` with [`VisionConfig::read`].
+/// It is the image and video processors' configuration, as transformers and
+/// SGLang name it (their `VisionConfig` is the vision tower's model
+/// configuration). Read from the checkpoint's
+/// `processor/preprocessor_config.json` and
+/// `processor/video_preprocessor_config.json` with [`ProcessorConfig::read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisionConfig {
+pub struct ProcessorConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
     /// Frames merged into one temporal patch.
@@ -808,22 +811,23 @@ struct ProcessorSize {
     longest_edge: u64,
 }
 
-impl VisionConfig {
+impl ProcessorConfig {
     /// Reads a checkpoint's image processor config
     /// (`processor/preprocessor_config.json`) and video processor config
     /// (`processor/video_preprocessor_config.json`).
     ///
     /// # Errors
     ///
-    /// Returns [`VisionConfigError`] when a file cannot be read or parsed, or
+    /// Returns [`ProcessorConfigError`] when a file cannot be read or parsed, or
     /// when the two configs disagree on the patch geometry.
-    pub fn read(image: &Path, video: &Path) -> Result<Self, VisionConfigError> {
-        let read = |path: &Path| -> Result<ProcessorFile, VisionConfigError> {
-            let text = std::fs::read_to_string(path).map_err(|source| VisionConfigError::Read {
-                path: path.to_owned(),
-                source,
-            })?;
-            serde_json::from_str(&text).map_err(|source| VisionConfigError::Parse {
+    pub fn read(image: &Path, video: &Path) -> Result<Self, ProcessorConfigError> {
+        let read = |path: &Path| -> Result<ProcessorFile, ProcessorConfigError> {
+            let text =
+                std::fs::read_to_string(path).map_err(|source| ProcessorConfigError::Read {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            serde_json::from_str(&text).map_err(|source| ProcessorConfigError::Parse {
                 path: path.to_owned(),
                 source,
             })
@@ -833,7 +837,7 @@ impl VisionConfig {
         let geometry =
             |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
         if geometry(&image) != geometry(&video) {
-            return Err(VisionConfigError::Geometry);
+            return Err(ProcessorConfigError::Geometry);
         }
         Ok(Self {
             patch_size: image.patch_size,
@@ -1453,12 +1457,12 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// Returns [`RuleError::VideoCanvas`] when the display aspect lies outside
 /// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than 22 frames
 /// remain after the offset, and the errors of [`audio_clip`],
-/// [`sample_video_frames`] and [`VisionConfig::video_grid`].
+/// [`sample_video_frames`] and [`ProcessorConfig::video_grid`].
 pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), RuleError> {
     // Display sizes stay far below 2^53, so the conversions are exact.
@@ -1989,7 +1993,7 @@ fn plan_keyframe(
     size: Canvas,
     order: usize,
     task: VideoTask,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
     let position = if condition.frame_index == Some(0) {
         FramePosition::First
@@ -2026,7 +2030,7 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
     let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
@@ -2080,7 +2084,7 @@ pub fn plan_request(
     target: &Target<'_>,
     conditions: &[ConditionSpec],
     media: &[MediaFacts],
-    vision: &VisionConfig,
+    vision: &ProcessorConfig,
     limits: &PlanLimits,
 ) -> Result<RequestPlan, VideoInputError> {
     if media.len() != conditions.len() {
@@ -2144,12 +2148,12 @@ pub(super) mod tests {
     use super::{
         AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
         ConditionType, FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO,
-        MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared,
+        MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared, ProcessorConfig,
         REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig, RequestField, RequestPlan, Role, Target,
-        VideoFacts, VideoInputError, VideoTask, Vision, VisionConfig, audio_clip, bucket,
-        bucket_short_edge, canvas, check_request, cover_crop, gcd, latent_frames, plan_request,
-        reference_bounds, reference_image_size, requested_frames, rows_per_frame, rule_canvases,
-        video_frame_count, video_reference,
+        VideoFacts, VideoInputError, VideoTask, Vision, audio_clip, bucket, bucket_short_edge,
+        canvas, check_request, cover_crop, gcd, latent_frames, plan_request, reference_bounds,
+        reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
+        video_reference,
     };
     use crate::MediaLocator;
 
@@ -2161,8 +2165,8 @@ pub(super) mod tests {
         .unwrap()
     }
 
-    pub(in crate::video) fn vision(fixture: &Value) -> VisionConfig {
-        VisionConfig::deserialize(&fixture["vision"]).unwrap()
+    pub(in crate::video) fn vision(fixture: &Value) -> ProcessorConfig {
+        ProcessorConfig::deserialize(&fixture["vision"]).unwrap()
     }
 
     /// Limits that serve every task, duration and canvas the model does.
@@ -2277,7 +2281,7 @@ pub(super) mod tests {
         /// server applies them before fetching media.
         pub(in crate::video) fn plan(
             &self,
-            vision: &VisionConfig,
+            vision: &ProcessorConfig,
         ) -> Result<RequestPlan, VideoInputError> {
             check_request(self.task, &self.target(), &self.conditions, &limits())?;
             plan_request(
