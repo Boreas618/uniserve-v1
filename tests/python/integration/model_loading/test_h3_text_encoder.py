@@ -40,7 +40,7 @@ from uniserve import loading
 from uniserve.bindings.context import ExecutionContext
 from uniserve.loading import checkpoint, weights
 from uniserve.models import TextSize, VisionInput, qwen3_vl
-from uniserve.models.minimax_h3.config import TEXT_FIELDS
+from uniserve.models.minimax_h3.config import read_config
 from uniserve.models.minimax_h3.encoder import TextEncoder, TextEncoderConfig
 
 pytestmark = [
@@ -229,15 +229,7 @@ def reference(processor, cases):
 
 
 def _encoder_config(root: Path) -> TextEncoderConfig:
-    metadata = json.loads((root / "config.json").read_text())
-    text = metadata["text_config"]
-    return TextEncoderConfig(
-        **{target: text[source] for source, target in TEXT_FIELDS.items()},
-        mrope_sections=tuple(text["rope_scaling"]["mrope_section"]),
-        image_token_id=metadata["image_token_id"],
-        video_token_id=metadata["video_token_id"],
-        vision=qwen3_vl.read_vision_config(metadata["vision_config"]),
-    )
+    return read_config(root.parent, loading.Config(), sources={}).text_encoder
 
 
 @pytest.fixture(scope="module")
