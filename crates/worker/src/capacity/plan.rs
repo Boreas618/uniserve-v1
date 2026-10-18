@@ -253,6 +253,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         encoder_entry_bytes: 0,
         max_unresolved_calls: 0,
         host_lane_capacity: 1,
+        transfer_tickets: 1,
         image_warmups: Vec::new(),
         diffusion_lm_step_rows: 0,
     })
@@ -319,6 +320,7 @@ impl TokenLayout {
             info.buffer_pool_bytes + arena.deferred_device_bytes() + latent_bytes,
         );
         info.host_lane_capacity = narrow(arena.host_lane_inflight, "host lane capacity")?;
+        info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
         Ok(Self {
             info,
             arena,
@@ -454,6 +456,7 @@ pub(crate) fn request_layout(
     } else {
         narrow(arena.host_lane_inflight, "host lane capacity")?
     };
+    info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
     let mut plan = Plan {
         info,
         arena,
