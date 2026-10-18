@@ -847,6 +847,8 @@ class ExecutionContext:
                     self._bind_matmul(
                         MatmulBinding, child, dtype, max_rows, merged
                     )
+                if merged and child.exchange is not None:
+                    self._bind_exchange(child, device, dtype, max_rows)
                 if isinstance(child, ColumnParallelLinear):
                     self._bind_gather(child, device, max_rows)
                 if isinstance(child, FusedMoE):
@@ -929,6 +931,45 @@ class ExecutionContext:
         )
         if capacity:
             with pool.borrow(capacity, device):
+                pass
+
+    def _bind_exchange(self, layer, device, dtype, rows) -> None:
+        """Reserve an exchanged projection's step backing for ``rows`` tokens.
+
+        An exchange projects each step's rows for every member's heads into
+        backing that stays readable until the step's transfer is joined: one
+        step slot when the whole shard is one step, two when a transfer
+        overlaps the next step, and for encoded inputs a whole-weight
+        projection region per slot before its member split. The backing
+        comes from the exchange group's gather pool, so captured graphs
+        allocate nothing per step.
+        """
+        exchange = layer.exchange
+        group = exchange.group
+        amount = None
+        if rows is not None:
+            capacity = -(-rows // group.size)
+            step = (
+                capacity
+                if exchange.rows is None
+                else min(exchange.rows, capacity)
+            )
+            branches = tuple(layer.projections.values())
+            width = sum(int(branch.weight.shape[0]) for branch in branches)
+            encoded = any(
+                branch.input_quantizer is not None for branch in branches
+            )
+            slots = 1 if exchange.rows is None else 2
+            amount = slots * (1 + encoded) * step * width * dtype.itemsize
+        pool = self._gather_pools.get(group)
+        if pool is None:
+            pool = GatherPool(group)
+            self._gather_pools[group] = pool
+        self._chunks[id(layer)] = functools.partial(
+            pool.borrow, capacity=amount
+        )
+        if amount:
+            with pool.borrow(amount, device):
                 pass
 
     def _bind_attention(self, factory, layer, device, dtype, size) -> None:

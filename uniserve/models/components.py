@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from importlib import import_module
-from typing import Any
+from typing import Any, Literal, cast
 
 import torch
 from torch import nn
@@ -157,13 +157,26 @@ def placements(value: Mapping[str, Any]) -> dict[str, Placement]:
     }
 
 
-def attention_parallel(sequence: str) -> AttentionParallelConfig:
+def attention_parallel(
+    sequence: str,
+    projection: str = "gather",
+    projection_rows: int | None = None,
+) -> AttentionParallelConfig:
     """Translate a sequence-parallel kind into attention partition axes.
 
     ``ulysses`` and ``hybrid`` partition attention heads; ``allgather`` and
-    ``hybrid`` gather the context partition over the ``cp`` axis.
+    ``hybrid`` gather the context partition over the ``cp`` axis. A
+    ``ulysses`` placement also carries its head projection mode and step
+    (``Ulysses.projection``, ``Ulysses.projection_rows``); the launch
+    refuses them on the other kinds, and the axes do not depend on them.
     """
-    heads = Ulysses() if sequence in {"ulysses", "hybrid"} else None
+    # Ulysses refuses a mode other than gather and exchange.
+    mode = cast(Literal["gather", "exchange"], projection)
+    heads = (
+        Ulysses(projection=mode, projection_rows=projection_rows)
+        if sequence in {"ulysses", "hybrid"}
+        else None
+    )
     context = (
         ContextParallelConfig(gather_axis="cp")
         if sequence in {"allgather", "hybrid"}

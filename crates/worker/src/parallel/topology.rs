@@ -350,7 +350,11 @@ mod tests {
             vec![0, 1, 2, 3],
             ParallelConfig {
                 tensor_parallel_size: 2,
-                sequence_parallel: SequenceParallel::Ulysses { ulysses_degree: 2 },
+                sequence_parallel: SequenceParallel::Ulysses {
+                    ulysses_degree: 2,
+                    projection: Default::default(),
+                    projection_rows: None,
+                },
                 ..ParallelConfig::default()
             },
         );
