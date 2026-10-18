@@ -21,6 +21,7 @@ from ._activation import (
     value_first_swiglu_fp8,
 )
 from ._attention import attention
+from ._bias import bias_add
 from ._frame import frame_norm_pad, frame_pad, load_frame_kernels
 from ._linear import linear, merged_linear
 from ._moe import Routes, fused_moe, topk_softmax
@@ -52,6 +53,7 @@ __all__ = [
     "add_rms_norm",
     "apply_rotary",
     "attention",
+    "bias_add",
     "calibrated_nvfp4",
     "frame_norm_pad",
     "frame_pad",
