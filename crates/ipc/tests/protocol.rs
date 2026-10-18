@@ -1553,7 +1553,11 @@ fn worker_info_round_trips() {
     use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
     let strategies = [
         SequenceParallel::Local,
-        SequenceParallel::Ulysses { ulysses_degree: 2 },
+        SequenceParallel::Ulysses {
+            ulysses_degree: 2,
+            projection: Default::default(),
+            projection_rows: None,
+        },
         SequenceParallel::Allgather {
             allgather_degree: 2,
         },

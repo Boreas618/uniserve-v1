@@ -26,6 +26,21 @@ const fn one() -> usize {
     1
 }
 
+/// How a Ulysses component's merged head projections reach each member's
+/// heads. Both produce the same values; the library's
+/// `uniserve.nn.attention.Ulysses` implements them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadProjection {
+    /// Every member gathers all members' input rows and projects its own
+    /// head shard with head-partitioned weights.
+    #[default]
+    Gather,
+    /// Every member projects its own rows for all heads with whole weights
+    /// and sends each member that member's head shard.
+    Exchange,
+}
+
 /// One mutually exclusive sequence attention strategy.
 ///
 /// Serialized with a `kind` tag (`local`, `ulysses`, `allgather`, `hybrid`);
@@ -40,6 +55,13 @@ pub enum SequenceParallel {
     Ulysses {
         #[serde(default = "one")]
         ulysses_degree: usize,
+        /// Head projection mode; an omitted mode gathers.
+        #[serde(default)]
+        projection: HeadProjection,
+        /// Rows each member projects and sends per overlapped exchange step;
+        /// absent, the whole shard is exchanged once. Exchange only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projection_rows: Option<usize>,
     },
     /// Context parallelism that gathers every context partition's keys and
     /// values onto each of `allgather_degree` ranks.
@@ -62,7 +84,7 @@ impl SequenceParallel {
     pub fn dimensions(&self) -> [(&'static str, usize); 2] {
         let (context, ulysses) = match *self {
             Self::Local => (1, 1),
-            Self::Ulysses { ulysses_degree } => (1, ulysses_degree),
+            Self::Ulysses { ulysses_degree, .. } => (1, ulysses_degree),
             Self::Allgather { allgather_degree } => (allgather_degree, 1),
             Self::Hybrid {
                 ulysses_degree,
@@ -76,12 +98,24 @@ impl SequenceParallel {
     ///
     /// # Errors
     ///
-    /// Returns [`ParallelConfigError`] when a degree is zero or the product
-    /// overflows.
+    /// Returns [`ParallelConfigError`] when a degree is zero, the product
+    /// overflows, or a Ulysses projection step is zero or steps a gathered
+    /// projection.
     pub fn size(&self) -> Result<usize, ParallelConfigError> {
+        if let Self::Ulysses {
+            projection,
+            projection_rows: Some(rows),
+            ..
+        } = *self
+            && (rows == 0 || projection != HeadProjection::Exchange)
+        {
+            return Err(ParallelConfigError(
+                "projection_rows is a positive step of an exchange projection",
+            ));
+        }
         let degrees = match *self {
             Self::Local => vec![1],
-            Self::Ulysses { ulysses_degree } => vec![ulysses_degree],
+            Self::Ulysses { ulysses_degree, .. } => vec![ulysses_degree],
             Self::Allgather { allgather_degree } => vec![allgather_degree],
             Self::Hybrid {
                 ulysses_degree,
@@ -303,7 +337,11 @@ mod tests {
                 },
             )
         };
-        let ulysses = |ulysses_degree| SequenceParallel::Ulysses { ulysses_degree };
+        let ulysses = |ulysses_degree| SequenceParallel::Ulysses {
+            ulysses_degree,
+            projection: HeadProjection::Gather,
+            projection_rows: None,
+        };
 
         assert!(component(1, 1, ulysses(4)).publishes_on_every_rank());
         assert!(!component(4, 1, SequenceParallel::Local).publishes_on_every_rank());
@@ -326,5 +364,38 @@ mod tests {
             serde_json::from_str::<ComponentConfig>(r#"{"ranks": [0], "weights": "disk"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ulysses_selects_its_head_projection() {
+        let parse = |text: &str| serde_json::from_str::<SequenceParallel>(text);
+
+        let gathered = parse(r#"{"kind": "ulysses", "ulysses_degree": 8}"#).unwrap();
+        assert_eq!(
+            gathered,
+            SequenceParallel::Ulysses {
+                ulysses_degree: 8,
+                projection: HeadProjection::Gather,
+                projection_rows: None,
+            }
+        );
+
+        let stepped = parse(
+            r#"{"kind": "ulysses", "ulysses_degree": 8, "projection": "exchange", "projection_rows": 4096}"#,
+        )
+        .unwrap();
+        assert_eq!(stepped.size().unwrap(), 8);
+        let text = serde_json::to_string(&stepped).unwrap();
+        assert_eq!(parse(&text).unwrap(), stepped);
+
+        for invalid in [
+            r#"{"kind": "ulysses", "projection": "exchange", "projection_rows": 0}"#,
+            r#"{"kind": "ulysses", "projection_rows": 4096}"#,
+        ] {
+            assert!(parse(invalid).unwrap().size().is_err());
+        }
+        assert!(parse(r#"{"kind": "ulysses", "projection": "scatter"}"#).is_err());
+        assert!(parse(r#"{"kind": "hybrid", "projection": "exchange"}"#).is_err());
+        assert!(parse(r#"{"kind": "allgather", "projection": "gather"}"#).is_err());
     }
 }

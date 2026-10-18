@@ -59,7 +59,7 @@ fn call(function: &tvm_ffi::Function, args: &[Any]) -> Any {
 
 #[test]
 #[ignore = "needs two CUDA devices"]
-fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
+fn ranks_reduce_gather_broadcast_and_exchange_on_their_binding_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let mut listener = Some(listener);
@@ -129,19 +129,49 @@ fn ranks_reduce_gather_and_broadcast_on_their_binding_stream() {
                     );
                     let broadcast = download(&broadcast, &stream);
 
+                    // Asynchronous grouped exchange with the other member on
+                    // the transfer fork, joined on the binding stream.
+                    let sent = upload(&[rank as f32 + 7.0; 2], device, &stream);
+                    let received = upload(&[0.0; 2], device, &stream);
+                    let peer = 1 - rank as i64;
+                    let values: tvm_ffi::Array<Any> = [
+                        Any::from(sent.to_tensor().unwrap()),
+                        Any::from(received.to_tensor().unwrap()),
+                    ]
+                    .into_iter()
+                    .collect();
+                    let integers = |values: [i64; 2]| -> tvm_ffi::Array<Any> {
+                        values.into_iter().map(Any::from).collect()
+                    };
+                    let token = call(
+                        &functions.start_exchange,
+                        &[
+                            Any::from(values),
+                            Any::from(integers([peer, peer])),
+                            Any::from(integers([1, 0])),
+                        ],
+                    );
+                    call(
+                        &functions.wait,
+                        &[token, Any::from(stream.handle().unwrap() as i64)],
+                    );
+                    let exchanged = download(&received, &stream);
+
                     collectives.close(false).unwrap();
-                    (reduced, gathered, started, broadcast)
+                    (reduced, gathered, started, broadcast, exchanged)
                 })
             })
             .collect();
-        for rank in ranks {
-            let (reduced, gathered, started, broadcast) = rank.join().unwrap();
+        for (index, rank) in ranks.into_iter().enumerate() {
+            let (reduced, gathered, started, broadcast, exchanged) = rank.join().unwrap();
             assert_eq!(reduced, [3.0, 30.0]);
             // Backend order is ascending world rank.
             assert_eq!(gathered, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
             assert_eq!(started, gathered);
             // The root names a world rank.
             assert_eq!(broadcast, [6.0]);
+            // Each member received the other member's values.
+            assert_eq!(exchanged, [(1 - index) as f32 + 7.0; 2]);
         }
     });
 }

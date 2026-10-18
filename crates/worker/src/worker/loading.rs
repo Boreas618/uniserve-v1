@@ -102,6 +102,9 @@ pub(crate) struct ComponentMesh {
     pub(crate) units: Option<Handle>,
     /// The sequence-parallel kind of the placement.
     pub(crate) sequence: &'static str,
+    /// The Ulysses head projection mode (`gather` or `exchange`) and its
+    /// exchange step in rows; other kinds gather.
+    pub(crate) projection: (&'static str, Option<usize>),
 }
 
 /// The expert-parallel union a model partitions its routed experts over.
@@ -196,6 +199,12 @@ impl LoadedModel {
                     mesh.units.as_ref().map(Handle::to_any).unwrap_or_default()
                 }))),
                 Any::from(strings(meshes.iter().map(|mesh| mesh.sequence))),
+                Any::from(strings(meshes.iter().map(|mesh| mesh.projection.0))),
+                Any::from(list(
+                    meshes
+                        .iter()
+                        .map(|mesh| optional(mesh.projection.1.map(|rows| rows as i64))),
+                )),
                 world,
                 Any::from(attention_ranks),
                 Any::from(expert_dedicated),
@@ -243,6 +252,27 @@ impl LoadedModel {
         let value = Interpreter::import(&format!("{LOADING}.{function}"))?
             .call_values(&[self.handle.to_any()])?;
         texts(value).map_err(|error| Error::numerical(function, &error))
+    }
+}
+
+/// The Ulysses head projection of a placement: its mode name and exchange
+/// step in rows. Kinds other than `ulysses` gather.
+pub(crate) fn head_projection(
+    placement: &uniserve_core::ComponentConfig,
+) -> (&'static str, Option<usize>) {
+    match placement.parallel_config.sequence_parallel {
+        uniserve_core::SequenceParallel::Ulysses {
+            projection,
+            projection_rows,
+            ..
+        } => (
+            match projection {
+                uniserve_core::HeadProjection::Gather => "gather",
+                uniserve_core::HeadProjection::Exchange => "exchange",
+            },
+            projection_rows,
+        ),
+        _ => ("gather", None),
     }
 }
 

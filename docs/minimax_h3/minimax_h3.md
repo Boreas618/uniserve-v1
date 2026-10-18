@@ -122,6 +122,12 @@ The deployment files are in `configs/minimax_h3/`; the `fasth3-` files place Fas
 
 A component placed with `"weights": "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.json` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--graph-policy off`.
 
+A Ulysses denoiser's `sequence_parallel` object also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `"projection": "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `"projection": "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `"projection_rows": <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset, and none applies to the `hybrid` and `allgather` kinds:
+
+```json
+"sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8, "projection": "exchange", "projection_rows": 4096 }
+```
+
 One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
