@@ -233,7 +233,7 @@ fn borrow_unit(
     let transport = parts
         .storage
         .transports
-        .get(TransportKind::Shm)
+        .get(TransportKind::PosixShm)
         .ok_or_else(|| Error::Invalid("video encoding requires local shared storage".into()))?;
     let location = tensor
         .locations
@@ -425,7 +425,7 @@ fn read_rows(parts: &Parts<'_>, plan: &BatchPlan, product: &TensorRef) -> Result
             TransferTransport::PosixShm { .. }
                 if location.source.node == parts.info.endpoint.node =>
             {
-                let Some(transport) = parts.storage.transports.get(TransportKind::Shm) else {
+                let Some(transport) = parts.storage.transports.get(TransportKind::PosixShm) else {
                     continue;
                 };
                 let mut read = transport.borrow(location, None)?;

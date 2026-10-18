@@ -527,7 +527,7 @@ fn the_encoder_cache_holds_the_launched_entry_count() {
 fn channel_and_transfer_values_are_checked() {
     assert!(launch_error(json!({"queue_depth": 0})).contains("--queue-depth must be positive"));
     assert!(launch_error(json!({"transfer_backends": "local,local"})).contains("unique"));
-    assert!(launch_error(json!({"export_backends": "shm"})).contains("bound transports"));
+    assert!(launch_error(json!({"export_backends": "posix_shm"})).contains("bound transports"));
     assert!(
         launch_error(json!({"transfer_backends": "local,cuda_vmm", "export_backends": "local"}))
             .contains("CUDA VMM")
