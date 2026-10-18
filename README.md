@@ -121,8 +121,8 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--block-size` | Chosen by the worker | Tokens per KV block of the widest cache group, supported by every cache group's attention readers |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a request with an input image whose vision feature block holds more tokens is refused |
-| `--chunked-prefill-size` | `8192` | Per-request prefill bound |
+| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a request with an input image whose vision feature block holds more tokens is refused; a video pipeline refuses it |
+| `--chunked-prefill-size` | `8192` | Per-request prefill bound; a video pipeline refuses it |
 | `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
 | `--graph-policy` | `auto` | CUDA graph policy: `auto` captures graphs when serving captures the attention provider's calls (every provider but `torch`) and otherwise serves every call eagerly, `full` requires those graphs, `off` serves every call eagerly |
 | `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
