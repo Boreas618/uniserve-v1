@@ -8,8 +8,9 @@
 //!
 //! 1. resolves the rows' attention pages against the installed block tables
 //!    (checking every write against the cache's live accesses);
-//! 2. selects an eager run, a resident graph or, before the rank is sealed,
-//!    a graph to capture;
+//! 2. selects a resident graph of the smallest bucket that holds the rows,
+//!    before the rank is sealed a graph to capture, or an eager run for
+//!    multimodal rows and rows no bucket holds;
 //! 3. records the writes of the forward's inputs on its stream, one batched
 //!    copy ([`CausalLMRunner::stage`]);
 //! 4. records the graph's launch, or the eager call of the runner's forward
@@ -750,7 +751,8 @@ impl CausalLMRunner {
         let axes = if spatial { 3 } else { 1 };
 
         // Graph selection depends only on call metadata, so every rank of a
-        // group selects the same graph.
+        // group selects the same graph. A forward no captured bucket holds
+        // runs eagerly at its live shape.
         let mut choice = Choice::Eager;
         let mut bucket = (live, live_tokens);
         if self.pool.is_some() && !multimodal {

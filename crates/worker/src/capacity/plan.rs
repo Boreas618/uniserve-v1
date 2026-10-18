@@ -28,7 +28,7 @@ use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
     latent_pool_bytes, request_tensor_window,
 };
-use crate::config::{Device, WorkerConfig, graph_padding_block_count};
+use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::parallel::host::HostGroup;
 use crate::storage::CachePlan;
@@ -254,15 +254,6 @@ impl Plan {
                 self.info.max_batch_tokens = self.info.max_batch_tokens.min(saturate(tokens));
             }
         }
-        self.info.max_prefill_calls = self.info.max_prefill_calls.min(self.info.max_batch_calls);
-        self.info.max_decode_calls = self.info.max_decode_calls.min(self.info.max_batch_calls);
-    }
-
-    /// Bound calls by the captured graphs a token runtime holds. Zero leaves
-    /// a kind bounded by `max_batch_calls` alone.
-    pub(crate) fn bound_graph_calls(&mut self, prefill: u32, decode: u32) {
-        self.info.max_prefill_calls = prefill.min(self.info.max_batch_calls);
-        self.info.max_decode_calls = decode.min(self.info.max_batch_calls);
     }
 }
 
@@ -294,8 +285,6 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         queue_depth: narrow(queue_depth, "queue depth")?,
         max_batch_calls: narrow(config.max_batch_calls, "max batch calls")?,
         max_batch_tokens: narrow(config.max_batch_tokens, "max batch tokens")?,
-        max_prefill_calls: 0,
-        max_decode_calls: 0,
         request_slots: narrow(config.max_request_pool_size, "request slots")?,
         prefix_cache: None,
         latent_page_units: 0,
@@ -391,11 +380,12 @@ impl TokenLayout {
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
     /// The pool takes the grant left after a graph-capture reservation (10%
-    /// of the device), the widest default graph padding of every group, and
-    /// the fixed storage, in whole units. A configured token capacity sizes
-    /// it instead. `total_bytes` is the device's total memory, zero on CPU.
-    /// `unit_overhead` is device storage other owners keep per unit (unit
-    /// index columns), charged with each unit.
+    /// of the device) and the fixed storage, in whole units. Graph padding
+    /// takes no unit: padding rows read the sentinel unit and write no K/V.
+    /// A configured token capacity sizes the pool instead. `total_bytes` is
+    /// the device's total memory, zero on CPU. `unit_overhead` is device
+    /// storage other owners keep per unit (unit index columns), charged with
+    /// each unit.
     pub(crate) fn fit_cache(
         &mut self,
         cache: &CachePlan,
@@ -410,17 +400,13 @@ impl TokenLayout {
             .iter()
             .map(|group| (group.page_tokens, group.units_per_page))
             .collect();
-        let mut reserved_units = 0;
-        for &(tokens, units) in &pages {
-            reserved_units += graph_padding_block_count(tokens as usize) as u64 * u64::from(units);
-        }
-        reserved_units += graph_storage_budget_bytes(total_bytes as i64).div_ceil(unit_bytes);
-        reserved_units += self
-            .fixed
-            .get(&config.device)
-            .copied()
-            .unwrap_or(0)
-            .div_ceil(unit_bytes);
+        let reserved_units = graph_storage_budget_bytes(total_bytes as i64).div_ceil(unit_bytes)
+            + self
+                .fixed
+                .get(&config.device)
+                .copied()
+                .unwrap_or(0)
+                .div_ceil(unit_bytes);
 
         let cuda = config.device.is_cuda();
         let tokens = config.cache_token_capacity.map(|tokens| tokens as u64);
@@ -703,9 +689,7 @@ mod tests {
             .unwrap();
 
         let unit = cache.unit_bytes;
-        let reserved = graph_padding_block_count(64) as u64 * 2
-            + (10 * gib).div_ceil(unit)
-            + (fixed_before + gib).div_ceil(unit);
+        let reserved = (10 * gib).div_ceil(unit) + (fixed_before + gib).div_ceil(unit);
         assert_eq!(capacity.num_units, 20 * gib / unit - reserved);
         let plan = layout.finish(&config, Some(Arc::new(cache)));
         let info = plan.info.prefix_cache.as_ref().unwrap();
