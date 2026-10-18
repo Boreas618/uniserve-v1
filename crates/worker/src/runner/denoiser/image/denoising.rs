@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use uniserve_core::ImageParams;
 use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{DrawLayout, ForwardStats, LatentParams, RequestKey};
+use uniserve_ipc::{ForwardStats, LatentParams, RequestKey};
 
 use super::{DenoiseRow, IntegrateRow};
 use crate::cuda_graph::GraphMode;
@@ -332,17 +332,11 @@ impl ImageBatch<'_> {
                     "latent preparation requires a fresh trajectory".into(),
                 ));
             }
-            let rng = call
-                .rng
-                .ok_or_else(|| Error::Invalid("latent preparation requires an rng".into()))?;
-            if rng.draw_layout != DrawLayout::FlowNoise
-                || rng.seed != image.seed.unwrap_or(0)
-                || rng.semantic_index_base == 0
-            {
-                return Err(Error::Invalid(
-                    "latent preparation rng disagrees with the admitted image".into(),
-                ));
-            }
+            // The image's noise comes from the admitted image seed and the
+            // index the engine assigned the image it initializes.
+            let image_index = call
+                .image_index
+                .ok_or_else(|| Error::Invalid("latent preparation names no image index".into()))?;
             if call
                 .latent_output
                 .as_ref()
@@ -353,7 +347,7 @@ impl ImageBatch<'_> {
                 ));
             }
             self.conditioning(index)?;
-            trajectories.push((trajectory, image, rng));
+            trajectories.push((trajectory, image, image_index));
         }
         if trajectories.is_empty() {
             return Ok(ForwardStats::default());
@@ -371,7 +365,7 @@ impl ImageBatch<'_> {
             self.place(&values, issue)?
         };
 
-        for ((trajectory, image, rng), scratch) in trajectories.iter().zip(&scratch) {
+        for ((trajectory, image, image_index), scratch) in trajectories.iter().zip(&scratch) {
             let call = &self.plan.calls[trajectory.index];
             let denoiser = self.parts.denoiser().ok_or_else(|| {
                 Error::Unsupported("image trajectories require a denoiser".into())
@@ -388,16 +382,14 @@ impl ImageBatch<'_> {
             latents
                 .pool
                 .require_initial(trajectory.slot, &scratch.pages)?;
-            let semantic = u32::try_from(rng.semantic_index_base)
-                .map_err(|_| Error::Invalid("image index exceeds its range".into()))?;
             denoiser.initial_latent(
                 scratch.sample,
                 scratch.units,
                 scratch.padded(page_units),
                 trajectory.params.height,
                 trajectory.params.width,
-                rng.seed,
-                semantic,
+                image.seed.unwrap_or(0),
+                *image_index,
                 job,
             )?;
             latents.scatter(1, scratch, issue)?;
@@ -613,9 +605,6 @@ impl ImageBatch<'_> {
                         "denoising requires distinct latent input and output generations".into(),
                     ));
                 }
-            }
-            if call.rng.is_some() {
-                return Err(Error::Invalid("denoising draws no random values".into()));
             }
             // The engine plans every denoising call as the next step of its
             // trajectory's schedule.

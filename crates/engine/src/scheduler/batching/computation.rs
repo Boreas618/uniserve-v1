@@ -145,14 +145,7 @@ impl Scheduler {
                 }
 
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_decode(
-                        request,
-                        pos,
-                        None,
-                        input_token,
-                        relay_input,
-                        sampling_state,
-                    )
+                    generation::plan_decode(request, None, input_token, relay_input, sampling_state)
                 })
             }
             Phase::CloseCache => {
@@ -256,7 +249,6 @@ impl Scheduler {
                 feedback.feedback_source.as_ref()?;
                 let step_index = self.scheduled_feedback(id)?.0;
                 let is_final_step = step_index + 1 == feedback.feedback_encoders.len();
-                let logical_positions = feedback.num_feedback_positions;
                 let encoder_input = *feedback.feedback_encoders.get(step_index)?;
                 let feature = self
                     .pending_output(id, |call| call.encoder_output.as_ref())
@@ -282,9 +274,6 @@ impl Scheduler {
                         } else {
                             None
                         },
-                        Some(u64::from(
-                            logical_position.saturating_add(logical_positions.max(1)),
-                        )),
                     )
                 })
             }
@@ -449,7 +438,6 @@ impl Scheduler {
                     feature,
                     false,
                     false,
-                    None,
                     None,
                 )
             });

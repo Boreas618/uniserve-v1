@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 
 use uniserve_core::SamplingParams;
 use uniserve_core::philox::{DRAW_LAYOUT_TARGET, request_sampling_key, sampling_uniform};
-use uniserve_ipc::{Call, DrawLayout};
+use uniserve_ipc::Call;
 
-use crate::{Error, Result};
+use crate::Result;
 
 mod metadata;
 
@@ -107,28 +107,6 @@ impl SamplingControls {
             .map(|index| index + 1);
 
         let draws = if parameters.temperature > 0.0 {
-            let rng = call
-                .rng
-                .as_ref()
-                .filter(|rng| rng.draw_layout == DrawLayout::TargetSampling)
-                .ok_or_else(|| {
-                    Error::Invalid(
-                        "stochastic sampling requires target-sampling RNG coordinates".into(),
-                    )
-                })?;
-            if rng.seed != parameters.seed.unwrap_or(0) {
-                return Err(Error::Invalid(
-                    "call RNG seed disagrees with admitted sampling".into(),
-                ));
-            }
-            if positions.iter().enumerate().any(|(index, position)| {
-                rng.semantic_index_base.checked_add(index as u64) != Some(*position)
-            }) {
-                return Err(Error::Invalid(
-                    "sampling positions disagree with registered semantic RNG coordinates".into(),
-                ));
-            }
-
             let key = request_sampling_key(
                 parameters.seed,
                 call.request_key.engine_id,
