@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
 
+use uniserve_core::ComponentWeights;
 use uniserve_cuda::{DeviceId, PrimaryContext};
 use uniserve_ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
@@ -53,7 +54,9 @@ use crate::executor::transfer::TransferRuntime;
 use crate::ffi::Interpreter;
 use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::parallel::world::{World, startup_timeout};
-use crate::parallel::{DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, PeerGroup};
+use crate::parallel::{
+    DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, HostWeights, PeerGroup,
+};
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
@@ -198,8 +201,14 @@ impl Worker {
         let model = LoadedModel::load(description, &launch, meshes, experts, host_only)
             .map_err(phase("load"))?;
         // Every later graph decision of the rank reads the resolved policy.
+        let host_component = components
+            .placed()
+            .iter()
+            .find(|placed| placed.config.weights == ComponentWeights::Host)
+            .map(|placed| placed.name.as_str());
         launch.execution.graph_policy =
-            graph_policy(&launch.execution.graph_policy, &model).map_err(phase("load"))?;
+            graph_policy(&launch.execution.graph_policy, &model, host_component)
+                .map_err(phase("load"))?;
         let mut config = launch.execution.clone();
         if model.video_decoder {
             config = config
@@ -232,6 +241,9 @@ impl Worker {
         .map_err(phase("experts"))?;
         let weights = DwdpManager::start(&launch, &world, &model, &streams, &node)
             .map_err(phase("experts"))?;
+        // Host-resident layer weights release their device storage before
+        // capacity planning measures free memory.
+        let host_weights = HostWeights::start(&model, &components).map_err(phase("load"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(
@@ -442,6 +454,7 @@ impl Worker {
         if let Some(weights) = weights {
             backend.set_weights(weights);
         }
+        backend.set_host_weights(host_weights);
         let expert_warmup = experts.is_some();
         if let Some(experts) = experts {
             backend.set_experts(experts);
@@ -875,7 +888,22 @@ fn endpoint(worker_id: &str, rank: usize) -> Result<WorkerEndpoint> {
 /// otherwise serves every call eagerly; `full` requires that capture; `off`
 /// never captures. Every rank of a group loads the same provider, so the
 /// group resolves one policy and captures the same shapes.
-fn graph_policy(configured: &str, model: &LoadedModel) -> Result<String> {
+///
+/// A rank holding `host_component`, a component that keeps its weights in
+/// host memory, requires `off`: its layers' weight copies are scheduled by
+/// the host as each layer is reached, which a captured graph cannot repeat.
+fn graph_policy(
+    configured: &str,
+    model: &LoadedModel,
+    host_component: Option<&str>,
+) -> Result<String> {
+    if let Some(name) = host_component
+        && configured != "off"
+    {
+        return Err(Error::Unsupported(format!(
+            "component {name} keeps its weights in host memory, which requires --graph-policy off"
+        )));
+    }
     if model.attention_captures || configured == "off" {
         return Ok(configured.to_owned());
     }

@@ -344,6 +344,7 @@ mod tests {
             parallel_config: ParallelConfig::default(),
             distribution: Some(ComponentDistribution::TemporalUnits),
             units_per_rank: 1,
+            weights: Default::default(),
         };
         let sequence = ComponentConfig::parallel(
             vec![0, 1, 2, 3],

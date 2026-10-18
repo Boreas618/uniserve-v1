@@ -121,6 +121,7 @@ mod tests {
             parallel_config: Default::default(),
             distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
             units_per_rank,
+            weights: Default::default(),
         }
     }
 
@@ -180,6 +181,7 @@ mod tests {
                 parallel_config: Default::default(),
                 distribution: None,
                 units_per_rank: 1,
+                weights: Default::default(),
             },
         )]);
         let peers = BTreeMap::from([
