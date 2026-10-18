@@ -678,17 +678,12 @@ impl SimEngine {
         }
     }
 
-    /// Model limits of a deployment that serves every call kind the
-    /// simulator implements without a model-imposed bound.
+    /// Model limits of a deployment without a model-imposed bound.
     ///
-    /// The scheduler intersects them with the capacities and call kinds the
-    /// simulated worker reports.
+    /// The scheduler takes the served features from the call kinds the
+    /// simulated worker reports and clamps these limits to its capacities.
     pub fn generation_limits() -> uniserve_core::GenerationLimits {
         uniserve_core::GenerationLimits {
-            features: uniserve_core::GenerationFeatures::UNDERSTANDING
-                | uniserve_core::GenerationFeatures::VISION_ENCODE
-                | uniserve_core::GenerationFeatures::LATENT_ENCODE
-                | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
             max_latent_units: u64::MAX,
             latent_downsample: 16,
             max_vae_grid_tokens: u32::MAX,
@@ -701,6 +696,7 @@ impl SimEngine {
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             encoder_cache_entries: 256,
+            ..Default::default()
         }
     }
 
