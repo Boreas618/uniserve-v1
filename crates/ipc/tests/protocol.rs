@@ -1774,7 +1774,6 @@ fn full_image() -> ImageParams {
         height: 1024,
         width: 768,
         seed: Some(77),
-        negative_prompt: "blurry".into(),
         max_images: 2,
         image_prompts: vec!["p0".into(), "p1".into()],
         retain_images: false,
