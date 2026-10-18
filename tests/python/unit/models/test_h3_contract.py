@@ -56,7 +56,7 @@ def test_full_vsa_checkpoint_resolves_its_trained_rungs(checkpoint):
     assert set(config.denoisers) == {"denoiser"}
     denoiser = config.denoisers["denoiser"]
     assert denoiser.schedule.rungs == (999, 749, 500, 250)
-    assert denoiser.schedule.clock == 1000
+    assert denoiser.schedule.num_train_timesteps == 1000
     assert denoiser.schedule.video_shift == 12
     assert denoiser.schedule.audio_shift == 3
     assert denoiser.attention == SparseAttention(tile=64, sparsity=0.9)
@@ -295,6 +295,19 @@ def test_h3_reader_rejects_unsupported_decoder_math(
     path.write_text(json.dumps(values))
     with pytest.raises(ValueError, match=error):
         read_config(checkpoint, IOConfig(), sources={})
+
+
+def test_pixel_normalization_comes_from_the_checkpoint_processor(checkpoint):
+    path = checkpoint / "processor/preprocessor_config.json"
+    values = json.loads(path.read_text())
+    path.write_text(
+        json.dumps(
+            {**values, "image_mean": [0.1, 0.2, 0.3], "image_std": [1, 2, 3]}
+        )
+    )
+
+    pixels = read_config(checkpoint, IOConfig(), sources={}).text_encoder.pixels
+    assert (pixels.mean, pixels.std) == ((0.1, 0.2, 0.3), (1, 2, 3))
 
 
 def test_h3_reader_reports_missing_decoder_field(checkpoint):

@@ -117,7 +117,7 @@ def schedules(
             result[name] = ladder(
                 schedule.rungs,
                 shift=shift,
-                clock=schedule.clock,
+                num_train_timesteps=schedule.num_train_timesteps,
                 device=device,
             )
         else:
