@@ -28,8 +28,6 @@ use crate::{Error, Result};
 /// The meta-device description of a model and its declarations.
 pub(crate) struct Description {
     handle: Handle,
-    /// `module.QualName` of the model class.
-    pub(crate) model_name: String,
     pub(crate) declarations: Declarations,
     /// Routed-expert module paths, when experts are disaggregated.
     pub(crate) expert_paths: Vec<String>,
@@ -76,7 +74,6 @@ impl Description {
             ])?,
         )?;
         let method = |name: &str| Interpreter::import(&format!("{LOADING}.Description.{name}"));
-        let model_name: tvm_ffi::String = method("model_name")?.call_as(&[handle.view()])?;
         let expert_paths = texts(method("routed_experts")?.call_values(&[handle.to_any()])?)
             .map_err(|error| Error::numerical("routed_experts", &error))?;
         let video_decoder = method("decodes_video")?.call_as(&[handle.view()])?;
@@ -84,7 +81,6 @@ impl Description {
         declarations.validate(&launch.components)?;
         Ok(Self {
             handle,
-            model_name: model_name.as_str().to_owned(),
             declarations,
             expert_paths,
             video_decoder,
@@ -117,7 +113,6 @@ pub(crate) struct ExpertPartition {
 /// A loaded model and its declarations.
 pub(crate) struct LoadedModel {
     handle: Handle,
-    pub(crate) model_name: String,
     pub(crate) declarations: Declarations,
     pub(crate) video_decoder: bool,
     /// The attention backend the model was loaded with.
@@ -224,7 +219,6 @@ impl LoadedModel {
             .call_as::<bool>(&[handle.view()])?;
         Ok(Self {
             handle,
-            model_name: description.model_name,
             declarations: description.declarations,
             video_decoder: description.video_decoder,
             attention_backend: backend.as_str().to_owned(),
