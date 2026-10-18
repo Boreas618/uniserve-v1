@@ -372,24 +372,6 @@ impl OutputBuffer {
         Ok(())
     }
 
-    /// Upper bound before token deduplication, used for output-byte admission.
-    pub fn logprob_entries(&self, span: (usize, usize, usize)) -> Result<usize> {
-        let (offset, count, row) = span;
-        self.logprob_layouts
-            .get(&(offset, count))
-            .ok_or(Error::State("logprob capture has no row layout"))?
-            .entries(row)
-    }
-
-    /// IPC encodes a 4-byte row length and 12 bytes per token score. Admission
-    /// uses the count before deduplication, so selected/top/requested overlap
-    /// can only reduce the eventual payload.
-    pub fn logprob_bytes(&self, spans: &[(usize, usize, usize)]) -> Result<usize> {
-        spans.iter().try_fold(0, |bytes, &span| {
-            Ok(bytes + 4 + 12 * self.logprob_entries(span)?)
-        })
-    }
-
     /// Selected token first, then top and explicitly requested tokens. The
     /// packed column is decoded once for all of its consuming request rows.
     pub fn logprob_values(&mut self, span: (usize, usize, usize)) -> Result<&[TokenLogprob]> {

@@ -220,7 +220,6 @@ impl BlockTables {
         }
 
         let reset: HashSet<_> = initialized.iter().copied().collect();
-        let mut held = HashSet::new();
         let mut spans = Vec::new();
         for (group, table) in tables.iter().enumerate() {
             self.validate_table(group, table)?;
@@ -232,7 +231,6 @@ impl BlockTables {
                     "cache import exceeds its scheduler block table".into(),
                 ));
             }
-            held.extend(table.units.iter().map(|unit| unit.0));
 
             if transfer.base_extent > 0 {
                 let installed = self.table(slot, group as u32)?;
@@ -274,12 +272,6 @@ impl BlockTables {
             }
         }
 
-        if reset.len() != initialized.len() || !reset.is_subset(&held) {
-            return Err(Error::Invalid(
-                "cache import resets repeated units or units outside its block tables".into(),
-            ));
-        }
-
         // A physical unit can serve any group. Reset reserves its full token
         // range, while the access owner coalesces it with the copied suffix.
         let unit_tokens = self
@@ -291,16 +283,18 @@ impl BlockTables {
         Ok(spans)
     }
 
+    /// Check a table against the rank's own table storage: its group's
+    /// shape, whole pages within the row width, allocated tokens within its
+    /// pages, and units inside the pool. The scheduler's allocator owns
+    /// which units a table names (never the sentinel, never twice); the pool
+    /// bound stays here because kernels address the planes by these ids, so
+    /// a unit beyond the pool would read and write outside its allocation.
     fn validate_table(&self, group: usize, table: &GroupTable) -> Result<()> {
         let per_page = table.shape.units_per_page as usize;
         if self.groups.get(group) != Some(&table.shape)
             || !table.units.len().is_multiple_of(per_page)
             || table.units.len() / per_page > self.width
-            || table
-                .units
-                .iter()
-                .any(|unit| unit.0 == 0 || unit.0 >= self.num_units)
-            || table.units.iter().collect::<HashSet<_>>().len() != table.units.len()
+            || table.units.iter().any(|unit| unit.0 >= self.num_units)
             || u64::from(table.allocated_tokens)
                 > table.end_page() * u64::from(table.shape.page_tokens)
         {

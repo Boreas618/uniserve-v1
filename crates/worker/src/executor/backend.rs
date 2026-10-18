@@ -655,7 +655,10 @@ impl WorkerBackend {
         Ok(())
     }
 
-    /// Refuse a batch outside this rank's advertised capacity.
+    /// Refuse a batch outside this rank's advertised capacity, with the
+    /// checks no other owner makes. Buffer allocations, block tables and new
+    /// cache units are refused by their owners (`BufferPool::bind`,
+    /// `BlockTables::prepare`, `UnitColumn::recycle`).
     fn validate(&self, plan: &BatchPlan) -> Result<()> {
         let unsupported: BTreeSet<&str> = plan
             .calls
@@ -667,27 +670,6 @@ impl WorkerBackend {
             return Err(Error::Invalid(format!(
                 "execution batch contains call kinds unsupported by this worker: {:?}",
                 unsupported.into_iter().collect::<Vec<_>>()
-            )));
-        }
-        if let Some(cache) = &self.info.prefix_cache
-            && plan
-                .new_cache_units
-                .iter()
-                .flat_map(|allocation| &allocation.unit_ids)
-                .any(|unit| unit.0 >= cache.num_units)
-        {
-            return Err(Error::Invalid(
-                "cache allocation exceeds the fixed physical pool".into(),
-            ));
-        }
-        if let Some(allocation) = plan
-            .buffer_allocations
-            .iter()
-            .find(|allocation| allocation.offset + allocation.bytes > self.info.buffer_pool_bytes)
-        {
-            return Err(Error::Invalid(format!(
-                "batch buffer allocation exceeds the worker buffer pool: offset={}, bytes={}, capacity={}, buffer={:?}",
-                allocation.offset, allocation.bytes, self.info.buffer_pool_bytes, allocation.buffer,
             )));
         }
         if !self.info.components.is_empty() {
@@ -708,11 +690,10 @@ impl WorkerBackend {
             ));
         }
         if plan
-            .block_tables
+            .forward
+            .request_pool_indices
             .iter()
-            .map(|table| table.request_pool_idx)
-            .chain(plan.forward.request_pool_indices.iter().copied())
-            .any(|slot| slot > self.info.request_slots)
+            .any(|&slot| slot > self.info.request_slots)
         {
             return Err(Error::Invalid(
                 "execution batch exceeds request-slot capacity".into(),

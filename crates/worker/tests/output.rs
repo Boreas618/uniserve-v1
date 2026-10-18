@@ -81,8 +81,6 @@ fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
     )?;
     complete(&mut output)?;
 
-    assert_eq!(output.logprob_entries((0, count, 4))?, 5);
-    assert_eq!(output.logprob_bytes(&[(0, count, 4), (0, count, 1)])?, 116);
     assert_eq!(
         output.logprob_values((0, count, 1))?,
         [entry(9, -2.0, 4), entry(2, -1.0, 1)]
@@ -114,7 +112,6 @@ fn selected_score_needs_no_top_or_requested_columns() -> Result<()> {
     )?;
     complete(&mut output)?;
 
-    assert_eq!(output.logprob_entries((1, 3, 6))?, 1);
     assert_eq!(output.logprob_values((1, 3, 6))?, [entry(0, -3.5, 8)]);
     Ok(())
 }

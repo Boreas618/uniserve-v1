@@ -157,15 +157,12 @@ impl<F: Default> Opening<F> {
             .ok_or_else(|| Error::Invariant("a batch has calls".into()))?;
         let reports = reports_output(info, rank, &first.component)?;
 
-        let rows = plan
+        let calls: Vec<_> = plan
             .calls
             .iter()
-            .map(|call| {
-                let request = requests.get(call.request_key.request_id.0)?;
-                Ok((call.request_key, call.call_id, request.slot()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let bound = requests.bind_calls(&rows)?;
+            .map(|call| (call.request_key, call.call_id))
+            .collect();
+        let bound = requests.bind_calls(&calls)?;
         let mut calls = Vec::with_capacity(plan.calls.len());
         for (index, (call, request)) in plan.calls.iter().zip(&bound).enumerate() {
             calls.push(CallState {
@@ -393,11 +390,8 @@ impl<F> Batch<F> {
     /// Check every call's captured output and the batch's writes before
     /// the commit point.
     pub(crate) fn validate(&self, plan: &BatchPlan, tensors: &ProductStore) -> Result<()> {
-        {
-            let output = lock(&self.buffer);
-            for (state, call) in self.calls.iter().zip(&plan.calls) {
-                state.output.validate_output(&output, call)?;
-            }
+        for (state, call) in self.calls.iter().zip(&plan.calls) {
+            state.output.validate_output(call)?;
         }
         tensors.validate_writes(&self.writes)
     }
