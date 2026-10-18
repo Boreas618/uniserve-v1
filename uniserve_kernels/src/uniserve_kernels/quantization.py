@@ -199,7 +199,8 @@ if triton is not None:
         step, so the bytes equal its output: each K16 block's amax times
         ``rcp.approx(6)`` times ``1 / s`` rounds to the E4M3 block scale;
         values multiply by ``rcp.approx(scale * rcp.approx(1 / s))`` (zero
-        for an all-zero block) and round to E2M1, saturating.
+        when the stored block scale is zero, which a block of small nonzero
+        values also rounds to) and round to E2M1, saturating.
         """
         blocks = tl.reshape(values, [BLOCK // 16, 16])
         amax = tl.max(tl.abs(blocks), axis=1)
@@ -212,7 +213,7 @@ if triton is not None:
         decoded = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         inverse_global = _rcp_approx(tl.zeros_like(amax) + global_scale)
         output_scale = tl.where(
-            amax != 0.0, _rcp_approx(decoded * inverse_global), 0.0
+            decoded != 0.0, _rcp_approx(decoded * inverse_global), 0.0
         )
 
         scaled = blocks * output_scale[:, None]

@@ -185,7 +185,8 @@ def test_cuda_sandwich_stores_a_normalization_in_its_consumer_encoding(width):
     Its values, block scales and tensor scale equal, bit for bit, what the
     calibrated NVFP4 quantizer stores for the unencoded normalization of the
     same call; the other outputs are unchanged. Rows include an all-zero
-    K16 block and one whose block scale saturates.
+    K16 block, one of small nonzero values whose block scale rounds to zero,
+    and one whose block scale saturates.
     """
     from uniserve.quantization import (
         QuantizedTensor,
@@ -200,6 +201,9 @@ def test_cuda_sandwich_stores_a_normalization_in_its_consumer_encoding(width):
     weights = torch.randn((3, width), dtype=dtype, device=device)
     weights[2, :16] = 0
     weights[2, 16:32] = 1e4
+    # Normalized values near 1e-6 give a block maximum whose E4M3 scale,
+    # amax / (6 * 0.0123), rounds to zero.
+    weights[2, 32:48] = 1e-6
     quantizer = Quantizer("nvfp4", calibrated_scale=0.0123)
     norms = ((weights[1],), (weights[2],))
 
