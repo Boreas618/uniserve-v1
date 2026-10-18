@@ -406,6 +406,14 @@ impl WorkerGroup {
             .min()
             .unwrap_or(info.buffer_pool_bytes);
 
+        // A rank's transfer entries follow the products it imports, which
+        // its components set; the group holds what its narrowest rank does.
+        info.transfer_tickets = workers
+            .iter()
+            .map(|worker| worker.info().transfer_tickets)
+            .min()
+            .unwrap_or(info.transfer_tickets);
+
         // A rank states the shapes the engine warms only for what it holds:
         // the image denoiser's ranks its image shapes, a diffusion LM's ranks
         // its step rows, every other rank none. The group's are those its

@@ -195,7 +195,10 @@ pub(crate) struct RequestBounds {
 
 impl ArenaCapacity {
     /// The arena of a token worker: relay lanes for every unresolved call
-    /// of every request slot, and one batch's reads per transfer ticket.
+    /// of every request slot, and one transfer ticket and one host-lane task
+    /// per queued call (`depth` batches of up to `calls` calls are in flight
+    /// at once, and a call holds at most one of each), each ticket budgeted
+    /// for the largest single read.
     pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
         let TokenBounds {
             depth,
@@ -205,8 +208,7 @@ impl ArenaCapacity {
             device_exports,
         } = *bounds;
         let window = call_window(depth, calls)?;
-        let slots = depth * calls;
-        let transfer_tickets = slots.min(256);
+        let transfer_tickets = depth * calls;
         let device_product_bytes = relay_bytes(requests, window);
 
         Ok(Self {
@@ -218,12 +220,15 @@ impl ArenaCapacity {
             } else {
                 0
             },
-            host_lane_inflight: 256,
+            host_lane_inflight: transfer_tickets,
         })
     }
 
-    /// A media rank retains every local product in full. Read tickets also
-    /// cover assembly across all producing ranks, including stateless ranks.
+    /// A media rank retains every local product in full. It holds a read
+    /// ticket per queued call or per concurrent artifact import of every
+    /// slot, whichever is more, and at least one per rank of the
+    /// deployment, since assembly reads from every producing rank,
+    /// including stateless ranks.
     pub(crate) fn for_requests(bounds: &RequestBounds) -> Result<Self> {
         let RequestBounds {
             depth,
@@ -241,7 +246,7 @@ impl ArenaCapacity {
         Ok(Self {
             device_product_bytes,
             transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
-            transfer_tickets: ranks.max(slots.min(256)),
+            transfer_tickets: ranks.max(slots),
             export_pool_bytes: if device_exports {
                 export_pool_bytes(device_product_bytes)
             } else {
