@@ -220,9 +220,10 @@ impl ImageBatch<'_> {
 
     /// Record into `job` the calls a trajectory of request `key` opens
     /// with: its guidance plan, and the prefix of each source one of its
-    /// guidance branches may condition on. The negative prefix is the
-    /// admitted negative tokens as they are ([`BranchSource::admitted`]);
-    /// the model frames and tokenizes the others.
+    /// guidance branches may condition on. The conditioning prefix is the
+    /// request's own context and the negative prefix the admitted negative
+    /// tokens as they are ([`BranchSource::admitted`]); the model frames and
+    /// tokenizes the others.
     /// [`Self::planned_trajectory`] opens the trajectory from the job's
     /// completion.
     fn plan_trajectory(
@@ -247,7 +248,6 @@ impl ImageBatch<'_> {
             .as_ref()
             .map(|ar| ar.negative_token_ids.clone())
             .unwrap_or_default();
-        let prompt = image.image_prompts.first().cloned().unwrap_or_default();
         let mut prefixes: Vec<(BranchSource, Option<Prefix>)> = Vec::new();
         for source in [
             BranchSource::Conditioning,
@@ -259,7 +259,7 @@ impl ImageBatch<'_> {
             }
             let given = source.admitted(&negative);
             if given.is_none() {
-                self.parts.policy.ask_prefix(source, &prompt, job);
+                self.parts.policy.ask_prefix(source, job);
             }
             prefixes.push((source, given));
         }
