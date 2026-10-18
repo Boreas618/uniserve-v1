@@ -93,7 +93,6 @@ fn engine() -> anyhow::Result<EngineCore> {
         ranks: config.workers[0].ranks.clone(),
         components,
         queue_depth: 2,
-        max_message_bytes: 8 << 20,
         max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 16,

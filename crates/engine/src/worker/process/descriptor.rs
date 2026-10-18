@@ -154,7 +154,6 @@ impl Default for WorkerProcessArgs {
             peers: Default::default(),
             stub: false,
             queue_depth: Self::DEFAULT_QUEUE_DEPTH,
-            max_message_bytes: 8 << 20,
             max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
@@ -251,7 +250,6 @@ impl WorkerProcessArgs {
         expert_listen_fd: Option<std::os::fd::RawFd>,
     ) -> anyhow::Result<LaunchDescriptor> {
         let depth = self.queue_depth.max(1);
-        let max_payload = self.max_message_bytes.max(1);
         // Resolve mechanism ownership from the physical rank's incident edges.
         let (transfer_backends, export_backends) =
             self.transfer.rank_backends(&self.worker_id, rank);
@@ -291,7 +289,6 @@ impl WorkerProcessArgs {
             // host. Only the placement knows that.
             products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
             queue_depth: depth,
-            ipc_payload_cap: max_payload,
             // The rank reports a stalled lane after half of it: see
             // `WorkerProcessArgs::watchdog_timeout`.
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())

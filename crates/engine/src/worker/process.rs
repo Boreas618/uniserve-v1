@@ -125,9 +125,6 @@ pub(super) struct PendingRank {
     rank: u32,
     /// Most requests outstanding at once on the rank.
     depth: usize,
-    /// Largest encoded message in bytes, which `adopt` sets as the bound of
-    /// what the head sends the rank.
-    max_payload: usize,
     /// Moves by adoption alongside the process it cancels.
     startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The launch descriptor `adopt` answers the rank's registration with.
@@ -194,7 +191,6 @@ impl PendingRank {
         generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
-        let max_payload = args.max_message_bytes.max(1);
         let world_size = args.world_size();
 
         let mut cmd = uniserve_ipc::launch::rank_command(
@@ -253,7 +249,6 @@ impl PendingRank {
             child: PendingChild(child),
             rank,
             depth,
-            max_payload,
             startup_abort,
             descriptor,
         })
@@ -291,7 +286,6 @@ impl PendingRank {
             child,
             rank,
             depth,
-            max_payload,
             startup_abort,
             descriptor,
         } = self;
@@ -301,7 +295,6 @@ impl PendingRank {
         channel
             .send(&descriptor)
             .with_context(|| format!("sending rank {rank} its launch descriptor"))?;
-        channel.set_bound(max_payload);
         tracing::info!(rank, "a rank registered and received its launch descriptor");
 
         Ok(RankProcess {

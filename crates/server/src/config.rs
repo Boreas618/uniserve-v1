@@ -138,10 +138,7 @@ impl Default for EngineSettings {
             transfer: TransferConfig::default(),
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process: WorkerProcessArgs {
-                max_message_bytes: EngineSettings::DEFAULT_MAX_MESSAGE_BYTES,
-                ..WorkerProcessArgs::default()
-            },
+            worker_process: WorkerProcessArgs::default(),
         }
     }
 }
@@ -327,11 +324,6 @@ impl EngineSettings {
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
 
-    /// Default bound, in bytes, of one message on a rank's channel (64 MiB).
-    /// `build_state` raises the configured bound to the model's channel
-    /// payload capacity when that is larger.
-    pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 << 20;
-
     /// Default condition capacity in denoiser rows: two keyframes on the
     /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
     /// The capacity sizes each request slot's retained conditioning and the
@@ -372,10 +364,6 @@ impl EngineSettings {
         );
         crate::serving::validate_video_capacity(self.max_video_seconds)
             .map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(
-            self.worker_process.max_message_bytes > 0,
-            "resp_slot_cap must be greater than 0"
-        );
         WorkerConfig::validate_all(&self.workers)?;
         Ok(())
     }
@@ -425,13 +413,6 @@ mod tests {
     fn zero_max_model_len_is_rejected() {
         let mut config = Config::default();
         config.engine.max_model_len = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn a_zero_message_bound_is_rejected() {
-        let mut config = Config::default();
-        config.engine.worker_process.max_message_bytes = 0;
         assert!(config.validate().is_err());
     }
 

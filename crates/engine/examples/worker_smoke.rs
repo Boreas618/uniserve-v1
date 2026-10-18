@@ -53,7 +53,6 @@ fn main() -> anyhow::Result<()> {
         .ranks,
         // Allows two physical runs in flight on the rank at once.
         queue_depth: 2,
-        max_message_bytes: 8 << 20,
         max_total_tokens: None,
         block_size: Some(256),
         max_batch_calls: 32,

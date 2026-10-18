@@ -105,7 +105,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             })?;
     }
     let max_model_len = model_config.max_model_len;
-    let channel_payload_capacity = model_config.channel_payload_capacity();
     let control_tokens = special_token_ids(&model_config);
     let generation_limits =
         model_config.generation_limits(config.engine.worker_process.model_dtype);
@@ -126,16 +125,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
         .context("max_num_batched_tokens exceeds the worker field width")?;
 
-    // The model profile states the largest message its products need, and
-    // the configured bound applies only when it is larger.
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
         base_model: config.base_model.clone(),
-        max_message_bytes: config
-            .engine
-            .worker_process
-            .max_message_bytes
-            .max(channel_payload_capacity),
         max_batch_calls,
         max_batch_tokens,
         max_model_len,

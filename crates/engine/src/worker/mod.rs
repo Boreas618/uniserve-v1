@@ -91,9 +91,6 @@ pub struct WorkerProcessArgs {
     pub stub: bool,
     /// Maximum number of physical batches concurrently in flight per rank.
     pub queue_depth: usize,
-    /// Largest encoded message, in bytes, a rank's channel carries in either
-    /// direction: the bound of one frame.
-    pub max_message_bytes: usize,
     /// Optional prefix cache capacity in tokens (`--max-total-tokens`).
     pub max_total_tokens: Option<u64>,
     /// Tokens per cache page of the cache group with the widest token rows;

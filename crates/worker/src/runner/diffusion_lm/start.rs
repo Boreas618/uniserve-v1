@@ -202,8 +202,6 @@ pub(crate) struct Startup<'a> {
     pub(crate) config: &'a WorkerConfig,
     pub(crate) request_slots: usize,
     pub(crate) queue_depth: usize,
-    /// Bytes of one IPC message, which bounds a batch's completion values.
-    pub(crate) max_payload_bytes: usize,
     pub(crate) model: &'a LoadedModel,
     /// Routed experts use an expert exchange, and the attention ranks of a
     /// disaggregated expert union (zero when every rank holds its experts).
@@ -449,11 +447,14 @@ impl DiffusionLMRunner {
             )?;
 
             // One lease per batch in flight. A lease holds every step's
-            // outcome and tokens, or the candidate values of readouts, whose
-            // four bytes each the batch's result message bounds.
+            // outcome and block tokens, or the candidate values of readouts,
+            // one word each. A denoising batch's words are bounded by the
+            // rank's own limits: per call, a step's outcome and its block. A
+            // readout's candidate count is the request's own, which no
+            // admission limit bounds, so a readout batch of more words than a
+            // block reads back into storage of its own (`OutputPool`).
             let max_calls = config.max_batch_calls.max(1);
-            let words = (max_calls * (1 + facts.sequence_length))
-                .max(startup.max_payload_bytes.div_ceil(4));
+            let words = max_calls * (1 + facts.sequence_length);
             let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words)?;
             runners.push(Self {
                 index,

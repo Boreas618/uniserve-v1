@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{EncodingError, IpcError, IpcResult, TransportError};
+use crate::error::{IpcError, IpcResult, TransportError};
 use crate::frame::Frame;
 
 /// The prefix of a Unix socket address; the rest is the socket's path.
@@ -392,8 +392,6 @@ pub struct Channel {
     stream: Stream,
     reader: FrameReader,
     writer: FrameWriter,
-    /// Largest encoded message this end sends; see [`Self::set_bound`].
-    bound: usize,
     /// Terminal failure, reported after the frames that arrived whole have
     /// been taken: an IO failure or the peer's close.
     failure: Option<TransportError>,
@@ -417,7 +415,6 @@ impl Channel {
             stream: stream.configure()?,
             reader: FrameReader::new(),
             writer: FrameWriter::new(),
-            bound: usize::MAX,
             failure: None,
             local: LocalWake::new()?,
         })
@@ -455,33 +452,19 @@ impl Channel {
         self.local.wake.clone()
     }
 
-    /// Sets the largest encoded message, in bytes, this end sends.
-    ///
-    /// A rank sizes the storage it stages a batch's inputs in from the bound
-    /// its launch descriptor states, so a longer message is refused where it
-    /// is sent rather than where that storage would not hold it.
-    pub fn set_bound(&mut self, bound: usize) {
-        self.bound = bound;
-    }
-
     /// Encodes and sends one message.
     ///
     /// Queues the frame and writes as far as the socket accepts; later calls
-    /// write the rest. Fails with the recorded failure once the channel has
-    /// failed, when the message cannot be encoded or is longer than the
-    /// bound, and on a write error.
+    /// write the rest. A message of any length a frame's length field can
+    /// state is sent; nothing about a channel bounds it further. Fails with
+    /// the recorded failure once the channel has failed, when the message
+    /// cannot be encoded or is longer than a frame can state, and on a write
+    /// error.
     pub fn send<M: Serialize>(&mut self, message: &M) -> IpcResult<()> {
         if let Some(error) = &self.failure {
             return Err(IpcError::Transport(error.clone()));
         }
         let frame = Frame::encode(message)?.into_bytes();
-        let length = frame.len() - Frame::LENGTH_BYTES;
-        if length > self.bound {
-            return Err(IpcError::Encoding(EncodingError::Oversized {
-                length,
-                limit: self.bound,
-            }));
-        }
         self.writer.pending.push_back(frame);
         Ok(self.writer.flush(&mut self.stream)?)
     }
@@ -965,18 +948,6 @@ mod tests {
     }
 
     #[test]
-    fn a_message_above_the_bound_is_refused_where_it_is_sent() {
-        let (mut channel, _peer) = with_raw_peer();
-        let message = response_of(1, 64);
-        let length = frame_of(&message).len() - Frame::LENGTH_BYTES;
-
-        channel.set_bound(length - 1);
-        assert!(matches!(channel.send(&message), Err(IpcError::Encoding(_))));
-        channel.set_bound(length);
-        channel.send(&message).unwrap();
-    }
-
-    #[test]
     fn a_frame_decodes_only_as_the_message_it_carries() {
         let (mut channel, mut peer) = with_raw_peer();
         peer.write_all(&frame_of(&WorkerRequest::info())).unwrap();
@@ -1142,6 +1113,45 @@ mod tests {
         );
         let (wire, _peer) = reader.join().unwrap();
         assert!(wire == expected, "the frame arrived changed");
+    }
+
+    /// A message above 64 MiB, the size of one decoded MiniMax H3 unit,
+    /// crosses a TCP connection intact: a channel carries any message its
+    /// frame's length field can state.
+    #[test]
+    fn a_message_above_64_mib_crosses_a_tcp_connection_intact() {
+        let listener = Listener::bind(&["127.0.0.1:0"]).unwrap();
+        let mut near = Channel::connect(&listener.addresses()[0]).unwrap();
+        let mut far = accept(&listener);
+        let large = response_of(1, 72 << 20);
+        let length = frame_of(&large).len();
+        assert!(length > 64 << 20);
+
+        // The sender writes the frame out while the receiver reads it, as
+        // the head and a rank on another host do.
+        let sent = large.clone();
+        let sender = std::thread::spawn(move || {
+            near.send(&sent).unwrap();
+            near.flush().unwrap();
+            near
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let received = loop {
+            if let Some(message) = far.try_recv::<WorkerResponse>().unwrap() {
+                break message;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the large message did not arrive"
+            );
+            far.wait(Duration::from_millis(50)).unwrap();
+        };
+        let _near = sender.join().unwrap();
+        assert!(
+            frame_of(&received).len() == length,
+            "the frame arrived resized"
+        );
+        assert!(received == large, "the message arrived changed");
     }
 
     /// A hangup observer sees the peer's close without the channel being

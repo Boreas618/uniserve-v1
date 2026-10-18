@@ -222,9 +222,6 @@ pub(crate) struct SharedRuntimeArgs {
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long = "disable-prefix-cache")]
     pub disable_prefix_reuse: bool,
-    /// Largest message in bytes a rank's channel carries.
-    #[arg(long = "resp-slot-cap", default_value_t = EngineSettings::DEFAULT_MAX_MESSAGE_BYTES, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub max_message_bytes: usize,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
@@ -491,7 +488,6 @@ impl SharedRuntimeArgs {
             .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
-        worker_process.max_message_bytes = self.max_message_bytes;
         worker_process.max_total_tokens = self.max_total_tokens;
         worker_process.block_size = self.block_size;
         worker_process.attention_backend = self.attention_backend.clone();
@@ -861,8 +857,6 @@ mod tests {
             "1234",
             "--schedule-policy",
             "priority",
-            "--resp-slot-cap",
-            "1048576",
             "--dtype",
             "float16",
             "--mem-fraction-static",
