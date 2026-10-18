@@ -602,7 +602,7 @@ impl Scheduler {
         if st.phase == Phase::Prefill
             && let Some((_, step)) = self.next_context_encode(id)
         {
-            return Some(generation::encoder_call(step));
+            return Some(CallKind::Media(step));
         }
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
@@ -619,7 +619,7 @@ impl Scheduler {
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                generation::encoder_call(
+                CallKind::Media(
                     feedback
                         .feedback_encoders
                         .get(st.feedback_encoder_index)?

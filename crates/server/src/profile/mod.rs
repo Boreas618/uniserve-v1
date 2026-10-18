@@ -403,7 +403,7 @@ mod tests {
     use tempfile::tempdir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::{GenerationConstraint, ImageIngestStep};
+    use uniserve_core::{GenerationConstraint, MediaCall};
 
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::profile::assets::ResolvedModelFiles;
@@ -539,7 +539,7 @@ mod tests {
                             .iter()
                             .map(|input| input.encoder)
                             .collect::<Vec<_>>(),
-                        vec![ImageIngestStep::VitEncode]
+                        vec![MediaCall::VisionEncoding]
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }
@@ -554,7 +554,7 @@ mod tests {
                             .iter()
                             .map(|input| input.encoder)
                             .collect::<Vec<_>>(),
-                        vec![ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode]
+                        vec![MediaCall::LatentEncoding, MediaCall::VisionEncoding]
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }
