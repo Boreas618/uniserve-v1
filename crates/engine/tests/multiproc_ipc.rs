@@ -2154,7 +2154,6 @@ fn text_admission(
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
-            canvas: None,
         }),
         None,
         0,
@@ -3318,7 +3317,6 @@ mod trajectory {
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![1000, 1007],
             initial_position: 0,
-            canvas: None,
         };
         let image = uniserve_core::ImageParams {
             steps: IMAGE_STEPS as u16,

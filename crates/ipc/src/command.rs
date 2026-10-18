@@ -90,9 +90,6 @@ pub struct ArRequestParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
-    /// Block-diffusion sampling of a request that generates its text in
-    /// canvases; its seed is `sampling.seed`.
-    pub canvas: Option<CanvasSampling>,
 }
 
 pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};
@@ -204,12 +201,6 @@ impl NewRequest {
         );
         if let Some(ar) = &self.ar {
             ar.sampling.validate()?;
-            if let Some(canvas) = &ar.canvas
-                && let Some(parameter) = canvas.invalid_parameter()
-            {
-                bail_invalid!("invalid canvas sampling {parameter}");
-            }
-
             ensure_valid!(
                 ar.finish_token_ids.windows(2).all(|pair| pair[0] < pair[1]),
                 "autoregressive finish token ids are not canonical"

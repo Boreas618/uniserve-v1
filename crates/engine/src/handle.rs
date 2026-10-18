@@ -589,7 +589,6 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
-            canvas: None,
         }
     }
 

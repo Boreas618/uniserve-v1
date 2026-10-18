@@ -110,6 +110,7 @@ impl Scheduler {
                 }
                 let sampling_state = self.build_token_masks(id, 0, 0);
 
+                let generates_canvases = self.config.canvas.is_some();
                 self.plan_computation(id, |_scheduler, request| {
                     generation::plan_prompt(
                         request,
@@ -118,6 +119,7 @@ impl Scheduler {
                         Vec::new(),
                         0,
                         sampling_state,
+                        generates_canvases,
                     )
                 })
             }
@@ -313,7 +315,7 @@ impl Scheduler {
                 // chunk, or the previous block's commit, which makes the
                 // planned step the next block's step zero.
                 let st = self.running.get(&id)?;
-                let canvas = st.req.canvas.as_ref()?;
+                let canvas = self.config.canvas?;
                 let canvas_length = canvas.canvas_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
                 if (pending > 0
@@ -353,7 +355,7 @@ impl Scheduler {
                     return None;
                 }
                 self.plan_computation(id, |_scheduler, request| {
-                    generation::plan_canvas_step(request, block, step)
+                    generation::plan_canvas_step(request, &canvas, block, step)
                 })
             }
             Phase::CommitCanvas => {
@@ -572,6 +574,7 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0, 0);
+        let generates_canvases = self.config.canvas.is_some();
         self.plan_computation(id, |_scheduler, request| {
             generation::plan_prompt(
                 request,
@@ -580,6 +583,7 @@ impl Scheduler {
                 blocks,
                 block_tokens,
                 sampling_state,
+                generates_canvases,
             )
         })
     }

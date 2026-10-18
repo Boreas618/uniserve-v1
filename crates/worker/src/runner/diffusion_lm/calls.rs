@@ -200,7 +200,8 @@ impl Readouts {
 /// The denoising step `call` of `admission`'s request in `slot`, whose
 /// accepted visible prefix cache is `visible` tokens and whose block starts at
 /// logical position `position`. `served` is the sampling this worker steps
-/// blocks with (`None` on a rank that serves readouts only).
+/// blocks with, the deployment's (`None` on a rank that serves readouts
+/// only); the request carries none of its own.
 pub(crate) fn step_row(
     forward: &ForwardBatch,
     call: &Call,
@@ -216,22 +217,13 @@ pub(crate) fn step_row(
     let generation = admission
         .ar
         .as_ref()
-        .ok_or_else(|| Error::Invalid("a block step requires admitted block sampling".into()))?;
-    let sampling = generation
-        .canvas
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("a block step requires admitted block sampling".into()))?;
+        .ok_or_else(|| Error::Invalid("a block step requires an admitted generation".into()))?;
     let seed = generation
         .sampling
         .seed
         .ok_or_else(|| Error::Invalid("a block step requires a seeded request".into()))?;
-    let served =
+    let sampling =
         served.ok_or_else(|| Error::Invalid("this worker keeps no generating blocks".into()))?;
-    if served != sampling {
-        return Err(Error::Invalid(
-            "the admitted block sampling is not the sampling this worker serves".into(),
-        ));
-    }
     let slot = admission.request_pool_idx;
     read_only(forward, descriptors, slot, visible)?;
     let length = sampling.canvas_length;
@@ -328,7 +320,7 @@ mod tests {
         }
     }
 
-    fn admission(seed: Option<u64>, canvas: Option<CanvasSampling>) -> NewRequest {
+    fn admission(seed: Option<u64>) -> NewRequest {
         NewRequest::new(
             RequestKey::new(1, RequestId(7), 1),
             2,
@@ -340,7 +332,6 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
-                canvas,
             }),
             None,
             0,
@@ -444,6 +435,8 @@ mod tests {
         );
     }
 
+    /// A block step runs under the sampling this rank was launched with and
+    /// the request's seed.
     #[test]
     fn steps_require_the_served_sampling_and_a_seeded_request() -> Result<()> {
         let served = sampling();
@@ -455,7 +448,7 @@ mod tests {
             &rows,
             &canvas,
             &[0],
-            &admission(Some(seed), Some(served)),
+            &admission(Some(seed)),
             Some(&served),
             10,
             12,
@@ -476,23 +469,9 @@ mod tests {
         let refused = |admitted: &NewRequest, served: Option<&CanvasSampling>, call: &Call| {
             step_row(&rows, call, &[0], admitted, served, 10, 12).is_err()
         };
-        let seeded = admission(Some(1), Some(served));
-        assert!(refused(
-            &admission(None, Some(served)),
-            Some(&served),
-            &canvas
-        ));
-        assert!(refused(&admission(Some(1), None), Some(&served), &canvas));
+        let seeded = admission(Some(1));
+        assert!(refused(&admission(None), Some(&served), &canvas));
         assert!(refused(&seeded, None, &canvas));
-        let other = CanvasSampling {
-            t_min: 0.3,
-            ..served
-        };
-        assert!(refused(
-            &admission(Some(1), Some(other)),
-            Some(&served),
-            &canvas
-        ));
         // The last step of a block is the step limit's predecessor.
         assert!(refused(
             &seeded,

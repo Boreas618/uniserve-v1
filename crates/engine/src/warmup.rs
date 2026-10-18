@@ -79,9 +79,16 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
     };
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
+        // A deployment with block sampling generates every request but a
+        // readout in canvases, so admission checks its canvas features.
+        let canvases = config.worker_process.canvas_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
-            limits.features.contains(request.required_features())
-                && request.validate_resources(&limits).is_ok()
+            let needs = if canvases && !request.is_readout() {
+                request.canvas_features()
+            } else {
+                request.required_features()
+            };
+            limits.features.contains(needs) && request.validate_resources(&limits).is_ok()
         });
         if !refused.is_empty() {
             tracing::info!(
@@ -119,12 +126,9 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
             let blocks = if rows == 1 { 2 } else { 1 };
             let requests = servable(
                 "diffusion LM",
-                (0..rows)
-                    .map(|_| GenerationRequest {
-                        canvas: Some(sampling),
-                        ..request(blocks * length)
-                    })
-                    .collect(),
+                // The scheduler generates every such request in canvases of
+                // the deployment's block sampling.
+                (0..rows).map(|_| request(blocks * length)).collect(),
             );
             if !requests.is_empty() {
                 run(core, "diffusion LM", requests)?;
@@ -234,7 +238,6 @@ fn warmup_request(
             sample_feedback_continuation: false,
         },
         readout: Vec::new(),
-        canvas: None,
     }
 }
 
@@ -449,6 +452,8 @@ mod tests {
             confidence_threshold: 0.005,
             stability_threshold: 1,
         };
+        // The ranks are launched with the deployment's block sampling.
+        sim.set_canvas_sampling(canvas);
 
         let batches = warmed(sim, |config| {
             config.generation_limits = GenerationLimits {

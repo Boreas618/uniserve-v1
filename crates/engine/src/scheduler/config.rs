@@ -47,6 +47,11 @@ pub struct SchedulerConfig {
     /// bound. Submission counts waiting token and media requests together
     /// with finished requests whose output events are still retained.
     pub max_num_waiting: Option<usize>,
+    /// Block-diffusion sampling of every canvas the deployment generates, as
+    /// the ranks are launched with. A block-diffusion runtime has no
+    /// autoregressive decode, so each request it does not read out runs
+    /// under this sampling; without it the runtime serves readouts only.
+    pub canvas: Option<uniserve_core::CanvasSampling>,
 }
 
 impl Default for SchedulerConfig {
@@ -58,6 +63,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             max_num_waiting: None,
+            canvas: None,
         }
     }
 }
