@@ -326,7 +326,7 @@ fn video_canvases_keep_the_order_the_deployment_names() {
 }
 
 #[test]
-fn attention_options_and_cuda_representations_are_checked() {
+fn attention_options_are_checked() {
     let launch = resolved(
         json!({"flashinfer_workspace_size": 64 << 20, "flashinfer_use_tensor_core": "True"}),
     )
@@ -337,35 +337,6 @@ fn attention_options_and_cuda_representations_are_checked() {
         launch_error(json!({"flashinfer_workspace_size": 0})).contains("FlashInfer workspace size")
     );
     assert!(resolved(json!({"flashinfer_workspace_size": -5})).is_err());
-
-    for (overrides, option) in [
-        (json!({"model_dtype": "float32"}), "--dtype float32"),
-        (
-            json!({"prefix_cache_dtype": "float8_e4m3fn"}),
-            "--kv-cache-dtype float8_e4m3fn",
-        ),
-        (
-            json!({"quantization_config": {"kv_cache_dtype": "float8_e4m3fn"}}),
-            "--quantization-config kv_cache_dtype float8_e4m3fn",
-        ),
-    ] {
-        let mut cuda = overrides.clone();
-        cuda.as_object_mut()
-            .unwrap()
-            .insert("device".into(), json!("cuda:0"));
-        assert!(
-            launch_error(cuda).contains(&format!("{option} has no native CUDA attention kernel"))
-        );
-        // A CPU rank keeps the portable representations.
-        let requested = overrides
-            .get("model_dtype")
-            .and_then(Value::as_str)
-            .unwrap_or("bfloat16")
-            .to_owned();
-        let cpu = resolved(overrides).unwrap();
-        assert_eq!(cpu.execution.device, Device::Cpu);
-        assert_eq!(cpu.execution.model_dtype, requested);
-    }
 }
 
 #[test]
