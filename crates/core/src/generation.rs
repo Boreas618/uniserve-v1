@@ -218,18 +218,19 @@ pub struct ImageEncoderInput {
 
 /// Derives the cache identity of one ordered image encoder.
 ///
-/// `step_index` is the encoder's index in `ImageInput::encoders`. The engine
+/// `encoder_index` is the encoder's index in `ImageInput::encoders`. The engine
 /// derives the key when it looks up a cached product before encoding and
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
-pub fn encoder_cache_key(image_hash: u64, step_index: usize, encoder: MediaCall) -> u64 {
+pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: MediaCall) -> u64 {
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
-    // the stage index distinguishes repeated encoder kinds within one image input.
+    // the encoder index distinguishes repeated encoder kinds within one image
+    // input.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in image_hash
         .to_le_bytes()
         .into_iter()
-        .chain((step_index as u64).to_le_bytes())
+        .chain((encoder_index as u64).to_le_bytes())
         .chain([encoder as u8])
     {
         hash ^= u64::from(byte);

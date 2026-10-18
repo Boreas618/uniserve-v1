@@ -219,8 +219,8 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                let step_index = self.scheduled_feedback(id)?.0;
-                let step = feedback.feedback_encoders.get(step_index)?.encoder;
+                let encoder_index = self.scheduled_feedback(id)?.0;
+                let encoder = feedback.feedback_encoders.get(encoder_index)?.encoder;
                 let source = (feedback.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct))
                 .then(|| {
@@ -238,7 +238,7 @@ impl Scheduler {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
-                        step,
+                        encoder,
                         image_b64,
                         source,
                         true,
@@ -249,20 +249,20 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
-                let step_index = self.scheduled_feedback(id)?.0;
-                let is_final_step = step_index + 1 == feedback.feedback_encoders.len();
-                let encoder_input = *feedback.feedback_encoders.get(step_index)?;
+                let encoder_index = self.scheduled_feedback(id)?.0;
+                let is_final_encoder = encoder_index + 1 == feedback.feedback_encoders.len();
+                let encoder_input = *feedback.feedback_encoders.get(encoder_index)?;
                 let feature = self
                     .pending_output(id, |call| call.encoder_output.as_ref())
                     .or(st.feedback_features.as_ref())
                     .cloned();
-                let sample_continuation = is_final_step && feedback.sample_feedback_continuation;
+                let sample_continuation = is_final_encoder && feedback.sample_feedback_continuation;
                 let Some(feature) = feature else {
                     self.finish(id, FinishReason::Error);
                     return None;
                 };
 
-                let sampling_state = self.build_token_masks(id, 0, usize::from(is_final_step));
+                let sampling_state = self.build_token_masks(id, 0, usize::from(is_final_encoder));
                 self.plan_computation(id, |scheduler, request| {
                     generation::plan_image_extend(
                         &scheduler.generation_limits,

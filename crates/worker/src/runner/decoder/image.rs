@@ -427,11 +427,11 @@ impl ImageBatch<'_> {
                     .ok_or_else(|| {
                         Error::Invalid("image decoding requires image parameters".into())
                     })?;
-                // The slot's committed step, the latent pool's ledger, is
-                // the end of the admitted schedule once denoising completed.
+                // The slot's committed step index, the latent pool's ledger,
+                // is the end of the admitted schedule once denoising
+                // completed.
                 let slot = self.batch.calls[index].slot;
-                let committed = self.parts.latents()?.pool.committed_step(slot);
-                if committed != i64::from(steps) {
+                if self.parts.latents()?.pool.step_index(slot) != i64::from(steps) {
                     return Err(Error::Invalid(
                         "image decoding requires a completed trajectory".into(),
                     ));
@@ -450,9 +450,9 @@ impl ImageBatch<'_> {
                     .latent_input
                     .as_ref()
                     .map_or(0, |input| i64::from(input.generation));
-                let committed = latents.pool.committed_step(slot);
+                let step_index = latents.pool.step_index(slot);
                 let trajectory = TrajectoryVersion {
-                    step: committed,
+                    step_index,
                     generation,
                     units: i64::from(params.latent_units),
                     height: i64::from(params.height),
@@ -480,7 +480,7 @@ impl ImageBatch<'_> {
                 }));
                 self.updates.push((
                     *index,
-                    LatentUpdate::for_call(slot, call, params, committed)?,
+                    LatentUpdate::for_call(slot, call, params, step_index)?,
                 ));
             }
         }
