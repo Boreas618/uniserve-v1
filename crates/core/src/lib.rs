@@ -585,8 +585,6 @@ pub struct ImageParams {
     pub seed: Option<u64>,
     /// Maximum images this request may generate.
     pub max_images: u16,
-    /// Optional per-image prompt overrides.
-    pub image_prompts: Vec<String>,
     /// Whether completed image bytes remain available to the caller.
     pub retain_images: bool,
 }
@@ -859,7 +857,6 @@ impl Default for ImageParams {
             width: 512,
             seed: None,
             max_images: 1,
-            image_prompts: Vec::new(),
             retain_images: true,
         }
     }

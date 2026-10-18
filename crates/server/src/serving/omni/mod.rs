@@ -579,7 +579,6 @@ fn resolve_image_params(
         width: resolution.width,
         seed: sampling_seed.or(defaults.seed),
         max_images,
-        image_prompts: Vec::new(),
         retain_images: constraint != GenerationConstraint::GenOnly,
     })
 }
