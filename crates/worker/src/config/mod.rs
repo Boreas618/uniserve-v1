@@ -81,7 +81,6 @@ pub struct WorkerConfig {
     pub encoder_cache_entries: usize,
     /// Device of the generation tower when it is placed apart from `device`.
     pub generation_device: Option<Device>,
-    pub min_request_pool_size: usize,
     /// Device-storage grant after loaded weights and fixed overhead, in bytes.
     pub pool_storage_bytes: Option<usize>,
     pub model_dtype: String,
@@ -127,7 +126,6 @@ impl Default for WorkerConfig {
             max_request_pool_size: 128,
             encoder_cache_entries: 256,
             generation_device: None,
-            min_request_pool_size: 1,
             pool_storage_bytes: None,
             model_dtype: "bfloat16".into(),
             prefix_cache_dtype: None,
@@ -170,14 +168,14 @@ impl WorkerConfig {
     /// Each resident media request keeps two unresolved outputs and one
     /// retiring position, so it needs three queue positions; the rank serves
     /// as many concurrent requests as the queue holds slots, at most
-    /// `max_batch_calls`, and at least two. Request storage is then sized
-    /// by those slots instead of the token pool.
+    /// `max_batch_calls`. One slot pipelines a request in its three
+    /// positions, and requests serialize on it. Request storage is then
+    /// sized by those slots instead of the token pool.
     pub(crate) fn for_media_slots(&self, queue_depth: usize) -> Result<Self> {
         let slots = self.max_batch_calls.min(queue_depth / 3);
-        if slots < 2 {
+        if slots == 0 {
             return Err(Error::Unsupported(format!(
-                "resident media execution requires two slots of three queue positions each; queue depth {queue_depth} holds {}",
-                queue_depth / 3
+                "resident media execution requires three queue positions per request slot; queue depth {queue_depth} holds no slot"
             )));
         }
         Ok(Self {
@@ -186,7 +184,6 @@ impl WorkerConfig {
             max_batch_calls: slots,
             max_batch_tokens: slots,
             max_request_pool_size: slots,
-            min_request_pool_size: 2,
             ..self.clone()
         })
     }
@@ -216,12 +213,6 @@ impl WorkerConfig {
 
         if self.world_size == 0 || self.rank >= self.world_size {
             return Err(invalid("worker configuration process rank is invalid"));
-        }
-
-        if self.min_request_pool_size == 0
-            || self.min_request_pool_size > self.max_request_pool_size
-        {
-            return Err(invalid("worker request slot bounds are invalid"));
         }
 
         if self.block_size == Some(0)
@@ -298,6 +289,36 @@ impl WorkerConfig {
             return Err(invalid("worker KV dtype is unsupported"));
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A media rank keeps one request slot per three queue positions and
+    /// refuses a queue that holds none.
+    #[test]
+    fn media_slots_take_three_queue_positions_each() -> Result<()> {
+        let config = WorkerConfig::default();
+        for (queue_depth, slots) in [(3, 1), (6, 2), (8, 2), (24, 8)] {
+            let media = config.for_media_slots(queue_depth)?;
+            assert_eq!(
+                media.max_request_pool_size, slots,
+                "queue depth {queue_depth}"
+            );
+            assert_eq!(media.max_batch_calls, slots);
+            media.validate()?;
+        }
+        assert!(config.for_media_slots(2).is_err());
+
+        // The batch call bound caps the slots.
+        let narrow = WorkerConfig {
+            max_batch_calls: 1,
+            ..WorkerConfig::default()
+        };
+        assert_eq!(narrow.for_media_slots(24)?.max_request_pool_size, 1);
         Ok(())
     }
 }
