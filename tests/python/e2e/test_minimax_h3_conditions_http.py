@@ -253,8 +253,12 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
 # The OmniRef checkpoint packs at most 131,072 rows. Five seconds, 49,536
 # text tokens and 43,776 condition rows make the largest layout its workers
 # prepare 131,022 rows: 37,296 + 414 generated rows, the text capacity and
-# six 16:9 reference images of 7,296 condition rows each (57 whole tiles).
+# six 16:9 reference images of 7,296 condition rows each (57 whole tiles),
+# enlarged to their 2048-pixel short edge as the released pipeline enlarges
+# them.
 BOUND_OPTIONS = [
+    "--mm-processor-kwargs",
+    '{"enlarge_references": true}',
     "--max-video-seconds",
     "5",
     "--max-model-len",

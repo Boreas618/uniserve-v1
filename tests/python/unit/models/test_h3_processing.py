@@ -139,9 +139,12 @@ def _media(entry: dict[str, Any]) -> ImageFacts | VideoFacts | AudioFacts:
         return ImageFacts(media["width"], media["height"])
     if "display" in media:
         track = media.get("soundtrack")
+        # The vectors state a video's displayed size as its aspect.
         return VideoFacts(
             display_width=media["display"][0],
             display_height=media["display"][1],
+            width=media["display"][0],
+            height=media["display"][1],
             frame_rate=Fraction(*media["frame_rate"]),
             frames=media["frames"],
             soundtrack=None if track is None else _audio_facts(track),
@@ -161,6 +164,8 @@ def _plan(case: dict[str, Any]) -> RequestPlan:
         )
         for entry in case["conditions"]
     ]
+    # The vectors come from the released pipeline, which enlarges small
+    # references.
     return processing.plan_request(
         Task(case["task"]),
         Target(
@@ -170,6 +175,7 @@ def _plan(case: dict[str, Any]) -> RequestPlan:
         ),
         conditions,
         _VISION,
+        references=processing.ReferenceConfig(enlarge=True),
     )
 
 
@@ -397,3 +403,38 @@ def test_max_seconds_bounds_the_duration():
             max_seconds=8.0,
         )
     assert error.value.field == "target.duration_seconds"
+
+
+def test_references_keep_their_size_unless_enlarged():
+    """A reference image keeps its size unless it exceeds its encoding size.
+
+    By default a 1920x1080 image keeps its own size on the 32-pixel grid,
+    1080 rounding to 1088; enlarging scales it to the 2048-pixel short edge
+    as the released pipeline does. A 4096x2304 image is reduced to that edge
+    either way.
+    """
+
+    def planned(media, references):
+        plan = processing.plan_request(
+            Task.REF2VA,
+            Target(duration_seconds=5.0),
+            [
+                Condition(
+                    type=ConditionType.IMAGE, role=Role.REFERENCE, media=media
+                )
+            ],
+            _VISION,
+            references=references,
+        )
+        return plan.conditions[0].prepared
+
+    default, enlarged = (
+        processing.ReferenceConfig(),
+        processing.ReferenceConfig(enlarge=True),
+    )
+    small, large = ImageFacts(1920, 1080), ImageFacts(4096, 2304)
+    assert planned(small, default) == image.Config(height=1088, width=1920)
+    reduced = image.Config(height=2048, width=3648)
+    assert planned(small, enlarged) == reduced
+    for references in (default, enlarged):
+        assert planned(large, references) == reduced

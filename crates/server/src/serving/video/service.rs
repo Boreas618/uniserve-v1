@@ -19,7 +19,7 @@ use uniserve_core::video::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
     MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
-    RequestPlan, Target, VIDEO_FPS, VisionConfig, video_frame_count,
+    ReferenceConfig, RequestPlan, Target, VIDEO_FPS, VisionConfig, video_frame_count,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -90,12 +90,17 @@ impl VideoService {
     /// Binds the served denoiser, the checkpoint's vision processor, the
     /// deployment's duration capacity and stated condition-row capacity,
     /// the condition units its latent encoder covers in one round, its media
-    /// policy, and the tokenizer.
+    /// policy, how it sizes references, and the tokenizer.
     ///
     /// # Errors
     ///
     /// Fails when the handshake names a task this server does not know or
-    /// is otherwise invalid, or when the media fetcher cannot be built.
+    /// is otherwise invalid, when the reference config is invalid, or when
+    /// the media fetcher cannot be built.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the served denoiser and processors and each deployment option the service applies"
+    )]
     pub fn new(
         denoiser: VideoDenoiserInfo,
         vision: VisionConfig,
@@ -103,11 +108,13 @@ impl VideoService {
         max_condition_rows: Option<u32>,
         latent_encoding_lane: u32,
         media: &VideoMediaSettings,
+        references: ReferenceConfig,
         tokenizer: DynTokenizer,
     ) -> anyhow::Result<Self> {
         denoiser
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid video denoiser handshake: {error}"))?;
+        references.validate().map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
             .iter()
@@ -131,6 +138,7 @@ impl VideoService {
             // An empty list means the denoiser generates every canvas of the
             // canvas rule.
             canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
+            references,
         };
         Ok(Self {
             processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
@@ -151,7 +159,8 @@ impl VideoService {
 
     /// Describes the served video contract for `GET /v1/capabilities`.
     ///
-    /// Reports the tasks and their condition rules, the canvas rule, the
+    /// Reports the tasks and their condition rules, with how the deployment
+    /// sizes `ref2va` references, the canvas rule, the
     /// short edges and named aspect ratios the deployment serves and the
     /// canvas each pair resolves to, the duration range, the fixed schedule
     /// (its sigma points, the form `num_inference_steps` restates), the
@@ -176,6 +185,7 @@ impl VideoService {
             entry[aspect_ratio] = json!({"width": size.width, "height": size.height});
         }
         let limits = MediaLimits::new(self.media.max_request_bytes);
+        let references = self.processor.limits().references;
         let conditions: serde_json::Map<String, Value> = self
             .tasks
             .iter()
@@ -192,6 +202,8 @@ impl VideoService {
                         "max_audios": MAX_AUDIO_REFERENCES,
                         "max_references": MAX_REFERENCES,
                         "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
+                        "reference_image_short_edge": references.image_short_edge,
+                        "enlarge_references": references.enlarge,
                     }),
                 };
                 (task.as_str().to_owned(), rules)
@@ -517,7 +529,7 @@ mod tests {
     use image::ImageEncoder as _;
     use uniserve_core::video::plan::{
         AudioFacts, ConditionSpec, ConditionType, FrameRate, ImageFacts, MediaFacts, PlanLimits,
-        RequestPlan, Role, Target, VideoFacts, plan_request,
+        ReferenceConfig, RequestPlan, Role, Target, VideoFacts, plan_request,
     };
     use uniserve_core::{
         Canvas, ConditionMedia, ConditionRole, ConditionTiles, ConditionVision, ImageFit,
@@ -538,7 +550,8 @@ mod tests {
     }
 
     /// A denoiser serving every task that packs conditions as `tiles`
-    /// prescribes, on a latent encoder of one rank.
+    /// prescribes, on a latent encoder of one rank, in a deployment that
+    /// sizes references as the released pipeline does.
     fn packed_service(
         max_condition_rows: u32,
         max_sequence_rows: Option<u32>,
@@ -549,17 +562,20 @@ mod tests {
             max_sequence_rows,
             condition_tiles,
             1,
+            ReferenceConfig::RELEASED,
         )
     }
 
     /// A denoiser serving every task whose latent encoder covers
     /// `latent_encoding_lane` condition units in one round, on a deployment
-    /// that states `max_condition_rows` or no condition capacity.
+    /// that states `max_condition_rows` or no condition capacity and sizes
+    /// references as `references` states.
     fn encoding_service(
         max_condition_rows: Option<u32>,
         max_sequence_rows: Option<u32>,
         condition_tiles: Option<ConditionTiles>,
         latent_encoding_lane: u32,
+        references: ReferenceConfig,
     ) -> VideoService {
         VideoService::new(
             VideoDenoiserInfo {
@@ -576,6 +592,7 @@ mod tests {
             max_condition_rows,
             latent_encoding_lane,
             &VideoMediaSettings::default(),
+            references,
             Arc::new(character_tokenizer()),
         )
         .unwrap()
@@ -600,6 +617,7 @@ mod tests {
             tasks: VideoTask::ALL.to_vec(),
             max_video_seconds: 15.0,
             canvases: None,
+            references: ReferenceConfig::default(),
         };
         plan_request(task, &target, &specs, &media, &vision(), &limits).unwrap()
     }
@@ -617,6 +635,8 @@ mod tests {
         let video = VideoFacts {
             display_width: 16,
             display_height: 9,
+            width: 1920,
+            height: 1080,
             frame_rate: FrameRate {
                 numerator: 30_000,
                 denominator: 1001,
@@ -741,10 +761,10 @@ mod tests {
     #[test]
     fn an_unstated_capacity_refuses_no_condition_rows() {
         let plan = video_and_audio();
-        let unstated = encoding_service(None, None, None, 1);
+        let unstated = encoding_service(None, None, None, 1, ReferenceConfig::default());
         assert_eq!(unstated.check_rows(&plan, 1024), Ok(()));
 
-        let bounded = encoding_service(None, Some(76_683), None, 1);
+        let bounded = encoding_service(None, Some(76_683), None, 1, ReferenceConfig::default());
         let message = refusal(bounded.check_rows(&plan, 1024).unwrap_err());
         assert!(
             message.contains("76684") && message.contains("76683"),
@@ -807,25 +827,47 @@ mod tests {
     }
 
     /// A reference image becomes one condition the worker can read and
-    /// encode: its bytes published under its locator, resized to its 2048
-    /// short edge, read by the conditioner as one image block, and encoded
-    /// in one band of its patch rows per unit of a latent encoding round.
-    /// The presentation's tags travel with its tokens.
+    /// encode: its bytes published under its locator, sized as the
+    /// deployment sizes references (enlarged to its 2048 short edge here),
+    /// read by the conditioner as one image block, and encoded in one band
+    /// of its patch rows per unit of a latent encoding round. The
+    /// presentation's tags travel with its tokens. A deployment that does
+    /// not enlarge keeps the image at its own size on the 32-pixel grid.
     #[tokio::test]
     async fn a_reference_image_is_described_for_the_worker() {
         let image = png(160, 90);
-        let processed = encoding_service(Some(1 << 17), None, None, 4)
+        let body = serde_json::json!({
+            "model": "minimax_h3",
+            "prompt": "a fox",
+            "task": "ref2va",
+            "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
+            "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+        });
+        let unenlarged = encoding_service(Some(1 << 17), None, None, 4, ReferenceConfig::default())
             .process(
                 &ServeRequestId::new("reference"),
-                &request(serde_json::json!({
-                    "model": "minimax_h3",
-                    "prompt": "a fox",
-                    "task": "ref2va",
-                    "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
-                    "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
-                })),
+                &request(body.clone()),
                 1 << 16,
             )
+            .await
+            .unwrap();
+        // 90 is 2.8 patches and rounds to 96.
+        let own = Canvas {
+            width: 160,
+            height: 96,
+        };
+        assert_eq!(
+            unenlarged.request.conditions[0].media,
+            ConditionMedia::Image(ImageFit {
+                resized: own,
+                left: 0,
+                top: 0,
+                size: own,
+            })
+        );
+
+        let processed = encoding_service(Some(1 << 17), None, None, 4, ReferenceConfig::RELEASED)
+            .process(&ServeRequestId::new("reference"), &request(body), 1 << 16)
             .await
             .unwrap();
         let request = &processed.request;
@@ -876,7 +918,8 @@ mod tests {
     /// split into bands that fill it: on a four-unit lane nine square images
     /// take 1 x 8 + 4 units and six take 1 x 4 + 2 x 2, while seven, whose
     /// final three cannot share four units evenly, stay whole. A square
-    /// reference is 64 patch rows of 64 patches.
+    /// reference enlarged to its 2048 short edge is 64 patch rows of 64
+    /// patches.
     #[tokio::test]
     async fn reference_images_fill_their_final_latent_round() {
         let image = data_uri(&png(90, 90));
@@ -886,20 +929,26 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let processed = encoding_service(Some(1 << 17), None, None, 4)
-                .process(
-                    &ServeRequestId::new("images"),
-                    &request(serde_json::json!({
-                        "model": "minimax_h3",
-                        "prompt": "a fox",
-                        "task": "ref2va",
-                        "conditions": conditions,
-                        "target": {"short_edge": 768, "aspect_ratio": "1:1", "duration_seconds": 5.0},
-                    })),
-                    1 << 17,
-                )
-                .await
-                .unwrap();
+            let processed = encoding_service(
+                Some(1 << 17),
+                None,
+                None,
+                4,
+                ReferenceConfig::RELEASED,
+            )
+            .process(
+                &ServeRequestId::new("images"),
+                &request(serde_json::json!({
+                    "model": "minimax_h3",
+                    "prompt": "a fox",
+                    "task": "ref2va",
+                    "conditions": conditions,
+                    "target": {"short_edge": 768, "aspect_ratio": "1:1", "duration_seconds": 5.0},
+                })),
+                1 << 17,
+            )
+            .await
+            .unwrap();
             for (index, condition) in processed.request.conditions.iter().enumerate() {
                 let expected = if index < count - split {
                     vec![64 * 64]
@@ -920,7 +969,7 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let processed = encoding_service(Some(1 << 17), None, None, 4)
+        let processed = encoding_service(Some(1 << 17), None, None, 4, ReferenceConfig::default())
             .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({

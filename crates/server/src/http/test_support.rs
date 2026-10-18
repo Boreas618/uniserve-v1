@@ -115,6 +115,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         None,
         1,
         &crate::VideoMediaSettings::default(),
+        Default::default(),
         configured_tokenizer(),
     )
     .unwrap()
