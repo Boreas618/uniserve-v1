@@ -43,7 +43,7 @@ impl PrefillShape {
     /// Fit capture rows into the scratch cache pool without exceeding a row's
     /// token limit. Tokens that do not fit become graph padding.
     ///
-    /// Cache groups supply `(tokens per page, units per page)`. Page sizes are
+    /// Cache groups supply `(tokens per page, units per page)`. Block sizes are
     /// positive powers of two; the pool holds at least one page of each group.
     pub(crate) fn scratch_lengths(
         &self,

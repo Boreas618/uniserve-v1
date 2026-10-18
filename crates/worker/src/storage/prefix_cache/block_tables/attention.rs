@@ -49,7 +49,7 @@ impl GroupTable {
     /// The first query at `prefix` reaches furthest back into the window.
     fn first_page(&self, prefix: u32) -> u32 {
         self.shape.window.map_or(0, |window| {
-            prefix.saturating_sub(window) / self.shape.page_tokens
+            prefix.saturating_sub(window) / self.shape.block_size
         })
     }
 
@@ -66,7 +66,7 @@ impl GroupTable {
 
         let end = if self.shape.window.is_some() {
             self.end_page().min(
-                (u64::from(prefix) + u64::from(query)).div_ceil(u64::from(self.shape.page_tokens)),
+                (u64::from(prefix) + u64::from(query)).div_ceil(u64::from(self.shape.block_size)),
             )
         } else {
             self.end_page()

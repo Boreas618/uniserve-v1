@@ -90,7 +90,7 @@ pub(crate) const COMMIT_CACHE: i64 = 3;
 /// A numerical block table's page layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableShape {
-    pub(crate) page_tokens: u32,
+    pub(crate) block_size: u32,
     pub(crate) windowed: bool,
 }
 

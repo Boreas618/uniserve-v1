@@ -162,7 +162,7 @@ class _Session:
             None,
             TOKENS,
             2 * ROWS,
-            [group.page_tokens for group in groups],
+            [group.block_size for group in groups],
             [group.window is not None for group in groups],
         ]
         if sampling:
@@ -266,7 +266,7 @@ class _Session:
                 blocks=(tuple(self._units(number)),),
                 query_lengths=(self.setup.prompt,),
                 prefix_lengths=(0,),
-                block_size=self.pool.groups[table.group].page_tokens,
+                block_size=self.pool.groups[table.group].block_size,
                 causal=True,
                 device=self.setup.device,
             )
@@ -371,8 +371,8 @@ class _Session:
             group = self.pool.groups[table.group]
             first = 0
             if group.window is not None:
-                first = max(prompt - group.window, 0) // group.page_tokens
-            pages = math.ceil(prompt / group.page_tokens) - first
+                first = max(prompt - group.window, 0) // group.block_size
+            pages = math.ceil(prompt / group.block_size) - first
             units = self._units(number)[first : first + pages]
             tables = buffers["attention.block_tables"][number]
             tables[:rows].zero_()
@@ -406,7 +406,7 @@ class _Session:
                     self.buffers["attention.block_tables"][
                         number, : len(queries), : widths[number]
                     ].clone(),
-                    group.page_tokens,
+                    group.block_size,
                     torch.tensor(first, dtype=torch.int32, device=device)
                     if windowed
                     else None,

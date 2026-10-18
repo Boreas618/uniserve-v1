@@ -169,7 +169,7 @@ fn fp8_plan() -> CachePlan {
         dtype: PrefixCacheDtype::Float8E4m3Fn,
         groups: vec![CacheGroupPlan {
             window: None,
-            page_tokens: 8,
+            block_size: 8,
             units_per_page: 1,
             layers: vec!["a".into(), "b".into()],
             layer_ids: vec![0, 1],

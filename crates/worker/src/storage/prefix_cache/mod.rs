@@ -173,7 +173,7 @@ impl PrefixCache {
         let mut spans = Vec::new();
         for group in 0..self.tables.groups().len() as u32 {
             let table = self.tables.table(slot, group)?;
-            let start = u64::from(table.start_page) * u64::from(table.shape.page_tokens);
+            let start = u64::from(table.start_page) * u64::from(table.shape.block_size);
             if length > start {
                 spans.extend(table.spans(start, length - start)?);
             }
@@ -596,7 +596,7 @@ impl PrefixCache {
             shapes
                 .iter()
                 .map(|shape| {
-                    length.max(1).div_ceil(shape.page_tokens as usize)
+                    length.max(1).div_ceil(shape.block_size as usize)
                         * shape.units_per_page as usize
                 })
                 .sum()
@@ -607,7 +607,7 @@ impl PrefixCache {
         let mut tables = Vec::new();
         for (row, &length) in lengths.iter().enumerate() {
             for (group, shape) in shapes.iter().enumerate() {
-                let pages = length.max(1).div_ceil(shape.page_tokens as usize);
+                let pages = length.max(1).div_ceil(shape.block_size as usize);
                 let units = pages * shape.units_per_page as usize;
                 tables.push(BlockTable {
                     request_pool_idx: row as u32 + 1,
@@ -616,7 +616,7 @@ impl PrefixCache {
                     unit_ids: (unit..unit + units as u32)
                         .map(uniserve_core::UnitId)
                         .collect(),
-                    allocated_tokens: (pages * shape.page_tokens as usize) as u32,
+                    allocated_tokens: (pages * shape.block_size as usize) as u32,
                 });
                 unit += units as u32;
             }

@@ -152,7 +152,7 @@ pub(super) fn installs(plan: &BatchPlan) -> impl Iterator<Item = &Call> {
 }
 
 /// Every cache span the batch writes: whole newly assigned units (a recycled
-/// unit may have served another group's page size), forward rows that
+/// unit may have served another group's block size), forward rows that
 /// write their queries, and the extent each install copies.
 fn write_spans(
     prefix_cache: &mut PrefixCache,
@@ -195,7 +195,7 @@ fn write_spans(
         let slot = requests.get(call.request_key.request_id.0)?.slot() as u32;
         for table in tables.for_batch(slot, &plan.block_tables)? {
             let start = u64::from(transfer.base_extent)
-                .max(u64::from(table.start_page) * u64::from(table.shape.page_tokens));
+                .max(u64::from(table.start_page) * u64::from(table.shape.block_size));
             let end = u64::from(transfer.exported_extent);
             if start < end {
                 spans.extend(table.spans(start, end - start)?);

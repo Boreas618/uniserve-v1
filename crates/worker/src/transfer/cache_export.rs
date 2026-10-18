@@ -27,12 +27,12 @@ use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// The pages a token interval touches: `(absolute page, offset, length)`.
-fn pages(start: u64, end: u64, page_tokens: u64) -> Vec<(u64, u32, u32)> {
+fn pages(start: u64, end: u64, block_size: u64) -> Vec<(u64, u32, u32)> {
     let mut pages = Vec::new();
     let mut position = start;
     while position < end {
-        let (page, offset) = (position / page_tokens, position % page_tokens);
-        let length = (end - position).min(page_tokens - offset);
+        let (page, offset) = (position / block_size, position % block_size);
+        let length = (end - position).min(block_size - offset);
         pages.push((page, offset as u32, length as u32));
         position += length;
     }
@@ -221,7 +221,7 @@ pub(crate) fn export(
         if visible > base_extent {
             groups.push(CacheGroupTransfer {
                 start,
-                page_tokens: table.shape.page_tokens,
+                block_size: table.shape.block_size,
                 tensors: Vec::new(),
             });
         }
@@ -309,7 +309,7 @@ fn export_group(
     let pages = pages(
         u64::from(export.start),
         u64::from(export.visible),
-        u64::from(table.shape.page_tokens),
+        u64::from(table.shape.block_size),
     );
     let mut retain = |retirement| accesses.retain_export(buffer, retirement);
 
@@ -500,7 +500,7 @@ mod tests {
             dtype: PrefixCacheDtype::Float8E4m3Fn,
             groups: vec![CacheGroupPlan {
                 window: None,
-                page_tokens: tokens as u32,
+                block_size: tokens as u32,
                 units_per_page: 1,
                 layers: vec!["a".into(), "b".into()],
                 layer_ids: vec![0, 1],

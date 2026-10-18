@@ -273,7 +273,7 @@ class DiffusionLMRunner:
             on the stream, or ``None``.
         tokens: The most tokens one forward evaluates.
         rows: The most sequences one forward evaluates.
-        page_tokens: Tokens per page of each numerical block table.
+        block_size: Tokens per page of each numerical block table.
         windowed: Whether each numerical block table retires pages behind
             an attention window.
         chunk_rows: Blocks the head projects and the sampler steps at a
@@ -305,7 +305,7 @@ class DiffusionLMRunner:
         collectives,
         tokens: int,
         rows: int,
-        page_tokens: Sequence[int],
+        block_size: Sequence[int],
         windowed: Sequence[int],
         chunk_rows: int,
         max_steps: int = 0,
@@ -333,7 +333,7 @@ class DiffusionLMRunner:
         context.prepare(TextSize(int(tokens), int(rows)))
         # Expert joins of the rank run through this context.
         self.context = self._context = context
-        self._page_tokens = tuple(int(value) for value in page_tokens)
+        self._block_sizes = tuple(int(value) for value in block_size)
         self._windowed = tuple(bool(value) for value in windowed)
 
         backbone = self._model.backbone
@@ -505,7 +505,7 @@ class DiffusionLMRunner:
         # Every token sees its whole sequence.
         current = shared.values[:, None].expand(-1, visible)
         entries = {}
-        for number, page_tokens in enumerate(self._page_tokens):
+        for number, block_size in enumerate(self._block_sizes):
             windowed = self._windowed[number]
             first = None
             if windowed:
@@ -515,7 +515,7 @@ class DiffusionLMRunner:
                 )
             blocks = BlockTable(
                 block_tables[number, :rows, : int(widths[number])],
-                page_tokens,
+                block_size,
                 start_pages[number, :rows] if windowed else None,
                 first,
             )

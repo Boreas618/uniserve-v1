@@ -171,14 +171,14 @@ class CausalLMRunner:
         rows: The most rows one forward evaluates.
         tokens: The most tokens one forward evaluates.
         width: The most pages one row selects from a block table.
-        page_tokens: Tokens per page of each numerical block table.
+        block_size: Tokens per page of each numerical block table.
         windowed: Whether each numerical block table retires pages behind
             an attention window.
         unit_tables: ``[tables, S, units]`` int32, each slot's installed
             units from its installed start page on.
         start_pages: ``[groups, S]`` int32, each slot's installed start
             page.
-        table_shapes: ``[tables, 3]`` int32 ``(group, page tokens, window
+        table_shapes: ``[tables, 3]`` int32 ``(group, block size, window
             or -1)``.
         verified_lengths: ``[S]`` int32, each slot's verified cache length.
         future_input_tokens: ``[S, 1]`` int64, each slot's next input token.
@@ -210,7 +210,7 @@ class CausalLMRunner:
         rows: int,
         tokens: int,
         width: int,
-        page_tokens: Sequence[int],
+        block_size: Sequence[int],
         windowed: Sequence[int],
         unit_tables: torch.Tensor,
         start_pages: torch.Tensor,
@@ -265,7 +265,7 @@ class CausalLMRunner:
         rows, tokens = int(rows), int(tokens)
         with self._scope():
             self._attention_metadata = AttentionMetadata(
-                page_tokens,
+                block_size,
                 windowed,
                 unit_tables,
                 start_pages,

@@ -8,7 +8,7 @@
 //! Vocabulary: a *unit* is one allocation unit of the pool (unit 0 is the
 //! padding sentinel); a *column* is a layer's position inside a unit
 //! (`columns = gcd(layers per group)`); a *plane* is the bytes of one
-//! (field, column) of one unit; a group's logical page of `page_tokens`
+//! (field, column) of one unit; a group's logical page of `block_size`
 //! tokens occupies `units_per_page` units.
 
 use uniserve_core::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
@@ -36,7 +36,7 @@ pub struct GroupAxis {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheGroupPlan {
     pub window: Option<u32>,
-    pub page_tokens: u32,
+    pub block_size: u32,
     pub units_per_page: u32,
     /// Resident layer names in column order: layer `k` lies in column
     /// `k % columns` of a page's unit `k / columns`.
@@ -61,7 +61,7 @@ impl CacheGroupPlan {
     }
 
     pub(crate) fn shape(&self) -> Result<GroupShape> {
-        GroupShape::new(self.page_tokens, self.units_per_page, self.window)
+        GroupShape::new(self.block_size, self.units_per_page, self.window)
     }
 }
 
@@ -161,7 +161,7 @@ impl CachePlan {
         // One value per group; a window of -1 keeps the whole history.
         let windows =
             integers(call("windows")?).map_err(|error| Error::numerical("windows", &error))?;
-        let page_tokens = counts("page_tokens")?;
+        let block_sizes = counts("block_sizes")?;
         let units_per_page = counts("units_per_page")?;
         let (axis_offsets, axis_sizes) = (counts("axis_offsets")?, counts("axis_sizes")?);
         let (num_kv_heads, total_kv_heads) = (counts("num_kv_heads")?, counts("total_kv_heads")?);
@@ -176,7 +176,7 @@ impl CachePlan {
             .enumerate()
             .map(|(group, layer_count)| CacheGroupPlan {
                 window: u32::try_from(windows[group]).ok(),
-                page_tokens: page_tokens[group],
+                block_size: block_sizes[group],
                 units_per_page: units_per_page[group],
                 layers: layers.by_ref().take(layer_count as usize).collect(),
                 layer_ids: layer_ids.by_ref().take(layer_count as usize).collect(),
@@ -217,7 +217,7 @@ impl CachePlan {
     pub(crate) fn unit_tokens(&self) -> u32 {
         self.groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .max()
             .unwrap_or(0)
     }
@@ -243,7 +243,7 @@ impl CachePlan {
                     kind: group.window.map_or(CacheGroupKind::Full, |window| {
                         CacheGroupKind::SlidingWindow { window }
                     }),
-                    page_tokens: group.page_tokens,
+                    block_size: group.block_size,
                     units_per_page: group.units_per_page,
                     layer_ids: group.layer_ids.clone(),
                     num_kv_heads: group.num_kv_heads,
@@ -256,13 +256,13 @@ impl CachePlan {
     }
 
     /// Elements `E` and scale entries `S` of the largest group page, which
-    /// size a cache import workspace: `E = page_tokens * layers * heads * dim`
-    /// and `S = page_tokens * layers * heads`, maximized over groups.
+    /// size a cache import workspace: `E = block_size * layers * heads * dim`
+    /// and `S = block_size * layers * heads`, maximized over groups.
     pub(crate) fn page_extents(&self) -> (u64, u64) {
         self.groups
             .iter()
             .fold((0, 0), |(elements, scales), group| {
-                let rows = u64::from(group.page_tokens)
+                let rows = u64::from(group.block_size)
                     * group.layers.len() as u64
                     * u64::from(group.num_kv_heads);
                 (

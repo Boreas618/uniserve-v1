@@ -17,7 +17,7 @@ pub use storage::BlockTableStorage;
 /// Page dimensions needed to address one cache group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupShape {
-    pub page_tokens: u32,
+    pub block_size: u32,
     pub units_per_page: u32,
     pub window: Option<u32>,
 }
@@ -28,7 +28,7 @@ impl GroupShape {
     pub(crate) fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
         max_sequence_tokens
             .max(1)
-            .div_ceil(u64::from(self.page_tokens))
+            .div_ceil(u64::from(self.block_size))
     }
 
     /// A windowed call selects its history and queries plus the partial page
@@ -37,21 +37,21 @@ impl GroupShape {
         let resident = self.resident_width(max_sequence_tokens);
         self.window.map_or(resident, |window| {
             resident.min(
-                (u64::from(window) + max_query_tokens.max(1)).div_ceil(u64::from(self.page_tokens))
+                (u64::from(window) + max_query_tokens.max(1)).div_ceil(u64::from(self.block_size))
                     + 1,
             )
         })
     }
 
-    pub fn new(page_tokens: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
-        if page_tokens == 0 || units_per_page == 0 {
+    pub fn new(block_size: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
+        if block_size == 0 || units_per_page == 0 {
             return Err(Error::Invalid(
                 "cache page dimensions must be positive".into(),
             ));
         }
 
         Ok(Self {
-            page_tokens,
+            block_size,
             units_per_page,
             window,
         })
@@ -95,7 +95,7 @@ impl GroupTable {
     /// Map absolute tokens to `(unit, token offset, token count)` intervals.
     /// Every unit in a page holds these tokens for its own subset of layers.
     pub(crate) fn spans(&self, mut start: u64, mut length: u64) -> Result<Vec<(u32, u32, u32)>> {
-        let tokens = u64::from(self.shape.page_tokens);
+        let tokens = u64::from(self.shape.block_size);
         let units = self.shape.units_per_page as usize;
         let end = start.checked_add(length);
         if (length > 0 && start < u64::from(self.start_page) * tokens)
@@ -223,9 +223,9 @@ impl BlockTables {
         let mut spans = Vec::new();
         for (group, table) in tables.iter().enumerate() {
             self.validate_table(group, table)?;
-            let page_tokens = u64::from(table.shape.page_tokens);
+            let block_size = u64::from(table.shape.block_size);
             if table.allocated_tokens < transfer.exported_extent
-                || u64::from(table.start_page) * page_tokens > u64::from(transfer.exported_extent)
+                || u64::from(table.start_page) * block_size > u64::from(transfer.exported_extent)
             {
                 return Err(Error::Invalid(
                     "cache import exceeds its scheduler block table".into(),
@@ -236,7 +236,7 @@ impl BlockTables {
                 let installed = self.table(slot, group as u32)?;
                 let first = table.start_page.max(installed.start_page) as u64;
                 let last = u64::from(transfer.base_extent)
-                    .div_ceil(page_tokens)
+                    .div_ceil(block_size)
                     .min(table.end_page())
                     .min(installed.end_page());
                 let per_page = table.shape.units_per_page as usize;
@@ -277,7 +277,7 @@ impl BlockTables {
         let unit_tokens = self
             .groups
             .iter()
-            .map(|group| group.page_tokens)
+            .map(|group| group.block_size)
             .fold(0, u32::max);
         spans.extend(initialized.iter().map(|&unit| (unit, 0, unit_tokens)));
         Ok(spans)
@@ -296,7 +296,7 @@ impl BlockTables {
             || table.units.len() / per_page > self.width
             || table.units.iter().any(|unit| unit.0 >= self.num_units)
             || u64::from(table.allocated_tokens)
-                > table.end_page() * u64::from(table.shape.page_tokens)
+                > table.end_page() * u64::from(table.shape.block_size)
         {
             return Err(Error::Invalid("scheduler block table is invalid".into()));
         }

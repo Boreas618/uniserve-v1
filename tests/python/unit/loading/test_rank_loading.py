@@ -67,7 +67,7 @@ def test_cache_plan_describes_pages_of_the_requested_size(loaded):
     plan = cache.cache_plan(model, 32, "")
     assert cache.reads_pages(model, "torch", plan) is True
     assert plan.dtype() == "bfloat16"
-    assert plan.page_tokens() == [32]
+    assert plan.block_sizes() == [32]
     assert plan.layers() == ["backbone.layers.0.attention"]
     assert plan.layer_ids() == [0]
     assert plan.windows() == [-1]

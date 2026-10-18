@@ -2,7 +2,7 @@
 //!
 //! An import reads another rank's cache export into this rank's pages on an
 //! import thread. When the source stores the destination's representation
-//! (same dtype; for FP8 also page-aligned with the same page size, compute
+//! (same dtype; for FP8 also page-aligned with the same block size, compute
 //! dtype and one source scale group per destination head range), transports
 //! write the live pages directly, one layer at a time to bound the read
 //! fan-out. Otherwise each destination page span is read into the
@@ -230,9 +230,9 @@ impl ImportCopy {
             if direct && plan.quantized {
                 // Partial pages keep their destination scale; an intact
                 // source scale can only serve one destination head group.
-                let page_tokens = self.tables[index].shape.page_tokens;
-                direct = group.page_tokens == page_tokens
-                    && group.start.is_multiple_of(page_tokens)
+                let block_size = self.tables[index].shape.block_size;
+                direct = group.block_size == block_size
+                    && group.start.is_multiple_of(block_size)
                     && self.export.compute_dtype == target.compute_dtype.name()
                     && head / scale_heads
                         == (head + u64::from(target.num_kv_heads) - 1) / scale_heads;
@@ -456,8 +456,8 @@ impl GroupCopy<'_> {
         let table = &backend.tables[self.index];
         let workspace = self.workspace;
         let elements = workspace.elements;
-        let page_tokens = u64::from(table.shape.page_tokens);
-        let source_page_tokens = u64::from(group.page_tokens);
+        let block_size = u64::from(table.shape.block_size);
+        let source_block_size = u64::from(group.block_size);
         let start = u64::from(group.start);
         let end = u64::from(backend.export.exported_extent);
         let extent = |axis: &Range<u64>| (axis.end - axis.start) as i64;
@@ -470,10 +470,10 @@ impl GroupCopy<'_> {
 
         let mut position = start;
         while position < end {
-            let page = position / page_tokens;
-            let offset = position % page_tokens;
-            let count = (end - position).min(page_tokens - offset);
-            let source_offset = position % source_page_tokens;
+            let page = position / block_size;
+            let offset = position % block_size;
+            let count = (end - position).min(block_size - offset);
+            let source_offset = position % source_block_size;
             let shape = [count as i64, layers, heads, width];
             let region = [
                 position - start..position - start + count,
@@ -491,8 +491,8 @@ impl GroupCopy<'_> {
             }
             let mut pages = 0;
             if self.scale_heads > 0 {
-                let first = position / source_page_tokens - start / source_page_tokens;
-                pages = (source_offset + count).div_ceil(source_page_tokens);
+                let first = position / source_block_size - start / source_block_size;
+                pages = (source_offset + count).div_ceil(source_block_size);
                 let groups = self.axes[1].end.div_ceil(self.scale_heads)
                     - self.axes[1].start / self.scale_heads;
                 let region = [
@@ -523,7 +523,7 @@ impl GroupCopy<'_> {
                 count as i64,
                 offset as i64,
                 source_offset as i64,
-                source_page_tokens as i64,
+                source_block_size as i64,
                 self.scale_heads as i64,
                 pages as i64,
             );

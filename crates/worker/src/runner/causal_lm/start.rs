@@ -88,7 +88,7 @@ impl TextBounds {
             }
             for _ in 0..shape.units_per_page {
                 tables.push(TableShape {
-                    page_tokens: shape.page_tokens,
+                    block_size: shape.block_size,
                     windowed: shape.window.is_some(),
                 });
                 widths.push(width as i64);
@@ -116,7 +116,7 @@ impl TextBounds {
         };
         let pages: Vec<(usize, usize)> = shapes
             .iter()
-            .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
+            .map(|shape| (shape.block_size as usize, shape.units_per_page as usize))
             .collect();
         let prefill = if graphs && config.prefill_cuda_graph {
             let pool_rows = units.map_or(max_rows, |units| {
@@ -384,7 +384,7 @@ impl CausalLMRunners {
         let table_layout: Vec<i64> = bounds
             .tables
             .iter()
-            .map(|table| i64::from(table.page_tokens))
+            .map(|table| i64::from(table.block_size))
             .collect();
         let windowed: Vec<i64> = bounds
             .tables
@@ -444,7 +444,7 @@ impl CausalLMRunners {
                 rows: bounds.rows,
                 tokens: bounds.tokens,
                 width: bounds.width(),
-                page_tokens: &table_layout,
+                block_size: &table_layout,
                 windowed: &windowed,
                 state: [
                     slot_table("unit_tables")?,

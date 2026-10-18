@@ -97,7 +97,7 @@ pub struct WorkerProcessArgs {
     /// Optional prefix cache capacity in tokens (`--max-total-tokens`).
     pub max_total_tokens: Option<u64>,
     /// Tokens per cache page of the cache group with the widest token rows;
-    /// the worker derives every other group's page size from it. `None`
+    /// the worker derives every other group's block size from it. `None`
     /// lets the worker choose it from its cache layers and attention
     /// kernels.
     pub block_size: Option<u32>,

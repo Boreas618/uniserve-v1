@@ -66,7 +66,7 @@ def test_hybrid_plan_groups_layers_by_window_and_page_shape():
     assert (plan.quantized(), plan.dtype()) == (False, "float32")
     # One value per group: the windowed group, then the full one.
     assert plan.windows() == [8, -1]
-    assert plan.page_tokens() == [16, 32]
+    assert plan.block_sizes() == [16, 32]
     assert plan.units_per_page() == [5, 1]
     assert plan.layer_counts() == [len(WINDOWED), len(FULL)]
     assert plan.layers() == [
@@ -119,7 +119,7 @@ def test_portable_attention_reads_every_page():
 
 
 @pytest.mark.gpu
-def test_native_attention_bounds_the_hybrid_page_size():
+def test_native_attention_bounds_the_hybrid_block_size():
     heads = ((16, 8, 256), (16, 2, 512))
     hybrid = _model(dtype=torch.bfloat16, heads=heads).cuda()
     # Full-attention rows occupy half the bytes, so a 64-token base page
@@ -129,7 +129,7 @@ def test_native_attention_bounds_the_hybrid_page_size():
     )
     plan = cache.cache_plan(hybrid, 32, "")
     assert cache.reads_pages(hybrid, "auto", plan)
-    assert sorted(plan.page_tokens()) == [32, 64]
+    assert sorted(plan.block_sizes()) == [32, 64]
 
     uniform = _model(layers=1, dtype=torch.bfloat16, heads=heads).cuda()
     assert cache.reads_pages(uniform, "auto", cache.cache_plan(uniform, 64, ""))

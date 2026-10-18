@@ -77,7 +77,7 @@ fn tables(slot: u32, groups: &[Vec<UnitId>], tokens: u32, plan: &CachePlan) -> V
             unit_ids: unit_ids.clone(),
             allocated_tokens: tokens.min(
                 unit_ids.len() as u32 / plan.groups[group].units_per_page
-                    * plan.groups[group].page_tokens,
+                    * plan.groups[group].block_size,
             ),
         })
         .collect()

@@ -135,7 +135,7 @@ def _group_layers(model: CausalLM, planes: Planes) -> list[list[int]]:
 
 @dataclass(frozen=True)
 class CachePlan:
-    """A rank's K/V unit pool for one page size, read column by column.
+    """A rank's K/V unit pool for one block size, read column by column.
 
     ``columns``, ``plane_bytes``, ``quantized``, ``unit_bytes`` and
     ``dtype`` describe the pool. Every other method returns one value per
@@ -187,9 +187,9 @@ class CachePlan:
             for group in self.planes.groups
         ]
 
-    def page_tokens(self) -> list[int]:
-        """Tokens of each group's logical page."""
-        return [int(group.page_tokens) for group in self.planes.groups]
+    def block_sizes(self) -> list[int]:
+        """Tokens of each group's logical page, its block size."""
+        return [int(group.block_size) for group in self.planes.groups]
 
     def units_per_page(self) -> list[int]:
         """Units each group's logical page occupies."""
@@ -243,7 +243,7 @@ class CachePlan:
 def cache_plan(loaded, block_size: int, prefix_cache_dtype: str) -> CachePlan:
     """Describe the rank's K/V unit pool for ``block_size``-token pages.
 
-    ``block_size`` is the page size of the group with the widest token rows;
+    ``block_size`` is the block size of the group with the widest token rows;
     every other group's page holds as many tokens as fit the same plane.
     ``prefix_cache_dtype`` is ``""`` for each layer's compute dtype, a dense
     dtype name, or ``"float8_e4m3fn"`` for FP8 storage.
@@ -323,7 +323,7 @@ def reads_pages(loaded, backend: str, plan: CachePlan) -> bool:
     provider = resolve(backend, device=device)
     for group in plan.planes.groups:
         pages = CachePages(
-            int(group.page_tokens), group.dtype, plan.planes.quantized
+            int(group.block_size), group.dtype, plan.planes.quantized
         )
         for name in group.layers:
             reader = readers[name]

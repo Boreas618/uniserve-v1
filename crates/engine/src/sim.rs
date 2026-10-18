@@ -1273,7 +1273,7 @@ impl SimEngine {
             .num_units = count;
     }
 
-    /// Sets every cache group's page size in tokens.
+    /// Sets every cache group's block size in tokens.
     ///
     /// # Panics
     ///
@@ -1282,7 +1282,7 @@ impl SimEngine {
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
     )]
-    pub fn set_page_tokens(&mut self, tokens: u32) {
+    pub fn set_block_size(&mut self, tokens: u32) {
         for group in &mut self
             .info
             .prefix_cache
@@ -1290,7 +1290,7 @@ impl SimEngine {
             .expect("sim AR worker has a prefix cache")
             .groups
         {
-            group.page_tokens = tokens;
+            group.block_size = tokens;
         }
     }
 

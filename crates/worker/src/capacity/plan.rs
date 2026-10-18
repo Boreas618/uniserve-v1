@@ -1,9 +1,9 @@
-//! Startup capacity planning: page size, request slots, cache units, latent
+//! Startup capacity planning: block size, request slots, cache units, latent
 //! pages and the [`WorkerInfo`] the rank reports.
 //!
 //! Planning runs after the model is loaded, so measured device storage
 //! includes the weights. Every quantity the engine schedules against must be
-//! identical on the ranks of a group, so the page size, the request-slot fit
+//! identical on the ranks of a group, so the block size, the request-slot fit
 //! and the cache unit count are agreed over the group's [`HostGroup`] with a
 //! minimum reduction.
 //!
@@ -44,12 +44,12 @@ pub(crate) fn product_bytes(outputs: &[OutputInfo]) -> u64 {
         .sum()
 }
 
-/// The largest page size of at most 64 tokens that every resident layer's
+/// The largest block size of at most 64 tokens that every resident layer's
 /// attention reads, agreed over `group` as the minimum.
 ///
 /// A preset size is used unchanged and needs no agreement: every rank was
 /// launched with it. `readable` plans the pool for one candidate size.
-pub(crate) fn page_size(
+pub(crate) fn resolve_block_size(
     preset: Option<usize>,
     mut readable: impl FnMut(usize) -> Result<bool>,
     group: &HostGroup,
@@ -62,7 +62,7 @@ pub(crate) fn page_size(
         size /= 2;
         if size == 0 {
             return Err(Error::Unsupported(
-                "no KV page size of at most 64 tokens is read by the attention of every resident cache layer".into(),
+                "no KV block size of at most 64 tokens is read by the attention of every resident cache layer".into(),
             ));
         }
     }
@@ -341,7 +341,7 @@ impl TokenLayout {
         let pages: Vec<(u32, u32)> = cache
             .groups
             .iter()
-            .map(|group| (group.page_tokens, group.units_per_page))
+            .map(|group| (group.block_size, group.units_per_page))
             .collect();
         let reserved_units = graph_storage_budget_bytes(total_bytes as i64).div_ceil(unit_bytes)
             + self
@@ -577,7 +577,7 @@ pub(crate) mod tests {
             dtype: uniserve_core::PrefixCacheDtype::BFloat16,
             groups: vec![crate::storage::CacheGroupPlan {
                 window: None,
-                page_tokens: 64,
+                block_size: 64,
                 units_per_page: 2,
                 layers: vec!["layers.0".into(), "layers.1".into()],
                 layer_ids: vec![0, 1],
@@ -611,9 +611,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_page_size_halves_until_every_layer_reads_it() {
+    fn the_block_size_halves_until_every_layer_reads_it() {
         let mut probed = Vec::new();
-        let size = page_size(
+        let size = resolve_block_size(
             None,
             |size| {
                 probed.push(size);
@@ -624,8 +624,11 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(size, 16);
         assert_eq!(probed, vec![64, 32, 16]);
-        assert_eq!(page_size(Some(8), |_| Ok(false), &group()).unwrap(), 8);
-        assert!(page_size(None, |_| Ok(false), &group()).is_err());
+        assert_eq!(
+            resolve_block_size(Some(8), |_| Ok(false), &group()).unwrap(),
+            8
+        );
+        assert!(resolve_block_size(None, |_| Ok(false), &group()).is_err());
     }
 
     #[test]

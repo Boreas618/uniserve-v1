@@ -88,7 +88,7 @@ pub(crate) struct Construction<'a> {
     pub(crate) rows: usize,
     pub(crate) tokens: usize,
     pub(crate) width: usize,
-    pub(crate) page_tokens: &'a [i64],
+    pub(crate) block_size: &'a [i64],
     pub(crate) windowed: &'a [i64],
     /// The constructor's tensors in parameter order: `unit_tables`,
     /// `start_pages`, `table_shapes`, `verified_lengths`,
@@ -117,7 +117,7 @@ pub(crate) fn construct(construction: &Construction<'_>) -> Result<Methods> {
         construction.rows.into(),
         construction.tokens.into(),
         construction.width.into(),
-        construction.page_tokens.into(),
+        construction.block_size.into(),
         construction.windowed.into(),
     ];
     arguments.extend(construction.state.iter().map(|&view| view.into()));

@@ -28,7 +28,7 @@ def test_segmented_replay_reads_changed_partitions_empty_prefixes_and_page_bound
 ):
     device = torch.device("cuda", 0)
     torch.manual_seed(136)
-    count, width, page_size = 259, 64, 64
+    count, width, block_size = 259, 64, 64
     query = torch.randn(count, 4, width, device=device, dtype=torch.bfloat16)
     key = torch.randn(count, 2, width, device=device, dtype=query.dtype)
     value = torch.randn_like(key)
@@ -39,7 +39,7 @@ def test_segmented_replay_reads_changed_partitions_empty_prefixes_and_page_bound
         torch.tensor(
             [[0, 1], [2, 3], [4, 5]], device=device, dtype=torch.int32
         ),
-        page_size,
+        block_size,
     )
     layouts = (
         ((1, 129, 129), (0, 63, 64)),
@@ -92,7 +92,7 @@ def test_segmented_replay_reads_changed_partitions_empty_prefixes_and_page_bound
         cache = UnitPool.allocate(
             Config({"attention": mha.Config(2, width, (0, 1), query.dtype)}),
             num_units=6,
-            block_size=page_size,
+            block_size=block_size,
             device=device,
         )
         state = cache.state("attention")
