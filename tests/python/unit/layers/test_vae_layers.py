@@ -121,3 +121,42 @@ def test_tiled_encoder_bands_are_rows_of_the_whole_encoding():
         encoder.encode(pixels, tiled=True, rows=slice(0, whole.shape[-2] + 1))
     with pytest.raises(ValueError, match="tiled encoding"):
         encoder.encode(pixels, tiled=False, rows=slice(0, 4))
+
+
+def test_tiled_encoder_encodes_tiles_through_a_bound_operator():
+    """A context's tile operator encodes every tile, bands included.
+
+    Doubling a tile's latents doubles every cross-fade exactly, so the
+    encoding equals twice the unbound one only if every tile went through
+    the operator; outside the context the encoder is unbound again.
+    """
+    from uniserve.bindings.context import ExecutionContext
+    from uniserve.nn.vae import TiledEncoder
+
+    torch.manual_seed(0)
+    encoder = TiledEncoder(
+        torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
+        ),
+        spatial_compression=4,
+        tile_height=32,
+        tile_width=16,
+        overlap_height=8,
+        overlap_width=4,
+    )
+    pixels = torch.randn(2, 3, 76, 40)
+
+    with torch.inference_mode():
+        whole = encoder.encode(pixels, tiled=True)
+        context = ExecutionContext(
+            encoder, tiles={encoder: lambda tile: 2 * encoder(tile)}
+        )
+        with context.activate():
+            bound = encoder.encode(pixels, tiled=True)
+            band = encoder.encode(pixels, tiled=True, rows=slice(3, 11))
+        unbound = encoder.encode(pixels, tiled=True)
+        context.close()
+
+    assert torch.equal(bound, 2 * whole)
+    assert torch.equal(band, 2 * whole[..., 3:11, :])
+    assert torch.equal(unbound, whole)

@@ -6,6 +6,14 @@ depend on the encoder's capability class and are documented there. A text
 encoder's forward of a prompt without vision tokens has shapes fixed by its
 tensors and no host work, so it is captured into one CUDA graph per prompt
 capacity; a text conditioner's forward likewise.
+
+A video encoder's still frames encode as runs of tiles of one shape, each
+many small kernels, so their eager encoding is bound by the host launching
+them. The rank captures one tile's encoding at startup
+(:meth:`EncoderRunner.tile`, :meth:`EncoderRunner.encode_tile`), and every
+video encoder runner constructed afterwards replays it for each still-frame
+tile of that shape (``_TileReplay``) inside its eager forward; a video
+clip's tiles stay eager.
 """
 
 from __future__ import annotations
@@ -38,7 +46,7 @@ from uniserve.models import (
     VisionInput,
 )
 from uniserve.nn.rng import posterior_noise_seed
-from uniserve.nn.vae import PatchAutoencoder
+from uniserve.nn.vae import PatchAutoencoder, TiledEncoder
 from uniserve.processing import PatchTransform, TowerTransform
 from uniserve.runner.context import (
     execution_context,
@@ -48,6 +56,39 @@ from uniserve.runner.context import (
 )
 
 __all__ = ["EncoderRunner"]
+
+
+class _TileReplay:
+    """The replay of a captured still-frame tile encoding, as a tile operator.
+
+    Called with one tile's native input, it returns a new tensor equal to the
+    tiled encoder's encoding of that tile: a tile of the captured input's
+    shape, dtype and device is copied into that input, the graph replayed on
+    the current stream (the one stream every runner of a rank's video encoder
+    computes on) and its output copied out; any other tile is encoded
+    eagerly.
+    """
+
+    def __init__(self, runner: EncoderRunner, graph) -> None:
+        self._encoder = runner._tile_encoder
+        self._input = runner._tile_input
+        self._output = runner._tile_output
+        self._graph = graph
+
+    def __call__(self, tile: torch.Tensor) -> torch.Tensor:
+        static, output = self._input, self._output
+        if (
+            static is None
+            or output is None
+            or tile.shape != static.shape
+            or tile.dtype != static.dtype
+            or tile.device != static.device
+        ):
+            return self._encoder(tile)
+        static.copy_(tile)
+        self._graph.replay()
+        # The next replay overwrites the output.
+        return output.clone()
 
 
 def _module(loaded, path: str):
@@ -102,12 +143,22 @@ class EncoderRunner:
             of a text conditioner's features, ``[frames, height, width,
             3]`` of each visual unit of a video encoder's call, ``[samples,
             2]`` of each track of an audio encoder's call.
+        tile_runner: A video encoder's tile runner (:meth:`tile`), whose
+            captured still-frame tile encoding ``tile_graph`` (a
+            ``uniserve.cuda_graph.BreakableCUDAGraph``) this runner replays
+            for every tile of that shape; both borrowed, both ``None`` to
+            encode every tile eagerly.
     """
 
     # The encoder, of one of the capability classes :meth:`encode` lists.
     _module: Any
     # The loaded model of an image model's encoder.
     _loaded: Any = None
+    # A tile runner's tiled encoder, the one-tile input its captured
+    # encoding reads and the output it writes (:meth:`tile`).
+    _tile_encoder: Any = None
+    _tile_input: torch.Tensor | None = None
+    _tile_output: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -117,6 +168,8 @@ class EncoderRunner:
         attention: str,
         scratch,
         size: Sequence[int],
+        tile_runner: EncoderRunner | None = None,
+        tile_graph: Any = None,
     ) -> None:
         path, attention = str(path), str(attention)
         module = loaded.module.get_submodule(path) if path else loaded.module
@@ -136,7 +189,13 @@ class EncoderRunner:
             raise SetupError(
                 f"{type(module).__qualname__} is not constructed with a size"
             )
-        context = execution_context(module, int(stream), attention, scratch)
+        tiles = None
+        if tile_runner is not None and tile_graph is not None:
+            replay = _TileReplay(tile_runner, tile_graph)
+            tiles = {tile_runner._tile_encoder: replay}
+        context = execution_context(
+            module, int(stream), attention, scratch, tiles=tiles
+        )
         # A condition encoder's context is keyed by its inputs' shapes, as
         # one numerical signature of the encoder.
         context.prepare(prepared)
@@ -227,7 +286,67 @@ class EncoderRunner:
         else:
             self._encode = self._encode_audio
 
+    @classmethod
+    def tile(
+        cls,
+        loaded,
+        path: str,
+        stream: int,
+        attention: str,
+        scratch,
+    ) -> EncoderRunner:
+        """A runner of the video encoder at ``path`` for one still-frame tile.
+
+        Its context is prepared for a tile-sized frame. It holds the tile's
+        native input, zero, and the output :meth:`encode_tile` writes the
+        input's encoding into: the forward the rank captures. Construction
+        encodes the zero tile once, on the runner's stream, to size that
+        output. Construct it only for an encoder whose latent encoder tiles
+        (:meth:`still_tile` is not empty).
+        """
+        module = _module(loaded, path)
+        frame = cls.still_tile(loaded, path)
+        if not isinstance(module, VideoEncoder) or not frame:
+            raise SetupError(f"{path!r} encodes no still-frame tiles")
+        runner = cls(loaded, path, stream, attention, scratch, frame)
+        tile = module.still_tile(runner._device)
+        if tile is None:
+            raise SetupError(f"{path!r} encodes no still-frame tiles")
+        runner._tile_encoder, runner._tile_input = tile
+        with torch.inference_mode(), runner._context.activate():
+            runner._tile_output = torch.empty_like(
+                runner._tile_encoder(runner._tile_input)
+            )
+        return runner
+
+    def encode_tile(self) -> None:
+        """Encode the runner's one-tile input into its tile output.
+
+        The tiled encoder's encoding of one tile (``TiledEncoder.forward``)
+        of the input :meth:`tile` holds: the forward a still-frame tile's
+        graph captures; its replays read the input and write the output.
+        """
+        if self._tile_input is None or self._tile_output is None:
+            raise SetupError("only a tile runner encodes a still-frame tile")
+        with torch.inference_mode(), self._context.activate():
+            self._tile_output.copy_(self._tile_encoder(self._tile_input))
+
     # Facts.
+
+    @staticmethod
+    def still_tile(loaded, path: str) -> list[int]:
+        """``[1, height, width, 3]`` of a still frame one tile in size.
+
+        Empty for a video encoder whose latent encoder does not tile still
+        frames, and for any other module.
+        """
+        module = _module(loaded, path)
+        if not isinstance(module, VideoEncoder):
+            return []
+        tiled = module.encoder.encoder
+        if not isinstance(tiled, TiledEncoder):
+            return []
+        return [1, int(tiled.tile_height), int(tiled.tile_width), 3]
 
     @staticmethod
     def unit_frames(loaded, frames: int) -> list[int]:

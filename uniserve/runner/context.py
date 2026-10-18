@@ -30,6 +30,7 @@ def execution_context(
     experts=None,
     weights=None,
     collectives: Sequence[Any] | None = None,
+    tiles: Mapping[Any, Any] | None = None,
 ) -> ExecutionContext:
     """An execution context of ``module`` on a caller's stream.
 
@@ -55,6 +56,8 @@ def execution_context(
         collectives: The ``NativeCollectives`` of each of the module's
             communicators on ``stream``; ``None`` when the module
             communicates over no multi-member group.
+        tiles: Borrowed tile operators of ``TiledEncoder`` modules
+            (``ExecutionContext``).
     """
     bound = None
     if collectives is not None:
@@ -78,6 +81,7 @@ def execution_context(
         weights=weights,
         scratch=scratch,
         collectives=bound,
+        tiles=tiles,
     )
 
 
