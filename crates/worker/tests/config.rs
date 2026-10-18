@@ -44,8 +44,8 @@ fn defaults() -> Value {
         "model_dtype": "bfloat16",
         "quantization_config": {},
         "prefix_cache_dtype": null,
-        "cache_memory_fraction": 0.70,
-        "cache_token_capacity": null,
+        "mem_fraction_static": 0.70,
+        "max_total_tokens": null,
         "attention_backend": "auto",
         "block_size": 64,
         "max_batch_calls": 256,
@@ -136,16 +136,16 @@ fn a_malformed_device_names_its_option() {
 }
 
 #[test]
-fn the_storage_fraction_lies_in_the_unit_interval() {
+fn the_mem_fraction_static_lies_in_the_unit_interval() {
     assert_eq!(
-        resolved(json!({"cache_memory_fraction": 1.0}))
+        resolved(json!({"mem_fraction_static": 1.0}))
             .unwrap()
             .execution
-            .cache_storage_fraction,
+            .mem_fraction_static,
         1.0
     );
     for fraction in [0.0, -0.5, 1.5] {
-        assert!(resolved(json!({"cache_memory_fraction": fraction})).is_err());
+        assert!(resolved(json!({"mem_fraction_static": fraction})).is_err());
     }
 }
 

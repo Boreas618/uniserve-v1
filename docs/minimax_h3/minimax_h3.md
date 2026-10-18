@@ -164,7 +164,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | `--media-directory` | Directory under which `file://` condition URIs resolve; `file://` is refused without it. |
 | `--remote-media` | Whether `http(s)://` condition URIs are fetched; on by default. |
 | `--max-request-bytes` | Largest request body and fetched media in total; 256 MiB by default. |
-| `--mem-fraction-static` | Device storage each worker process may hold; 0.70 by default. |
+| `--mem-fraction-static` | Device memory each worker process may hold for weights and KV cache; 0.70 by default. |
 | `--graph-policy` | `auto` (default) captures CUDA graphs at startup; `off` runs eagerly. |
 
 Startup prepares, and with graphs captures, every layout an admitted request reaches: each frame count up to `--max-video-seconds` at each canvas and text capacity. Fewer canvases, capacities and seconds start faster and hold less storage. Until then the log reports `worker still busy during Worker startup`. On four GB200 with `ulysses4.json` and the defaults, FastH3 is ready in about 17 minutes from warm kernel caches and holds about 105 GiB per model worker; the first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--video-text-capacities 1024,10240,16384`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.

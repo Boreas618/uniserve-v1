@@ -74,7 +74,7 @@ def _generate(
         "4096",
         "--max-running-requests",
         "8",
-        "--page-size",
+        "--block-size",
         "64",
         "--prefill-cuda-graph",
         "true",

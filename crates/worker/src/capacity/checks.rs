@@ -22,9 +22,7 @@ pub(crate) fn auxiliary(
         if device == config.device {
             continue;
         }
-        let available = budget
-            .budget(index, config.cache_storage_fraction)?
-            .available;
+        let available = budget.budget(index, config.mem_fraction_static)?.available;
         let reserved = bytes + graph_storage_budget_bytes(total_bytes(index)? as i64);
         if reserved > available {
             return Err(Error::Unsupported(format!(
@@ -55,8 +53,8 @@ pub(crate) fn startup(
         } else {
             0
         };
-        let measured = budget.budget(index, config.cache_storage_fraction)?;
-        let grant = (measured.total as f64 * config.cache_storage_fraction) as u64;
+        let measured = budget.budget(index, config.mem_fraction_static)?;
+        let grant = (measured.total as f64 * config.mem_fraction_static) as u64;
         let remaining = products.saturating_sub(resident_products(device));
         if remaining > measured.available || measured.process + remaining > grant {
             return Err(Error::Unsupported(format!(

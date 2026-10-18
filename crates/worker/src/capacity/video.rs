@@ -162,7 +162,7 @@ pub(crate) fn plan(
     } else {
         0
     };
-    let tokens = u32::try_from(config.max_sequence_tokens)
+    let tokens = u32::try_from(config.max_model_len)
         .map_err(|_| Error::Invalid("prompt capacity exceeds its range".into()))?;
     let requested: Vec<u32> = config
         .video_text_capacities

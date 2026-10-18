@@ -31,10 +31,10 @@ use crate::{Error, Result};
 
 /// Block-table width that holds the longest admitted sequence in every
 /// group.
-pub(super) fn cache_width(shapes: &[GroupShape], max_sequence_tokens: usize) -> u32 {
+pub(super) fn cache_width(shapes: &[GroupShape], max_model_len: usize) -> u32 {
     shapes
         .iter()
-        .map(|shape| shape.resident_width(max_sequence_tokens as u64))
+        .map(|shape| shape.resident_width(max_model_len as u64))
         .max()
         .unwrap_or(1)
         .try_into()
@@ -108,11 +108,8 @@ pub(super) fn plan(
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
-        config.pool_storage_bytes = Some(
-            budget
-                .budget(index, config.cache_storage_fraction)?
-                .available as usize,
-        );
+        config.pool_storage_bytes =
+            Some(budget.budget(index, config.mem_fraction_static)?.available as usize);
     }
 
     let declarations = &model.declarations;
@@ -231,7 +228,7 @@ pub(super) fn plan(
         LatentPlan::image(
             config.max_request_pool_size,
             image_tokens,
-            config.cache_token_capacity,
+            config.max_total_tokens,
             block_size,
             layout.width() as usize,
             latent_dtype,
@@ -265,7 +262,7 @@ pub(super) fn plan(
         // The cache's fixed storage beside its units: block tables, import
         // scratch and one unit index column per import worker and lane.
         let shapes = cache.group_shapes()?;
-        let width = cache_width(&shapes, config.max_sequence_tokens);
+        let width = cache_width(&shapes, config.max_model_len);
         let import_capacity = layout.info().max_unresolved_calls as usize;
         let fixed = PrefixCache::fixed_bytes(
             &cache,
@@ -361,9 +358,7 @@ fn video_layout(
         .get("video_codec")
         .map(|component| component.ranks.len());
     if let (Device::Cuda(index), Some(budget)) = (config.device, budget) {
-        let available = budget
-            .budget(index, config.cache_storage_fraction)?
-            .available;
+        let available = budget.budget(index, config.mem_fraction_static)?.available;
         // Slot fitting searches from one slot: a media request pipelines in
         // a single slot's three queue positions.
         let maximum = config.max_request_pool_size;

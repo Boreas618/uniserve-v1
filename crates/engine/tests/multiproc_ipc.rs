@@ -2027,7 +2027,7 @@ fn rank_group_args(max_message_bytes: usize) -> WorkerProcessArgs {
         components: WorkerConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
         max_message_bytes,
-        cache_token_capacity: Some(4096),
+        max_total_tokens: Some(4096),
         block_size: Some(16),
         max_batch_calls: 256,
         max_batch_tokens: 256,
@@ -2078,8 +2078,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         model_dtype: "bfloat16".into(),
         quantization_config: serde_json::json!({}),
         prefix_cache_dtype: None,
-        cache_memory_fraction: 0.7,
-        cache_token_capacity: Some(4096),
+        mem_fraction_static: 0.7,
+        max_total_tokens: Some(4096),
         attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,
@@ -2292,7 +2292,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
             ranks: args.ranks.clone(),
             components: args.components.clone(),
             queue_depth: args.queue_depth,
-            storage_fraction: None,
+            mem_fraction_static: None,
         }])?;
         args.transfer = transfer.clone();
         let mut executor = WorkerExecutor::try_new(

@@ -92,8 +92,8 @@ pub struct WorkerProcessArgs {
     /// Largest encoded message, in bytes, a rank's channel carries in either
     /// direction: the bound of one frame.
     pub max_message_bytes: usize,
-    /// Optional prefix cache capacity expressed in tokens.
-    pub cache_token_capacity: Option<u64>,
+    /// Optional prefix cache capacity in tokens (`--max-total-tokens`).
+    pub max_total_tokens: Option<u64>,
     /// Tokens per cache page of the cache group with the widest token rows;
     /// the worker derives every other group's page size from it. `None`
     /// lets the worker choose it from its cache layers and attention
@@ -128,10 +128,10 @@ pub struct WorkerProcessArgs {
     pub quantization_config: serde_json::Value,
     /// Numeric data type used by the prefix cache, when explicitly selected.
     pub prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
-    /// Each rank's share of its device's total storage, which bounds the
-    /// process's static allocations; `WorkerConfig::validate_storage_fraction`
-    /// states its range.
-    pub cache_storage_fraction: f64,
+    /// Each rank's share of its device's total memory, which bounds the
+    /// process's static allocations, weights and KV cache;
+    /// `WorkerConfig::validate_mem_fraction_static` states its range.
+    pub mem_fraction_static: f64,
     /// Optional device mesh specification for model components.
     pub mesh: Option<String>,
     /// Optional process-world communication backend.

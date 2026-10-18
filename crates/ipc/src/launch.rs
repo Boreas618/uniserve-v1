@@ -449,9 +449,11 @@ pub struct LaunchDescriptor {
     /// Precision selectors, a JSON object.
     pub quantization_config: serde_json::Value,
     pub prefix_cache_dtype: Option<String>,
-    /// Fraction of device memory this rank may hold, in (0, 1].
-    pub cache_memory_fraction: f64,
-    pub cache_token_capacity: Option<u64>,
+    /// Fraction of device memory this rank may hold for static allocations,
+    /// weights and prefix cache, in (0, 1].
+    pub mem_fraction_static: f64,
+    /// Prefix cache capacity in tokens; `None` sizes it from memory.
+    pub max_total_tokens: Option<u64>,
     /// Attention provider name of the rank's model, as `--attention-backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)
     /// owns the names and refuses one it does not provide when the model
