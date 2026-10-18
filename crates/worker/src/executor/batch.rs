@@ -1067,7 +1067,7 @@ mod tests {
             completion_output: None,
             transition_output: None,
             predicate,
-            rng: None,
+            image_index: None,
             sampling_state: None,
             input_token_ids: Vec::new(),
             readout: None,

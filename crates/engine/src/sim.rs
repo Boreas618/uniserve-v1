@@ -30,8 +30,8 @@ use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
 use uniserve_core::{CommandWaker, ImageParams, RequestId, SamplingParams, TokenLogprob};
 use uniserve_ipc::{
-    BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
-    RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
+    BatchOutput, Call, CallKind, CallStatus, ErrorCode, FinishFlags, NewRequest, RequestOutput,
+    SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -778,13 +778,9 @@ impl SimEngine {
     /// Applies request sampling controls to deterministic simulated logits.
     ///
     /// Returns `None` when the request's masks leave no candidate (see
-    /// `select_token`). The draw of a stochastic call is the one the rank's
-    /// control plane generates for the call's coordinates
-    /// (`philox::sampling_uniform`). Errors when a stochastic call has no
-    /// RNG coordinates, uses a draw layout other than `TargetSampling`, or
-    /// states a seed other than the admitted one (zero when unset). A request
-    /// admitted without an autoregressive branch takes the natural synthetic
-    /// token directly.
+    /// `select_token`). A stochastic call draws from the admitted seed at the
+    /// sampled token's position, as a rank does. A request admitted without
+    /// an autoregressive branch takes the natural synthetic token directly.
     fn sample(
         vocab: usize,
         text_len: usize,
@@ -799,17 +795,15 @@ impl SimEngine {
         match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = call.rng.ok_or_else(|| {
-                        anyhow::anyhow!("stochastic sampling call has no RNG coordinates")
-                    })?;
-                    anyhow::ensure!(
-                        rng.draw_layout == DrawLayout::TargetSampling,
-                        "stochastic sampling call uses the wrong RNG layout"
-                    );
-                    anyhow::ensure!(
-                        rng.seed == sampling.seed.unwrap_or(0),
-                        "call RNG seed disagrees with admitted sampling"
-                    );
+                    // The draw follows the admitted seed and the sampled
+                    // token's logical position, which a prefill reaches past
+                    // its query tokens and a decode or verify one past its
+                    // first, as a rank keys it.
+                    let query_tokens = match call.code {
+                        CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
+                        _ => 1,
+                    };
+                    let position = u64::from(request.logical_position) + u64::from(query_tokens);
                     let key = philox::request_sampling_key(
                         sampling.seed,
                         call.request_key.engine_id,
@@ -817,7 +811,7 @@ impl SimEngine {
                         call.request_key.request_epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
-                    philox::sampling_uniform(key, rng.semantic_index_base, 0, 0)
+                    philox::sampling_uniform(key, position, 0, 0)
                 } else {
                     0.0
                 };
@@ -1667,7 +1661,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         ExecutionBatch::new(
             batch_id,

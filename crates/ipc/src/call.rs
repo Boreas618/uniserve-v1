@@ -3,9 +3,8 @@
 //! A [`Call`] is one immutable computation of a request ([`RequestKey`]):
 //! its [`CallKind`], the [`CallCoordinates`] it executes at, the products it
 //! reads and writes, the [`Bounds`] the scheduler reserved for it and, for a
-//! sampling call, its random-draw coordinates ([`Rng`]) and token processor
-//! inputs ([`SamplingState`]). A [`Batch`] carries the calls of one
-//! numerical call.
+//! sampling call, its token processor inputs ([`SamplingState`]). A
+//! [`Batch`] carries the calls of one numerical call.
 //!
 //! Types with invariants carry a `validate` method, which
 //! [`Batch::validate`] reaches. The `ensure_valid!` and `invalid_message!`
@@ -254,30 +253,6 @@ pub struct Bounds {
     pub max_transfer_bytes: u64,
 }
 
-/// How the common sampler consumes deterministic random draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum DrawLayout {
-    /// One draw used to sample a target token.
-    TargetSampling = 0,
-    /// Draw sequence used to propose speculative tokens.
-    SpeculativeProposal = 1,
-    /// Draw sequence used to generate diffusion noise.
-    FlowNoise = 2,
-}
-
-/// Deterministic random-draw coordinates for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Rng {
-    /// Request-level random seed.
-    pub seed: u64,
-    /// First semantic draw index assigned to the call.
-    pub semantic_index_base: u64,
-    /// Mapping from semantic work to deterministic draws.
-    pub draw_layout: DrawLayout,
-}
-
 /// Branch-local token processor inputs for one sampling call.
 ///
 /// Token ids in every field are strictly increasing: [`Call::validate`]
@@ -507,8 +482,16 @@ pub struct Call {
     /// Device predicate that enables execution: a U8 flag or a packed I64
     /// continuation scalar. A false predicate yields [`CallStatus::Predicated`].
     pub predicate: Option<TensorRef>,
-    /// Deterministic sampling coordinates.
-    pub rng: Option<Rng>,
+    /// Index of the image an image trajectory's latent preparation
+    /// initializes: positive, and present on exactly the latent preparations
+    /// that write a latent product. Only the engine knows how many images a
+    /// request generates; the rank derives the image's noise seed from its
+    /// admitted image seed and this index. A video denoiser's latent
+    /// preparation writes no latent product (its rank holds the slot's pages)
+    /// and draws its noise from the request's own seed, so it names none.
+    /// Token sampling carries no draw coordinates: the rank keys its draws on
+    /// the admitted seed and each sampled row's position.
+    pub image_index: Option<u32>,
     /// Host-side sampler constraints for this computation; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order,
@@ -556,7 +539,7 @@ impl Call {
             completion_output: None,
             transition_output: None,
             predicate: None,
-            rng: None,
+            image_index: None,
             sampling_state: None,
             input_token_ids: Vec::new(),
             readout: None,
@@ -668,9 +651,9 @@ impl Call {
     /// Checks identity, component, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, cache export
     /// identities, product ownership, generations, output indices, dtypes and
-    /// byte bounds, cross-request inputs, and the predicate. `rng` is not
-    /// checked. Relationships to other calls and to the batch's allocation
-    /// tables belong to [`Batch::validate`].
+    /// byte bounds, cross-request inputs, the predicate, and the image index
+    /// of a latent preparation. Relationships to other calls and to the
+    /// batch's allocation tables belong to [`Batch::validate`].
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish call identity, component, coordinates, and token capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
@@ -859,6 +842,16 @@ impl Call {
                 "device predicate requires a boolean or packed continuation scalar"
             );
         }
+
+        // An image trajectory's latent preparation names the image whose
+        // noise it draws; image indices count from one. A video latent
+        // preparation, which writes no latent product, names none.
+        let prepares_image = self.code == CallKind::Media(MediaCall::LatentPreparation)
+            && self.latent_output.is_some();
+        ensure_valid!(
+            self.image_index.is_some() == prepares_image && self.image_index != Some(0),
+            "exactly an image latent preparation names a positive image index"
+        );
         Ok(())
     }
 }
