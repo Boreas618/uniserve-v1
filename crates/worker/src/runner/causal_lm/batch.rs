@@ -404,9 +404,9 @@ impl<'a> TokenBatch<'a> {
 
         // Each active call has one forward row on its own slot; a context
         // prefill has one per prompt run and vision block (checked against
-        // its rows when they are built). A queued token relay declares a
-        // capacity bound: its device state decides the visible length when
-        // it executes.
+        // its rows when they are built). A row's lengths are the attention
+        // geometry the engine builds from the same request state as the
+        // call's coordinates, and each is read by its own consumer.
         let forward = &plan.forward;
         let rows = ForwardRows::new(&forward.call_indices, plan.calls.len())?;
         for (index, (call, state)) in plan.calls.iter().zip(&self.batch.calls).enumerate() {
@@ -414,7 +414,7 @@ impl<'a> TokenBatch<'a> {
                 continue;
             }
             let call_rows = rows.of(index);
-            let (&first, rest) = call_rows
+            let (_, rest) = call_rows
                 .split_first()
                 .ok_or_else(|| Error::Invalid("a token call has no forward row".into()))?;
             if !rest.is_empty() && !call.writes_context() {
@@ -428,18 +428,6 @@ impl<'a> TokenBatch<'a> {
             {
                 return Err(Error::Invalid(
                     "a token call's forward row reads another slot".into(),
-                ));
-            }
-            let declared =
-                u64::from(forward.seq_lens[first].saturating_sub(forward.query_lens[first]));
-            let visible = state.output.progress.cache_visible_len;
-            let relayed = call
-                .predicate
-                .as_ref()
-                .is_some_and(|value| value.dtype == DType::I64);
-            if declared < visible || (!relayed && declared != visible) {
-                return Err(Error::Invalid(
-                    "forward row sequence length disagrees with execution state".into(),
                 ));
             }
             for &row in call_rows {

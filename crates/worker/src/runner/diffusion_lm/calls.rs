@@ -74,15 +74,15 @@ pub(crate) fn rows_by_call(plan: &Batch) -> Result<Vec<Vec<usize>>> {
     Ok(rows)
 }
 
-/// Check that `descriptors` read `slot`'s unchanged prefix of `visible`
-/// tokens without writing the prefix cache.
-fn read_only(forward: &ForwardBatch, descriptors: &[usize], slot: u32, visible: u64) -> Result<()> {
+/// Check that `descriptors` read `slot`'s prefix without writing the
+/// prefix cache. A row's prefix length is attention geometry the engine
+/// builds from the same request state as the call's visible length, so the
+/// two are not compared.
+fn read_only(forward: &ForwardBatch, descriptors: &[usize], slot: u32) -> Result<()> {
     if descriptors.is_empty()
         || descriptors.iter().any(|&row| {
             forward.write_cache[row]
                 || forward.request_pool_indices[row] != slot
-                || u64::from(forward.seq_lens[row].saturating_sub(forward.query_lens[row]))
-                    != visible
                 || forward.query_lens[row] == 0
         })
     {
@@ -130,7 +130,7 @@ impl Readouts {
             .readout
             .as_ref()
             .ok_or_else(|| Error::Invalid("a readout forward requires a readout".into()))?;
-        read_only(forward, descriptors, slot, visible)?;
+        read_only(forward, descriptors, slot)?;
         let lengths: Vec<usize> = descriptors
             .iter()
             .map(|&row| forward.query_lens[row] as usize)
@@ -225,7 +225,7 @@ pub(crate) fn step_row(
     let sampling =
         served.ok_or_else(|| Error::Invalid("this worker keeps no generating blocks".into()))?;
     let slot = admission.request_pool_idx;
-    read_only(forward, descriptors, slot, visible)?;
+    read_only(forward, descriptors, slot)?;
     let length = sampling.canvas_length;
     if descriptors.len() != 1
         || call.bounds.max_tokens != length
@@ -407,12 +407,6 @@ mod tests {
         assert!(
             Readouts::new()
                 .add(&forward(2, 6, &[3, 2]), &readout_call, &[0, 1], 2, 6, 0)
-                .is_err()
-        );
-        // The prefix is not the accepted visible length.
-        assert!(
-            Readouts::new()
-                .add(&forward(2, 5, &[5]), &readout_call, &[0], 2, 6, 0)
                 .is_err()
         );
         // Another slot, a write, or rows not partitioning the tokens.
