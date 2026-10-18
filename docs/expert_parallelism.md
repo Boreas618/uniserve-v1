@@ -44,7 +44,7 @@ A deployment file places attention and experts on different workers:
 
 Attention ranks hold no routed-expert weights; expert ranks hold every routed expert, partitioned among themselves, and own no request state. Dedicated expert workers require `deepep` or `megamoe`. `configs/afd/qwen3_moe.json` places a tensor-parallel attention replica and two expert ranks on two hosts.
 
-`--expert-microbatches` (one to four) splits each attention batch into microbatches that run on separate streams and host threads and take turns at every expert dispatch, so one microbatch's attention overlaps another's expert computation on the expert ranks. Expert ranks follow the same turns.
+`--expert-microbatches` splits each attention batch into microbatches that run on separate streams and host threads and take turns at every expert dispatch, so one microbatch's attention overlaps another's expert computation on the expert ranks. Expert ranks follow the same turns. The split MegaMoE kernel serves at most four microbatches.
 
 ## Distributed weight data parallelism
 
