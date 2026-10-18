@@ -18,16 +18,16 @@ pub(in crate::scheduler) struct ScheduledContext {
 }
 
 impl Scheduler {
-    /// Returns whether a flow prefix can be scheduled now.
+    /// Returns whether a guidance prefix can be scheduled now.
     ///
-    /// Returns `false` only while the request holds a flow prefix that no
+    /// Returns `false` only while the request holds a guidance prefix that no
     /// successful denoising completion has finalized and a denoising call is
     /// in flight.
-    pub(in crate::scheduler) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
+    pub(in crate::scheduler) fn guidance_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
             .get(&id)
-            .and_then(|state| state.flow_prefix.as_ref())
+            .and_then(|state| state.guidance_prefix.as_ref())
             .is_some_and(|prefix| !prefix.diffusion_finalized);
         !prefix_is_pending
             || !self
@@ -293,9 +293,9 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishCache,
-                CallKind::Transfer(TransferMode::CacheExport) => Phase::PrepareGen,
+                CallKind::Transfer(TransferMode::CacheExport) => Phase::LatentPreparation,
                 CallKind::Media(MediaCall::LatentPreparation)
-                | CallKind::Media(MediaCall::Denoising) => Phase::DenoiseGen,
+                | CallKind::Media(MediaCall::Denoising) => Phase::Denoising,
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
@@ -326,10 +326,10 @@ impl Scheduler {
                     Phase::DecodeUnd
                 }
             }
-            Phase::DenoiseGen
+            Phase::Denoising
                 if self.num_scheduled_denoise_steps(id)? >= state.denoising.steps() =>
             {
-                Phase::CommitGen
+                Phase::ImageDecoding
             }
             phase => phase,
         })
@@ -616,9 +616,9 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseCache | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
-            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
+            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::Readout | Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
             Phase::FeedbackEncode => {

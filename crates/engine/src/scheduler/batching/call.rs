@@ -367,7 +367,7 @@ impl Scheduler {
         // A denoising call adds one query row per guidance branch; its query
         // is the latent grid plus the commit marker tokens and writes nothing to the prefix cache.
         // Branch 0 attends to the request's own conditioning prefix cache. Every other
-        // branch attends to the flow prefix (the negative-prompt prefix cache in its own
+        // branch attends to the guidance prefix (the negative-prompt prefix cache in its own
         // request row) when the request holds one, and to the request's own
         // prefix cache otherwise. Until a denoising call completes successfully and
         // finalizes the prefix, the call also prefills a non-empty negative
@@ -399,7 +399,7 @@ impl Scheduler {
                 return None;
             };
             let mut alternative = None;
-            if let Some(prefix) = state.flow_prefix.as_mut() {
+            if let Some(prefix) = state.guidance_prefix.as_mut() {
                 if !prefix.diffusion_finalized || !prefix.new_units.is_empty() {
                     for table in prefix.block_tables() {
                         call_block_tables.push(IpcBlockTable {

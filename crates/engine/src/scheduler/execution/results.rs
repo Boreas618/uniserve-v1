@@ -790,7 +790,7 @@ impl Scheduler {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
+                let free_guidance_prefix = call_variant == CallKind::Media(MediaCall::Denoising)
                     && record.status == CallStatus::Ok
                     && self
                         .running
@@ -801,15 +801,15 @@ impl Scheduler {
                     && let Some(prefix) = self
                         .running
                         .get_mut(&id)
-                        .and_then(|state| state.flow_prefix.as_mut())
+                        .and_then(|state| state.guidance_prefix.as_mut())
                 {
                     prefix.diffusion_finalized = true;
                 }
                 if call.code == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
-                if free_flow_prefix {
-                    self.free_flow_prefix(id);
+                if free_guidance_prefix {
+                    self.free_guidance_prefix(id);
                 }
                 if matches!(
                     call_variant,

@@ -88,21 +88,21 @@ impl Scheduler {
     /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
-    /// order, or `None` when the call cannot run now: the flow prefix of a
+    /// order, or `None` when the call cannot run now: the guidance prefix of a
     /// denoising call cannot be allocated, transfer capacity is exhausted,
     /// the request is not running, `Placement::worker_target` finds no worker,
     /// a buffer or latent-page allocation fails, or (after latching
     /// engine-fatal) the request holds no allocations.
     ///
     /// Buffer spans reserved before a failure are returned to the pool, but a
-    /// failure is not free of side effects: a flow prefix already allocated
+    /// failure is not free of side effects: a guidance prefix already allocated
     /// stays with the request, and a failed buffer allocation evicts one
     /// unpinned encoder-cache product, if any, and queues a `Free` for its
     /// buffer. Only a successful reservation counts against the transfer
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_flow_prefix(id) {
+        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_guidance_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -287,7 +287,7 @@ impl Scheduler {
             // Between two steps of one request, another request may take it.
             if next_type == Some(CallKind::Media(MediaCall::Denoising))
                 && (self.inflight.denoiser_lane_held_by_other(id)
-                    || !self.flow_prefix_is_schedulable(id))
+                    || !self.guidance_prefix_is_schedulable(id))
             {
                 continue;
             }
@@ -339,7 +339,7 @@ impl Scheduler {
 
                 // Only a call that obtains its storage is charged to the
                 // pass. A call that cannot run now leaves the budget to later
-                // requests; in particular, requests waiting for the flow-prefix
+                // requests; in particular, requests waiting for the guidance-prefix
                 // row must not spend the pass before the request that holds
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
@@ -653,12 +653,12 @@ impl Scheduler {
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::CloseCache => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
-            Phase::PrepareGen => CallKind::Media(MediaCall::LatentPreparation),
-            Phase::DenoiseGen if st.denoising.is_complete() => {
+            Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
+            Phase::Denoising if st.denoising.is_complete() => {
                 CallKind::Media(MediaCall::ImageDecoding)
             }
-            Phase::DenoiseGen => CallKind::Media(MediaCall::Denoising),
-            Phase::CommitGen => CallKind::Media(MediaCall::ImageDecoding),
+            Phase::Denoising => CallKind::Media(MediaCall::Denoising),
+            Phase::ImageDecoding => CallKind::Media(MediaCall::ImageDecoding),
             Phase::FeedbackEncode => {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;

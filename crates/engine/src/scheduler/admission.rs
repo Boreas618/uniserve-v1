@@ -210,7 +210,7 @@ impl Scheduler {
         let st = RequestState {
             finish_token_ids,
             allocations: None,
-            flow_prefix: None,
+            guidance_prefix: None,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),
             latest_token: None,
@@ -837,13 +837,13 @@ impl Scheduler {
     /// Materializes the negative-prompt cache prefix required by multi-branch guidance.
     ///
     /// Allocates the prefix its own request row and cache tables sized to the
-    /// negative prompt, and stores them in `RequestState::flow_prefix`.
+    /// negative prompt, and stores them in `RequestState::guidance_prefix`.
     /// Returns `true` when the prefix is in place, the request uses a single
     /// guidance branch, or the request is not running. Returns `false`,
     /// holding nothing new, when no request row or cache capacity is free, or
     /// (after latching engine-fatal) the prefix cache is missing;
     /// `reserve_generation_resources` then declines the denoising call.
-    pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
+    pub(super) fn ensure_guidance_prefix(&mut self, id: RequestId) -> bool {
         let (prefix_tokens, needs_alternative) = self
             .running
             .get(&id)
@@ -858,7 +858,7 @@ impl Scheduler {
             || self
                 .running
                 .get(&id)
-                .is_some_and(|state| state.flow_prefix.is_some())
+                .is_some_and(|state| state.guidance_prefix.is_some())
         {
             return true;
         }
@@ -892,7 +892,7 @@ impl Scheduler {
             allocations.free(&mut self.storage);
             return false;
         };
-        state.flow_prefix = Some(FlowPrefixState {
+        state.guidance_prefix = Some(GuidancePrefixState {
             allocations,
             new_units,
             diffusion_finalized: false,
@@ -900,12 +900,12 @@ impl Scheduler {
         true
     }
 
-    /// Releases the request's flow-prefix allocations.
-    pub(super) fn free_flow_prefix(&mut self, id: RequestId) {
+    /// Releases the request's guidance-prefix allocations.
+    pub(super) fn free_guidance_prefix(&mut self, id: RequestId) {
         let prefix = self
             .running
             .get_mut(&id)
-            .and_then(|state| state.flow_prefix.take());
+            .and_then(|state| state.guidance_prefix.take());
         if let Some(prefix) = prefix {
             prefix.allocations.free(&mut self.storage);
         }

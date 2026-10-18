@@ -176,7 +176,7 @@ impl Scheduler {
                     request,
                 )
             }),
-            Phase::PrepareGen => {
+            Phase::LatentPreparation => {
                 let conditioning = self.cache_conditioning(id)?;
                 self.plan_computation(id, |scheduler, request| {
                     generation::plan_diffusion_prepare(
@@ -188,7 +188,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::DenoiseGen => {
+            Phase::Denoising => {
                 // Each call covers the next step of the schedule, and none
                 // is planned once every step is submitted. Accepted
                 // completion remains separately tracked on the request.
@@ -211,7 +211,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::CommitGen => {
+            Phase::ImageDecoding => {
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
