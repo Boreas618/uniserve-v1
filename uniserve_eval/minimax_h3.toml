@@ -81,7 +81,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w1.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 
 [benchmarks.gb200-4-w1.load]
 num_prompts = 8
@@ -106,7 +105,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w2.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 
 [benchmarks.gb200-4-w2.load]
 num_prompts = 4
@@ -143,7 +141,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-w3.video]
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-w3.load]
@@ -182,7 +179,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-reference-w4.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w4.load]
@@ -208,7 +204,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-reference-w5.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w5.load]
@@ -247,7 +242,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-omniref-w4.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w4.load]
@@ -273,7 +267,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-4-omniref-w5.video]
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w5.load]
@@ -313,7 +306,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.fast-h3-gb200-4-w1.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 
 [benchmarks.fast-h3-gb200-4-w1.load]
 num_prompts = 8
@@ -338,7 +330,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.fast-h3-gb200-4-w2.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 
 [benchmarks.fast-h3-gb200-4-w2.load]
 num_prompts = 4
@@ -373,7 +364,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w1.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 
 [benchmarks.gb200-8-w1.load]
 num_prompts = 8
@@ -398,7 +388,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w2.video]
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 
 [benchmarks.gb200-8-w2.load]
 num_prompts = 4
@@ -487,7 +476,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -517,7 +505,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -547,7 +534,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -594,7 +580,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -625,7 +610,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -684,7 +668,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -713,7 +696,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -742,7 +724,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -790,7 +771,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -820,7 +800,6 @@ endpoint = "/v1/videos/sync"
 backend = "vllm-omni"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
@@ -870,7 +849,6 @@ endpoint = "/v1/videos/sync"
 backend = "fastvideo"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
@@ -899,7 +877,6 @@ endpoint = "/v1/videos/sync"
 backend = "fastvideo"
 task = "ref2va"
 aspect_ratio = "auto"
-seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
@@ -940,7 +917,6 @@ endpoint = "/v1/videos/sync"
 [benchmarks.gb200-8-w3.video]
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 
@@ -1001,7 +977,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 5.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1035,7 +1010,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "t2va"
 aspect_ratio = "16:9"
-seconds = 15.0
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1069,7 +1043,6 @@ endpoint = "/v1/videos"
 backend = "sglang"
 task = "fl2va"
 aspect_ratio = "auto"
-seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
