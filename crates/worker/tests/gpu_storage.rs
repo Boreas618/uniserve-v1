@@ -193,7 +193,7 @@ fn fp8_plan() -> CachePlan {
 fn cache_planes_start_reset_and_reset_their_leading_units() -> Result<()> {
     let stream = Stream::new(DEVICE)?;
     let plan = Arc::new(fp8_plan());
-    assert_eq!(plan.info(6).unit_bytes, 276);
+    assert_eq!(plan.unit_bytes, 276);
     let planes = CachePlanes::allocate(plan, Some(DEVICE), 6, Some(&stream))?;
     let views: HashMap<_, _> = planes.views().into_iter().collect();
     assert_eq!(views["key.values"].shape(), &[2, 6, 64]);

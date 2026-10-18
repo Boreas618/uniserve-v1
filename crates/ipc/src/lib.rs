@@ -19,8 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    CacheGroup, CacheGroupKind, ImageParams, PrefixCacheDtype, RequestId, SamplingParams,
-    TokenLogprob, UnitId,
+    CacheGroup, ImageParams, PrefixCacheDtype, RequestId, SamplingParams, TokenLogprob, UnitId,
 };
 pub use uniserve_core::{CallId, ForwardStats};
 

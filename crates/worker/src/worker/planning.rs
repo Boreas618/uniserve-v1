@@ -44,17 +44,23 @@ pub(super) fn cache_width(shapes: &[GroupShape], max_model_len: usize) -> u32 {
 /// Report the planned capacity once, for operators.
 pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     let info = &plan.info;
-    let prefix_cache = info.prefix_cache.as_ref().map_or_else(
-        || "no cache pool".to_owned(),
-        |cache| {
-            format!(
-                "{} cache units of {} bytes in {} groups",
-                cache.num_units,
-                cache.unit_bytes,
-                cache.groups.len()
-            )
-        },
-    );
+    // The unit size is the rank's own layout fact (its cache plan); the
+    // report carries only the agreed unit count and the groups.
+    let prefix_cache = info
+        .prefix_cache
+        .as_ref()
+        .zip(plan.cache.as_ref())
+        .map_or_else(
+            || "no cache pool".to_owned(),
+            |(cache, layout)| {
+                format!(
+                    "{} cache units of {} bytes in {} groups",
+                    cache.num_units,
+                    layout.unit_bytes,
+                    cache.groups.len()
+                )
+            },
+        );
     tracing::info!(
         "planned capacity: {prefix_cache}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
         config.block_size.unwrap_or(0),
