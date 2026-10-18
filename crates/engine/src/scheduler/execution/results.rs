@@ -25,7 +25,7 @@ impl Scheduler {
     /// through `Inflight::take_ready_completions`.
     pub(in crate::scheduler) fn queue_completion(
         &mut self,
-        mut record: uniserve_ipc::RequestOutput,
+        mut record: uniserve_ipc::CallOutput,
         media: Result<Option<Arc<SharedMedia>>, uniserve_core::SharedMediaError>,
     ) {
         let id = record.request_key.request_id;
@@ -102,7 +102,7 @@ impl Scheduler {
         &mut self,
         call: Call,
         decode: Option<DecodeRange>,
-        record: uniserve_ipc::RequestOutput,
+        record: uniserve_ipc::CallOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
