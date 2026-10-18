@@ -24,7 +24,7 @@ use crate::parallel::joins::GraphFunctions;
 use crate::request::video::{VideoLayout, VideoSize};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{RequestSlots, TrajectoryVersion};
+use crate::storage::{LatentPlan, RequestSlots, TrajectoryVersion};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -144,6 +144,8 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) maximum: VideoLayout,
     pub(crate) envelope: StateEnvelope,
     pub(crate) pages: SamplePages,
+    /// The sample pool the rank's capacity planned.
+    pub(crate) latent: LatentPlan,
     pub(crate) slots: u32,
     /// `None` without a conditioner on this rank.
     pub(crate) conditioning: Option<Conditioning>,
@@ -187,21 +189,12 @@ impl DenoiserRunner {
             .collect::<Result<Vec<_>>>()?;
         let banks = RequestSlots::allocate(&setup.envelope.device, setup.slots, Some(device))?;
         let host = RequestSlots::allocate(&setup.envelope.host, setup.slots, Some(device))?;
-        let num_pages = setup.pages.pool_pages(u64::from(setup.slots));
-        let storage = LatentStorage::allocate(
-            setup.slots,
-            num_pages as u32,
-            setup.pages.page_units as u32,
-            1,
-            DType::F32,
-            false,
-            Some(device),
-            Some(&setup.stream),
-        )?;
+        let latent = setup.latent;
+        let storage = LatentStorage::allocate(&latent, Some(device), Some(&setup.stream))?;
         let pool = LatentPool::new(
-            setup.slots as usize,
-            num_pages as usize,
-            setup.pages.page_units as usize,
+            latent.request_pool_size,
+            latent.num_pages,
+            latent.page_units,
         )?;
 
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));

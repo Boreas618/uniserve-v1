@@ -371,11 +371,17 @@ pub struct UnitColumn {
 const UNIT_RESETS: &str = "uniserve.prefix_cache.units.UnitResets";
 
 impl UnitColumn {
+    /// Device bytes of a column over a pool of `num_units` units: one int64
+    /// unit index each.
+    pub(crate) fn bytes(num_units: u32) -> u64 {
+        u64::from(num_units) * DType::I64.bytes() as u64
+    }
+
     /// Allocate a column for `planes` and construct the library's
     /// `UnitResets` over it on `stream` (`None` for a CPU pool).
     pub(crate) fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
-        let memory = allocate(planes.device, planes.num_units as usize * 8)?;
+        let memory = allocate(planes.device, Self::bytes(planes.num_units) as usize)?;
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
 
         let mut arguments = vec![

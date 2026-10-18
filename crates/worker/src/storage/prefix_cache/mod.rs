@@ -86,7 +86,7 @@ impl PrefixCache {
         Ok(
             BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width)
                 + workers * ImportWorkspace::scratch_bytes(elements, scales)
-                + (workers + unit_columns as u64) * u64::from(num_units) * 8,
+                + (workers + unit_columns as u64) * UnitColumn::bytes(num_units),
         )
     }
 

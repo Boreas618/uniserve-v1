@@ -12,7 +12,7 @@ mod request_slots;
 
 // The storage owners the integration tests and the storage harness drive.
 pub use buffer::{BufferBinding, BufferPool};
-pub use latent::LatentStorage;
+pub use latent::{LatentPlan, LatentStorage};
 pub use memory::{Memory, StorageView};
 pub use output::{LogprobLayout, OutputBuffer, OutputStorage};
 pub use prefix_cache::block_tables::{

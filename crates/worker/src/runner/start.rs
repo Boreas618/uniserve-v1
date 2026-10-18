@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use uniserve_cuda::Stream;
 use uniserve_ipc::{CallKind, MediaCall};
 
-use crate::capacity::plan::LatentPlan;
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig};
@@ -31,7 +30,7 @@ use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
-use crate::storage::{LatentCache, LatentPool, LatentStorage, OutputPool};
+use crate::storage::{LatentCache, LatentPlan, LatentPool, LatentStorage, OutputPool};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::worker::RankStorage;
@@ -289,21 +288,7 @@ impl ImageOwners {
             .map(|target| target.device);
         let latents = match (denoiser_device, startup.latent) {
             (Some(device), Some(plan)) => {
-                let width = u32::try_from(plan.latent_width)
-                    .map_err(|_| Error::Invalid("latent width overflows".into()))?;
-                let narrow = |value: usize, name: &str| {
-                    u32::try_from(value).map_err(|_| Error::Invalid(format!("{name} overflows")))
-                };
-                let storage = LatentStorage::allocate(
-                    narrow(plan.request_pool_size, "latent slots")?,
-                    narrow(plan.num_pages, "latent pages")?,
-                    narrow(plan.page_units, "latent page units")?,
-                    width,
-                    dtype,
-                    true,
-                    device.cuda(),
-                    startup.preparation,
-                )?;
+                let storage = LatentStorage::allocate(&plan, device.cuda(), startup.preparation)?;
                 let pool =
                     LatentPool::new(plan.request_pool_size, plan.num_pages, plan.page_units)?;
                 Some(LatentCache::new(pool, storage))

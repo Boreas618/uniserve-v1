@@ -84,6 +84,7 @@ impl DenoiserRunners {
             maximum: plan.maximum,
             envelope,
             pages: setup.capacity.pages,
+            latent: setup.capacity.latent(info.request_slots as usize),
             slots: info.request_slots,
             conditioning,
             conditioning_width: u64::from(model.facts.text_condition_width),

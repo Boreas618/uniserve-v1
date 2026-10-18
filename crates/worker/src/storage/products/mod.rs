@@ -79,7 +79,6 @@ pub(crate) type CallKey = (RequestKey, CallId);
 /// Rank-local values and bounded scalar relay lanes: the store's buffers
 /// and imports, the views of its arenas and of its relay lanes.
 struct State {
-    capacity: usize,
     byte_capacity: usize,
     request_capacity: usize,
     relay_depth: usize,
@@ -94,14 +93,8 @@ struct State {
 }
 
 impl State {
-    pub(crate) fn new(
-        capacity: usize,
-        byte_capacity: usize,
-        request_capacity: usize,
-        relay_depth: usize,
-    ) -> Self {
+    pub(crate) fn new(byte_capacity: usize, request_capacity: usize, relay_depth: usize) -> Self {
         Self {
-            capacity,
             byte_capacity,
             request_capacity,
             relay_depth,
@@ -118,36 +111,17 @@ impl State {
 }
 
 impl State {
-    /// Check the whole allocation group before any view is created.
-    pub(crate) fn validate_bindings(
-        &self,
-        bindings: &[(BufferId, MemoryKind)],
-        feature: bool,
-    ) -> Result<()> {
+    /// Check the whole allocation group before any view is created: no
+    /// output repeats or is registered already. The scheduler's buffer
+    /// placements bound persistent products; the store counts none.
+    pub(crate) fn validate_bindings(&self, bindings: &[BufferId]) -> Result<()> {
         let mut seen = HashSet::new();
-        let mut counts = HashMap::<MemoryKind, usize>::new();
-        for buffer in self.buffers.values() {
-            let buffer = lock(buffer);
-            if !buffer.feature && matches!(buffer.backing, Some(Backing::Persistent(_))) {
-                *counts.entry(buffer.device).or_default() += 1;
-            }
-        }
-
-        for (id, device) in bindings {
+        for id in bindings {
             let key = buffer_key(*id);
             if !seen.insert(key) || self.buffers.contains_key(&key) {
                 return Err(Error::Invalid(
                     "persistent output is already registered".into(),
                 ));
-            }
-            if !feature {
-                let count = counts.entry(*device).or_default();
-                *count += 1;
-                if *count > self.capacity {
-                    return Err(Error::Resource(
-                        "device-product arena has no query-ready free generation",
-                    ));
-                }
             }
         }
         Ok(())
@@ -386,27 +360,18 @@ impl State {
     /// After physical accesses drain, return owners for destruction outside
     /// the store lock. Existing reads retain their views.
     pub(crate) fn close(&mut self) -> Self {
-        let empty = Self::new(
-            self.capacity,
-            self.byte_capacity,
-            self.request_capacity,
-            self.relay_depth,
-        );
+        let empty = Self::new(self.byte_capacity, self.request_capacity, self.relay_depth);
         std::mem::replace(self, empty)
     }
 }
 
 impl ProductStore {
-    /// A store of at most `capacity` persistent non-feature products per
-    /// device and `byte_capacity` bytes of relay arenas, with features of at
+    /// A store of `byte_capacity` bytes of relay arenas, with features of at
     /// most `max_feature_bytes` on `devices`, `request_capacity` request
     /// slots of `relay_depth` relay lanes each (both zero without relays).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the store's complete startup facts"
-    )]
+    /// Persistent products lie in `buffer_pool`, whose scheduler placements
+    /// bound them.
     pub fn new(
-        capacity: usize,
         byte_capacity: usize,
         max_feature_bytes: usize,
         devices: Vec<MemoryKind>,
@@ -429,12 +394,7 @@ impl ProductStore {
             buffer_pool: Mutex::new(buffer_pool),
             events,
             exports: Mutex::new(HashMap::new()),
-            state: Mutex::new(State::new(
-                capacity,
-                byte_capacity,
-                request_capacity,
-                relay_depth,
-            )),
+            state: Mutex::new(State::new(byte_capacity, request_capacity, relay_depth)),
         })
     }
 
