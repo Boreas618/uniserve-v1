@@ -139,6 +139,68 @@ fn encoder_products_obey_worker_entry_capacity() {
     assert_eq!(limits.encoder_cache_entries, 64);
 }
 
+/// A generated image reserves its latent at the model's bytes per latent
+/// unit, whichever worker capacity clamps the latent feature bytes. A worker
+/// whose encoder entries hold a quarter of the simulator's feature bytes
+/// leaves the latent of a 512x512 image (1,024 units of 16x16 pixels) at
+/// 1,024 units of `SimEngine::generation_limits().latent_bytes_per_unit`.
+#[test]
+fn a_generated_image_reserves_its_latent_at_the_model_density() {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().encoder_entry_bytes = 64 << 20;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let scheduler = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
+    assert_eq!(
+        scheduler.generation_limits().max_latent_feature_bytes,
+        64 << 20
+    );
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let mut events = handle
+        .submit(generation_request(
+            RequestId(1),
+            text_input(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 1,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        ))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut finished = None;
+    while finished.is_none() && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(EngineCoreOutput::Finished { reason, .. }) => finished = Some(reason),
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+    assert_eq!(finished, Some(FinishReason::ImageDone));
+
+    let latent_bytes = dispatched
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(batch),
+            _ => None,
+        })
+        .flat_map(|batch| batch.requests)
+        .filter(|(call, _)| call.code == CallKind::Media(MediaCall::LatentPreparation))
+        .filter_map(|(call, _)| call.latent_output.map(|latent| latent.max_bytes()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latent_bytes,
+        vec![1_024 * SimEngine::generation_limits().latent_bytes_per_unit]
+    );
+}
+
 fn text_input(token_ids: Vec<u32>) -> (Vec<u32>, MultimodalInputs) {
     (token_ids, MultimodalInputs::default())
 }
@@ -220,6 +282,7 @@ fn generation_request(
         latent_downsample: 16,
         max_vae_grid_tokens: 65_536,
         max_vit_grid_tokens: 8_192,
+        latent_bytes_per_unit: (256 << 20) / 65_536,
         max_latent_feature_bytes: 256 << 20,
         max_vision_feature_bytes: 256 << 20,
         commit_marker_tokens: 2,
