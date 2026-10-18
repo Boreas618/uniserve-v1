@@ -372,19 +372,19 @@ impl ImagePolicy {
     }
 
     /// Record the call asking the prefix a guidance branch of `source`
-    /// conditions on for the image prompt `image_prompt`: the job's
-    /// completion carries `[reuses, *tokens]`, which [`Self::prefix`] reads.
+    /// conditions on: the job's completion carries `[reuses, *tokens]`,
+    /// which [`Self::prefix`] reads.
     ///
-    /// The negative prompt the model is given is empty: the negative
-    /// source's prefix is the admitted negative tokens
-    /// ([`BranchSource::admitted`]), and no other source reads it.
-    pub(crate) fn ask_prefix(&self, source: BranchSource, image_prompt: &str, job: &Job) {
+    /// The model is given no image prompt and no negative prompt: the
+    /// conditioning and negative sources' prefixes are what the admission
+    /// fixes ([`BranchSource::admitted`]), and no other source reads them.
+    pub(crate) fn ask_prefix(&self, source: BranchSource, job: &Job) {
         job.call_returning(MethodCall::new(
             &self.guidance_prefix,
             vec![
                 Argument::Handle(self.loaded.clone()),
                 Argument::Text(source.name().to_owned()),
-                Argument::Text(image_prompt.to_owned()),
+                Argument::Text(String::new()),
                 Argument::Text(String::new()),
             ],
         ));

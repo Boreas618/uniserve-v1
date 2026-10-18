@@ -12,10 +12,11 @@
 //! the request's own context; the unconditional branches to prefixes the
 //! scheduler placed in other request slots, which the runtime prefills the
 //! first time a branch is evaluated. A prefix's tokens are resolved once
-//! per source when the trajectory opens and kept with it: the negative
-//! source's are the request's admitted negative tokens, which the engine
-//! sized that prefix's cache from ([`BranchSource::admitted`]), and the
-//! model frames the others (`image.guidance_prefix`, its prompt framing
+//! per source when the trajectory opens and kept with it: the conditioning
+//! source reads the request's own context and the negative source's are
+//! the request's admitted negative tokens, which the engine sized that
+//! prefix's cache from ([`BranchSource::admitted`]), and the model frames
+//! the others (`image.guidance_prefix`, its prompt framing
 //! and tokenizer). A prefix's physical
 //! coordinates are resolved again for every submitted denoising call,
 //! because the scheduler may place a later interval's prefixes in other
@@ -105,7 +106,8 @@ impl BranchSet {
 /// What a guidance branch conditions on (`uniserve.processing.BranchSource`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BranchSource {
-    /// The image prompt, or the request's own context when blank.
+    /// The request's own context. In serving the conditioned branch reads
+    /// it where the request's prefill wrote it ([`Self::admitted`]).
     Conditioning,
     /// The negative prompt. In serving its prefix is the request's admitted
     /// negative tokens ([`Self::admitted`]); the model frames an empty
@@ -139,17 +141,25 @@ impl BranchSource {
     /// admission fixes, given its admitted negative tokens `negative`; `None`
     /// for a source the model frames.
     ///
-    /// The negative source conditions on exactly the admitted tokens, also
-    /// when none were admitted. They are the request's final negative
-    /// conditioning tokens (`GenerationRequest::negative_prompt_token_ids`),
-    /// and the engine sizes the prefix's cache and its prefill from their
-    /// count, so a prefix the rank framed itself would not fit the slot the
-    /// engine placed it in.
+    /// The conditioning source reads the request's own context, where the
+    /// engine places the conditioned branch's row. The negative source
+    /// conditions on exactly the admitted tokens, also when none were
+    /// admitted. They are the request's final negative conditioning tokens
+    /// (`GenerationRequest::negative_prompt_token_ids`), and the engine sizes
+    /// the prefix's cache and its prefill from their count, so a prefix the
+    /// rank framed itself would not fit the slot the engine placed it in.
     pub(crate) fn admitted(self, negative: &[u32]) -> Option<Prefix> {
-        (self == Self::NegativeOrStart).then(|| Prefix {
-            tokens: Arc::from(negative),
-            reuses_conditioning: false,
-        })
+        match self {
+            Self::Conditioning => Some(Prefix {
+                tokens: Arc::from(Vec::new()),
+                reuses_conditioning: true,
+            }),
+            Self::NegativeOrStart => Some(Prefix {
+                tokens: Arc::from(negative),
+                reuses_conditioning: false,
+            }),
+            Self::Start => None,
+        }
     }
 }
 
@@ -533,7 +543,8 @@ mod tests {
     fn the_negative_branch_conditions_on_exactly_the_admitted_tokens() -> Result<()> {
         let given = BranchSource::NegativeOrStart.admitted(&[4, 5]);
         assert_eq!(given.map(|prefix| prefix.tokens.to_vec()), Some(vec![4, 5]));
-        assert_eq!(BranchSource::Conditioning.admitted(&[4, 5]), None);
+        let conditioning = BranchSource::Conditioning.admitted(&[4, 5]);
+        assert!(conditioning.is_some_and(|prefix| prefix.reuses_conditioning));
         assert_eq!(BranchSource::Start.admitted(&[4, 5]), None);
 
         // A request admitted without negative tokens: the engine reserves its
