@@ -224,8 +224,8 @@ impl WorkerConfig {
             return Err(invalid("worker role must be model or experts"));
         }
 
-        if !(1..=4).contains(&self.expert_microbatches) {
-            return Err(invalid("expert microbatches must be from one to four"));
+        if self.expert_microbatches < 1 {
+            return Err(invalid("expert microbatches must be at least one"));
         }
 
         if self.world_size == 0 || self.rank >= self.world_size {
