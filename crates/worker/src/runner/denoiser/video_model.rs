@@ -378,6 +378,7 @@ impl VideoModel {
             video_shift: self.facts.video_shift,
             audio_shift: self.facts.audio_shift,
             frame_rate: self.facts.frame_rate,
+            audio_sample_rate: self.facts.sample_rate,
             canvases: canvases.to_vec(),
             max_sequence_rows: self.facts.max_sequence_rows,
         }

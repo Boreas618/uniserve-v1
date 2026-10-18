@@ -93,7 +93,6 @@ use uniserve_server::{
 // The served canvases come from `--video-resolutions` and
 // `--video-aspect-ratios`, as for `uniserve serve`; the loaded checkpoint
 // determines the step count.
-const H3_AUDIO_SAMPLE_RATE: i32 = 32_000;
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
 const DEFAULT_SECONDS: f64 = 5.0;
@@ -659,6 +658,9 @@ fn prepare_request(
 struct Outputs {
     /// Frames per second of every generated video (`fps`).
     frame_rate: u32,
+    /// Sample rate, in Hz, of the audio muxed into each video
+    /// (`audio_sample_rate`).
+    audio_sample_rate: u32,
 }
 
 /// A deployment whose video capabilities are not the FastH3 contract.
@@ -676,9 +678,14 @@ enum DeploymentMismatch {
         /// The deployment's `canvas.canvases` capability, as JSON.
         canvases: String,
     },
-    /// Capabilities without the output frame rate.
-    #[error("the deployment reports no output frame rate: fps is {0}")]
-    FrameRate(String),
+    /// Capabilities without a rate of the generated media.
+    #[error("the deployment reports no output {name}: {value}")]
+    Rate {
+        /// The capability, `fps` or `audio_sample_rate`.
+        name: &'static str,
+        /// Its reported value, as JSON.
+        value: String,
+    },
 }
 
 /// Checks that a deployment's video capabilities are FastH3's: `t2va` alone
@@ -704,13 +711,22 @@ fn check_fasth3(
             canvases: canvases.to_string(),
         });
     }
-    let fps = &capabilities["fps"];
-    let frame_rate = fps
-        .as_u64()
-        .and_then(|rate| u32::try_from(rate).ok())
-        .filter(|&rate| rate > 0)
-        .ok_or_else(|| DeploymentMismatch::FrameRate(fps.to_string()))?;
-    Ok(Outputs { frame_rate })
+    // A rate is a positive count of the deployment's own.
+    let rate = |name: &'static str| {
+        let value = &capabilities[name];
+        value
+            .as_u64()
+            .and_then(|rate| u32::try_from(rate).ok())
+            .filter(|&rate| rate > 0)
+            .ok_or_else(|| DeploymentMismatch::Rate {
+                name,
+                value: value.to_string(),
+            })
+    };
+    Ok(Outputs {
+        frame_rate: rate("fps")?,
+        audio_sample_rate: rate("audio_sample_rate")?,
+    })
 }
 
 /// Maps a video stream that ended without an artifact to Dynamo's error type.
@@ -747,9 +763,9 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
 /// `NvVideosResponse`.
 ///
 /// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
-/// `B64Json` as bare base64. `fps` reports the deployment's output frame rate
-/// and `audio_sample_rate` the fixed FastH3 contract, not values read from
-/// the artifact.
+/// `B64Json` as bare base64. `fps` and `audio_sample_rate` report the rates
+/// the deployment declares for its video and audio, not values read from the
+/// artifact.
 fn video_response(
     id: &str,
     model: &str,
@@ -775,7 +791,7 @@ fn video_response(
             "url": url,
             "b64_json": b64_json,
             "fps": outputs.frame_rate,
-            "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
+            "audio_sample_rate": outputs.audio_sample_rate,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
     })
@@ -894,10 +910,18 @@ mod tests {
     }
 
     /// What the default 24 fps deployment generates.
-    const OUTPUTS: Outputs = Outputs { frame_rate: 24 };
+    const OUTPUTS: Outputs = Outputs {
+        frame_rate: 24,
+        audio_sample_rate: 32_000,
+    };
 
     fn capabilities(tasks: Value, canvases: Value) -> Value {
-        json!({"tasks": tasks, "canvas": {"canvases": canvases}, "fps": 24})
+        json!({
+            "tasks": tasks,
+            "canvas": {"canvases": canvases},
+            "fps": 24,
+            "audio_sample_rate": 32_000,
+        })
     }
 
     #[test]
@@ -911,10 +935,12 @@ mod tests {
             check_fasth3(&capabilities(json!(["t2va"]), served.clone()), &rasters).ok(),
             Some(OUTPUTS)
         );
-        // A deployment that reports no frame rate is refused.
-        let mut silent = capabilities(json!(["t2va"]), served.clone());
-        silent["fps"] = Value::Null;
-        assert!(check_fasth3(&silent, &rasters).is_err());
+        // A deployment that reports no frame or audio rate is refused.
+        for rate in ["fps", "audio_sample_rate"] {
+            let mut silent = capabilities(json!(["t2va"]), served.clone());
+            silent[rate] = json!(0);
+            assert!(check_fasth3(&silent, &rasters).is_err(), "{rate}");
+        }
         // Another canvas set than the configured one is refused.
         let landscape = json!([{"width": 1344, "height": 768}]);
         assert!(check_fasth3(&capabilities(json!(["t2va"]), landscape), &rasters).is_err());
@@ -1051,6 +1077,7 @@ mod tests {
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
         assert_eq!(response["data"][0]["fps"], 24);
+        assert_eq!(response["data"][0]["audio_sample_rate"], 32_000);
         assert!(response["data"][0]["url"].is_null());
         assert_eq!(response["inference_time_s"], 1.5);
 

@@ -283,6 +283,8 @@ pub struct VideoDenoiserInfo {
     /// generates: the output clock durations and reference videos are
     /// counted on.
     pub frame_rate: u32,
+    /// Sample rate, in Hz, of the audio track generated with each video.
+    pub audio_sample_rate: u32,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order it names them. Empty declares every canvas of the model's
     /// canvas rule.
@@ -299,8 +301,8 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, the frame rate is declared, and every
-    /// canvas and the capacity are positive.
+    /// and positive finite shifts, the frame and audio sample rates are
+    /// declared, and every canvas and the capacity are positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -318,6 +320,10 @@ impl VideoDenoiserInfo {
         ensure_valid!(
             self.frame_rate > 0,
             "a video denoiser declares no frame rate"
+        );
+        ensure_valid!(
+            self.audio_sample_rate > 0,
+            "a video denoiser declares no audio sample rate"
         );
         ensure_valid!(
             self.canvases
