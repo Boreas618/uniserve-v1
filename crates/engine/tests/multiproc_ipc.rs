@@ -2060,7 +2060,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         world_size: 1,
         components: WorkerConfig::single_component("model", 1),
         deployment_components: vec!["model".into()],
-        supported_calls: None,
         transfer_backends: "local".into(),
         export_backends: "local".into(),
         rendezvous_address: None,

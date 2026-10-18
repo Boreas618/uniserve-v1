@@ -138,20 +138,17 @@ pub(super) fn plan(
 
     let dedicated = config.role == "experts";
     let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
+    // A rank serves every call kind its placed components implement, which
+    // for a model rank always includes tensor transfer.
     let supported: Vec<CallKind> = if dedicated {
         Vec::new()
     } else {
         let declared = declarations.supported(&held);
         CallKind::ALL
             .into_iter()
-            .filter(|kind| declared.contains(kind) && launch.supported_calls.contains(kind))
+            .filter(|kind| declared.contains(kind))
             .collect()
     };
-    if supported.is_empty() && !dedicated {
-        return Err(Error::Unsupported(
-            "worker model implements none of the requested call kinds".into(),
-        ));
-    }
     let media_components = if dedicated {
         BTreeMap::new()
     } else {
