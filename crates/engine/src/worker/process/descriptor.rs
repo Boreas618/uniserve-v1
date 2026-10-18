@@ -129,7 +129,6 @@ impl Default for WorkerProcessArgs {
                 + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
                 as u32,
             attention_backend: "auto".into(),
-            capability_groups: Vec::new(),
             transfer: Default::default(),
             load_format: "auto".to_string(),
             download_dir: None,
@@ -271,10 +270,6 @@ impl WorkerProcessArgs {
             world_size: self.world_size(),
             components: self.components.clone(),
             deployment_components: deployment,
-            // `None` lets the worker serve every capability group it
-            // implements.
-            supported_calls: (!self.capability_groups.is_empty())
-                .then(|| self.capability_groups.join(",")),
             transfer_backends: names(&transfer_backends),
             export_backends: names(&export_backends),
             // Every rank of a group meets its peers at this address. The
