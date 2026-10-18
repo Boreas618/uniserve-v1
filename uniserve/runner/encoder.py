@@ -384,12 +384,15 @@ class EncoderRunner:
 
         A video encoder takes ``(pixels, out, units, *noise)``: ``pixels``
         is the request's ``[pixels, 3]`` uint8 condition pixels and each
-        unit is ``[pixel_offset, frames, width, height, unit]``, flattened:
-        its condition's first pixel row, frame count and raster, and the
-        unit's index among the condition's units. An encoder that samples
-        its posterior takes one ``noise`` tensor per unit, the complete
-        draw of the unit's condition size (:meth:`draw_posterior`). The
-        units' rows fill ``out`` in order.
+        unit is ``[pixel_offset, frames, width, height, unit, first_row,
+        stop_row]``, flattened: its condition's first pixel row, frame count
+        and raster, the unit's clip among the condition's clips, and the run
+        of the frames' latent row groups it encodes: a still frame's band
+        (``VideoEncoder.encode(rows=...)``), every row group of a whole frame
+        or of a video's clip. An encoder that samples its posterior takes one
+        ``noise`` tensor per unit, the complete draw of the unit's condition
+        size (:meth:`draw_posterior`). The units' rows fill ``out`` in
+        order.
 
         An audio encoder takes ``(samples, out, lengths)``: the request's
         ``[samples, 2]`` FP32 PCM, the tracks' sample counts ``lengths``;
@@ -472,10 +475,16 @@ class EncoderRunner:
         *noise: torch.Tensor,
     ) -> None:
         encoder = self._module
-        values, clips, counts, draws = [], [], [], []
-        for index, (offset, frames, width, height, unit) in enumerate(
-            _chunks(units, 5)
-        ):
+        values, clips, counts, draws, bands = [], [], [], [], []
+        for index, (
+            offset,
+            frames,
+            width,
+            height,
+            unit,
+            first,
+            stop,
+        ) in enumerate(_chunks(units, 7)):
             # Media unit ``unit`` encodes the condition's clip of that index.
             clip = encoder.clips(frames)[unit]
             area = width * height
@@ -491,11 +500,19 @@ class EncoderRunner:
                     video.Config(frames, image.Config(height, width))
                 )
                 draws.append(noise[index].view(shape))
+            # A still frame's run of row groups is a band of its latent rows
+            # (all of them for a whole frame); a video's clip encodes whole.
+            bands.append(
+                slice(first * encoder.row_group, stop * encoder.row_group)
+                if frames == 1
+                else None
+            )
         encoded = encoder.encode(
             tuple(values),
             clips=tuple(clips),
             num_frames=tuple(counts),
             noise=tuple(draws) if noise else None,
+            rows=tuple(bands),
         )
         if (
             sum(int(output.tensor.shape[0]) for output in encoded)

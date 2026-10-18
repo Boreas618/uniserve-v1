@@ -649,21 +649,31 @@ class VideoEncoder(nn.Module):
     frame outside it. ``clips`` lists a video's clips in order and
     ``latent_slices`` the contiguous latent frames each one produces, so the
     clips of one video may be encoded by different ranks, in any order, and
-    their rows assemble the whole-video encoding exactly.
+    their rows assemble the whole-video encoding exactly. A still frame (a
+    one-frame video) may further be encoded in bands of whole latent row
+    groups (``encode(rows=...)``): each band's rows are a contiguous run of
+    the frame's rows, and the bands' rows assemble the frame's encoding
+    exactly. Banding needs a latent encoder that encodes a band on its own,
+    one over a ``TiledEncoder``.
 
     Subclasses define both partitions; ``output_layout``, which describes a
     video's complete latent as frame-major rows along its leading axis, each
     latent frame owning the same number of consecutive rows;
+    ``latent_size``, a frame's native latent raster; ``row_group``, the
+    latent rows of one row group, a frame's output rows being row-major over
+    its row groups, each group owning the same number of consecutive rows;
     ``unpack_pixels``, the conversion of one clip's frames into the native
     encoder input; and ``pack_latents``, the conversion of that clip's native
     NCTHW latents into its output rows. An encoder whose posterior is sampled
     defines ``posterior_shape`` and ``draw_noise``: the draw spans the
     video's complete latent and depends on the video's size alone, so a
     caller draws it once per size and passes it with every clip of that
-    size; each clip takes the share of its own latent frames, which
-    reproduces the draw of a whole-video encoding. Inputs remain borrowed;
-    results are new tensors.
+    size; each clip takes the share of its own latent frames, and a band its
+    rows of them, which reproduces the draw of a whole-video encoding.
+    Inputs remain borrowed; results are new tensors.
     """
+
+    row_group: int = 1
 
     def __init__(self, encoder: LatentEncoder):
         super().__init__()
@@ -679,6 +689,13 @@ class VideoEncoder(nn.Module):
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
         """Describe the complete latent rows of one video under ``video``."""
+        raise NotImplementedError
+
+    def latent_size(self, frame: image.Config) -> tuple[int, int]:
+        """Return the native ``(height, width)`` latent raster of a frame.
+
+        The height is a whole number of row groups.
+        """
         raise NotImplementedError
 
     def load_kernels(self) -> None:
@@ -729,6 +746,7 @@ class VideoEncoder(nn.Module):
         clips: tuple[slice, ...],
         num_frames: tuple[int, ...],
         noise: tuple[torch.Tensor, ...] | None = None,
+        rows: tuple[slice | None, ...] | None = None,
     ) -> tuple[TensorOutput, ...]:
         """Encode clips of RGB24 videos into their latent rows.
 
@@ -737,22 +755,31 @@ class VideoEncoder(nn.Module):
         uint8, and ``clips[i]`` must be one of that video's clips. An
         encoder that samples its posterior takes ``noise[i]``, the complete
         draw of clip ``i``'s video (``draw_noise``), which clips of one video
-        share; other encoders take no ``noise``. Each result holds its clip's
+        share; other encoders take no ``noise``. ``rows[i]`` is None for the
+        clip's whole raster, or, for a still frame, a band of its native
+        latent rows made of whole row groups. Each result holds its clip's
         rows at their place in the video's complete latent.
+
+        Raises:
+            ValueError: The inputs break the clip contract above, or the
+                encoded rows disagree with the declared layout.
         """
+        if rows is None:
+            rows = (None,) * len(pixels)
         if (
             not pixels
             or len(pixels) != len(clips)
             or len(pixels) != len(num_frames)
             or (noise is not None and len(noise) != len(pixels))
+            or len(pixels) != len(rows)
         ):
             raise ValueError(
-                "video frames, clips, durations and draws must align"
+                "video frames, clips, durations, draws and bands must align"
             )
 
-        positions = []
-        for value, interval, count in zip(
-            pixels, clips, num_frames, strict=True
+        positions, bands = [], []
+        for value, interval, count, band in zip(
+            pixels, clips, num_frames, rows, strict=True
         ):
             legal = self.clips(count)
             if interval not in legal:
@@ -769,11 +796,33 @@ class VideoEncoder(nn.Module):
                     "video clips must be uint8 RGB frames "
                     "[frames, height, width, 3] covering their clip"
                 )
+            if band is not None:
+                height, _ = self.latent_size(
+                    image.Config(int(value.shape[1]), int(value.shape[2]))
+                )
+                group = self.row_group
+                if (
+                    count != 1
+                    or band.step not in (None, 1)
+                    or band.start is None
+                    or band.stop is None
+                    or not 0 <= band.start < band.stop <= height
+                    or band.start % group
+                    or band.stop % group
+                ):
+                    raise ValueError(
+                        "a band must be whole latent row groups of a still "
+                        "frame"
+                    )
+                # A band over every row is the whole frame.
+                if (band.start, band.stop) == (0, height):
+                    band = None
             positions.append(legal.index(interval))
+            bands.append(band)
 
         outputs = []
-        for index, (value, interval, count, position) in enumerate(
-            zip(pixels, clips, num_frames, positions, strict=True)
+        for index, (value, interval, count, position, band) in enumerate(
+            zip(pixels, clips, num_frames, positions, bands, strict=True)
         ):
             size = video.Config(
                 count, image.Config(int(value.shape[1]), int(value.shape[2]))
@@ -788,6 +837,23 @@ class VideoEncoder(nn.Module):
                 )
             rows_per_frame = layout.shape[0] // spans[-1].stop
 
+            # A band keeps a run of its frame's row groups, whose output rows
+            # follow each other within the frame.
+            first, stop = (
+                span.start * rows_per_frame,
+                span.stop * rows_per_frame,
+            )
+            if band is not None:
+                groups = self.latent_size(size.frame)[0] // self.row_group
+                if rows_per_frame % groups:
+                    raise ValueError(
+                        "a frame's latent rows must divide evenly among its "
+                        "row groups"
+                    )
+                rows_per_group = rows_per_frame // groups
+                first = band.start // self.row_group * rows_per_group
+                stop = band.stop // self.row_group * rows_per_group
+
             shape = self.posterior_shape(size)
             if (shape is None) != (noise is None):
                 raise ValueError(
@@ -799,11 +865,13 @@ class VideoEncoder(nn.Module):
                     raise ValueError(
                         "a posterior draw must span its video's latent"
                     )
-                # The clip's latent frames of its video's draw. A caller's
-                # draw stays unchanged while the copy reads it.
-                draw = noise[index][:, :, span].to(
-                    value.device, non_blocking=True
-                )
+                # The clip's latent frames of its video's draw, and a band's
+                # rows of them. A caller's draw stays unchanged while the
+                # copy reads it.
+                draw = noise[index][:, :, span]
+                if band is not None:
+                    draw = draw[..., band, :]
+                draw = draw.to(value.device, non_blocking=True)
 
             # A clip whose input was padded to the encoder's temporal extent
             # yields trailing latent frames beyond its own; the encoder's
@@ -811,30 +879,25 @@ class VideoEncoder(nn.Module):
             # samples the others.
             latents = self.encoder(
                 self.unpack_pixels(value, interval, count),
+                rows=band,
                 window=(slice(None), slice(None), slice(0, extent)),
                 noise=draw,
             )
-            rows = self.pack_latents(latents)
+            values = self.pack_latents(latents)
             if (
-                rows.shape != (extent * rows_per_frame, *layout.shape[1:])
-                or rows.dtype != layout.dtype
+                values.shape != (stop - first, *layout.shape[1:])
+                or values.dtype != layout.dtype
             ):
                 raise ValueError(
                     "packed video latents must match the declared output rows"
                 )
             outputs.append(
                 TensorOutput(
-                    rows,
+                    values,
                     OutputLayout(
                         layout.shape,
                         layout.dtype,
-                        (
-                            slice(
-                                span.start * rows_per_frame,
-                                span.stop * rows_per_frame,
-                            ),
-                            *layout.local_slice[1:],
-                        ),
+                        (slice(first, stop), *layout.local_slice[1:]),
                         variable_axes=layout.variable_axes,
                         value_range=layout.value_range,
                     ),
