@@ -743,7 +743,6 @@ class ExecutionContext:
                 heads=heads,
                 head_dim=head_dim,
                 dtype=dtype,
-                block_size=1,
             )
             self._context_backing[key] = buffers
         self._vsa_context[parallel] = buffers
@@ -778,7 +777,7 @@ class ExecutionContext:
                 "dtype": dtype,
             }
             output = self._bind_output(parallel, **options)
-            context = self._bind_context(parallel, **options, block_size=64)
+            context = self._bind_context(parallel, **options)
             self._vsa_transport[key] = (output, context)
         output, context = self._vsa_transport[key]
         self._vsa_output[parallel] = output
