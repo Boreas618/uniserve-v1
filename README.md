@@ -197,6 +197,8 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 
 ## Repository layout
 
+The [architecture guide](docs/architecture.md) describes how the head, the launchers and the rank processes divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
+
 ```text
 crates/core/                  Shared values and the engine-process codec
 crates/observability/         Runtime metrics and process registry
@@ -223,6 +225,7 @@ uniserve/                     Numerical layers, loading, resource binding, concr
 uniserve_kernels/             Native CUDA, Triton and CuTe kernels
 uniserve_eval/                Serving evaluator, profiles, and request workloads
 configs/minimax_h3/           H3 deployment files
+docs/architecture.md          Processes, the rank planes and the request path
 docs/minimax_h3/              H3 serving, library, evaluation and Dynamo guides, container files
 ```
 

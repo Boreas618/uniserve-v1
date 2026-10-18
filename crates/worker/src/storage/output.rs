@@ -1,11 +1,13 @@
 //! Bounded host output storage and per-batch readback lifetimes.
 //!
-//! A lane's batch results are copied device-to-host into the batch's range
-//! of the lane's page-locked word arena, which the lane allocates when it
-//! starts: integer token columns from the front of the range, raw byte
-//! captures from its back. The copies are ordered on the producing streams
-//! and fenced by events; the host reads the words only after those fences
-//! complete, widening narrower token columns to 64 bits on the host.
+//! A batch's results are copied device-to-host into the batch's range of
+//! its runtime's word arena (`OutputPool`): one arena per runtime on each
+//! lane, allocated when that runtime starts, page-locked for device copies
+//! and pageable on a CPU lane. Integer token columns fill the range
+//! from its front, raw byte captures from its back. The copies are ordered
+//! on the producing streams and fenced by events; the host reads the words
+//! only after those fences complete, widening narrower token columns to 64
+//! bits on the host.
 
 use std::collections::HashMap;
 use std::ops::Range;
