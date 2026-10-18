@@ -28,9 +28,9 @@ pub mod exports;
 pub mod fetch;
 mod local;
 mod pool;
+mod posix_shm;
 mod read;
 mod registry;
-mod shm;
 mod spans;
 mod ticket;
 mod transport;
@@ -39,10 +39,10 @@ pub(crate) mod vmm;
 pub(crate) use cache_import::{
     CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired,
 };
+pub use posix_shm::SharedRead;
+pub(crate) use posix_shm::{SharedBuffer, SharedMapping};
 pub use read::Read;
 pub(crate) use read::ReadRef;
-pub use shm::SharedRead;
-pub(crate) use shm::{SharedBuffer, SharedMapping};
 pub use spans::Spans;
 pub(crate) use spans::{copy_on_host, copy_planner, submit_copy};
 pub use transport::{Transport, TransportKind, TransportOptions, Transports};

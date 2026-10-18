@@ -2261,14 +2261,14 @@ fn a_rank_may_transfer_over_every_mechanism_its_edges_name() {
     let mut info = WorkerInfo {
         transfer_backends: vec![
             "cuda_vmm".to_owned(),
-            "shm".to_owned(),
+            "posix_shm".to_owned(),
             "channel".to_owned(),
         ],
         ..WorkerInfo::default()
     };
     assert!(info.validate().is_ok());
 
-    // `socket` is not a transfer mechanism name (`local`, `shm`, `cuda_vmm`,
+    // `socket` is not a transfer mechanism name (`local`, `posix_shm`, `cuda_vmm`,
     // or `channel`).
     info.transfer_backends = vec!["cuda_vmm".to_owned(), "socket".to_owned()];
     let error = info.validate().unwrap_err().to_string();

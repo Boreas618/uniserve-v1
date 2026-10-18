@@ -223,7 +223,7 @@ def test_direct_imports_copy_pages_and_mark_them_initialized(
 @pytest.mark.parametrize(
     ("transport", "kinds", "devices"),
     [
-        ("shm", ("", "float8_e4m3fn"), (0, 0)),
+        ("posix_shm", ("", "float8_e4m3fn"), (0, 0)),
         ("cuda_vmm", ("float8_e4m3fn", "float8_e4m3fn"), (0, 1)),
     ],
 )

@@ -43,7 +43,7 @@ pub(super) fn borrowed(
     let shared = backend.rank_storage().is_some_and(|storage| {
         storage
             .transports
-            .get(crate::transfer::TransportKind::Shm)
+            .get(crate::transfer::TransportKind::PosixShm)
             .is_some()
     });
     let node = &backend.info().endpoint.node;

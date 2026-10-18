@@ -494,10 +494,10 @@ impl WorkerInfo {
         ensure_valid!(
             !self.device.is_empty()
                 && !self.transfer_backends.is_empty()
-                && self
-                    .transfer_backends
-                    .iter()
-                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_vmm" | "channel"))
+                && self.transfer_backends.iter().all(|name| matches!(
+                    name.as_str(),
+                    "local" | "posix_shm" | "cuda_vmm" | "channel"
+                ))
                 && self.transfer_backends.iter().collect::<HashSet<_>>().len()
                     == self.transfer_backends.len(),
             "worker physical transfer capabilities are incomplete"

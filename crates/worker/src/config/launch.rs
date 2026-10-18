@@ -350,12 +350,14 @@ fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {
             "transfer backends must be nonempty and unique",
         ));
     }
-    if names
-        .iter()
-        .any(|name| !matches!(name.as_str(), "local" | "shm" | "cuda_vmm" | "channel"))
-    {
+    if names.iter().any(|name| {
+        !matches!(
+            name.as_str(),
+            "local" | "posix_shm" | "cuda_vmm" | "channel"
+        )
+    }) {
         return Err(DescriptorError::new(
-            "transfer backends must name local, shm, cuda_vmm, or channel",
+            "transfer backends must name local, posix_shm, cuda_vmm, or channel",
         ));
     }
     Ok(names)

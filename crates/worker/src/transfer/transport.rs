@@ -6,7 +6,7 @@
 //! | Kind | Export | Read |
 //! | --- | --- | --- |
 //! | local | register the spans with a producer fence | borrow in place, or copy |
-//! | shm | copy into a POSIX shared-memory segment | stage on the host, then copy |
+//! | posix_shm | copy into a POSIX shared-memory segment | stage on the host, then copy |
 //! | cuda_vmm | export in place or copy into a VMM pool chunk | map the handle, then copy |
 //! | channel | copy into the locator's payload bytes | stage on the host, then copy |
 //!
@@ -39,7 +39,7 @@ use crate::{Error, EventPool, Result, lock};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportKind {
     Local,
-    Shm,
+    PosixShm,
     CudaVmm,
     Channel,
 }
@@ -48,7 +48,7 @@ impl TransportKind {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Shm => "shm",
+            Self::PosixShm => "posix_shm",
             Self::CudaVmm => "cuda_vmm",
             Self::Channel => "channel",
         }
@@ -57,7 +57,7 @@ impl TransportKind {
     pub fn parse(name: &str) -> Result<Self> {
         Ok(match name {
             "local" => Self::Local,
-            "shm" => Self::Shm,
+            "posix_shm" => Self::PosixShm,
             "cuda_vmm" => Self::CudaVmm,
             "channel" => Self::Channel,
             _ => return Err(Error::Invalid(format!("unknown transport: {name}"))),
@@ -68,7 +68,7 @@ impl TransportKind {
     pub fn of(locator: &Locator) -> Self {
         match locator.transport {
             TransferTransport::Local { .. } => Self::Local,
-            TransferTransport::PosixShm { .. } => Self::Shm,
+            TransferTransport::PosixShm { .. } => Self::PosixShm,
             TransferTransport::CudaVmm { .. } => Self::CudaVmm,
             TransferTransport::Channel { .. } => Self::Channel,
         }
@@ -223,7 +223,7 @@ impl Transport {
                 endpoint: endpoint(),
                 next: AtomicU64::new(0),
             },
-            TransportKind::Shm => Backend::Shared {
+            TransportKind::PosixShm => Backend::Shared {
                 endpoint: endpoint(),
                 slot: options.acknowledgment_slot,
                 host_slots: options.host_slots.clone(),
@@ -259,7 +259,7 @@ impl Transport {
     pub(crate) fn kind(&self) -> TransportKind {
         match self.backend {
             Backend::Local { .. } => TransportKind::Local,
-            Backend::Shared { .. } => TransportKind::Shm,
+            Backend::Shared { .. } => TransportKind::PosixShm,
             Backend::Cuda(_) => TransportKind::CudaVmm,
             Backend::Channel { .. } => TransportKind::Channel,
         }
@@ -288,7 +288,7 @@ impl Transport {
     /// Whether this mechanism reads `locator`, a location of its kind: a
     /// POSIX segment only on this rank's node.
     pub(crate) fn reads(&self, locator: &Locator) -> bool {
-        self.kind() != TransportKind::Shm || locator.source.node == self.source.node
+        self.kind() != TransportKind::PosixShm || locator.source.node == self.source.node
     }
 
     /// Whether this mechanism reaches any of `consumers` (every mechanism

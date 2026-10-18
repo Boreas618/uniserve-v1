@@ -218,11 +218,11 @@ fn local_reads_copy_or_borrow_and_retire_after_release() -> Result<()> {
 #[test]
 fn shared_memory_and_channel_reads_stage_whole_payloads() -> Result<()> {
     let (transports, capacity) =
-        host_transports(&[TransportKind::Shm, TransportKind::Channel], 1 << 12)?;
+        host_transports(&[TransportKind::PosixShm, TransportKind::Channel], 1 << 12)?;
     let source = counting(&[3, 2])?;
     let locations = located(&transports, &source, Some(&[2, 0]), &[0], None, |_| Ok(()))?;
     // Slot 0 is on this host: shared memory reaches it, the channel does not.
-    assert_eq!(kinds(&locations), [TransportKind::Shm]);
+    assert_eq!(kinds(&locations), [TransportKind::PosixShm]);
     let (transport, locator) = &locations[0];
     assert_eq!(locator.offset, [2, 0]);
 
@@ -331,7 +331,8 @@ fn fetches_cover_regions_from_shards_and_reject_missing_coverage() -> Result<()>
 #[test]
 fn a_failed_export_revokes_every_accepted_location() -> Result<()> {
     // Room for one export only: the second mechanism's reservation fails.
-    let (transports, capacity) = host_transports(&[TransportKind::Local, TransportKind::Shm], 24)?;
+    let (transports, capacity) =
+        host_transports(&[TransportKind::Local, TransportKind::PosixShm], 24)?;
     let source = counting(&[2, 3])?;
     let accepted = AtomicUsize::new(0);
     let result = located(&transports, &source, None, &[0], None, |_| {
@@ -404,7 +405,7 @@ const CLAIMED: &str = "shared export claimed";
 #[test]
 fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result<()> {
     let (transports, capacity, events) = transports(
-        &[TransportKind::Local, TransportKind::Shm],
+        &[TransportKind::Local, TransportKind::PosixShm],
         "producer",
         0,
         1 << 12,
@@ -418,7 +419,7 @@ fn shared_exports_retire_once_another_process_acknowledged_its_reads() -> Result
     })?;
     let (_, locator) = locations
         .iter()
-        .find(|(_, locator)| TransportKind::of(locator) == TransportKind::Shm)
+        .find(|(_, locator)| TransportKind::of(locator) == TransportKind::PosixShm)
         .ok_or(Error::State("no shared-memory location was exported"))?;
 
     let locator = serde_json::to_string(locator)
@@ -487,9 +488,10 @@ fn shared_export_consumer() -> Result<()> {
     };
     let locator: Locator = serde_json::from_str(&locator)
         .map_err(|error| Error::Invalid(format!("unreadable locator: {error}")))?;
-    let (transports, _, _) = transports(&[TransportKind::Shm], "consumer", 1, 1 << 12, 1 << 20)?;
+    let (transports, _, _) =
+        transports(&[TransportKind::PosixShm], "consumer", 1, 1 << 12, 1 << 20)?;
     let transport = transports
-        .get(TransportKind::Shm)
+        .get(TransportKind::PosixShm)
         .ok_or(Error::State("no shared-memory transport is bound"))?;
 
     // A copy read acknowledges its claim when its task retires.
@@ -624,14 +626,14 @@ fn device_exports_reach_local_shared_and_channel_readers() -> Result<()> {
     let (transports, capacity, events) = device_transports(
         &[
             TransportKind::Local,
-            TransportKind::Shm,
+            TransportKind::PosixShm,
             TransportKind::Channel,
         ],
         "space",
         0,
     )?;
     let spans = Spans::single(device_counting(&[8, 4], &stream)?)?;
-    // Slot 0 is on this host, slot 7 is not: local, shm and channel all apply.
+    // Slot 0 is on this host, slot 7 is not: local, posix_shm and channel all apply.
     let locations = located(
         &transports,
         &spans,
@@ -644,7 +646,7 @@ fn device_exports_reach_local_shared_and_channel_readers() -> Result<()> {
         kinds(&locations),
         [
             TransportKind::Local,
-            TransportKind::Shm,
+            TransportKind::PosixShm,
             TransportKind::Channel
         ]
     );
@@ -753,7 +755,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() -> Result<()> {
         &[
             TransportKind::Local,
             TransportKind::CudaVmm,
-            TransportKind::Shm,
+            TransportKind::PosixShm,
         ],
         "producer",
         0,
@@ -761,7 +763,7 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() -> Result<()> {
     let locations = located(&with_shared, &spans, None, &[1], Some(&stream), |_| Ok(()))?;
     assert_eq!(
         kinds(&locations),
-        [TransportKind::Local, TransportKind::Shm]
+        [TransportKind::Local, TransportKind::PosixShm]
     );
     exports::release(&locations)?;
     settle(&with_shared, &capacity, &events)?;

@@ -2283,7 +2283,7 @@ fn components_transfer_published_values_within_one_worker() -> anyhow::Result<()
     // rank 0 (the patch encoder), and once with only the edges
     // `TransferConfig::with_worker_defaults` derives for this worker.
     for transfer in [
-        uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?,
+        uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?,
         uniserve_engine::TransferConfig::default(),
     ] {
         let mut args = rank_group_args(8 << 20);
@@ -2387,7 +2387,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
-    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=shm")?;
+    let transfer = uniserve_engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?;
     let mut args = rank_group_args(8 << 20);
     args.queue_depth = 3;
     args.transfer = transfer.clone();
@@ -2550,7 +2550,7 @@ fn input_no_edge_carries_fails_only_the_requests_reading_it() -> anyhow::Result<
     // Two one-rank instances whose products cross only over shared storage.
     // A product whose one location is in its producer's own address space
     // therefore has no way to the other instance.
-    let edges = "producer->consumer=shm,consumer->producer=shm";
+    let edges = "producer->consumer=posix_shm,consumer->producer=posix_shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
         args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
@@ -2702,7 +2702,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // Each instance is a one-rank group holding every stub component, with
     // its own queue depth; both route products to each other over shared
     // storage.
-    let edges = "encoder-0->encoder-1=shm,encoder-1->encoder-0=shm";
+    let edges = "encoder-0->encoder-1=posix_shm,encoder-1->encoder-0=posix_shm";
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
         let mut args = single_rank_args(worker_id, depth);
         if worker_id == "encoder-0" {
@@ -3034,7 +3034,7 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
     let mut args = rank_group_args(8 << 20);
     // `publisher` is the worker id `SlowShmExport` names as the source of its
     // segment.
-    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=shm")?;
+    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?;
     let mut executor = WorkerGroup::spawn(args)?;
 
     let slow_admission = text_admission(31, 1, 1)?;
@@ -3176,7 +3176,7 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
 fn a_request_continues_on_the_worker_that_installed_its_cache() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerId};
 
-    let edges = "source->target=shm";
+    let edges = "source->target=posix_shm";
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = single_rank_args(worker_id, QUEUE_DEPTH);
         args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
@@ -3667,8 +3667,9 @@ fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyho
     // may run on.
     let workers = ["prepare", "denoise"];
     let placement = single_rank_args("prepare", QUEUE_DEPTH);
-    let mut transfer =
-        uniserve_engine::TransferConfig::parse("prepare->denoise=shm,denoise->prepare=shm")?;
+    let mut transfer = uniserve_engine::TransferConfig::parse(
+        "prepare->denoise=posix_shm,denoise->prepare=posix_shm",
+    )?;
     for worker in workers {
         let hosts = placement.ranks.iter().map(|rank| rank.node.clone());
         transfer
@@ -4048,7 +4049,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
 fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
     // One mechanism at a time: each pair of workers holds two copies of the
     // model on the device.
-    for edges in ["source->target=shm", "source->target=cuda_vmm"] {
+    for edges in ["source->target=posix_shm", "source->target=cuda_vmm"] {
         continue_greedily_from_installed_cache(edges).with_context(|| edges.to_owned())?;
     }
     Ok(())
@@ -4590,7 +4591,7 @@ fn media_rank() -> anyhow::Result<()> {
 #[test]
 fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
     let mut args = rank_group_args(8 << 20);
-    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=shm")?;
+    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?;
     let mut executor = WorkerGroup::spawn(args)?;
 
     let admission = text_admission(34, 1, 1)?;
