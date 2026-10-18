@@ -24,21 +24,35 @@ from .inputs import BlockInput, Pattern, Segments
 from .layer import BlockAttention
 
 
+def zero_padding(rows: torch.Tensor, segments: Segments) -> None:
+    """Store zeros to the rows past each tile's valid size, in place.
+
+    ``rows`` is ``[padded_tokens, heads, width]`` with any row and head
+    strides; rows within a tile's valid size are not touched.
+    """
+    if rows.is_cuda:
+        from uniserve_kernels.attention import vsa_segments
+
+        vsa_segments.zero_tile_padding(
+            rows, segments.valid_sizes, segments.tile
+        )
+        return
+    live = torch.arange(segments.tile) < segments.valid_sizes[:, None]
+    rows.view(segments.tiles, segments.tile, *rows.shape[1:]).masked_fill_(
+        ~live[:, :, None, None], 0
+    )
+
+
 def pool(rows: torch.Tensor, segments: Segments) -> torch.Tensor:
     """Average each tile's valid rows of every head in FP32.
 
-    ``rows`` is ``[padded_tokens, heads, width]``; the result is ``[tiles,
-    heads, width]`` FP32, zero for an empty tile. Rows past a tile's valid
-    size are excluded whatever they hold.
+    ``rows`` is ``[padded_tokens, heads, width]`` whose rows past each tile's
+    valid size hold zeros (``zero_padding``); the result is ``[tiles, heads,
+    width]`` FP32, zero for an empty tile. The zeros add nothing, so the sum
+    is the valid rows' sum in the order of a masked copy's.
     """
-    tiles, tile = segments.tiles, segments.tile
-    live = (
-        torch.arange(tile, device=rows.device) < segments.valid_sizes[:, None]
-    )
-    values = rows.view(tiles, tile, *rows.shape[1:])
-    total = torch.where(live[:, :, None, None], values, 0).sum(
-        1, dtype=torch.float32
-    )
+    values = rows.view(segments.tiles, segments.tile, *rows.shape[1:])
+    total = values.sum(1, dtype=torch.float32)
     return total / segments.valid_sizes.clamp_min(1).view(-1, 1, 1)
 
 
@@ -54,7 +68,7 @@ def select(
 
     Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
     tile's kept tiles first in ascending order, and ``[heads, tiles]`` int32
-    counts. Entries past a count are unread.
+    counts. Entries past a count are unread; they hold the unkept tiles.
     """
     tiles = segments.tiles
     device = scores.device
@@ -85,9 +99,17 @@ def select(
     mask = (video[:, None] & dense[None, :]) | (dense[:, None] & live[None, :])
     mask = mask[None] | (chosen & video[None, :, None])
     counts = mask.sum(-1, dtype=torch.int32)
-    keys = torch.where(mask, torch.arange(tiles, device=device), tiles)
-    indices = keys.sort(dim=-1).values.clamp_max(tiles - 1)
-    return indices.to(torch.int32), counts
+
+    # Compact each query tile's kept key tiles to the front in ascending
+    # order: a kept tile's slot is the count of kept tiles before it, and
+    # the unkept tiles fill the remaining slots in order.
+    kept_before = mask.cumsum(-1) - 1
+    unkept_before = (~mask).cumsum(-1) - 1
+    slots = torch.where(mask, kept_before, counts[..., None] + unkept_before)
+    keys = torch.arange(tiles, dtype=torch.int32, device=device)
+    indices = torch.empty(mask.shape, dtype=torch.int32, device=device)
+    indices.scatter_(-1, slots, keys.expand(mask.shape))
+    return indices, counts
 
 
 class SegmentAttention(nn.Module):
@@ -121,8 +143,10 @@ class SegmentAttention(nn.Module):
         """Attend ``[padded_tokens, heads, width]`` projections of all rows.
 
         ``q`` and ``k`` are normalized and rotated; ``gate`` weights the
-        compression branch elementwise. Returns BF16 ``[padded_tokens /
-        members, heads * members, width]`` rows of this rank's token shard,
+        compression branch elementwise. Every projection may use its own row
+        and head strides; the rows of ``q``, ``k`` and ``v`` past a tile's
+        valid size are overwritten with zeros. Returns BF16 ``[padded_tokens
+        / members, heads * members, width]`` rows of this rank's token shard,
         ``members`` being the Ulysses group size. Rows past a tile's valid
         size hold unspecified values.
 
@@ -142,7 +166,11 @@ class SegmentAttention(nn.Module):
 
         # Pooled scores [heads, query tile, key tile] in FP32: the tile means
         # of the queries and keys, scaled by the inverse square root of the
-        # head width.
+        # head width. Attention never reads padding rows (keys past a tile's
+        # valid size are masked and padded query rows are unspecified), so
+        # zeroing them leaves every valid result as it was.
+        for value in (q, k, v):
+            zero_padding(value, segments)
         pooled_query, pooled_key, pooled_value = (
             pool(value, segments).permute(1, 0, 2) for value in (q, k, v)
         )
@@ -167,7 +195,12 @@ class SegmentAttention(nn.Module):
         live = segments.valid_sizes > 0
         weights = scores.masked_fill(~live, -torch.inf).softmax(-1)
         compressed = torch.matmul(weights, pooled_value).to(q.dtype)
-        tiled = (tiles, tile, heads, width)
-        gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)
-        fine.view(tiled).add_(gated)
+        if fine.is_cuda:
+            from uniserve_kernels.attention import vsa_segments
+
+            vsa_segments.add_gated_tiles(fine, compressed, gate, tile)
+        else:
+            tiled = (tiles, tile, heads, width)
+            gated = compressed.permute(1, 0, 2)[:, None] * gate.view(tiled)
+            fine.view(tiled).add_(gated)
         return self.exchange.tokens(fine)
