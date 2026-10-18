@@ -880,12 +880,10 @@ pub enum CacheGroupKind {
     /// request continues. `window` is the longest history any reader of the
     /// group needs, not the checkpoint's nominal window.
     SlidingWindow {
-        /// History tokens any reader of the group needs.
+        /// History tokens any reader of the group needs. A table keeps one
+        /// contiguous run of pages, so no prefix is retained outside the
+        /// window.
         window: u32,
-        /// Prefix tokens retained outside the window. The unit pool keeps one
-        /// contiguous run of pages per table, so validation rejects a
-        /// nonzero sink.
-        sink: u32,
     },
 }
 
@@ -894,7 +892,7 @@ impl CacheGroupKind {
     pub const fn window(self) -> Option<u32> {
         match self {
             Self::Full => None,
-            Self::SlidingWindow { window, .. } => Some(window),
+            Self::SlidingWindow { window } => Some(window),
         }
     }
 }

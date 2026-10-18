@@ -235,14 +235,13 @@ impl CachePlan {
     pub fn info(&self, num_units: u32) -> PrefixCacheInfo {
         PrefixCacheInfo {
             num_units,
-            unit_bytes: self.unit_bytes,
             dtype: self.dtype,
             groups: self
                 .groups
                 .iter()
                 .map(|group| CacheGroup {
                     kind: group.window.map_or(CacheGroupKind::Full, |window| {
-                        CacheGroupKind::SlidingWindow { window, sink: 0 }
+                        CacheGroupKind::SlidingWindow { window }
                     }),
                     page_tokens: group.page_tokens,
                     units_per_page: group.units_per_page,

@@ -1464,10 +1464,7 @@ fn hybrid_groups_share_one_unit_pool() {
             ..base.clone()
         },
         CacheGroup {
-            kind: CacheGroupKind::SlidingWindow {
-                window: 96,
-                sink: 0,
-            },
+            kind: CacheGroupKind::SlidingWindow { window: 96 },
             page_tokens: 32,
             units_per_page: 3,
             layer_ids: (4..16).collect(),

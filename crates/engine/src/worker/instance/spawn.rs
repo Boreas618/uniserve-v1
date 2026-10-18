@@ -484,8 +484,7 @@ impl WorkerGroup {
         // every layer must have its KV heads covered from head 0 to
         // `total_kv_heads` by the ranks storing it. Overlapping regions are
         // allowed; a gap is not. The group reports the union of its ranks'
-        // layers, which bounds exports, and the largest unit, because
-        // the scheduler reserves units shared by every stage.
+        // layers, which bounds exports.
         if let Some(cache) = &mut info.prefix_cache {
             let regions: Vec<_> = workers
                 .iter()
@@ -540,11 +539,6 @@ impl WorkerGroup {
                 owners.keys().copied().eq(0..owners.len() as u32),
                 "worker cache regions do not cover every logical cache layer"
             );
-            cache.unit_bytes = regions
-                .iter()
-                .map(|region| region.unit_bytes)
-                .max()
-                .unwrap_or(cache.unit_bytes);
         }
 
         // Keep startup cancellation attached until every deployment group

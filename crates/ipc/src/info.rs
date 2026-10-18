@@ -20,10 +20,6 @@ use uniserve_core::ConditionTiles;
 pub struct PrefixCacheInfo {
     /// Allocation units in the pool, including the unit-zero sentinel.
     pub num_units: u32,
-    /// Physical bytes one unit occupies on this rank: every column plane of
-    /// the unit plus its per-unit metadata (initialization flags and, with
-    /// FP8, scales).
-    pub unit_bytes: u64,
     /// Element data type of cache tensors.
     pub dtype: PrefixCacheDtype,
     /// Cache groups in table order.
@@ -94,11 +90,10 @@ impl PrefixCacheInfo {
     ///
     /// Every page size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
-    /// at most one group. A sliding-window group may not retain sink tokens:
-    /// a table keeps one contiguous run of pages.
+    /// at most one group.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            self.num_units > 1 && self.unit_bytes > 0 && !self.groups.is_empty(),
+            self.num_units > 1 && !self.groups.is_empty(),
             "worker info declare an incomplete cache unit pool"
         );
 
@@ -124,10 +119,6 @@ impl PrefixCacheInfo {
                     && group.head_dim > 0,
                 "worker cache group head interval exceeds its logical bounds"
             );
-            ensure_valid!(
-                !matches!(group.kind, CacheGroupKind::SlidingWindow { sink, .. } if sink > 0),
-                "worker cache group retains sliding-window sink tokens"
-            );
         }
         Ok(())
     }
@@ -137,8 +128,7 @@ impl PrefixCacheInfo {
     /// Stages must agree on dtype and on every group's retention policy and
     /// page shape; their rank-local layer ids and head placement may differ.
     /// The combined pool has the smaller unit count, because the scheduler
-    /// assigns one set of unit ids valid in both, the larger unit size, and
-    /// per group the union of both stages' layers, which bounds exports.
+    /// assigns one set of unit ids valid in both, and per group the union of both stages' layers, which bounds exports.
     pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
         ensure_valid!(
             self.dtype == other.dtype
@@ -172,7 +162,6 @@ impl PrefixCacheInfo {
             .collect();
         let merged = Self {
             num_units: self.num_units.min(other.num_units),
-            unit_bytes: self.unit_bytes.max(other.unit_bytes),
             dtype: self.dtype,
             groups,
         };
@@ -652,12 +641,10 @@ impl Default for WorkerInfo {
             max_batch_calls: 1,
             max_batch_tokens: 8192,
             request_slots: 128,
-            // One full-attention group of 28 layers with 8 BF16 heads of 128:
-            // each 64-token page is one unit of 28 columns of 128 KiB K and V
-            // planes plus one initialization flag per plane.
+            // One full-attention group of 28 layers with 8 BF16 heads of 128,
+            // one unit per 64-token page.
             prefix_cache: Some(PrefixCacheInfo {
                 num_units: 4096,
-                unit_bytes: 28 * 2 * (64 * 8 * 128 * 2 + 1),
                 dtype: PrefixCacheDtype::BFloat16,
                 groups: vec![CacheGroup {
                     kind: Default::default(),
