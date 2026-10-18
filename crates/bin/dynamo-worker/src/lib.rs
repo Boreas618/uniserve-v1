@@ -58,6 +58,7 @@
 //! and its ranks down and exits with status 0.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,7 +84,10 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{FinishStatus, RequestOutput, ServeRequestId},
+    serving::{
+        ServeRequestId,
+        video::artifact::{ArtifactCollector, VideoStreamError},
+    },
 };
 
 // The served canvases come from `--video-resolutions` and
@@ -377,8 +381,8 @@ impl RawEngine for DynamoFastH3Engine {
         // without an item; abort failures are ignored.
         Ok(Box::pin(async_stream::stream! {
             let started_at = Instant::now();
-            let mut artifact = None;
-            loop {
+            let mut collector = ArtifactCollector::default();
+            let artifact = loop {
                 // `biased` polls the stop and shutdown signals first, so they
                 // take precedence over an event that is ready at the same time.
                 let event = tokio::select! {
@@ -393,51 +397,23 @@ impl RawEngine for DynamoFastH3Engine {
                     }
                     event = events.next() => event,
                 };
-                match event {
-                    Some(Ok(RequestOutput::Artifact(value))) => {
-                        if artifact.replace(value).is_some() {
-                            yield Err(engine_error("UniServe produced multiple media artifacts"));
-                            return;
-                        }
-                    }
-                    Some(Ok(RequestOutput::Finished { reason: FinishStatus::Stop { .. }, .. })) => break,
-                    Some(Ok(RequestOutput::Finished { reason, .. })) => {
-                        yield Err(engine_error(format!("video generation ended without an artifact: {reason:?}")));
-                        return;
-                    }
-                    Some(Ok(RequestOutput::Rejected { kind, message, .. })) => {
-                        yield Err(api_error(uniserve_server::openai::ApiError::rejected(kind, message)));
-                        return;
-                    }
-                    Some(Ok(RequestOutput::Failed { message, .. })) => {
-                        yield Err(engine_error(message));
-                        return;
-                    }
-                    // Lifecycle, usage and progress events have no place in
-                    // the single non-streaming response.
-                    Some(Ok(
-                        RequestOutput::Accepted { .. }
-                        | RequestOutput::Usage { .. }
-                        | RequestOutput::Scheduled { .. }
-                        | RequestOutput::MediaProgress { .. },
-                    )) => {}
-                    Some(Ok(_)) => {
-                        yield Err(engine_error("UniServe emitted an incompatible event"));
-                        return;
-                    }
+                let event = match event {
                     Some(Err(error)) => {
                         yield Err(api_error(serve_error_to_api(error)));
                         return;
                     }
-                    None => {
-                        yield Err(engine_error("UniServe generation stream stopped"));
-                        return;
+                    Some(Ok(event)) => Some(event),
+                    None => None,
+                };
+                if let ControlFlow::Break(outcome) = collector.push(event) {
+                    match outcome {
+                        Ok(artifact) => break artifact,
+                        Err(error) => {
+                            yield Err(stream_error(error));
+                            return;
+                        }
                     }
                 }
-            }
-            let Some(artifact) = artifact else {
-                yield Err(engine_error("UniServe produced no media artifact"));
-                return;
             };
             if artifact.media_kind != MediaKind::Video || artifact.content_type != "video/mp4" {
                 yield Err(engine_error(format!(
@@ -714,6 +690,27 @@ fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), Depl
         tasks: tasks.to_string(),
         canvases: canvases.to_string(),
     })
+}
+
+/// Maps a video stream that ended without an artifact to Dynamo's error type.
+fn stream_error(error: VideoStreamError) -> DynamoError {
+    match error {
+        VideoStreamError::Rejected { kind, message } => {
+            api_error(uniserve_server::openai::ApiError::rejected(kind, message))
+        }
+        VideoStreamError::Failed { message } => engine_error(message),
+        VideoStreamError::Ended { reason } => engine_error(format!(
+            "video generation ended without an artifact: {reason:?}"
+        )),
+        VideoStreamError::MissingArtifact => engine_error("UniServe produced no media artifact"),
+        VideoStreamError::MultipleArtifacts => {
+            engine_error("UniServe produced multiple media artifacts")
+        }
+        VideoStreamError::Cancelled | VideoStreamError::Incompatible => {
+            engine_error("UniServe emitted an incompatible event")
+        }
+        VideoStreamError::Closed => engine_error("UniServe generation stream stopped"),
+    }
 }
 
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
