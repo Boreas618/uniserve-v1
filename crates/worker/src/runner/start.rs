@@ -266,8 +266,13 @@ impl ImageOwners {
                     .into(),
             ));
         }
+        // A branch that reads the request's own context has no prefix of
+        // its own; the model frames the others.
+        if layout.image_unconditional == BranchSource::Conditioning {
+            return Ok(None);
+        }
         let prefix = self.policy.prefix_of(layout.image_unconditional)?;
-        Ok((!prefix.reuses_conditioning).then(|| prefix.tokens.to_vec()))
+        Ok(Some(prefix.tokens.to_vec()))
     }
 
     /// Create the runners of every image call on this rank, or `None` on

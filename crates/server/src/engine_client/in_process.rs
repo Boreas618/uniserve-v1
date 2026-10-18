@@ -452,6 +452,7 @@ mod tests {
             constraint,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 64,
             include_stop_token: false,
             stop_strings: Vec::new(),
@@ -507,6 +508,7 @@ mod tests {
             constraint: GenerationConstraint::UndOnly,
             sampling: SamplingParams::default(),
             image: ImageParams::default(),
+            max_images: 1,
             max_und_tokens: 64,
             include_stop_token: false,
             stop_strings: Vec::new(),
@@ -614,6 +616,7 @@ mod tests {
                 steps: 4,
                 ..ImageParams::default()
             },
+            max_images: 1,
             max_und_tokens: 0,
             include_stop_token: false,
             stop_strings: Vec::new(),

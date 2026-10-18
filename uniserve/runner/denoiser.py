@@ -1308,21 +1308,17 @@ class DenoiserRunner:
         return _dtype(_image_denoiser(loaded).prediction_dtype)
 
     @staticmethod
-    def guidance_prefix(
-        loaded, source: str, image_prompt: str, negative_prompt: str
-    ) -> list[int]:
-        """The prefix a guidance branch of ``source`` conditions on.
+    def guidance_prefix(loaded, source: str) -> list[int]:
+        """The prefix tokens an unconditional guidance branch conditions on.
 
-        The model's prompt framing and tokenizer resolve it (see
-        ``uniserve.processing.resolve_prefix``).
-
-        Returns:
-            ``[reuses, *tokens]``: whether the branch reuses the request's
-            own context, then the prefix tokens.
+        ``source`` names the branch. The model's prompt framing and
+        tokenizer resolve them (see ``uniserve.processing.resolve_prefix``).
+        The rank asks only for a source no admission fixes, the start of a
+        conversation, so no prompt text of the request is framed.
 
         Raises:
-            ValueError: A prompt override for a model without prompt
-                framing.
+            ValueError: ``source`` is the conditioned branch, which reads the
+                request's own context.
         """
 
         def tokenizer():
@@ -1332,14 +1328,13 @@ class DenoiserRunner:
                 else _tokenizer(loaded.tokenizer)
             )
 
-        tokens, reuses = resolve_prefix(
+        tokens = resolve_prefix(
             loaded.flow_prompt,
             tokenizer,
             source,
-            image_prompt=image_prompt,
-            negative_prompt=negative_prompt,
+            negative_prompt="",
         )
-        return [int(reuses), *(int(token) for token in tokens)]
+        return [int(token) for token in tokens]
 
     def plans_attention(self) -> bool:
         """Whether an attention operator plans each launch on the host.

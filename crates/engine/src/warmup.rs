@@ -218,6 +218,8 @@ fn warmup_request(
             ..SamplingParams::default()
         },
         image,
+        // One generated image, the budget a client's image request states.
+        max_images: 1,
         max_und_tokens: tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
