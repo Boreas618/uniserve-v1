@@ -69,9 +69,11 @@ def test_a_segment_extent_sizes_its_packing(layout):
     for field in dataclasses.fields(SegmentExtent):
         assert getattr(packing, field.name) == getattr(extent, field.name)
     assert extent.padded_tokens % layout["token_multiple"] == 0
-    assert packing.video_valid_sizes.shape == (extent.video_tiles,)
+    assert packing.video_variable_block_sizes.shape == (extent.video_tiles,)
     frames, height, width = extent.video_grid
-    assert int(packing.video_valid_sizes.sum()) == frames * height * width
+    assert (
+        int(packing.video_variable_block_sizes.sum()) == frames * height * width
+    )
     video_end = extent.video_start + extent.video_tiles * extent.tile
     assert int(packing.video_indices.min()) == extent.video_start
     assert int(packing.video_indices.max()) < video_end <= extent.padded_tokens
@@ -131,7 +133,7 @@ def test_every_query_tile_keeps_at_most_its_key_bound(tile, references):
     segments = vsa.Segments(
         tile,
         packing.padded_tokens,
-        tables.valid_sizes,
+        tables.variable_block_sizes,
         tables.tile_segments,
         tables.segment_starts,
         tables.segment_keep,
@@ -144,7 +146,7 @@ def test_every_query_tile_keeps_at_most_its_key_bound(tile, references):
 
     assert (counts <= torch.tensor(bounds, dtype=torch.int32)).all()
     # The leading dense tiles keep every live key tile.
-    live = int((tables.valid_sizes > 0).sum())
+    live = int((tables.variable_block_sizes > 0).sum())
     for index in range(packing.dense_prefix_tiles):
-        if tables.valid_sizes[index] > 0:
+        if tables.variable_block_sizes[index] > 0:
             assert (counts[:, index] == live).all()

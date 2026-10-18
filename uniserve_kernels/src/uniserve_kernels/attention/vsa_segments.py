@@ -60,7 +60,7 @@ if triton is not None:
     @triton.jit
     def _zero_tile_padding_kernel(
         values,
-        valid_sizes,
+        variable_block_sizes,
         stride_row,
         stride_head,
         heads: tl.constexpr,
@@ -71,7 +71,7 @@ if triton is not None:
         """Store zeros to one tile's row block past the tile's valid size."""
         tile = tl.program_id(0)
         block = tl.program_id(1)
-        valid = tl.load(valid_sizes + tile)
+        valid = tl.load(variable_block_sizes + tile)
         # A row block wholly inside the valid rows stores nothing.
         if (block + 1) * block_rows > valid:
             local = block * block_rows + tl.arange(0, block_rows)
@@ -143,7 +143,7 @@ if triton is not None:
     def _select_tiles_kernel(
         scores,
         tile_segments,
-        valid_sizes,
+        variable_block_sizes,
         segment_keep,
         indices,
         counts,
@@ -174,9 +174,9 @@ if triton is not None:
         keys = tl.arange(0, block)
         present = keys < tiles
         segments = tl.load(tile_segments + keys, mask=present, other=-1)
-        live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
+        live = tl.load(variable_block_sizes + keys, mask=present, other=0) > 0
         query_segment = tl.load(tile_segments + query_offset + query)
-        query_live = tl.load(valid_sizes + query_offset + query) > 0
+        query_live = tl.load(variable_block_sizes + query_offset + query) > 0
 
         mask = live & query_live
         if query_live & (query_segment >= 0):
@@ -241,13 +241,13 @@ def _rows_layout(value: torch.Tensor, name: str) -> None:
 
 
 def zero_tile_padding(
-    values: torch.Tensor, valid_sizes: torch.Tensor, tile: int
+    values: torch.Tensor, variable_block_sizes: torch.Tensor, tile: int
 ) -> None:
     """Store zeros to every row past its tile's valid size, in place.
 
     ``values`` is ``[tiles * tile, heads, width]`` with unit column stride
-    and ``valid_sizes`` the int32 valid rows of each ``tile``-row tile, read
-    on the device. Rows within a tile's valid size are not touched.
+    and ``variable_block_sizes`` the int32 valid rows of each ``tile``-row
+    tile, read on the device. Rows within a tile's valid size are not touched.
 
     Raises:
         RuntimeError: Triton cannot launch on the tensors' device.
@@ -256,11 +256,11 @@ def zero_tile_padding(
     if not launchable(values.device):
         raise RuntimeError("tile padding requires Triton")
     _rows_layout(values, "tile rows")
-    tiles = int(valid_sizes.numel())
+    tiles = int(variable_block_sizes.numel())
     if (
         tile % _BLOCK_ROWS
         or values.shape[0] != tiles * tile
-        or valid_sizes.dtype != torch.int32
+        or variable_block_sizes.dtype != torch.int32
     ):
         raise ValueError(
             "tile padding needs whole tiles and an int32 valid-size table"
@@ -270,7 +270,7 @@ def zero_tile_padding(
         return
     _zero_tile_padding_kernel[(tiles, tile // _BLOCK_ROWS)](
         values,
-        valid_sizes,
+        variable_block_sizes,
         int(values.stride(0)),
         int(values.stride(1)),
         heads,
@@ -342,7 +342,7 @@ def add_gated_tiles(
 def select_tiles(
     scores: torch.Tensor,
     tile_segments: torch.Tensor,
-    valid_sizes: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     segment_keep: torch.Tensor,
     *,
     query_tile_offset: int = 0,
@@ -371,7 +371,7 @@ def select_tiles(
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
     heads, query_tiles, tiles = (int(size) for size in scores.shape)
-    tables = (tile_segments, valid_sizes, segment_keep)
+    tables = (tile_segments, variable_block_sizes, segment_keep)
     if (
         scores.ndim != 3
         or scores.dtype != torch.float32
@@ -401,7 +401,7 @@ def select_tiles(
     _select_tiles_kernel[(query_tiles, heads)](
         scores,
         tile_segments,
-        valid_sizes,
+        variable_block_sizes,
         segment_keep,
         indices,
         counts,
