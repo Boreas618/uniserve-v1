@@ -8,9 +8,7 @@
 //!
 //! The validators here are the wire contract: a [`Frame`] runs
 //! them, through `Batch::validate` and `BatchOutput::validate`, whenever it
-//! encodes or decodes a batch or a batch result. A rank also checks a product's
-//! descriptor size estimate against [`MAX_TRANSFER_HANDLE_BYTES`] before it
-//! publishes the product.
+//! encodes or decodes a batch or a batch result.
 
 use super::*;
 
@@ -363,9 +361,6 @@ pub struct CacheTransfer {
 impl CacheTransfer {
     /// Validate source/base identities and every group's raw K/V/scale
     /// geometry, including rank shards.
-    ///
-    /// Also bounds the descriptor by [`MAX_TRANSFER_HANDLE_BYTES`] as
-    /// estimated by [`CacheTransfer::encoded_size_bound`].
     pub fn validate(&self) -> ValidationResult<()> {
         let Self {
             groups,
@@ -397,10 +392,6 @@ impl CacheTransfer {
         for group in groups {
             group.validate(*base_extent, *exported_extent)?;
         }
-        ensure_valid!(
-            self.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-            "cache transfer exceeds its descriptor byte bound"
-        );
         Ok(())
     }
 
@@ -413,15 +404,6 @@ impl CacheTransfer {
     /// for rebinding or pruning their locators.
     pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
         self.groups.iter_mut().flat_map(|group| &mut group.tensors)
-    }
-
-    /// Conservative wire size, including every shard and replica locator.
-    pub fn encoded_size_bound(&self) -> usize {
-        // Each group record adds its interval and page size to the envelope.
-        transfer_encoded_size(self.tensors())
-            .saturating_add(32usize.saturating_mul(self.groups.len()))
-            .saturating_add(self.destination.len())
-            .saturating_add(self.compute_dtype.len())
     }
 
     /// Merge reports for one immutable export without exposing a partial update.
@@ -534,72 +516,10 @@ impl TransferHandle {
         }
     }
 
-    /// Conservative size bound for the complete wire descriptor, including replicas.
-    pub fn encoded_size_bound(&self) -> usize {
-        transfer_encoded_size(self.tensors())
-    }
-
     /// Returns every physical shard and replica carried by this product.
     pub fn locators(&self) -> impl Iterator<Item = &Locator> {
         self.tensors().iter().flat_map(|tensor| &tensor.locations)
     }
-}
-
-/// Conservative estimate of a descriptor's encoded size, used to enforce
-/// [`MAX_TRANSFER_HANDLE_BYTES`].
-///
-/// The integer constants are per-record overhead allowances rather than exact
-/// encoded sizes; only string and list lengths are measured. A rank's output
-/// acceptance and the message validators share this estimate.
-fn transfer_encoded_size<'a>(tensors: impl IntoIterator<Item = &'a TensorTransfer>) -> usize {
-    let mut size = 512usize;
-    for tensor in tensors {
-        size = size
-            .saturating_add(64)
-            .saturating_add(8usize.saturating_mul(tensor.shape.len()));
-        for location in &tensor.locations {
-            let source = &location.source;
-            size = size
-                .saturating_add(256)
-                .saturating_add(location.dtype.len())
-                .saturating_add(location.device.len())
-                .saturating_add(16usize.saturating_mul(location.shape.len()))
-                .saturating_add(source.worker_id.len())
-                .saturating_add(source.node.len())
-                .saturating_add(source.address_space.len())
-                .saturating_add(source.incarnation.len());
-            let native = match &location.transport {
-                TransferTransport::Local { endpoint, .. } => endpoint.len().saturating_add(16),
-                TransferTransport::PosixShm { endpoint, name } => {
-                    endpoint.len().saturating_add(name.len()).saturating_add(16)
-                }
-                TransferTransport::CudaVmm {
-                    endpoint,
-                    export_id,
-                    ready_event_handle,
-                    allocation_handle,
-                    tensor_stride,
-                    span_lengths,
-                    storage_offsets_bytes,
-                    ..
-                } => endpoint
-                    .len()
-                    .saturating_add(export_id.len())
-                    .saturating_add(ready_event_handle.len())
-                    .saturating_add(allocation_handle.len())
-                    .saturating_add(8usize.saturating_mul(tensor_stride.len()))
-                    .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
-                    .saturating_add(12usize.saturating_mul(span_lengths.len()))
-                    .saturating_add(64),
-                // The bytes are the product, not the handle: their budget is
-                // the channel's capacity and the rank channel's message caps,
-                // so only the locator's framing counts toward the handle bound.
-                TransferTransport::Channel { endpoint, .. } => endpoint.len().saturating_add(24),
-            };
-            size = size.saturating_add(native);
-        }
-    }
-    size
 }
 
 /// Appends `source`'s locators to the matching tensors of `destination`,
@@ -648,9 +568,8 @@ impl TensorExport {
     ///
     /// The engine merges reports of one product, such as per-rank reports,
     /// this way. The product identities and the variant's semantic metadata
-    /// must match, and the merged export must stay within
-    /// [`MAX_TRANSFER_HANDLE_BYTES`] and pass [`TensorExport::validate`];
-    /// on any error `self` is left unchanged.
+    /// must match, and the merged export must pass
+    /// [`TensorExport::validate`]; on any error `self` is left unchanged.
     pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
         ensure_valid!(
             self.product == other.product,
@@ -713,10 +632,6 @@ impl TensorExport {
         ensure_valid!(agrees, "product locations disagree on semantic metadata");
         let mut candidate = self.clone();
         merge_tensor_locations(candidate.value.tensors_mut(), other.value.tensors())?;
-        ensure_valid!(
-            candidate.value.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-            "merged tensor locations exceed their descriptor byte bound"
-        );
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -728,11 +643,6 @@ impl TensorExport {
         validate_transfer_handle(&self.product, &self.value)
     }
 }
-
-/// Maximum estimated encoded size in bytes of one transfer descriptor, as
-/// computed by `TransferHandle::encoded_size_bound` and
-/// `CacheTransfer::encoded_size_bound`.
-pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl Locator {
     /// Validates common tensor bounds and transport-specific opening metadata.
@@ -829,8 +739,7 @@ impl Locator {
 ///
 /// Checks the variant's semantic metadata, then the tensor's locators, dtype,
 /// and actual shape against `product`, then the logical byte size against the
-/// product's byte bound, and finally the descriptor size estimate against
-/// [`MAX_TRANSFER_HANDLE_BYTES`].
+/// product's byte bound.
 fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> ValidationResult<()> {
     // Product-family metadata must agree before inspecting physical locators.
     match handle {
@@ -886,10 +795,5 @@ fn validate_transfer_handle(product: &TensorRef, handle: &TransferHandle) -> Val
             "transfer tensor shape disagrees with its product"
         );
     }
-
-    ensure_valid!(
-        handle.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
-        "transfer handle exceeds its byte bound"
-    );
     Ok(())
 }
