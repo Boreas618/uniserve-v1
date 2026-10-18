@@ -14,8 +14,7 @@ use crate::Result;
 mod metadata;
 
 pub(crate) use metadata::{
-    RowSampling, SampleTask, SamplingGroup, SamplingMetadata, logprob_request, logprob_words,
-    padded,
+    RowSampling, SampleTask, SamplingGroup, SamplingMetadata, logprob_count, logprob_words,
 };
 
 /// The most candidates the top-k sampler keeps per row: a row samples from

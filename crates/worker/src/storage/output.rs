@@ -372,8 +372,8 @@ impl OutputBuffer {
         Ok(())
     }
 
-    /// Selected token first, then top and explicitly requested tokens. The
-    /// packed column is decoded once for all of its consuming request rows.
+    /// Selected token first, then the top tokens. The packed column is
+    /// decoded once for all of its consuming request rows.
     pub fn logprob_values(&mut self, span: (usize, usize, usize)) -> Result<&[TokenLogprob]> {
         let (offset, count, row) = span;
         let key = (offset, count);

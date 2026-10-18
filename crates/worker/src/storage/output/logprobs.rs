@@ -6,31 +6,25 @@ use uniserve_core::TokenLogprob;
 
 use crate::{Error, Result};
 
-/// Row selection and padded widths of one packed logprob column.
-/// Scores carry float32 bits in the low half of each int64 word.
+/// Row selection and padded width of one packed logprob column: per row
+/// the selected token, its score and rank, then `max_count` top tokens,
+/// scores and ranks, of which a row's own count is visible. Scores carry
+/// float32 bits in the low half of each int64 word.
 pub struct LogprobLayout {
     pub rows: Vec<usize>,
     pub counts: Vec<usize>,
-    pub requested_ids: Vec<Vec<u32>>,
     pub max_count: usize,
-    pub max_requested: usize,
 }
 
 impl LogprobLayout {
     pub(super) fn validate(&self, words: usize) -> Result<()> {
-        let width = self.max_count.checked_mul(3).and_then(|top| {
-            self.max_requested
-                .checked_mul(2)
-                .and_then(|requested| top.checked_add(requested)?.checked_add(3))
-        });
+        let width = self
+            .max_count
+            .checked_mul(3)
+            .and_then(|top| top.checked_add(3));
         if width.and_then(|width| self.rows.len().checked_mul(width)) != Some(words)
             || self.counts.len() != self.rows.len()
-            || self.requested_ids.len() != self.rows.len()
             || self.counts.iter().any(|&count| count > self.max_count)
-            || self
-                .requested_ids
-                .iter()
-                .any(|ids| ids.len() > self.max_requested)
         {
             return Err(Error::Invariant(
                 "logprob completion does not match its row layout".into(),
@@ -42,18 +36,15 @@ impl LogprobLayout {
     pub(super) fn decode(&self, words: &[i64]) -> Result<HashMap<usize, Vec<TokenLogprob>>> {
         let rows = self.rows.len();
 
-        // Each field contains all rows before the next field begins. Top and
-        // requested-token fields are padded; only their row counts are visible.
+        // Each field contains all rows before the next field begins. Top
+        // fields are padded; only a row's own count of them is visible.
         let top_ids = rows * 3;
         let top_values = top_ids + rows * self.max_count;
         let top_ranks = top_values + rows * self.max_count;
-        let requested_values = top_ranks + rows * self.max_count;
-        let requested_ranks = requested_values + rows * self.max_requested;
         let mut result = HashMap::with_capacity(rows);
 
         for (local, &row) in self.rows.iter().enumerate() {
-            let mut entries =
-                Vec::with_capacity(1 + self.counts[local] + self.requested_ids[local].len());
+            let mut entries = Vec::with_capacity(1 + self.counts[local]);
             let mut seen = HashSet::with_capacity(entries.capacity());
             let mut append = |token, score, rank| -> Result<()> {
                 let token_id = u32::try_from(token)
@@ -76,14 +67,6 @@ impl LogprobLayout {
                     words[top_ids + column],
                     words[top_values + column],
                     words[top_ranks + column],
-                )?;
-            }
-            for (index, &token) in self.requested_ids[local].iter().enumerate() {
-                let column = local * self.max_requested + index;
-                append(
-                    i64::from(token),
-                    words[requested_values + column],
-                    words[requested_ranks + column],
                 )?;
             }
             result.insert(row, entries);

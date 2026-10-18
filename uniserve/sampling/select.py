@@ -39,7 +39,7 @@ from dataclasses import dataclass
 import torch
 
 from .categorical import sample_categorical
-from .logprobs import LogprobRequest, logprob_details
+from .logprobs import logprob_details
 from .top_k import (
     MIN_P,
     TEMPERATURE,
@@ -246,7 +246,7 @@ def select_categorical(
     bias: Sequence[int],
     bias_values: Sequence[float],
     logprob_tasks: Sequence[int],
-    logprob_requests: Sequence[LogprobRequest],
+    logprob_counts: Sequence[int],
     force_finish: Sequence[int],
     finish_ids: Sequence[int],
     transition_ids: Sequence[int],
@@ -261,10 +261,11 @@ def select_categorical(
     the one-based length of its draft prefix ending at the first terminal
     draft token, or zero. The shaping arguments are those of
     :func:`shape_logits`, the decision arguments those of
-    :func:`decisions`, and ``logprob_tasks`` names the tasks reporting one
-    of ``logprob_requests`` each. Reported logprobs are those of the
-    model's distribution, the unshaped ``logits``: the sampling controls
-    decide which token is selected, not how likely the model found it.
+    :func:`decisions`, and ``logprob_tasks`` names the tasks reporting
+    logprobs, each with its top count of ``logprob_counts``. Reported
+    logprobs are those of the model's distribution, the unshaped
+    ``logits``: the sampling controls decide which token is selected, not
+    how likely the model found it.
 
     Speculative tasks accept the longest prefix where row ``i``'s selection
     equals draft ``i``. Without a terminal prefix, the output row is the
@@ -385,7 +386,7 @@ def select_categorical(
             logits.float(),
             scored.index_select(0, reporting),
             tokens.index_select(0, reporting),
-            logprob_requests,
+            logprob_counts,
         )
     return Selection(
         tokens,

@@ -38,9 +38,9 @@ use crate::runner::input_buffers::Columns;
 /// is selected by the runner's `sample`.
 pub(crate) const FINISH_IDS: usize = 8;
 
-/// Logprob words per token of capacity: room for 20 top and 20 requested
-/// tokens per scored position.
-const LOGPROB_WORDS_PER_TOKEN: usize = 3 + 3 * 20 + 2 * 20;
+/// Logprob words per token of capacity: room for 20 top tokens per scored
+/// position.
+const LOGPROB_WORDS_PER_TOKEN: usize = 3 + 3 * 20;
 
 /// The dimensions of one binding's columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

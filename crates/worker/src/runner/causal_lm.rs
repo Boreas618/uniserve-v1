@@ -76,7 +76,7 @@ use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
 use crate::request::decode_state::DecodeState;
 use crate::runner::attention::pack_rows;
-use crate::sampling::{RowSampling, SamplingGroup, SamplingPath, candidates, padded};
+use crate::sampling::{RowSampling, SamplingGroup, SamplingPath, candidates};
 use crate::storage::memory::StorageView;
 use crate::storage::{AttentionRow, PrefixCache};
 use crate::stream::{Fill, Issue};
@@ -112,9 +112,8 @@ pub(crate) struct PromptChunks {
     pub(crate) offsets: Vec<i64>,
     /// The row of the tail tensor its last logits go to.
     pub(crate) tails: Vec<i64>,
-    /// Its top count and the explicit token ids it reports.
+    /// Its top count.
     pub(crate) tops: Vec<i64>,
-    pub(crate) ids: Vec<Vec<u32>>,
 }
 
 /// The sampling inputs of one forward (see [`crate::sampling::SamplingMetadata`]).
@@ -473,11 +472,7 @@ impl CausalLMRunner {
                 &group.finish_ids,
                 &group.transition_ids,
             ];
-            let logprobs = [
-                group.logprob_tasks.as_slice(),
-                &group.logprob_counts,
-                &group.logprob_ids,
-            ];
+            let logprobs = [group.logprob_tasks.as_slice(), &group.logprob_counts];
             let shaping = |drafts: bool| {
                 let mut arguments = lists(&[
                     &group.top_ks,
@@ -551,7 +546,6 @@ impl CausalLMRunner {
 
         let prompt = request.prompt;
         if !prompt.rows.is_empty() {
-            let ids: Vec<&[u32]> = prompt.ids.iter().map(Vec::as_slice).collect();
             let mut arguments = vec![plan.logit_count.into()];
             arguments.extend(lists(&[
                 &prompt.rows,
@@ -562,7 +556,6 @@ impl CausalLMRunner {
                 &prompt.offsets,
                 &prompt.tails,
                 &prompt.tops,
-                &padded(&ids),
             ]));
             arguments.extend(self.tensors(&[
                 "hidden",
