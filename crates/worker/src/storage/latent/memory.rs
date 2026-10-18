@@ -16,6 +16,86 @@ use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
 use crate::{Error, Result};
 
+/// The dimensions of one latent pool, from which capacity planning sums its
+/// storage ([`LatentPlan::bytes`]) and [`LatentStorage::allocate`] allocates
+/// it: the one statement of the pool's tensors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatentPlan {
+    /// One-based request slots.
+    pub request_pool_size: usize,
+    /// Pages including the reserved sentinel page.
+    pub num_pages: usize,
+    pub page_units: usize,
+    /// Values per latent unit.
+    pub latent_width: usize,
+    /// The element type of latent values.
+    pub dtype: DType,
+    /// A step workspace beside the two banks (image denoising).
+    pub with_workspace: bool,
+}
+
+impl LatentPlan {
+    fn validate(&self) -> Result<()> {
+        if self.num_pages < 2
+            || self.page_units == 0
+            || self.latent_width == 0
+            || self.request_pool_size == 0
+        {
+            return Err(Error::Invalid(
+                "latent storage needs slots, a usable page, units and elements".into(),
+            ));
+        }
+        if !matches!(
+            self.dtype,
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64
+        ) {
+            return Err(Error::Invalid(
+                "latent storage must use a floating dtype".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The two page banks, which alternate across denoising steps:
+    /// `[2, num_pages, page_units, width]`.
+    fn bank_shape(&self) -> [i64; 4] {
+        [
+            2,
+            self.num_pages as i64,
+            self.page_units as i64,
+            self.latent_width as i64,
+        ]
+    }
+
+    /// The contiguous step workspace of every usable page's units,
+    /// `[(num_pages - 1) * page_units, width]`, when declared.
+    fn step_shape(&self) -> Option<[i64; 2]> {
+        self.with_workspace.then(|| {
+            [
+                (self.num_pages as i64 - 1) * self.page_units as i64,
+                self.latent_width as i64,
+            ]
+        })
+    }
+
+    /// One float32 timestep per one-based slot: `[request_pool_size + 1, 1]`.
+    fn timestep_shape(&self) -> [i64; 2] {
+        [self.request_pool_size as i64 + 1, 1]
+    }
+
+    /// The bytes [`LatentStorage::allocate`] allocates for this pool.
+    pub fn bytes(&self) -> Result<u64> {
+        self.validate()?;
+        let elements = |shape: &[i64]| shape.iter().product::<i64>() as u64;
+        let value = self.dtype.bytes() as u64;
+        Ok(elements(&self.bank_shape()) * value
+            + self
+                .step_shape()
+                .map_or(0, |shape| elements(&shape) * value)
+            + elements(&self.timestep_shape()) * DType::F32.bytes() as u64)
+    }
+}
+
 /// The latent pool's storage on one device (or host memory for CPU lanes).
 pub struct LatentStorage {
     num_pages: u32,
@@ -51,59 +131,42 @@ fn allocate_banks(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Back
 }
 
 impl LatentStorage {
-    /// Allocate a pool's storage with zeroed banks (reset on `stream`, which
-    /// is synchronized before returning).
-    #[expect(clippy::too_many_arguments, reason = "the pool's complete geometry")]
+    /// Allocate the storage `plan` states, with zeroed banks (reset on
+    /// `stream`, which is synchronized before returning).
     pub fn allocate(
-        request_pool_size: u32,
-        num_pages: u32,
-        page_units: u32,
-        width: u32,
-        dtype: DType,
-        with_step: bool,
+        plan: &LatentPlan,
         device: Option<DeviceId>,
         stream: Option<&Stream>,
     ) -> Result<Self> {
-        if num_pages < 2 || page_units == 0 || width == 0 || request_pool_size == 0 {
-            return Err(Error::Invalid(
-                "latent storage needs slots, a usable page, units and elements".into(),
-            ));
-        }
-        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
-            return Err(Error::Invalid(
-                "latent storage must use a floating dtype".into(),
-            ));
-        }
+        plan.validate()?;
         if device.is_some() != stream.is_some() {
             return Err(Error::Invalid(
                 "device latent storage is reset on a stream of its device".into(),
             ));
         }
-        let (pages_count, units, width_i) = (
-            i64::from(num_pages),
-            i64::from(page_units),
-            i64::from(width),
-        );
-        let page_bytes = (2 * pages_count * units * width_i) as usize * dtype.bytes();
+        let narrow = |value: usize, name: &str| {
+            u32::try_from(value).map_err(|_| Error::Invalid(format!("latent {name} overflow")))
+        };
+        let dtype = plan.dtype;
+        let bytes =
+            |shape: &[i64], dtype: DType| shape.iter().product::<i64>() as usize * dtype.bytes();
+        let bank_shape = plan.bank_shape();
+        let page_bytes = bytes(&bank_shape, dtype);
         let banks = allocate_banks(device, page_bytes)?;
-        let pages = StorageView::contiguous(
-            Arc::clone(&banks),
-            0,
-            dtype,
-            &[2, pages_count, units, width_i],
-        )?;
-        let capacity_units = (pages_count - 1) * units;
-        let step = with_step
-            .then(|| {
-                let memory = allocate(device, (capacity_units * width_i) as usize * dtype.bytes())?;
-                StorageView::contiguous(memory, 0, dtype, &[capacity_units, width_i])
+        let pages = StorageView::contiguous(Arc::clone(&banks), 0, dtype, &bank_shape)?;
+        let step = plan
+            .step_shape()
+            .map(|shape| {
+                let memory = allocate(device, bytes(&shape, dtype))?;
+                StorageView::contiguous(memory, 0, dtype, &shape)
             })
             .transpose()?;
+        let timestep_shape = plan.timestep_shape();
         let timesteps = StorageView::contiguous(
-            allocate(device, (request_pool_size as usize + 1) * 4)?,
+            allocate(device, bytes(&timestep_shape, DType::F32))?,
             0,
             DType::F32,
-            &[i64::from(request_pool_size) + 1, 1],
+            &timestep_shape,
         )?;
 
         match stream {
@@ -117,10 +180,10 @@ impl LatentStorage {
             }
         }
         Ok(Self {
-            num_pages,
-            page_units,
-            width,
-            request_pool_size,
+            num_pages: narrow(plan.num_pages, "pages")?,
+            page_units: narrow(plan.page_units, "page units")?,
+            width: narrow(plan.latent_width, "width")?,
+            request_pool_size: narrow(plan.request_pool_size, "slots")?,
             pages,
             step,
             timesteps,
@@ -249,7 +312,24 @@ mod tests {
 
     #[test]
     fn host_pages_spans_and_timesteps_follow_the_pool_layout() -> Result<()> {
-        let storage = LatentStorage::allocate(2, 4, 2, 3, DType::F32, true, None, None)?;
+        let plan = LatentPlan {
+            request_pool_size: 2,
+            num_pages: 4,
+            page_units: 2,
+            latent_width: 3,
+            dtype: DType::F32,
+            with_workspace: true,
+        };
+        let storage = LatentStorage::allocate(&plan, None, None)?;
+        // Capacity planning charges exactly what the pool allocates.
+        let bytes = |view: &StorageView| view.numel() * view.dtype().bytes() as u64;
+        let step = storage
+            .step()
+            .ok_or(Error::State("the pool declares a step workspace"))?;
+        assert_eq!(
+            plan.bytes()?,
+            bytes(&storage.pages) + bytes(step) + bytes(storage.timesteps())
+        );
 
         let spans = storage.spans(1, &[3, 1], 3)?;
         assert_eq!(spans.shape(), vec![3, 3]);

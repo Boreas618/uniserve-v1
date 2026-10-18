@@ -13,7 +13,7 @@ use uniserve_ipc::{CallKind, ComponentInfo};
 use super::loading::LoadedModel;
 use super::{endpoint, expert_exchange, exports_device_products};
 use crate::capacity::device::{DeviceBudget, total_bytes};
-use crate::capacity::plan::{LatentPlan, Plan, Report, TokenFacts, TokenLayout, page_size};
+use crate::capacity::plan::{Plan, Report, TokenFacts, TokenLayout, page_size};
 use crate::capacity::video::VideoCapacity;
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
@@ -26,7 +26,7 @@ use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::diffusion_lm::{self};
 use crate::runner::encoder::EncoderInfo;
 use crate::runner::start::reserved_bytes as image_reserved_bytes;
-use crate::storage::{CachePlan, GroupShape, PrefixCache};
+use crate::storage::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 /// Block-table width that holds the longest admitted sequence in every
@@ -223,11 +223,9 @@ pub(super) fn plan(
         return Ok((plan, Some(capacity)));
     }
 
-    let element_bytes = DType::from_name(&config.model_dtype)
-        .map(DType::bytes)
-        .ok_or_else(|| {
-            Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
-        })?;
+    let latent_dtype = DType::from_name(&config.model_dtype).ok_or_else(|| {
+        Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
+    })?;
     // The longest image sequence an image denoiser accepts, in latent rows.
     let image_tokens = image
         .denoiser
@@ -239,14 +237,14 @@ pub(super) fn plan(
             config.cache_token_capacity,
             block_size,
             layout.width() as usize,
-            element_bytes,
+            latent_dtype,
         )
     });
     let token_facts = TokenFacts {
         image_processor: image.processing.is_some(),
         vision_feature_bytes: vision_feature_bytes(model, &config.model_dtype)?,
         latent_feature_bytes: latent.map_or(0, |plan| {
-            image_tokens as u64 * plan.latent_width as u64 * element_bytes as u64
+            image_tokens as u64 * plan.latent_width as u64 * plan.dtype.bytes() as u64
         }),
         latent,
     };
@@ -316,8 +314,10 @@ pub(super) fn plan(
                 &cache,
             )?,
         );
+        // Every unit column holds one index per unit, charged with each unit.
         let columns = PrefixCache::import_workers(import_capacity) + unit_columns;
-        layout.fit_cache(&cache, 8 * columns as u64, config, total, &world.host)?;
+        let unit_overhead = columns as u64 * UnitColumn::bytes(1);
+        layout.fit_cache(&cache, unit_overhead, config, total, &world.host)?;
         Some(Arc::new(cache))
     } else {
         None

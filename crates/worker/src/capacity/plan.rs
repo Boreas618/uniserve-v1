@@ -20,35 +20,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use uniserve_ipc::{
-    CallKind, ComponentInfo, DType, MediaCall, OutputInfo, VideoDenoiserInfo, WorkerEndpoint,
-    WorkerInfo,
+    CallKind, ComponentInfo, MediaCall, OutputInfo, VideoDenoiserInfo, WorkerEndpoint, WorkerInfo,
 };
 
 use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
-    latent_pool_bytes, request_tensor_window,
+    request_tensor_window,
 };
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::graph_storage_budget_bytes;
 use crate::parallel::host::HostGroup;
-use crate::storage::CachePlan;
+use crate::storage::{CachePlan, LatentPlan};
 use crate::{Error, Result};
-
-/// Product scalar banks keep one value of every protocol dtype per slot.
-pub(crate) fn product_scalar_bytes() -> u64 {
-    [
-        DType::U8,
-        DType::I16,
-        DType::I32,
-        DType::I64,
-        DType::F16,
-        DType::BF16,
-        DType::F32,
-    ]
-    .iter()
-    .map(|dtype| dtype.element_bytes())
-    .sum()
-}
 
 /// Bytes one product slot of a component's outputs retains: every output's
 /// largest extent, aligned to 256 bytes.
@@ -119,19 +102,6 @@ pub(crate) fn request_slots(
         })
 }
 
-/// Device dimensions of one latent pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LatentPlan {
-    pub request_pool_size: usize,
-    /// Pages including the reserved sentinel page.
-    pub num_pages: usize,
-    pub page_units: usize,
-    pub latent_width: usize,
-    pub element_bytes: usize,
-    /// A step workspace beside the two banks (image denoising).
-    pub with_workspace: bool,
-}
-
 impl LatentPlan {
     /// The pool of an image flow: pages of `block_size` units holding the
     /// longest image (or the configured token budget, when larger).
@@ -141,7 +111,7 @@ impl LatentPlan {
         cache_token_capacity: Option<usize>,
         block_size: usize,
         width: usize,
-        element_bytes: usize,
+        dtype: crate::ffi::DType,
     ) -> Self {
         let units = if max_tokens == 0 {
             0
@@ -153,20 +123,9 @@ impl LatentPlan {
             num_pages: units.div_ceil(block_size) + 1,
             page_units: block_size,
             latent_width: width,
-            element_bytes,
+            dtype,
             with_workspace: true,
         }
-    }
-
-    pub(crate) fn bytes(&self) -> Result<u64> {
-        latent_pool_bytes(
-            self.request_pool_size,
-            self.num_pages,
-            self.page_units,
-            self.latent_width,
-            self.element_bytes,
-            self.with_workspace,
-        )
     }
 }
 
@@ -349,7 +308,6 @@ impl TokenLayout {
             depth: queue_depth,
             calls: config.max_batch_calls,
             requests: config.max_request_pool_size,
-            scalar_bytes: product_scalar_bytes(),
             transfer_bytes_per_read: feature_bytes,
             device_exports,
         })?;
@@ -485,7 +443,6 @@ pub(crate) fn request_layout(
         calls: info.max_batch_calls as usize,
         requests: slots,
         ranks: config.world_size,
-        scalar_bytes: product_scalar_bytes(),
         product_bytes_per_request: media.local_product_bytes,
         concurrent_imports: media.artifact_import_regions,
         device_exports,
@@ -525,7 +482,6 @@ pub(crate) fn slot_requirements(
             calls: config.max_batch_calls.min(count),
             requests: count,
             ranks: config.world_size,
-            scalar_bytes: product_scalar_bytes(),
             product_bytes_per_request: media.local_product_bytes,
             concurrent_imports: 0,
             device_exports,
@@ -537,14 +493,12 @@ pub(crate) fn slot_requirements(
                 } else {
                     count * ((plan.num_pages - 1) / plan.request_pool_size) + 1
                 };
-                latent_pool_bytes(
-                    count,
-                    pages,
-                    plan.page_units,
-                    plan.latent_width,
-                    plan.element_bytes,
-                    plan.with_workspace,
-                )?
+                LatentPlan {
+                    request_pool_size: count,
+                    num_pages: pages,
+                    ..plan
+                }
+                .bytes()?
             }
             None => 0,
         };
@@ -560,7 +514,7 @@ pub(crate) fn slot_requirements(
 #[cfg(test)]
 mod tests {
     use uniserve_cuda::DeviceId;
-    use uniserve_ipc::{DimBound, ShapeBound};
+    use uniserve_ipc::{DType, DimBound, ShapeBound};
 
     use super::*;
     use crate::capacity::DEFAULT_NUM_UNITS;
@@ -635,7 +589,6 @@ mod tests {
         };
         assert_eq!(product_bytes(&[output(100), output(128)]), 256 + 256);
         assert_eq!(product_bytes(&[output(129)]), 512);
-        assert_eq!(product_scalar_bytes(), 23);
     }
 
     #[test]
@@ -722,7 +675,14 @@ mod tests {
             image_processor: true,
             vision_feature_bytes: 1024,
             latent_feature_bytes: 512,
-            latent: Some(LatentPlan::image(8, 1000, None, 64, 12, 2)),
+            latent: Some(LatentPlan::image(
+                8,
+                1000,
+                None,
+                64,
+                12,
+                crate::ffi::DType::BF16,
+            )),
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let capacity = layout.fit_cache(&cache(), 0, &config, 0, &group()).unwrap();
@@ -787,7 +747,7 @@ mod tests {
             num_pages: 17,
             page_units: 1024,
             latent_width: 1,
-            element_bytes: 4,
+            dtype: crate::ffi::DType::F32,
             with_workspace: false,
         };
         let facts = |stores_latent| MediaFacts {

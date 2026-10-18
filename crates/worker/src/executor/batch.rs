@@ -1125,7 +1125,6 @@ mod tests {
     fn open(values: &[Option<u8>]) -> Result<Opening> {
         let mut requests = RequestPool::new(values.len())?;
         let store = ProductStore::new(
-            8,
             1024,
             1024,
             vec![HOST],

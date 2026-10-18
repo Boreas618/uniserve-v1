@@ -337,6 +337,7 @@ mod tests {
     use crate::executor::PendingOutput;
     use crate::ffi::DType;
     use crate::request::RequestProgress;
+    use crate::storage::LatentPlan;
     use crate::storage::{LatentUpdate, TrajectoryVersion};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
@@ -352,7 +353,18 @@ mod tests {
     fn pool() -> Result<(LatentPool, LatentStorage)> {
         Ok((
             crate::storage::LatentPool::new(2, 4, 2)?,
-            LatentStorage::allocate(2, 4, 2, WIDTH, DType::F32, false, None, None)?,
+            LatentStorage::allocate(
+                &LatentPlan {
+                    request_pool_size: 2,
+                    num_pages: 4,
+                    page_units: 2,
+                    latent_width: WIDTH as usize,
+                    dtype: DType::F32,
+                    with_workspace: false,
+                },
+                None,
+                None,
+            )?,
         ))
     }
 
