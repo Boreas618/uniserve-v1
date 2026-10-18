@@ -20,6 +20,7 @@ from uniserve.bindings.context import ExecutionContext
 from uniserve.diffusion import normal_noise
 from uniserve.errors import SetupError
 from uniserve.loading.rank import capability
+from uniserve.media import image, video
 from uniserve.media.pixels import (
     Tower,
     image_size,
@@ -255,6 +256,40 @@ class EncoderRunner:
             encoder.load_kernels()
 
     @staticmethod
+    def posterior_elements(loaded, frames: int, width: int, height: int) -> int:
+        """FP32 elements of a condition size's complete posterior draw.
+
+        0 when the video encoder takes no draw.
+        """
+        encoder = capability(loaded.module, VideoEncoder)
+        if encoder is None:
+            raise SetupError("the model has no VideoEncoder")
+        shape = encoder.posterior_shape(
+            video.Config(int(frames), image.Config(int(height), int(width)))
+        )
+        return 0 if shape is None else prod(shape)
+
+    @staticmethod
+    def draw_posterior(
+        loaded, frames: int, width: int, height: int, noise: torch.Tensor
+    ) -> None:
+        """Fill a condition size's complete posterior draw.
+
+        ``noise`` is a flat FP32 tensor of :meth:`posterior_elements`
+        elements, the control plane's storage of the draw, which every
+        encoding of a condition of this size then reads (:meth:`encode`).
+        """
+        encoder = capability(loaded.module, VideoEncoder)
+        if encoder is None:
+            raise SetupError("the model has no VideoEncoder")
+        size = video.Config(int(frames), image.Config(int(height), int(width)))
+        shape = encoder.posterior_shape(size)
+        if shape is None:
+            raise SetupError("the video encoder takes no posterior draw")
+        with torch.inference_mode():
+            encoder.draw_noise(size, noise.view(shape))
+
+    @staticmethod
     def sample_rate(loaded) -> int:
         """The sample rate condition audio is resampled to for the encoder."""
         encoder = capability(loaded.module, AudioEncoder)
@@ -350,12 +385,14 @@ class EncoderRunner:
         ``[1]`` int32 prompt length, and the ``[capacity, width]`` refined
         rows.
 
-        A video encoder takes ``(pixels, out, units)``: ``pixels`` is the
-        request's ``[pixels, 3]`` uint8 condition pixels and each unit is
-        ``[pixel_offset, frames, width, height, unit]``, flattened: its
-        condition's first pixel row, frame count and raster, and the
-        unit's index among the condition's units. The units' rows fill
-        ``out`` in order.
+        A video encoder takes ``(pixels, out, units, *noise)``: ``pixels``
+        is the request's ``[pixels, 3]`` uint8 condition pixels and each
+        unit is ``[pixel_offset, frames, width, height, unit]``, flattened:
+        its condition's first pixel row, frame count and raster, and the
+        unit's index among the condition's units. An encoder that samples
+        its posterior takes one ``noise`` tensor per unit, the complete
+        draw of the unit's condition size (:meth:`draw_posterior`). The
+        units' rows fill ``out`` in order.
 
         An audio encoder takes ``(samples, out, lengths)``: the request's
         ``[samples, 2]`` FP32 PCM, the tracks' sample counts ``lengths``;
@@ -431,11 +468,17 @@ class EncoderRunner:
         out.copy_(self._module.encode((features,), lengths=lengths)[0])
 
     def _encode_video(
-        self, pixels: torch.Tensor, out: torch.Tensor, units: Sequence[int]
+        self,
+        pixels: torch.Tensor,
+        out: torch.Tensor,
+        units: Sequence[int],
+        *noise: torch.Tensor,
     ) -> None:
         encoder = self._module
-        values, windows, counts = [], [], []
-        for offset, frames, width, height, unit in _chunks(units, 5):
+        values, windows, counts, draws = [], [], [], []
+        for index, (offset, frames, width, height, unit) in enumerate(
+            _chunks(units, 5)
+        ):
             window = encoder.frame_slices(frames)[unit]
             area = width * height
             values.append(
@@ -445,8 +488,16 @@ class EncoderRunner:
             )
             windows.append(window)
             counts.append(frames)
+            if noise:
+                shape = encoder.posterior_shape(
+                    video.Config(frames, image.Config(height, width))
+                )
+                draws.append(noise[index].view(shape))
         encoded = encoder.encode(
-            tuple(values), frames=tuple(windows), num_frames=tuple(counts)
+            tuple(values),
+            frames=tuple(windows),
+            num_frames=tuple(counts),
+            noise=tuple(draws) if noise else None,
         )
         if (
             sum(int(output.tensor.shape[0]) for output in encoded)

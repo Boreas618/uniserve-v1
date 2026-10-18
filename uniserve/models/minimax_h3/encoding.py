@@ -50,8 +50,9 @@ class VideoEncoder(BaseVideoEncoder):
 
     The posterior is sampled with a host FP32 draw seeded with
     ``POSTERIOR_SEED`` over the condition's complete ``[1, channels, frames,
-    height / 16, width / 16]`` latent, rounded to FP16 and normalized by the
-    latent channel statistics. Rows follow the denoiser's raster patch order:
+    height / 16, width / 16]`` latent (``draw_noise``; the caller draws once
+    per condition size), rounded to FP16 and normalized by the latent
+    channel statistics. Rows follow the denoiser's raster patch order:
     frame-major, then row-major 2x2 patches with channel-major features.
     """
 
@@ -155,25 +156,29 @@ class VideoEncoder(BaseVideoEncoder):
         if self.pixel_mean.is_cuda:
             functional.load_frame_kernels()
 
-    def posterior_noise(self, size: video.Config) -> torch.Tensor:
+    def posterior_shape(self, size: video.Config) -> tuple[int, ...]:
+        height, width = self._latent_size(size.frame)
+        return (
+            1,
+            self.config.latent_channels,
+            self._latent_frames(size.num_frames),
+            height,
+            width,
+        )
+
+    def draw_noise(self, size: video.Config, out: torch.Tensor) -> None:
         # One standard normal FP32 draw of the complete latent from a fresh
         # host generator, which is the reference's draw; the shape fixes how
         # the generator's stream maps onto latent positions.
-        height, width = self._latent_size(size.frame)
-        draw = torch.empty(
-            (
-                1,
-                1,
-                self.config.latent_channels,
-                self._latent_frames(size.num_frames),
-                height,
-                width,
-            ),
-            dtype=torch.float32,
-            device="cpu",
-        )
-        normal_noise((POSTERIOR_SEED,), out=(draw,))
-        return draw[0]
+        shape = self.posterior_shape(size)
+        if tuple(out.shape) != shape or out.dtype != torch.float32:
+            raise ValueError(
+                "an H3 posterior draw is FP32 of the condition's latent"
+            )
+        draw = out if out.device.type == "cpu" else torch.empty(shape)
+        normal_noise((POSTERIOR_SEED,), out=(draw.unsqueeze(0),))
+        if draw is not out:
+            out.copy_(draw)
 
     def unpack_pixels(
         self, pixels: torch.Tensor, frames: slice, num_frames: int
