@@ -35,7 +35,7 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
     Ok(Arc::new(HuggingFaceTokenizer::new(&path)?))
 }
 
-/// A single decoded delta containing a reasoning block, text, and two XML tool
+/// A single decoded delta containing a reasoning block, text, and two tool
 /// calls separates into reasoning deltas, visible text with the tool-call
 /// markup removed, and one call per `<tool_call>` block in order.
 #[tokio::test]
