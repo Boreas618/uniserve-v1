@@ -4,8 +4,8 @@
 //! worker reports it in its startup handshake ([`VideoDenoiserInfo`]), to the
 //! server's media policy, sequence capacity and the checkpoint's vision
 //! processor. It prepares every video request for the engine: the fields
-//! that only restate the served contract are checked first, ingestion
-//! ([`VideoIngest`]) then plans and presents the request, the packed
+//! that only restate the served contract are checked first, the processor
+//! ([`VideoProcessor`]) then plans and presents the request, the packed
 //! sequence is bounded, each condition's fetched media is published to
 //! shared memory for the worker's media reader, and the result becomes one
 //! `DiffusionRequest` describing every condition.
@@ -28,7 +28,7 @@ use uniserve_engine::VideoDenoiserInfo;
 
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
-use super::{ConditionInput, VideoIngest, VideoRequestInput};
+use super::{ConditionInput, VideoInputs, VideoProcessor};
 use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
@@ -59,7 +59,7 @@ pub(crate) const REQUEST_FIELDS: [&str; 16] = [
 
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PreparedVideo {
+pub struct ProcessedVideo {
     /// The engine request. `EngineClient` stamps the identifier it reserved
     /// for the request at submission.
     pub request: DiffusionRequest,
@@ -69,14 +69,14 @@ pub struct PreparedVideo {
     pub canvas: Canvas,
 }
 
-/// Prepares the video requests of one deployment.
+/// Processes the video requests of one deployment.
 pub struct VideoService {
     denoiser: VideoDenoiserInfo,
     tasks: Vec<VideoTask>,
     max_video_seconds: f64,
     max_condition_rows: u32,
     media: VideoMediaSettings,
-    ingest: VideoIngest,
+    processor: VideoProcessor,
 }
 
 impl VideoService {
@@ -124,7 +124,7 @@ impl VideoService {
             canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
         };
         Ok(Self {
-            ingest: VideoIngest::new(fetcher, prober, vision, limits, tokenizer),
+            processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
             denoiser,
             tasks,
             max_video_seconds,
@@ -150,7 +150,7 @@ impl VideoService {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
         // ref2va.
-        let served = plan::served_canvases(self.ingest.limits());
+        let served = plan::served_canvases(self.processor.limits());
         let named: Vec<String> = NAMED_ASPECT_RATIOS
             .iter()
             .map(|(width, height)| format!("{width}:{height}"))
@@ -189,7 +189,7 @@ impl VideoService {
             "tasks": self.denoiser.tasks,
             "task_conditions": conditions,
             "canvas": {
-                "short_edges": self.ingest.limits().short_edges(),
+                "short_edges": self.processor.limits().short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": named,
@@ -222,7 +222,7 @@ impl VideoService {
         })
     }
 
-    /// Validates, ingests and sizes one video request.
+    /// Validates, processes and sizes one video request.
     ///
     /// The schedule, output-count and quality fields are checked before any
     /// media is fetched; the fields the SGLang client restates (`seconds`,
@@ -238,20 +238,20 @@ impl VideoService {
     ///
     /// Returns `invalid_request` naming the field at fault, or the rows the
     /// request needs and the capacity it exceeds, and a server error when
-    /// ingestion's own resources or the shared-memory allocation fail.
-    pub async fn prepare(
+    /// processing's own resources or the shared-memory allocation fail.
+    pub async fn process(
         &self,
         request_id: &ServeRequestId,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<PreparedVideo, ApiError> {
+    ) -> Result<ProcessedVideo, ApiError> {
         self.check_contract(request)?;
 
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
-        let prepared = self
-            .ingest
-            .prepare(&VideoRequestInput {
+        let processed = self
+            .processor
+            .process(&VideoInputs {
                 task: request.task,
                 prompt: &request.prompt,
                 target: Target {
@@ -262,7 +262,7 @@ impl VideoService {
                 conditions,
             })
             .await?;
-        let plan = &prepared.plan;
+        let plan = &processed.plan;
         check_restated(
             request,
             plan.canvas,
@@ -270,7 +270,7 @@ impl VideoService {
             self.max_video_seconds,
         )?;
 
-        let prompt_token_ids = prepared.presentation.token_ids;
+        let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::ContextLengthExceeded {
@@ -284,9 +284,9 @@ impl VideoService {
 
         // Each condition's media reaches the worker's media reader through
         // shared memory on this host.
-        let mut media = Vec::with_capacity(prepared.media.len());
-        let mut conditions = Vec::with_capacity(prepared.media.len());
-        for (condition, fetched) in plan.conditions.iter().zip(&prepared.media) {
+        let mut media = Vec::with_capacity(processed.media.len());
+        let mut conditions = Vec::with_capacity(processed.media.len());
+        for (condition, fetched) in plan.conditions.iter().zip(&processed.media) {
             let source = MediaSource::publish(fetched.bytes()).map_err(|error| {
                 ApiError::server_error(format!(
                     "publishing conditions[{}] for the worker failed: {error}",
@@ -296,12 +296,12 @@ impl VideoService {
             conditions.push(condition.describe(plan.canvas, source.locator()));
             media.push(Arc::new(source));
         }
-        Ok(PreparedVideo {
+        Ok(ProcessedVideo {
             request: DiffusionRequest {
                 request_id: RequestId::default(),
                 task: plan.task,
                 prompt_token_ids,
-                text_tags: prepared.presentation.tags,
+                text_tags: processed.presentation.tags,
                 conditions,
                 media,
                 priority: 0,
@@ -339,7 +339,7 @@ impl VideoService {
     fn check_rows(&self, plan: &RequestPlan, text_rows: usize) -> Result<(), ApiError> {
         let Some(condition_rows) = plan.condition_rows(self.denoiser.condition_tiles) else {
             return Err(ApiError::invalid_request(
-                "conditions: this denoiser packs references in region tiles and holds no keyframes",
+                "conditions: this denoiser packs references in segment tiles and holds no keyframes",
                 Some("conditions"),
             ));
         };
@@ -431,7 +431,7 @@ impl VideoService {
     }
 }
 
-/// The ingestion input of one request condition.
+/// The processing input of one request condition.
 fn condition_input(condition: &VideoCondition) -> ConditionInput<'_> {
     ConditionInput {
         spec: ConditionSpec {
@@ -547,7 +547,7 @@ mod tests {
 
     /// The FastH3 OmniRef reference denoiser's condition tiles: 128 rows, a
     /// video tile of 4 latent frames by 4 by 8 tokens.
-    const REGION_TILES: ConditionTiles = ConditionTiles {
+    const SEGMENT_TILES: ConditionTiles = ConditionTiles {
         rows: 128,
         video: [4, 4, 8],
     };
@@ -670,7 +670,7 @@ mod tests {
         );
         assert!(message.contains("37950"), "{message}");
 
-        let packed = |capacity| packed_service(capacity, None, Some(REGION_TILES));
+        let packed = |capacity| packed_service(capacity, None, Some(SEGMENT_TILES));
         assert_eq!(packed(46_848).check_rows(&plan, text_rows), Ok(()));
         let message = refusal(packed(46_847).check_rows(&plan, text_rows).unwrap_err());
         assert!(
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn the_sequence_bound_counts_tile_packed_rows() {
         let plan = video_and_audio();
-        let bounded = |bound| packed_service(1 << 17, Some(bound), Some(REGION_TILES));
+        let bounded = |bound| packed_service(1 << 17, Some(bound), Some(SEGMENT_TILES));
         assert_eq!(bounded(85_582).check_rows(&plan, 1024), Ok(()));
         let message = refusal(bounded(85_581).check_rows(&plan, 1024).unwrap_err());
         assert!(
@@ -697,14 +697,14 @@ mod tests {
         );
     }
 
-    /// A keyframe has no rows in a region packing, so a tile-packing
+    /// A keyframe has no rows in a segment packing, so a tile-packing
     /// denoiser refuses it while a dense one admits it.
     #[test]
     fn tile_packing_refuses_keyframes() {
         let plan = first_keyframe();
         assert_eq!(service(1 << 17, None).check_rows(&plan, 1024), Ok(()));
         let message = refusal(
-            packed_service(1 << 17, None, Some(REGION_TILES))
+            packed_service(1 << 17, None, Some(SEGMENT_TILES))
                 .check_rows(&plan, 1024)
                 .unwrap_err(),
         );
@@ -758,8 +758,8 @@ mod tests {
     #[tokio::test]
     async fn a_reference_image_is_described_for_the_worker() {
         let image = png(160, 90);
-        let prepared = service(1 << 17, None)
-            .prepare(
+        let processed = service(1 << 17, None)
+            .process(
                 &ServeRequestId::new("reference"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
@@ -772,7 +772,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = &prepared.request;
+        let request = &processed.request;
         assert_eq!(request.task, VideoTask::Ref2va);
         assert_eq!(request.text_tags.len(), request.prompt_token_ids.len());
         assert_eq!(request.validate(), Ok(()));
@@ -819,8 +819,8 @@ mod tests {
     /// canvas, anchoring its end of the video.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let prepared = service(1 << 17, None)
-            .prepare(
+        let processed = service(1 << 17, None)
+            .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
@@ -836,8 +836,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let canvas = prepared.canvas;
-        let [first, last] = prepared.request.conditions.as_slice() else {
+        let canvas = processed.canvas;
+        let [first, last] = processed.request.conditions.as_slice() else {
             panic!("two keyframes");
         };
         assert_eq!(first.role, ConditionRole::FirstFrame);
@@ -891,7 +891,7 @@ mod tests {
         };
 
         let error = service(7_000, None)
-            .prepare(&id, &body(), 1 << 16)
+            .process(&id, &body(), 1 << 16)
             .await
             .unwrap_err();
         let message = refused(error);
@@ -905,7 +905,7 @@ mod tests {
         // 7296 condition rows, 2 * 207 generated audio rows, 37 * 1008
         // generated video rows and the presentation's text rows.
         let error = service(1 << 17, Some(40_000))
-            .prepare(&id, &body(), 1 << 16)
+            .process(&id, &body(), 1 << 16)
             .await
             .unwrap_err();
         let message = refused(error);

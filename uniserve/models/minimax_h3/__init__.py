@@ -11,7 +11,7 @@ draws its other components from, and ``checkpoint_mappings`` maps its
 tensors onto the modules.
 """
 
-from .attention import Dense, RegionSparse, Sparse
+from .attention import Dense, SegmentSparse, Sparse
 from .checkpoint import base_checkpoint
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
@@ -34,13 +34,13 @@ from .inputs import (
     AttentionInput,
     DenoiserInput,
     DenoiserSize,
-    RegionInput,
+    SegmentInput,
     SequenceInput,
 )
 from .model import Model, entry_points
 from .modulation import OutputNorm, TimestepEmbedding
 from .output import VideoPostprocessor
-from .packing import DensePacking, RegionPacking, TilePacking
+from .packing import DensePacking, SegmentPacking, TilePacking
 from .precision import checkpoint_precision, precisions, weight_config
 from .transformer import StepProjection, Transformer, TransformerLayer
 from .weights import checkpoint_mappings, checkpoint_sources
@@ -59,7 +59,7 @@ __all__ = [
     "Model",
     "Config",
     "Dense",
-    "RegionSparse",
+    "SegmentSparse",
     "Sparse",
     "Conditioner",
     "RefinerBlock",
@@ -81,13 +81,13 @@ __all__ = [
     "AttentionInput",
     "DenoiserInput",
     "DenoiserSize",
-    "RegionInput",
+    "SegmentInput",
     "SequenceInput",
     "OutputNorm",
     "TimestepEmbedding",
     "VideoPostprocessor",
     "DensePacking",
-    "RegionPacking",
+    "SegmentPacking",
     "TilePacking",
     "StepProjection",
     "Transformer",

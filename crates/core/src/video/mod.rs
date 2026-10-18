@@ -192,7 +192,7 @@ pub struct VideoCondition {
     pub audio_rows: u32,
 }
 
-/// Whole-tile condition packing of a multi-region video denoiser.
+/// Whole-tile condition packing of a multi-segment video denoiser.
 ///
 /// Each condition occupies whole tiles of `rows` rows: its audio rows fill
 /// tiles of their own, then an image's rows fill tiles, while a video's
@@ -229,7 +229,7 @@ impl ConditionTiles {
 /// Denoiser rows a condition packs into, as `tiles` prescribes: its video
 /// and audio rows without tiles, or the rows of the whole tiles they fill, a
 /// video's in tiles of its `(latent frames, height / 32, width / 32)` token
-/// grid. `None` for a keyframe under tiles, which a region packing does not
+/// grid. `None` for a keyframe under tiles, which a segment packing does not
 /// hold.
 ///
 /// This is the count a denoiser's `make_size` reaches for the same condition

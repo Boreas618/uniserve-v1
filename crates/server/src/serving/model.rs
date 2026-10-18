@@ -34,7 +34,7 @@ use crate::serving::chat::{
 };
 use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
-use crate::serving::video::{PreparedVideo, VideoService};
+use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{Result, ServeError};
 
 /// Owns the tokenizer and template resources used to produce final engine inputs.
@@ -407,12 +407,12 @@ impl InputProcessor {
     /// # Errors
     ///
     /// Returns an API error when the model serves no video, the request names another model,
-    /// or `VideoService::prepare` refuses it.
+    /// or `VideoService::process` refuses it.
     pub async fn preprocess_video_request(
         &self,
         request_id: &crate::serving::ServeRequestId,
         request: &crate::openai::VideoGenerationRequest,
-    ) -> std::result::Result<PreparedVideo, crate::openai::ApiError> {
+    ) -> std::result::Result<ProcessedVideo, crate::openai::ApiError> {
         let Some(video) = &self.video else {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::UnsupportedFeature {
@@ -423,7 +423,7 @@ impl InputProcessor {
         };
         crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
         video
-            .prepare(request_id, request, self.config.max_model_len)
+            .process(request_id, request, self.config.max_model_len)
             .await
     }
 

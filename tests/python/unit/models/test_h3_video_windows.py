@@ -19,11 +19,11 @@ from uniserve.models.minimax_h3.packing import video_latent_frames, video_order
 pytestmark = pytest.mark.unit
 
 # Dense packing keeps raster order; tile packing (the FastH3 students) and
-# region packing (reference-conditioned students) order rows tile-major.
+# segment packing (reference-conditioned students) order rows tile-major.
 ATTENTION = {
     "dense": DenseAttention(),
     "tiles": SparseAttention(tile=64, sparsity=0.9),
-    "regions": SparseAttention(tile=128, sparsity=0.9, reference_keep=0.5),
+    "segments": SparseAttention(tile=128, sparsity=0.9, reference_keep=0.5),
 }
 
 
