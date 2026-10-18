@@ -486,7 +486,7 @@ impl Scheduler {
                 key: cache_key,
                 product: product.clone(),
             });
-            if step == ImageIngestStep::VaeEncode {
+            if step == MediaCall::LatentEncoding {
                 state.input_image_features = Some(product);
                 state.phase = Phase::IngestState;
                 return self.next_context_computation(id, budget, context_rows);
@@ -531,7 +531,7 @@ impl Scheduler {
                     break;
                 };
                 if end < text_stop
-                    || input.encoder != ImageIngestStep::VitEncode
+                    || input.encoder != MediaCall::VisionEncoding
                     || rows >= context_rows
                 {
                     break;
@@ -604,7 +604,7 @@ impl Scheduler {
     pub(in crate::scheduler) fn next_context_encode(
         &self,
         id: RequestId,
-    ) -> Option<(BlockCursor, ImageIngestStep)> {
+    ) -> Option<(BlockCursor, MediaCall)> {
         let state = self.running.get(&id)?;
         if state.phase == Phase::IngestState {
             return None;
@@ -615,7 +615,7 @@ impl Scheduler {
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {
             let position = image.position as usize;
-            if input.encoder == ImageIngestStep::VaeEncode {
+            if input.encoder == MediaCall::LatentEncoding {
                 return (position == cursor).then_some((block, input.encoder));
             }
             if position > cursor && position >= reach {

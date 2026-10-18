@@ -1,9 +1,9 @@
 //! Reference-counted cache of worker-resident encoder products.
 //!
 //! Content-derived keys (`uniserve_core::encoder_cache_key`, over the image
-//! hash, ingest step index, and step kind) map to immutable product
-//! references. The scheduler owns this bookkeeping; the tensors themselves
-//! live in worker buffers. Requests pin the entries they read, unpinned
+//! hash, the encoder's index in the image's encoders, and its encoding call)
+//! map to immutable product references. The scheduler owns this bookkeeping;
+//! the tensors themselves live in worker buffers. Requests pin the entries they read, unpinned
 //! entries participate in LRU eviction, and every operation that gives up
 //! worker storage returns the product so the scheduler can queue a `Free` for
 //! its buffer.

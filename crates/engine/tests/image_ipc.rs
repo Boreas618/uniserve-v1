@@ -24,8 +24,8 @@ use base64::Engine as _;
 use uniserve_core::{
     ComponentConfig, EngineCoreOutput, FeedbackNextToken, FeedbackSource, FinishReason,
     GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageInput, ImageParams,
-    ImageTrigger, MultimodalInputs, Request, RequestId, SamplingParams,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaCall,
+    MultimodalInputs, Request, RequestId, SamplingParams,
 };
 use uniserve_engine::{EngineConfig, EngineCore, WorkerConfig, WorkerProcessArgs};
 
@@ -140,7 +140,7 @@ fn policy(feedback: bool) -> ImageGenerationConfig {
         num_feedback_positions: 2,
         feedback_encoders: if feedback {
             vec![ImageEncoderInput {
-                encoder: ImageIngestStep::VaeEncode,
+                encoder: MediaCall::LatentEncoding,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }]
@@ -330,7 +330,7 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
                 position: 2,
                 num_positions: 1,
                 encoders: vec![ImageEncoderInput {
-                    encoder: ImageIngestStep::VitEncode,
+                    encoder: MediaCall::VisionEncoding,
                     num_cache_tokens: Some(4),
                     max_cache_tokens: None,
                 }],
