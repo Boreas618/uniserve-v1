@@ -131,6 +131,7 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
 | `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
+| `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced; a rank reports a lane stalled after half of it |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
 | `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
 | `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |

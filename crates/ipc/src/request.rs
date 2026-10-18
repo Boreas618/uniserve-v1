@@ -158,7 +158,8 @@ pub struct WorkerResponseError {
 }
 
 /// A job one of a rank's lanes has performed for at least the rank's stall
-/// bound ([`LaunchDescriptor::stall_bound_ms`](crate::LaunchDescriptor)),
+/// bound, half the head's watchdog timeout
+/// ([`LaunchDescriptor::watchdog_timeout_ms`](crate::LaunchDescriptor)),
 /// as the rank's control thread observes it: the job was submitted and its
 /// completion has not arrived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

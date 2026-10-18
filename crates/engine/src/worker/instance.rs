@@ -59,7 +59,7 @@ pub struct WorkerGroup {
     /// whose identifier does not exceed it.
     last_batch_id: Option<u64>,
     /// Time of construction or of the last submission, joined result, or
-    /// group replacement, from which `WorkerProcessArgs::result_deadline`
+    /// group replacement, from which `WorkerProcessArgs::watchdog_timeout`
     /// is measured.
     last_progress: Instant,
     /// Admitted batches not yet retired, by batch identifier.
@@ -866,7 +866,7 @@ impl WorkerGroup {
     /// and the group stays usable. Any other error, including rank loss, a
     /// protocol violation, an agreed error `join_rank_errors` does not retire,
     /// a lane a rank reports stalled, and an expired
-    /// `WorkerProcessArgs::result_deadline` (measured from the group's last
+    /// `WorkerProcessArgs::watchdog_timeout` (measured from the group's last
     /// progress and enforced only while a batch is pending), replaces the
     /// rank group and returns the recovery's `WorkerFailure`.
     pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
@@ -912,11 +912,14 @@ impl WorkerGroup {
         }
     }
 
+    /// Fails when a batch is pending and no rank has made progress within
+    /// the watchdog timeout, measured from `last_progress`. Expiry is an
+    /// error that `poll_batch` answers by replacing the rank group.
     fn check_progress_deadline(&self) -> anyhow::Result<()> {
-        let deadline = self.process_args.result_deadline;
+        let timeout = self.process_args.watchdog_timeout;
         anyhow::ensure!(
-            self.pending_batches.is_empty() || self.last_progress.elapsed() < deadline,
-            "cooperative workers produced no progress within {deadline:?}",
+            self.pending_batches.is_empty() || self.last_progress.elapsed() < timeout,
+            "cooperative workers produced no progress within {timeout:?}",
         );
         Ok(())
     }

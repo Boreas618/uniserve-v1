@@ -73,14 +73,16 @@ pub struct WorkerProcessArgs {
     /// rather than a constant.
     pub launcher_timeout: std::time::Duration,
     /// How long the group waits for progress of its ranks (a joined result)
-    /// while a batch is pending before it replaces them. A rank reports a
-    /// lane whose job has run for half of it
-    /// (`LaunchDescriptor::stall_bound_ms`), so a lane that stays inside a
-    /// call is reported, and named in the failure of its requests, before
-    /// this expires, even for a forward that started up to half of it after
-    /// the group's last progress. This deadline remains for a rank that stops
-    /// answering at all.
-    pub result_deadline: std::time::Duration,
+    /// while a batch is pending before it treats them as hung and replaces
+    /// them, failing the requests they hold (`--watchdog-timeout`). A rank
+    /// that dies is detected at once; this bounds a rank that is alive but
+    /// stuck, for example in a collective. The launch descriptor carries it
+    /// to every rank, which reports a lane whose job has run for half of it
+    /// (`WorkerResponse::Stalled`), so a lane that stays inside a call is
+    /// reported, and named in the failure of its requests, before this
+    /// expires, even for a forward that started up to half of it after the
+    /// group's last progress.
+    pub watchdog_timeout: std::time::Duration,
     /// Launch the worker without model weights, using its deterministic test
     /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.

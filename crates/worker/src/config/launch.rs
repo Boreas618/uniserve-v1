@@ -23,7 +23,7 @@ pub struct IpcConfig {
     /// Largest frame payload, in bytes.
     pub max_payload_bytes: usize,
     /// How long one job may run on a lane before the rank reports the lane
-    /// stalled.
+    /// stalled: half the head's watchdog timeout.
     pub stall_bound: std::time::Duration,
 }
 
@@ -236,9 +236,9 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     if descriptor.ipc_payload_cap == 0 {
         return Err(DescriptorError::new("--ipc-payload-cap must be positive"));
     }
-    if descriptor.stall_bound_ms == 0 {
+    if descriptor.watchdog_timeout_ms < 2 {
         return Err(DescriptorError::new(
-            "the lane stall bound must be positive",
+            "--watchdog-timeout must leave a positive lane stall bound",
         ));
     }
     let stub = descriptor.no_model;
@@ -272,7 +272,11 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             products_cross_hosts: descriptor.products_cross_hosts,
             queue_depth: descriptor.queue_depth,
             max_payload_bytes: descriptor.ipc_payload_cap,
-            stall_bound: std::time::Duration::from_millis(descriptor.stall_bound_ms),
+            // Half the head's watchdog, so a stalled lane is reported, and
+            // named in its requests' failure, before the head replaces the
+            // group, even for a job that started up to half of it after the
+            // group's last progress.
+            stall_bound: std::time::Duration::from_millis(descriptor.watchdog_timeout_ms / 2),
         },
         local_rank: descriptor.local_rank as usize,
         distributed_backend: text(descriptor.distributed_backend.as_deref()),

@@ -558,7 +558,7 @@ fn lose_head(
 fn a_rank_without_its_head_closes_when_idle_and_ends_at_once_when_stuck() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let descriptor = LaunchDescriptor {
-        stall_bound_ms: 500,
+        watchdog_timeout_ms: 1_000,
         ..stub_launch_descriptor()
     };
 
@@ -801,7 +801,7 @@ fn a_stalled_lane_is_reported_while_its_rank_serves_on() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let address = format!("unix:{}", directory.path().join("head.sock").display());
     let descriptor = LaunchDescriptor {
-        stall_bound_ms: 500,
+        watchdog_timeout_ms: 1_000,
         ..stub_launch_descriptor()
     };
     let (mut head, mut child) = RawHead::launch(&address, &descriptor)?;
@@ -866,13 +866,13 @@ fn a_stalled_lane_is_reported_while_its_rank_serves_on() -> anyhow::Result<()> {
 }
 
 /// A group whose rank reports a stalled lane fails the batch's requests with
-/// an error naming the lane and the forward, before its own result deadline,
+/// an error naming the lane and the forward, before its own watchdog timeout,
 /// and is replaced by a group that serves.
 #[test]
 fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
     let mut args = single_rank_args("stalling", QUEUE_DEPTH);
     // The rank reports a job that has run for half of this, 4 seconds.
-    args.result_deadline = Duration::from_secs(8);
+    args.watchdog_timeout = Duration::from_secs(8);
     let mut group = WorkerGroup::spawn(args)?;
 
     let admission = text_admission(31, 1, 1)?;
@@ -2052,8 +2052,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         products_cross_hosts: false,
         queue_depth: 8,
         ipc_payload_cap: 1 << 20,
-        // Half the head's default result deadline, as the head states it.
-        stall_bound_ms: 150_000,
+        // The head's default watchdog timeout.
+        watchdog_timeout_ms: 300_000,
         model: String::new(),
         base_model: None,
         device: "cpu".into(),
