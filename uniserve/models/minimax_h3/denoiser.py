@@ -271,7 +271,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return attention.tile if isinstance(attention, SparseAttention) else 64
 
     def legal_frame_count(self, requested: int) -> int:
-        """Round a requested duration up to the next complete native window."""
+        """Round a requested duration up to the next complete clip."""
         return align_num_frames(requested)
 
     def make_size(

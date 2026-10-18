@@ -6,7 +6,7 @@ use std::ops::Range;
 use uniserve_core::Canvas;
 use uniserve_ipc::{CallKind, MediaCall};
 
-use super::{DecodeImage, DecoderRunner, Segment, TrackUnits, UnitShape};
+use super::{ClipOutput, DecodeImage, DecoderRunner, TrackUnits, UnitShape};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoSize};
@@ -45,11 +45,11 @@ pub(crate) struct DecoderRunners {
     /// A video model's video decoder.
     pub(crate) video: Option<Component<DecoderRunner>>,
     /// The unit shapes startup warmed, which it then captures: each with
-    /// its window's latent rows and its video's longest unit.
+    /// its clip input's latent rows and its video's longest unit.
     unit_shapes: Vec<(UnitShape, u64, u32)>,
-    /// The segment each media unit of every admitted video decodes to, by
+    /// The clip output each media unit of every admitted video decodes to, by
     /// `(frames, canvas, unit)`, read from the model at startup.
-    segments: HashMap<(u32, Canvas, u32), Segment>,
+    clip_outputs: HashMap<(u32, Canvas, u32), ClipOutput>,
     /// A video model's audio decoder.
     pub(crate) audio: Option<Component<DecoderRunner>>,
     /// Every admitted audio track decoded in some number of units, by
@@ -118,7 +118,7 @@ impl DecoderRunners {
         decoder.check_staged(returns, &mut completion)
     }
 
-    /// Prepare and warm the video decoder's segments and every round shape
+    /// Prepare and warm the video decoder's clip outputs and every round shape
     /// of its unit ring, then the audio decoder's durations. Runs on every
     /// rank of the group in the same order, because rounds exchange
     /// overlaps. Each warmup is a job of the decoder's lane on `lanes`,
@@ -131,7 +131,9 @@ impl DecoderRunners {
         lanes: &JobQueues,
     ) -> Result<()> {
         if let Some(decoder) = &mut self.video {
-            decoder.runner.prepare_segments(&segments(model, plan)?)?;
+            decoder
+                .runner
+                .prepare_clip_outputs(&clip_outputs(model, plan)?)?;
             let width = (decoder.config.ranks.len() * decoder.config.units_per_rank.max(1)) as u32;
             // One round of each shape warms the ring and is captured: a
             // round's shape is its canvas, whether it holds the video's
@@ -147,9 +149,10 @@ impl DecoderRunners {
                     // What a decode of each unit takes from the model is
                     // read now: a serving rank asks the library nothing.
                     for unit in 0..total {
-                        let segment = model.segment(frames, canvas, unit)?;
-                        self.segments.insert((frames, canvas, unit), segment);
-                        decoder.runner.read_window(frames, canvas, unit)?;
+                        let clip_output = model.clip_output(frames, canvas, unit)?;
+                        self.clip_outputs
+                            .insert((frames, canvas, unit), clip_output);
+                        decoder.runner.read_clip_rows(frames, canvas, unit)?;
                     }
                     let mut cursor = 0;
                     while cursor < total {
@@ -159,12 +162,12 @@ impl DecoderRunners {
                         if warmed.insert(round) && !run.is_empty() {
                             let unit = run.start;
                             let shape = UnitShape {
-                                segment: model.segment(frames, canvas, unit)?,
+                                clip_output: model.clip_output(frames, canvas, unit)?,
                                 first: unit == 0,
                                 last: unit + 1 == total,
                                 count,
                             };
-                            let rows = model.window_rows(frames, canvas, unit)?;
+                            let rows = model.clip_rows(frames, canvas, unit)?;
                             let job = Job::new();
                             decoder.runner.warm_unit(shape, rows, longest, &job)?;
                             perform(lanes, VIDEO, job)?;
@@ -223,10 +226,10 @@ impl DecoderRunners {
         Ok(())
     }
 
-    /// The `(frames, canvas)` segment unit `unit` of an admitted
+    /// The `(frames, canvas)` clip output unit `unit` of an admitted
     /// `frames`-frame video at `canvas` decodes to.
-    pub(crate) fn segment(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<Segment> {
-        self.segments
+    pub(crate) fn clip_output(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<ClipOutput> {
+        self.clip_outputs
             .get(&(frames, canvas, unit))
             .copied()
             .ok_or_else(|| Error::Invalid("the rank admits no video with this media unit".into()))
@@ -300,16 +303,16 @@ impl DecoderRunners {
     }
 }
 
-/// Every segment admitted videos decode to: canvases (in preparation order) by
+/// Every clip output admitted videos decode to: canvases (in preparation order) by
 /// frame counts (longest first) by units, without repeats.
-pub(crate) fn segments(model: &VideoModel, plan: &MediaPlan) -> Result<Vec<Segment>> {
+pub(crate) fn clip_outputs(model: &VideoModel, plan: &MediaPlan) -> Result<Vec<ClipOutput>> {
     let mut result = Vec::new();
     for &canvas in &plan.canvases {
         for &frames in plan.frame_counts.iter().rev() {
             for unit in 0..model.unit_frames(frames)?.len() as u32 {
-                let segment = model.segment(frames, canvas, unit)?;
-                if !result.contains(&segment) {
-                    result.push(segment);
+                let clip_output = model.clip_output(frames, canvas, unit)?;
+                if !result.contains(&clip_output) {
+                    result.push(clip_output);
                 }
             }
         }

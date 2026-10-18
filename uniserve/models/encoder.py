@@ -1,7 +1,7 @@
 """Encoders with homogeneous feature batching and numerical boundaries.
 
-The text, patch and condition encoders, and the windowed video and audio
-encoders.
+The text, patch and condition encoders, the clip-wise video encoder and the
+audio encoder.
 """
 
 from collections import defaultdict
@@ -643,24 +643,24 @@ class TextEncoder(Encoder[tuple[torch.Tensor, ...]]):
 
 
 class VideoEncoder(nn.Module):
-    """Encode temporal units of RGB24 frames into latent rows.
+    """Encode clips of RGB24 frames into latent rows.
 
-    A unit is a contiguous run of a video's frames whose latents depend on no
-    frame outside it. ``frame_slices`` lists a video's units in order and
+    A clip is a contiguous run of a video's frames whose latents depend on no
+    frame outside it. ``clips`` lists a video's clips in order and
     ``latent_slices`` the contiguous latent frames each one produces, so the
-    units of one video may be encoded by different ranks, in any order, and
+    clips of one video may be encoded by different ranks, in any order, and
     their rows assemble the whole-video encoding exactly.
 
     Subclasses define both partitions; ``output_layout``, which describes a
     video's complete latent as frame-major rows along its leading axis, each
     latent frame owning the same number of consecutive rows;
-    ``unpack_pixels``, the conversion of one unit's frames into the native
-    encoder input; and ``pack_latents``, the conversion of that unit's native
+    ``unpack_pixels``, the conversion of one clip's frames into the native
+    encoder input; and ``pack_latents``, the conversion of that clip's native
     NCTHW latents into its output rows. An encoder whose posterior is sampled
     defines ``posterior_shape`` and ``draw_noise``: the draw spans the
     video's complete latent and depends on the video's size alone, so a
-    caller draws it once per size and passes it with every unit of that
-    size; each unit takes the share of its own latent frames, which
+    caller draws it once per size and passes it with every clip of that
+    size; each clip takes the share of its own latent frames, which
     reproduces the draw of a whole-video encoding. Inputs remain borrowed;
     results are new tensors.
     """
@@ -669,12 +669,12 @@ class VideoEncoder(nn.Module):
         super().__init__()
         self.encoder = encoder
 
-    def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
-        """Partition a video of ``num_frames`` frames into its units."""
+    def clips(self, num_frames: int) -> tuple[slice, ...]:
+        """Partition a video of ``num_frames`` frames into its clips."""
         raise NotImplementedError
 
     def latent_slices(self, num_frames: int) -> tuple[slice, ...]:
-        """Return the latent frames each unit produces, in unit order."""
+        """Return the latent frames each clip produces, in clip order."""
         raise NotImplementedError
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:
@@ -708,17 +708,17 @@ class VideoEncoder(nn.Module):
         raise ValueError(f"{type(self).__qualname__} takes no posterior draw")
 
     def unpack_pixels(
-        self, pixels: torch.Tensor, frames: slice, num_frames: int
+        self, pixels: torch.Tensor, clip: slice, num_frames: int
     ) -> torch.Tensor:
-        """Return the native encoder input of one unit's frames.
+        """Return the native encoder input of one clip's frames.
 
-        ``pixels`` holds exactly the frames ``frames`` selects, as
+        ``pixels`` holds exactly the frames ``clip`` selects, as
         ``[frames, height, width, 3]`` uint8 RGB.
         """
         raise NotImplementedError
 
     def pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Return the output rows of one unit's native NCTHW latents."""
+        """Return the output rows of one clip's native NCTHW latents."""
         raise NotImplementedError
 
     @torch.inference_mode()
@@ -726,38 +726,38 @@ class VideoEncoder(nn.Module):
         self,
         pixels: tuple[torch.Tensor, ...],
         *,
-        frames: tuple[slice, ...],
+        clips: tuple[slice, ...],
         num_frames: tuple[int, ...],
         noise: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[TensorOutput, ...]:
-        """Encode units of RGB24 videos into their latent rows.
+        """Encode clips of RGB24 videos into their latent rows.
 
-        ``pixels[i]`` holds exactly the frames that ``frames[i]`` selects from
+        ``pixels[i]`` holds exactly the frames that ``clips[i]`` selects from
         a video of ``num_frames[i]`` frames, as ``[frames, height, width, 3]``
-        uint8, and ``frames[i]`` must be one of that video's units. An
+        uint8, and ``clips[i]`` must be one of that video's clips. An
         encoder that samples its posterior takes ``noise[i]``, the complete
-        draw of unit ``i``'s video (``draw_noise``), which units of one video
-        share; other encoders take no ``noise``. Each result holds its unit's
+        draw of clip ``i``'s video (``draw_noise``), which clips of one video
+        share; other encoders take no ``noise``. Each result holds its clip's
         rows at their place in the video's complete latent.
         """
         if (
             not pixels
-            or len(pixels) != len(frames)
+            or len(pixels) != len(clips)
             or len(pixels) != len(num_frames)
             or (noise is not None and len(noise) != len(pixels))
         ):
             raise ValueError(
-                "video frames, unit slices, durations and draws must align"
+                "video frames, clips, durations and draws must align"
             )
 
-        units = []
+        positions = []
         for value, interval, count in zip(
-            pixels, frames, num_frames, strict=True
+            pixels, clips, num_frames, strict=True
         ):
-            legal = self.frame_slices(count)
+            legal = self.clips(count)
             if interval not in legal:
                 raise ValueError(
-                    "video frame slice must select one complete encoding unit"
+                    "video clip must be one of the video's complete clips"
                 )
             if (
                 value.ndim != 4
@@ -766,27 +766,27 @@ class VideoEncoder(nn.Module):
                 or value.shape[0] != interval.stop - interval.start
             ):
                 raise ValueError(
-                    "video units must be uint8 RGB frames "
-                    "[frames, height, width, 3] covering their frame slice"
+                    "video clips must be uint8 RGB frames "
+                    "[frames, height, width, 3] covering their clip"
                 )
-            units.append(legal.index(interval))
+            positions.append(legal.index(interval))
 
         outputs = []
-        for index, (value, interval, count, unit) in enumerate(
-            zip(pixels, frames, num_frames, units, strict=True)
+        for index, (value, interval, count, position) in enumerate(
+            zip(pixels, clips, num_frames, positions, strict=True)
         ):
             size = video.Config(
                 count, image.Config(int(value.shape[1]), int(value.shape[2]))
             )
             layout = self.output_layout(size)["video"]
-            windows = self.latent_slices(count)
-            window = windows[unit]
-            extent = window.stop - window.start
-            if layout.shape[0] % windows[-1].stop:
+            spans = self.latent_slices(count)
+            span = spans[position]
+            extent = span.stop - span.start
+            if layout.shape[0] % spans[-1].stop:
                 raise ValueError(
                     "video latent rows must divide evenly among latent frames"
                 )
-            rows_per_frame = layout.shape[0] // windows[-1].stop
+            rows_per_frame = layout.shape[0] // spans[-1].stop
 
             shape = self.posterior_shape(size)
             if (shape is None) != (noise is None):
@@ -799,15 +799,16 @@ class VideoEncoder(nn.Module):
                     raise ValueError(
                         "a posterior draw must span its video's latent"
                     )
-                # The unit's latent frames of its video's draw. A caller's
+                # The clip's latent frames of its video's draw. A caller's
                 # draw stays unchanged while the copy reads it.
-                draw = noise[index][:, :, window].to(
+                draw = noise[index][:, :, span].to(
                     value.device, non_blocking=True
                 )
 
-            # A unit whose input was padded to the encoder's temporal extent
-            # yields trailing latent frames beyond its own; the window keeps
-            # the leading ones, so the posterior never samples the others.
+            # A clip whose input was padded to the encoder's temporal extent
+            # yields trailing latent frames beyond its own; the encoder's
+            # output window keeps the leading ones, so the posterior never
+            # samples the others.
             latents = self.encoder(
                 self.unpack_pixels(value, interval, count),
                 window=(slice(None), slice(None), slice(0, extent)),
@@ -829,8 +830,8 @@ class VideoEncoder(nn.Module):
                         layout.dtype,
                         (
                             slice(
-                                window.start * rows_per_frame,
-                                window.stop * rows_per_frame,
+                                span.start * rows_per_frame,
+                                span.stop * rows_per_frame,
                             ),
                             *layout.local_slice[1:],
                         ),

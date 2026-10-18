@@ -23,7 +23,7 @@
 //! - `start_time_seconds` skips the first `floor(s * 24 + 0.5)` frames of a
 //!   reference video's 24 fps timeline and the first `floor(s * rate + 0.5)`
 //!   samples of its soundtrack;
-//! - a reference video needs at least 22 frames (one `17n + 5` VAE window)
+//! - a reference video needs at least 22 frames (one `17n + 5` VAE clip)
 //!   on its 24 fps timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
@@ -94,11 +94,12 @@ const BUCKETS: [[Canvas; 6]; 2] = [
 /// Short edge an image reference is encoded at, upscaling included.
 pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
 
-/// Pixel frames per video VAE window, and the overlap a window carries.
-const VAE_FRAMES_PER_CHUNK: u32 = 17;
-const VAE_LATENTS_PER_CHUNK: u32 = 5;
-/// Fewest 24 fps frames a reference video must keep: one VAE window.
-pub const MIN_REFERENCE_FRAMES: u32 = VAE_FRAMES_PER_CHUNK + VAE_LATENTS_PER_CHUNK;
+/// Pixel frames per video VAE clip, and the latent frames a clip encodes to
+/// (also the frames of the overlap a clip carries).
+const CLIP_FRAMES: u32 = 17;
+const CLIP_LATENTS: u32 = 5;
+/// Fewest 24 fps frames a reference video must keep: one VAE clip.
+pub const MIN_REFERENCE_FRAMES: u32 = CLIP_FRAMES + CLIP_LATENTS;
 
 /// Frame rate, in frames per second, of every MiniMax-H3 video.
 pub const VIDEO_FPS: u32 = 24;
@@ -250,7 +251,7 @@ pub enum RuleError {
     /// A soundtrack whose latent count exceeds `u32`.
     #[error("the audio track is too long")]
     AudioLength,
-    /// A reference video with fewer than one VAE window of frames after its
+    /// A reference video with fewer than one VAE clip of frames after its
     /// start offset.
     #[error(
         "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {VIDEO_FPS} fps after start_time_seconds, got {available}"
@@ -552,7 +553,7 @@ pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
 ///
 /// The requested frame count is `seconds * 24` rounded half to even
 /// ([`requested_frames`]), and the output extends it upward to the next
-/// complete native temporal window, a count of the form `17n + 5`. The
+/// complete VAE clip, a count of the form `17n + 5`. The
 /// output may therefore last longer than requested: 4 seconds yields 107
 /// frames and 15 seconds 362.
 ///
@@ -568,8 +569,8 @@ pub fn video_frame_count(seconds: f64, max_video_seconds: f64) -> Result<u32, Ru
     }
     let requested = requested_frames(seconds, VIDEO_FPS);
     // The frames up to the next count congruent to 5 modulo 17.
-    let window = VAE_FRAMES_PER_CHUNK;
-    Ok(requested + (window + VAE_LATENTS_PER_CHUNK - requested % window) % window)
+    let clip = CLIP_FRAMES;
+    Ok(requested + (clip + CLIP_LATENTS - requested % clip) % clip)
 }
 
 /// The requested output, as the request states it.
@@ -1043,17 +1044,16 @@ impl ConditionPlan {
     /// A still image is one unit. A video's `17n + 5` encoded frames are
     /// `n + 1` units of up to 17 frames: each complete one yields 5 latent
     /// frames and the last 2, the video encoder dropping the leading 3 of
-    /// its padded final window. An audio reference has none.
+    /// its padded final clip. An audio reference has none.
     pub fn latent_units(&self) -> Vec<u32> {
         match &self.prepared {
             Prepared::Keyframe(_) | Prepared::Image(_) => vec![self.video_rows],
             Prepared::Video(clip) => {
-                let windows = (clip.vae_frames - VAE_LATENTS_PER_CHUNK) / VAE_FRAMES_PER_CHUNK;
+                let complete = (clip.vae_frames - CLIP_LATENTS) / CLIP_FRAMES;
                 let rows_per_frame = rows_per_frame(clip.canvas);
-                let mut units = vec![VAE_LATENTS_PER_CHUNK * rows_per_frame; windows as usize];
+                let mut units = vec![CLIP_LATENTS * rows_per_frame; complete as usize];
                 units.push(
-                    (latent_frames(clip.vae_frames) - windows * VAE_LATENTS_PER_CHUNK)
-                        * rows_per_frame,
+                    (latent_frames(clip.vae_frames) - complete * CLIP_LATENTS) * rows_per_frame,
                 );
                 units
             }
@@ -1142,9 +1142,9 @@ impl RequestPlan {
 }
 
 /// The video latent frames of a `17n + 5` frame count: five per complete
-/// 17-frame window and two for the trailing 5-frame overlap.
+/// 17-frame clip and two for the trailing 5-frame overlap.
 pub const fn latent_frames(frames: u32) -> u32 {
-    (frames - VAE_LATENTS_PER_CHUNK) / VAE_FRAMES_PER_CHUNK * VAE_LATENTS_PER_CHUNK + 2
+    (frames - CLIP_LATENTS) / CLIP_FRAMES * CLIP_LATENTS + 2
 }
 
 /// The audio latents of a frame count: its duration at 40 latents per
@@ -1325,9 +1325,7 @@ pub fn video_reference(
     }
     let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
     // The VAE encodes the leading complete `17n + 5` frames.
-    let vae_frames = ((kept - VAE_LATENTS_PER_CHUNK) / VAE_FRAMES_PER_CHUNK).max(1)
-        * VAE_FRAMES_PER_CHUNK
-        + VAE_LATENTS_PER_CHUNK;
+    let vae_frames = ((kept - CLIP_LATENTS) / CLIP_FRAMES).max(1) * CLIP_FRAMES + CLIP_LATENTS;
     let soundtrack = media
         .soundtrack
         .as_ref()
@@ -2276,7 +2274,7 @@ pub(super) mod tests {
     }
 
     /// A video's encoded frames split into the video encoder's 17-frame
-    /// windows: each complete window yields five latent frames of rows and
+    /// clips: each complete clip yields five latent frames of rows and
     /// the padded last one two, which together are the condition's rows. A
     /// still image is one unit.
     #[test]
@@ -2359,7 +2357,7 @@ pub(super) mod tests {
     }
 
     /// Reference videos resample to 24 fps, honour the start offset, keep a
-    /// whole VAE window, and sample the reference's 2 fps vision blocks.
+    /// whole VAE clip, and sample the reference's 2 fps vision blocks.
     #[test]
     fn reference_videos_match_the_reference() {
         let fixture = fixture();

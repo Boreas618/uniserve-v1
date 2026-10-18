@@ -1,8 +1,8 @@
 """The forwards of the media decoders: :class:`DecoderRunner`.
 
 One runner serves one decoder module on one stream: a video decoder at one
-segment (the native frames and raster a media unit decodes to), an audio
-decoder at one track length, an image decoder of a bound component at
+clip output (the native frames and raster a media unit's clip decodes to),
+an audio decoder at one track length, an image decoder of a bound component at
 every image size (:meth:`DecoderRunner.bound`). The tensors of a forward are
 parameters of :meth:`DecoderRunner.decode`; the parameters depend on the
 decoder's capability class and are documented there. A video decoder's
@@ -85,7 +85,7 @@ def _first_frames(decoder: VideoDecoder, frames: int = 1) -> int:
     """
     while True:
         try:
-            decoder.frame_slices(frames)
+            decoder.clips(frames)
         except ValueError:
             frames += 1
             continue
@@ -102,8 +102,8 @@ class DecoderRunner:
         attention: The attention backend the model loaded with.
         scratch: The stream's shared work areas
             (``uniserve.bindings.workspace.Scratch``).
-        size: ``[frames, width, height]`` of a video decoder's segment, or
-            ``[latent_frames]`` of an audio decoder's track.
+        size: ``[frames, width, height]`` of a video decoder's clip output,
+            or ``[latent_frames]`` of an audio decoder's track.
     """
 
     # An image decoder and its caller's tensors (see :meth:`bound`).
@@ -127,11 +127,11 @@ class DecoderRunner:
         if isinstance(module, VideoDecoder):
             frames, width, height = extents
             self._decoder = module
-            self._segment = _video(frames, width, height)
+            self._output = _video(frames, width, height)
             self._context: ExecutionContext = execution_context(
                 module, int(stream), str(attention), scratch
             )
-            self._context.prepare(self._segment)
+            self._context.prepare(self._output)
             self._postprocessor = _require(loaded, VideoPostprocessor)
 
             # The canvas's RGB reconstruction constants and the shape of
@@ -149,9 +149,9 @@ class DecoderRunner:
 
             # The decoder input and the overlap the unit ring delivers are
             # read and written by the forward alone.
-            window = module.window_input(self._segment)
-            self._window = torch.empty(
-                window.shape, dtype=window.dtype, device=self._device
+            clip_input = module.clip_input(self._output)
+            self._input = torch.empty(
+                clip_input.shape, dtype=clip_input.dtype, device=self._device
             )
             self._exchange = torch.empty(
                 self._overlap_shape, dtype=overlap.dtype, device=self._device
@@ -165,10 +165,10 @@ class DecoderRunner:
             length, count = 0, 0
             while len(self._units) < 4 and count < 3:
                 length = _first_frames(module, length + 1)
-                shortest = video.Config(length, self._segment.frame)
-                slices = module.frame_slices(length)
-                count = len(slices)
-                for index, unit in enumerate(slices):
+                shortest = video.Config(length, self._output.frame)
+                clips = module.clips(length)
+                count = len(clips)
+                for index, unit in enumerate(clips):
                     kind = (index == 0, index == count - 1)
                     self._units.setdefault(kind, (shortest, unit))
             self._decode = self._decode_video
@@ -264,40 +264,41 @@ class DecoderRunner:
     def unit_frames(loaded, frames: int) -> list[int]:
         """Frames of each media unit of a video of ``frames`` frames."""
         decoder = _require(loaded, VideoDecoder)
-        return [
-            window.stop - window.start
-            for window in decoder.frame_slices(int(frames))
-        ]
+        return [clip.stop - clip.start for clip in decoder.clips(int(frames))]
 
     @staticmethod
-    def segment(
+    def clip_output(
         loaded, frames: int, width: int, height: int, unit: int
     ) -> list[int]:
-        """The ``[frames, width, height]`` segment one unit decodes to."""
+        """The ``[frames, width, height]`` clip output one unit decodes to.
+
+        Media unit ``unit`` decodes the video's clip of that index.
+        """
         decoder = _require(loaded, VideoDecoder)
         size = _video(frames, width, height)
-        window = decoder.frame_slices(size.num_frames)[int(unit)]
-        segment = decoder.segment(size, window)
+        clip = decoder.clips(size.num_frames)[int(unit)]
+        output = decoder.clip_output(size, clip)
         return [
-            int(segment.num_frames),
-            int(segment.frame.width),
-            int(segment.frame.height),
+            int(output.num_frames),
+            int(output.frame.width),
+            int(output.frame.height),
         ]
 
     @staticmethod
-    def window_rows(
+    def clip_rows(
         loaded, frames: int, width: int, height: int, unit: int
     ) -> list[int]:
         """The rows of a video's packed latent that one unit decodes.
 
         The video has ``frames`` frames at the raster; the result lists, in
         the order the decoder reads them, the rows of its complete packed
-        latent that the window of media unit ``unit`` holds.
+        latent that the decoder input of the clip of media unit ``unit``
+        holds.
         """
         decoder = _require(loaded, VideoDecoder)
         size = _video(frames, width, height)
-        window = decoder.frame_slices(size.num_frames)[int(unit)]
-        return [int(row) for row in decoder.window_rows(window, size)]
+        clip = decoder.clips(size.num_frames)[int(unit)]
+        return [int(row) for row in decoder.clip_rows(clip, size)]
 
     @staticmethod
     def overlap_elements(loaded, width: int, height: int) -> int:
@@ -346,7 +347,7 @@ class DecoderRunner:
         unit_count)`` and decodes and reconstructs one media unit at the
         runner's raster. ``latent`` holds the request's complete packed
         video latent in its leading rows; ``rows`` (int64) names the rows
-        of it that the unit's window reads (:meth:`window_rows`);
+        of it that the unit's clip input reads (:meth:`clip_rows`);
         ``overlap`` is the request's retained overlap (flat, the decoded
         tail its previous round left), which the round's first unit blends
         with and replaces; ``out`` the unit's ``[longest, height, width,
@@ -448,20 +449,20 @@ class DecoderRunner:
         unit_count: int,
     ) -> None:
         decoder, postprocessor = self._decoder, self._postprocessor
-        size, frames_slice = self._units[bool(first), bool(last)]
+        size, clip = self._units[bool(first), bool(last)]
         retained = overlap.reshape(-1)[: self._exchange.numel()].view(
             self._overlap_shape
         )
         with torch.inference_mode(), self._context.activate():
-            decoder.unpack_window(
-                latent.index_select(0, rows), self._segment, out=self._window
+            decoder.unpack_rows(
+                latent.index_select(0, rows), self._output, out=self._input
             )
             decoded = decoder.decode(
-                (self._window,), segments=(self._segment,)
+                (self._input,), clip_outputs=(self._output,)
             )[0]
             postprocessor(
-                (decoder.place(decoded, frames_slice, size),),
-                frames=(frames_slice,),
+                (decoder.place(decoded, clip, size),),
+                clips=(clip,),
                 sizes=(size,),
                 state={"video_overlap": retained},
                 constants=self._constants,

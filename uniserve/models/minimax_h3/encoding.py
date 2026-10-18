@@ -2,7 +2,7 @@
 
 ``VideoEncoder`` turns keyframes, reference images and reference videos into
 the normalized latent rows the denoiser conditions on; every 17-frame clip of
-a video is a temporal unit that one rank encodes on its own. ``AudioEncoder``
+a video is encoded on its own and may run on any rank. ``AudioEncoder``
 turns reference soundtracks into channel-major stereo latent rows. Both
 reproduce the conditioning recipe of the diffusers MiniMax-H3 pipeline.
 """
@@ -46,7 +46,7 @@ class VideoEncoder(BaseVideoEncoder):
     ``5 * n + 2`` latent frames. A single frame (an image or a keyframe) runs
     through the same network alone and yields one latent frame. Clips share
     no state, because causal padding restarts at every clip and
-    normalization never mixes frames, so every clip is one unit.
+    normalization never mixes frames, so every clip encodes on its own.
 
     The posterior is sampled with a host FP32 draw seeded with
     ``POSTERIOR_SEED`` over the condition's complete ``[1, channels, frames,
@@ -114,7 +114,7 @@ class VideoEncoder(BaseVideoEncoder):
             frame_size.width // self.config.spatial_compression,
         )
 
-    def frame_slices(self, num_frames: int) -> tuple[slice, ...]:
+    def clips(self, num_frames: int) -> tuple[slice, ...]:
         self._latent_frames(num_frames)
         clip = self.config.clip_length
         return tuple(
@@ -127,7 +127,7 @@ class VideoEncoder(BaseVideoEncoder):
         span = self.clip_latents
         return tuple(
             slice(index * span, min((index + 1) * span, total))
-            for index in range(len(self.frame_slices(num_frames)))
+            for index in range(len(self.clips(num_frames)))
         )
 
     def output_layout(self, size: video.Config) -> Mapping[str, OutputLayout]:

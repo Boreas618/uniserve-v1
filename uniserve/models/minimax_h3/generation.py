@@ -236,23 +236,25 @@ def _decode_video(
 ) -> torch.Tensor:
     """Decode and reconstruct a video's media units in order.
 
-    Each unit runs at its segment, whose runner the worker constructs once,
-    largest first. A unit reads its window of the packed latent and the
-    overlap the previous unit retained; this rank reconstructs every unit
-    alone, so each round holds one unit.
+    Each unit decodes one clip at its clip output, whose runner the worker
+    constructs once, largest first. A unit reads its clip's rows of the
+    packed latent and the overlap the previous unit retained; this rank
+    reconstructs every unit alone, so each round holds one unit.
     """
     loaded = runners.loaded
     width, height = canvas.width, canvas.height
     units = DecoderRunner.unit_frames(loaded, num_frames)
-    segments = [
-        tuple(DecoderRunner.segment(loaded, num_frames, width, height, unit))
+    outputs = [
+        tuple(
+            DecoderRunner.clip_output(loaded, num_frames, width, height, unit)
+        )
         for unit in range(len(units))
     ]
     decoders = {
-        segment: runners.open(DecoderRunner, _VIDEO_DECODER, segment)
-        for segment in sorted(
-            set(segments),
-            key=lambda segment: segment[0] * segment[1] * segment[2],
+        output: runners.open(DecoderRunner, _VIDEO_DECODER, output)
+        for output in sorted(
+            set(outputs),
+            key=lambda output: output[0] * output[1] * output[2],
             reverse=True,
         )
     }
@@ -267,14 +269,14 @@ def _decode_video(
         (max(units), height, width, 3), dtype=torch.uint8, device=device
     )
     frames = []
-    for unit, (count, segment) in enumerate(zip(units, segments, strict=True)):
-        window = torch.tensor(
-            DecoderRunner.window_rows(loaded, num_frames, width, height, unit),
+    for unit, (count, output) in enumerate(zip(units, outputs, strict=True)):
+        rows = torch.tensor(
+            DecoderRunner.clip_rows(loaded, num_frames, width, height, unit),
             dtype=torch.long,
             device=device,
         )
-        decoders[segment].decode(
-            latent, window, overlap, rgb, unit == 0, unit + 1 == len(units), 1
+        decoders[output].decode(
+            latent, rows, overlap, rgb, unit == 0, unit + 1 == len(units), 1
         )
         frames.append(rgb[:count].clone())
     return torch.cat(frames)

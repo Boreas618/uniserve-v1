@@ -238,10 +238,7 @@ class EncoderRunner:
         encoder = capability(loaded.module, VideoEncoder)
         if encoder is None:
             raise SetupError("the model has no VideoEncoder")
-        return [
-            window.stop - window.start
-            for window in encoder.frame_slices(int(frames))
-        ]
+        return [clip.stop - clip.start for clip in encoder.clips(int(frames))]
 
     @staticmethod
     def load_condition_kernels(loaded) -> None:
@@ -475,18 +472,19 @@ class EncoderRunner:
         *noise: torch.Tensor,
     ) -> None:
         encoder = self._module
-        values, windows, counts, draws = [], [], [], []
+        values, clips, counts, draws = [], [], [], []
         for index, (offset, frames, width, height, unit) in enumerate(
             _chunks(units, 5)
         ):
-            window = encoder.frame_slices(frames)[unit]
+            # Media unit ``unit`` encodes the condition's clip of that index.
+            clip = encoder.clips(frames)[unit]
             area = width * height
             values.append(
                 pixels[
-                    offset + window.start * area : offset + window.stop * area
-                ].view(window.stop - window.start, height, width, 3)
+                    offset + clip.start * area : offset + clip.stop * area
+                ].view(clip.stop - clip.start, height, width, 3)
             )
-            windows.append(window)
+            clips.append(clip)
             counts.append(frames)
             if noise:
                 shape = encoder.posterior_shape(
@@ -495,7 +493,7 @@ class EncoderRunner:
                 draws.append(noise[index].view(shape))
         encoded = encoder.encode(
             tuple(values),
-            frames=tuple(windows),
+            clips=tuple(clips),
             num_frames=tuple(counts),
             noise=tuple(draws) if noise else None,
         )

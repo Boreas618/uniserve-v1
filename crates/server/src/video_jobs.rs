@@ -57,7 +57,7 @@ pub(crate) struct VideoJob {
     pub seconds: f64,
     /// Duration in seconds of the frames the model generates, `num_frames`
     /// at the model's frame rate. It may exceed `seconds`, since the model
-    /// extends a duration to a complete native temporal window.
+    /// extends a duration to a complete VAE clip.
     pub actual_seconds: f64,
     /// Frames the model generates for the requested duration.
     pub num_frames: u32,
