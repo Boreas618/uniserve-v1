@@ -537,7 +537,7 @@ impl WorkerGroup {
             }
             let batch = &self.pending_batches[&batch_id].batch;
             if canonical.fatal
-                || canonical.code.as_deref() == Some("InvariantViolation")
+                || canonical.code == Some(uniserve_ipc::ErrorCode::InvariantViolation)
                 || batch
                     .commands
                     .iter()
