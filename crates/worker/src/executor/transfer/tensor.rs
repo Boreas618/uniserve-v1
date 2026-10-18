@@ -152,8 +152,11 @@ impl TransferBatch<'_> {
                     .iter()
                     .map(|&page| page as usize)
                     .collect();
+                // The slot's committed step, the latent pool's ledger, is the
+                // version the input names; the export carries it.
+                let step = pool.committed_step(slot);
                 let committed = TrajectoryVersion {
-                    step: i64::from(params.start_step),
+                    step,
                     generation: i64::from(input.generation),
                     units: i64::from(params.latent_units),
                     height: i64::from(params.height),
@@ -169,7 +172,9 @@ impl TransferBatch<'_> {
                     slot,
                     params,
                     bank,
-                    params.start_step,
+                    u32::try_from(step).map_err(|_| {
+                        Error::Invariant("a committed latent step exceeds u32".into())
+                    })?,
                     issue,
                 )?;
                 self.recorded.versions.push_back((index, version));

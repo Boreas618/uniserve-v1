@@ -105,7 +105,11 @@ struct Trajectory {
     index: usize,
     slot: usize,
     params: LatentParams,
+    /// Steps in the admitted schedule.
     steps: u32,
+    /// The slot's committed step, from the latent pool's ledger: the step a
+    /// denoising call advances, and the schedule's end for image decoding.
+    step: u32,
 }
 
 impl ImageBatch<'_> {
@@ -142,12 +146,16 @@ impl ImageBatch<'_> {
                 "latent allocation disagrees with the admitted image".into(),
             ));
         }
+        let slot = self.batch.calls[index].slot;
+        let step = u32::try_from(self.parts.latents()?.pool.committed_step(slot))
+            .map_err(|_| Error::Invariant("a committed latent step exceeds u32".into()))?;
         Ok((
             Trajectory {
                 index,
-                slot: self.batch.calls[index].slot,
+                slot,
                 params,
                 steps: u32::from(image.steps),
+                step,
             },
             image,
         ))
@@ -321,17 +329,9 @@ impl ImageBatch<'_> {
         let mut trajectories = Vec::new();
         for index in self.active() {
             let call = &self.plan.calls[index];
+            // The pool refuses a slot whose trajectory is still open
+            // (`require_initial`, and the commit's `validate_updates`).
             let (trajectory, image) = self.trajectory(index)?;
-            if trajectory.params.start_step != 0 || trajectory.params.step_count != 0 {
-                return Err(Error::Invalid(
-                    "latent preparation assigns no denoising steps".into(),
-                ));
-            }
-            if self.batch.calls[index].output.progress.flow_step != 0 {
-                return Err(Error::Invalid(
-                    "latent preparation requires a fresh trajectory".into(),
-                ));
-            }
             // The image's noise comes from the admitted image seed and the
             // index the engine assigned the image it initializes.
             let image_index = call
@@ -360,6 +360,7 @@ impl ImageBatch<'_> {
                     slot: value.slot,
                     params: value.params.clone(),
                     steps: value.steps,
+                    step: value.step,
                 })
                 .collect();
             self.place(&values, issue)?
@@ -399,7 +400,7 @@ impl ImageBatch<'_> {
             self.plans.push(planned);
             self.updates.push((
                 trajectory.index,
-                LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
+                LatentUpdate::for_call(trajectory.slot, call, &trajectory.params, 0)?,
             ));
         }
         Ok(ForwardStats::default())
@@ -606,11 +607,11 @@ impl ImageBatch<'_> {
                     ));
                 }
             }
-            // The engine plans every denoising call as the next step of its
-            // trajectory's schedule.
-            if params.step_count != 1 || params.start_step >= trajectory.steps {
+            // Each denoising call advances the slot's committed trajectory
+            // by the next step of its admitted schedule.
+            if trajectory.step >= trajectory.steps {
                 return Err(Error::Invalid(
-                    "a denoising call covers one step of the admitted schedule".into(),
+                    "denoising continues past the admitted schedule".into(),
                 ));
             }
             let conditioning = self.conditioning(index)?;
@@ -669,6 +670,7 @@ impl ImageBatch<'_> {
                     slot: value.slot,
                     params: value.params.clone(),
                     steps: value.steps,
+                    step: value.step,
                 })
                 .collect();
             self.place(&values, job.on(stream.as_ref()))?
@@ -685,7 +687,7 @@ impl ImageBatch<'_> {
                     .as_ref()
                     .map_or(0, |input| i64::from(input.generation));
                 let committed = TrajectoryVersion {
-                    step: i64::from(params.start_step),
+                    step: i64::from(trajectory.step),
                     generation,
                     units: i64::from(params.latent_units),
                     height: i64::from(params.height),
@@ -766,7 +768,7 @@ impl ImageBatch<'_> {
             let mut stepping: Stepping = Vec::new();
             let mut fills: Fills = Vec::new();
             for (position, (trajectory, _)) in trajectories.iter().enumerate() {
-                let step = trajectory.params.start_step;
+                let step = trajectory.step;
                 let key = plan.calls[trajectory.index].request_key;
                 let call_rows = descriptors
                     .get(&trajectory.index)
@@ -842,7 +844,7 @@ impl ImageBatch<'_> {
 
         // A finished trajectory's guidance prefixes retire with it.
         for (trajectory, _) in &trajectories {
-            if trajectory.params.start_step + 1 < trajectory.steps {
+            if trajectory.step + 1 < trajectory.steps {
                 continue;
             }
             let own = trajectory.slot as u32;
@@ -979,14 +981,19 @@ impl ImageBatch<'_> {
             self.publish_latent(
                 trajectory.index,
                 bank,
-                params.start_step + 1,
+                trajectory.step + 1,
                 params,
                 job.on(stream.as_ref()),
             )?;
             let call = &plan.calls[trajectory.index];
             self.updates.push((
                 trajectory.index,
-                LatentUpdate::for_call(trajectory.slot, call, &trajectory.params)?,
+                LatentUpdate::for_call(
+                    trajectory.slot,
+                    call,
+                    &trajectory.params,
+                    i64::from(trajectory.step),
+                )?,
             ));
         }
         Ok(())

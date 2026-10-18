@@ -90,7 +90,8 @@ impl Scheduler {
     ///
     /// A result is valid when it succeeded, names the submitted call, carries
     /// an artifact exactly when it is the final muxing call, and, for a
-    /// denoising step, completes its interval. The first valid result marks
+    /// denoising step, advances the trajectory's completed steps the worker
+    /// reports. The first valid result marks
     /// the request registered with its workers. An invalid result records a
     /// failure intent instead of advancing anything. A valid result of a
     /// request that has not already failed frees the products the call
@@ -100,7 +101,6 @@ impl Scheduler {
     pub(in crate::scheduler) fn process_diffusion_result(
         &mut self,
         call: Call,
-        latent: Option<LatentParams>,
         decode: Option<DecodeRange>,
         record: uniserve_ipc::RequestOutput,
         media: Option<Arc<SharedMedia>>,
@@ -119,10 +119,11 @@ impl Scheduler {
         } else {
             media.is_none()
         };
+        // The worker reports the steps it has completed; a denoising result
+        // that does not advance the trajectory would be scheduled again
+        // without end.
         let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
-            || latent
-                .as_ref()
-                .is_some_and(|interval| Denoising::completes(interval, record.num_completed_steps));
+            || record.num_completed_steps > state.denoising.completed();
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
             && record.call_id == call.call_id
@@ -183,15 +184,10 @@ impl Scheduler {
                         consumed_products.extend(state.condition_video_latents.iter().cloned());
                         consumed_products.extend(state.condition_audio_latents.iter().cloned());
                     }
-                    // `valid` requires a denoising result to complete its interval.
+                    // `valid` requires a denoising result to advance the trajectory.
                     CallKind::Media(MediaCall::Denoising) => {
-                        if let Some(interval) = latent.as_ref() {
-                            let accepted =
-                                state
-                                    .denoising
-                                    .accept(interval, record.num_completed_steps, None);
-                            debug_assert!(accepted, "a valid step completes its interval");
-                        }
+                        let accepted = state.denoising.accept(record.num_completed_steps, None);
+                        debug_assert!(accepted, "a valid step advances the trajectory");
                     }
                     CallKind::Media(MediaCall::VideoEncoding) => {
                         let Some(range) = decode.as_ref() else {
@@ -633,15 +629,12 @@ impl Scheduler {
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
-                let (image_cache, latent) = match input {
-                    InflightInput::Media { latent, decode } => {
-                        self.process_diffusion_result(call, latent, decode, record, media);
+                let image_cache = match input {
+                    InflightInput::Media { decode } => {
+                        self.process_diffusion_result(call, decode, record, media);
                         continue;
                     }
-                    InflightInput::Generation {
-                        image_cache,
-                        latent,
-                    } => (image_cache, latent),
+                    InflightInput::Generation { image_cache } => image_cache,
                 };
 
                 // A request already finishing with an error discards the
@@ -691,7 +684,6 @@ impl Scheduler {
                 if let Err(error) = generation::validate_generation_result(
                     &call,
                     image_cache,
-                    latent.as_ref(),
                     state,
                     &record,
                     self.config.canvas.as_ref(),
@@ -748,9 +740,9 @@ impl Scheduler {
                 }
 
                 let progress_result = if record.status == CallStatus::Ok {
-                    self.running.get_mut(&id).map(|state| {
-                        state.process_generation_result(&call, latent.as_ref(), &record)
-                    })
+                    self.running
+                        .get_mut(&id)
+                        .map(|state| state.process_generation_result(&call, &record))
                 } else {
                     None
                 };

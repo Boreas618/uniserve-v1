@@ -94,8 +94,8 @@ use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
 use uniserve_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId,
     CacheUnitAllocation, Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange,
-    DimBound, ForwardBatch, ForwardStats, LatentParams, NewRequest, RequestKey, SamplingState,
-    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
+    DimBound, ForwardBatch, ForwardStats, NewRequest, RequestKey, SamplingState, ShapeBound,
+    TensorRef, TimingCounters, WorkerInfo,
 };
 
 use crate::executor::{RankBuffer, WorkerFailure};

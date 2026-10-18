@@ -10,7 +10,7 @@ use uniserve_ipc::Batch as BatchPlan;
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
 use crate::executor::video::MediaBatch;
-use crate::executor::video::{Parts, latent_params, product_name, stream_of};
+use crate::executor::video::{Parts, product_name, stream_of};
 use crate::lane::Job;
 use crate::storage::memory::StorageView;
 use crate::{Error, Result};
@@ -27,7 +27,6 @@ pub(crate) fn prepare(
     job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
-    let params = latent_params(plan, call)?;
     let (id, seed, conditioned, size) = {
         let request = parts.video.request(slot, call.request_key)?;
         let id = request
@@ -74,7 +73,9 @@ pub(crate) fn prepare(
     denoiser
         .runner
         .prepare_latents(id, slot, &size, seed, job)?;
-    let update = denoiser.runner.initialize(id, slot, call, params, job)?;
+    let update = denoiser
+        .runner
+        .initialize(id, slot, call, size.canvas, job)?;
     if let Some(features) = features {
         let value = features.value();
         let count = u64::from(size.tokens);
@@ -209,12 +210,13 @@ pub(crate) fn denoise(
     job: &Job,
 ) -> Result<()> {
     let call = &plan.calls[index];
-    let params = latent_params(plan, call)?;
-    let id = parts
-        .video
-        .request(slot, call.request_key)?
-        .layout
-        .ok_or_else(|| Error::Invariant("a denoising request has no layout".into()))?;
+    let (id, canvas) = {
+        let request = parts.video.request(slot, call.request_key)?;
+        let id = request
+            .layout
+            .ok_or_else(|| Error::Invariant("a denoising request has no layout".into()))?;
+        (id, request.canvas)
+    };
     let num_steps = parts.video.model.facts.num_steps;
     let names: Vec<String> = call
         .outputs
@@ -226,16 +228,26 @@ pub(crate) fn denoise(
         .video
         .as_mut()
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-    let (update, mode) = denoiser.runner.denoise(id, slot, call, params, job)?;
+    // Each call advances the slot's committed trajectory, the latent pool's
+    // ledger, by the next step of the checkpoint's fixed schedule.
+    let step = denoiser.runner.committed_step(slot)?;
+    if step >= i64::from(num_steps) {
+        return Err(Error::Invalid(
+            "denoising continues past the fixed schedule".into(),
+        ));
+    }
+    // Only the call that completes denoising declares products: the final
+    // samples its step publishes.
+    if !call.outputs.is_empty() && step + 1 != i64::from(num_steps) {
+        return Err(Error::Invalid(
+            "final latent products require completed denoising".into(),
+        ));
+    }
+    let (update, mode) = denoiser.runner.denoise(id, slot, call, canvas, job)?;
     batch.record(mode);
     batch.batch.calls[index].forward.latent = Some(update);
     if call.outputs.is_empty() {
         return Ok(());
-    }
-    if params.start_step + params.step_count != num_steps {
-        return Err(Error::Invalid(
-            "final latent products require completed denoising".into(),
-        ));
     }
     let samples = denoiser.runner.final_samples(id)?;
     let rows = denoiser.runner.sample_rows(id)?;

@@ -160,7 +160,6 @@ impl Scheduler {
             } else {
                 state.cache_computed_len.max(cache_visible_len)
             },
-            flow_step: self.num_scheduled_denoise_steps(id)?,
         })
     }
 
@@ -185,7 +184,8 @@ impl Scheduler {
             })
     }
 
-    /// Last denoising step covered by submitted intervals, without accepting them.
+    /// Denoising steps covered once the submitted calls complete, without
+    /// accepting them.
     pub(in crate::scheduler) fn num_scheduled_denoise_steps(&self, id: RequestId) -> Option<u32> {
         let state = self.running.get(&id)?;
         Some(self.scheduled_steps(id, &state.denoising))

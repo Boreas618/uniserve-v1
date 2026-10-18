@@ -21,7 +21,7 @@
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::prefix_cache::{BlockTable, CacheAllocation};
 
-use uniserve_ipc::{ForwardMode, LatentParams, MediaCall, TransferMode};
+use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use uniserve_core::{
     CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
@@ -253,12 +253,11 @@ impl RequestState {
     ///
     /// Returns an error, before changing any state, for a call id with batch
     /// zero, a latent call without a latent product, or a denoising result
-    /// that has no submitted interval or that `Denoising::accept` rejects. The
-    /// caller then finishes the request with an error.
+    /// that `Denoising::accept` rejects. The caller then finishes the request
+    /// with an error.
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        latent: Option<&LatentParams>,
         record: &RequestOutput,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
@@ -398,13 +397,9 @@ impl RequestState {
                     self.denoising.open(call.latent_output.clone());
                     self.phase = GenerationPhase::Denoising;
                 } else {
-                    let accepted = latent.is_some_and(|interval| {
-                        self.denoising.accept(
-                            interval,
-                            record.num_completed_steps,
-                            call.latent_output.clone(),
-                        )
-                    });
+                    let accepted = self
+                        .denoising
+                        .accept(record.num_completed_steps, call.latent_output.clone());
                     if !accepted {
                         return Err(GenerationResultError::Progress {
                             detail: "denoise_step_mismatch",
@@ -986,7 +981,7 @@ pub(super) fn register_call(
 
 /// Validates a result against submitted inputs and immutable request limits.
 ///
-/// `image_cache` and `latent` are the inputs frozen when the call was submitted
+/// `image_cache` is the input frozen when the call was submitted
 /// (`InflightInput::Generation`). A predicated result is valid only when the
 /// call carried a predicate and the result reports no tokens and no products.
 /// `canvas` is the deployment's block-diffusion sampling, which bounds a
@@ -995,7 +990,6 @@ pub(super) fn register_call(
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_cache: Option<(u32, Option<u32>)>,
-    latent: Option<&LatentParams>,
     state: &RequestState,
     record: &RequestOutput,
     canvas: Option<&CanvasSampling>,
@@ -1027,18 +1021,6 @@ pub(crate) fn validate_generation_result(
         return Err(GenerationResultError::Status {
             detail: "call_failed",
         });
-    }
-
-    // Denoising must end exactly at the end of its submitted interval.
-    if call.code == CallKind::Media(MediaCall::Denoising) {
-        let interval = latent.ok_or(GenerationResultError::Progress {
-            detail: "denoise_input_step_missing",
-        })?;
-        if !super::Denoising::completes(interval, record.num_completed_steps) {
-            return Err(GenerationResultError::Progress {
-                detail: "denoise_step_mismatch",
-            });
-        }
     }
 
     // A readout reports one finite log-probability per declared candidate,
