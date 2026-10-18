@@ -14,12 +14,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uniserve_ipc::{DType, DimBound, MediaCall, OutputInfo, ShapeBound};
 
-use super::plan::{LatentPlan, MediaFacts, product_bytes};
+use super::plan::{MediaFacts, product_bytes};
 use crate::config::WorkerConfig;
 use crate::host::mux::encoded_unit_bytes;
 use crate::request::video::MediaPlan;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::{SamplePages, StateEnvelope};
+use crate::storage::LatentPlan;
 use crate::{Error, Result};
 
 /// What a rank's video components need beside its products.
@@ -217,6 +218,20 @@ pub(crate) fn plan(
 }
 
 impl VideoCapacity {
+    /// The sample pool of `slots` request slots: one float32 value per unit
+    /// in the denoiser's pages, with no step workspace. Capacity planning
+    /// sizes it and the denoising rank allocates it from this one plan.
+    pub(crate) fn latent(&self, slots: usize) -> LatentPlan {
+        LatentPlan {
+            request_pool_size: slots,
+            num_pages: self.pages.pool_pages(slots as u64) as usize,
+            page_units: self.pages.page_units as usize,
+            latent_width: 1,
+            dtype: crate::ffi::DType::F32,
+            with_workspace: false,
+        }
+    }
+
     /// The rank's per-request facts at `slots` request slots.
     pub(crate) fn facts(
         &self,
@@ -244,14 +259,7 @@ impl VideoCapacity {
                 + self.overlap_bytes,
             local_product_bytes,
             product_bytes,
-            latent: self.sampling.then(|| LatentPlan {
-                request_pool_size: slots,
-                num_pages: self.pages.pool_pages(slots as u64) as usize,
-                page_units: self.pages.page_units as usize,
-                latent_width: 1,
-                element_bytes: 4,
-                with_workspace: false,
-            }),
+            latent: self.sampling.then(|| self.latent(slots)),
             stores_latent: self.envelope.is_some(),
             artifact_import_regions,
         })

@@ -17,7 +17,8 @@ use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
 use uniserve_ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, MemoryKind};
 use uniserve_worker::storage::{
-    CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentStorage, Memory, StorageView,
+    CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentPlan, LatentStorage, Memory,
+    StorageView,
 };
 use uniserve_worker::transfer::exports::{self, Location};
 use uniserve_worker::transfer::{
@@ -819,12 +820,14 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
 
     // One page of 768 units of 2048 f32 elements, also 6 MiB.
     let latents = LatentStorage::allocate(
-        1,
-        2,
-        768,
-        2048,
-        DType::F32,
-        false,
+        &LatentPlan {
+            request_pool_size: 1,
+            num_pages: 2,
+            page_units: 768,
+            latent_width: 2048,
+            dtype: DType::F32,
+            with_workspace: false,
+        },
         Some(DEVICE),
         Some(&stream),
     )?;

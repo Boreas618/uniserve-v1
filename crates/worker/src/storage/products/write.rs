@@ -185,10 +185,10 @@ impl ProductStore {
                     ));
                 }
             }
-            native.push((id, *device));
+            native.push(id);
             candidates.push((reference, *device, allocation));
         }
-        state.validate_bindings(&native, feature)?;
+        state.validate_bindings(&native)?;
 
         let mut buffers = Vec::new();
         let result = (|| -> Result<()> {

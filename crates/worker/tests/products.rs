@@ -55,7 +55,6 @@ fn store(
     relay_depth: usize,
 ) -> Result<ProductStore> {
     ProductStore::new(
-        4,
         1024,
         1024,
         vec![CPU],

@@ -202,7 +202,6 @@ fn host_rank(capacity: usize) -> Result<Executor> {
     let mut executor = rank(capacity, false)?;
     let events = EventPool::new();
     let tensors = ProductStore::new(
-        8,
         1024,
         1024,
         vec![MemoryKind::Host],

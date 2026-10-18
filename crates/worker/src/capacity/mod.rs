@@ -129,8 +129,9 @@ pub(crate) fn request_tensor_window(depth: usize, slots: usize) -> Result<usize>
 /// Storage and concurrency bounds consumed by the worker's physical owners.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArenaCapacity {
-    pub tensor_store: usize,
-    /// Device bytes the product store's relay arenas may take.
+    /// Device bytes the product store's relay arenas may take. The store's
+    /// other products lie in the scheduler-placed buffer pool, which bounds
+    /// them.
     pub device_product_bytes: u64,
     /// The rank's transfer byte budget: bytes every export and read holds
     /// until it retires, whether or not it occupies storage of its own.
@@ -166,9 +167,6 @@ pub(crate) struct TokenBounds {
     pub calls: usize,
     /// Request slots.
     pub requests: usize,
-    /// Scalar backing of one product slot, from the numerical store's dtype
-    /// schema.
-    pub scalar_bytes: u64,
     /// Bytes one read of a product carries, at least one.
     pub transfer_bytes_per_read: u64,
     /// Whether the rank exports device products over CUDA VMM.
@@ -187,9 +185,6 @@ pub(crate) struct RequestBounds {
     /// Ranks of the deployment, every one of which may read this rank's
     /// products.
     pub ranks: usize,
-    /// Scalar backing of one product slot, from the numerical store's dtype
-    /// schema.
-    pub scalar_bytes: u64,
     /// Bytes of the products one request retains on this rank.
     pub product_bytes_per_request: u64,
     /// Artifact imports one request may have in flight.
@@ -199,25 +194,22 @@ pub(crate) struct RequestBounds {
 }
 
 impl ArenaCapacity {
-    /// Tensor storage keeps six products per call and one batch beyond the
-    /// submitted window until its last reader retires.
+    /// The arena of a token worker: relay lanes for every unresolved call
+    /// of every request slot, and one batch's reads per transfer ticket.
     pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
         let TokenBounds {
             depth,
             calls,
             requests,
-            scalar_bytes,
             transfer_bytes_per_read,
             device_exports,
         } = *bounds;
         let window = call_window(depth, calls)?;
         let slots = depth * calls;
-        let tensor_store = 6 * (slots + calls);
         let transfer_tickets = slots.min(256);
-        let device_product_bytes = product_bytes(tensor_store, requests, window, scalar_bytes);
+        let device_product_bytes = relay_bytes(requests, window);
 
         Ok(Self {
-            tensor_store,
             device_product_bytes,
             transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
             transfer_tickets,
@@ -238,18 +230,15 @@ impl ArenaCapacity {
             calls,
             requests,
             ranks,
-            scalar_bytes,
             product_bytes_per_request,
             concurrent_imports,
             device_exports,
         } = *bounds;
         let window = request_tensor_window(depth, requests)?;
         let slots = (depth * calls).max(requests * concurrent_imports);
-        let tensor_store = 6 * (slots + calls);
-        let device_product_bytes = product_bytes(tensor_store, requests, window, scalar_bytes);
+        let device_product_bytes = relay_bytes(requests, window);
 
         Ok(Self {
-            tensor_store,
             device_product_bytes,
             transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
             transfer_tickets: ranks.max(slots.min(256)),
@@ -269,32 +258,13 @@ impl ArenaCapacity {
     }
 }
 
-fn product_bytes(products: usize, requests: usize, window: usize, scalar_bytes: u64) -> u64 {
-    // One byte per generic value, plus the store's scalar banks. Each request
-    // relay row holds two int64 values and two flags, with a retirement lane
-    // beyond the unresolved window and slot zero reserved for padding.
-    products as u64 * (scalar_bytes + 1) + ((requests + 1) * (window + 1) * 18) as u64
-}
-
-/// Device storage for two latent banks, an optional step workspace and a
-/// float32 timestep for each one-based request slot.
-pub(crate) fn latent_pool_bytes(
-    requests: usize,
-    pages: usize,
-    page_units: usize,
-    width: usize,
-    element_bytes: usize,
-    with_workspace: bool,
-) -> Result<u64> {
-    if requests == 0 || pages < 2 || page_units == 0 || width == 0 || element_bytes == 0 {
-        return Err(Error::Invalid("latent pool dimensions are invalid".into()));
-    }
-
-    let page_bytes = page_units as u64 * width as u64 * element_bytes as u64;
-    let workspace = if with_workspace {
-        (pages - 1) as u64 * page_bytes
-    } else {
-        0
-    };
-    Ok(2 * pages as u64 * page_bytes + workspace + (requests + 1) as u64 * 4)
+/// Bytes of the product store's relay arenas: one lane per unresolved call
+/// and one retirement lane, for every request slot and the padding slot
+/// zero. Arenas are allocated per dtype and field of the scalar outputs
+/// calls declare, which the engine states with each call, so a rank cannot
+/// derive them before serving: the budget is 18 bytes per lane, two int64
+/// values and two one-byte flags, the scalar outputs of the calls the
+/// engine forms.
+fn relay_bytes(requests: usize, window: usize) -> u64 {
+    ((requests + 1) * (window + 1) * 18) as u64
 }

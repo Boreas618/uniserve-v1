@@ -18,7 +18,7 @@
 mod memory;
 mod pages;
 
-pub use memory::LatentStorage;
+pub use memory::{LatentPlan, LatentStorage};
 pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
 
 use std::collections::HashSet;
