@@ -37,12 +37,10 @@ use crate::worker::LoadedModel;
 use crate::worker::RankStorage;
 use crate::{Error, Result};
 
-/// Guidance branches one image evaluates at most per step.
-const MAX_BRANCHES: usize = 3;
-
 /// The configured denoising steps that fit the denoiser's columns and the
 /// latent pool, largest footprint first: every configured image size and
-/// batch size with one to three guidance branches, keeping those within
+/// batch size with one to the denoiser's most guidance branches
+/// (`ImageDenoiserLayout::guidance_branches`), keeping those within
 /// the batch's calls, the evaluation's tokens, one image's sequence and the
 /// pool's units.
 fn flow_shapes(
@@ -62,7 +60,7 @@ fn flow_shapes(
             continue;
         };
         for &images in &config.flow_graph_batch_sizes {
-            for branches in 1..=MAX_BRANCHES {
+            for branches in 1..=layout.guidance_branches as usize {
                 if images > 0
                     && images <= max_calls
                     && images * length as usize * branches <= tokens
@@ -141,7 +139,7 @@ pub(crate) fn flow_tokens(layout: &ImageDenoiserLayout, config: &WorkerConfig) -
     }
     // Denoising and prompt invocations share one token extent: a batch's
     // tokens beside one image's sequence.
-    (tokens * MAX_BRANCHES).max(
+    (tokens * layout.guidance_branches as usize).max(
         config.max_batch_tokens + (layout.max_sequence_tokens + layout.framing_tokens) as usize,
     )
 }
@@ -212,7 +210,7 @@ impl ImageOwners {
             * layout.downsample;
         let captured = self.denoisers.flow_shapes();
         let mut warmups = Vec::new();
-        for branches in 1..=MAX_BRANCHES {
+        for branches in 1..=layout.guidance_branches as usize {
             if branches > 1 && request_slots < 2 {
                 continue;
             }
@@ -352,7 +350,7 @@ impl ImageOwners {
                 let tokens = flow_tokens(&layout, config);
                 let width = bounds.widths.iter().copied().max().unwrap_or(1).max(1) as usize;
                 let capacity = DiffusionCapacity {
-                    rows: max_calls * MAX_BRANCHES,
+                    rows: max_calls * layout.guidance_branches as usize,
                     tokens,
                     units: tokens,
                     tables: bounds.tables.len(),
@@ -591,7 +589,7 @@ pub(crate) fn reserved_bytes(
     };
     let calls = config.max_batch_calls.min(request_slots.max(1)).max(1);
     let tokens = flow_tokens(layout, config) as u64;
-    let rows = (calls * MAX_BRANCHES) as u64;
+    let rows = (calls * layout.guidance_branches as usize) as u64;
     let predictions = tokens * u64::from(layout.width()) * layout.prediction_dtype.bytes() as u64;
     let columns = tokens * (3 * 8 + 8 * 4) + rows * 64;
     let staging = (max_image_pixels(Some(layout)) * 3 * calls) as u64;

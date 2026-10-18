@@ -61,6 +61,9 @@ pub(crate) struct ImageDenoiserLayout {
     /// the image, and the request's logical position advances by it after
     /// the image (`ImageDenoiser.rope_advance`).
     pub rope_advance: u32,
+    /// The most guidance branches one denoising step evaluates; the rank
+    /// prepares every branch count from one to it.
+    pub guidance_branches: u32,
     pub prediction_dtype: DType,
 }
 
@@ -237,6 +240,7 @@ impl ImageModel {
                 framing_tokens,
                 max_sequence_tokens,
                 rope_advance,
+                guidance_branches,
             ] => {
                 let extent = |value: i64| -> Result<u32> {
                     u32::try_from(value).map_err(|_| {
@@ -254,11 +258,17 @@ impl ImageModel {
                     image_unconditional: BranchSource::parse(unconditional.as_str())?,
                     max_sequence_tokens: extent(max_sequence_tokens)?,
                     rope_advance: extent(rope_advance)?,
+                    guidance_branches: extent(guidance_branches)?,
                     prediction_dtype: dtype(&prediction, prediction.call_as(&model)?)?,
                 };
                 if layout.downsample == 0 || !matches!(layout.framing_tokens, 0 | 2) {
                     return Err(Error::Interface(
                         "an image denoiser frames an image with zero or two tokens".into(),
+                    ));
+                }
+                if layout.guidance_branches == 0 {
+                    return Err(Error::Interface(
+                        "an image denoiser evaluates at least one guidance branch".into(),
                     ));
                 }
                 Some(layout)
@@ -434,6 +444,7 @@ mod tests {
             image_unconditional: BranchSource::Conditioning,
             max_sequence_tokens: 4096,
             rope_advance: 2,
+            guidance_branches: 3,
             prediction_dtype: DType::BF16,
         }
     }
