@@ -53,7 +53,7 @@ if triton is not None:
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
         rows,
         tokens,
         cell_programs,
@@ -198,7 +198,7 @@ if triton is not None:
                 -1,
             )
             tl.store(
-                write_indices + table * write_stride + token,
+                slot_mapping + table * write_stride + token,
                 address,
                 mask=live,
             )
@@ -219,7 +219,7 @@ def gather_request_rows(
     query_lengths: torch.Tensor,
     query_offsets: torch.Tensor,
     prefix_offsets: torch.Tensor,
-    write_indices: torch.Tensor,
+    slot_mapping: torch.Tensor,
 ) -> None:
     """Gather every table's columns of ``rows`` request rows.
 
@@ -234,7 +234,7 @@ def gather_request_rows(
     past a row's selected pages) from the first page each row selects (page
     zero, or for a windowed table ``max(0, prefix - window) //
     page_tokens``) into ``start_pages[t]``, and each token's append address
-    into ``write_indices[t]`` (-1 for rows that do not write); and, shared by
+    into ``slot_mapping[t]`` (-1 for rows that do not write); and, shared by
     all tables, the lengths and offsets. ``request_unit_tables[t, slot]``
     holds the slot's units from its installed start page
     ``request_start_pages[group, slot]`` on.
@@ -259,7 +259,7 @@ def gather_request_rows(
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
     )
     device = columns.device
     if any(value.device != device for value in tensors):
@@ -274,10 +274,10 @@ def gather_request_rows(
         or token_count < 1
         or int(width) < 1
         or int(width) > int(block_tables.shape[2])
-        or token_count > int(write_indices.shape[1])
+        or token_count > int(slot_mapping.shape[1])
         or int(columns.numel())
         < row_columns_size(
-            int(block_tables.shape[1]), tables, int(write_indices.shape[1])
+            int(block_tables.shape[1]), tables, int(slot_mapping.shape[1])
         )
     ):
         raise ValueError("request rows exceed their buffer capacity")
@@ -294,7 +294,7 @@ def gather_request_rows(
             query_lengths,
             query_offsets,
             prefix_offsets,
-            write_indices,
+            slot_mapping,
             rows=count,
             tokens=token_count,
             width=int(width),
@@ -320,7 +320,7 @@ def gather_request_rows(
         block_table_stride=int(block_tables.stride(0)),
         block_table_row_stride=int(block_tables.stride(1)),
         start_page_stride=int(start_pages.stride(0)),
-        write_stride=int(write_indices.stride(0)),
+        write_stride=int(slot_mapping.stride(0)),
         row_block=triton.next_power_of_2(stride),
         block=block,
         num_warps=4,
@@ -338,7 +338,7 @@ def _gather_rows(
     query_lengths,
     query_offsets,
     prefix_offsets,
-    write_indices,
+    slot_mapping,
     *,
     rows,
     tokens,
@@ -387,7 +387,7 @@ def _gather_rows(
         unit = request_unit_tables[
             table, slots[owner], column.clamp(0, request_width - 1)
         ].to(torch.int64)
-        write_indices[table, :tokens] = torch.where(
+        slot_mapping[table, :tokens] = torch.where(
             valid & (unit >= 0),
             unit * page_tokens + position % page_tokens,
             torch.full_like(unit, -1),
@@ -432,7 +432,7 @@ if triton is not None:
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
         unit_table_stride: tl.constexpr,
         unit_row_stride: tl.constexpr,
         request_width: tl.constexpr,
@@ -453,7 +453,7 @@ if triton is not None:
         """Gather one table's cells and per-row decode scalars.
 
         Axis 1 of the grid selects the numerical table. On it, program 0
-        writes the table's start pages and write addresses, and on table 0
+        writes the table's start pages and slot mappings, and on table 0
         also every shared per-row scalar column; the other programs copy the
         table's cells. Their outputs are disjoint and no program stores to
         an input, so no global barrier is needed. A row is live when its
@@ -508,7 +508,7 @@ if triton is not None:
                 -1,
             )
             tl.store(
-                write_indices + table * write_stride + offsets,
+                slot_mapping + table * write_stride + offsets,
                 writes,
                 mask=scalar_mask,
             )
@@ -614,7 +614,7 @@ def _gather_decode_inputs(
     query_lengths,
     query_offsets,
     prefix_offsets,
-    write_indices,
+    slot_mapping,
     *,
     columns,
 ):
@@ -643,7 +643,7 @@ def _gather_decode_inputs(
         unit = request_unit_tables[
             table, slots, column.clamp(0, request_width - 1)
         ].to(torch.int64)
-        write_indices[table, :rows] = torch.where(
+        slot_mapping[table, :rows] = torch.where(
             appendable & (unit >= 0),
             unit * page_tokens + cache % page_tokens,
             -1,
@@ -683,7 +683,7 @@ def gather_request_decode_inputs(
     query_lengths: torch.Tensor,
     query_offsets: torch.Tensor,
     prefix_offsets: torch.Tensor,
-    write_indices: torch.Tensor,
+    slot_mapping: torch.Tensor,
     columns: int,
 ) -> None:
     """Gather request state into fixed-capacity decode buffers in place.
@@ -697,7 +697,7 @@ def gather_request_decode_inputs(
     ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
     units from their first selected page into ``block_tables[t]``, that page
     into ``start_pages[t]`` and the append address into
-    ``write_indices[t]``; and, shared by all tables, next-token ids and
+    ``slot_mapping[t]``; and, shared by all tables, next-token ids and
     position axes, cache/query lengths and offsets. A row's first selected
     page of a windowed table is the first page its window reaches,
     ``max(0, cache - window) // page_tokens``; of a full table, page zero.
@@ -712,7 +712,7 @@ def gather_request_decode_inputs(
     table and slot strides of ``request_unit_tables``, the group stride of
     ``request_start_pages``, the first-axis strides of ``request_tokens`` and
     ``request_positions``, the table and row strides of ``block_tables``, the
-    table strides of ``start_pages`` and ``write_indices``, and the axis
+    table strides of ``start_pages`` and ``slot_mapping``, and the axis
     stride of ``positions``; every other dimension is indexed with unit
     stride, which is checked for the columns of ``positions`` and the unit
     tables.
@@ -742,7 +742,7 @@ def gather_request_decode_inputs(
         query_lengths,
         query_offsets,
         prefix_offsets,
-        write_indices,
+        slot_mapping,
     )
     device = request_pool_indices.device
     if any(value.device != device for value in tensors):
@@ -757,7 +757,7 @@ def gather_request_decode_inputs(
         or request_start_pages.ndim != 2
         or block_tables.ndim != 3
         or start_pages.ndim != 2
-        or write_indices.ndim != 2
+        or slot_mapping.ndim != 2
     ):
         raise ValueError("request-indexed decode tables have the wrong rank")
 
@@ -773,8 +773,8 @@ def gather_request_decode_inputs(
         or block_tables.stride(2) != 1
         or int(start_pages.shape[0]) != tables
         or int(start_pages.shape[1]) < max_rows
-        or int(write_indices.shape[0]) != tables
-        or int(write_indices.shape[1]) < max_rows
+        or int(slot_mapping.shape[0]) != tables
+        or int(slot_mapping.shape[1]) < max_rows
         or int(columns) < 1
     ):
         raise ValueError(
@@ -821,7 +821,7 @@ def gather_request_decode_inputs(
         block_table_stride=int(block_tables.stride(0)),
         block_table_row_stride=int(block_tables.stride(1)),
         start_page_stride=int(start_pages.stride(0)),
-        write_stride=int(write_indices.stride(0)),
+        write_stride=int(slot_mapping.stride(0)),
         max_rows=max_rows,
         row_block=triton.next_power_of_2(max_rows),
         columns=int(columns),
