@@ -37,7 +37,6 @@ def _kind(name: str) -> type[KindError]:
 
 UnsupportedSetup = _kind("UnsupportedSetup")
 OutOfMemory = _kind("OutOfMemory")
-GraphError = _kind("GraphError")
 UnsupportedCall = _kind("UnsupportedCall")
 InputError = _kind("InputError")
 InvariantViolation = _kind("InvariantViolation")
@@ -56,8 +55,6 @@ def kind(error: BaseException) -> type[KindError]:
         "outofmemory" in name.lower() for name in names
     ):
         return OutOfMemory
-    if "CUDAGraphError" in names:
-        return GraphError
     if isinstance(error, NotImplementedError):
         return UnsupportedCall
     if isinstance(error, (KeyError, IndexError, TypeError, ValueError)):

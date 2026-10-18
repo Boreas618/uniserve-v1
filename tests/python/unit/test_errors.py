@@ -9,16 +9,11 @@ from uniserve import errors
 pytestmark = pytest.mark.unit
 
 
-class CUDAGraphError(RuntimeError):
-    pass
-
-
 @pytest.mark.parametrize(
     ("error", "kind"),
     [
         (errors.SetupError("placement"), "UnsupportedSetup"),
         (torch.OutOfMemoryError("CUDA out of memory"), "OutOfMemory"),
-        (CUDAGraphError("bucket"), "GraphError"),
         (NotImplementedError("call"), "UnsupportedCall"),
         (KeyError("slot"), "InputError"),
         (ValueError("shape"), "InputError"),
