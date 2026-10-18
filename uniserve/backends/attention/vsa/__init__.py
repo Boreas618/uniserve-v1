@@ -8,6 +8,7 @@ from importlib import import_module
 
 import torch
 
+from uniserve.errors import SetupError
 from uniserve.nn.attention.vsa.inputs import BlockInput, Pattern
 
 from ._rows import _Rows
@@ -237,8 +238,12 @@ def resolve(backend, *, device, tile):
     the device for the first available provider of ``tile``-row tiles. A
     provider module declares the tile sizes it serves in ``TILES``.
 
+    This is the one refusal of a tile no installed kernel serves: a
+    serving rank meets it when it prepares the execution context of a
+    sparse layer at startup, as the deployment's setup error.
+
     Raises:
-        RuntimeError: No installed provider (or not the named one) serves
+        SetupError: No installed provider (or not the named one) serves
             ``tile``-row tiles on ``device``. Only SM100 (data-center
             Blackwell) and SM120 devices serve 128-row tiles.
         ValueError: An unknown backend name.
@@ -252,7 +257,7 @@ def resolve(backend, *, device, tile):
             candidate = import_module(f"{__name__}.{name}")
             if cuda and tile in candidate.TILES and candidate.available(device):
                 return candidate.Backend()
-        raise RuntimeError(
+        raise SetupError(
             f"no installed VSA backend serves {tile}-row tiles on {device}"
             + (
                 "; 128-row tiles require an SM100 (data-center Blackwell) "
@@ -266,7 +271,7 @@ def resolve(backend, *, device, tile):
         raise ValueError(f"unknown VSA backend {backend!r}")
     module = import_module(f"{__name__}.{backend}")
     if not cuda or tile not in module.TILES or not module.available(device):
-        raise RuntimeError(
+        raise SetupError(
             f"VSA backend {backend!r} does not serve {tile}-row tiles on "
             f"{device}"
         )
