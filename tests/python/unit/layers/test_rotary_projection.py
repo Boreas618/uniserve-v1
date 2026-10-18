@@ -67,6 +67,7 @@ def test_partial_qk_rotation_normalizes_the_complete_head_in_place(device):
             eps=1e-5,
             axis_dims=(128,),
             out=(query, key),
+            rounding=Rounding.ONCE,
         )
     for value, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(value, reference, rtol=2e-2, atol=2e-2)
@@ -455,6 +456,7 @@ def test_shared_domain_normalizes_its_axes_with_one_denominator(
             sine,
             eps=1e-6,
             axis_dims=axis_dims,
+            rounding=Rounding.ONCE,
         )
 
     tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
@@ -521,6 +523,7 @@ def test_unrotated_domain_is_normalized_without_rotation(device, tokens, dtype):
             sine,
             eps=1e-6,
             axis_dims=(64, 64),
+            rounding=Rounding.ONCE,
         )
 
     tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
@@ -562,6 +565,7 @@ def test_normalization_domains_must_end_on_rotary_axis_boundaries():
         zeros,
         eps=1e-6,
         axis_dims=(2, 2),
+        rounding=Rounding.ONCE,
     )
     separate, _ = qk_norm_rope(
         value,
@@ -572,6 +576,7 @@ def test_normalization_domains_must_end_on_rotary_axis_boundaries():
         zeros,
         eps=1e-6,
         axis_dims=(2, 2),
+        rounding=Rounding.ONCE,
     )
     torch.testing.assert_close(joint, _normalize(value, weight, 1e-6).float())
     torch.testing.assert_close(
@@ -596,6 +601,7 @@ def test_normalization_domains_must_end_on_rotary_axis_boundaries():
                 zeros,
                 eps=1e-6,
                 axis_dims=(2, 2),
+                rounding=Rounding.ONCE,
             )
 
 
@@ -646,6 +652,7 @@ def test_full_head_rotation_preserves_strided_heads_and_value_rows(
             eps=1e-6,
             axis_dims=(width,),
             out=(query, key) if in_place else None,
+            rounding=Rounding.ONCE,
         )
 
     for source, weight, result in zip(sources, weights, actual, strict=True):
@@ -841,6 +848,7 @@ def test_single_domain_rotates_every_axis_with_its_own_factors(
             sines,
             eps=1e-6,
             axis_dims=axis_dims,
+            rounding=Rounding.ONCE,
         )
 
     for source, weight, result in zip(
@@ -942,4 +950,5 @@ def test_cuda_rotary_calls_without_a_kernel_raise(case, reason):
             eps=1e-6,
             axis_dims=(width,),
             out=None if out is None else (out, value),
+            rounding=Rounding.ONCE,
         )

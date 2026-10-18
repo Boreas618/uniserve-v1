@@ -414,7 +414,14 @@ class TransformerLayer(nn.Module):
             config.decoder_attention_head_dim,
         )
         self.output = RowParallelLinear(width, width)
-        self.mlp = GatedMLP(width, width * config.decoder_ffn_mult, bias=True)
+        # The decoder's fused kernels evaluate the gating with one rounding,
+        # and its MLP keeps that recipe.
+        self.mlp = GatedMLP(
+            width,
+            width * config.decoder_ffn_mult,
+            rounding=functional.Rounding.ONCE,
+            bias=True,
+        )
 
     def _norm(self, index: int) -> tuple[torch.Tensor, float]:
         """Return one normalization's weight and epsilon for fused kernels."""
