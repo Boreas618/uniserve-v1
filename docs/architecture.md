@@ -80,6 +80,7 @@ A method that can be captured meets four conditions: its shapes are fixed by its
 Besides the runners, Rust calls:
 
 - `uniserve.loading.rank`: read a checkpoint's configuration and the model's description, load this rank's modules;
+- `uniserve.loading.host_weights`: the layer stack of a component that keeps its weights in host memory, its layout in a layer slot, and the rebinding of its projections to the slots Rust allocates;
 - `uniserve.distributed`: process groups, created in the order Rust fixes; `collectives.NativeCollectives`, which wraps Rust's collectives for layers; `experts`, with `uniserve.backends.experts.HostBootstrap`, for expert unions;
 - `uniserve.bindings.context.Scratch`: the transient work area that the execution contexts serialized on one stream share (a runner prepares its own execution context with `uniserve.runner.context.execution_context`);
 - `uniserve.cuda_graph`: graph pools, `capture_begin`, `capture_end`, `break_graph`;
@@ -87,7 +88,7 @@ Besides the runners, Rust calls:
 - `uniserve.backends.kernel_choices`, `uniserve.profiling` and `uniserve.media`;
 - `torch` and `gc` functions as they are.
 
-In the other direction, Rust passes Python the collectives of a communicator on one stream, the host group's `all_gather`, `broadcast`, `barrier` and `split`, the peer-mapped storage Rust allocates for split expert weights (a storage tensor and every member's address), and expert dispatch and weight prefetch.
+In the other direction, Rust passes Python the collectives of a communicator on one stream, the host group's `all_gather`, `broadcast`, `barrier` and `split`, the peer-mapped storage Rust allocates for split expert weights (a storage tensor and every member's address), expert dispatch and weight prefetch, and the hooks that make a host-resident layer readable before its projections run and record their reads after.
 
 ### Attention providers
 
@@ -129,7 +130,7 @@ Every rank of a group runs these phases in the same order, because several are c
 2. `read_config` describes the model; Rust validates placement.
 3. Rust plans the process groups; Python creates them.
 4. `load_model`; the checkpoint reader reads each source file front to back into the page cache before mapping its tensors, so ranks loading one cold file do not fault it page by page.
-5. Rust creates the rank's streams and starts one execution thread per lane; expert unions and weight prefetch start.
+5. Rust creates the rank's streams and starts one execution thread per lane; expert unions and weight prefetch start, and a component placed with `"weights": "host"` moves its layer projections into a page-locked host region and a ring of device slots that Rust copies them into ahead of each layer.
 6. Rust plans capacity from the model's sizes and measured memory, allocates request storage, and constructs a runner, with its execution context, for each placed component and lane.
 7. The executor and the profiler start.
 8. Warmup: Rust sets each runner's graph budget and prepares it; then every captured method runs eagerly once at its shape, so kernels compile outside capture, and is captured, each runner's shapes largest first. Paths that always run eagerly (image prompts, uncaptured image denoising steps) run once too, so no serving request selects a kernel first.

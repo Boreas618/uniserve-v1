@@ -11,7 +11,8 @@ mod allocation;
 pub use allocation::ByteAllocator;
 mod parallel;
 pub use parallel::{
-    ComponentConfig, ComponentDistribution, ParallelConfig, ParallelConfigError, SequenceParallel,
+    ComponentConfig, ComponentDistribution, ComponentWeights, ParallelConfig, ParallelConfigError,
+    SequenceParallel,
 };
 
 use std::sync::{Arc, OnceLock};

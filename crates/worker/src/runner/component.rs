@@ -146,6 +146,7 @@ mod tests {
             parallel_config: ParallelConfig::default(),
             distribution: distribution.then_some(ComponentDistribution::TemporalUnits),
             units_per_rank,
+            weights: Default::default(),
         }
     }
 

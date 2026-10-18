@@ -117,7 +117,10 @@ The deployment files are in `configs/minimax_h3/`; the `fasth3-` files place Fas
 | `fasth3-ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
 | `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
+| `fasth3-dp8-text-tp8-host-weights.json` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `fasth3-gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
+
+A component placed with `"weights": "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.json` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--graph-policy off`.
 
 One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The validated FastH3 settings:
 
