@@ -228,11 +228,8 @@ A keyframe request anchors the first (`frame_index` 0) or last (`-1`) frame to a
 | `conditions` | In request order. `t2va` takes none; `fl2va` one or two image keyframes; `ref2va` up to 9 images, 3 videos and 3 audio tracks, 12 in total, plus keyframes on the base reference denoiser. Each has `type` (`image`, `video`, `video_audio` for a video that must have a soundtrack, or `audio`), `uri` (`data:`, `http(s)://` or `file://`), `role` (`keyframe` or `reference`), and optionally `frame_index` or `start_time_seconds`, an offset into a video reference. |
 | `target` | Required: `short_edge`, `aspect_ratio` (a served ratio, or `auto`: the keyframe's aspect for `fl2va`, 16:9 otherwise) and `duration_seconds` (4 to the served maximum; a reference request whose only audio-bearing reference sets the duration may omit it). |
 | `seed` | Default 42. |
-| `num_inference_steps`, `flow_shift`, `audio_flow_shift` | Optional; only the served schedule `/v1/capabilities` reports. |
-| `n`, `num_outputs_per_prompt`, `quality` | Optional; only 1, 1 and `lossless`. |
-| `seconds`, `size`, `width`, `height` | Optional; only values that agree with the target. |
 
-Any other field is refused, naming it. A video has `duration_seconds × 24` frames, rounded half to even and extended to the next count of the form 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362.
+Any other field is refused, naming it. The served checkpoint fixes the schedule, which `/v1/capabilities` reports, and every request generates one video. A video has `duration_seconds × 24` frames, rounded half to even and extended to the next count of the form 17n + 5: 4 seconds give 107 frames, 5 give 124, 8 give 192 and 15 give 362.
 
 `POST /v1/videos` creates an asynchronous job instead; `GET /v1/videos/{id}` reports its state (`queued`, `in_progress`, `completed`, `failed`) and progress, `GET /v1/videos/{id}/content` returns the MP4, `GET /v1/videos` lists jobs and `DELETE` cancels one. Jobs live in the server process for `--video-job-retention` seconds (one hour by default), within `--max-video-job-bytes` of retained MP4s (1 GiB by default); a job whose video does not fit fails with `artifact_capacity_exceeded`. Synchronous requests do not use the job store.
 

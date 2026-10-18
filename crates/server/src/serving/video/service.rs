@@ -3,9 +3,8 @@
 //! [`VideoService`] binds what the deployment's denoiser serves, as the
 //! worker reports it in its startup handshake ([`VideoDenoiserInfo`]), to the
 //! server's media policy, sequence capacity and the checkpoint's vision
-//! processor. It prepares every video request for the engine: the fields
-//! that only restate the served contract are checked first, the processor
-//! ([`VideoProcessor`]) then plans and presents the request, the packed
+//! processor. It prepares every video request for the engine: the processor
+//! ([`VideoProcessor`]) plans and presents the request, the packed
 //! sequence is bounded, each condition's fetched media is published to
 //! shared memory for the worker's media reader, and the result becomes one
 //! `DiffusionRequest` describing every condition.
@@ -19,7 +18,7 @@ use uniserve_core::video::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
     MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
-    ReferenceConfig, RequestPlan, Target, VIDEO_FPS, VisionConfig, video_frame_count,
+    ReferenceConfig, RequestPlan, Target, VIDEO_FPS, VisionConfig,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -34,28 +33,9 @@ use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::{ServeError, ServeRequestId};
 
-/// The only numerical quality the video service runs.
-const LOSSLESS: &str = "lossless";
-
 /// The fields of the video request body, in schema order.
-pub(crate) const REQUEST_FIELDS: [&str; 16] = [
-    "model",
-    "prompt",
-    "task",
-    "conditions",
-    "target",
-    "seed",
-    "num_inference_steps",
-    "flow_shift",
-    "audio_flow_shift",
-    "num_outputs_per_prompt",
-    "n",
-    "quality",
-    "seconds",
-    "size",
-    "width",
-    "height",
-];
+pub(crate) const REQUEST_FIELDS: [&str; 6] =
+    ["model", "prompt", "task", "conditions", "target", "seed"];
 
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,10 +143,10 @@ impl VideoService {
     /// sizes `ref2va` references, the canvas rule, the
     /// short edges and named aspect ratios the deployment serves and the
     /// canvas each pair resolves to, the duration range, the fixed schedule
-    /// (its sigma points, the form `num_inference_steps` restates), the
-    /// prompt and sequence capacities, the stated condition capacity (null
-    /// when the workers provision the largest condition set their denoiser
-    /// admits), and the media sources and size caps.
+    /// (its sigma points and shifts), the prompt and sequence capacities, the
+    /// stated condition capacity (null when the workers provision the largest
+    /// condition set their denoiser admits), and the media sources and size
+    /// caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
@@ -245,14 +225,11 @@ impl VideoService {
 
     /// Validates, processes and sizes one video request.
     ///
-    /// The schedule, output-count and quality fields are checked before any
-    /// media is fetched; the fields the SGLang client restates (`seconds`,
-    /// `size`, `width`, `height`) are checked against the duration and
-    /// canvas the plan resolves. The presentation must fit the prompt
-    /// capacity (`--max-model-len`), the condition rows the stated condition
-    /// capacity (`--max-condition-rows`), and the packed sequence (text,
-    /// conditions, generated audio and video) the denoiser's sequence
-    /// capacity. Each condition's fetched media is then copied to shared
+    /// The presentation must fit the prompt capacity (`--max-model-len`),
+    /// the condition rows the stated condition capacity
+    /// (`--max-condition-rows`), and the packed sequence (text, conditions,
+    /// generated audio and video) the denoiser's sequence capacity. Each
+    /// condition's fetched media is then copied to shared
     /// memory, which the request holds until the engine retires it.
     ///
     /// # Errors
@@ -266,8 +243,6 @@ impl VideoService {
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
     ) -> Result<ProcessedVideo, ApiError> {
-        self.check_contract(request)?;
-
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
         let processed = self
@@ -284,12 +259,6 @@ impl VideoService {
             })
             .await?;
         let plan = &processed.plan;
-        check_restated(
-            request,
-            plan.canvas,
-            plan.num_frames,
-            self.max_video_seconds,
-        )?;
 
         let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
@@ -397,65 +366,6 @@ impl VideoService {
         }
         Ok(())
     }
-
-    /// Checks the fields that may only restate the served contract: the
-    /// schedule (the checkpoint's own, D5), one output per prompt and the
-    /// lossless quality.
-    fn check_contract(&self, request: &VideoGenerationRequest) -> Result<(), ApiError> {
-        let restate = |param: &'static str, given: String, served: String| {
-            ApiError::invalid_request(
-                format!(
-                    "{param} must be omitted or equal the served schedule's {served}, got {given}"
-                ),
-                Some(param),
-            )
-        };
-        if let Some(steps) = request.num_inference_steps
-            && steps != self.denoiser.schedule_points
-        {
-            return Err(restate(
-                "num_inference_steps",
-                steps.to_string(),
-                self.denoiser.schedule_points.to_string(),
-            ));
-        }
-        for (param, given, served) in [
-            ("flow_shift", request.flow_shift, self.denoiser.video_shift),
-            (
-                "audio_flow_shift",
-                request.audio_flow_shift,
-                self.denoiser.audio_shift,
-            ),
-        ] {
-            if let Some(given) = given
-                && given != served
-            {
-                return Err(restate(param, given.to_string(), served.to_string()));
-            }
-        }
-        for (param, count) in [
-            ("num_outputs_per_prompt", request.num_outputs_per_prompt),
-            ("n", request.n),
-        ] {
-            if count.is_some_and(|count| count != 1) {
-                return Err(ApiError::invalid_request(
-                    format!("{param} accepts only 1"),
-                    Some(param),
-                ));
-            }
-        }
-        if request
-            .quality
-            .as_deref()
-            .is_some_and(|quality| quality != LOSSLESS)
-        {
-            return Err(ApiError::invalid_request(
-                format!("quality accepts only {LOSSLESS:?}"),
-                Some("quality"),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// The processing input of one request condition.
@@ -469,53 +379,6 @@ fn condition_input(condition: &VideoCondition) -> ConditionInput<'_> {
         },
         uri: &condition.uri,
     }
-}
-
-/// Checks the duration and canvas fields the SGLang client restates.
-///
-/// `seconds` agrees when it aligns to the same frame count as the target's
-/// duration; `size` (`WxH`), `width` and `height` agree when they name the
-/// planned canvas.
-fn check_restated(
-    request: &VideoGenerationRequest,
-    canvas: Canvas,
-    num_frames: u32,
-    max_video_seconds: f64,
-) -> Result<(), ApiError> {
-    if let Some(seconds) = request.seconds
-        && video_frame_count(seconds, max_video_seconds).ok() != Some(num_frames)
-    {
-        return Err(ApiError::invalid_request(
-            format!(
-                "seconds={seconds} disagrees with the target duration, which generates \
-                 {num_frames} frames"
-            ),
-            Some("seconds"),
-        ));
-    }
-    let size = format!("{}x{}", canvas.width, canvas.height);
-    if let Some(given) = &request.size
-        && *given != size
-    {
-        return Err(ApiError::invalid_request(
-            format!("size={given:?} disagrees with the target canvas {size}"),
-            Some("size"),
-        ));
-    }
-    for (param, given, planned) in [
-        ("width", request.width, canvas.width),
-        ("height", request.height, canvas.height),
-    ] {
-        if let Some(given) = given
-            && given != planned
-        {
-            return Err(ApiError::invalid_request(
-                format!("{param}={given} disagrees with the target canvas {size}"),
-                Some(param),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
