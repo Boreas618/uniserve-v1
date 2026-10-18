@@ -23,7 +23,7 @@ fn allocation(output_index: u16, offset: u64, bytes: u64) -> BufferAllocation {
 
 #[test]
 fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
-    let mut pool = BufferPool::allocate(32, false, &[HOST])?;
+    let mut pool = BufferPool::allocate(32, &[HOST])?;
 
     let first = allocation(0, 0, 16);
     let (binding, arena) = pool.bind(first, HOST, 8, 4)?;
@@ -49,19 +49,22 @@ fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
 }
 
 #[test]
-fn compact_ranges_reuse_gaps_without_accepting_stale_or_foreign_handles() -> Result<()> {
-    let mut pool = BufferPool::allocate(512, true, &[HOST])?;
-    let mut other = BufferPool::allocate(512, true, &[HOST])?;
-    let first = allocation(0, 4096, 512);
-    let second = allocation(1, 8192, 512);
+fn released_ranges_rebind_without_accepting_stale_or_foreign_handles() -> Result<()> {
+    let mut pool = BufferPool::allocate(1024, &[HOST])?;
+    let mut other = BufferPool::allocate(1024, &[HOST])?;
+    let first = allocation(0, 0, 512);
+    let second = allocation(1, 512, 512);
     let (binding, _) = pool.bind(first, HOST, 128, 4)?;
     let (foreign, _) = other.bind(first, HOST, 128, 4)?;
     assert!(matches!(pool.release(&foreign), Err(Error::Invariant(_))));
 
+    // Every range binds at the offset the engine placed it.
     let (neighbor, _) = pool.bind(second, HOST, 128, 4)?;
     assert_eq!(binding.physical_offset(), 0);
-    assert_eq!(neighbor.physical_offset(), 256);
-    assert!(pool.bind(allocation(2, 0, 512), HOST, 128, 4).is_err());
+    assert_eq!(neighbor.physical_offset(), 512);
+    assert!(pool.bind(allocation(2, 256, 512), HOST, 128, 4).is_err());
+    // A range beyond the pool this rank backs binds nothing.
+    assert!(pool.bind(allocation(2, 1024, 256), HOST, 128, 4).is_err());
 
     pool.release(&binding)?;
     let (replacement, _) = pool.bind(first, HOST, 128, 4)?;

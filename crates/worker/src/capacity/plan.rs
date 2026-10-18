@@ -154,10 +154,9 @@ pub(crate) struct MediaFacts {
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Device bytes of one request's state buffers.
     pub state_bytes: u64,
-    /// Product bytes this rank retains per request.
+    /// Product bytes this rank backs per request: those of the components it
+    /// executes and of the components it reads.
     pub local_product_bytes: u64,
-    /// Product bytes of every component per request (the logical pool).
-    pub product_bytes: u64,
     /// Latent pool of sampled trajectories, when the worker holds the
     /// denoiser. Every rank of the worker reports its pages, because the head
     /// schedules a request's pages by the worker's report.
@@ -193,8 +192,6 @@ pub(crate) struct Plan {
     pub arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
-    /// Bytes of this rank's physical buffer pool.
-    pub physical_buffer_pool_bytes: u64,
     pub latent: Option<LatentPlan>,
     /// The cache layout, with the agreed unit count in `info.prefix_cache`.
     pub cache: Option<Arc<CachePlan>>,
@@ -404,12 +401,10 @@ impl TokenLayout {
     }
 
     pub(crate) fn finish(self, config: &WorkerConfig, cache: Option<Arc<CachePlan>>) -> Plan {
-        let physical_buffer_pool_bytes = self.info.buffer_pool_bytes;
         let mut plan = Plan {
             info: self.info,
             arena: self.arena,
             fixed_device_bytes: self.fixed,
-            physical_buffer_pool_bytes,
             latent: self.latent,
             cache,
         };
@@ -435,7 +430,9 @@ pub(crate) fn request_layout(
     )?;
     info.max_batch_calls = info.max_batch_calls.min(info.request_slots);
     info.max_batch_tokens = info.max_batch_calls;
-    info.buffer_pool_bytes = slots as u64 * media.product_bytes;
+    // The pool this rank backs, which the engine places this rank's buffers
+    // in: the products of the components it executes and reads.
+    info.buffer_pool_bytes = slots as u64 * media.local_product_bytes;
     info.num_inference_steps = media.num_steps;
     info.video_denoiser = media.video_denoiser.clone();
     if let Some(plan) = &media.latent {
@@ -461,7 +458,6 @@ pub(crate) fn request_layout(
         info,
         arena,
         fixed_device_bytes: BTreeMap::new(),
-        physical_buffer_pool_bytes: slots as u64 * media.local_product_bytes,
         latent: media.stored_latent(),
         cache: None,
     };
@@ -713,7 +709,6 @@ mod tests {
             video_denoiser: None,
             state_bytes: 1000,
             local_product_bytes: 4096,
-            product_bytes: 8192,
             latent: None,
             stores_latent: false,
             artifact_import_regions: 0,
@@ -734,8 +729,7 @@ mod tests {
         .unwrap();
         // Twelve positions over three slots keep three unresolved outputs.
         assert_eq!(plan.info.max_unresolved_calls, 3);
-        assert_eq!(plan.info.buffer_pool_bytes, 3 * 8192);
-        assert_eq!(plan.physical_buffer_pool_bytes, 3 * 4096);
+        assert_eq!(plan.info.buffer_pool_bytes, 3 * 4096);
         assert_eq!(plan.info.num_inference_steps, 8);
     }
 
@@ -760,7 +754,6 @@ mod tests {
             video_denoiser: None,
             state_bytes: 1000,
             local_product_bytes: 4096,
-            product_bytes: 8192,
             latent: Some(pool),
             stores_latent,
             artifact_import_regions: 0,
