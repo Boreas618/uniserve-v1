@@ -3,11 +3,15 @@
 ``read_config`` recognizes the checkpoint layout (``checkpoint.detect``),
 reads the JSON sidecars of every component, validates the FastVideo
 inference contract where one exists, and returns one immutable ``Config``
-before any module is constructed. The network architecture is fixed:
-``Config`` rejects any network or output field that differs from its
-default. What a checkpoint may vary is each denoiser's schedule and
-attention (``DenoiserConfig``), the PDD output heads of a parallel-decoding
-student, the VSA sparsity and the latent normalization statistics.
+before any module is constructed. The checkpoint's own configuration
+defines each network's dimensions; the modules are parameterised by it. The
+reader refuses only what the packing and reconstruction code hard-codes:
+the 16x spatial and 4x temporal video compression with its 17-frame clip
+and the audio hop of the timeline. A checkpoint also states each
+denoiser's schedule and attention (``DenoiserConfig``): the base release's
+uniform schedule and dense attention, or a FastH3 student's distilled
+schedule and sparse attention as its ``fastvideo_inference.json`` states
+them.
 """
 
 from __future__ import annotations
@@ -31,7 +35,13 @@ from .checkpoint import (
     detect,
 )
 from .encoder import TextEncoderConfig
-from .packing import AUDIO_SAMPLE_RATE, VIDEO_TILE_SHAPES
+from .packing import (
+    AUDIO_HOP,
+    AUDIO_SAMPLE_RATE,
+    CLIP_FRAMES,
+    CLIP_LATENTS,
+    VIDEO_TILE_SHAPES,
+)
 from .processing import buckets
 
 # DMD rungs are unshifted noise levels on the 1000-step training clock.
@@ -344,7 +354,7 @@ class DenoiserConfig:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Compose the fixed H3 networks and the checkpoint's denoisers.
+    """Compose the checkpoint's encoders, denoisers and VAEs.
 
     ``denoisers`` maps each denoising component the checkpoint holds
     (``denoiser`` for the ``transformer`` partition, ``reference_denoiser``
@@ -380,34 +390,6 @@ class Config:
                 raise ValueError(
                     "H3 audio latent channels must match the denoiser"
                 )
-        # Packing, attention and native reconstruction
-        # implement this architecture; typed configs do not imply arbitrary
-        # variants. The latent statistics come from each checkpoint and are
-        # exempt, as are the PDD output heads.
-        expected_networks: tuple[tuple[str, object, object], ...] = (
-            ("text_encoder", self.text_encoder, TextEncoderConfig()),
-            ("video_vae", self.video_vae, video_vae.Config()),
-            ("audio_vae", self.audio_vae, audio_vae.Config()),
-            *(
-                (f"{name}.transformer", value.transformer, TransformerConfig())
-                for name, value in self.denoisers.items()
-            ),
-        )
-        for name, actual, expected in expected_networks:
-            for field in fields(expected):  # type: ignore[arg-type]
-                if field.name in {
-                    "latents_mean",
-                    "latents_std",
-                    "output_heads",
-                }:
-                    continue
-                value = getattr(actual, field.name)
-                supported = getattr(expected, field.name)
-                if value != supported:
-                    raise ValueError(
-                        f"H3 {name}.{field.name} must be {supported!r}, "
-                        f"got {value!r}"
-                    )
 
 
 # Checkpoint config field names mapped to the typed config fields they fill.
@@ -719,7 +701,25 @@ def _video_vae(values: Mapping[str, Any]) -> video_vae.Config:
                 )
             value = tuple(value)
         result[field.name] = value
-    return video_vae.Config(**result)
+    config = video_vae.Config(**result)
+
+    # Packing and reconstruction hard-code the clip timeline: a 17-frame
+    # clip encodes to 5 latent frames, 3 of which the final clip drops, at
+    # 16x spatial and 4x temporal compression.
+    clip = (
+        config.clip_length,
+        config.clip_latents,
+        config.clip_latents - config.token_drop,
+        config.spatial_compression,
+        config.temporal_compression,
+    )
+    if clip != (CLIP_FRAMES, CLIP_LATENTS, 2, 16, 4):
+        raise ValueError(
+            "MiniMax-H3 video_vae must encode 17-frame clips to 5 latent "
+            "frames, dropping 3 of them from the final clip, at 16x spatial "
+            "and 4x temporal compression"
+        )
+    return config
 
 
 def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
@@ -746,7 +746,17 @@ def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
         elif isinstance(field.default, tuple):
             value = tuple(value)
         result[field.name] = value
-    return audio_vae.Config(**result)
+    config = audio_vae.Config(**result)
+
+    # Packing counts audio latents in hops of the timeline.
+    if (
+        math.prod(config.encoder_rates) != AUDIO_HOP
+        or math.prod(config.decoder_rates) != AUDIO_HOP
+    ):
+        raise ValueError(
+            f"MiniMax-H3 audio_vae must hop {AUDIO_HOP} samples per latent"
+        )
+    return config
 
 
 def _shifts(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
