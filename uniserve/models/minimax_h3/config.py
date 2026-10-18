@@ -45,8 +45,8 @@ from .packing import (
 )
 from .processing import buckets
 
-# DMD rungs are unshifted noise levels on the 1000-step training clock.
-TRAINING_CLOCK = 1000.0
+# DMD rungs are unshifted noise levels on the 1000-step training schedule.
+NUM_TRAIN_TIMESTEPS = 1000.0
 
 # A diffusers root evaluates the released sigma grid of 50 points: 49 network
 # evaluations and the clean endpoint.
@@ -178,22 +178,23 @@ class UniformGrid:
 class DmdLadder:
     """A DMD student's trained rungs.
 
-    Each rung is an unshifted noise level on the ``clock`` (the 1000-step
-    training clock), shifted once per modality; the clean endpoint follows
-    the last rung. The student starts from unit noise.
+    Each rung is an unshifted noise level of the ``num_train_timesteps``-step
+    training schedule (1000 for H3), shifted once per modality; the clean
+    endpoint follows the last rung. The student starts from unit noise.
     """
 
     rungs: tuple[int, ...]
     video_shift: float
     audio_shift: float
-    clock: float = TRAINING_CLOCK
+    num_train_timesteps: float = NUM_TRAIN_TIMESTEPS
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.rungs, tuple)
             or not self.rungs
             or any(
-                not _is_integer(rung) or not 0 < rung <= self.clock
+                not _is_integer(rung)
+                or not 0 < rung <= self.num_train_timesteps
                 for rung in self.rungs
             )
             or any(
@@ -202,19 +203,21 @@ class DmdLadder:
         ):
             raise ValueError(
                 "H3 DMD rungs must be strictly decreasing integers within "
-                "the training clock"
+                "num_train_timesteps"
             )
         _check_shifts(self.video_shift, self.audio_shift)
-        if not _is_positive_number(self.clock):
-            raise ValueError("H3 DMD clock must be finite and positive")
+        if not _is_positive_number(self.num_train_timesteps):
+            raise ValueError(
+                "H3 DMD num_train_timesteps must be finite and positive"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class PddGrid:
     """A parallel-decoding student's fine grid and runtime blocks.
 
-    The fine grid ``linspace(max_t, 0, intervals + 1)`` lives on the
-    unshifted base clock; each modality reaches its noise level through the
+    The fine grid ``linspace(max_t, 0, intervals + 1)`` covers the unshifted
+    times ``[0, max_t]``; each modality reaches its noise level through the
     shift ``f_s(u) = s u M / (u (s - 1) + M)`` whose fixed point is
     ``M = max_t``. ``nodes`` are the fine-grid indices of the block
     boundaries, one network evaluation per block.
@@ -500,7 +503,7 @@ def _dmd_denoiser(
         not isinstance(rungs, list)
         or not rungs
         or any(
-            not _is_integer(rung) or not 0 < rung <= TRAINING_CLOCK
+            not _is_integer(rung) or not 0 < rung <= NUM_TRAIN_TIMESTEPS
             for rung in rungs
         )
         or any(left <= right for left, right in zip(rungs, rungs[1:]))

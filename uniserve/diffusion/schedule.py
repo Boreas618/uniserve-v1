@@ -155,18 +155,21 @@ def ladder(
     rungs: tuple[int, ...],
     *,
     shift: float,
-    clock: float,
+    num_train_timesteps: float,
     device: torch.device | str,
 ) -> Schedule:
-    """Shift trained rungs of a ``clock``-step training clock once.
+    """Shift trained rungs of a ``num_train_timesteps``-step schedule once.
 
-    Each rung divided by ``clock`` gives ``u`` in (0, 1]; sigma is the
+    Each rung divided by ``num_train_timesteps`` gives ``u`` in (0, 1]; sigma
+    is the
     shifted ``u`` evaluated in double precision, followed by the clean
     endpoint, then materialized in FP32. Network times are ``1 - sigma``
     formed in FP32; the analytical coordinates keep the unrounded
     ``1 - sigma``.
     """
-    sigmas = tuple(_shifted(rung / clock, shift) for rung in (*rungs, 0))
+    sigmas = tuple(
+        _shifted(rung / num_train_timesteps, shift) for rung in (*rungs, 0)
+    )
     sigma = torch.tensor(sigmas, dtype=torch.float32, device=device)
     return Schedule(1.0 - sigma, sigma, tuple(1.0 - value for value in sigmas))
 
@@ -203,7 +206,7 @@ def fixed_point_increments(grid: torch.Tensor, shift: float, max_t: float):
 
 @dataclass(frozen=True, slots=True)
 class BlockGrid:
-    """A fine base-clock grid partitioned into evaluation blocks.
+    """A fine grid over ``[0, max_t]`` partitioned into evaluation blocks.
 
     A parallel-decoding (PDD) student predicts one head per fine interval.
     Each evaluation advances one block of intervals ``[nodes[k],
