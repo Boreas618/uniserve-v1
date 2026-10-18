@@ -205,32 +205,17 @@ impl PendingOutput {
         });
     }
 
-    pub(crate) fn validate_output(&self, buffer: &OutputBuffer, call: &Call) -> Result<()> {
-        let sampled = self.logprob_range.as_slice();
-        let bytes =
-            buffer.logprob_bytes(sampled)? + buffer.logprob_bytes(&self.prompt_logprob_ranges)?;
-        if bytes > call.bounds.max_completion_bytes as usize {
-            return Err(Error::Invalid(
-                "logprob result exceeds its registered completion capacity".into(),
-            ));
-        }
-
+    /// Check the call's captured output against its declaration. Its byte
+    /// bounds are the engine's: a completion's capture is bounded by the
+    /// lease the batch sized from its calls' `max_completion_bytes`
+    /// (`OutputBuffer::reserve_tokens`, `reserve_bytes`), and a cache
+    /// export's bytes by the reservation the engine planned from the same
+    /// visible extent (`PrefixCacheInfo::transfer_bytes`).
+    pub(crate) fn validate_output(&self, call: &Call) -> Result<()> {
         if let Some(output) = &self.output.cache_output {
             if Some(output.source) != call.cache_output {
                 return Err(Error::Invalid(
                     "cache export differs from its declared output".into(),
-                ));
-            }
-
-            let bytes = output
-                .tensors()
-                .try_fold(0_u64, |sum, tensor| {
-                    tensor.nbytes().map(|bytes| sum.saturating_add(bytes))
-                })
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            if bytes > call.bounds.max_transfer_bytes {
-                return Err(Error::Invalid(
-                    "cache export exceeds its transfer-byte bound".into(),
                 ));
             }
             if output.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {

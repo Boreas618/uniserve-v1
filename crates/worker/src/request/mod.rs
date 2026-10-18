@@ -206,35 +206,22 @@ impl RequestPool {
         Ok(Some(slot))
     }
 
-    /// Bind numerical rows to distinct, live request epochs and slots.
-    pub(crate) fn bind_calls(
-        &self,
-        calls: &[(RequestKey, CallId, usize)],
-    ) -> Result<Vec<Arc<Request>>> {
-        let mut keys = HashSet::new();
-        let mut slots = HashSet::new();
+    /// Bind a batch's calls to their live request epochs.
+    ///
+    /// A batch names each request once (`Batch::validate`, where the engine
+    /// builds it) and live requests hold distinct slots (`Self::start`), so
+    /// only live state is checked: an unknown or stale request, a closed
+    /// one, and a call already executing.
+    pub(crate) fn bind_calls(&self, calls: &[(RequestKey, CallId)]) -> Result<Vec<Arc<Request>>> {
+        if self.closed {
+            return Err(Error::State("request pool is closed"));
+        }
         let mut requests = Vec::with_capacity(calls.len());
-
-        for &(key, id, slot) in calls {
-            let slot = self.validate_slot(slot)?;
-            if !keys.insert(key) {
-                return Err(Error::Invalid("a batch repeats a request".into()));
-            }
-            if !slots.insert(slot) {
-                return Err(Error::Invalid(
-                    "a batch repeats a request-pool index".into(),
-                ));
-            }
-
+        for &(key, id) in calls {
             let request = self.get(key.request_id.0)?;
             if request.key() != key {
                 return Err(Error::Invalid(format!(
                     "call {id:?} has a stale request key"
-                )));
-            }
-            if request.slot() != slot {
-                return Err(Error::Invalid(format!(
-                    "call {id:?} has a stale request slot"
                 )));
             }
             let state = request.state()?;

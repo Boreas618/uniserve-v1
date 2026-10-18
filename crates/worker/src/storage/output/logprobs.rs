@@ -39,15 +39,6 @@ impl LogprobLayout {
         Ok(())
     }
 
-    pub(super) fn entries(&self, row: usize) -> Result<usize> {
-        let local = self
-            .rows
-            .iter()
-            .position(|&index| index == row)
-            .ok_or(Error::State("logprob capture has no requested row"))?;
-        Ok(1 + self.counts[local] + self.requested_ids[local].len())
-    }
-
     pub(super) fn decode(&self, words: &[i64]) -> Result<HashMap<usize, Vec<TokenLogprob>>> {
         let rows = self.rows.len();
 

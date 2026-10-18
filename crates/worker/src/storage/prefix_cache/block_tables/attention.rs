@@ -55,6 +55,9 @@ impl GroupTable {
 
     fn visible_pages(&self, prefix: u32, query: u32) -> Result<Range<u64>> {
         let first = u64::from(self.first_page(prefix));
+        // The table no longer holds pages before its start, and the page
+        // selection counts from the start (`TablePages::rows`), so a row
+        // reaching back before it has no pages to read.
         if first < u64::from(self.start_page) {
             return Err(Error::Invalid(
                 "attention row reads retired window pages".into(),
@@ -124,9 +127,9 @@ pub(crate) fn table_pages(
 }
 
 impl BlockTables {
-    /// Resolve an attention batch while checking scheduler-assigned capacity.
-    /// The caller supplies the cache's write check over the batch's physical
-    /// intervals.
+    /// Resolve an attention batch over the installed tables. The scheduler
+    /// sizes every row within its tables; the caller supplies the cache's
+    /// write check over the batch's physical intervals.
     pub(crate) fn prepare_attention(
         &self,
         rows: &[AttentionRow],
@@ -142,19 +145,6 @@ impl BlockTables {
         let mut prefixes = Vec::with_capacity(rows.len());
         let mut queries = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.query == 0 {
-                return Err(Error::Invalid(
-                    "forward attention lengths are invalid".into(),
-                ));
-            }
-            let resulting =
-                u64::from(row.prefix) + u64::from(if row.write { row.query } else { 0 });
-            if resulting > u64::from(self.allocated_length(row.slot)) {
-                return Err(Error::Invalid(
-                    "forward row exceeds its scheduler block table".into(),
-                ));
-            }
-
             let mut groups = Vec::with_capacity(self.groups.len());
             for group in 0..self.groups.len() {
                 let table = self.table(row.slot, group as u32)?;
