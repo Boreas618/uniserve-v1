@@ -5,14 +5,18 @@ A MiniMax-H3 checkpoint is one of:
 * a FastVideo full export (FastH3 V1/V2 and their NVFP4 exports): every
   component lives under the root, and ``fastvideo_inference.json`` carries
   a DMD contract (``dmd_denoising_steps``) for its ``transformer``;
-* the MiniMax-H3 diffusers root (``model_index.json`` naming
-  ``MiniMaxH3ModularPipeline``, no inference contract): every component
-  lives under the root and both DiTs, ``transformer`` and
-  ``transformer_ref``, use the full-step uniform schedule;
+* the MiniMax-H3 diffusers root (a ``model_index.json`` and no inference
+  contract): every component lives under the root and both DiTs,
+  ``transformer`` and ``transformer_ref``, use the full-step uniform
+  schedule;
 * a FastVideo component export (FastH3-OmniRef): the root holds one DiT and
   its schedulers, ``fastvideo_inference.json`` carries a PDD contract
   (``pdd_steps``) and ``base_model_revision`` pins the diffusers root that
   supplies every other component.
+
+The loader's catalog selects this package by the pipeline class the root
+index names (``MiniMaxH3ModularPipeline``), so the layouts are told apart by
+the inference contract and the partitions they hold alone.
 
 ``Layout`` names the denoising components each layout holds: the
 ``transformer`` partition is the ``denoiser`` component and serves t2va and
@@ -121,18 +125,24 @@ def _json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _contract(root: Path) -> dict[str, Any] | None:
+    """Read an export's ``fastvideo_inference.json``, or None without one."""
+    path = root / "fastvideo_inference.json"
+    return _json(path) if path.is_file() else None
+
+
 def detect(root: Path) -> Layout:
     """Classify ``root`` and list the denoising components it holds.
 
     Raises:
         FileNotFoundError: The root holds neither an inference contract nor a
             diffusers pipeline index.
-        ValueError: The contract or index is not a MiniMax-H3 layout this
-            package serves, naming the offending field.
+        ValueError: The contract is not one this package serves, naming
+            the offending field, or the index lists no DiT partition the
+            root holds.
     """
-    contract_path = root / "fastvideo_inference.json"
-    if contract_path.is_file():
-        contract = _json(contract_path)
+    contract = _contract(root)
+    if contract is not None:
         if contract.get("schema_version") != INFERENCE_SCHEMA:
             raise ValueError(
                 "unsupported MiniMax-H3 checkpoint: schema_version must be "
@@ -178,11 +188,6 @@ def detect(root: Path) -> Layout:
             "model_index.json"
         )
     index = _json(index_path)
-    if index.get("_class_name") != "MiniMaxH3ModularPipeline":
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: model_index.json must name "
-            "MiniMaxH3ModularPipeline"
-        )
     denoisers = {
         name: directory
         for name, directory in DENOISER_DIRECTORIES.items()
@@ -201,13 +206,15 @@ def base_checkpoint(root: Path) -> Base | None:
 
     A component export pins its base with ``base_model_revision``; the base
     supplies ``BASE_DIRECTORIES``. Returns ``None`` for the layouts that
-    hold every component.
+    hold every component. Only the pin is read: ``read_config`` classifies
+    the layout, once per load.
 
     Raises:
-        FileNotFoundError: As ``detect``.
-        ValueError: As ``detect``.
+        ValueError: The contract is not a JSON object, or the pin is not of
+            the form ``hf://<repository>@<revision>``.
     """
-    layout = detect(root)
-    if layout.base is None:
+    contract = _contract(root)
+    if contract is None or contract.get("base_model_revision") is None:
         return None
-    return Base(layout.base.repository, layout.base.revision, BASE_DIRECTORIES)
+    pinned = BaseRevision.parse(contract["base_model_revision"])
+    return Base(pinned.repository, pinned.revision, BASE_DIRECTORIES)
