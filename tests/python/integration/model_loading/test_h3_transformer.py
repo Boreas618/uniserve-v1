@@ -12,17 +12,13 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
-from tests.python.fixtures.h3 import dmd_denoiser
+from tests.python.fixtures.h3 import dmd_denoiser, transformer_config
 from tests.python.fixtures.vsa import layout_tables, segment_reference
 from uniserve import cuda_graph, loading
 from uniserve.bindings.context import ExecutionContext
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
-from uniserve.models.minimax_h3 import (
-    SegmentInput,
-    Transformer,
-    TransformerConfig,
-)
+from uniserve.models.minimax_h3 import SegmentInput, Transformer
 from uniserve.models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve.models.minimax_h3.denoiser import (
     modulation_timesteps,
@@ -163,7 +159,7 @@ def _reference(hidden, source, config, step, tags, cosine, sine):
 
 @torch.inference_mode()
 def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
-    config = TransformerConfig(
+    config = transformer_config(
         hidden_size=64,
         num_attention_heads=2,
         num_hidden_layers=2,

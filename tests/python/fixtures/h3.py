@@ -1,9 +1,17 @@
-"""MiniMax-H3 denoiser configurations of the released checkpoint families."""
+"""MiniMax-H3 configurations of the released checkpoint families.
+
+The released architecture values are stated once, by the sidecars of the
+checkpoint fixture ``fixtures/models/fasth3``; the factories below read them
+with the production reader and apply per-test overrides.
+"""
 
 from dataclasses import replace
+from functools import cache
+from pathlib import Path
 
 from torch import nn
 
+from uniserve.loading import Config as IOConfig
 from uniserve.media import image
 from uniserve.models import ComponentEntry, EntryPoint
 from uniserve.models.minimax_h3 import (
@@ -19,10 +27,39 @@ from uniserve.models.minimax_h3 import (
     audio_vae,
     video_vae,
 )
+from uniserve.models.minimax_h3.config import read_config
 from uniserve.models.minimax_h3.encoder import TextEncoderConfig
+
+CHECKPOINT = Path(__file__).parent / "models/fasth3"
 
 # The 16:9 canvas FastH3 DMD exports generate.
 WIDE = image.Config(768, 1344)
+
+
+@cache
+def _released() -> Config:
+    return read_config(CHECKPOINT, IOConfig(), sources={})
+
+
+def transformer_config(**overrides) -> TransformerConfig:
+    """The released DiT dimensions, with ``overrides`` applied."""
+    transformer = _released().denoisers["denoiser"].transformer
+    return replace(transformer, **overrides)
+
+
+def text_encoder_config(**overrides) -> TextEncoderConfig:
+    """The released text encoder dimensions, with ``overrides`` applied."""
+    return replace(_released().text_encoder, **overrides)
+
+
+def video_vae_config(**overrides) -> video_vae.Config:
+    """The released video VAE configuration, with ``overrides`` applied."""
+    return replace(_released().video_vae, **overrides)
+
+
+def audio_vae_config(**overrides) -> audio_vae.Config:
+    """The released audio VAE configuration, with ``overrides`` applied."""
+    return replace(_released().audio_vae, **overrides)
 
 
 class DenoisingModel(nn.Module):
@@ -42,7 +79,7 @@ def entry_points(config):
 
 
 def dmd_denoiser(
-    transformer: TransformerConfig = TransformerConfig(),
+    transformer: TransformerConfig | None = None,
     *,
     rungs: tuple[int, ...] = (999, 749, 500, 250),
     video_shift: float = 12.0,
@@ -50,7 +87,7 @@ def dmd_denoiser(
 ) -> DenoiserConfig:
     """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9."""
     return DenoiserConfig(
-        transformer=transformer,
+        transformer=transformer or transformer_config(),
         schedule=DmdLadder(
             rungs=rungs, video_shift=video_shift, audio_shift=3.0
         ),
@@ -62,14 +99,14 @@ def dmd_denoiser(
 
 
 def base_denoiser(
-    transformer: TransformerConfig = TransformerConfig(),
+    transformer: TransformerConfig | None = None,
     *,
     tasks: tuple[str, ...] = ("t2va", "fl2va"),
     points: int = 50,
 ) -> DenoiserConfig:
     """A released diffusers DiT: dense attention over the uniform grid."""
     return DenoiserConfig(
-        transformer=transformer,
+        transformer=transformer or transformer_config(),
         schedule=UniformGrid(points=points, video_shift=12.0, audio_shift=3.0),
         attention=DenseAttention(),
         tasks=tasks,
@@ -79,11 +116,13 @@ def base_denoiser(
 
 
 def omniref_denoiser(
-    transformer: TransformerConfig = TransformerConfig(),
+    transformer: TransformerConfig | None = None,
 ) -> DenoiserConfig:
     """A FastH3 OmniRef PDD student: 32 heads, multi-segment tile-128 VSA."""
     return DenoiserConfig(
-        transformer=replace(transformer, output_heads=32),
+        transformer=replace(
+            transformer or transformer_config(), output_heads=32
+        ),
         schedule=PddGrid(
             intervals=32,
             nodes=(0, 4, 8, 12, 16, 20, 24, 28, 32),
@@ -101,21 +140,21 @@ def omniref_denoiser(
 def fasth3_config() -> Config:
     """A FastH3 export: one DMD denoiser."""
     return Config(
-        text_encoder=TextEncoderConfig(),
+        text_encoder=text_encoder_config(),
         denoisers={"denoiser": dmd_denoiser()},
-        video_vae=video_vae.Config(),
-        audio_vae=audio_vae.Config(),
+        video_vae=video_vae_config(),
+        audio_vae=audio_vae_config(),
     )
 
 
 def base_config() -> Config:
     """A diffusers root: both released DiTs."""
     return Config(
-        text_encoder=TextEncoderConfig(),
+        text_encoder=text_encoder_config(),
         denoisers={
             "denoiser": base_denoiser(),
             "reference_denoiser": base_denoiser(tasks=("ref2va",)),
         },
-        video_vae=video_vae.Config(),
-        audio_vae=audio_vae.Config(),
+        video_vae=video_vae_config(),
+        audio_vae=audio_vae_config(),
     )

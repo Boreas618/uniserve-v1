@@ -22,9 +22,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TypeAlias, TypeGuard
+from typing import Any, TypeAlias, TypeGuard, get_origin, get_type_hints
 
 from uniserve.media import image
+from uniserve.models import qwen3_vl
 
 from . import audio_vae, video_vae
 from .checkpoint import (
@@ -34,7 +35,7 @@ from .checkpoint import (
     Layout,
     detect,
 )
-from .encoder import TextEncoderConfig
+from .encoder import RETAINED_LAYERS, TextEncoderConfig
 from .packing import (
     AUDIO_HOP,
     AUDIO_SAMPLE_RATE,
@@ -83,23 +84,23 @@ class TransformerConfig:
     hold one head-major prediction per interval.
     """
 
-    hidden_size: int = 5376
-    num_attention_heads: int = 56
-    head_dim: int = 128
-    num_hidden_layers: int = 50
-    num_refiner_layers: int = 2
-    intermediate_size: int = 14336
-    video_channels: int = 24
-    audio_channels: int = 32
-    text_dim: int = 5120
-    frequency_dim: int = 256
-    time_hidden_dim: int = 5376
-    time_dim: int = 2688
-    rope_frequency_dim: int = 16
-    rope_theta: float = 10000.0
-    norm_eps: float = 1e-5
-    qk_norm_eps: float = 1e-5
-    output_heads: int = 1
+    hidden_size: int
+    num_attention_heads: int
+    head_dim: int
+    num_hidden_layers: int
+    num_refiner_layers: int
+    intermediate_size: int
+    video_channels: int
+    audio_channels: int
+    text_dim: int
+    frequency_dim: int
+    time_hidden_dim: int
+    time_dim: int
+    rope_frequency_dim: int
+    rope_theta: float
+    norm_eps: float
+    qk_norm_eps: float
+    output_heads: int
 
     def __post_init__(self) -> None:
         for name in (
@@ -647,7 +648,25 @@ def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
     )
 
 
-def _text_encoder(metadata: Mapping[str, Any]) -> TextEncoderConfig:
+def _pixels(preprocessor: Mapping[str, Any]) -> qwen3_vl.PixelConfig:
+    """Read the pixel normalization of the checkpoint's image processor."""
+    missing = {"image_mean", "image_std"} - preprocessor.keys()
+    if missing:
+        raise ValueError(
+            "MiniMax-H3 processor preprocessor_config is missing fields: "
+            f"{', '.join(sorted(missing))}"
+        )
+    mean, std = preprocessor["image_mean"], preprocessor["image_std"]
+    if not isinstance(mean, list) or not isinstance(std, list):
+        raise ValueError(
+            "MiniMax-H3 processor image_mean and image_std must be lists"
+        )
+    return qwen3_vl.PixelConfig(mean=tuple(mean), std=tuple(std))
+
+
+def _text_encoder(
+    metadata: Mapping[str, Any], preprocessor: Mapping[str, Any]
+) -> TextEncoderConfig:
     text = metadata.get("text_config")
     if not isinstance(text, dict):
         raise ValueError("MiniMax-H3 text encoder requires text_config")
@@ -658,43 +677,61 @@ def _text_encoder(metadata: Mapping[str, Any]) -> TextEncoderConfig:
         raise ValueError(
             "MiniMax-H3 checkpoint requires an independent vocabulary head"
         )
-    if text.get("rope_scaling") != {
-        "mrope_interleaved": True,
-        "mrope_section": [24, 20, 20],
-        "rope_type": "default",
-    }:
-        raise ValueError("unsupported MiniMax-H3 text encoder rope_scaling")
-    # ``weights`` enumerates the vision tower's checkpoint tensor names from
-    # this fixed layout, so the checkpoint must match it.
-    vision = metadata.get("vision_config")
+    # The language layers rotate by interleaved M-RoPE; its sections are
+    # the checkpoint's.
+    rope = text.get("rope_scaling")
     if (
-        not isinstance(vision, dict)
-        or vision.get("depth") != 27
-        or vision.get("deepstack_visual_indexes") != [8, 16, 24]
+        not isinstance(rope, dict)
+        or rope.get("rope_type") != "default"
+        or rope.get("mrope_interleaved") is not True
+        or not isinstance(rope.get("mrope_section"), list)
     ):
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint visual layer layout"
-        )
+        raise ValueError("unsupported MiniMax-H3 text encoder rope_scaling")
+    vision = metadata.get("vision_config")
+    if not isinstance(vision, dict):
+        raise ValueError("MiniMax-H3 text encoder requires vision_config")
     missing = set(TEXT_FIELDS) - text.keys()
     if missing:
         raise ValueError(
             "MiniMax-H3 text_encoder.text_config is missing fields: "
             f"{', '.join(sorted(missing))}"
         )
+    missing = {"image_token_id", "video_token_id"} - metadata.keys()
+    if missing:
+        raise ValueError(
+            "MiniMax-H3 text_encoder config is missing fields: "
+            f"{', '.join(sorted(missing))}"
+        )
     return TextEncoderConfig(
-        **{target: text[source] for source, target in TEXT_FIELDS.items()}
+        **{target: text[source] for source, target in TEXT_FIELDS.items()},
+        num_retained_layers=RETAINED_LAYERS,
+        mrope_sections=tuple(rope["mrope_section"]),
+        image_token_id=metadata["image_token_id"],
+        video_token_id=metadata["video_token_id"],
+        vision=qwen3_vl.read_vision_config(vision),
+        pixels=_pixels(preprocessor),
     )
+
+
+def _sequence_fields(config: type) -> set[str]:
+    """Name the fields ``config`` annotates as tuples."""
+    return {
+        name
+        for name, hint in get_type_hints(config).items()
+        if get_origin(hint) is tuple
+    }
 
 
 def _video_vae(values: Mapping[str, Any]) -> video_vae.Config:
     result = {}
+    sequences = _sequence_fields(video_vae.Config)
     for field in fields(video_vae.Config):
         if field.name not in values:
             raise ValueError(
                 f"MiniMax-H3 video_vae is missing field {field.name}"
             )
         value = values[field.name]
-        if isinstance(field.default, tuple):
+        if field.name in sequences:
             if not isinstance(value, (tuple, list)):
                 raise ValueError(
                     f"MiniMax-H3 video_vae.{field.name} must be a sequence"
@@ -724,15 +761,14 @@ def _video_vae(values: Mapping[str, Any]) -> video_vae.Config:
 
 def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
     result = {}
+    sequences = _sequence_fields(audio_vae.Config)
     for field in fields(audio_vae.Config):
         if field.name not in values:
             raise ValueError(
                 f"MiniMax-H3 audio_vae is missing field {field.name}"
             )
         value = values[field.name]
-        if isinstance(field.default, tuple) and not isinstance(
-            value, (tuple, list)
-        ):
+        if field.name in sequences and not isinstance(value, (tuple, list)):
             raise ValueError(
                 f"MiniMax-H3 audio_vae.{field.name} must be a sequence"
             )
@@ -743,7 +779,7 @@ def _audio_vae(values: Mapping[str, Any]) -> audio_vae.Config:
                     "must contain sequences"
                 )
             value = tuple(tuple(row) for row in value)
-        elif isinstance(field.default, tuple):
+        elif field.name in sequences:
             value = tuple(value)
         result[field.name] = value
     config = audio_vae.Config(**result)
@@ -776,12 +812,14 @@ def normalize(
 ) -> Config:
     """Normalize recognized checkpoint sidecars without allocating resources.
 
-    ``metadata`` holds the parsed JSON of ``text_encoder``, ``video_vae``,
+    ``metadata`` holds the parsed JSON of ``text_encoder``, ``processor``
+    (the image processor's ``preprocessor_config.json``), ``video_vae``,
     ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per
     denoising component the layout holds (its ``config.json``).
     """
     for name in (
         "text_encoder",
+        "processor",
         "video_vae",
         "audio_vae",
         "scheduler",
@@ -837,7 +875,9 @@ def normalize(
                 max_sequence_rows=None,
             )
     return Config(
-        text_encoder=_text_encoder(metadata["text_encoder"]),
+        text_encoder=_text_encoder(
+            metadata["text_encoder"], metadata["processor"]
+        ),
         denoisers=denoisers,
         video_vae=_video_vae(metadata["video_vae"]),
         audio_vae=_audio_vae(metadata["audio_vae"]),
@@ -848,6 +888,7 @@ def normalize(
 # component export holds its schedulers and draws the others from its base.
 _SIDECARS = {
     "text_encoder": "text_encoder/config.json",
+    "processor": "processor/preprocessor_config.json",
     "video_vae": "vae/config.json",
     "audio_vae": "audio_vae/config.json",
     "scheduler": "scheduler/scheduler_config.json",

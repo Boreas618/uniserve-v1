@@ -16,10 +16,10 @@ from tests.python.fixtures.h3 import (
     base_denoiser,
     dmd_denoiser,
     omniref_denoiser,
+    transformer_config,
 )
 from uniserve.media import image, video
 from uniserve.models import Condition, ConditionRole
-from uniserve.models.minimax_h3 import TransformerConfig
 from uniserve.models.minimax_h3.denoiser import Denoiser
 from uniserve.models.minimax_h3.inputs import DenoiserSize
 from uniserve.models.minimax_h3.packing import patchify_video
@@ -87,7 +87,7 @@ def test_visual_condition_draws_lead_in_packed_order():
 
 
 def _small() -> Denoiser:
-    transformer = TransformerConfig(
+    transformer = transformer_config(
         hidden_size=64,
         num_attention_heads=4,
         num_hidden_layers=1,
@@ -193,7 +193,7 @@ def test_reference_segments_take_whole_tiles():
 def test_reference_segment_state_follows_its_layout():
     model = Denoiser(
         omniref_denoiser(
-            TransformerConfig(
+            transformer_config(
                 hidden_size=64,
                 num_attention_heads=4,
                 num_hidden_layers=1,

@@ -9,8 +9,8 @@ from. Audio conditions are encoded whole as channel-major stereo rows.
 import pytest
 import torch
 
+from tests.python.fixtures.h3 import audio_vae_config, video_vae_config
 from uniserve.media import image, video
-from uniserve.models.minimax_h3 import audio_vae, video_vae
 from uniserve.models.minimax_h3.encoding import AudioEncoder, VideoEncoder
 from uniserve.models.minimax_h3.packing import video_latent_frames
 
@@ -20,12 +20,12 @@ pytestmark = pytest.mark.unit
 def _video_encoder() -> VideoEncoder:
     # Partition and layout queries need no materialized weights.
     with torch.device("meta"):
-        return VideoEncoder(video_vae.Config())
+        return VideoEncoder(video_vae_config())
 
 
 def _audio_encoder() -> AudioEncoder:
     with torch.device("meta"):
-        return AudioEncoder(audio_vae.Config(), sample_rate=32000)
+        return AudioEncoder(audio_vae_config(), sample_rate=32000)
 
 
 @pytest.mark.parametrize("num_frames", (1, 2, 17, 18, 22, 39, 56, 362))
