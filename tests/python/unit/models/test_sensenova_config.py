@@ -66,3 +66,11 @@ def test_an_activation_without_a_gated_form_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="unsupported SenseNova hidden_act"):
         _read(tmp_path, metadata)
+
+
+def test_the_image_sequence_limit_is_required(tmp_path):
+    metadata = neo_metadata()
+    del metadata["max_image_seq_len"]
+
+    with pytest.raises(ValueError, match="max_image_seq_len"):
+        _read(tmp_path, metadata)
