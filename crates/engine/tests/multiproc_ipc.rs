@@ -1349,7 +1349,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         logical_position: 3,
         cache_visible_len: 3,
         cache_computed_len: 5,
-        flow_step: 0,
     };
     for mut batch in [first, successor, verifier, resumed] {
         let batch_id = batch.batch_id;
@@ -1464,7 +1463,6 @@ fn token_batch(
         logical_position: prefix_length,
         cache_visible_len: prefix_length,
         cache_computed_len: prefix_length,
-        flow_step: 0,
     };
     call.token_output = Some(token_output);
     call.input_token_ids = tokens.to_vec();
@@ -3357,18 +3355,18 @@ mod trajectory {
         }
     }
 
-    /// The coordinates of a call after the closed conditioning, at solver
-    /// step `flow_step`.
-    fn coordinates(flow_step: u32) -> CallCoordinates {
+    /// The coordinates of a call after the closed conditioning.
+    fn coordinates() -> CallCoordinates {
         CallCoordinates {
             logical_position: PROMPT.len() as u32,
             cache_visible_len: CONDITIONING,
             cache_computed_len: CONDITIONING,
-            flow_step,
         }
     }
 
-    fn params(key: RequestKey, batch: u64, page: u32, start: u32, count: u32) -> LatentParams {
+    /// The latent page and raster a call on the trajectory in `page`
+    /// addresses; the rank's latent pool keeps the trajectory's step.
+    fn params(key: RequestKey, batch: u64, page: u32) -> LatentParams {
         LatentParams {
             request_key: key,
             call_id: CallId::new(batch, 0),
@@ -3376,8 +3374,6 @@ mod trajectory {
             latent_units: LATENT_UNITS,
             height: SIDE,
             width: SIDE,
-            start_step: start,
-            step_count: count,
         }
     }
 
@@ -3440,7 +3436,6 @@ mod trajectory {
             logical_position: PROMPT.len() as u32,
             cache_visible_len: PROMPT.len() as u32,
             cache_computed_len: PROMPT.len() as u32,
-            flow_step: 0,
         };
         call.input_token_ids = vec![0];
         call.completion_output = Some(output(key, batch_id, 0, generation, DType::U8));
@@ -3474,7 +3469,7 @@ mod trajectory {
             CallKind::Transfer(TransferMode::CacheExport),
         );
         call.component = "model".into();
-        call.coordinates = coordinates(0);
+        call.coordinates = coordinates();
         call.cache_output = Some(buffer);
         call.completion_output = Some(output(key, batch_id, 1, generation + 1, DType::U8));
         call.bounds = Bounds {
@@ -3500,7 +3495,7 @@ mod trajectory {
             CallKind::Media(MediaCall::LatentPreparation),
         );
         call.component = "model".into();
-        call.coordinates = coordinates(0);
+        call.coordinates = coordinates();
         call.cache_input = Some(conditioning);
         call.latent_output = Some(initial.clone());
         call.completion_output = Some(output(key, batch_id, 1, generation, DType::U8));
@@ -3510,11 +3505,11 @@ mod trajectory {
             ..Bounds::default()
         };
         let mut batch = single(batch_id, call);
-        batch.latent_params = vec![params(key, batch_id, page, 0, 0)];
+        batch.latent_params = vec![params(key, batch_id, page)];
         (initial, batch)
     }
 
-    /// Denoise step `step` of the trajectory whose committed version is
+    /// Denoise the next step of the trajectory whose committed version is
     /// `input`, in latent page `page`.
     pub(super) fn denoise(
         batch_id: u64,
@@ -3522,7 +3517,6 @@ mod trajectory {
         conditioning: BufferId,
         input: &TensorRef,
         page: u32,
-        step: u32,
         generation: u32,
     ) -> (TensorRef, Batch) {
         let key = input.request_key;
@@ -3533,7 +3527,7 @@ mod trajectory {
             CallKind::Media(MediaCall::Denoising),
         );
         call.component = "model".into();
-        call.coordinates = coordinates(step);
+        call.coordinates = coordinates();
         call.cache_input = Some(conditioning);
         call.latent_input = Some(input.clone());
         call.latent_output = Some(next.clone());
@@ -3552,7 +3546,7 @@ mod trajectory {
             query_lens: vec![LATENT_UNITS + 2],
             write_cache: vec![false],
         };
-        batch.latent_params = vec![params(key, batch_id, page, step, 1)];
+        batch.latent_params = vec![params(key, batch_id, page)];
         (next, batch)
     }
 
@@ -3565,7 +3559,7 @@ mod trajectory {
             CallKind::Media(MediaCall::ImageDecoding),
         );
         call.component = "model".into();
-        call.coordinates = coordinates(IMAGE_STEPS);
+        call.coordinates = coordinates();
         call.latent_input = Some(input.clone());
         call.completion_output = Some(output(key, batch_id, 2, generation, DType::U8));
         // The base64 bound the scheduler derives for a 32x32 PNG.
@@ -3575,7 +3569,7 @@ mod trajectory {
             ..Bounds::default()
         };
         let mut batch = single(batch_id, call);
-        batch.latent_params = vec![params(key, batch_id, page, IMAGE_STEPS, 0)];
+        batch.latent_params = vec![params(key, batch_id, page)];
         batch
     }
 }
@@ -3683,7 +3677,6 @@ fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyho
             reference_conditioning,
             &version,
             2,
-            step,
             6 + 2 * step,
         );
         completed(&mut executor, batch, "denoise")?;
@@ -3723,7 +3716,6 @@ fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyho
             denoising_conditioning,
             &version,
             1,
-            step,
             9 + 2 * step,
         );
         completed(&mut executor, batch, "denoise")?;
@@ -4727,7 +4719,6 @@ fn coordinates_after(output: &uniserve_ipc::RequestOutput) -> CallCoordinates {
         logical_position: output.cache_visible_len,
         cache_visible_len: output.cache_visible_len,
         cache_computed_len: output.cache_computed_len,
-        flow_step: output.num_completed_steps,
     }
 }
 

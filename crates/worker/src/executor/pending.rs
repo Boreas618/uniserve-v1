@@ -45,6 +45,11 @@ pub(crate) struct PendingOutput {
     pub candidate_range: Option<(usize, usize)>,
     /// Element offset and length of [step outcome | canvas token ids].
     pub canvas_range: Option<(usize, usize)>,
+    /// The trajectory step the call's latent update publishes, which a
+    /// successful denoising result reports as the steps its trajectory
+    /// completed; zero for every other call. The latent pool is the rank's
+    /// ledger of steps, so no coordinate carries it.
+    completed_steps: u32,
     tensor_outputs: Vec<TensorRef>,
     products: Vec<TensorExport>,
     speculation: Option<Speculation>,
@@ -57,7 +62,6 @@ impl PendingOutput {
         let coordinates = &call.coordinates;
         let progress = RequestProgress {
             logical_position: u64::from(coordinates.logical_position),
-            flow_step: u64::from(coordinates.flow_step),
             cache_visible_len: u64::from(coordinates.cache_visible_len),
             cache_computed_len: u64::from(coordinates.cache_computed_len),
             ..previous
@@ -75,6 +79,7 @@ impl PendingOutput {
             prompt_logprob_ranges: Vec::new(),
             candidate_range: None,
             canvas_range: None,
+            completed_steps: 0,
             tensor_outputs,
             products: Vec::new(),
             speculation: None,
@@ -168,14 +173,16 @@ impl PendingOutput {
         self.progress.cache_computed_len = length;
     }
 
-    /// Mirror a validated physical trajectory commit in the call's progress.
-    /// Releasing the trajectory ends its solver sequence.
-    pub(crate) fn apply_latent_update(&mut self, update: &LatentUpdate) {
-        self.progress.flow_step = if update.release {
+    /// Record the step a validated trajectory commit publishes, which the
+    /// call's completion reports. Releasing the trajectory publishes none.
+    pub(crate) fn apply_latent_update(&mut self, update: &LatentUpdate) -> Result<()> {
+        self.completed_steps = if update.release {
             0
         } else {
-            update.step as u64
+            u32::try_from(update.step)
+                .map_err(|_| Error::State("a trajectory step exceeds its wire range"))?
         };
+        Ok(())
     }
 
     /// Verification initializes the prefix cache for the full draft. Acceptance later makes
@@ -248,6 +255,11 @@ impl PendingOutput {
         }
 
         set_progress(&mut self.output, self.progress)?;
+        self.output.num_completed_steps = if self.output.status == CallStatus::Ok {
+            self.completed_steps
+        } else {
+            0
+        };
         let [queued_us, device_us, copy_us, host_us] = buffer.observe(self.row)?;
         self.output.timing_counters = TimingCounters {
             queued_us,
@@ -420,7 +432,6 @@ fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> Result
     };
     output.cache_visible_len = narrow(progress.cache_visible_len)?;
     output.cache_computed_len = narrow(progress.cache_computed_len)?;
-    output.num_completed_steps = narrow(progress.flow_step)?;
     Ok(())
 }
 
@@ -490,15 +501,13 @@ mod tests {
         for transferred in [false, true] {
             let mut pool = LatentPool::new(1, 2, 4)?;
             let mut call = call();
-            let mut params = LatentParams {
+            let params = LatentParams {
                 request_key: call.request_key,
                 call_id: call.call_id,
                 page_table: vec![1],
                 latent_units: 4,
                 height: 16,
                 width: 64,
-                start_step: 0,
-                step_count: 0,
             };
             let mut reference = TensorRef {
                 request_key: call.request_key,
@@ -511,7 +520,7 @@ mod tests {
 
             call.code = CallKind::Media(MediaCall::LatentPreparation);
             call.latent_output = transferred.then(|| reference.clone());
-            let initial = LatentUpdate::for_call(1, &call, &params)?;
+            let initial = LatentUpdate::for_call(1, &call, &params, pool.committed_step(1))?;
             pool.validate_updates(std::slice::from_ref(&initial))?;
             pool.apply_updates(&[initial]);
             let generation = if transferred { 7 } else { 1 };
@@ -524,35 +533,35 @@ mod tests {
             };
             assert_eq!(pool.current_bank(1, &committed, &[1])?, 1);
 
+            // A denoising call advances the pool's committed step by one, and
+            // its completion reports the step it published.
             call.code = CallKind::Media(MediaCall::Denoising);
             call.latent_input = call.latent_output.take();
             reference.generation = 19;
             call.latent_output = transferred.then(|| reference.clone());
-            params.step_count = 2;
-            let update = LatentUpdate::for_call(1, &call, &params)?;
+            let update = LatentUpdate::for_call(1, &call, &params, pool.committed_step(1))?;
             let mut output = PendingOutput::new(&call, RequestProgress::default(), 0)?;
             pool.validate_updates(std::slice::from_ref(&update))?;
-            output.apply_latent_update(&update);
+            output.apply_latent_update(&update)?;
             pool.apply_updates(&[update]);
-            let generation = if transferred { 19 } else { 3 };
+            let generation = if transferred { 19 } else { 2 };
             let denoised = TrajectoryVersion {
-                step: 2,
+                step: 1,
                 generation,
                 ..committed
             };
             assert_eq!(pool.current_bank(1, &denoised, &[1])?, 0);
-            assert_eq!(output.progress.flow_step, 2);
+            assert_eq!(pool.committed_step(1), 1);
+            assert_eq!(output.completed_steps, 1);
 
             if transferred {
                 call.code = CallKind::Media(MediaCall::ImageDecoding);
                 call.latent_input = call.latent_output.take();
-                params.start_step = 2;
-                params.step_count = 0;
-                let release = LatentUpdate::for_call(1, &call, &params)?;
+                let release = LatentUpdate::for_call(1, &call, &params, pool.committed_step(1))?;
                 pool.validate_updates(std::slice::from_ref(&release))?;
-                output.apply_latent_update(&release);
+                output.apply_latent_update(&release)?;
                 pool.apply_updates(&[release]);
-                assert_eq!(output.progress.flow_step, 0);
+                assert_eq!(output.completed_steps, 0);
             } else {
                 pool.release_slots(&[1])?;
             }

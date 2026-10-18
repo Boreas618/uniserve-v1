@@ -15,13 +15,13 @@ use crate::{Error, Result};
 
 /// Accepted coordinates of a state-consuming call.
 ///
-/// Cache lengths and logical positions count tokens. `flow_step` counts solver
-/// steps; `rng_counter` counts draws in the request's sampling stream.
+/// Cache lengths and logical positions count tokens; `rng_counter` counts
+/// draws in the request's sampling stream. A trajectory's solver steps are
+/// the latent pool's ledger, not a request coordinate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestProgress {
     pub logical_position: u64,
     pub rng_counter: u64,
-    pub flow_step: u64,
     pub cache_visible_len: u64,
     pub cache_computed_len: u64,
     pub prompt_logits_ready: bool,
@@ -526,7 +526,6 @@ mod tests {
                 cache_computed_len: 9,
                 cache_visible_len: 9,
                 prompt_logits_ready: true,
-                ..RequestProgress::default()
             }),
         )?;
         assert_eq!(pool.get(7)?.progress()?.logical_position, 9);

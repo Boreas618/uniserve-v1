@@ -344,7 +344,10 @@ impl<'a> ImageBatch<'a> {
             .seal(&self.storage.events, &self.job)
             .map_err(&failed)?;
         for (index, update) in &self.updates {
-            self.batch.calls[*index].output.apply_latent_update(update);
+            self.batch.calls[*index]
+                .output
+                .apply_latent_update(update)
+                .map_err(&failed)?;
         }
         self.requests
             .validate_pending(&Batch::<()>::pending(self.plan))

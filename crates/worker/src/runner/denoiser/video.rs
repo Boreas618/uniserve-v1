@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
+use uniserve_core::Canvas;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::{Call, LatentParams};
 
@@ -480,18 +481,20 @@ impl DenoiserRunner {
 
     /// Copy a request's prepared host sources into its slot: each
     /// modality's sample into bank 1 of its pages and each table into its
-    /// slot rows. The host task that filled them has completed.
+    /// slot rows. The host task that filled them has completed. `canvas` is
+    /// the request's admitted canvas, the raster its samples decode to.
     pub(crate) fn initialize(
         &mut self,
         id: usize,
         slot: usize,
         call: &Call,
-        params: &LatentParams,
+        canvas: Canvas,
         job: &Job,
     ) -> Result<LatentUpdate> {
         let (_, stream) = self.cuda()?;
         let video = self.family.video_mut()?;
-        let pages = video.slot_pages(slot, params)?;
+        let params = video.trajectory(slot, call, canvas);
+        let pages = video.slot_pages(&params)?;
         video.pool.require_initial(slot, &pages)?;
         let layout = video.layout(id)?;
         let first = pages[0] as u64;
@@ -516,7 +519,13 @@ impl DenoiserRunner {
         // no other request owns; the pinned sources stay allocated for the
         // runner's lifetime and are rewritten only by the slot's next request.
         unsafe { job.on(Some(&stream)).copy(&copies) }?;
-        LatentUpdate::for_call(slot, call, params)
+        LatentUpdate::for_call(slot, call, &params, 0)
+    }
+
+    /// The step of `slot`'s committed trajectory, from the latent pool: the
+    /// step its next denoising call advances.
+    pub(crate) fn committed_step(&self, slot: usize) -> Result<i64> {
+        Ok(self.family.video()?.pool.committed_step(slot))
     }
 
     /// Whether this rank retains a request's conditioning: whether it holds
@@ -651,26 +660,24 @@ impl DenoiserRunner {
         Ok(())
     }
 
-    /// Advance a request's trajectory by one solver step and return its
-    /// commit. `outputs` receive the final step's local samples, one view
-    /// per modality.
+    /// Advance a request's trajectory by one solver step, from the step the
+    /// latent pool committed, and return its commit. `canvas` is the
+    /// request's admitted canvas.
     pub(crate) fn denoise(
         &mut self,
         id: usize,
         slot: usize,
         call: &Call,
-        params: &LatentParams,
+        canvas: Canvas,
         job: &Job,
     ) -> Result<(LatentUpdate, GraphMode)> {
-        if params.step_count != 1 {
-            return Err(Error::Invalid(
-                "a video denoising call advances exactly one solver step".into(),
-            ));
-        }
         let (_, stream) = self.cuda()?;
         let video = self.family.video_mut()?;
-        let pages = video.slot_pages(slot, params)?;
-        let step = i64::from(params.start_step);
+        let params = video.trajectory(slot, call, canvas);
+        let pages = video.slot_pages(&params)?;
+        let step = video.pool.committed_step(slot);
+        let evaluation = u32::try_from(step)
+            .map_err(|_| Error::Invariant("a committed latent step exceeds u32".into()))?;
         let trajectory = TrajectoryVersion {
             step,
             generation: step + 1,
@@ -709,7 +716,7 @@ impl DenoiserRunner {
             issue.copy(&gather)?;
             issue.fill(Fill {
                 address: video.step.address(),
-                value: params.start_step,
+                value: evaluation,
                 width: 4,
                 count: 1,
             })?;
@@ -731,7 +738,7 @@ impl DenoiserRunner {
         );
         // SAFETY: as above; the scatter follows the step on the stream.
         unsafe { issue.copy(&scatter) }?;
-        Ok((LatentUpdate::for_call(slot, call, params)?, mode))
+        Ok((LatentUpdate::for_call(slot, call, &params, step)?, mode))
     }
 
     /// The final step's local sample of each modality, as `[rows, width]`
@@ -1093,20 +1100,27 @@ impl VideoDenoiser {
             .ok_or_else(|| Error::Invariant(format!("video layout {id} is not prepared")))
     }
 
-    /// The pages of `slot` as the scheduler must assign them.
-    fn slot_pages(&self, slot: usize, params: &LatentParams) -> Result<Vec<usize>> {
-        let expected = self.pages.for_slot(slot as u64);
-        if params.page_table.len() as u64 != expected.end - expected.start
-            || params
-                .page_table
-                .iter()
-                .zip(expected)
-                .any(|(&page, wanted)| u64::from(page) != wanted)
-        {
-            return Err(Error::Invalid(
-                "video latent pages are not the request slot's pages".into(),
-            ));
+    /// The pages, latent units and raster of `slot`'s trajectory. The pool
+    /// gives every request slot the same run of consecutive pages after the
+    /// padding page ([`SamplePages::for_slot`]), so the rank names them
+    /// itself; the raster is the request's admitted canvas.
+    fn trajectory(&self, slot: usize, call: &Call, canvas: Canvas) -> LatentParams {
+        LatentParams {
+            request_key: call.request_key,
+            call_id: call.call_id,
+            page_table: self
+                .pages
+                .for_slot(slot as u64)
+                .map(|page| page as u32)
+                .collect(),
+            latent_units: (self.pages.pages * self.pages.page_units) as u32,
+            height: canvas.height,
+            width: canvas.width,
         }
+    }
+
+    /// The pages of a trajectory, checked against the pool's bounds.
+    fn slot_pages(&self, params: &LatentParams) -> Result<Vec<usize>> {
         self.pool.validate_pages(
             &params
                 .page_table

@@ -48,7 +48,6 @@ fn ar_decode_call() -> Call {
             logical_position: 7,
             cache_visible_len: 5,
             cache_computed_len: 6,
-            flow_step: 0,
         },
 
         token_output: Some(output_product(CallId::new(11, 0))),
@@ -447,11 +446,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 true,
             );
         }
-        if matches!(
-            call.code,
-            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
-        ) || call.latent_input.is_some()
-        {
+        if call.addresses_latent_pages() {
             run.latent_params.push(LatentParams {
                 request_key: call.request_key,
                 call_id: call.call_id,
@@ -459,8 +454,6 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 latent_units: 1,
                 height: 1,
                 width: 1,
-                start_step: 0,
-                step_count: u32::from(call.code == CallKind::Media(MediaCall::Denoising)),
             });
         }
         if matches!(
@@ -709,8 +702,9 @@ fn a_batch_carries_one_computation_through_one_entry() {
 }
 
 #[test]
-fn solver_parameters_round_trip_with_request_or_paged_storage() {
-    let call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+fn latent_parameters_round_trip_with_request_or_paged_storage() {
+    let mut call = call_for(CallKind::Media(MediaCall::Denoising), CallId::new(101, 0));
+    call.latent_output = Some(output_product(call.call_id));
     let mut run = batch_with_calls(1, Vec::new(), vec![call]);
     assert_eq!(execute_round_trip(run.clone()), run);
 
