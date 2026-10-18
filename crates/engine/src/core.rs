@@ -25,7 +25,7 @@ use crate::handle::{EngineHandle, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    DEFAULT_MAX_NUM_SEQS,
 };
 use crate::scheduler::{MAX_FLOW_PREFIX_ROWS, MAX_NUM_SEQS, flow_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
@@ -341,9 +341,6 @@ pub struct EngineConfig {
     pub max_num_seqs: usize,
     /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
-    /// Per-step budget of text prefill tokens allowed to join a decode batch
-    /// as one mixed extend+decode forward. `0` disables mixing.
-    pub mixed_prefill_tokens: usize,
     /// Reuse and retain prompt cache prefixes across requests. Disabling this
     /// does not remove the cache storage needed within an active request.
     pub prefix_reuse: bool,
@@ -413,7 +410,6 @@ impl EngineConfig {
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             prefix_reuse: true,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
@@ -780,7 +776,6 @@ impl EngineCore {
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
                 max_num_seqs: config.max_num_seqs.max(1),
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
-                mixed_prefill_tokens: config.mixed_prefill_tokens,
                 policy: config.scheduler_policy,
                 ..Default::default()
             },
