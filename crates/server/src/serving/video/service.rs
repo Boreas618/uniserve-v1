@@ -75,14 +75,18 @@ pub struct VideoService {
     tasks: Vec<VideoTask>,
     max_video_seconds: f64,
     max_condition_rows: u32,
+    /// Condition units one latent encoding round covers, which reference
+    /// images are banded to fill (`RequestPlan::image_bands`).
+    latent_encoding_lane: u32,
     media: VideoMediaSettings,
     processor: VideoProcessor,
 }
 
 impl VideoService {
     /// Binds the served denoiser, the checkpoint's vision processor, the
-    /// deployment's duration and condition-row capacities and media policy,
-    /// and the tokenizer.
+    /// deployment's duration and condition-row capacities, the condition
+    /// units its latent encoder covers in one round, its media policy, and
+    /// the tokenizer.
     ///
     /// # Errors
     ///
@@ -93,6 +97,7 @@ impl VideoService {
         vision: VisionConfig,
         max_video_seconds: f64,
         max_condition_rows: u32,
+        latent_encoding_lane: u32,
         media: &VideoMediaSettings,
         tokenizer: DynTokenizer,
     ) -> anyhow::Result<Self> {
@@ -129,6 +134,7 @@ impl VideoService {
             tasks,
             max_video_seconds,
             max_condition_rows,
+            latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
         })
     }
@@ -284,6 +290,7 @@ impl VideoService {
 
         // Each condition's media reaches the worker's media reader through
         // shared memory on this host.
+        let image_bands = plan.image_bands(self.latent_encoding_lane);
         let mut media = Vec::with_capacity(processed.media.len());
         let mut conditions = Vec::with_capacity(processed.media.len());
         for (condition, fetched) in plan.conditions.iter().zip(&processed.media) {
@@ -293,7 +300,7 @@ impl VideoService {
                     condition.index
                 ))
             })?;
-            conditions.push(condition.describe(plan.canvas, source.locator()));
+            conditions.push(condition.describe(plan.canvas, source.locator(), image_bands));
             media.push(Arc::new(source));
         }
         Ok(ProcessedVideo {
@@ -519,11 +526,22 @@ mod tests {
     }
 
     /// A denoiser serving every task that packs conditions as `tiles`
-    /// prescribes.
+    /// prescribes, on a latent encoder of one rank.
     fn packed_service(
         max_condition_rows: u32,
         max_sequence_rows: Option<u32>,
         condition_tiles: Option<ConditionTiles>,
+    ) -> VideoService {
+        encoding_service(max_condition_rows, max_sequence_rows, condition_tiles, 1)
+    }
+
+    /// A denoiser serving every task whose latent encoder covers
+    /// `latent_encoding_lane` condition units in one round.
+    fn encoding_service(
+        max_condition_rows: u32,
+        max_sequence_rows: Option<u32>,
+        condition_tiles: Option<ConditionTiles>,
+        latent_encoding_lane: u32,
     ) -> VideoService {
         VideoService::new(
             VideoDenoiserInfo {
@@ -538,6 +556,7 @@ mod tests {
             vision(),
             15.0,
             max_condition_rows,
+            latent_encoding_lane,
             &VideoMediaSettings::default(),
             Arc::new(character_tokenizer()),
         )
@@ -753,11 +772,12 @@ mod tests {
     /// A reference image becomes one condition the worker can read and
     /// encode: its bytes published under its locator, resized to its 2048
     /// short edge, read by the conditioner as one image block, and encoded
-    /// as one latent unit. The presentation's tags travel with its tokens.
+    /// in one band of its patch rows per unit of a latent encoding round.
+    /// The presentation's tags travel with its tokens.
     #[tokio::test]
     async fn a_reference_image_is_described_for_the_worker() {
         let image = png(160, 90);
-        let processed = service(1 << 17, None)
+        let processed = encoding_service(1 << 17, None, None, 4)
             .process(
                 &ServeRequestId::new("reference"),
                 &request(serde_json::json!({
@@ -805,7 +825,8 @@ mod tests {
                 frame_indices: Vec::new(),
             })
         );
-        assert_eq!(condition.latent_units, [7296]);
+        // 64 patch rows of 114 patches, 16 rows to each of four bands.
+        assert_eq!(condition.latent_units, [16 * 114; 4]);
         assert_eq!(condition.audio_rows, 0);
         assert_eq!(
             published(&condition.source.name, condition.source.bytes),
@@ -815,10 +836,11 @@ mod tests {
 
     /// The first keyframe is stretched onto the canvas its own aspect sets
     /// and a second one cover-cropped: each is one still image at the
-    /// canvas, anchoring its end of the video.
+    /// canvas, anchoring its end of the video, and one latent unit on any
+    /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let processed = service(1 << 17, None)
+        let processed = encoding_service(1 << 17, None, None, 4)
             .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({
@@ -864,6 +886,7 @@ mod tests {
             })
         );
         assert_eq!(first.latent_units, [1008]);
+        assert_eq!(last.latent_units, [1008]);
         assert!(first.vision.is_some() && last.vision.is_some());
     }
 

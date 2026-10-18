@@ -53,7 +53,7 @@ pub use crate::worker::{
     BatchSubmitError, CallReaders, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
     FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
 };
-pub use uniserve_ipc::{DEFAULT_COMPONENT, VideoDenoiserInfo};
+pub use uniserve_ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///

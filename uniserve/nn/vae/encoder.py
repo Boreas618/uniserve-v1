@@ -57,20 +57,29 @@ class LatentEncoder(nn.Module):
         self,
         inputs: torch.Tensor,
         *,
+        rows: slice | None = None,
         window: tuple[slice, ...] | None = None,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the normalized FP32 latent of ``inputs``.
 
-        ``window`` indexes the encoder output in native latent coordinates
-        and keeps only that region, such as the latent frames of an input
-        that was padded to the encoder's temporal extent; the posterior then
-        samples the kept region alone. ``noise`` is the standard normal draw
-        a sampling posterior adds, with the kept mean's shape; without it the
-        posterior draws its own.
+        ``rows`` asks for a band of latent rows along the height axis alone,
+        which a ``TiledEncoder`` computes from the tiles the band depends
+        on; None encodes every row. ``window`` then indexes the encoder
+        output in native latent coordinates and keeps only that region, such
+        as the latent frames of an input that was padded to the encoder's
+        temporal extent; the posterior samples the kept region alone.
+        ``noise`` is the standard normal draw a sampling posterior adds, with
+        the kept mean's shape; without it the posterior draws its own.
+
+        Raises:
+            ValueError: ``rows`` is given to an encoder that is not a
+                ``TiledEncoder``, or the latent statistics live elsewhere.
         """
         if isinstance(self.encoder, TiledEncoder):
-            values = self.encoder.encode(inputs, tiled=True)
+            values = self.encoder.encode(inputs, tiled=True, rows=rows)
+        elif rows is not None:
+            raise ValueError("a band of latent rows needs a tiled encoder")
         else:
             values = self.encoder(inputs)
         if window is not None:

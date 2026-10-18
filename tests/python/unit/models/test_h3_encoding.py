@@ -82,6 +82,71 @@ def test_video_encoding_rejects_inputs_outside_the_clip_contract():
             num_frames=(1,),
         )
 
+    # Bands are runs of whole two-row patch rows of a still frame.
+    still = torch.zeros((1, 64, 64, 3), dtype=torch.uint8)
+    for band in (slice(1, 3), slice(0, 5), slice(2, 2)):
+        with pytest.raises(ValueError, match="whole latent row groups"):
+            encoder.encode(
+                (still,), clips=(slice(0, 1),), num_frames=(1,), rows=(band,)
+            )
+    with pytest.raises(ValueError, match="whole latent row groups"):
+        encoder.encode(
+            (frames,),
+            clips=(slice(0, 17),),
+            num_frames=(39,),
+            rows=(slice(0, 2),),
+        )
+
+
+@pytest.mark.parametrize(
+    "edges",
+    (
+        (0, 40),
+        (0, 20, 40),
+        (0, 12, 26, 40),
+        (0, 2, 4, 6, 8, 14, 22, 30, 38, 40),
+    ),
+)
+def test_still_frame_bands_assemble_the_whole_encoding(edges):
+    """Bands of a still frame encoded separately give its encoding exactly.
+
+    The 640x320 frame spans three tile rows and two tile columns, so bands
+    start inside the tiles' cross-fades and before and after their seams;
+    every band's rows land where the layout places them. ``edges`` are the
+    bands' boundaries in latent rows, each a whole number of row groups.
+    """
+    torch.manual_seed(0)
+    encoder = VideoEncoder(
+        video_vae_config(block_out_channels=(32,) * 6, layers_per_block=1)
+    )
+    for parameter in encoder.parameters():
+        torch.nn.init.normal_(parameter, std=0.05)
+    pixels = torch.randint(0, 256, (1, 640, 320, 3), dtype=torch.uint8)
+    # Every band takes the frame's complete posterior draw.
+    size = video.Config(1, image.Config(640, 320))
+    draw = torch.empty(encoder.posterior_shape(size))
+    encoder.draw_noise(size, draw)
+    bands = tuple(
+        slice(start, stop)
+        for start, stop in zip(edges, edges[1:], strict=False)
+    )
+
+    (whole,) = encoder.encode(
+        (pixels,), clips=(slice(0, 1),), num_frames=(1,), noise=(draw,)
+    )
+    banded = encoder.encode(
+        (pixels,) * len(bands),
+        clips=(slice(0, 1),) * len(bands),
+        num_frames=(1,) * len(bands),
+        noise=(draw,) * len(bands),
+        rows=bands,
+    )
+
+    assembled = torch.full_like(whole.tensor, torch.nan)
+    for result in banded:
+        assembled[result.layout.local_slice] = result.tensor
+    assert torch.equal(assembled, whole.tensor)
+
 
 def test_video_encoding_takes_its_conditions_posterior_draw():
     # The posterior is sampled, so every unit takes its condition's complete

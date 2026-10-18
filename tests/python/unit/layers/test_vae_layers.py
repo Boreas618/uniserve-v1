@@ -82,3 +82,42 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
 
     assert tiled.shape == (2, 3, 18, 15)
     torch.testing.assert_close(tiled, encoder.encode(pixels, tiled=False))
+
+
+def test_tiled_encoder_bands_are_rows_of_the_whole_encoding():
+    """Every band of latent rows equals those rows of the whole encoding.
+
+    A padded convolution reads across tile edges, so tiles disagree on their
+    overlaps and each band's seams must blend exactly as the whole raster's
+    do, including bands that start inside a cross-fade.
+    """
+    from uniserve.nn.vae import TiledEncoder
+
+    torch.manual_seed(0)
+    encoder = TiledEncoder(
+        torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.AvgPool2d(4)
+        ),
+        spatial_compression=4,
+        tile_height=32,
+        tile_width=16,
+        overlap_height=8,
+        overlap_width=4,
+    )
+    pixels = torch.randn(2, 3, 76, 40)
+
+    with torch.inference_mode():
+        whole = encoder.encode(pixels, tiled=True)
+        for start in range(whole.shape[-2]):
+            for stop in range(start + 1, whole.shape[-2] + 1):
+                band = encoder.encode(
+                    pixels, tiled=True, rows=slice(start, stop)
+                )
+                assert torch.equal(band, whole[..., start:stop, :])
+
+    with pytest.raises(ValueError, match="latent rows"):
+        encoder.encode(pixels, tiled=True, rows=slice(4, 4))
+    with pytest.raises(ValueError, match="latent rows"):
+        encoder.encode(pixels, tiled=True, rows=slice(0, whole.shape[-2] + 1))
+    with pytest.raises(ValueError, match="tiled encoding"):
+        encoder.encode(pixels, tiled=False, rows=slice(0, 4))

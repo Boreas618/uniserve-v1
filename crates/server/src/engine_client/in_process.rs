@@ -226,6 +226,13 @@ impl EngineClient {
         self.first().info().video_denoiser.clone()
     }
 
+    /// Returns the media units one call of `call` covers at once on the
+    /// deployment's workers (`EngineCore::media_lane_units`); `None` when no
+    /// worker serves it.
+    pub fn media_lane_units(&self, call: uniserve_engine::MediaCall) -> Option<u32> {
+        self.first().media_lane_units(call)
+    }
+
     /// Returns whether the engine can accept requests: whether any replica's
     /// core is alive. Requests route only to live replicas.
     pub fn is_healthy(&self) -> bool {

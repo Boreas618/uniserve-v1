@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
+use uniserve_core::video::plan::CANVAS_MULTIPLE;
 use uniserve_core::{Canvas, VideoCondition};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{Batch as BatchPlan, CallKind, MediaCall};
@@ -91,12 +92,20 @@ pub(crate) enum ConditionMedium {
     Audio,
 }
 
+/// One visual unit as the encoder takes it: `[pixel_offset, frames, width,
+/// height, window, first_row, stop_row]`: its condition's first pixel row,
+/// frame count and raster, the index of the encoder window the unit's frames
+/// are, and the run of the frames' rows of 32-pixel latent patches it
+/// encodes. A reference image's band reads its whole frame (window 0) and
+/// encodes the band's patch rows; every other unit encodes all of them.
+pub(crate) type ConditionUnit = [i64; 7];
+
 /// What a condition encoding call encodes on this rank.
 pub(crate) enum ConditionInput {
-    /// Visual units, each `[pixel_offset, frames, width, height, unit]`,
-    /// written to rows `region` of the round's `rows`.
+    /// Visual units ([`ConditionUnit`]), written to rows `region` of the
+    /// round's `rows`.
     Units {
-        units: Vec<[i64; 5]>,
+        units: Vec<ConditionUnit>,
         rows: u64,
         region: std::ops::Range<u64>,
     },
@@ -151,7 +160,7 @@ impl Conditions {
                 ConditionInput::Tracks { .. } => None,
             })
             .flatten()
-            .map(|&[_, frames, width, height, _]| [frames, width, height])
+            .map(|&[_, frames, width, height, ..]| [frames, width, height])
             .collect();
         sizes.sort_unstable();
         sizes.dedup();
@@ -183,9 +192,9 @@ impl Conditions {
     /// The input shapes of a call encoding `units`: each unit's frames at
     /// its raster. `None` while the unit frames of one of the conditions
     /// were not asked for.
-    fn unit_shapes(&self, units: &[[i64; 5]]) -> Result<Option<Vec<i64>>> {
+    fn unit_shapes(&self, units: &[ConditionUnit]) -> Result<Option<Vec<i64>>> {
         let mut shapes = Vec::with_capacity(units.len() * 4);
-        for &[_, frames, width, height, unit] in units {
+        for &[_, frames, width, height, unit, _, _] in units {
             let Some(lengths) = self.frames.get(&frames) else {
                 return Ok(None);
             };
@@ -367,12 +376,12 @@ impl Conditions {
         Ok(())
     }
 
-    /// Encode visual units, each `[pixel_offset, frames, width, height,
-    /// unit]`, into consecutive rows of `out`.
+    /// Encode visual units ([`ConditionUnit`]) into consecutive rows of
+    /// `out`.
     fn encode_video(
         &mut self,
         pixels: &StorageView,
-        units: &[[i64; 5]],
+        units: &[ConditionUnit],
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
@@ -388,7 +397,7 @@ impl Conditions {
         ];
         // Each unit reads its condition size's posterior draw; an encoder
         // that takes no draw reads none.
-        for &[_, frames, width, height, _] in units {
+        for &[_, frames, width, height, ..] in units {
             match self.posteriors.get(&[frames, width, height]) {
                 Some(Posterior::Drawn(noise)) => arguments.push(Argument::Tensor(noise.clone())),
                 Some(Posterior::None) => {}
@@ -589,12 +598,12 @@ impl EncoderRunner {
         self.condition_encoders()?.accept(setup, completion)
     }
 
-    /// Encode a condition's visual units, each `[pixel_offset, frames,
-    /// width, height, unit]`, into consecutive rows of `out`.
+    /// Encode a condition's visual units ([`ConditionUnit`]) into
+    /// consecutive rows of `out`.
     pub(crate) fn encode_condition_units(
         &mut self,
         pixels: &StorageView,
-        units: &[[i64; 5]],
+        units: &[ConditionUnit],
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
@@ -823,25 +832,29 @@ fn condition_input(
                 offsets.push(cursor_pixels);
                 cursor_pixels += condition.pixel_bytes() / 3;
             }
-            let units: Vec<[i64; 5]> = round[run.start as usize..run.end as usize]
+            let units: Vec<ConditionUnit> = round[run.start as usize..run.end as usize]
                 .iter()
                 .map(|&(condition, unit, _)| {
-                    let (frames, canvas) = conditions[condition].media.pixels().unwrap_or((
+                    let condition_ref = &conditions[condition];
+                    let (frames, canvas) = condition_ref.media.pixels().unwrap_or((
                         0,
                         Canvas {
                             width: 0,
                             height: 0,
                         },
                     ));
-                    [
+                    let (window, patch_rows) = unit_rows(condition_ref, unit, frames, canvas)?;
+                    Ok([
                         offsets[condition] as i64,
                         i64::from(frames),
                         i64::from(canvas.width),
                         i64::from(canvas.height),
-                        i64::from(unit),
-                    ]
+                        i64::from(window),
+                        i64::from(patch_rows.start),
+                        i64::from(patch_rows.end),
+                    ])
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             Ok(Some(ConditionInput::Units {
                 units,
                 rows,
@@ -867,6 +880,42 @@ fn condition_input(
             "latent encoding does not produce {other}"
         ))),
     }
+}
+
+/// The encoder window and the rows of 32-pixel latent patches that unit
+/// `unit` of `condition` encodes, its pixels being `frames` frames of
+/// `canvas`.
+///
+/// A still frame planned as several units is encoded in bands of its patch
+/// rows, each band reading the whole frame: the head deals the patch rows in
+/// order, so a band's first row follows the rows of the bands before it
+/// (`uniserve_core::video::plan::ConditionPlan::latent_units`). Any other
+/// unit is its encoder window, over every patch row.
+fn unit_rows(
+    condition: &VideoCondition,
+    unit: u32,
+    frames: u32,
+    canvas: Canvas,
+) -> Result<(u32, std::ops::Range<u32>)> {
+    let patch_rows = canvas.height / CANVAS_MULTIPLE;
+    let units = &condition.latent_units;
+    if frames != 1 || units.len() < 2 {
+        return Ok((unit, 0..patch_rows));
+    }
+    let patches_per_row = canvas.width / CANVAS_MULTIPLE;
+    let unit = unit as usize;
+    let rows_before: u32 = units[..unit].iter().sum();
+    let rows = units[unit];
+    if patches_per_row == 0
+        || !rows_before.is_multiple_of(patches_per_row)
+        || !rows.is_multiple_of(patches_per_row)
+    {
+        return Err(Error::Invalid(
+            "an image band is not whole rows of latent patches".into(),
+        ));
+    }
+    let first = rows_before / patches_per_row;
+    Ok((0, first..first + rows / patches_per_row))
 }
 
 /// Record into `job` what the batch's condition encodings lack before

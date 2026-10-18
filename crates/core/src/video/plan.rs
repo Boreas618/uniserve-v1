@@ -1038,16 +1038,34 @@ impl ConditionPlan {
         )
     }
 
-    /// Denoiser video rows of each temporal unit the video encoder encodes,
-    /// in unit order.
+    /// Denoiser video rows of each unit the video encoder encodes, in unit
+    /// order.
     ///
-    /// A still image is one unit. A video's `17n + 5` encoded frames are
+    /// A keyframe is one unit. A reference image is `image_bands` units:
+    /// bands of its rows of 32x32-pixel patches dealt as evenly as possible
+    /// in order, so with `g` patch rows band `b` holds rows `b * g / bands`
+    /// to `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one
+    /// through `g`. Each band is encoded on its own and the bands assemble
+    /// the whole image's encoding; a rank finds a band's patch rows from the
+    /// rows of the bands before it. A video's `17n + 5` encoded frames are
     /// `n + 1` units of up to 17 frames: each complete one yields 5 latent
     /// frames and the last 2, the video encoder dropping the leading 3 of
     /// its padded final clip. An audio reference has none.
-    pub fn latent_units(&self) -> Vec<u32> {
+    pub fn latent_units(&self, image_bands: u32) -> Vec<u32> {
         match &self.prepared {
-            Prepared::Keyframe(_) | Prepared::Image(_) => vec![self.video_rows],
+            Prepared::Keyframe(_) => vec![self.video_rows],
+            Prepared::Image(size) => {
+                let patch_rows = size.height / CANVAS_MULTIPLE;
+                let patches_per_row = size.width / CANVAS_MULTIPLE;
+                let bands = image_bands.clamp(1, patch_rows.max(1));
+                (0..bands)
+                    .map(|band| {
+                        let start = band * patch_rows / bands;
+                        let stop = (band + 1) * patch_rows / bands;
+                        (stop - start) * patches_per_row
+                    })
+                    .collect()
+            }
             Prepared::Video(clip) => {
                 let complete = (clip.vae_frames - CLIP_LATENTS) / CLIP_FRAMES;
                 let rows_per_frame = rows_per_frame(clip.canvas);
@@ -1063,9 +1081,15 @@ impl ConditionPlan {
 
     /// Describes the condition for the engine and the workers: its role, the
     /// published media at `source`, what the media reader decodes it into,
-    /// what the conditioner reads of it, and the denoiser rows it encodes to.
+    /// what the conditioner reads of it, and the denoiser rows it encodes to,
+    /// a reference image in `image_bands` units ([`Self::latent_units`]).
     /// `canvas` is the generated canvas, which a keyframe is fitted to.
-    pub fn describe(&self, canvas: Canvas, source: MediaLocator) -> VideoCondition {
+    pub fn describe(
+        &self,
+        canvas: Canvas,
+        source: MediaLocator,
+        image_bands: u32,
+    ) -> VideoCondition {
         let (role, media) = self.media(canvas);
         let vision = self.vision.as_ref().map(|vision| match vision {
             Vision::Image(image) => ConditionVision {
@@ -1084,7 +1108,7 @@ impl ConditionPlan {
             source,
             media,
             vision,
-            latent_units: self.latent_units(),
+            latent_units: self.latent_units(image_bands),
             audio_rows: self.audio_rows,
         }
     }
@@ -1138,6 +1162,22 @@ impl RequestPlan {
             .iter()
             .map(|plan| plan.packed_rows(self.canvas, tiles))
             .sum()
+    }
+
+    /// The units each reference image is encoded in when one latent
+    /// encoding round covers `lane` units: the lane divided evenly among the
+    /// request's reference images, at least one each.
+    ///
+    /// A lone reference image is the largest visual condition and is a
+    /// single rank's work as one unit; its bands spread its encoder tiles
+    /// over the ranks of one round. Several images share the round instead.
+    pub fn image_bands(&self, lane: u32) -> u32 {
+        let images = self
+            .conditions
+            .iter()
+            .filter(|plan| matches!(plan.prepared, Prepared::Image(_)))
+            .count() as u32;
+        (lane / images.max(1)).max(1)
     }
 }
 
@@ -2298,7 +2338,9 @@ pub(super) mod tests {
             video_rows: 37 * 1008,
             audio_rows: 0,
         };
-        let units = video.latent_units();
+        // A video's units are its encoder windows, however many bands an
+        // image would take.
+        let units = video.latent_units(4);
         assert_eq!(units, [vec![5 * 1008; 7], vec![2 * 1008]].concat());
         assert_eq!(units.iter().sum::<u32>(), video.video_rows);
 
@@ -2308,7 +2350,88 @@ pub(super) mod tests {
             video_rows: 1008,
             ..video
         };
-        assert_eq!(image.latent_units(), [1008]);
+        assert_eq!(image.latent_units(1), [1008]);
+    }
+
+    /// A reference image's bands are runs of whole 32-pixel patch rows dealt
+    /// as evenly as possible, together its rows; a keyframe stays one unit.
+    #[test]
+    fn reference_image_bands_partition_its_patch_rows() {
+        // A 16:9 reference at its 2048-pixel short edge: 64 patch rows of
+        // 114 patches.
+        let size = Canvas {
+            width: 3648,
+            height: 2048,
+        };
+        let image = ConditionPlan {
+            index: 0,
+            condition_type: ConditionType::Image,
+            prepared: Prepared::Image(size),
+            vision: None,
+            video_rows: rows_per_frame(size),
+            audio_rows: 0,
+        };
+        assert_eq!(image.latent_units(4), [16 * 114; 4]);
+        assert_eq!(image.latent_units(3), [21 * 114, 21 * 114, 22 * 114]);
+        assert_eq!(image.latent_units(0), [64 * 114]);
+        assert_eq!(image.latent_units(100), [114; 64]);
+
+        let keyframe = ConditionPlan {
+            prepared: Prepared::Keyframe(super::KeyframeFit {
+                position: super::FramePosition::First,
+                cover_crop: None,
+            }),
+            ..image.clone()
+        };
+        assert_eq!(keyframe.latent_units(4), [image.video_rows]);
+    }
+
+    /// The lane is divided evenly among a request's reference images, at
+    /// least one unit each; other conditions take no share.
+    #[test]
+    fn reference_images_share_the_latent_lane() {
+        let image = ConditionPlan {
+            index: 0,
+            condition_type: ConditionType::Image,
+            prepared: Prepared::Image(Canvas {
+                width: 2048,
+                height: 2048,
+            }),
+            vision: None,
+            video_rows: 4096,
+            audio_rows: 0,
+        };
+        let audio = ConditionPlan {
+            condition_type: ConditionType::Audio,
+            prepared: Prepared::Audio(AudioClip {
+                sample_rate: 32_000,
+                start_sample: 0,
+                source_samples: 32_000,
+                samples: 32_000,
+                latents: 40,
+            }),
+            video_rows: 0,
+            audio_rows: 80,
+            ..image.clone()
+        };
+        let plan = |conditions: Vec<ConditionPlan>| RequestPlan {
+            task: VideoTask::Ref2va,
+            canvas: Canvas {
+                width: 1344,
+                height: 768,
+            },
+            duration_seconds: 5.0,
+            num_frames: 124,
+            latent_frames: 37,
+            audio_latents: 200,
+            conditions,
+        };
+        assert_eq!(plan(vec![image.clone(), audio.clone()]).image_bands(4), 4);
+        assert_eq!(plan(vec![image.clone(); 3]).image_bands(4), 1);
+        assert_eq!(plan(vec![image.clone(); 2]).image_bands(4), 2);
+        assert_eq!(plan(vec![image.clone(); 9]).image_bands(4), 1);
+        assert_eq!(plan(vec![audio]).image_bands(4), 4);
+        assert_eq!(plan(vec![image]).image_bands(0), 1);
     }
 
     /// The worker counts an admitted condition's rows from its description:
@@ -2340,7 +2463,8 @@ pub(super) mod tests {
             }
             let plan = Request::parse(case).plan(&vision).unwrap();
             for condition in &plan.conditions {
-                let described = condition.describe(plan.canvas, source.clone());
+                // Bands split an image's rows without changing them.
+                let described = condition.describe(plan.canvas, source.clone(), 4);
                 for tiles in tilings {
                     let planned = condition.packed_rows(plan.canvas, tiles);
                     assert_eq!(described.packed_rows(tiles), planned, "{}", case["name"]);
