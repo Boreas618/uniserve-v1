@@ -17,21 +17,61 @@ pub enum CallStatus {
     Error = 2,
 }
 
-/// A deterministic error class for a failed completion.
+/// The class of a rank's failure: the one vocabulary of a failed call's
+/// completion and of an error response.
+///
+/// The rank classifies every failure it reports with these classes, and the
+/// engine decides by them: an invariant violation is a control-plane defect
+/// that stops the engine, an input error is a rejected request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[repr(u8)]
 pub enum ErrorCode {
-    /// Call metadata or product declarations are invalid.
-    InvalidCall = 0,
-    /// A reserved or physical resource could not satisfy the call.
-    ResourceExhausted = 1,
-    /// Device computation failed.
-    ComputeError = 2,
-    /// The request was cancelled before completion.
-    Cancelled = 3,
-    /// An invariant failed within the worker.
-    Internal = 4,
+    /// The rank does not serve the call's kind.
+    UnsupportedCall,
+    /// A message, a call or a launch value breaks the protocol contract.
+    InvalidDescriptor,
+    /// The deployment asks for a placement, a device or a kernel the rank
+    /// cannot provide.
+    UnsupportedSetup,
+    /// A request's inputs are invalid for its computation.
+    InputError,
+    /// Device or numerical computation failed.
+    ComputeError,
+    /// A reserved or physical resource could not satisfy the work.
+    ResourceError,
+    /// An invariant the rank relies on is broken.
+    InvariantViolation,
+    /// The rank failed in a way that leaves it unable to serve.
+    FatalWorkerFailure,
+}
+
+impl ErrorCode {
+    /// The class's name as the protocol spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedCall => "unsupported_call",
+            Self::InvalidDescriptor => "invalid_descriptor",
+            Self::UnsupportedSetup => "unsupported_setup",
+            Self::InputError => "input_error",
+            Self::ComputeError => "compute_error",
+            Self::ResourceError => "resource_error",
+            Self::InvariantViolation => "invariant_violation",
+            Self::FatalWorkerFailure => "fatal_worker_failure",
+        }
+    }
+
+    /// Whether a failure of this class leaves the rank unsafe to serve
+    /// further work.
+    pub const fn fatal(self) -> bool {
+        matches!(self, Self::InvariantViolation | Self::FatalWorkerFailure)
+    }
+}
+
+impl std::fmt::Display for ErrorCode {
+    /// Formats the class as its protocol name.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Device-observed finish candidates for a token call.
