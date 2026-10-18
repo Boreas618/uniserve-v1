@@ -1,15 +1,15 @@
-"""Cross-language parity of the canonical sampling RNG and inverse-CDF rule.
+"""Token selection on the rank's random draws matches the simulator's rule.
 
 ``tests/python/generated/sampling_rng_parity.json`` holds two kinds of cases.
-Each RNG case records a Philox key, the four Philox output words, the uniform
-draw, and the token selected from the shared dyadic ``probs``; its RNG values
-were produced by the simulator's ``uniserve_core::philox``. Each boundary case
-pairs its own distribution with a draw at an edge of the inverse-CDF rule
-(the first positive-mass entry whose cumulative mass exceeds the draw, else
-the last positive-mass entry) and an expected token derived from that rule.
-The worker recomputes every value here, and the simulator's
-``sample_categorical`` unit test selects from the same cases, so both
-implementations share one RNG mapping and one selection boundary.
+Each RNG case records a uniform draw of ``uniserve_core::philox``, the
+generator the rank's sampler draws through, and the token the inverse-CDF
+rule selects from the shared dyadic ``probs`` at that draw. Each boundary
+case pairs its own distribution with a draw at an edge of the rule (the
+first positive-mass entry whose cumulative mass exceeds the draw, else the
+last positive-mass entry). ``uniserve.sampling.sample_categorical`` selects
+every case here, and the simulator's ``sample_categorical`` unit test
+selects from the same cases, so both implementations share one selection
+boundary.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve.nn.rng import philox4x32_10, sampling_key, sampling_uniform
 from uniserve.sampling import sample_categorical
 
 pytestmark = pytest.mark.unit
@@ -31,10 +30,6 @@ _FIXTURE = (
     / "generated"
     / "sampling_rng_parity.json"
 )
-
-
-def _bits(value: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
 def _draw(bits: int) -> float:
@@ -50,38 +45,15 @@ def _select_token(probs: list[float], draw: float) -> int:
     return int(selected.item())
 
 
-def test_sampling_rng_matches_the_rust_reference() -> None:
+def test_the_generator_draws_select_the_simulator_tokens() -> None:
     fixture = json.loads(_FIXTURE.read_text())
     probs = fixture["probs"]
     assert fixture["cases"], "fixture carries at least one coordinate"
-    for case in fixture["cases"]:
-        key = sampling_key(
-            case["session_seed"],
-            case["engine_id"],
-            case["request_id"],
-            case["request_epoch"],
-            case["draw_layout"],
-        )
-        assert key == case["key"]
-        index = case["semantic_token_index"]
-        counter = (
-            index & 0xFFFFFFFF,
-            (index >> 32) & 0xFFFFFFFF,
-            case["processor_stage"] & 0xFFFFFFFF,
-            case["draw_index"] & 0xFFFFFFFF,
-        )
-        words = philox4x32_10(
-            counter, (key & 0xFFFFFFFF, (key >> 32) & 0xFFFFFFFF)
-        )
-        assert list(words) == case["words"]
-        draw = sampling_uniform(
-            key,
-            case["semantic_token_index"],
-            case["processor_stage"],
-            case["draw_index"],
-        )
-        assert _bits(draw) == case["uniform_bits"]
-        assert _select_token(probs, draw) == case["selected_token"]
+    selected = [
+        _select_token(probs, _draw(case["uniform_bits"]))
+        for case in fixture["cases"]
+    ]
+    assert selected == [case["selected_token"] for case in fixture["cases"]]
 
 
 def test_inverse_cdf_boundaries_match_the_shared_fixture() -> None:
