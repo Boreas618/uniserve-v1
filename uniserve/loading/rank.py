@@ -89,10 +89,6 @@ class Description:
     # Module paths of the routed experts a split deployment places apart.
     expert_paths: tuple[str, ...]
 
-    def model_name(self) -> str:
-        """``module.QualName`` of the model class."""
-        return _name(self.model)
-
     def components(self) -> list[str]:
         """The declared components, in declared order."""
         return list(self.calls)
@@ -512,10 +508,6 @@ def load_model(
         flashinfer=flashinfer.Backend(flashinfer.Config(**options)),
     )
     return loaded
-
-
-def _name(module: nn.Module) -> str:
-    return f"{type(module).__module__}.{type(module).__qualname__}"
 
 
 def _expert_partition(

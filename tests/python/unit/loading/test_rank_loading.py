@@ -19,7 +19,6 @@ def loaded():
 
 def test_description_reports_calls_with_capability_tags():
     description = read_config()
-    assert description.model_name() == "uniserve.models.stub.model.Model"
     assert description.components() == ["model", "vision_encoder"]
     assert description.call_paths("model")[:2] == ["", ""]
     assert description.call_methods("model")[:2] == [

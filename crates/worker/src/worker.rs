@@ -519,7 +519,7 @@ impl Worker {
             hooks.push(Box::new(ExpertWarmup));
         }
 
-        tracing::info!("loaded numerical model {}", model.model_name);
+        tracing::info!("loaded numerical model");
         Ok(Self {
             config,
             info,
