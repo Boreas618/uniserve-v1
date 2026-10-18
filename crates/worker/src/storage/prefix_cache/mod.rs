@@ -580,10 +580,70 @@ impl PrefixCache {
         *lock(&self.imports.retired.wake) = wake;
     }
 
+    /// Lend scratch units to request slots `1..` as resident block tables
+    /// of `lengths` tokens, issued to `stream`: the units are reset, then
+    /// the tables installed. A startup forward over them stages its rows
+    /// from the resident tables, as serving does, so what a graph is
+    /// captured over is what serving stages.
+    pub(crate) fn install_scratch(
+        &mut self,
+        lengths: &[usize],
+        stream: impl Issue,
+    ) -> Result<ScratchUnits> {
+        let shapes = self.plan().group_shapes()?;
+        // Whole pages of every group for each row, at least one.
+        let units_of = |length: usize| -> usize {
+            shapes
+                .iter()
+                .map(|shape| {
+                    length.max(1).div_ceil(shape.page_tokens as usize)
+                        * shape.units_per_page as usize
+                })
+                .sum()
+        };
+        let count: usize = lengths.iter().map(|&length| units_of(length)).sum();
+        let scratch = self.scratch_units(count as u32, stream)?;
+        let mut unit = *scratch.units().start();
+        let mut tables = Vec::new();
+        for (row, &length) in lengths.iter().enumerate() {
+            for (group, shape) in shapes.iter().enumerate() {
+                let pages = length.max(1).div_ceil(shape.page_tokens as usize);
+                let units = pages * shape.units_per_page as usize;
+                tables.push(BlockTable {
+                    request_pool_idx: row as u32 + 1,
+                    group_id: group as u32,
+                    start_page: 0,
+                    unit_ids: (unit..unit + units as u32)
+                        .map(uniserve_core::UnitId)
+                        .collect(),
+                    allocated_tokens: (pages * shape.page_tokens as usize) as u32,
+                });
+                unit += units as u32;
+            }
+        }
+        self.install(&tables, stream)?;
+        Ok(scratch)
+    }
+
+    /// Clear the scratch tables of slots `1..=rows` and return their units,
+    /// issued to `stream`: the stream waits for what wrote the units, resets
+    /// them and waits for the resets.
+    pub(crate) fn release_scratch(
+        &mut self,
+        scratch: ScratchUnits,
+        rows: usize,
+        stream: impl Issue,
+    ) -> Result<()> {
+        let slots: Vec<u32> = (1..=rows as u32).collect();
+        let cleared = self.release_slots(&slots, stream);
+        let finished = scratch.finish(self, stream);
+        cleared.and(finished)
+    }
+
     /// Lend units `1..=count` as warmup scratch: no access may be pending,
     /// and the units are reset natively, issued to `stream`, now and when
     /// the scratch is returned.
-    pub(crate) fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
+    fn scratch_units(&mut self, count: u32, stream: impl Issue) -> Result<ScratchUnits> {
         if self.accesses.has_pending_accesses() {
             return Err(Error::State("cache scratch requires an idle cache"));
         }

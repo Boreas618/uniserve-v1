@@ -11,7 +11,7 @@ use crate::{Error, Result};
 mod attention;
 mod storage;
 
-pub(crate) use attention::{AttentionRow, TablePages, table_pages};
+pub(crate) use attention::{AttentionRow, TablePages};
 pub use storage::BlockTableStorage;
 
 /// Page dimensions needed to address one cache group.
