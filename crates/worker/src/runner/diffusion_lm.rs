@@ -32,8 +32,10 @@
 //! launch performs between two segments. The capture is an operation of
 //! the forward's job, whose completion carries the graph. Without a pool
 //! (CPU lanes, graph policy off) every forward calls its method on the
-//! Python thread. A `readout` that exchanges tokens with expert peers also
-//! runs there, once over every slot of the forward.
+//! Python thread, and so does a forward of more blocks than the largest row
+//! bucket holds: the engine bounds a pass's blocks by its rows and token
+//! budget, not by the buckets. A `readout` that exchanges tokens with
+//! expert peers also runs there, once over every slot of the forward.
 //!
 //! With expert-parallel layers, a readout (`attend` and an exchanging
 //! `readout`) and a denoising step are each one expert step of the job
@@ -181,8 +183,9 @@ struct Executed {
 
 /// A method of the Python half as a forward runs it.
 struct Method<'a> {
-    /// The graph bucket of the forward.
-    key: &'a ShapeKey,
+    /// The graph bucket of the forward; None for a forward that runs
+    /// eagerly at its live shape.
+    key: Option<&'a ShapeKey>,
     function: &'a Function,
     /// The arguments of the `plan_attention` call a launch of a method
     /// that attends follows.
@@ -301,8 +304,8 @@ impl DiffusionLMRunner {
     /// Record one forward of `method` at expert `capacity`: into `forward`
     /// the launch of the resident graph (behind the `plan_attention` call
     /// of a method that attends), or the method's eager call; into `then`
-    /// the capture that follows an eager call. Without a pool the method
-    /// is called.
+    /// the capture that follows an eager call. Without a pool or a bucket
+    /// (a forward no captured bucket holds) the method is called eagerly.
     fn method(
         &self,
         method: &Method<'_>,
@@ -316,8 +319,8 @@ impl DiffusionLMRunner {
             function,
             plan,
         } = *method;
-        let (Some(pool), Some(stream), Some(device)) =
-            (&self.pool, &self.stream, self.buffers.device())
+        let (Some(key), Some(pool), Some(stream), Some(device)) =
+            (key, &self.pool, &self.stream, self.buffers.device())
         else {
             forward.call(self.methods.call(function, arguments));
             return Ok(GraphMode::Eager);
@@ -521,10 +524,13 @@ impl DiffusionLMRunner {
         }
 
         // `attend`: the smallest bucket holding the rows, or the live
-        // shape without graphs.
-        let graph = self.pool.is_some();
-        let (rows, visible, padding, widths) = if graph {
-            let (rows, length) = self.shapes.attend(pass.rows.len(), pass.longest())?;
+        // shape without graphs or when no bucket holds the rows.
+        let bucket = match self.pool {
+            Some(_) => self.shapes.attend(pass.rows.len(), pass.longest())?,
+            None => None,
+        };
+        let graph = bucket.is_some();
+        let (rows, visible, padding, widths) = if let Some((rows, length)) = bucket {
             (
                 rows,
                 length,
@@ -628,7 +634,7 @@ impl DiffusionLMRunner {
         };
 
         let attending = Method {
-            key: &key,
+            key: graph.then_some(&key),
             function: &self.functions.attend,
             plan: Some(&plan),
         };
@@ -663,7 +669,7 @@ impl DiffusionLMRunner {
                         job.call(self.methods.call(&self.functions.readout, arguments));
                     } else {
                         let reading = Method {
-                            key: &key,
+                            key: Some(&key),
                             function: &self.functions.readout,
                             plan: None,
                         };
@@ -746,12 +752,11 @@ impl DiffusionLMRunner {
         };
         let length = self.facts.sequence_length;
         let live = rows.len();
-        let graph = self.pool.is_some();
-        let padded = if graph {
-            self.shapes.denoise(live)?
-        } else {
-            live
-        };
+        // The smallest bucket holding the rows, or the live shape without
+        // graphs or when no bucket holds them.
+        let bucket = self.pool.as_ref().and_then(|_| self.shapes.denoise(live));
+        let graph = bucket.is_some();
+        let padded = bucket.unwrap_or(live);
         if live == 0 || padded > state.rows {
             return Err(Error::Invalid(format!(
                 "a denoising step of {live} rows exceeds its {} rows",
@@ -830,7 +835,7 @@ impl DiffusionLMRunner {
             first,
         };
         let denoising = Method {
-            key: &key,
+            key: graph.then_some(&key),
             function: &self.functions.denoise,
             plan: Some(&plan),
         };
@@ -1001,7 +1006,10 @@ impl DiffusionLMRunner {
                     candidates: vec![0; count],
                     pages: &pages,
                 };
-                let (rows, length) = self.shapes.attend(count, length)?;
+                let (rows, length) = self
+                    .shapes
+                    .attend(count, length)?
+                    .ok_or_else(|| Error::Invariant("a row bucket holds its own rows".into()))?;
                 let tokens = rows * length;
                 let extent = if local { tokens } else { tokens.max(count) };
                 for capacity in variants(extent) {
@@ -1015,7 +1023,10 @@ impl DiffusionLMRunner {
         if self.sampling.is_some() {
             for &count in &rows {
                 let pages = self.scratch_pages(count, length, first_unit, row_units)?;
-                let padded = self.shapes.denoise(count)?;
+                let padded = self
+                    .shapes
+                    .denoise(count)
+                    .ok_or_else(|| Error::Invariant("a row bucket holds its own rows".into()))?;
                 for first in [true, false] {
                     for capacity in variants(padded * length) {
                         let job = Job::new();
@@ -1055,7 +1066,7 @@ impl DiffusionLMRunner {
         arguments.extend(self.attend_state()?);
         let key = ShapeKey::Readout { slots };
         let reading = Method {
-            key: &key,
+            key: Some(&key),
             function: &self.functions.readout,
             plan: None,
         };

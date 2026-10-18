@@ -112,26 +112,25 @@ impl Shapes {
     }
 
     /// The `attend` bucket of `rows` blocks whose longest has `longest`
-    /// tokens.
-    pub(crate) fn attend(&self, rows: usize, longest: usize) -> Result<(usize, usize)> {
-        let length = bucket(&self.lengths, longest);
-        match (bucket(&self.rows, rows), length) {
-            (Some(rows), Some(length)) => Ok((rows, length)),
-            _ => Err(Error::Invalid(format!(
-                "no graph holds {rows} blocks of up to {longest} tokens; capacity is {} blocks of {} tokens",
-                self.capacity, self.sequence_length
-            ))),
-        }
+    /// tokens, or None when more blocks than the largest row bucket holds
+    /// arrive: the engine bounds a readout's rows by its pass and token
+    /// budget, so short blocks can outnumber the buckets, and such a call
+    /// runs eagerly. A block longer than the model's fits no bucket and no
+    /// buffer, which is an error.
+    pub(crate) fn attend(&self, rows: usize, longest: usize) -> Result<Option<(usize, usize)>> {
+        let length = bucket(&self.lengths, longest).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a block of {longest} tokens exceeds the model's {} tokens",
+                self.sequence_length
+            ))
+        })?;
+        Ok(bucket(&self.rows, rows).map(|rows| (rows, length)))
     }
 
-    /// The `denoise` bucket of `rows` blocks.
-    pub(crate) fn denoise(&self, rows: usize) -> Result<usize> {
-        bucket(&self.rows, rows).ok_or_else(|| {
-            Error::Invalid(format!(
-                "no graph holds {rows} denoising rows; capacity is {}",
-                self.capacity
-            ))
-        })
+    /// The `denoise` bucket of `rows` blocks, or None when more blocks than
+    /// the largest row bucket holds arrive, which run eagerly.
+    pub(crate) fn denoise(&self, rows: usize) -> Option<usize> {
+        bucket(&self.rows, rows)
     }
 }
 
@@ -179,11 +178,14 @@ mod tests {
         let shapes = Shapes::new(256, 10, None)?;
         assert_eq!(shapes.rows(), &[1, 2, 3, 4, 6, 8, 10]);
         assert_eq!(shapes.lengths(), &[16, 32, 64, 128, 256]);
-        assert_eq!(shapes.attend(5, 40)?, (6, 64));
-        assert_eq!(shapes.attend(10, 256)?, (10, 256));
-        assert!(shapes.attend(11, 16).is_err());
+        assert_eq!(shapes.attend(5, 40)?, Some((6, 64)));
+        assert_eq!(shapes.attend(10, 256)?, Some((10, 256)));
+        // More blocks than the largest bucket run eagerly; a block longer
+        // than the model's is refused.
+        assert_eq!(shapes.attend(11, 16)?, None);
         assert!(shapes.attend(1, 257).is_err());
-        assert_eq!(shapes.denoise(7)?, 8);
+        assert_eq!(shapes.denoise(7), Some(8));
+        assert_eq!(shapes.denoise(11), None);
 
         // Generating ranks never step more blocks than their slots.
         let shapes = Shapes::new(48, 200, Some(3))?;
