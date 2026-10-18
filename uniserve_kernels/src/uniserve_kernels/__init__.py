@@ -1,6 +1,6 @@
 """UniServe device kernels.
 
-Modules and subpackages group kernels by domain: norm, activation,
+Modules and subpackages group kernels by domain: norm, activation, bias,
 reduction, rope, routing, patch, quantization, cache, attention, diffusion
 and host_memory; ``jit`` builds the CUDA C++ extensions.
 Launchers consume device tensors. Many write caller-supplied outputs and pair
