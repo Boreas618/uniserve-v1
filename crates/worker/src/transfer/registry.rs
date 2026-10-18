@@ -77,26 +77,22 @@ impl RegisteredBuffer {
     }
 }
 
-/// Bounded registration and retirement of transport source storage.
+/// Registration and retirement of transport source storage. The registry
+/// counts nothing: every export reserves its bytes from the rank's transfer
+/// capacity before it registers, which refuses what the rank cannot hold.
 /// The transport serializes mutations and performs reclamation outside its
 /// ownership lock. Backend source values carry no registry lifecycle state.
 pub(crate) struct BufferRegistry {
-    capacity: usize,
     closing: bool,
     buffers: HashMap<SourceKey, RegisteredBuffer>,
 }
 
 impl BufferRegistry {
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(Error::Invalid("buffer capacity must be positive".into()));
-        }
-
-        Ok(Self {
-            capacity,
+    pub(crate) fn new() -> Self {
+        Self {
             closing: false,
             buffers: HashMap::new(),
-        })
+        }
     }
 
     pub(crate) fn register(
@@ -105,8 +101,8 @@ impl BufferRegistry {
         source: Source,
         retirement: Arc<Retirement>,
     ) -> Result<()> {
-        if self.closing || self.buffers.len() >= self.capacity {
-            return Err(Error::Resource("transport buffer capacity is unavailable"));
+        if self.closing {
+            return Err(Error::Resource("the transport is closing"));
         }
         if self.buffers.contains_key(&key) {
             return Err(Error::Invalid("buffer is already registered".into()));
@@ -179,8 +175,6 @@ impl BufferRegistry {
 mod tests {
     use std::sync::Weak;
 
-    use uniserve_ipc::{Locator, TransferTransport, WorkerInfo};
-
     use super::*;
     use crate::ffi::{Backing, DType};
     use crate::storage::memory::{Memory, StorageView};
@@ -202,21 +196,9 @@ mod tests {
             &[4],
         )?)?;
         let buffer = TransportBuffer::local(spans, None, ByteReservation::new(capacity, 4)?);
-        let locator = Locator {
-            source: WorkerInfo::default().endpoint,
-            transport: TransferTransport::Local {
-                endpoint: "registry".into(),
-                key,
-            },
-            nbytes: 4,
-            dtype: "uint8".into(),
-            shape: vec![4],
-            offset: vec![0],
-            device: "cpu".into(),
-        };
         Ok((
             SourceKey::Local(key),
-            Source::new(locator, Arc::new(buffer)),
+            Source::new(Arc::new(buffer)),
             retained,
         ))
     }
@@ -228,7 +210,7 @@ mod tests {
     #[test]
     fn reclamation_waits_for_readers_and_settlement() -> Result<()> {
         let capacity = capacity()?;
-        let mut registry = BufferRegistry::new(1)?;
+        let mut registry = BufferRegistry::new();
         let (key, first, retained) = source(1, &capacity)?;
         let retirement = Arc::new(Retirement::default());
         registry.register(key.clone(), first, Arc::clone(&retirement))?;
@@ -253,11 +235,6 @@ mod tests {
         );
         assert!(buffer.begin_reclaim(|_| Ok(true))?.is_some());
         assert!(registry.require_retired().is_err());
-        let (next, second, _) = source(2, &capacity)?;
-        assert!(matches!(
-            registry.register(next.clone(), second, Arc::new(Retirement::default())),
-            Err(Error::Resource(_))
-        ));
 
         // Successful physical retirement returns the storage.
         retirement.complete(Ok(()))?;
@@ -285,7 +262,7 @@ mod tests {
     #[test]
     fn an_unsettled_source_retains_only_its_own_storage() -> Result<()> {
         let capacity = capacity()?;
-        let mut registry = BufferRegistry::new(2)?;
+        let mut registry = BufferRegistry::new();
         let (pending, first, retained) = source(1, &capacity)?;
         let (independent, second, _) = source(2, &capacity)?;
         registry.register(pending.clone(), first, Arc::new(Retirement::default()))?;
@@ -317,7 +294,7 @@ mod tests {
     #[test]
     fn a_failed_reclamation_keeps_its_storage() -> Result<()> {
         let capacity = capacity()?;
-        let mut registry = BufferRegistry::new(1)?;
+        let mut registry = BufferRegistry::new();
         let (key, first, retained) = source(1, &capacity)?;
         let retirement = Arc::new(Retirement::default());
         registry.register(key.clone(), first, Arc::clone(&retirement))?;

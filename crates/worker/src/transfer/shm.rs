@@ -499,7 +499,7 @@ impl Transport {
         };
 
         let buffer = Arc::new(TransportBuffer::shared(storage, bytes));
-        if let Err(error) = endpoint.register(locator.clone(), Arc::clone(&buffer)) {
+        if let Err(error) = endpoint.register(&locator, Arc::clone(&buffer)) {
             TransportBuffer::reclaim(buffer, &self.events, None)?;
             return Err(error);
         }

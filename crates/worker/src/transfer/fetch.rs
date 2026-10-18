@@ -106,16 +106,8 @@ pub(crate) fn submit(
     let Some(first) = reads.first() else {
         return Ok(Vec::new());
     };
+    // Every transport of a rank shares its one capacity (`Transports::new`).
     let capacity = first.transport.capacity();
-    if reads
-        .iter()
-        .any(|read| !Arc::ptr_eq(read.transport.capacity(), capacity))
-    {
-        return Err(Error::Invalid(
-            "a fetch's transports must share the rank's transfer capacity".into(),
-        ));
-    }
-
     let reservation = ReadReservation::new(Arc::clone(capacity), reads.len())?;
     let mut submitted: Vec<Arc<Read>> = Vec::with_capacity(reads.len());
     let result = (|| -> Result<()> {
