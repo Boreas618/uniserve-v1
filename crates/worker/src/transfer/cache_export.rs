@@ -44,7 +44,7 @@ fn pages(start: u64, end: u64, block_size: u64) -> Vec<(u64, u32, u32)> {
 /// or host memory for a CPU pool.
 fn staging(planes: &CachePlanes, bytes: usize) -> Result<Arc<Memory>> {
     match planes.device() {
-        Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?),
+        Some(device) => Memory::export_staging(device, bytes.max(1), &Memory::peers(device)?),
         None => Ok(Memory::host(bytes.max(1))),
     }
 }
