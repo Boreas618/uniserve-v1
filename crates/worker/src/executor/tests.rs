@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use uniserve_core::{CallId, RequestId, SamplingParams};
 use uniserve_ipc::{
-    ArRequestParams, Batch as Plan, BatchCommand, BufferAllocation, DType as WireDType, DimBound,
+    Batch as Plan, BatchCommand, BufferAllocation, DType as WireDType, DimBound, GenerationParams,
     NewRequest, RequestKey, ShapeBound, TensorRef, WorkerInfo,
 };
 
@@ -78,13 +78,13 @@ fn key(id: u64, epoch: u64) -> RequestKey {
 
 /// The Start of a text request in `slot`.
 fn start(key: RequestKey, slot: u32) -> Result<BatchCommand> {
-    let ar = ArRequestParams {
+    let generation = GenerationParams {
         sampling: SamplingParams::default(),
         negative_token_ids: Vec::new(),
         finish_token_ids: Vec::new(),
         initial_position: 0,
     };
-    let request = NewRequest::new(key, slot, Some(ar), None, 0)
+    let request = NewRequest::new(key, slot, Some(generation), None, 0)
         .map_err(|error| Error::Invalid(error.to_string()))?;
     Ok(BatchCommand::Start {
         request: Box::new(request),

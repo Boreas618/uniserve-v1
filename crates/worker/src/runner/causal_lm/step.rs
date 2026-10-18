@@ -395,9 +395,9 @@ impl TokenBatch<'_> {
                 .admission();
             let admitted = calls::parameters(admission)?;
             let finish = admission
-                .ar
+                .generation
                 .as_ref()
-                .map_or(&[][..], |ar| ar.finish_token_ids.as_slice());
+                .map_or(&[][..], |generation| generation.finish_token_ids.as_slice());
             let state = &mut self.batch.calls[index];
             state.forward.microbatch = runner;
             let prepared = state

@@ -235,13 +235,14 @@ impl CallCoordinates {
 
 /// One denoising step of a block-diffusion request's resident canvas.
 ///
-/// The request's admitted `ArRequestParams::canvas` fixes the sampling; the
-/// worker holds the canvas, its self-conditioning input and its stopping
-/// history in the request's slot. `block` counts the blocks already
-/// committed to the request's context and `step` the steps already run on
-/// this canvas; step zero starts the canvas from random tokens. The step
-/// that stops the canvas, by convergence or by reaching the admitted step
-/// limit, reports the canvas's argmax tokens as its committed tokens.
+/// The deployment's launch configuration fixes the sampling
+/// (`LaunchDescriptor::canvas_sampling`); the worker holds the canvas, its
+/// self-conditioning input and its stopping history in the request's slot.
+/// `block` counts the blocks already committed to the request's context and
+/// `step` the steps already run on this canvas; step zero starts the canvas
+/// from random tokens. The step that stops the canvas, by convergence or by
+/// reaching the launched step limit, reports the canvas's argmax tokens as
+/// its committed tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CanvasStep {
     /// Blocks committed to the request's context before this canvas.

@@ -410,9 +410,10 @@ mod tests {
             .iter()
             .flat_map(|batch| &batch.commands)
             .filter_map(|command| match command {
-                BatchCommand::Start { request } if request.image.is_some() => {
-                    request.ar.as_ref().map(|ar| ar.negative_token_ids.clone())
-                }
+                BatchCommand::Start { request } if request.image.is_some() => request
+                    .generation
+                    .as_ref()
+                    .map(|generation| generation.negative_token_ids.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();

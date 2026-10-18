@@ -43,9 +43,9 @@ use uniserve_engine::{
     WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_ipc::{
-    ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, BufferAllocation,
-    CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode,
-    ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
+    Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call,
+    CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode, ForwardBatch, ForwardMode,
+    GenerationParams, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
     ShapeBound, TensorRef, TransferMode,
 };
 
@@ -1047,7 +1047,7 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     assert_eq!(info.max_batch_tokens, 256);
 
     let mut admission = text_admission(11, 1, 1)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.return_logprobs = true;
     sampling.n_logprobs = 1;
     sampling.return_prompt_logprobs = true;
@@ -1180,7 +1180,7 @@ fn sampled_first_token(
     seed: Option<u64>,
 ) -> anyhow::Result<u32> {
     let mut admission = text_admission(request_id, 1, slot)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.temperature = 100.0;
     sampling.seed = seed;
     let batch = token_batch(
@@ -1229,7 +1229,7 @@ fn first_token_logprobs(
     top_p: f32,
 ) -> anyhow::Result<Vec<uniserve_core::TokenLogprob>> {
     let mut admission = text_admission(request_id, 1, slot)?;
-    let sampling = &mut admission.ar.as_mut().unwrap().sampling;
+    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.top_p = top_p;
     sampling.return_logprobs = true;
     sampling.n_logprobs = 5;
@@ -2143,7 +2143,7 @@ fn text_admission(
     Ok(NewRequest::new(
         RequestKey::new(1, RequestId(request_id), request_epoch),
         request_pool_idx,
-        Some(ArRequestParams {
+        Some(GenerationParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ignore_eos: true,
@@ -3307,7 +3307,7 @@ mod trajectory {
     /// A text request with image parameters in `slot`, ending at the image
     /// tokens.
     pub(super) fn admission(request_id: u64, slot: u32) -> anyhow::Result<NewRequest> {
-        let ar = ArRequestParams {
+        let generation = GenerationParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ..SamplingParams::default()
@@ -3327,7 +3327,7 @@ mod trajectory {
         Ok(NewRequest::new(
             RequestKey::new(1, RequestId(request_id), 1),
             slot,
-            Some(ar),
+            Some(generation),
             Some(image),
             0,
         )?)

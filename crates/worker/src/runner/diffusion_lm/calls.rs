@@ -215,7 +215,7 @@ pub(crate) fn step_row(
         .canvas
         .ok_or_else(|| Error::Invalid("a block step requires its coordinates".into()))?;
     let generation = admission
-        .ar
+        .generation
         .as_ref()
         .ok_or_else(|| Error::Invalid("a block step requires an admitted generation".into()))?;
     let seed = generation
@@ -258,7 +258,7 @@ pub(crate) fn step_row(
 #[cfg(test)]
 mod tests {
     use uniserve_core::{CallId, RequestId, SamplingParams};
-    use uniserve_ipc::{ArRequestParams, CallKind, ForwardMode, Readout, RequestKey};
+    use uniserve_ipc::{CallKind, ForwardMode, GenerationParams, Readout, RequestKey};
 
     use super::*;
 
@@ -324,7 +324,7 @@ mod tests {
         NewRequest::new(
             RequestKey::new(1, RequestId(7), 1),
             2,
-            Some(ArRequestParams {
+            Some(GenerationParams {
                 sampling: SamplingParams {
                     seed,
                     ..SamplingParams::default()

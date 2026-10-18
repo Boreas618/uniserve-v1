@@ -57,9 +57,9 @@ pub(crate) struct Request {
 impl Request {
     fn new(admission: NewRequest) -> Self {
         let prefix = admission
-            .ar
+            .generation
             .as_ref()
-            .map_or(0, |ar| u64::from(ar.initial_position));
+            .map_or(0, |generation| u64::from(generation.initial_position));
 
         Self {
             admission,
@@ -427,7 +427,7 @@ impl RequestPool {
 #[cfg(test)]
 mod tests {
     use uniserve_core::{DiffusionSamplingParams, RequestId, SamplingParams, VideoTask};
-    use uniserve_ipc::{ArRequestParams, VideoAdmission};
+    use uniserve_ipc::{GenerationParams, VideoAdmission};
 
     use super::*;
 
@@ -435,7 +435,7 @@ mod tests {
         NewRequest {
             request_key: RequestKey::new(1, RequestId(id), epoch),
             request_pool_idx: slot,
-            ar: Some(ArRequestParams {
+            generation: Some(GenerationParams {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
@@ -454,7 +454,7 @@ mod tests {
         for order in [[1, 2], [2, 1]] {
             let mut pool = RequestPool::new(1)?;
             let request = NewRequest {
-                ar: None,
+                generation: None,
                 diffusion: Some(DiffusionSamplingParams {
                     num_frames: 1,
                     video_units: 1,

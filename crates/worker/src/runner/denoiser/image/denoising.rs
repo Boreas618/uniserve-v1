@@ -252,9 +252,9 @@ impl ImageBatch<'_> {
             .requests
             .get(key.request_id.0)?
             .admission()
-            .ar
+            .generation
             .as_ref()
-            .map(|ar| ar.negative_token_ids.clone())
+            .map(|generation| generation.negative_token_ids.clone())
             .unwrap_or_default();
         let mut prefixes: Vec<(BranchSource, Option<Prefix>)> = Vec::new();
         for source in [
