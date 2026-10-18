@@ -126,7 +126,8 @@ impl Default for WorkerProcessArgs {
             // The engine's default running-request limit plus the largest
             // row reserve a runtime keeps outside it.
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
-                + crate::scheduler::MAX_FLOW_PREFIX_ROWS) as u32,
+                + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
+                as u32,
             attention_backend: uniserve_ipc::AttentionBackend::Auto,
             capability_groups: Vec::new(),
             transfer: Default::default(),

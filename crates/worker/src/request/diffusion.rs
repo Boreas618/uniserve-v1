@@ -306,12 +306,12 @@ impl ImageTrajectory {
             };
             if length > u64::from(located.capacity) {
                 return Err(Error::Invalid(
-                    "flow prefix exceeds scheduler params".into(),
+                    "guidance prefix exceeds scheduler params".into(),
                 ));
             }
             if located.visible != 0 && located.visible != length {
                 return Err(Error::Invalid(
-                    "flow branch prefix disagrees with its initialized physical state".into(),
+                    "guidance branch prefix disagrees with its initialized physical state".into(),
                 ));
             }
             self.branches.insert(branch, located);
