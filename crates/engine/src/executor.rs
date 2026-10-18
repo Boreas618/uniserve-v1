@@ -45,21 +45,13 @@ pub struct ExecutorInfo {
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement; `single` and
-    /// `from_workers` leave it empty. Scheduler admission restricts a video
+    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
 }
 
 impl ExecutorInfo {
-    /// Constructs capability information for one physical pool.
-    pub fn single(id: WorkerId, info: WorkerInfo) -> Self {
-        Self {
-            workers: vec![(id, info)],
-            video_codecs: BTreeMap::new(),
-        }
-    }
-
     /// Validates and constructs capability information for multiple pools.
     ///
     /// Fails when `pools` is empty, repeats a pool id, contains a record that
