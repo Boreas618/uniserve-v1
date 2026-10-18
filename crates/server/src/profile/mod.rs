@@ -663,7 +663,6 @@ mod tests {
             .render_prompt_ids(
                 &tokenizer,
                 GenerationConstraint::Default,
-                false,
                 "draw a lighthouse",
                 None,
                 None,
