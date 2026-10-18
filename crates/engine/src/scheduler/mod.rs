@@ -85,11 +85,11 @@ use crate::storage::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
 use crossbeam_channel::Receiver;
+use uniserve_core::RequestId;
 use uniserve_core::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest, MediaKind,
     PositionLogprobs, Request, SharedMedia, TokenLogprob,
 };
-use uniserve_core::{HashAlgo, RequestId};
 use uniserve_core::{ImageIngestStep, RejectionKind, UnitId, encoder_cache_key};
 use uniserve_ipc::{
     ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId,
