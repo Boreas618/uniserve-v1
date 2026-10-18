@@ -51,7 +51,6 @@ impl Description {
             Interpreter::import(&format!("{LOADING}.read_config"))?.call_values(&[
                 Any::from(launch.stub),
                 optional(model.map(|model| model.path.as_str())),
-                optional(model.and_then(|model| model.base_model.as_deref())),
                 text(&launch.load.format),
                 text(&launch.load.mode),
                 optional(launch.load.download_dir.as_deref()),

@@ -32,7 +32,6 @@ local = {
 description = rank.read_config(
     stub=False,
     path=str(root),
-    base_model=None,
     io_format="auto",
     io_mode="eager",
     download_dir=None,

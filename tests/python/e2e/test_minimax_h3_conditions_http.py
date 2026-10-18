@@ -219,22 +219,23 @@ OMNIREF_OPTIONS = [
 ]
 
 
-def _omniref() -> tuple[str, str]:
-    """The OmniRef export and the local base copy the environment names."""
+def _omniref() -> str:
+    """The OmniRef export the environment names.
+
+    The export reads the components it omits from the Hugging Face cache at
+    the base revision it pins.
+    """
     export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
-    base_copy = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF_BASE")
-    if not export or not base_copy:
+    if not export:
         pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export "
-            "and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local directory "
-            "supplying the text encoder, tokenizer, processor and VAEs"
+            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
         )
-    return export, base_copy
+    return export
 
 
 def test_omniref_reference_requests(tmp_path: Path) -> None:
     inputs = _inputs()
-    export, base_copy = _omniref()
+    export = _omniref()
     port = find_free_port()
     _reference_requests(
         _command(
@@ -242,7 +243,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
             "ulysses4-reference.json",
             port,
             inputs,
-            [*OMNIREF_OPTIONS, "--base-model", base_copy],
+            OMNIREF_OPTIONS,
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
@@ -324,7 +325,7 @@ def test_omniref_sequence_bound(tmp_path: Path) -> None:
     # A request just under the 131,072-row bound is served; one just over
     # it is refused before admission, naming its rows.
     inputs = _inputs()
-    export, base_copy = _omniref()
+    export = _omniref()
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     command = _command(
@@ -332,7 +333,7 @@ def test_omniref_sequence_bound(tmp_path: Path) -> None:
         "ulysses4-reference.json",
         port,
         inputs,
-        [*BOUND_OPTIONS, "--base-model", base_copy],
+        BOUND_OPTIONS,
     )
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),

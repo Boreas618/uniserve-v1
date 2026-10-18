@@ -9,9 +9,10 @@
 #   revision 42ed227ee7df40d41602854ae760620d6eb651fe.
 # - UNISERVE_MINIMAX_H3_INPUTS names the protocol inputs directory, whose
 #   media/ holds the condition media the W3, W4 and W5 rows name.
-# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900
-#   and UNISERVE_MINIMAX_H3_OMNIREF_BASE a local copy of the MiniMax-H3
-#   revision it pins (9bfb6693f2cf6de171db46d1aa586f67d773a1da).
+# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastH3-OmniRef-DMPDD8-step1900;
+#   the Hugging Face cache holds the MiniMax-H3 revision it pins
+#   (9bfb6693f2cf6de171db46d1aa586f67d773a1da), from which UniServe reads the
+#   components the export omits.
 # - UNISERVE_FAST_H3_MODEL names a local copy of
 #   FastVideo/FastVideo-FastH3-8-Step-V2, as in uniserve_eval/fast_h3.toml.
 # - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
@@ -235,7 +236,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--base-model", "${UNISERVE_MINIMAX_H3_OMNIREF_BASE}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-running-requests", "2", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4-reference.json", "--max-running-requests", "2", "--max-model-len", "8192", "--video-text-capacities", "8192", "--max-video-seconds", "5", "--max-condition-rows", "49152", "--media-directory", "${UNISERVE_MINIMAX_H3_INPUTS}", "--ffprobe", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--ffmpeg", "${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}", "--mm-processor-kwargs", "{\"enlarge_references\":true}"]
 
 [servers.gb200-4-omniref.environment]
 NCCL_NVLS_ENABLE = "0"

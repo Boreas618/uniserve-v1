@@ -1,4 +1,4 @@
-"""Component exports read a caller-supplied local base or a pinned Hub base."""
+"""Component exports read the components they omit from their pinned base."""
 
 import json
 import shutil
@@ -17,7 +17,7 @@ REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
 
 @pytest.fixture
 def checkpoints(tmp_path):
-    """An OmniRef-like export and local component configurations."""
+    """An OmniRef-like export and the files of the base revision it pins."""
     fixture = Path(__file__).parents[2] / "fixtures/models/fasth3"
     base, export = tmp_path / "base", tmp_path / "export"
     shutil.copytree(fixture, base)
@@ -72,35 +72,7 @@ def checkpoints(tmp_path):
     return export, base
 
 
-def _read(export, base):
-    # Dummy reads resolve no payload; the configuration is complete.
-    return models.read_config(
-        export, io=IOConfig(mode="dummy"), modules=frozenset(), base=base
-    )
-
-
-def test_export_reads_local_components_without_hub_metadata(checkpoints):
-    export, base = checkpoints
-    config = _read(export, base)
-
-    assert set(config.model.denoisers) == {"reference_denoiser"}
-    denoiser = config.model.denoisers["reference_denoiser"]
-    assert isinstance(denoiser.schedule, PddGrid)
-    assert denoiser.attention == SparseAttention(
-        tile=128, sparsity=0.9, reference_keep=0.1
-    )
-    assert denoiser.max_sequence_rows == 131_072
-    assert config.tokenizer == base / "tokenizer"
-    assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
-
-
-def test_checkpoint_without_a_pinned_base_takes_none(checkpoints):
-    _, base = checkpoints
-    with pytest.raises(ValueError, match="pins no base"):
-        _read(base, base)
-
-
-def test_export_without_a_local_base_reads_the_pinned_hub_revision(
+def test_export_reads_the_pinned_hub_revision(
     checkpoints, tmp_path, monkeypatch
 ):
     from huggingface_hub.errors import EntryNotFoundError
@@ -135,7 +107,14 @@ def test_export_without_a_local_base_reads_the_pinned_hub_revision(
     )
 
     assert set(config.model.denoisers) == {"reference_denoiser"}
+    denoiser = config.model.denoisers["reference_denoiser"]
+    assert isinstance(denoiser.schedule, PddGrid)
+    assert denoiser.attention == SparseAttention(
+        tile=128, sparsity=0.9, reference_keep=0.1
+    )
+    assert denoiser.max_sequence_rows == 131_072
     assert config.tokenizer == snapshot / "tokenizer"
+    assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
 
 
 def test_offline_export_reads_its_base_from_the_cached_snapshot(

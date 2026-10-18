@@ -47,9 +47,6 @@ pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Local base directory supplying a component export's missing modules.
-    /// Unset, ranks fetch the base revision the export declares from the Hub.
-    pub base_model: Option<std::path::PathBuf>,
     /// Ordered physical members of this WorkerGroup instance.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks

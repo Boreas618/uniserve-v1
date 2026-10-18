@@ -79,7 +79,6 @@ class Description:
     model: nn.Module
     metadata: registry.Config | None
     path: str | None
-    base: str | None
     io: library.Config
     entries: Mapping[str, Any]
     calls: dict[str, tuple[Call, ...]]
@@ -176,7 +175,6 @@ class Loaded:
 def read_config(
     stub: bool,
     path: str | None,
-    base_model: str | None,
     io_format: str,
     io_mode: str,
     download_dir: str | None,
@@ -193,7 +191,6 @@ def read_config(
     Args:
         stub: Describe the stub model instead of a checkpoint.
         path: The checkpoint directory.
-        base_model: The base checkpoint an adapter refers to.
         io_format, io_mode, download_dir, num_threads: How weights are read
             (``uniserve.loading.Config``).
         device: The rank's primary device.
@@ -217,7 +214,7 @@ def read_config(
         download_dir=None if download_dir is None else Path(str(download_dir)),
         num_threads=None if num_threads is None else int(num_threads),
     )
-    path, base = _text(path), _text(base_model)
+    path = _text(path)
     rank, role = int(rank), str(role)
     placed = placements(json.loads(str(components)))
     if stub:
@@ -230,9 +227,7 @@ def read_config(
     else:
         if path is None:
             raise SetupError("--model is required for a model worker")
-        metadata = registry.read_config(
-            path, io=io, modules=frozenset(), base=base
-        )
+        metadata = registry.read_config(path, io=io, modules=frozenset())
         with torch.device("meta"):
             model = metadata.model_class(metadata.model)
         entries = metadata.entry_points
@@ -274,7 +269,6 @@ def read_config(
         model,
         metadata,
         path,
-        base,
         io,
         entries,
         calls,
@@ -319,7 +313,6 @@ def _resolve(
         description.path,
         io=description.io,
         modules=frozenset(str(path) for path in modules),
-        base=description.base,
         exclude_modules=frozenset(str(path) for path in exclude_modules),
     )
     options = json.loads(str(quantization))

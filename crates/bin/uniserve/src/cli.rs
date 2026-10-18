@@ -155,12 +155,6 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(value_name = "MODEL")]
     pub model: String,
 
-    /// Local base directory supplying a component export's missing modules,
-    /// such as FastH3 OmniRef's text encoder and VAEs. Without it, load the
-    /// base revision declared by the export from the Hugging Face cache.
-    #[arg(long, value_name = "PATH")]
-    pub base_model: Option<std::path::PathBuf>,
-
     /// Override the maximum model context length. When unset, a model with a
     /// root `config.json` uses its `max_position_embeddings` (8192 when it
     /// declares none) and a MiniMax-H3 pipeline uses 16384 prompt tokens, the
@@ -509,7 +503,6 @@ impl SharedRuntimeArgs {
         worker_process.host = self.host_identity.clone();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        worker_process.base_model = self.base_model.clone();
         let queue_depth = self
             .queue_depth
             .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
@@ -568,7 +561,6 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
-            base_model: self.base_model,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -1026,23 +1018,6 @@ mod tests {
             worker.quantization_config["components"]["transformer.mlp"],
             "nvfp4"
         );
-    }
-
-    #[test]
-    fn serve_forwards_a_local_base_checkpoint() {
-        let parsed = <Cli as clap::Parser>::try_parse_from([
-            "uniserve",
-            "serve",
-            "/models/FastH3-OmniRef",
-            "--base-model",
-            "/models/MiniMax-H3",
-        ])
-        .expect("component export with a local base");
-        let Command::Serve(args) = parsed.command;
-        let config = args.to_uniserve_config();
-        let base = Some(std::path::PathBuf::from("/models/MiniMax-H3"));
-        assert_eq!(config.base_model, base);
-        assert_eq!(config.engine.worker_process.base_model, base);
     }
 
     #[test]

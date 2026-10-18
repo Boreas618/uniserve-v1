@@ -2029,7 +2029,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         // The head's default watchdog timeout.
         watchdog_timeout_ms: 300_000,
         model: String::new(),
-        base_model: None,
         device: "cpu".into(),
         rank: 0,
         local_rank: 0,
