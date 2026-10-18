@@ -583,10 +583,6 @@ pub struct ImageParams {
     pub width: u32,
     /// Optional deterministic diffusion seed.
     pub seed: Option<u64>,
-    /// Negative prompt text as the client gave it. The tokens image guidance
-    /// conditions on are `GenerationRequest::negative_prompt_token_ids`,
-    /// which the server renders from it.
-    pub negative_prompt: String,
     /// Maximum images this request may generate.
     pub max_images: u16,
     /// Optional per-image prompt overrides.
@@ -858,7 +854,6 @@ impl Default for ImageParams {
             height: 512,
             width: 512,
             seed: None,
-            negative_prompt: String::new(),
             max_images: 1,
             image_prompts: Vec::new(),
             retain_images: true,

@@ -139,7 +139,6 @@ pub(super) fn preprocess_sensenova(
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
         generation.sampling.seed,
-        negative_text.unwrap_or_default(),
         generation.constraint,
     )?;
     let mut multimodal_inputs = prepare_image_inputs(
@@ -220,7 +219,6 @@ pub(super) fn preprocess_bagel(
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
         generation.sampling.seed,
-        negative_text.unwrap_or_default(),
         generation.constraint,
     )?;
     let multimodal_inputs = prepare_image_inputs(
@@ -553,7 +551,6 @@ fn resolve_image_params(
     resolution_policy: &ResolutionPolicy,
     image: crate::serving::ImageGenControls,
     sampling_seed: Option<u64>,
-    negative_prompt: String,
     constraint: GenerationConstraint,
 ) -> OmniResult<ImageParams> {
     let resolution = resolve_resolution(
@@ -581,7 +578,6 @@ fn resolve_image_params(
         height: resolution.height,
         width: resolution.width,
         seed: sampling_seed.or(defaults.seed),
-        negative_prompt,
         max_images,
         image_prompts: Vec::new(),
         retain_images: constraint != GenerationConstraint::GenOnly,

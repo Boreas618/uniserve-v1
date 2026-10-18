@@ -973,7 +973,8 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
 }
 
 /// The image API produces an image-only (`GenOnly`) request that keeps the
-/// requested canvas, steps, seed, guidance scale, and negative prompt.
+/// requested canvas, steps, seed, guidance scale, and negative prompt, the
+/// last as its rendered tokens.
 /// SenseNova accepts only its resolution buckets, and 1536x1536 is one of
 /// them.
 #[test]
@@ -983,20 +984,26 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
         (ModelDescription::Bagel, "bagel", 512, 512),
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let request: uniserve_server::openai::ImageGenerationRequest =
-            serde_json::from_value(serde_json::json!({
+        let request = |negative_prompt: Option<&str>| {
+            let mut body = serde_json::json!({
                 "model": description.id(),
                 "prompt": "a blue bird",
-                "negative_prompt": "blur",
                 "size": format!("{width}x{height}"),
                 "steps": 4,
                 "seed": 17,
                 "guidance_scale": 7.5
-            }))
-            .unwrap();
-        let (generation, _) = processor
-            .preprocess_image_request(ServeRequestId::new("image-api"), request)
-            .unwrap();
+            });
+            if let Some(negative_prompt) = negative_prompt {
+                body["negative_prompt"] = negative_prompt.into();
+            }
+            let request: uniserve_server::openai::ImageGenerationRequest =
+                serde_json::from_value(body).unwrap();
+            processor
+                .preprocess_image_request(ServeRequestId::new("image-api"), request)
+                .unwrap()
+                .0
+        };
+        let generation = request(Some("blur"));
         assert_eq!(
             generation.constraint,
             uniserve_core::GenerationConstraint::GenOnly
@@ -1010,7 +1017,12 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
         assert_eq!(generation.image.seed, Some(17));
         assert_eq!(generation.sampling.seed, Some(17));
         assert_eq!(generation.image.cfg_text_scale, 7.5);
-        assert_eq!(generation.image.negative_prompt, "blur");
+        // The negative prompt reaches the engine as the tokens the model's
+        // profile renders it to, which guidance conditions on.
+        assert_ne!(
+            generation.negative_prompt_token_ids,
+            request(None).negative_prompt_token_ids
+        );
     }
 }
 
