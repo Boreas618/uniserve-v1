@@ -65,7 +65,6 @@ impl ExpertUnion {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelSource {
     pub path: String,
-    pub base_model: Option<String>,
     /// Precision selectors as a JSON object text, interpreted by the
     /// numerical library's rank loading (`uniserve.loading.rank`).
     pub quantization: String,
@@ -192,7 +191,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         expert_parallel: experts,
         model: model.map(|path| ModelSource {
             path,
-            base_model: text(descriptor.base_model.as_deref()),
             quantization: descriptor.quantization_config.to_string(),
         }),
         data_plane: DataPlane { backends, exports },

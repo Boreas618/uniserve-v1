@@ -129,7 +129,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
 
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        base_model: config.base_model.clone(),
         max_batch_calls,
         max_batch_tokens,
         max_model_len,

@@ -160,10 +160,6 @@ pub struct Config {
     /// repository ID or a local model directory. Empty by default; callers
     /// must set it.
     pub model: String,
-    /// Local base directory supplying a component export's missing modules.
-    /// Without it, the server and workers fetch the base revision declared
-    /// by the export from the Hugging Face cache.
-    pub base_model: Option<PathBuf>,
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
@@ -298,7 +294,6 @@ impl Default for Config {
         Self {
             engine: EngineSettings::default(),
             model: String::new(),
-            base_model: None,
             served_model_name: None,
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),

@@ -41,7 +41,7 @@ The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the Cu
 
 The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A checkpoint's schedule comes from its `fastvideo_inference.json` and schedulers, or for the base checkpoint 50 sigma points with video shift 12 and audio shift 3. A server places one denoiser, so a base deployment serves either `t2va` and `fl2va` or `ref2va`.
 
-An OmniRef export holds only its reference denoiser and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses; the server reads them from the Hugging Face cache at that revision, or from the local copy `--base-model` names, which must hold every file at the pinned revision.
+An OmniRef export holds only its reference denoiser and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read them from the Hugging Face cache at that revision, downloading what the cache lacks.
 
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
@@ -50,8 +50,8 @@ hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 export H3_ROOT=/workspace/models/MiniMax-H3
 hf download MiniMaxAI/MiniMax-H3 --local-dir "$H3_ROOT"
 
-# The base components an OmniRef export pins.
-hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> --local-dir "$OMNIREF_BASE" \
+# The base components an OmniRef export pins, into the Hugging Face cache.
+hf download MiniMaxAI/MiniMax-H3 --revision <base_model_revision> \
   --include 'text_encoder/*' --include 'tokenizer/*' --include 'processor/*' \
   --include 'vae/*' --include 'audio_vae/*'
 ```
@@ -88,7 +88,7 @@ uniserve serve "$H3_ROOT" \
   --max-video-seconds 5 --max-model-len 8192 --video-text-capacities 8192 \
   --max-condition-rows 40960 --media-directory /srv/media
 
-uniserve serve "$OMNIREF_EXPORT" --base-model "$OMNIREF_BASE" \
+uniserve serve "$OMNIREF_EXPORT" \
   --workers configs/minimax_h3/ulysses4-reference.json \
   --served-model-name MiniMax-H3-OmniRef \
   --host 0.0.0.0 \
@@ -267,4 +267,4 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `invalid_request` naming the prompt length | Raise `--max-model-len`. |
 | A refused `file://` condition | Set `--media-directory` to a directory that holds the path. |
 | `server_error` naming `cannot run ffprobe` | Put FFmpeg on `PATH` or name it with `--ffprobe`. |
-| An OmniRef start refusing a base file by name | Download the base at the revision the export pins. |
+| An OmniRef start that cannot find a base file | Let the server download the pinned revision, or download it into the Hugging Face cache as above. |

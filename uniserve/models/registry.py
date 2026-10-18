@@ -77,10 +77,10 @@ class Base:
 
     A package's ``base_checkpoint(root)`` returns one for a checkpoint
     directory that holds only some of its components, else ``None``.
-    ``read_config`` then resolves the base, from the Hub cache at
-    ``revision`` or from a local copy the caller names, and reads every
-    source and sidecar under ``directories`` from it; the package's own
-    ``read_config`` receives the base directory as ``base``.
+    ``read_config`` then resolves the base from the Hub cache at
+    ``revision``, fetching what the cache lacks, and reads every source and
+    sidecar under ``directories`` from it; the package's own ``read_config``
+    receives the base directory as ``base``.
 
     Attributes:
         repository: Hub repository id of the base.
@@ -690,27 +690,19 @@ def _calibrated_quantization(
     }
 
 
-def _base_snapshot(base: Base, path: str | Path | None, io) -> _Snapshot:
+def _base_snapshot(base: Base, io) -> _Snapshot:
     """Resolve a component export's base checkpoint.
 
-    ``path`` names the local directory supplying the missing components.
-    Without it, fetch the Hub revision declared by the export. Only files
-    under ``base.directories`` are listed.
+    The base is the Hub snapshot of the revision the export pins, read from
+    the Hub cache and fetched into it when absent. Only files under
+    ``base.directories`` are listed.
 
     Raises:
-        FileNotFoundError: The supplied local directory does not exist.
+        FileNotFoundError: The pinned revision publishes no model metadata.
     """
-    if path is not None:
-        root = Path(path).expanduser()
-        if not root.is_dir():
-            raise FileNotFoundError(
-                f"base checkpoint {root} is not a directory"
-            )
-        repository = revision = None
-    else:
-        root, repository, revision = _root(
-            base.repository, replace(io, revision=base.revision)
-        )
+    root, repository, revision = _root(
+        base.repository, replace(io, revision=base.revision)
+    )
     inventory = frozenset(
         name
         for name in _inventory(root, repository, revision, io)
@@ -758,7 +750,6 @@ def read_config(
     io: loading.Config = loading.Config(),
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
-    base: str | Path | None = None,
 ) -> Config:
     """Normalize one local or immutable Hub snapshot without materializing a
     model.
@@ -778,9 +769,6 @@ def read_config(
             whole model, and an empty set resolves no payload source.
         exclude_modules: Subtrees to leave unmaterialized, including their
             aliases. Their architecture metadata remains available.
-        base: Local directory supplying a component export's missing modules
-            (``Base``). Without it, fetch the revision declared by the export
-            from the Hub cache.
 
     Raises:
         FileNotFoundError: The checkpoint, its metadata, its base, or a
@@ -789,8 +777,7 @@ def read_config(
             unsupported, including an architecture outside the catalog, a
             selected path that is not a module, and malformed architecture,
             model configuration, index, tokenizer or quantization metadata
-            (a required field that is missing or a field of the wrong type);
-            or a ``base`` for a checkpoint that declares none.
+            (a required field that is missing or a field of the wrong type).
     """  # noqa: D205
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
@@ -819,11 +806,7 @@ def read_config(
     export = _Snapshot(root, repository, revision, inventory)
     declares_base = hasattr(package, "base_checkpoint")
     pinned = package.base_checkpoint(root) if declares_base else None
-    if pinned is None and base is not None:
-        raise ValueError(
-            f"checkpoint {root} pins no base checkpoint, so it takes no base"
-        )
-    supplier = None if pinned is None else _base_snapshot(pinned, base, io)
+    supplier = None if pinned is None else _base_snapshot(pinned, io)
     if supplier is not None:
         _fetch(
             supplier.root,
