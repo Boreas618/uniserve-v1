@@ -16,6 +16,7 @@ use crate::executor::batch::decodes_video;
 use crate::ffi::Interpreter;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
+use crate::request::diffusion::BranchSource;
 use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
@@ -182,6 +183,78 @@ pub(crate) struct ImageOwners {
 }
 
 impl ImageOwners {
+    /// The image shapes the engine warms this rank's image denoiser with,
+    /// through its scheduler, once the rank reported: one per guidance
+    /// branch count, at the smallest captured step with that count, or,
+    /// without one (flow graphs off), a square raster of the largest image
+    /// the latent pool's `latent_units` and the denoiser's sequence bound
+    /// hold. A guided shape needs a request slot beside its request's for
+    /// its alternative prefix, so a rank of one slot states only the
+    /// unguided shape; a guided shape carries the tokens the model frames
+    /// for an empty negative prompt, which its warmup request admits as its
+    /// negative tokens. Empty on a rank without an image denoiser.
+    pub(crate) fn warmups(
+        &self,
+        request_slots: u32,
+        latent_units: u64,
+    ) -> Result<Vec<uniserve_ipc::ImageWarmup>> {
+        let Some(layout) = self
+            .model
+            .denoiser
+            .filter(|_| self.denoisers.image.is_some())
+        else {
+            return Ok(Vec::new());
+        };
+        let side = u64::from(layout.max_sequence_tokens)
+            .min(latent_units)
+            .max(1)
+            .isqrt() as u32
+            * layout.downsample;
+        let captured = self.denoisers.flow_shapes();
+        let mut warmups = Vec::new();
+        for branches in 1..=MAX_BRANCHES {
+            if branches > 1 && request_slots < 2 {
+                continue;
+            }
+            let (height, width) = captured
+                .iter()
+                .rev()
+                .find(|shape| shape.branches == branches)
+                .map_or((side, side), |shape| (shape.height, shape.width));
+            // A second branch conditions on the negative prompt, here an
+            // empty one; a third also on the image-unconditional source. The
+            // engine places both in one alternative prefix sized from the
+            // request's negative tokens, so they must frame alike.
+            let mut sources = Vec::new();
+            if branches > 1 {
+                sources.push(BranchSource::NegativeOrStart);
+            }
+            if branches > 2 {
+                sources.push(layout.image_unconditional);
+            }
+            let mut alternatives = Vec::new();
+            for source in sources {
+                let prefix = self.policy.prefix_of(source)?;
+                let tokens = prefix.tokens.to_vec();
+                if !prefix.reuses_conditioning && !alternatives.contains(&tokens) {
+                    alternatives.push(tokens);
+                }
+            }
+            if alternatives.len() > 1 {
+                return Err(Error::Interface(
+                    "image guidance frames more than one alternative prefix".into(),
+                ));
+            }
+            warmups.push(uniserve_ipc::ImageWarmup {
+                height,
+                width,
+                branches: branches as u8,
+                negative_token_ids: alternatives.pop().unwrap_or_default(),
+            });
+        }
+        Ok(warmups)
+    }
+
     /// Create the runners of every image call on this rank, or `None` on
     /// a rank without one.
     pub(crate) fn start(startup: Startup<'_>) -> Result<Option<Self>> {

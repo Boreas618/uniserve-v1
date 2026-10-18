@@ -133,7 +133,8 @@ Every rank of a group runs these phases in the same order, because several are c
 6. Rust plans capacity from the model's sizes and measured memory, allocates request storage, and constructs a runner, with its execution context, for each placed component and lane.
 7. The executor and the profiler start.
 8. Warmup: Rust sets each runner's graph budget and prepares it; then every captured method runs eagerly once at its shape, so kernels compile outside capture, and is captured, each runner's shapes largest first. Paths that always run eagerly (image prompts, uncaptured image denoising steps) run once too, so no serving request selects a kernel first.
-9. Representative requests run through the serving path; the runners' graph tables and graph storage are sealed; Python's garbage collector is collected, frozen and disabled; the rank reports its capacities to the engine.
+9. The runners' graph tables and graph storage are sealed; Python's garbage collector is collected, frozen and disabled; the rank reports its capacities and the shapes it prepared to the engine: one image shape per captured guidance-branch count (`WorkerInfo::image_warmups`, a guided one with its model's framing of an empty negative prompt) and the rows of one diffusion LM sampler chunk (`diffusion_lm_step_rows`).
+10. On CUDA ranks the engine warms the serving path with real requests through its scheduler (`crates/engine/src/warmup.rs`): a token request of a prefill and a decode, a group of equal one-block diffusion LM requests for each row count of a sampler chunk, each submitted in one command so its steps run with exactly that many rows (the one-row request generates a second block, so a commit prefill runs), and a two-step image request per image shape at the guidance scales of its branch count. A request the deployment's generation limits refuse a client is left out. Serving starts once every warmup request finished.
 
 After startup the Python thread is idle except for eager forwards, host-planned attention plans and the little resource work issued while serving.
 
@@ -183,7 +184,7 @@ Dependency direction: `core <- ipc <- {engine, worker, uniserve-host}`, `cuda <-
 | --- | --- |
 | `launch`, `config` | arguments, signals, registration with the head; the rank's configuration; component declarations and placement |
 | `worker` | start, serve, ordered close; the model description and loading, capacity planning (`worker/planning.rs`) and request storage allocation (`worker/storage.rs`) |
-| `warmup` | the startup phases after storage: graph budgets, preparation, capture, representative requests (`Scenarios`), completion |
+| `warmup` | the startup phases after storage: graph budgets, preparation, capture, completion (`WarmupHooks`); the serving path is warmed by the engine |
 | `service.rs` | serves the channel |
 | `completion`, `error`, `logging` | the completions jobs post; error kinds; tracing setup |
 | `executor` | batch admission, forward order, job submission, completions, retirement; the batch skeleton and the image and video batches |

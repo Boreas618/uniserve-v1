@@ -591,22 +591,6 @@ impl Executor {
         }
     }
 
-    /// Reset startup numbering only after every warmup result is consumed.
-    pub(crate) fn reset(&mut self) -> Result<(), WorkerError> {
-        self.require_open()?;
-        if self.has_work() {
-            return Err(WorkerError::classify(
-                Error::State("warmup completed with pending batches"),
-                None,
-            ));
-        }
-
-        self.last_batch = None;
-        self.last_sequence = None;
-        self.ready_receiver.try_iter().for_each(drop);
-        Ok(())
-    }
-
     /// Attempt every batch cleanup before returning the first failure.
     pub(crate) fn close(&mut self) -> Result<(), WorkerError> {
         self.closed = true;

@@ -220,10 +220,11 @@ impl ImageBatch<'_> {
 
     /// Record into `job` the calls a trajectory of request `key` opens
     /// with: its guidance plan, and the prefix of each source one of its
-    /// guidance branches may condition on. The model frames and tokenizes
-    /// a prefix; admitted negative tokens are the negative prefix as they
-    /// are. [`Self::planned_trajectory`] opens the trajectory from the
-    /// job's completion.
+    /// guidance branches may condition on. The negative prefix is the
+    /// admitted negative tokens as they are ([`BranchSource::admitted`]);
+    /// the model frames and tokenizes the others.
+    /// [`Self::planned_trajectory`] opens the trajectory from the job's
+    /// completion.
     fn plan_trajectory(
         &self,
         slot: usize,
@@ -256,15 +257,9 @@ impl ImageBatch<'_> {
             if prefixes.iter().any(|(known, _)| *known == source) {
                 continue;
             }
-            let given =
-                (source == BranchSource::NegativeOrStart && !negative.is_empty()).then(|| Prefix {
-                    tokens: Arc::from(&negative[..]),
-                    reuses_conditioning: false,
-                });
+            let given = source.admitted(&negative);
             if given.is_none() {
-                self.parts
-                    .policy
-                    .ask_prefix(source, &prompt, &image.negative_prompt, job);
+                self.parts.policy.ask_prefix(source, &prompt, job);
             }
             prefixes.push((source, given));
         }
