@@ -391,3 +391,64 @@ fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
     assert_eq!(read(lease.value()), values);
     Ok(())
 }
+
+#[test]
+fn a_released_import_leaves_its_product_importable() -> Result<()> {
+    let producer = store(1024, 0, 0)?;
+    let consumer = store(1024, 0, 0)?;
+    let transports = transports(1024)?;
+    let product = reference(1, 0, WireDType::F32, &[2, 3]);
+    let values: Vec<f32> = (0..6).map(|value| value as f32).collect();
+    let source = persistent(&producer, &product, allocation(&product, 0, 24), None)?;
+    publish(&producer, &source, &values, &[2, 3])?;
+    let export = producer.export_buffer(
+        &call(vec![]),
+        &product,
+        &source,
+        &transports,
+        false,
+        None,
+        None,
+    )?;
+    let (export, _locations) = producer.located(&source, export)?;
+    let TransferHandle::DeviceProduct { tensor, .. } = &export.value else {
+        panic!("a product exports as a device product");
+    };
+    let allocations = HashMap::from([(product.buffer_id(), allocation(&product, 0, 24))]);
+    let placement = OutputPlacement {
+        allocations: Some(&allocations),
+        ..OutputPlacement::default()
+    };
+    let import = |placement| -> Result<Arc<uniserve_worker::storage::ProductRead>> {
+        let read =
+            consumer.import_tensor(&product, tensor, CPU, &transports, placement, None, None)?;
+        for transfer in read.reads() {
+            transfer.start()?;
+            transfer.wait_ready();
+        }
+        consumer.complete_import(&read, None)?;
+        Ok(read)
+    };
+
+    // A consumer reads the imported copy, which is then released (a
+    // consumed predicate is) after its reader finished. Nothing has
+    // reclaimed it yet: its accesses retired, but no binding has run since.
+    let first = import(placement)?;
+    consumer.complete_reads(std::slice::from_ref(&first), None, &[])?;
+    consumer.release_calls(&[(request(), product.producer_call_id)]);
+
+    // A later call reading the same product imports it again.
+    let second = import(placement)?;
+    assert_eq!(read(second.value()), values);
+
+    // Released while that reader still holds it, as a copy whose fences are
+    // pending is, the copy is not retired; the next reader revives it and
+    // reads its value where it lies.
+    consumer.release_calls(&[(request(), product.producer_call_id)]);
+    let third =
+        consumer.import_tensor(&product, tensor, CPU, &transports, placement, None, None)?;
+    assert_eq!(third.value().address(), second.value().address());
+    assert_eq!(read(third.value()), values);
+    consumer.complete_reads(&[second, third], None, &[])?;
+    Ok(())
+}
