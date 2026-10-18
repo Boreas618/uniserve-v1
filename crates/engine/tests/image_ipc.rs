@@ -98,7 +98,7 @@ fn engine() -> anyhow::Result<EngineCore> {
         block_size: Some(16),
         max_batch_calls: 16,
         max_batch_tokens: 256,
-        attention_backend: uniserve_ipc::AttentionBackend::Torch,
+        attention_backend: "torch".into(),
         ..config.worker_process.clone()
     };
     EngineCore::new(config)
