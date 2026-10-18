@@ -1901,16 +1901,17 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let images = count(|kind| kind == ConditionType::Image);
         let audios = count(|kind| kind == ConditionType::Audio);
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
-        for (kind, found, limit) in [
-            ("image", images, MAX_IMAGE_REFERENCES),
-            ("video", videos, MAX_VIDEO_REFERENCES),
-            ("audio", audios, MAX_AUDIO_REFERENCES),
-            ("reference", references().count(), MAX_REFERENCES),
+        // Each limit names what it bounds; the last bounds every kind.
+        for (bounded, found, limit) in [
+            ("image references", images, MAX_IMAGE_REFERENCES),
+            ("video references", videos, MAX_VIDEO_REFERENCES),
+            ("audio references", audios, MAX_AUDIO_REFERENCES),
+            ("references", references().count(), MAX_REFERENCES),
         ] {
             if found > limit {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
-                    format!("at most {limit} {kind} references, got {found}"),
+                    format!("at most {limit} {bounded}, got {found}"),
                 ));
             }
         }
@@ -3164,6 +3165,37 @@ pub(super) mod tests {
         };
         let error = check_request(VideoTask::T2va, &ten_seconds, &[], &limits).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
+    }
+
+    /// Each reference-count refusal names what it bounds: nine images, three
+    /// videos and three audio tracks are each within their own limit, but
+    /// thirteen references exceed the twelve of every kind together.
+    #[test]
+    fn reference_limits_name_what_they_bound() {
+        let reference = |condition_type| ConditionSpec {
+            condition_type,
+            role: Role::Reference,
+            frame_index: None,
+            start_seconds: None,
+        };
+        let refusal = |conditions: &[ConditionSpec]| {
+            let checked = check_request(VideoTask::Ref2va, &FIVE_SECONDS, conditions, &limits());
+            match checked {
+                Err(VideoInputError::Invalid { field, message }) => {
+                    assert_eq!(field, RequestField::Conditions);
+                    message
+                }
+                other => panic!("the references were not refused: {other:?}"),
+            }
+        };
+
+        let images = vec![reference(ConditionType::Image); 10];
+        assert_eq!(refusal(&images), "at most 9 image references, got 10");
+
+        let mut every_kind = vec![reference(ConditionType::Image); 9];
+        every_kind.extend(vec![reference(ConditionType::Video); 3]);
+        every_kind.push(reference(ConditionType::Audio));
+        assert_eq!(refusal(&every_kind), "at most 12 references, got 13");
     }
 
     /// A task outside the placed denoiser's set is rejected first.
