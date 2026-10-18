@@ -66,9 +66,9 @@ def test_spatial_encoder_tiles_reproduce_a_local_encoding():
     placed at their raster positions agree on every overlap and the blended
     seams reproduce the whole-raster encoding.
     """
-    from uniserve.nn.vae import SpatialEncoder
+    from uniserve.nn.vae import TiledEncoder
 
-    encoder = SpatialEncoder(
+    encoder = TiledEncoder(
         torch.nn.AvgPool2d(4),
         spatial_compression=4,
         tile_height=32,

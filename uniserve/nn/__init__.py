@@ -6,6 +6,7 @@ resources.
 """
 
 from uniserve.nn.activation import GELUAndMul, SiLUAndMul, get_act_fn
+from uniserve.nn.adaln_cache import AdaLNCache
 from uniserve.nn.attention import Attention
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -17,7 +18,6 @@ from uniserve.nn.linear import (
     VocabParallelHead,
 )
 from uniserve.nn.mlp import GatedMLP
-from uniserve.nn.modulation import Modulation
 from uniserve.nn.moe import FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import RotaryEmbedding
@@ -39,6 +39,7 @@ from uniserve.nn.vision import (
 )
 
 __all__ = [
+    "AdaLNCache",
     "Attention",
     "AttentionBlock",
     "ColumnParallelLinear",
@@ -50,7 +51,6 @@ __all__ = [
     "Linear",
     "MLPConnector",
     "MergedColumnParallelLinear",
-    "Modulation",
     "PatchAutoencoder",
     "PatchEmbed",
     "PositionEmbedding",

@@ -21,7 +21,7 @@ from uniserve.loading import checkpoint, weights
 from uniserve.models.minimax_h3 import SegmentInput, Transformer
 from uniserve.models.minimax_h3.config import TRANSFORMER_FIELDS
 from uniserve.models.minimax_h3.denoiser import (
-    modulation_timesteps,
+    adaln_timesteps,
     schedules,
 )
 from uniserve.models.minimax_h3.weights import transformer_component
@@ -192,9 +192,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     # The Preview export's four DMD rungs; each step reads its video and
     # audio timestep entries.
     denoiser = dmd_denoiser(config)
-    _, entries, _ = modulation_timesteps(
-        denoiser, schedules(denoiser, device="cpu")
-    )
+    _, entries, _ = adaln_timesteps(denoiser, schedules(denoiser, device="cpu"))
     model = loading.load_model(
         lambda config: Transformer(
             config,

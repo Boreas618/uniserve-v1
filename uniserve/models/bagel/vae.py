@@ -176,7 +176,7 @@ class Decoder(nn.Module):
 # ``uniserve.models.bagel.model.Model`` borrows only this model's encoder,
 # decoder and posterior, and ``PatchAutoencoder`` applies the same scale and
 # shift. The ``encode`` and ``decode`` methods here serve direct use of the
-# codec.
+# VAE.
 class Model(nn.Module):
     """Encode normalized posterior samples and decode their inverse transform."""  # noqa: E501
 

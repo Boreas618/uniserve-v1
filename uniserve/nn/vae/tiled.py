@@ -1,4 +1,4 @@
-"""Shared spatial tiling for numerical video encoders and decoders."""
+"""Shared tiled encoding and decoding for numerical VAEs."""
 
 from __future__ import annotations
 
@@ -21,9 +21,7 @@ def split_tiles(
             value % alignment for value in (length, tile_size, minimum_overlap)
         )
     ):
-        raise ValueError(
-            "spatial tiles and overlap must align with the decoder scale"
-        )
+        raise ValueError("tiles and overlap must align with the decoder scale")
     if tile_size >= length:
         return [0], [length], []
 
@@ -82,7 +80,7 @@ def stitch_tiles(
     return torch.cat(assembled_rows, dim=-2)
 
 
-class SpatialDecoder(nn.Module):
+class TiledDecoder(nn.Module):
     """Decode an aligned raster directly or as one batch of overlapping tiles.
 
     The concrete ``forward`` defines any latent-channel projection before its
@@ -119,9 +117,7 @@ class SpatialDecoder(nn.Module):
         tile.
         """  # noqa: D205
         if latents.ndim != 5 or latents.shape[0] < 1:
-            raise ValueError(
-                "spatial decoding requires a nonempty NCTHW latent"
-            )
+            raise ValueError("tiled decoding requires a nonempty NCTHW latent")
         if not tiled:
             return self(latents)
 
@@ -166,7 +162,7 @@ class SpatialDecoder(nn.Module):
         return stitch_tiles(rows, y_overlaps, x_overlaps)
 
 
-class SpatialEncoder(nn.Module):
+class TiledEncoder(nn.Module):
     """Encode an aligned raster directly or as overlapping tiles.
 
     The concrete ``forward`` encodes one tile, including any latent-channel
@@ -209,7 +205,7 @@ class SpatialEncoder(nn.Module):
         The raster must align with the spatial compression ratio when tiled.
         """
         if pixels.ndim < 3 or pixels.shape[0] < 1:
-            raise ValueError("spatial encoding requires a nonempty raster")
+            raise ValueError("tiled encoding requires a nonempty raster")
         if not tiled:
             return self(pixels)
 
