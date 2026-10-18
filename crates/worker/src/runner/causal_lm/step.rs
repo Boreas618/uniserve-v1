@@ -29,7 +29,7 @@ use crate::runner::causal_lm::{
 };
 use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::{
-    RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_request, logprob_words,
+    RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_count, logprob_words,
 };
 use crate::storage::LogprobLayout;
 use crate::worker::RankStorage;
@@ -154,9 +154,9 @@ impl Planned {
 }
 
 impl PromptScore {
-    /// Add the chunk, which reports its `top` tokens and `ids`, to the
-    /// forward's prompt chunks.
-    fn record(&self, chunks: &mut PromptChunks, top: usize, ids: &[u32]) {
+    /// Add the chunk, which reports its `top` tokens, to the forward's
+    /// prompt chunks.
+    fn record(&self, chunks: &mut PromptChunks, top: usize) {
         chunks.rows.push(self.span.0 as i64);
         chunks.row_counts.push(self.span.1 as i64);
         chunks.tokens.push(self.token as i64);
@@ -165,7 +165,6 @@ impl PromptScore {
         chunks.offsets.push(self.words as i64);
         chunks.tails.push(self.tail as i64);
         chunks.tops.push(top as i64);
-        chunks.ids.push(ids.to_vec());
     }
 }
 
@@ -536,11 +535,7 @@ impl TokenBatch<'_> {
                 .get(plan.calls[index].request_key.request_id.0)?
                 .admission();
             let admitted = calls::parameters(admission)?;
-            let (top, ids) = logprob_request(
-                admitted.n_prompt_logprobs,
-                &admitted.logprob_token_ids,
-                vocab,
-            );
+            let top = logprob_count(admitted.n_prompt_logprobs, vocab);
             // A first chunk has no prediction for its first token.
             let scored = span.1.saturating_sub(usize::from(continued == 0));
             let score = PromptScore {
@@ -550,16 +545,14 @@ impl TokenBatch<'_> {
                 slot: self.batch.calls[index].slot,
                 tail,
                 words: cursor,
-                size: logprob_words(scored, top, ids.len()),
+                size: logprob_words(scored, top),
                 layout: (scored > 0).then(|| LogprobLayout {
                     rows: (0..scored).collect(),
                     counts: vec![top; scored],
-                    requested_ids: vec![ids.clone(); scored],
                     max_count: top,
-                    max_requested: ids.len(),
                 }),
             };
-            score.record(&mut prompt_chunks, top, &ids);
+            score.record(&mut prompt_chunks, top);
             cursor += score.size;
             self.batch.calls[index].forward.prompt.push(score);
         }

@@ -231,9 +231,7 @@ impl TokenBatch<'_> {
                     LogprobLayout {
                         rows: group.layout.rows.clone(),
                         counts: group.layout.counts.clone(),
-                        requested_ids: group.layout.requested_ids.clone(),
                         max_count: group.layout.max_count,
-                        max_requested: group.layout.max_requested,
                     },
                 )?;
                 for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {

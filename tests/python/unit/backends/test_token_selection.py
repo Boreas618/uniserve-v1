@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve.sampling.logprobs import LogprobRequest, prompt_logprobs
+from uniserve.sampling.logprobs import prompt_logprobs
 from uniserve.sampling.select import (
     TOKEN_CONTINUATION_BIT,
     select_categorical,
@@ -58,7 +58,7 @@ def _select(logits, params, **controls):
         "bias": [],
         "bias_values": [],
         "logprob_tasks": [],
-        "logprob_requests": [],
+        "logprob_counts": [],
         "force_finish": [0] * tasks,
         "finish_ids": [-1] * tasks,
         "transition_ids": [-1] * tasks,
@@ -193,7 +193,7 @@ def test_verifications_of_different_draft_counts_share_one_call() -> None:
         terminal_prefixes=[0, 0, 0, 1],
         finish_ids=[-1, -1, -1, 1],
         logprob_tasks=[0, 2, 3],
-        logprob_requests=[LogprobRequest(count=0, token_ids=())] * 3,
+        logprob_counts=[0] * 3,
     )
 
     assert selection.accepted.tolist() == [1, 0, 1, 1]
@@ -250,10 +250,7 @@ def test_selections_queue_behind_the_forward_without_synchronizing() -> None:
             bias=[5 * 5 + 4],
             bias_values=[0.5],
             logprob_tasks=[0, 2],
-            logprob_requests=[
-                LogprobRequest(count=2, token_ids=(1, 3)),
-                LogprobRequest(count=2, token_ids=(0,)),
-            ],
+            logprob_counts=[2, 2],
         )
         greedy = select_greedy(
             logits[:2],
@@ -298,7 +295,7 @@ def test_reported_logprobs_score_the_unshaped_distribution() -> None:
         params,
         top_ks=[2],
         logprob_tasks=[0],
-        logprob_requests=[LogprobRequest(count=4, token_ids=())],
+        logprob_counts=[4],
     )
 
     assert selection.tokens.tolist() == [0]
@@ -326,16 +323,14 @@ def test_continued_prompt_chunk_scores_first_token_from_retained_logits() -> (
     torch.manual_seed(0)
     tokens = torch.tensor([1, 2, 3, 0])
     logits = torch.randn(4, 6)
-    request = LogprobRequest(count=0, token_ids=())
-
     # A first chunk cannot score its first token.
-    retained, packed = prompt_logprobs(tokens[:2], logits[:2], None, request)
+    retained, packed = prompt_logprobs(tokens[:2], logits[:2], None, 0)
     assert packed is not None
     expected = torch.log_softmax(logits[0], dim=-1)[2].item()
     assert _selected_logprobs(packed, 1) == pytest.approx([expected], rel=1e-6)
 
     # The continuation's first token is predicted by the retained row.
-    _, packed = prompt_logprobs(tokens[2:], logits[2:], retained, request)
+    _, packed = prompt_logprobs(tokens[2:], logits[2:], retained, 0)
     assert packed is not None
     expected = [
         torch.log_softmax(logits[1], dim=-1)[3].item(),

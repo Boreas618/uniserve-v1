@@ -49,7 +49,7 @@ fn entry(token_id: u32, logprob: f32, rank: u32) -> TokenLogprob {
 #[test]
 fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
     // Two scored rows from a larger batch. The second requests fewer top
-    // tokens, while the first repeats its selection in both other fields.
+    // tokens, while the first repeats its selection among its top tokens.
     let words = [
         vec![5, 9],
         vec![score(-0.5), score(-2.0)],
@@ -57,13 +57,6 @@ fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
         vec![5, 7, 2, 8],
         vec![score(-0.5), score(-0.5), score(-1.0), score(-1.5)],
         vec![1, 1, 1, 2],
-        vec![
-            score(-0.5),
-            score(f32::NEG_INFINITY),
-            score(-2.0),
-            score(-1.0),
-        ],
-        vec![1, 10, 4, 1],
     ]
     .concat();
     let count = words.len();
@@ -74,9 +67,7 @@ fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
         LogprobLayout {
             rows: vec![4, 1],
             counts: vec![2, 1],
-            requested_ids: vec![vec![5, 3], vec![9, 2]],
             max_count: 2,
-            max_requested: 2,
         },
     )?;
     complete(&mut output)?;
@@ -87,17 +78,13 @@ fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
     );
     assert_eq!(
         output.logprob_values((0, count, 4))?,
-        [
-            entry(5, -0.5, 1),
-            entry(7, -0.5, 1),
-            entry(3, f32::NEG_INFINITY, 10)
-        ]
+        [entry(5, -0.5, 1), entry(7, -0.5, 1)]
     );
     Ok(())
 }
 
 #[test]
-fn selected_score_needs_no_top_or_requested_columns() -> Result<()> {
+fn selected_score_needs_no_top_columns() -> Result<()> {
     let mut output = buffer(vec![12, 0, score(-3.5), 8])?;
     output.register_logprobs(
         1,
@@ -105,9 +92,7 @@ fn selected_score_needs_no_top_or_requested_columns() -> Result<()> {
         LogprobLayout {
             rows: vec![6],
             counts: vec![0],
-            requested_ids: vec![vec![]],
             max_count: 0,
-            max_requested: 0,
         },
     )?;
     complete(&mut output)?;
@@ -131,12 +116,9 @@ fn readback_rejects_unfinished_copies_and_out_of_range_reads() -> Result<()> {
 #[test]
 fn score_layout_must_fit_its_capture_and_row_widths() -> Result<()> {
     let mut output = buffer(vec![0; 6])?;
-    for (counts, requested_ids, max_count, max_requested) in [
-        (vec![], vec![vec![]], 1, 0),
-        (vec![2], vec![vec![]], 1, 0),
-        (vec![1], vec![vec![3]], 1, 0),
-        (vec![0], vec![vec![]], 0, 0),
-    ] {
+    // A row of one top token fills the capture; a missing or excess count,
+    // or a width that does not, is refused.
+    for (counts, max_count) in [(vec![], 1), (vec![2], 1), (vec![1], 2), (vec![0], 0)] {
         assert!(
             output
                 .register_logprobs(
@@ -145,9 +127,7 @@ fn score_layout_must_fit_its_capture_and_row_widths() -> Result<()> {
                     LogprobLayout {
                         rows: vec![0],
                         counts,
-                        requested_ids,
                         max_count,
-                        max_requested,
                     },
                 )
                 .is_err()

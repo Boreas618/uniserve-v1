@@ -116,18 +116,16 @@ pub(crate) struct SamplingGroup {
     /// Per task, the one-based length of its draft prefix ending at the
     /// first finish token, or zero.
     pub(crate) terminal_prefixes: Vec<i64>,
-    /// The tasks reporting logprobs, each one's top count and its row of
-    /// the `[tasks, width]` explicit token ids.
+    /// The tasks reporting logprobs and each one's top count.
     pub(crate) logprob_tasks: Vec<i64>,
     pub(crate) logprob_counts: Vec<i64>,
-    pub(crate) logprob_ids: Vec<i64>,
     /// Where the group's logprob words start in the logprob tensor.
     pub(crate) logprob_offset: usize,
 }
 
 /// Row-major `[sets.len(), width]` matrix of token sets padded with -1,
 /// with at least one column.
-pub(crate) fn padded(sets: &[&[u32]]) -> Vec<i64> {
+fn padded(sets: &[&[u32]]) -> Vec<i64> {
     let width = sets.iter().map(|set| set.len()).max().unwrap_or(0).max(1);
     let mut matrix = vec![-1; sets.len() * width];
     for (row, set) in sets.iter().enumerate() {
@@ -181,7 +179,6 @@ impl SamplingGroup {
             terminal_prefixes: Vec::new(),
             logprob_tasks: Vec::new(),
             logprob_counts: Vec::new(),
-            logprob_ids: Vec::new(),
             logprob_offset: 0,
         }
     }
@@ -302,9 +299,7 @@ impl SamplingMetadata {
             let mut layout = LogprobLayout {
                 rows: Vec::new(),
                 counts: Vec::new(),
-                requested_ids: Vec::new(),
                 max_count: 0,
-                max_requested: 0,
             };
             let mut finish: Vec<&[u32]> = Vec::with_capacity(indices.len());
             let mut transitions: Vec<&[u32]> = Vec::with_capacity(indices.len());
@@ -330,25 +325,17 @@ impl SamplingMetadata {
                     params.extend_from_slice(&parameters(task.params, vocab));
                 }
                 if task.params.generated_logprobs_requested() {
-                    let (count, ids) = logprob_request(
-                        task.params.n_logprobs,
-                        &task.params.logprob_token_ids,
-                        vocab,
-                    );
+                    let count = logprob_count(task.params.n_logprobs, vocab);
                     layout.rows.push(local);
                     layout.max_count = layout.max_count.max(count);
-                    layout.max_requested = layout.max_requested.max(ids.len());
                     layout.counts.push(count);
-                    layout.requested_ids.push(ids);
                 }
             }
             group.finish_ids = padded(&finish);
             group.transition_ids = padded(&transitions);
             group.logprob_counts = layout.counts.iter().map(|&count| count as i64).collect();
-            let requested: Vec<&[u32]> = layout.requested_ids.iter().map(Vec::as_slice).collect();
-            group.logprob_ids = padded(&requested);
 
-            let size = layout.rows.len() * (3 + 3 * layout.max_count + 2 * layout.max_requested);
+            let size = logprob_words(layout.rows.len(), layout.max_count);
             let entry = if size > 0 {
                 if logprob_offset + size > logprob_capacity {
                     return Err(Error::Resource(
@@ -464,23 +451,17 @@ impl RowSampling {
     }
 }
 
-/// Top count and deduplicated in-range ids a call reports per position,
-/// of its `count` top tokens and explicit `token_ids`: the generated
-/// tokens' (`n_logprobs`) or the prompt's (`n_prompt_logprobs`).
-pub(crate) fn logprob_request(count: u32, token_ids: &[u32], vocab: usize) -> (usize, Vec<u32>) {
-    let count = (count as usize).min(vocab);
-    let mut ids = Vec::new();
-    for &id in token_ids {
-        if (id as usize) < vocab && !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    (count, ids)
+/// The top count a call reports per position, of its `count` top tokens
+/// (the generated tokens' `n_logprobs` or the prompt's
+/// `n_prompt_logprobs`) within the vocabulary.
+pub(crate) fn logprob_count(count: u32, vocab: usize) -> usize {
+    (count as usize).min(vocab)
 }
 
-/// Words of `rows` logprob rows of `count` top and `requested` ids each.
-pub(crate) fn logprob_words(rows: usize, count: usize, requested: usize) -> usize {
-    rows * (3 + 3 * count + 2 * requested)
+/// Words of `rows` logprob rows of `count` top tokens each: the selected
+/// token, score and rank, then the top tokens, scores and ranks.
+pub(crate) fn logprob_words(rows: usize, count: usize) -> usize {
+    rows * (3 + 3 * count)
 }
 
 fn parameters(params: &SamplingParams, vocab: usize) -> [f32; PARAMETER_COLUMNS] {
@@ -559,7 +540,6 @@ mod tests {
         let mut stochastic = params();
         stochastic.temperature = 0.7;
         stochastic.n_logprobs = 2;
-        stochastic.logprob_token_ids = vec![5, 5, 900];
         let tasks = [
             task(&stochastic, 0, Some(vec![0.25])),
             task(&greedy, 1, None),
@@ -574,15 +554,13 @@ mod tests {
             vec![0, 2, 1]
         );
         // Categorical group: tasks 0 and 2 at output positions 0 and 1,
-        // parameter rows from 0, logprobs at 10 for both tasks with the
-        // explicit ids deduplicated and kept inside the vocabulary.
+        // parameter rows from 0, and logprobs at 10 for both tasks.
         let categorical = &metadata.groups[0];
         assert_eq!(categorical.path, SamplingPath::Categorical);
         assert_eq!((categorical.first, categorical.parameters), (0, 0));
         assert_eq!(categorical.rows, vec![0, 2]);
         assert_eq!(categorical.logprob_tasks, vec![0, 1]);
         assert_eq!(categorical.logprob_counts, vec![2, 2]);
-        assert_eq!(categorical.logprob_ids, vec![5, 5]);
         assert_eq!(categorical.logprob_offset, 10);
         // Greedy group: task 1 at output position 2, parameter row 2, with
         // one padded column of finish and transition tokens.
@@ -597,9 +575,9 @@ mod tests {
         assert_eq!(greedy_group.transition_ids, vec![-1]);
         assert_eq!(metadata.draws, vec![0.25, 0.5, 0.0]);
         assert_eq!(metadata.params.len(), 3 * PARAMETER_COLUMNS);
-        assert_eq!(metadata.logprob_span(2), Some((10, 22, 1)));
+        assert_eq!(metadata.logprob_span(2), Some((10, 18, 1)));
         assert_eq!(metadata.logprob_span(1), None);
-        assert_eq!(metadata.logprob_end(), Some(32));
+        assert_eq!(metadata.logprob_end(), Some(28));
         assert_eq!(metadata.slots, vec![3, 3, 3]);
 
         assert!(SamplingMetadata::build(&tasks, 100, 990, 1000).is_err());
