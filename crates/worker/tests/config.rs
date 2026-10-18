@@ -212,12 +212,16 @@ fn execution_lanes_bind_disjoint_calls() {
         ]
     );
 
-    // A lane partitions compute only: it has no pool capacity of its own.
-    assert!(
-        launch_error(json!({"lane": [{"lane_id": "decode", "sm_budget": 64,
-            "call_kinds": ["decode"], "kv_capacity_tokens": 4096}]}))
-        .contains("unknown field")
-    );
+    // A misspelled optional limit fails at parsing instead of leaving the
+    // lane without that limit.
+    for field in ["max_batch_token", "max_inflght"] {
+        let mut lane = json!({"lane_id": "decode", "sm_budget": 64, "call_kinds": ["decode"]});
+        lane[field] = json!(2);
+        assert!(
+            launch_error(json!({ "lane": [lane] })).contains("unknown field"),
+            "{field}"
+        );
+    }
     let duplicate = json!({"lane": [
         {"lane_id": "a", "sm_budget": 64, "call_kinds": ["decode"],
          "max_batch_calls": null, "max_batch_tokens": null, "max_inflight": null},
