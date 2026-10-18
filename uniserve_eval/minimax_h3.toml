@@ -87,7 +87,6 @@ seconds = 5.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -113,7 +112,6 @@ seconds = 15.0
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -152,7 +150,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -192,7 +189,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -219,7 +215,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -259,7 +254,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -286,7 +280,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -326,7 +319,6 @@ seconds = 5.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -352,7 +344,6 @@ seconds = 15.0
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -388,7 +379,6 @@ seconds = 5.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -414,7 +404,6 @@ seconds = 15.0
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -508,7 +497,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -539,7 +527,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -571,7 +558,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -619,7 +605,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -651,7 +636,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -709,7 +693,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -739,7 +722,6 @@ audio_flow_shift = 3.0
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -770,7 +752,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -819,7 +800,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -850,7 +830,6 @@ audio_flow_shift = 3.0
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -900,7 +879,6 @@ parallel_decoding = true
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w4-warmup.jsonl"
 
@@ -930,7 +908,6 @@ parallel_decoding = true
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w5-warmup.jsonl"
 
@@ -971,7 +948,6 @@ condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
@@ -1036,7 +1012,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w1-warmup.jsonl"
 
@@ -1071,7 +1046,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 4
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w2-warmup.jsonl"
 
@@ -1107,7 +1081,6 @@ extra_params = { quality = "lossless" }
 num_prompts = 8
 request_rate = inf
 max_concurrency = 1
-warmup_requests = 0
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 
