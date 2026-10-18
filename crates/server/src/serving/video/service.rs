@@ -138,11 +138,11 @@ impl VideoService {
     /// Reports the tasks and their condition rules, with how the deployment
     /// sizes `ref2va` references, the canvas rule, the
     /// short edges and named aspect ratios the deployment serves and the
-    /// canvas each pair resolves to, the duration range, the fixed schedule
-    /// (its sigma points and shifts), the prompt and sequence capacities, the
-    /// stated condition capacity (null when the workers provision the largest
-    /// condition set their denoiser admits), and the media sources and size
-    /// caps.
+    /// canvas each pair resolves to, the output frame rate and audio sample
+    /// rate, the duration range, the fixed schedule (its sigma points and
+    /// shifts), the prompt and sequence capacities, the stated condition
+    /// capacity (null when the workers provision the largest condition set
+    /// their denoiser admits), and the media sources and size caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
         // The named ratios served at any short edge, in their canonical
         // order, and each served pair's canvas; `auto` is 16:9 for t2va and
@@ -198,6 +198,7 @@ impl VideoService {
                 "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
             },
             "fps": self.denoiser.frame_rate,
+            "audio_sample_rate": self.denoiser.audio_sample_rate,
             "min_seconds": MIN_VIDEO_SECONDS,
             "max_seconds": self.max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
@@ -362,6 +363,7 @@ mod tests {
                 video_shift: 12.0,
                 audio_shift: 3.0,
                 frame_rate: 24,
+                audio_sample_rate: 32_000,
                 canvases: Vec::new(),
                 max_sequence_rows,
             },
