@@ -91,7 +91,7 @@ In the other direction, Rust passes Python the collectives of a communicator on 
 
 ### Attention providers
 
-One table names the attention providers that both `--attention-backend` and the library accept: `auto` (a native kernel per call, chosen from the device and the installed kernel libraries), `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` and `sgl_kernel`. A provider declares whether serving captures its calls (`Backend.captures`); the portable `torch` provider does not. A host-planned provider's plan is shared by every layer of one execution context that has the same layer shape and batch signature, so a forward plans once.
+The library's provider registry (`uniserve.backends.attention.PROVIDERS`, with `resolve`) is the one list of attention providers: `auto` (a native kernel per call, chosen from the device and the installed kernel libraries), `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` and `sgl_kernel`. `--attention-backend` passes its value to the ranks unchanged, and a rank refuses a name the registry does not provide when it loads its model; the head reports that startup error. A provider declares whether serving captures its calls (`Backend.captures`); the portable `torch` provider does not. A host-planned provider's plan is shared by every layer of one execution context that has the same layer shape and batch signature, so a forward plans once.
 
 ## CUDA graphs
 

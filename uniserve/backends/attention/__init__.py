@@ -407,11 +407,12 @@ class Backend:
         )
 
 
-# The providers selectable by name. Each names the module of this package
-# whose ``Backend`` it constructs, and that backend reports it as its
-# ``name``. ``uniserve serve --attention-backend`` accepts these names and
-# ``"auto"`` (the Rust ``uniserve_ipc::AttentionBackend``).
-_PROVIDERS = (
+# The providers selectable by name, the one list of them: each names the
+# module of this package whose ``Backend`` it constructs, and that backend
+# reports it as its ``name``. ``uniserve serve --attention-backend`` forwards
+# its value to ``resolve`` unchanged, which accepts these names and
+# ``"auto"`` and refuses any other when a rank loads its model.
+PROVIDERS = (
     "flash_attn",
     "flash_attn_4",
     "flashinfer",
@@ -450,10 +451,10 @@ def resolve(
 
         return _Auto(device, flashinfer=flashinfer)
 
-    if backend not in _PROVIDERS:
+    if backend not in PROVIDERS:
         raise ValueError(
             f"unknown attention backend {backend!r}; accepted names are "
-            + ", ".join(("auto", *_PROVIDERS))
+            + ", ".join(("auto", *PROVIDERS))
         )
 
     if backend == "flashinfer" and flashinfer is not None:

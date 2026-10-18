@@ -15,7 +15,7 @@ pub use launch::{
     RendezvousConfig, WorkerLaunch, resolve,
 };
 
-use uniserve_ipc::{AttentionBackend, CanvasSampling, LaneConfig};
+use uniserve_ipc::{CanvasSampling, LaneConfig};
 
 use crate::{Error, Result};
 
@@ -52,8 +52,9 @@ pub struct WorkerConfig {
     /// Tokens per cache page in the group with the widest token rows; unset until binding.
     pub block_size: Option<usize>,
     pub cache_token_capacity: Option<usize>,
-    /// Attention provider selection the model is loaded with.
-    pub attention_backend: AttentionBackend,
+    /// Attention provider name the model is loaded with, resolved by the
+    /// attention registry (`uniserve.backends.attention.resolve`).
+    pub attention_backend: String,
     pub max_batch_calls: usize,
     pub max_batch_tokens: usize,
     pub max_sequence_tokens: usize,
@@ -111,7 +112,7 @@ impl Default for WorkerConfig {
             expert_microbatches: 1,
             block_size: None,
             cache_token_capacity: None,
-            attention_backend: AttentionBackend::Auto,
+            attention_backend: "auto".into(),
             max_batch_calls: 1024,
             max_batch_tokens: 8192,
             max_sequence_tokens: 16384,
