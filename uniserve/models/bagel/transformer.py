@@ -11,6 +11,7 @@ from uniserve.nn.attention import (
     AttentionBatch,
     RotaryQKVProjection,
 )
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -64,7 +65,17 @@ class TransformerLayer(nn.Module):
             self.post_attention_norms[route] = RMSNorm(
                 hidden, config.rms_norm_eps
             )
-            self.mlps[route] = GatedMLP(hidden, config.intermediate_size)
+            # The reference's eager MLP rounds the activated gate to the
+            # activation dtype before the product, but the rest of this layer
+            # evaluates fused single-rounding kernels. Measured on the real
+            # checkpoint, the logits of the whole network land closer to the
+            # Transformers forward, in float32 and in BF16, with
+            # single-rounding gating than with per-operation gating.
+            self.mlps[route] = GatedMLP(
+                hidden,
+                config.intermediate_size,
+                rounding=Rounding.ONCE,
+            )
         # The denoiser shares this layer with the text LM, so both address the
         # prefix cache entry named here.
         self.attention = Attention(

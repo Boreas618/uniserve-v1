@@ -24,6 +24,7 @@ from uniserve.nn.attention import (
     AttentionBatch,
     AxialQKVProjection,
 )
+from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -78,10 +79,17 @@ class TransformerLayer(nn.Module):
                 bias=config.attention_bias,
             )
             self.post_attention_norms[route] = RMSNorm(hidden, eps)
+            # The reference module computes ``act_fn(gate) * up`` in the
+            # activation dtype, rounding after each operation. On the real
+            # checkpoint the whole network lands as close to its float32
+            # forward with per-operation gating as with single rounding.
             self.mlps[route] = GatedMLP(
                 hidden,
                 config.intermediate_size,
                 activation=config.hidden_act,
+                rounding=Rounding.STEPWISE
+                if config.hidden_act == "silu"
+                else None,
             )
 
         # One attention module serves both routes. Its cache name is its
