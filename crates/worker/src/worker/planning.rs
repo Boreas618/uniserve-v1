@@ -367,8 +367,10 @@ fn video_layout(
         let available = budget
             .budget(index, config.cache_storage_fraction)?
             .available;
+        // Slot fitting searches from one slot: a media request pipelines in
+        // a single slot's three queue positions.
         let maximum = config.max_request_pool_size;
-        let minimum = config.min_request_pool_size.min(maximum).max(1);
+        let minimum = 1;
         let facts = capacity.facts(video, maximum, local, codec_ranks)?;
         let requirements = crate::capacity::plan::slot_requirements(
             config,
