@@ -477,8 +477,14 @@ class TransformerLayer(nn.Module):
             config.decoder_attention_head_dim,
         )
         self.output = RowParallelLinear(width, width)
-        # The decoder's fused kernels evaluate the gating with one rounding,
-        # and its MLP keeps that recipe.
+        # The reference SwiGLU multiplies the value by ``silu(gate)`` in the
+        # activation dtype, rounding after each operation, and the fused
+        # kernels evaluate the gating with one rounding. Per-operation gating
+        # reproduces the reference expression exactly on the checkpoint's
+        # weights, but the whole decoder lands no closer to the reference's
+        # float32 decode with it: on a seeded 7-latent-frame clip at 768x1344
+        # (tiled as the checkpoint specifies) the relative L2 error is 1.007e-3
+        # with one rounding and 1.015e-3 per operation.
         self.mlp = GatedMLP(
             width,
             width * config.decoder_ffn_mult,
