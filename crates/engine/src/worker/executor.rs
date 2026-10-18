@@ -100,7 +100,7 @@ struct WorkerSubmission {
 impl WorkerSubmission {
     /// Builds the one submission a worker receives for this batch.
     ///
-    /// A batch carries one computation to one component, so a worker receives
+    /// A batch carries one call kind to one component, so a worker receives
     /// it once, under one identity, and answers it once. Product inputs the
     /// worker does not yet hold travel as dependencies and hold the submission
     /// in its queue until they resolve. Inputs, cache inputs, and dependencies
@@ -557,7 +557,7 @@ impl WorkerExecutor {
         Ok(admissions)
     }
 
-    /// Includes every admitted or queued owner of this request's computation and products.
+    /// Includes every admitted or queued owner of this request's calls and products.
     fn request_workers(&self, request: RequestKey) -> Vec<usize> {
         let mut owners = self
             .admitted_workers
@@ -865,7 +865,7 @@ impl WorkerExecutor {
         })
     }
 
-    /// Dispatches each worker's queued runs in order, as far as they are ready.
+    /// Dispatches each worker's queued batches in order, as far as they are ready.
     ///
     /// Batch ids are dispatched in order, so a rank sees a strictly increasing
     /// subsequence and cooperative ranks launch their collectives in the same

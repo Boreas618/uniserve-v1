@@ -243,7 +243,7 @@ impl WorkerGroup {
 
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
-/// ranks; they do not create synthetic computation completions.
+/// ranks; they do not create synthetic call completions.
 ///
 /// `placed` holds the persistent spans of each rank's own buffer pool; a
 /// rank's projection keeps those of the buffers its calls read and write.

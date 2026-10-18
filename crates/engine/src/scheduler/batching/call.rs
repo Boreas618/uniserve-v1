@@ -1,4 +1,4 @@
-//! Registering a selected computation as a call: its device predicate, the
+//! Registering a selected call: its device predicate, the
 //! prefix-cache, forward-row and latent inputs derived from the lengths its
 //! in-flight predecessors project, its outputs, and the cache tables a request
 //! grows and activates for it.
@@ -7,7 +7,7 @@ use super::*;
 use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
-    /// Registers one selected computation with its allocated physical inputs and outputs.
+    /// Registers one selected call with its allocated physical inputs and outputs.
     ///
     /// Sets the call's device predicate, derives its prefix cache, forward-row, and
     /// latent inputs from the lengths its in-flight predecessors project,
@@ -108,7 +108,7 @@ impl Scheduler {
 
         call.predicate = predicate;
 
-        // Freeze physical inputs before registering this computation as pending.
+        // Freeze physical inputs before registering this call as pending.
         // Accepted progress may stop on cancellation while these inputs still drain.
         // `visible` is the cache length after the in-flight predecessors; `input`
         // counts the tokens this call appends. Export, latent preparation,
@@ -139,7 +139,7 @@ impl Scheduler {
         // current input image's encoder.
         let num_image_cache_tokens = if consumes_image_features(&call) {
             let state = self.running.get(&request_id)?;
-            let encoder = if is_feedback_computation(&call) {
+            let encoder = if is_feedback_call(&call) {
                 state
                     .req
                     .image_generation
@@ -224,7 +224,7 @@ impl Scheduler {
             // its last declaration (growth, or window retirement in a
             // sliding-window group) or it holds fresh units, which the worker
             // must reset before use. A forward's fresh units are those
-            // allocated since the declared watermark (`plan_computation`).
+            // allocated since the declared watermark (`plan_call`).
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.

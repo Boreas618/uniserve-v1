@@ -77,7 +77,7 @@ impl WorkerRequest {
     }
 
     /// Replaces the request-response correlation identity (`message_id`).
-    pub fn set_call_id(&mut self, value: Option<u64>) {
+    pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
@@ -118,7 +118,7 @@ impl WorkerRequest {
 pub enum ResponseKind {
     /// Worker capability response.
     Info,
-    /// Partial or terminal run result.
+    /// Partial or terminal batch result.
     Result,
     /// Successful control acknowledgement.
     Ok,
@@ -196,11 +196,11 @@ pub enum WorkerResponse {
         /// Loaded worker capabilities.
         info: WorkerInfo,
     },
-    /// Returns partial or terminal run progress.
+    /// Returns partial or terminal batch progress.
     Result {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Physical run result.
+        /// Physical batch result.
         result: BatchOutput,
     },
     /// Acknowledges a successful control request.
@@ -250,7 +250,7 @@ impl WorkerResponse {
 
     /// Replaces the request-response correlation identity (`message_id`) of
     /// a response; a stall report has none to replace.
-    pub fn set_call_id(&mut self, value: Option<u64>) {
+    pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
@@ -260,8 +260,8 @@ impl WorkerResponse {
         }
     }
 
-    /// Returns the run result carried by this response, if any.
-    pub const fn report(&self) -> Option<&BatchOutput> {
+    /// Returns the batch result carried by this response, if any.
+    pub const fn output(&self) -> Option<&BatchOutput> {
         match self {
             Self::Result { result, .. } => Some(result),
             _ => None,
@@ -276,7 +276,7 @@ impl WorkerResponse {
         }
     }
 
-    /// Constructs a run-result response.
+    /// Constructs a batch-result response.
     pub fn result(result: BatchOutput) -> Self {
         Self::Result {
             message_id: None,

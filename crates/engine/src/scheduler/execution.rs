@@ -97,7 +97,7 @@ impl Scheduler {
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
-                    // every affected computation has been retired.
+                    // every affected call has been retired.
                     self.on_executor_error(error);
                     return true;
                 }
@@ -109,7 +109,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// instance: a batch carries one computation to one component, so a media
+    /// instance: a batch carries one call kind to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
@@ -435,11 +435,11 @@ impl Scheduler {
             .push_back(InflightCall { call, input });
     }
 
-    /// Counts one backpressure event against the metrics domain of `computation`.
-    pub(super) fn record_domain_backpressure(&self, computation: uniserve_ipc::CallKind) {
+    /// Counts one backpressure event against the metrics domain of `kind`.
+    pub(super) fn record_domain_backpressure(&self, kind: uniserve_ipc::CallKind) {
         self.stats
             .domains
-            .get(computation)
+            .get(kind)
             .backpressure_events
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -460,13 +460,13 @@ impl Scheduler {
     }
 
     /// Counts one returned call, and a predicated or failed status, against
-    /// the metrics domain of `computation`.
+    /// the metrics domain of `kind`.
     pub(super) fn record_domain_completion(
         &self,
-        computation: uniserve_ipc::CallKind,
+        kind: uniserve_ipc::CallKind,
         status: CallStatus,
     ) {
-        let stats = self.stats.domains.get(computation);
+        let stats = self.stats.domains.get(kind);
         stats.completed_calls.fetch_add(1, Ordering::Relaxed);
         match status {
             CallStatus::Ok => {}
@@ -484,11 +484,11 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(&self, computation: uniserve_ipc::CallKind, failed: bool) {
-        let stats = self.stats.domains.get(computation);
+    pub(super) fn reclaim_domain_credit(&self, kind: uniserve_ipc::CallKind, failed: bool) {
+        let stats = self.stats.domains.get(kind);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
-            tracing::error!(?computation, "domain call credit accounting underflowed");
+            tracing::error!(?kind, "domain call credit accounting underflowed");
             return;
         }
         stats.active_credits.fetch_sub(1, Ordering::Relaxed);

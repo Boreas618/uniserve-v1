@@ -24,14 +24,14 @@ pub use instance::{CallReaders, WorkerGroup};
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 use process::{PendingRank, RankProcess};
 
-/// Backpressure and terminal failures returned by a WorkerGroup run submission.
+/// Backpressure and terminal failures returned by a WorkerGroup batch submission.
 #[derive(Debug, thiserror::Error)]
 pub enum BatchSubmitError {
     /// Returns the unaccepted physical submission when the instance has no capacity.
     ///
     /// The batch is handed back unchanged so the caller can resubmit it
     /// later; nothing was recorded or sent for it.
-    #[error("worker run queue is full")]
+    #[error("worker batch queue is full")]
     WouldBlock(Box<uniserve_ipc::Batch>),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
@@ -89,7 +89,7 @@ pub struct WorkerProcessArgs {
     /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.
     pub stub: bool,
-    /// Maximum number of physical runs concurrently in flight per rank.
+    /// Maximum number of physical batches concurrently in flight per rank.
     pub queue_depth: usize,
     /// Largest encoded message, in bytes, a rank's channel carries in either
     /// direction: the bound of one frame.
@@ -101,9 +101,9 @@ pub struct WorkerProcessArgs {
     /// lets the worker choose it from its cache layers and attention
     /// kernels.
     pub block_size: Option<u32>,
-    /// Maximum calls accepted in one worker run.
+    /// Maximum calls accepted in one worker batch.
     pub max_batch_calls: u32,
-    /// Maximum tokens accepted in one worker run.
+    /// Maximum tokens accepted in one worker batch.
     pub max_batch_tokens: u32,
     /// Request rows each rank holds: the size of the worker's request pool,
     /// whose rows carry per-request state such as canvases, sampling state

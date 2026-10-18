@@ -1,6 +1,6 @@
 //! Request identities and call descriptors.
 //!
-//! A [`Call`] is one immutable computation of a request ([`RequestKey`]):
+//! A [`Call`] is one immutable call of a request ([`RequestKey`]):
 //! its [`CallKind`], the [`CallCoordinates`] it executes at, the products it
 //! reads and writes, the [`Bounds`] the scheduler reserved for it and, for a
 //! sampling call, its token processor inputs ([`SamplingState`]). A
@@ -87,7 +87,7 @@ impl TransferMode {
     }
 }
 
-/// Exactly one computation classification. The sum preserves the distinct
+/// Exactly one call classification. The sum preserves the distinct
 /// forward, media, and storage contracts without parallel opcode metadata.
 ///
 /// Serde represents a kind by its inner enum's snake_case name alone
@@ -340,7 +340,7 @@ pub struct VisionInput {
     pub feature: TensorRef,
 }
 
-/// One immutable computation with its identity, data dependencies, and output limits.
+/// One immutable call with its identity, data dependencies, and output limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
     /// Request that owns the call.
@@ -354,7 +354,7 @@ pub struct Call {
     pub component: String,
     /// Kind performed by this call.
     pub kind: CallKind,
-    /// Scheduler-declared limits for the computation and its outputs.
+    /// Scheduler-declared limits for the call and its outputs.
     pub bounds: Bounds,
     /// Data dependencies consumed in input order.
     pub inputs: Vec<TensorRef>,
@@ -380,15 +380,15 @@ pub struct Call {
     pub latent_feature_input: Option<TensorRef>,
     /// Features produced by the selected image encoder.
     pub encoder_output: Option<TensorRef>,
-    /// Diffusion trajectory consumed by this computation.
+    /// Diffusion trajectory consumed by this call.
     pub latent_input: Option<TensorRef>,
-    /// Diffusion trajectory produced by this computation.
+    /// Diffusion trajectory produced by this call.
     pub latent_output: Option<TensorRef>,
     /// Resident image consumed by feedback encoding.
     pub image_input: Option<TensorRef>,
     /// Decoded image retained for feedback.
     pub image_output: Option<TensorRef>,
-    /// Boolean device completion consumed by a dependent computation.
+    /// Boolean device completion consumed by a dependent call.
     pub completion_output: Option<TensorRef>,
     /// Boolean device decision that selects an image transition.
     pub transition_output: Option<TensorRef>,
@@ -405,7 +405,7 @@ pub struct Call {
     /// Token sampling carries no draw coordinates: the rank keys its draws on
     /// the admitted seed and each sampled row's position.
     pub image_index: Option<u32>,
-    /// Host-side sampler constraints for this computation; absent uses admission defaults.
+    /// Host-side sampler constraints for this call; absent uses admission defaults.
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order,
     /// or a token-denoising call's canvas rows back to back. Empty when
@@ -420,9 +420,9 @@ pub struct Call {
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
-    /// Published or installed cache extent consumed by this computation.
+    /// Published or installed cache extent consumed by this call.
     pub cache_input: Option<BufferId>,
-    /// Identity under which this computation publishes or installs cache state.
+    /// Identity under which this call publishes or installs cache state.
     pub cache_output: Option<BufferId>,
 }
 
@@ -444,7 +444,7 @@ impl Call {
             .sum()
     }
 
-    /// Create a computation with no inputs or outputs and zero resource bounds.
+    /// Create a call with no inputs or outputs and zero resource bounds.
     /// The caller fills its numerical coordinates and limits before submission.
     pub fn new(request_key: RequestKey, call_id: CallId, kind: CallKind) -> Self {
         Self {
@@ -503,7 +503,7 @@ impl Call {
             && (!self.vision_inputs.is_empty() || self.latent_feature_input.is_some())
     }
 
-    /// Tensor dependencies in the computation signature, excluding its predicate.
+    /// Tensor dependencies in the call's signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
     /// omits.
@@ -517,7 +517,7 @@ impl Call {
             .chain(self.image_input.iter())
     }
 
-    /// All tensor declarations owned by this computation.
+    /// All tensor declarations owned by this call.
     ///
     /// Includes the device scalars (token, completion, transition) and
     /// `latent_output`, which [`Self::buffer_outputs`] omits.
@@ -532,7 +532,7 @@ impl Call {
             .chain(self.image_output.iter())
     }
 
-    /// Mutable declarations while assigning computation identities before submission.
+    /// Mutable declarations while assigning call identities before submission.
     pub fn tensor_outputs_mut(&mut self) -> impl Iterator<Item = &mut TensorRef> {
         self.outputs
             .iter_mut()
@@ -573,7 +573,7 @@ impl Call {
             .chain(self.cache_input)
     }
 
-    /// Resource identities published by this computation.
+    /// Resource identities published by this call.
     pub fn output_buffers(&self) -> impl Iterator<Item = BufferId> + '_ {
         self.tensor_outputs()
             .map(TensorRef::buffer_id)
@@ -604,7 +604,7 @@ impl Call {
 
         ensure_valid!(
             self.input_token_ids.len() <= self.bounds.max_tokens as usize,
-            "input token count exceeds the computation token bound"
+            "input token count exceeds the call's token bound"
         );
         if let Some(state) = &self.sampling_state {
             for ids in [
@@ -679,7 +679,7 @@ impl Call {
             output.validate()?;
             ensure_valid!(
                 output.owner == self.request_key && output.producer_call_id == self.call_id,
-                "cache output is not owned by its producing computation"
+                "cache output is not owned by its producing call"
             );
             output_indices.insert(output.output_index);
         }
@@ -692,7 +692,7 @@ impl Call {
             input.validate()?;
             ensure_valid!(
                 consumes_cache && input.owner == self.request_key,
-                "cache input is incompatible with its computation or request"
+                "cache input is incompatible with its call or request"
             );
         }
         ensure_valid!(
@@ -720,7 +720,7 @@ impl Call {
         if let Some(input) = &self.token_input {
             ensure_valid!(
                 self.kind == CallKind::Transfer(TransferMode::Tensor),
-                "token transfer input requires a tensor-transfer computation"
+                "token transfer input requires a tensor-transfer call"
             );
             ensure_valid!(
                 input.dtype == DType::I64 && input.shape_bound.max_elements() == 1,
@@ -762,7 +762,7 @@ impl Call {
             predicate.validate()?;
             ensure_valid!(
                 predicate.request_key == self.request_key,
-                "computation predicate belongs to another request"
+                "call predicate belongs to another request"
             );
             ensure_valid!(
                 matches!(predicate.dtype, DType::U8 | DType::I64)

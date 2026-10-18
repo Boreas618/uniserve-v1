@@ -339,7 +339,7 @@ impl RankProcess {
     fn request_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
-        request.set_call_id(Some(message_id));
+        request.set_message_id(Some(message_id));
         self.client.send(&request)?;
         self.starting = true;
         Ok(())
@@ -601,7 +601,7 @@ impl RankProcess {
         &self.info
     }
 
-    /// Submits one physical run and records its outstanding message identity.
+    /// Submits one physical batch and records its outstanding message identity.
     ///
     /// Hands the batch back as `WouldBlock` when `depth` requests are already
     /// outstanding; the batch is not recorded as pending then.
@@ -615,7 +615,7 @@ impl RankProcess {
         let batch_id = batch.batch_id;
         let message_id = self.alloc_call_id();
         let mut req = WorkerRequest::submit(batch);
-        req.set_call_id(Some(message_id));
+        req.set_message_id(Some(message_id));
         self.client
             .send(&req)
             .map_err(|error| BatchSubmitError::Failed(error.into()))?;
@@ -718,7 +718,7 @@ impl RankProcess {
             ) {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
-                req.set_call_id(Some(message_id));
+                req.set_message_id(Some(message_id));
                 acknowledgment = self.client.send(&req).ok().map(|()| message_id);
             }
         }

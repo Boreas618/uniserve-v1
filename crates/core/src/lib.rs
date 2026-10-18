@@ -167,7 +167,7 @@ pub struct UnitId(pub u32);
 )]
 pub struct RequestId(pub u64);
 
-/// Logical computation identity, preserved when a scheduler batch is split across workers.
+/// Logical call identity, preserved when a scheduler batch is split across workers.
 /// The request index is the ordinal assigned at selection, before physical row packing.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,

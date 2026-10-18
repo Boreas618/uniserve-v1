@@ -1,4 +1,4 @@
-//! What a request computes next: the computation chosen from its accepted state
+//! Planning a request's next call: the call chosen from its accepted state
 //! and pending input ranges (context prefill with the encodes its blocks need,
 //! the phases of generation, the close of a round), built with the cache units
 //! its dispatch owns, and the token constraints that vary with its scheduled
@@ -8,7 +8,7 @@ use super::*;
 use uniserve_ipc::{ForwardMode, VisionInput};
 
 impl Scheduler {
-    /// Builds a computation and records the cache units owned by its next dispatch.
+    /// Builds a call and records the cache units owned by its next dispatch.
     ///
     /// For a forward call, sets `bounds.max_cache_units` to the units every
     /// group's table gained since the last dispatch and advances
@@ -17,7 +17,7 @@ impl Scheduler {
     /// Returns `None` when the request is not running, when planning fails
     /// (the request is then finished with `Error`), or, after latching
     /// engine-fatal, when a forward's request holds no cache tables.
-    pub(in crate::scheduler) fn plan_computation(
+    pub(in crate::scheduler) fn plan_call(
         &mut self,
         id: RequestId,
         build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
@@ -59,17 +59,17 @@ impl Scheduler {
         }
     }
 
-    /// Selects the next computation using accepted state and pending input ranges.
+    /// Selects the next call using accepted state and pending input ranges.
     ///
     /// Prompt text and input images still to ingest go through
-    /// `next_context_computation`; otherwise the request's next phase decides.
+    /// `next_context_call`; otherwise the request's next phase decides.
     /// A canvas pass takes the next readout rows that fit both `budget`
     /// tokens and the pass's canvas `rows`, and a context prefill the
     /// segments that fit its context rows. Returns `None` when nothing can be
     /// planned now, including when the cache capacity a call needs, the
     /// image-branch reservation, or room for one whole canvas row is
     /// unavailable.
-    pub(in crate::scheduler) fn next_generation_computation(
+    pub(in crate::scheduler) fn next_generation_call(
         &mut self,
         id: RequestId,
         budget: usize,
@@ -85,7 +85,7 @@ impl Scheduler {
                     .is_some_and(|count| count < st.req.multimodal_inputs.images.len())
         });
         if context_pending {
-            return self.next_context_computation(id, budget, rows.context);
+            return self.next_context_call(id, budget, rows.context);
         }
         if self.running.get(&id)?.image_reservation_pending
             && !self.promote_gen_branch_reservation(id)
@@ -111,7 +111,7 @@ impl Scheduler {
                 let sampling_state = self.build_token_masks(id, 0, 0);
 
                 let generates_canvases = self.config.canvas.is_some();
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_prompt(
                         request,
                         cursor as u32,
@@ -146,7 +146,7 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_decode(request, None, input_token, relay_input, sampling_state)
                 })
             }
@@ -157,11 +157,11 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_close_cache(request, token, false)
                 })
             }
-            Phase::PublishCache => self.plan_computation(id, |scheduler, request| {
+            Phase::PublishCache => self.plan_call(id, |scheduler, request| {
                 generation::plan_cache_export(
                     scheduler
                         .info
@@ -173,7 +173,7 @@ impl Scheduler {
             }),
             Phase::LatentPreparation => {
                 let conditioning = self.cache_conditioning(id)?;
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_diffusion_prepare(
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
@@ -196,7 +196,7 @@ impl Scheduler {
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_diffusion_step(
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
@@ -211,7 +211,7 @@ impl Scheduler {
                     .pending_output(id, |call| call.latent_output.as_ref())
                     .or(self.running.get(&id)?.denoising.latent())
                     .cloned()?;
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_diffusion_finalize(request, latent)
                 })
             }
@@ -234,7 +234,7 @@ impl Scheduler {
                 } else {
                     String::new()
                 };
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
@@ -263,7 +263,7 @@ impl Scheduler {
                 };
 
                 let sampling_state = self.build_token_masks(id, 0, usize::from(is_final_encoder));
-                self.plan_computation(id, |scheduler, request| {
+                self.plan_call(id, |scheduler, request| {
                     generation::plan_image_extend(
                         &scheduler.generation_limits,
                         request,
@@ -279,7 +279,7 @@ impl Scheduler {
                     )
                 })
             }
-            Phase::IngestState => self.next_context_computation(id, budget, rows.context),
+            Phase::IngestState => self.next_context_call(id, budget, rows.context),
             Phase::Readout => {
                 // Whole rows join the pass in report order while they fit its
                 // remaining tokens and canvas rows.
@@ -297,7 +297,7 @@ impl Scheduler {
                 if end == start {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_readout(request, start..end)
                 })
             }
@@ -354,7 +354,7 @@ impl Scheduler {
                 if step >= canvas.max_steps {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_canvas_step(request, &canvas, block, step)
                 })
             }
@@ -377,7 +377,7 @@ impl Scheduler {
                 if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
                     return None;
                 }
-                self.plan_computation(id, |_scheduler, request| {
+                self.plan_call(id, |_scheduler, request| {
                     generation::plan_canvas_commit(request, &tokens)
                 })
             }
@@ -404,7 +404,7 @@ impl Scheduler {
     /// Returns `None` when nothing can be planned now, including when the
     /// next block does not fit this pass or the request's cache capacity is
     /// unavailable.
-    pub(in crate::scheduler) fn next_context_computation(
+    pub(in crate::scheduler) fn next_context_call(
         &mut self,
         id: RequestId,
         budget: usize,
@@ -432,7 +432,7 @@ impl Scheduler {
             ) {
                 return None;
             }
-            return self.plan_computation(id, |scheduler, request| {
+            return self.plan_call(id, |scheduler, request| {
                 generation::plan_image_extend(
                     &scheduler.generation_limits,
                     request,
@@ -461,7 +461,7 @@ impl Scheduler {
                 // A cache miss schedules the encoder. Nothing else of the
                 // request is planned while it is in flight, so its completion
                 // finds the same block here.
-                return self.plan_computation(id, |scheduler, request| {
+                return self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
@@ -489,7 +489,7 @@ impl Scheduler {
             if step == MediaCall::LatentEncoding {
                 state.input_image_features = Some(product);
                 state.phase = Phase::IngestState;
-                return self.next_context_computation(id, budget, context_rows);
+                return self.next_context_call(id, budget, context_rows);
             }
             state.context_features.push(product);
         }
@@ -575,7 +575,7 @@ impl Scheduler {
 
         let sampling_state = self.build_token_masks(id, 0, 0);
         let generates_canvases = self.config.canvas.is_some();
-        self.plan_computation(id, |_scheduler, request| {
+        self.plan_call(id, |_scheduler, request| {
             generation::plan_prompt(
                 request,
                 cursor as u32,

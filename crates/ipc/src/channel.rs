@@ -838,7 +838,7 @@ mod tests {
             route: None,
             calls: Vec::new(),
         });
-        response.set_call_id(Some(message_id));
+        response.set_message_id(Some(message_id));
         response
     }
 
@@ -920,7 +920,7 @@ mod tests {
             assert_eq!(near.peer_addr().unwrap(), far.local_addr().unwrap());
 
             let mut request = WorkerRequest::info();
-            request.set_call_id(Some(77));
+            request.set_message_id(Some(77));
             near.send(&request).unwrap();
             assert_eq!(recv::<WorkerRequest>(&mut far).unwrap(), request);
 
