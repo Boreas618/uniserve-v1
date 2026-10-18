@@ -58,8 +58,6 @@ class StreamCollectives(Protocol):
         self, output: torch.Tensor, value: torch.Tensor, dst: int, src: int
     ) -> None: ...
 
-    def close(self) -> None: ...
-
 
 # The communication resources of the running numerical invocation, by
 # communicator name; an execution context installs its ``collectives`` here
@@ -323,7 +321,8 @@ class NativeCollectives:
 
     The worker binds one communicator per stream and group and constructs
     this object over its functions; every call enqueues on that stream
-    (asynchronous ones on its transfer fork, joined by the consumer).
+    (asynchronous ones on its transfer fork, joined by the consumer). The
+    worker owns the communicator and destroys it; this object owns nothing.
     Members are ordered by ascending world rank, the backend order
     ``Communicator`` assumes; roots and peers are world ranks.
 
@@ -407,9 +406,6 @@ class NativeCollectives:
 
     def send_recv(self, output, value, dst: int, src: int) -> None:
         self._send_recv(output, value, int(dst), int(src))
-
-    def close(self) -> None:
-        """The worker destroys the communicator."""
 
 
 def group_collectives(groups, collectives: Sequence[NativeCollectives]) -> dict:
