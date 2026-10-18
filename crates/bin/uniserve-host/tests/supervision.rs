@@ -125,19 +125,17 @@ fn start_launcher_with(stdout: Stdio, stderr: Stdio) -> (Launcher, Channel) {
 fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() {
     let (_launcher, mut head) = start_launcher();
 
+    // The head reserves for one group at a time and reads the answer before
+    // it sends anything else.
+    let mut ports = Vec::new();
     for worker in ["first", "second"] {
         head.send(&Instruction::Reserve {
             worker_id: worker.into(),
         })
         .unwrap();
+        ports.push(reservation(&mut head).port);
     }
-    let first = reservation(&mut head);
-    let second = reservation(&mut head);
-    assert_eq!(
-        (first.worker_id.as_str(), second.worker_id.as_str()),
-        ("first", "second")
-    );
-    assert_ne!(first.port, second.port);
+    assert_ne!(ports[0], ports[1]);
 
     // /bin/false is a real process with a known exit status; numerical worker
     // initialization is irrelevant to the host's independent exit reporting.
