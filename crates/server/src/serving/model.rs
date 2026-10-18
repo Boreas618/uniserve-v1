@@ -23,7 +23,7 @@ use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
 use thiserror::Error;
-use uniserve_core::video::plan::VisionConfig;
+use uniserve_core::video::plan::ProcessorConfig;
 use uniserve_core::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
     ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
@@ -64,7 +64,7 @@ pub enum ModelResolutionError {
     MediaContract(String),
     /// The conditioner's processor configs cannot be read or disagree.
     #[error("invalid media checkpoint contract")]
-    VisionConfig(#[source] uniserve_core::video::plan::VisionConfigError),
+    ProcessorConfig(#[source] uniserve_core::video::plan::ProcessorConfigError),
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -100,7 +100,7 @@ pub(crate) enum LoadedRenderer {
     Chat(Box<HfChatRenderer>),
     /// A video pipeline's conditioner vision processor geometry; the video
     /// service built from the denoiser handshake plans requests against it.
-    Video(VisionConfig),
+    Video(ProcessorConfig),
 }
 
 /// What renders the served model's API requests into engine requests.
@@ -172,8 +172,8 @@ impl ModelConfig {
                 for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
                     processor.push(pipeline.component_file("processor", name).await?);
                 }
-                let vision = VisionConfig::read(&processor[0], &processor[1])
-                    .map_err(ModelResolutionError::VisionConfig)?;
+                let vision = ProcessorConfig::read(&processor[0], &processor[1])
+                    .map_err(ModelResolutionError::ProcessorConfig)?;
                 let model =
                     Self::from_pipeline(&served_name, description, config.engine.max_model_len)?;
                 return Ok(LoadedModel {
