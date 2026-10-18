@@ -387,9 +387,6 @@ pub struct LaunchDescriptor {
     pub products_cross_hosts: bool,
     /// Most requests outstanding on the rank's channel at once.
     pub queue_depth: usize,
-    /// Largest encoded message in bytes, in either direction. The rank sizes
-    /// the storage it stages a batch's inputs in from it.
-    pub ipc_payload_cap: usize,
     /// The head's watchdog timeout in milliseconds (`--watchdog-timeout`):
     /// how long a batch may go without progress of the group's ranks before
     /// the head replaces them. The rank reports a lane stalled

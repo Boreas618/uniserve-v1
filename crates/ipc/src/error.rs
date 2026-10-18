@@ -29,15 +29,14 @@ pub enum EncodingError {
     /// example a message of another type or of another build.
     #[error("worker message encoding error: decoding a message")]
     Decode(#[source] rmp_serde::decode::Error),
-    /// The encoded message is longer than the largest frame allowed.
+    /// The encoded message is longer than a frame's length field can state.
     #[error(
         "worker message encoding error: a message of {length} bytes exceeds the largest frame of {limit} bytes"
     )]
     Oversized {
         /// Bytes of the encoded message.
         length: usize,
-        /// The largest message allowed: the length field's range or a
-        /// channel's bound.
+        /// The largest message a frame carries: the length field's range.
         limit: usize,
     },
 }
