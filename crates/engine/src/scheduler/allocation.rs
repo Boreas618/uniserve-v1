@@ -249,21 +249,22 @@ impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
     /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components` or one of a reading component's, where readers
-    /// follow the video graph's persistent product edges
-    /// (`MediaCall::readers`) through the deployment's `routing`; the worker
-    /// sizes each rank's pool by the same rule. A group that declares no
-    /// components backs every result on every rank.
+    /// ranks in `components`, the placement the engine launched the group
+    /// with, or one of a reading component's, where readers follow the video
+    /// graph's persistent product edges (`MediaCall::readers`) through the
+    /// deployment's `routing`; the worker sizes each rank's pool by the same
+    /// rule. A group launched with no components backs every result on every
+    /// rank.
     pub(super) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
-        components: &[uniserve_ipc::ComponentInfo],
+        components: &BTreeMap<String, uniserve_core::ComponentConfig>,
         routing: &BTreeMap<MediaCall, String>,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;
         let placed = components
             .iter()
-            .map(|component| (component.name.as_str(), &component.config.ranks))
+            .map(|(name, config)| (name.as_str(), &config.ranks))
             .collect::<HashMap<_, _>>();
         let holders = routing
             .values()

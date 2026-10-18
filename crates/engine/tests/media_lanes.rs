@@ -26,8 +26,8 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, RequestPlacement, SchedulerConfig,
-    SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
+    Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PoolPlacement, RequestPlacement,
+    SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
@@ -40,7 +40,8 @@ const STEPS: u32 = 3;
 /// Every request carries the same short prompt.
 const PROMPT: [u32; 3] = [11, 12, 13];
 
-/// Declares one loaded component with the outputs it produces.
+/// Declares one loaded component: the outputs its ranks report and the
+/// placement the pool is launched with.
 ///
 /// A distributed component reconstructs one media unit per rank per round
 /// (`units_per_rank` of one) and keeps the default parallel config, whose
@@ -50,17 +51,17 @@ fn component(
     ranks: Vec<usize>,
     distributed: bool,
     outputs: Vec<OutputInfo>,
-) -> ComponentInfo {
+) -> (ComponentInfo, ComponentConfig) {
     let mut config = ComponentConfig::parallel(ranks, Default::default());
     if distributed {
         config.distribution = Some(ComponentDistribution::TemporalUnits);
     }
 
-    ComponentInfo {
+    let info = ComponentInfo {
         name: name.to_owned(),
-        config,
         outputs,
-    }
+    };
+    (info, config)
 }
 
 /// A small tensor result, indexed by media unit or row along a device-actual
@@ -160,9 +161,8 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
     // pages of samples per request slot.
     info.latent_page_units = 256;
     info.latent_pages = 2 * info.request_slots + 1;
-    info.world_size = decoder_ranks as u32;
     info.host_lane_capacity = host_lane_capacity;
-    info.components = vec![
+    let components = vec![
         component(
             "media_reader",
             vec![0],
@@ -232,6 +232,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         ),
         component("muxer", vec![0], false, Vec::new()),
     ];
+    info.components = components.iter().map(|(info, _)| info.clone()).collect();
     info.media_components = BTreeMap::from([
         (MediaCall::MediaReading, "media_reader".to_owned()),
         (MediaCall::VisionEncoding, "text_encoder".to_owned()),
@@ -245,6 +246,12 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         (MediaCall::AudioEncoding, "muxer".to_owned()),
         (MediaCall::Muxing, "muxer".to_owned()),
     ]);
+    sim.place_components(
+        components
+            .into_iter()
+            .map(|(info, config)| (info.name, config))
+            .collect(),
+    );
 
     sim
 }
@@ -1213,8 +1220,10 @@ impl PooledExecutor {
         let mut inner = SimExecutor::new(sim);
         let boundary = inner.observe();
         let (simulator, worker) = inner.info().workers[0].clone();
+        let launched = inner.info().placements[&simulator].clone();
 
-        // Each pool serves its components' media calls and nothing else.
+        // Each pool serves its components' media calls and nothing else, and
+        // is launched with those components at the simulator's queue depth.
         let pool = |components: &[&str]| {
             let mut info = worker.clone();
             info.components
@@ -1226,9 +1235,19 @@ impl PooledExecutor {
                 .keys()
                 .map(|call| CallKind::Media(*call))
                 .collect();
-            info
+            let placement = PoolPlacement {
+                queue_depth: launched.queue_depth,
+                ranks: launched.ranks,
+                components: launched
+                    .components
+                    .iter()
+                    .filter(|(name, _)| components.contains(&name.as_str()))
+                    .map(|(name, config)| (name.clone(), config.clone()))
+                    .collect(),
+            };
+            (info, placement)
         };
-        let info = ExecutorInfo::from_workers(vec![
+        let pools = [
             (
                 WorkerId("encoders".to_owned()),
                 pool(&["media_reader", "text_encoder", "latent_encoder"]),
@@ -1243,8 +1262,18 @@ impl PooledExecutor {
                     "muxer",
                 ]),
             ),
-        ])
+        ];
+        let mut info = ExecutorInfo::from_workers(
+            pools
+                .iter()
+                .map(|(id, (worker, _))| (id.clone(), worker.clone()))
+                .collect(),
+        )
         .unwrap();
+        info.placements = pools
+            .into_iter()
+            .map(|(id, (_, placement))| (id, placement))
+            .collect();
 
         let handed_back = Arc::new(AtomicBool::new(false));
         let executor = Self {

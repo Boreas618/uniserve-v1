@@ -34,12 +34,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use uniserve_cuda::Stream;
-use uniserve_ipc::{
-    Batch as BatchPlan, BufferId, CallKind, DType, ForwardStats, RequestKey, WorkerInfo,
-};
+use uniserve_ipc::{Batch as BatchPlan, BufferId, CallKind, DType, ForwardStats, RequestKey};
 
 use super::calls::{self, DenoiseRow, ReadoutPass, Readouts};
 use super::{DiffusionLMRunner, Executed, Expert, KIND, Recorded};
+use crate::config::placement::GroupPlacement;
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
@@ -57,7 +56,7 @@ use crate::{Error, Result, lock};
 
 /// What a batch borrows from the rank.
 struct Context<'a> {
-    info: &'a WorkerInfo,
+    placement: &'a GroupPlacement,
     rank: usize,
     runner: &'a mut DiffusionLMRunner,
     requests: &'a mut RequestPool,
@@ -109,7 +108,7 @@ pub(crate) enum Pending {
 /// the device: reading it here would serialize steps that can run.
 fn open(context: &mut Context<'_>, job: &Job) -> Result<Opening> {
     let Context {
-        info,
+        placement,
         rank,
         runner,
         requests,
@@ -135,7 +134,7 @@ fn open(context: &mut Context<'_>, job: &Job) -> Result<Opening> {
     Opening::open(
         requests,
         tensors,
-        info,
+        placement,
         *rank,
         plan,
         runner.buffers.device(),
@@ -695,7 +694,7 @@ fn context<'a>(
         return Err(unsupported(kind, "diffusion LM"));
     };
     Ok(Context {
-        info: parts.info,
+        placement: parts.placement,
         rank: parts.rank,
         runner,
         requests: parts.requests,

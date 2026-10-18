@@ -43,6 +43,7 @@ use uniserve_ipc::{
 };
 
 use crate::config::Device;
+use crate::config::placement::GroupPlacement;
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::PendingOutput;
@@ -506,6 +507,7 @@ pub(crate) struct Parts<'a> {
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) storage: &'a RankStorage,
     pub(crate) info: &'a WorkerInfo,
+    pub(crate) placement: &'a GroupPlacement,
     pub(crate) rank: usize,
     /// The rank's video requests, with the model and plan that admit them.
     pub(crate) video: &'a mut VideoRequests,
@@ -680,7 +682,7 @@ fn record(
             let opened = Opening::open(
                 parts.requests,
                 &parts.storage.tensors,
-                parts.info,
+                parts.placement,
                 parts.rank,
                 plan,
                 device,

@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use uniserve_core::ComponentConfig;
 use uniserve_cuda::HandleType;
 use uniserve_ipc::{CallKind, ComponentInfo};
 
@@ -177,18 +176,15 @@ pub(super) fn plan(
     };
     let infos: Vec<ComponentInfo> = launch
         .components
-        .iter()
-        .map(
-            |(name, config): (&String, &ComponentConfig)| ComponentInfo {
-                name: name.clone(),
-                config: config.clone(),
-                // Only a video model's components publish products.
-                outputs: capacity
-                    .as_ref()
-                    .and_then(|capacity| capacity.outputs.get(name).cloned())
-                    .unwrap_or_default(),
-            },
-        )
+        .keys()
+        .map(|name| ComponentInfo {
+            name: name.clone(),
+            // Only a video model's components publish products.
+            outputs: capacity
+                .as_ref()
+                .and_then(|capacity| capacity.outputs.get(name).cloned())
+                .unwrap_or_default(),
+        })
         .collect();
     let fabric_handles = match device {
         Device::Cuda(cuda) => HandleType::probe(cuda)? == HandleType::Fabric,
@@ -205,8 +201,6 @@ pub(super) fn plan(
     );
     let report = Report {
         endpoint: endpoint(&launch.worker_id, config.rank)?,
-        device: config.device.to_string(),
-        transfer_backends: launch.data_plane.backends.clone(),
         device_exports: exports_device_products(launch),
         fabric_handles,
         supported_calls: supported,

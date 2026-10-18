@@ -592,7 +592,7 @@ pub(crate) fn forward(
     };
     let job = Job::new();
     let (job, next) = match state {
-        None => match Opening::open(&mut owners, parts.info, parts.rank, &job) {
+        None => match Opening::open(&mut owners, parts.placement, parts.rank, &job) {
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
             Ok(opening) => grids(owners, opening, job),
             // The fences the opening recorded are still due.
