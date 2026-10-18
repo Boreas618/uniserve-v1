@@ -55,7 +55,7 @@ pub struct InputProcessor {
     // What the deployment's video denoiser serves; set exactly for MiniMax H3.
     video: Option<VideoService>,
     // Whether a Qwen3-family chat template instructs the tool-call format
-    // `Qwen3XmlToolParser` reads; false for every other family.
+    // `Qwen25ToolParser` reads; false for every other family.
     qwen3_tool_calls: bool,
 }
 
