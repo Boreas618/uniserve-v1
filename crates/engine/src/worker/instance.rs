@@ -8,7 +8,8 @@
 //! that rank's `RankProcess`. Returned rank results wait in per-rank buffers
 //! until every rank planned for a set of calls has reported them; `try_join`
 //! then merges those reports into one `WorkerResult` published by the calls'
-//! output owner, the first rank of their component. An execution error that
+//! output owner, the first rank of their component they are planned on
+//! (`routing::output_owner`). An execution error that
 //! every failing rank reports identically, while no succeeding rank holds an
 //! unjoined call, retires only its batch unless it is fatal, is coded as a
 //! scheduler bug or invariant violation, or failed a batch carrying a `Free`
@@ -39,7 +40,7 @@ use crate::worker::WorkerProcessArgs;
 use reports::{
     merge_rank_report, report_call_ids, take_rank_calls, validate_and_order_rank_report,
 };
-use routing::rank_projection;
+use routing::{output_owner, rank_projection};
 
 /// Cooperative worker processes with one IPC channel per rank.
 pub struct WorkerGroup {
@@ -593,9 +594,11 @@ impl WorkerGroup {
     /// takes no call and marks the batch done once ranks without a pending
     /// call, such as ranks that received only commands, have reported.
     /// Otherwise a pending call's output owner is the first rank of its
-    /// component, and one of the owner's reports yields every call it carries
-    /// that is still pending, belongs to the same component, is planned on
-    /// the same ranks, and has been returned by each of them.
+    /// component that the call is planned on: the component's first rank,
+    /// which publishes its host products, unless the call's units were dealt
+    /// to other ranks. One of the owner's reports yields every call it
+    /// carries that is still pending, belongs to the same component, is
+    /// planned on the same ranks, and has been returned by each of them.
     /// Returns the batch identifier, the output owner, and the call set.
     fn joinable_report_key(&self) -> Option<(u64, usize, Vec<CallIdentity>)> {
         for (&batch_id, pending_batch) in &self.pending_batches {
@@ -616,8 +619,13 @@ impl WorkerGroup {
                 if !pending.contains(&identity) {
                     continue;
                 }
-                let owner = self.process_args.components[&call.component].ranks[0];
                 let members = self.call_members(batch_id, identity);
+                let Some(owner) = output_owner(
+                    &self.process_args.components[&call.component].ranks,
+                    &members,
+                ) else {
+                    continue;
+                };
                 for report in self.buffers[owner]
                     .iter()
                     .filter(|report| report.batch_id == batch_id)

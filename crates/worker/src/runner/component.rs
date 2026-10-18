@@ -29,15 +29,25 @@ pub(crate) struct Component<R> {
 impl<R> Component<R> {
     /// This rank's media units of a round covering units `[cursor, cursor +
     /// count)`: all of them for an undistributed component, otherwise the
-    /// rank's run of `units_per_rank` units from its position.
-    pub(crate) fn units(&self, rank: usize, cursor: u32, count: u32) -> Result<Range<u32>> {
-        units(&self.config, rank, cursor, count)
+    /// rank's run of `units_per_rank` units from its position among the
+    /// ranks the round is `dealt` to (`DecodeRange::ranks`), or among the
+    /// component's ranks in configured order when it names none.
+    pub(crate) fn units(
+        &self,
+        dealt: &[u32],
+        rank: usize,
+        cursor: u32,
+        count: u32,
+    ) -> Result<Range<u32>> {
+        units(&self.config, dealt, rank, cursor, count)
     }
 }
 
-/// See [`Component::units`].
+/// See [`Component::units`]. A member of the component outside the deal
+/// holds no unit.
 pub(crate) fn units(
     config: &ComponentConfig,
+    dealt: &[u32],
     rank: usize,
     cursor: u32,
     count: u32,
@@ -45,12 +55,20 @@ pub(crate) fn units(
     if config.distribution.is_none() {
         return Ok(cursor..cursor + count);
     }
-    let position = config
-        .ranks
-        .iter()
-        .position(|&member| member == rank)
-        .ok_or_else(|| Error::Invalid("media units assigned outside the component".into()))?
-        as u32;
+    if !config.ranks.contains(&rank) {
+        return Err(Error::Invalid(
+            "media units assigned outside the component".into(),
+        ));
+    }
+    let position = if dealt.is_empty() {
+        config.ranks.iter().position(|&member| member == rank)
+    } else {
+        dealt.iter().position(|&member| member as usize == rank)
+    };
+    let Some(position) = position else {
+        return Ok(cursor..cursor);
+    };
+    let position = position as u32;
     let per_rank = config.units_per_rank as u32;
     let first = (position * per_rank).min(count);
     let last = (position * per_rank + per_rank).min(count);
@@ -156,14 +174,32 @@ mod tests {
     fn a_unit_ring_deals_each_round_from_its_first_member() {
         let ring = config(&[4, 5, 6, 7], true, 1);
         // A full round of four units starting at unit 8.
-        assert_eq!(units(&ring, 5, 8, 4).unwrap(), 9..10);
+        assert_eq!(units(&ring, &[], 5, 8, 4).unwrap(), 9..10);
         // A short round leaves the last members without a unit.
-        assert!(units(&ring, 6, 12, 2).unwrap().is_empty());
-        assert_eq!(units(&ring, 4, 12, 2).unwrap(), 12..13);
+        assert!(units(&ring, &[], 6, 12, 2).unwrap().is_empty());
+        assert_eq!(units(&ring, &[], 4, 12, 2).unwrap(), 12..13);
         // Members take consecutive runs of `units_per_rank`.
-        assert_eq!(units(&config(&[0, 1], true, 2), 1, 0, 3).unwrap(), 2..3);
+        let pairs = config(&[0, 1], true, 2);
+        assert_eq!(units(&pairs, &[], 1, 0, 3).unwrap(), 2..3);
         // An undistributed component computes the whole round.
-        assert_eq!(units(&config(&[0, 1], false, 1), 1, 3, 4).unwrap(), 3..7);
-        assert!(units(&ring, 0, 0, 4).is_err());
+        assert_eq!(
+            units(&config(&[0, 1], false, 1), &[], 1, 3, 4).unwrap(),
+            3..7
+        );
+        assert!(units(&ring, &[], 0, 0, 4).is_err());
+    }
+
+    #[test]
+    fn a_round_that_names_its_ranks_deals_in_their_order() {
+        let ring = config(&[4, 5, 6, 7], true, 1);
+        // The round's units go to ranks 6 and 4, in that order.
+        assert_eq!(units(&ring, &[6, 4], 6, 8, 2).unwrap(), 8..9);
+        assert_eq!(units(&ring, &[6, 4], 4, 8, 2).unwrap(), 9..10);
+        // A member the round leaves out holds none.
+        assert!(units(&ring, &[6, 4], 5, 8, 2).unwrap().is_empty());
+        let pairs = config(&[0, 1], true, 2);
+        assert_eq!(units(&pairs, &[1, 0], 1, 0, 3).unwrap(), 0..2);
+        assert_eq!(units(&pairs, &[1, 0], 0, 0, 3).unwrap(), 2..3);
+        assert!(units(&ring, &[4], 0, 0, 1).is_err());
     }
 }

@@ -123,9 +123,14 @@ impl Scheduler {
     /// reading those host products wait until the read has completed, so a
     /// model worker's queue never holds a call blocked on a host task. Then
     /// the vision encoding precedes the text encoding that splices its
-    /// features in, on the same component, while the latent encoding covers
-    /// the visual condition units in rounds and then the audio tracks.
-    /// Latent preparation follows once every one of them is scheduled.
+    /// features in, on the same component; the text encoding waits until
+    /// those features are produced, because a distributed worker starts its
+    /// batches in submission order and one waiting for an input would hold
+    /// back every later one. Meanwhile the latent encoding covers the visual
+    /// condition units in rounds and then the audio tracks, each call on the
+    /// latent encoder's ranks that the prompt's encoding does not take and
+    /// that hold none of the request's calls (`latent_round`). Latent
+    /// preparation follows once every one of them is scheduled.
     ///
     /// Latent preparation, the denoising steps and the two decoders become
     /// ready once their predecessor is scheduled; they name their inputs by
@@ -163,16 +168,27 @@ impl Scheduler {
         let mut ready = Vec::new();
         if graph.encodes_vision() && !state.vision_encoding_scheduled {
             ready.push(MediaCall::VisionEncoding);
-        } else if !state.text_encoding_scheduled {
+        } else if !state.text_encoding_scheduled
+            && state.vision_features.as_ref().is_none_or(produced)
+        {
             ready.push(MediaCall::TextEncoding);
         }
+        // Latent encoding is offered while a rank of the latent encoder is
+        // free to take units (`latent_round`), from the first tick: the ranks
+        // that encode no prompt start on the condition units beside the
+        // vision encoding, and ranks holding both encoders take units only
+        // once the prompt's encoding, whose ranks synchronize in its
+        // collectives, is placed ahead of them.
         let visual_units = graph.condition_units().len() as u32;
-        if state.scheduled_condition_units < visual_units
-            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none())
-        {
+        let encoding_remains = state.scheduled_condition_units < visual_units
+            || (graph.encodes_condition_audio() && state.condition_audio_latents.is_none());
+        if encoding_remains && self.latent_round(state).is_some() {
             ready.push(MediaCall::LatentEncoding);
         }
-        if !ready.is_empty() {
+        // Latent preparation reads the text features and every condition
+        // latent, so nothing later is offered while the text encoding waits
+        // for its vision features or a latent encoding call for a rank.
+        if !ready.is_empty() || encoding_remains || !state.text_encoding_scheduled {
             return ready;
         }
         if !state.latent_preparation_scheduled {
@@ -238,17 +254,19 @@ impl Scheduler {
         self.info.media_components.get(&media_call).cloned()
     }
 
-    /// Returns how many media units one call of this kind covers at once.
+    /// Returns the worker serving `component` for one request, with the
+    /// component's placement there.
     ///
-    /// A distributed component reconstructs `units_per_rank` media units on
-    /// each of its ranks per round; any other component counts one unit per
-    /// rank. The worker is the request's owner of `component` when it has
-    /// one, otherwise the first candidate that can execute `work`.
-    ///
-    /// Returns `None` when no such worker is loaded, when the worker was
-    /// launched without its bound component, or when the width does not fit
-    /// in `u32`.
-    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
+    /// The worker is the request's owner of `component` when it has one,
+    /// otherwise the first candidate that can execute `work`. Returns `None`
+    /// when no such worker is loaded or its bound component has no binding
+    /// on that worker.
+    fn placed_component<'a>(
+        &'a self,
+        request: RequestKey,
+        work: CallKind,
+        component: &'a str,
+    ) -> Option<(&'a crate::WorkerId, &'a crate::ComponentConfig)> {
         let owner = self
             .placement
             .affinity
@@ -258,12 +276,122 @@ impl Scheduler {
             .component_candidates(self.executor.as_ref(), work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
         let config = self.executor.info().component_config(worker, bound)?;
+        Some((worker, config))
+    }
+
+    /// Returns how many media units one call of this kind covers at once.
+    ///
+    /// A distributed component reconstructs `units_per_rank` media units on
+    /// each of its ranks per round; any other component counts one unit per
+    /// rank, on the worker `placed_component` names.
+    ///
+    /// Returns `None` when the component has no placement or the width does
+    /// not fit in `u32`.
+    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
+        let (_, config) = self.placed_component(request, work, component)?;
         let units_per_rank = if config.distribution.is_some() {
             config.units_per_rank.max(1)
         } else {
             1
         };
         u32::try_from(config.ranks.len().saturating_mul(units_per_rank)).ok()
+    }
+
+    /// Returns the next latent encoding call of one request: the condition
+    /// units it covers and the ranks that hold them.
+    ///
+    /// The call is a visual round while condition units remain unscheduled
+    /// and otherwise the request's audio tracks, which are one unit.
+    /// Condition units are encoded independently of one another, so a
+    /// distributed latent encoder deals a call only to its free ranks, in
+    /// the component's rank order: those that hold none of the request's
+    /// calls in flight and that the prompt's encoding, until its text
+    /// encoding is placed, does not take. A rank still encoding the prompt
+    /// or an earlier round thus takes no unit that a free rank would
+    /// otherwise wait beside. Returns `None` while every rank is held; each
+    /// completing call frees its ranks.
+    ///
+    /// A latent encoder whose members encode together has no deal: its call
+    /// covers the component's width and names no rank.
+    ///
+    /// Returns `None` as well when no component or worker serves latent
+    /// encoding.
+    fn latent_round(&self, state: &MediaFlowState) -> Option<(u32, Vec<u32>)> {
+        let request = state.admission.request_key;
+        let work = CallKind::Media(MediaCall::LatentEncoding);
+        let component = self.media_component(MediaCall::LatentEncoding)?;
+        let (worker, config) = self.placed_component(request, work, &component)?;
+        let remaining =
+            state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
+        if config.distribution.is_none() {
+            let width = u32::try_from(config.ranks.len()).ok()?;
+            let units = if remaining > 0 {
+                width.min(remaining)
+            } else {
+                1
+            };
+            return Some((units, Vec::new()));
+        }
+
+        // A call in flight on this worker holds the ranks it was dealt to,
+        // or every rank of its component when it names none.
+        let mut held = std::collections::HashSet::new();
+        // The vision and text encodings run one after the other on the text
+        // encoder's ranks, which are theirs from the start: between the two
+        // calls no call of the prompt is in flight there.
+        if !state.text_encoding_scheduled
+            && let Some(name) = self.media_component(MediaCall::TextEncoding)
+            && let Some((owner, prompt)) =
+                self.placed_component(request, CallKind::Media(MediaCall::TextEncoding), &name)
+            && owner == worker
+        {
+            held.extend(prompt.ranks.iter().copied());
+        }
+        for pending in self
+            .inflight
+            .pending_calls
+            .get(&state.request.request_id)
+            .into_iter()
+            .flatten()
+        {
+            let name = &pending.call.component;
+            if self.placement.affinity.get(&(request, name.clone())) != Some(worker) {
+                continue;
+            }
+            match &pending.input {
+                InflightInput::Media {
+                    decode: Some(range),
+                    ..
+                } if !range.ranks.is_empty() => {
+                    held.extend(range.ranks.iter().map(|rank| *rank as usize));
+                }
+                _ => held.extend(
+                    self.executor
+                        .info()
+                        .component_config(worker, name)
+                        .into_iter()
+                        .flat_map(|config| config.ranks.iter().copied()),
+                ),
+            }
+        }
+
+        let free = config
+            .ranks
+            .iter()
+            .filter(|rank| !held.contains(*rank))
+            .map(|rank| *rank as u32)
+            .collect::<Vec<_>>();
+        if free.is_empty() {
+            return None;
+        }
+        let per_rank = config.units_per_rank.max(1) as u32;
+        let units = if remaining > 0 {
+            remaining.min(free.len() as u32 * per_rank)
+        } else {
+            1
+        };
+        let holders = units.div_ceil(per_rank) as usize;
+        Some((units, free[..holders].to_vec()))
     }
 
     /// Returns a component's device lane capacity in media units.
@@ -488,17 +616,9 @@ impl Scheduler {
             MediaCall::VideoDecoding => {
                 width().min(state.request.sampling.video_units - state.scheduled_decode_units)
             }
-            // A visual round covers the condition units its component's
-            // ranks encode together; the audio tracks are one call.
-            MediaCall::LatentEncoding => {
-                let remaining =
-                    state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
-                if remaining > 0 {
-                    width().min(remaining)
-                } else {
-                    1
-                }
-            }
+            // A visual round covers the condition units its free ranks
+            // encode together; the audio tracks are one call.
+            MediaCall::LatentEncoding => self.latent_round(state).map_or(1, |(units, _)| units),
             MediaCall::AudioDecoding => width(),
             // An encode round covers the media units the decode round produced.
             MediaCall::VideoEncoding => state
@@ -524,8 +644,8 @@ impl Scheduler {
     /// latches engine-fatal on any error.
     ///
     /// A latent encoding call is a visual round while condition units remain
-    /// unscheduled, covering the next units its component's ranks encode
-    /// together, and otherwise the request's one audio call.
+    /// unscheduled, covering the next units its free ranks encode together,
+    /// and otherwise the request's one audio call (`latent_round`).
     fn plan_media_call(
         &mut self,
         id: RequestId,
@@ -545,6 +665,14 @@ impl Scheduler {
         let units = state.graph.condition_units();
         let visual_round = media_call == MediaCall::LatentEncoding
             && state.scheduled_condition_units < units.len() as u32;
+        let latent_round = if media_call == MediaCall::LatentEncoding {
+            Some(
+                self.latent_round(state)
+                    .ok_or("a scheduled latent encoding call has a free rank")?,
+            )
+        } else {
+            None
+        };
         // Freeze the actual decode/write interval before advancing scheduled
         // counters. Completion consumes this same range from the submission.
         let decode = match media_call {
@@ -556,12 +684,14 @@ impl Scheduler {
                     .component_width(request_key, work, &component)
                     .ok_or("a scheduled decoder has a loaded owner")?
                     .min(state.request.sampling.video_units - state.scheduled_decode_units),
+                ranks: Vec::new(),
             }),
             MediaCall::VideoEncoding => Some(DecodeRange {
                 request_key,
                 call_id,
                 cursor: state.scheduled_encode_units,
                 max_units: state.decoded_units[&state.scheduled_encode_units].0,
+                ranks: Vec::new(),
             }),
             MediaCall::AudioDecoding => Some(DecodeRange {
                 request_key,
@@ -570,30 +700,32 @@ impl Scheduler {
                 max_units: self
                     .component_width(request_key, work, &component)
                     .ok_or("a scheduled decoder has a loaded owner")?,
+                ranks: Vec::new(),
             }),
             MediaCall::AudioEncoding => Some(DecodeRange {
                 request_key,
                 call_id,
                 cursor: 0,
                 max_units: 1,
+                ranks: Vec::new(),
             }),
-            // A visual round covers the next condition units the latent
-            // encoder's ranks encode together; the audio call is one unit.
-            MediaCall::LatentEncoding if visual_round => Some(DecodeRange {
-                request_key,
-                call_id,
-                cursor: state.scheduled_condition_units,
-                max_units: self
-                    .component_width(request_key, work, &component)
-                    .ok_or("a scheduled latent encoder has a loaded owner")?
-                    .min(units.len() as u32 - state.scheduled_condition_units),
-            }),
-            MediaCall::LatentEncoding => Some(DecodeRange {
-                request_key,
-                call_id,
-                cursor: 0,
-                max_units: 1,
-            }),
+            // A visual round covers the next condition units on the latent
+            // encoder's free ranks; the audio call is one unit on the first.
+            MediaCall::LatentEncoding => {
+                let (max_units, ranks) =
+                    latent_round.ok_or("a latent encoding call has its round")?;
+                Some(DecodeRange {
+                    request_key,
+                    call_id,
+                    cursor: if visual_round {
+                        state.scheduled_condition_units
+                    } else {
+                        0
+                    },
+                    max_units,
+                    ranks,
+                })
+            }
             _ => None,
         };
 

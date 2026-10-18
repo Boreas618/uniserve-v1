@@ -75,8 +75,9 @@ pub struct VideoService {
     tasks: Vec<VideoTask>,
     max_video_seconds: f64,
     max_condition_rows: u32,
-    /// Condition units one latent encoding round covers, which reference
-    /// images are banded to fill (`RequestPlan::image_bands`).
+    /// Condition units one latent encoding round covers while a request's
+    /// prompt is encoded, which reference images are banded to fill
+    /// (`RequestPlan::image_bands`).
     latent_encoding_lane: u32,
     media: VideoMediaSettings,
     processor: VideoProcessor,

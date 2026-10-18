@@ -289,7 +289,7 @@ pub(crate) fn decode_audio(
         1
     };
     let units = range.max_units.min(total).max(1);
-    let run = audio.units(rank, 0, units)?;
+    let run = audio.units(&range.ranks, rank, 0, units)?;
     if run.is_empty() {
         return Ok(());
     }
