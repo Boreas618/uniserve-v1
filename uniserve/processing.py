@@ -395,32 +395,24 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FlowPrompt:
-    """Immutable caller-owned framing for one classifier-free-guidance prefix."""  # noqa: E501
+    """Immutable caller-owned framing of the unconditional guidance prefix."""
 
     user_prefix: str
     user_suffix: str
     assistant_suffix: str
-    conditioned_append: str
     unconditional_append: str
     system_prefix: str = ""
     system_message: str = ""
     system_suffix: str = ""
     add_special_tokens: bool = True
 
-    def encode(
-        self, tokenizer: Any, *, text: str, conditioned: bool
-    ) -> tuple[int, ...]:
-        """Frame and tokenize either the conditioned or unconditional diffusion prompt."""  # noqa: E501
+    def encode(self, tokenizer: Any, *, text: str) -> tuple[int, ...]:
+        """Frame and tokenize the unconditional diffusion prompt."""
         if tokenizer is None:
             raise ValueError(
                 "the configured generation prompt requires a tokenizer"
             )
 
-        append = (
-            self.conditioned_append
-            if conditioned
-            else self.unconditional_append
-        )
         framed = (
             self.system_prefix
             + self.system_message
@@ -429,7 +421,7 @@ class FlowPrompt:
             + text
             + self.user_suffix
             + self.assistant_suffix
-            + append
+            + self.unconditional_append
         )
         return tuple(
             int(value)
@@ -444,42 +436,31 @@ def resolve_prefix(
     tokenizer,
     source: str,
     *,
-    image_prompt: str,
     negative_prompt: str,
-) -> tuple[tuple[int, ...], bool]:
-    """Tokenize the prefix a guidance branch of ``source`` conditions on.
+) -> tuple[int, ...]:
+    """Tokenize the prefix an unconditional guidance branch conditions on.
 
-    ``conditioning`` frames the image prompt, and a blank one reuses the
-    request's own context; ``negative_or_start`` frames the negative
-    prompt; ``start`` frames empty text. Text is stripped as Python strips
-    it. Without prompt framing a model reuses its context for a blank
-    conditioning prompt, refuses a prompt override and leaves its other
-    prefixes empty. ``tokenizer`` returns the model's tokenizer; it is called
-    only when ``prompt`` frames text.
-
-    Returns:
-        The prefix tokens and whether the branch reuses the request's own
-        context.
+    ``negative_or_start`` frames the negative prompt and ``start`` frames
+    empty text; text is stripped as Python strips it. A model without
+    prompt framing leaves both prefixes empty. The conditioned branch reads
+    the request's own context and has no prefix to resolve. ``tokenizer``
+    returns the model's tokenizer; it is called only when ``prompt`` frames
+    text.
 
     Raises:
-        ValueError: A prompt override for a model without prompt framing.
+        ValueError: ``source`` is not an unconditional branch source.
     """
-    source = str(source)
-    conditioned = source == "conditioning"
-    text = {
-        "conditioning": str(image_prompt),
-        "negative_or_start": str(negative_prompt),
-    }.get(source, "")
-    text = text.strip()
-    if conditioned and not text:
-        return (), True
+    source = BranchSource(str(source))
+    if source is BranchSource.CONDITIONING:
+        raise ValueError("the conditioned guidance branch has no prefix")
     if prompt is None:
-        if conditioned:
-            raise ValueError(
-                "this model does not accept a generation prompt override"
-            )
-        return (), False
-    return prompt.encode(tokenizer(), text=text, conditioned=conditioned), False
+        return ()
+    text = (
+        str(negative_prompt).strip()
+        if source is BranchSource.NEGATIVE_OR_START
+        else ""
+    )
+    return prompt.encode(tokenizer(), text=text)
 
 
 def load_tokenizer(path: Path):

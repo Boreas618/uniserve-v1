@@ -170,6 +170,7 @@ fn request(
             ..SamplingParams::default()
         },
         image,
+        max_images: 1,
         max_und_tokens: 4,
         include_stop_token: false,
         stop_strings: Vec::new(),
