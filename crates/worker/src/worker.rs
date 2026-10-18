@@ -401,13 +401,16 @@ impl Worker {
             _ => None,
         };
         // The shapes the engine warms the serving path with, through its
-        // scheduler, once the rank reported.
+        // scheduler, once the rank reported, and the image-unconditional
+        // guidance prefix it reserves.
         let info = {
             let mut info = info;
             if let Some(image) = &image {
                 info.image_warmups = image
                     .warmups(info.request_slots, info.latent_capacity_units())
                     .map_err(phase("bind"))?;
+                info.image_unconditional_token_ids =
+                    image.image_unconditional_prefix().map_err(phase("bind"))?;
             }
             info.diffusion_lm_step_rows = diffusion_lm
                 .iter()

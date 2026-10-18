@@ -398,41 +398,60 @@ impl Scheduler {
                 self.invariant_broken("a denoising request is admitted");
                 return None;
             };
-            let mut alternative = None;
-            if let Some(prefix) = state.guidance_prefix.as_mut() {
-                if !prefix.diffusion_finalized || !prefix.new_units.is_empty() {
-                    for table in prefix.block_tables() {
-                        call_block_tables.push(IpcBlockTable {
-                            request_pool_idx: prefix.request_pool_idx(),
-                            group_id: table.group_id() as u32,
-                            start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
-                            unit_ids: table.unit_ids(),
-                            allocated_tokens: u32::try_from(table.capacity_tokens())
-                                .unwrap_or(u32::MAX),
-                        });
+            // Each guidance prefix carries its tables and fresh units, and is
+            // prefilled until a denoising call completes; then one row per
+            // branch, in evaluation order, reads the prefix it attends to.
+            let mut text_row = None;
+            let mut image_row = None;
+            if let Some(state) = state.guidance_prefix.as_mut() {
+                let finalized = state.diffusion_finalized;
+                for prefix in &mut state.prefixes {
+                    if !finalized || !prefix.new_units.is_empty() {
+                        for table in prefix.block_tables() {
+                            call_block_tables.push(IpcBlockTable {
+                                request_pool_idx: prefix.request_pool_idx(),
+                                group_id: table.group_id() as u32,
+                                start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
+                                unit_ids: table.unit_ids(),
+                                allocated_tokens: u32::try_from(table.capacity_tokens())
+                                    .unwrap_or(u32::MAX),
+                            });
+                        }
+                    }
+                    for (group_id, units) in std::mem::take(&mut prefix.new_units) {
+                        if !units.is_empty() {
+                            call_new_cache_units.push(CacheUnitAllocation {
+                                request_pool_idx: prefix.request_pool_idx(),
+                                group_id,
+                                unit_ids: units,
+                            });
+                        }
+                    }
+                    if prefix.tokens > 0 && !finalized {
+                        call_forward.push(
+                            0,
+                            prefix.request_pool_idx(),
+                            prefix.tokens,
+                            prefix.tokens,
+                            true,
+                        );
                     }
                 }
-                for (group_id, units) in std::mem::take(&mut prefix.new_units) {
-                    if !units.is_empty() {
-                        call_new_cache_units.push(CacheUnitAllocation {
-                            request_pool_idx: prefix.request_pool_idx(),
-                            group_id,
-                            unit_ids: units,
-                        });
-                    }
-                }
-                let prefix_len = state.req.negative_prompt_token_ids.len() as u32;
-                if prefix_len > 0 && !prefix.diffusion_finalized {
-                    call_forward.push(0, prefix.request_pool_idx(), prefix_len, prefix_len, true);
-                }
-                alternative = Some((prefix.request_pool_idx(), prefix_len));
+                text_row = state.row(state.text);
+                image_row = state.row(state.image);
             }
-            for branch in 0..usize::from(cfg_branch_count(&state.req.image).max(1)) {
-                let (request_pool_index, seq_len) = if branch == 0 {
-                    (main_slot, conditioning_tokens)
-                } else {
-                    alternative.unwrap_or((main_slot, conditioning_tokens))
-                };
+            // The conditioned branch reads the request's own context; a
+            // branch without a prefix of its own (an image-unconditional
+            // branch the worker states none for) reads it too.
+            let own = (main_slot, conditioning_tokens);
+            let mut rows = vec![own];
+            if state.req.image.guides_text() {
+                rows.push(text_row.unwrap_or(own));
+            }
+            if state.req.image.guides_image() {
+                rows.push(image_row.unwrap_or(own));
+            }
+            for (request_pool_index, seq_len) in rows {
                 call_forward.push(0, request_pool_index, seq_len + query_len, query_len, false);
             }
         }

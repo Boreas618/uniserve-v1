@@ -253,6 +253,7 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         transfer_tickets: 1,
         image_warmups: Vec::new(),
         diffusion_lm_step_rows: 0,
+        image_unconditional_token_ids: None,
     })
 }
 

@@ -194,25 +194,20 @@ impl TerminalIntent {
     }
 }
 
-/// Negative-prompt cache prefix of a token request whose image generation uses
-/// more than one guidance branch (`Scheduler::ensure_guidance_prefix`).
-///
-/// The prefix holds its own request-pool slot and cache allocation, separate
-/// from the request's main `RequestAllocations`, until
-/// `Scheduler::free_guidance_prefix` releases them after the last denoising step
-/// or the request finishes.
-struct GuidancePrefixState {
+/// One cache prefix a guidance branch attends to: its own request-pool slot
+/// and cache allocation, separate from the request's main
+/// `RequestAllocations`, sized to the tokens it holds.
+struct GuidancePrefix {
     allocations: RequestAllocations,
     /// Units per cache group, as `(group_id, unit_ids)`, not yet declared to the
     /// worker; the next denoising call drains them as fresh-unit allocations.
     new_units: Vec<(u32, Vec<UnitId>)>,
-    /// Set by the first successful denoising completion. Until then every
-    /// denoising call carries the prefix's block tables and, when the negative
-    /// prompt is not empty, prefills it.
-    diffusion_finalized: bool,
+    /// Tokens the prefix holds, which the denoising calls prefill until one
+    /// completes.
+    tokens: u32,
 }
 
-impl GuidancePrefixState {
+impl GuidancePrefix {
     /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations.request_slot()
@@ -221,6 +216,42 @@ impl GuidancePrefixState {
     /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
         self.allocations.block_tables()
+    }
+}
+
+/// Guidance prefixes of a token request whose image generation uses more
+/// than one guidance branch (`Scheduler::ensure_guidance_prefix`).
+///
+/// The text-unconditional branch attends to the request's negative prompt
+/// tokens. The image-unconditional branch attends to the prefix the worker
+/// states for its model (`WorkerInfo::image_unconditional_token_ids`), or to
+/// the request's own context when it states none. Each distinct prefix holds
+/// its own slot until `Scheduler::free_guidance_prefix` releases them after
+/// the last denoising step or the request finishes.
+struct GuidancePrefixState {
+    prefixes: Vec<GuidancePrefix>,
+    /// Index in `prefixes` of the text-unconditional branch's prefix, when
+    /// text guidance is active.
+    text: Option<usize>,
+    /// Index in `prefixes` of the image-unconditional branch's prefix, when
+    /// image guidance is active and the branch has a prefix of its own.
+    image: Option<usize>,
+    /// Set by the first successful denoising completion. Until then every
+    /// denoising call carries the prefixes' block tables and prefills each
+    /// prefix that holds tokens.
+    diffusion_finalized: bool,
+}
+
+impl GuidancePrefixState {
+    /// The request-pool row and token count of prefix `index`.
+    fn row(&self, index: Option<usize>) -> Option<(u32, u32)> {
+        let prefix = &self.prefixes[index?];
+        Some((prefix.request_pool_idx(), prefix.tokens))
+    }
+
+    /// Every allocation the prefixes hold.
+    fn into_allocations(self) -> impl Iterator<Item = RequestAllocations> {
+        self.prefixes.into_iter().map(|prefix| prefix.allocations)
     }
 }
 
@@ -533,9 +564,4 @@ fn output_bound(code: CallKind) -> usize {
         CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
         _ => DEFAULT_OUTPUT_EVENTS,
     }
-}
-
-/// Returns the number of classifier-free-guidance branches.
-fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
-    image.cfg_branch_count()
 }
