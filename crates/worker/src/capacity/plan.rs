@@ -95,8 +95,11 @@ pub(crate) fn request_slots(
         .rposition(|&fits| fits != 0)
         .map(|offset| minimum + offset)
         .ok_or_else(|| {
+            // A slot holds one request's tensors at the deployment's
+            // capacities, so the operator either serves smaller ones or
+            // grants the storage.
             Error::Unsupported(format!(
-                "insufficient device storage for a common request tensor slot count: candidate range {minimum}..{}, local requirements {requirements:?}, {available} bytes available",
+                "insufficient device storage for a common request tensor slot count: candidate range {minimum}..{}, local requirements {requirements:?}, {available} bytes available; serve smaller prompt, condition or duration capacities, or give the worker more device storage (--mem-fraction-static)",
                 minimum + requirements.len() - 1,
             ))
         })
