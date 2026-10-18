@@ -30,6 +30,7 @@
 //! `invalid_request_error`. Failures of the server's own resources (a missing
 //! `ffprobe`, scratch storage) are [`VideoInputError::Internal`].
 
+pub mod artifact;
 pub mod probe;
 pub mod service;
 pub mod sources;
