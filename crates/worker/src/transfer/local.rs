@@ -38,7 +38,7 @@ impl Transport {
                 key: next.fetch_add(1, Ordering::Relaxed),
             },
         );
-        if let Err(error) = endpoint.register(locator.clone(), Arc::clone(&buffer)) {
+        if let Err(error) = endpoint.register(&locator, Arc::clone(&buffer)) {
             TransportBuffer::reclaim(buffer, &self.events, None)?;
             return Err(error);
         }
