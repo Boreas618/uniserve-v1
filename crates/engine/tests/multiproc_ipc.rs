@@ -4213,7 +4213,7 @@ fn decode_step(
     token: u32,
     unit: u32,
     position: u32,
-) -> anyhow::Result<(uniserve_ipc::RequestOutput, TensorRef)> {
+) -> anyhow::Result<(uniserve_ipc::CallOutput, TensorRef)> {
     let decode = decode_batch(key, batch_id, token, unit, position);
     let sampled = decode.calls[0]
         .token_output
@@ -4430,8 +4430,8 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
 #[ignore = "runs as a rank process of the media result test"]
 fn media_rank() -> anyhow::Result<()> {
     use uniserve_ipc::{
-        ArtifactHandle, BatchOutput, Channel, LaunchDescriptor, MediaOutput, Registration,
-        RequestOutput, WorkerRequest, WorkerResponse,
+        ArtifactHandle, BatchOutput, CallOutput, Channel, LaunchDescriptor, MediaOutput,
+        Registration, WorkerRequest, WorkerResponse,
     };
 
     let Ok(arguments) = std::env::var(MEDIA_RANK_ARGS) else {
@@ -4487,12 +4487,12 @@ fn media_rank() -> anyhow::Result<()> {
                 return Ok(());
             }
             WorkerRequest::Submit { message_id, batch } => {
-                let mut completions: Vec<RequestOutput> = batch
+                let mut completions: Vec<CallOutput> = batch
                     .calls
                     .iter()
                     .map(|call| {
                         let length = call.input_token_ids.len() as u32;
-                        RequestOutput {
+                        CallOutput {
                             request_key: call.request_key,
                             call_id: call.call_id,
                             status: CallStatus::Ok,
@@ -4714,7 +4714,7 @@ fn image_admission(
 
 /// The coordinates a call entering after `output` executes at, for a request
 /// whose completions advance its logical position with its visible cache.
-fn coordinates_after(output: &uniserve_ipc::RequestOutput) -> CallCoordinates {
+fn coordinates_after(output: &uniserve_ipc::CallOutput) -> CallCoordinates {
     CallCoordinates {
         logical_position: output.cache_visible_len,
         cache_visible_len: output.cache_visible_len,

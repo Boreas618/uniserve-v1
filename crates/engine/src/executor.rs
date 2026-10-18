@@ -448,7 +448,7 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_ipc::RequestOutput,
+    pub output: uniserve_ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, uniserve_core::SharedMediaError>,
 }

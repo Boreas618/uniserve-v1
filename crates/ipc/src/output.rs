@@ -1,4 +1,4 @@
-//! Call completions and batch results: the [`RequestOutput`] a rank emits
+//! Call completions and batch results: the [`CallOutput`] a rank emits
 //! once for every call, the media artifacts it materializes, and the
 //! [`BatchOutput`] that answers one batch.
 
@@ -134,7 +134,7 @@ pub struct MediaOutput {
 /// The completion record a worker emits once for every call, after its copy
 /// event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RequestOutput {
+pub struct CallOutput {
     /// Request completed by the call.
     pub request_key: RequestKey,
     /// Request-local call identifier.
@@ -172,7 +172,7 @@ pub struct RequestOutput {
     pub cache_output: Option<CacheTransfer>,
 }
 
-impl RequestOutput {
+impl CallOutput {
     /// Validates completion identity, status, accepted lengths, and the
     /// ownership of a cache export.
     ///
@@ -240,7 +240,7 @@ pub struct BatchOutput {
     /// Batch identity copied from the submission.
     pub batch_id: u64,
     /// Call completions, one per call the batch carried.
-    pub completions: Vec<RequestOutput>,
+    pub completions: Vec<CallOutput>,
     /// Product values published by completed calls.
     pub products: Vec<TensorExport>,
     /// Aggregate worker execution time in microseconds, when measured.
@@ -251,7 +251,7 @@ pub struct BatchOutput {
 
 impl BatchOutput {
     /// Iterates over call completions in report order.
-    pub fn completions(&self) -> impl Iterator<Item = &RequestOutput> {
+    pub fn completions(&self) -> impl Iterator<Item = &CallOutput> {
         self.completions.iter()
     }
 

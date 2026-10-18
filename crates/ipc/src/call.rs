@@ -258,7 +258,7 @@ pub struct CanvasStep {
 /// token ids `candidate_ids[candidate_offsets[i]..candidate_offsets[i + 1]]`.
 /// The worker reports, in `candidate_ids` order, each candidate's natural-log
 /// probability under the log-softmax over the full vocabulary of the model's
-/// logits at its slot (`RequestOutput::candidate_logprobs`).
+/// logits at its slot (`CallOutput::candidate_logprobs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Readout {
     /// Index of each slot's token in the call's concatenated canvas rows.

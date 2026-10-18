@@ -2,8 +2,8 @@
 
 use uniserve_core::{CallId, MediaSource};
 use uniserve_ipc::{
-    ArtifactHandle, BatchOutput, Call, CallStatus, ErrorCode, MediaOutput, RequestKey,
-    RequestOutput, TensorExport, TensorRef, TimingCounters,
+    ArtifactHandle, BatchOutput, Call, CallOutput, CallStatus, ErrorCode, MediaOutput, RequestKey,
+    TensorExport, TensorRef, TimingCounters,
 };
 
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
@@ -32,7 +32,7 @@ struct Speculation {
 /// ready rows before accepting them into RequestPool. Tensor and callback
 /// owners remain with the numerical backend; decoding needs only host values.
 pub(crate) struct PendingOutput {
-    pub output: RequestOutput,
+    pub output: CallOutput,
     pub progress: RequestProgress,
     pub row: usize,
     pub reports_output: bool,
@@ -111,7 +111,7 @@ impl PendingOutput {
         &self.products
     }
 
-    pub(crate) fn result(&self) -> Result<&RequestOutput> {
+    pub(crate) fn result(&self) -> Result<&CallOutput> {
         if !self.resolved {
             return Err(Error::State("call output is not resolved"));
         }
@@ -139,7 +139,7 @@ impl PendingOutput {
     /// The call's wire output, the products it exports and its generated
     /// media, moved into its batch's result while execution resources
     /// close: the media's receiver then holds its unlink responsibility.
-    pub(crate) fn into_parts(self) -> (RequestOutput, Vec<TensorExport>, Option<MediaSource>) {
+    pub(crate) fn into_parts(self) -> (CallOutput, Vec<TensorExport>, Option<MediaSource>) {
         (self.output, self.products, self.media)
     }
 
@@ -403,8 +403,8 @@ pub(crate) fn request_output(
     key: RequestKey,
     id: CallId,
     progress: RequestProgress,
-) -> Result<RequestOutput> {
-    let mut output = RequestOutput {
+) -> Result<CallOutput> {
+    let mut output = CallOutput {
         request_key: key,
         call_id: id,
         status: CallStatus::Ok,
@@ -426,7 +426,7 @@ pub(crate) fn request_output(
     Ok(output)
 }
 
-fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> Result<()> {
+fn set_progress(output: &mut CallOutput, progress: RequestProgress) -> Result<()> {
     let narrow = |value| {
         u32::try_from(value).map_err(|_| Error::State("request coordinate exceeds its wire range"))
     };
