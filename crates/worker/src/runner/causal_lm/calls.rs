@@ -49,9 +49,13 @@ pub(super) fn kind(call: &Call) -> Result<ForwardMode> {
 
 /// The admitted sampling parameters of a call's request.
 pub(super) fn parameters(admission: &uniserve_ipc::NewRequest) -> Result<&SamplingParams> {
-    admission.ar.as_ref().map(|ar| &ar.sampling).ok_or_else(|| {
-        Error::Invalid("sequence execution requires admitted sampling parameters".into())
-    })
+    admission
+        .generation
+        .as_ref()
+        .map(|generation| &generation.sampling)
+        .ok_or_else(|| {
+            Error::Invalid("sequence execution requires admitted sampling parameters".into())
+        })
 }
 
 /// Build a call's input row.

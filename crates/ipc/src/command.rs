@@ -79,10 +79,10 @@ impl BatchCommand {
     }
 }
 
-/// Autoregressive request parameters fixed for the worker request lifetime.
+/// A request's token-generation parameters, fixed for its lifetime on a rank.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ArRequestParams {
-    /// Sampling policy shared by autoregressive calls.
+pub struct GenerationParams {
+    /// Sampling policy shared by the request's token calls.
     pub sampling: SamplingParams,
     /// Token identifiers used for negative-conditioning input.
     pub negative_token_ids: Vec<u32>,
@@ -119,8 +119,8 @@ pub struct NewRequest {
     /// Scheduler-assigned stable request-state row. Index zero is reserved for
     /// inactive graph padding and never identifies a live request.
     pub request_pool_idx: u32,
-    /// Autoregressive request parameters, when applicable.
-    pub ar: Option<ArRequestParams>,
+    /// Token-generation parameters, when the request generates tokens.
+    pub generation: Option<GenerationParams>,
     /// Image request parameters, when applicable.
     pub image: Option<ImageParams>,
     /// Diffusion request parameters, when applicable.
@@ -137,26 +137,26 @@ pub struct NewRequest {
 }
 
 impl NewRequest {
-    /// Constructs static autoregressive or multimodal admission state.
+    /// Constructs static token-generation or multimodal admission state.
     ///
-    /// Checks only the request-pool index and that `ar` or `image` is present;
+    /// Checks only the request-pool index and that `generation` or `image` is present;
     /// it does not run [`Self::validate`] on the family parameters.
     pub fn new(
         request_key: RequestKey,
         request_pool_idx: u32,
-        ar: Option<ArRequestParams>,
+        generation: Option<GenerationParams>,
         image: Option<ImageParams>,
         input_images: u32,
     ) -> ValidationResult<Self> {
         ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         ensure_valid!(
-            ar.is_some() || image.is_some(),
-            "request start must declare autoregressive or image parameters"
+            generation.is_some() || image.is_some(),
+            "request start must declare token-generation or image parameters"
         );
         let admission = Self {
             request_key,
             request_pool_idx,
-            ar,
+            generation,
             image,
             diffusion: None,
             video: None,
@@ -178,7 +178,7 @@ impl NewRequest {
         let admission = Self {
             request_key,
             request_pool_idx,
-            ar: None,
+            generation: None,
             image: None,
             diffusion: Some(diffusion),
             video: Some(video),
@@ -196,14 +196,17 @@ impl NewRequest {
             "request-pool index must be positive"
         );
         ensure_valid!(
-            self.ar.is_some() || self.image.is_some() || self.diffusion.is_some(),
+            self.generation.is_some() || self.image.is_some() || self.diffusion.is_some(),
             "request start must declare one runtime-family parameter set"
         );
-        if let Some(ar) = &self.ar {
-            ar.sampling.validate()?;
+        if let Some(generation) = &self.generation {
+            generation.sampling.validate()?;
             ensure_valid!(
-                ar.finish_token_ids.windows(2).all(|pair| pair[0] < pair[1]),
-                "autoregressive finish token ids are not canonical"
+                generation
+                    .finish_token_ids
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "token-generation finish token ids are not canonical"
             );
         }
         if let Some(branch) = &self.image {

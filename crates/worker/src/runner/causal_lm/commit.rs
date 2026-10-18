@@ -158,9 +158,9 @@ impl TokenBatch<'_> {
                 .requests
                 .get(call.request_key.request_id.0)?
                 .admission()
-                .ar
+                .generation
                 .as_ref()
-                .is_some_and(|ar| ar.sampling.uses_penalties());
+                .is_some_and(|generation| generation.sampling.uses_penalties());
             let position = match state.forward.task {
                 Some(task) => Some(stepped.invocation(state.forward.microbatch)?.position(task)),
                 None => None,
