@@ -580,8 +580,8 @@ fn text_and_image_requests_complete() {
 /// Cancelling a resident image request reports `Cancelled` and releases its
 /// resources, so an image request submitted behind it still completes. The
 /// latent pool (64 usable pages of 64 units) and buffer pool are reduced from
-/// the simulator defaults, and the first request runs `ImageParams::MAX_STEPS`
-/// denoising steps so it is still resident when the second arrives.
+/// the simulator defaults, and the first request runs a thousand denoising
+/// steps so it is still resident when the second arrives.
 #[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut sim = SimEngine::new();
@@ -601,7 +601,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
             text_input(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
-                steps: ImageParams::MAX_STEPS,
+                steps: 1000,
                 ..Default::default()
             },
             GenerationConstraint::GenOnly,
