@@ -31,6 +31,7 @@ from .checkpoint import (
     detect,
 )
 from .encoder import TextEncoderConfig
+from .packing import VIDEO_TILE_SHAPES
 from .processing import buckets
 
 # DMD rungs are unshifted noise levels on the 1000-step training clock.
@@ -259,8 +260,12 @@ class SparseAttention:
     reference_keep: float | None = None
 
     def __post_init__(self) -> None:
-        if self.tile not in (64, 128):
-            raise ValueError("H3 sparse attention tiles hold 64 or 128 rows")
+        # A tile holds one video tile shape of the segment packing.
+        if self.tile not in VIDEO_TILE_SHAPES:
+            raise ValueError(
+                "H3 sparse attention tiles hold "
+                f"{' or '.join(map(str, VIDEO_TILE_SHAPES))} rows"
+            )
         for name in ("sparsity",) + (
             () if self.reference_keep is None else ("reference_keep",)
         ):
@@ -307,7 +312,8 @@ class DenoiserConfig:
             not isinstance(self.tasks, tuple)
             or not self.tasks
             or any(
-                task not in ("t2va", "fl2va", "ref2va") for task in self.tasks
+                not any(task in served for served in DENOISER_TASKS.values())
+                for task in self.tasks
             )
             or len(set(self.tasks)) != len(self.tasks)
         ):
