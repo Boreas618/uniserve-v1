@@ -24,8 +24,6 @@ pub struct IpcConfig {
     pub products_cross_hosts: bool,
     /// Most unresolved requests on the channel.
     pub queue_depth: usize,
-    /// Largest frame payload, in bytes.
-    pub max_payload_bytes: usize,
     /// How long one job may run on a lane before the rank reports the lane
     /// stalled: half the head's watchdog timeout.
     pub stall_bound: std::time::Duration,
@@ -182,7 +180,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             host_slots: descriptor.host_slots.clone(),
             products_cross_hosts: descriptor.products_cross_hosts,
             queue_depth: descriptor.queue_depth,
-            max_payload_bytes: descriptor.ipc_payload_cap,
             // Half the head's watchdog, so a stalled lane is reported, and
             // named in its requests' failure, before the head replaces the
             // group, even for a job that started up to half of it after the

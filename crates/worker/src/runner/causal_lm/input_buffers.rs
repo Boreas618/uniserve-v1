@@ -42,6 +42,12 @@ pub(crate) const FINISH_IDS: usize = 8;
 /// position.
 const LOGPROB_WORDS_PER_TOKEN: usize = 3 + 3 * 20;
 
+/// Logprob words a binding of `tokens` tokens holds: the most a forward of
+/// it packs, since planning refuses a forward whose logprobs exceed them.
+pub(crate) const fn logprob_capacity(tokens: usize) -> usize {
+    tokens * LOGPROB_WORDS_PER_TOKEN
+}
+
 /// The dimensions of one binding's columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Dimensions {
@@ -69,7 +75,7 @@ impl Dimensions {
     }
 
     pub(crate) fn logprob_words(&self) -> usize {
-        self.tokens * LOGPROB_WORDS_PER_TOKEN
+        logprob_capacity(self.tokens)
     }
 }
 

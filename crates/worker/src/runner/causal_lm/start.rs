@@ -23,6 +23,7 @@ use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::batch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::request::decode_state::DecodeState;
+use crate::runner::causal_lm::input_buffers::logprob_capacity;
 use crate::runner::causal_lm::runners::COMPLETION_FIELDS;
 use crate::runner::causal_lm::{
     CausalLMRunner, Construction, Dimensions, RunnerParts, TableShape, methods, model_dtype,
@@ -249,7 +250,6 @@ pub(crate) struct Startup<'a> {
     pub(crate) config: &'a WorkerConfig,
     pub(crate) request_slots: usize,
     pub(crate) queue_depth: usize,
-    pub(crate) max_payload_bytes: usize,
     pub(crate) model: &'a LoadedModel,
     /// The model declares an image policy.
     pub(crate) image_processor: bool,
@@ -542,12 +542,21 @@ impl CausalLMRunners {
 
         // A batch leases its calls' completion fields and one payload word
         // per four bytes the engine bounds each call's completion by
-        // (`TokenBatch::lease`). The batch reports every call's payload in
-        // one result message of at most `max_payload_bytes`, so its payload
-        // words are bounded by the message's, plus one word of rounding per
-        // call.
+        // (`TokenBatch::lease`). Its payload is its logprob rows: the engine
+        // costs a row 4 bytes plus 12 per entry, one word more than the 3
+        // words per entry the rank packs it in, and a batch reports at most
+        // one row per token it carries. What a forward packs fits its
+        // runner's logprob column, or planning refuses it, and a batch runs
+        // one forward per microbatch runner of its lane. So the largest
+        // batch's words are its calls' fields with one word of rounding
+        // each, a logprob column per microbatch, and one word per token. A
+        // request asking for more top tokens than the vocabulary holds is
+        // costed above what the rank packs, and runs while that cost fits.
         let max_calls = config.max_batch_calls.max(1);
-        let words = max_calls * (COMPLETION_FIELDS + 1) + startup.max_payload_bytes.div_ceil(4);
+        let microbatches = groups.iter().map(Vec::len).max().unwrap_or(1);
+        let words = max_calls * (COMPLETION_FIELDS + 1)
+            + microbatches * logprob_capacity(bounds.tokens)
+            + bounds.tokens;
         // Storage for the largest batch of each batch in flight, and of one
         // whose result was reported before its lease retired.
         let outputs = OutputPool::new(cuda, startup.queue_depth.max(1) + 1, words)?;

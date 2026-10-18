@@ -16,7 +16,6 @@ fn defaults() -> Value {
         "host_slots": [0],
         "products_cross_hosts": false,
         "queue_depth": 2,
-        "ipc_payload_cap": 65536,
         "watchdog_timeout_ms": 300000,
         "model": "model",
         "device": "cpu",

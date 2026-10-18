@@ -230,7 +230,6 @@ fn serve(arguments: &Arguments, signals: &Signals) -> Ended {
         Ok(launch) => launch,
         Err(error) => return Failure::Descriptor(error).into(),
     };
-    channel.set_bound(launch.ipc.max_payload_bytes);
 
     // Until the service observes the connection, the head's close ends the
     // process from the watch's thread.
