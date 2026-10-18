@@ -501,7 +501,7 @@ mod tests {
 
     /// Serve the connection with a rank without components that queues
     /// two batches. No job of these batches stays in flight, so the stall
-    /// bound (here the default, half the head's 300 s result deadline)
+    /// bound (here the default, half the head's 300 s watchdog timeout)
     /// is never reached.
     fn serve(channel: &mut Channel) -> Result<Ending> {
         let mut executor = rank(2, false)?;
