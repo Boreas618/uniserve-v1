@@ -129,7 +129,9 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 | `--attention-backend` | `auto` | Attention provider: `auto` selects a native kernel for each call from the device and the installed kernel libraries; `flashinfer`, `trtllm` (TensorRT-LLM kernels shipped with FlashInfer), `flash_attn_4` (FlashAttention-4), `torch` (portable SDPA), `prefix_block` (UniServe's SM100 prefix-block kernels), `flash_attn` (FlashAttention-2) or `sgl_kernel` (SGLang's FlashAttention-3, SM90) serves every call, and startup refuses a model with a call that provider does not compute. The ranks resolve the name when they load their model and refuse a name these are not. The `gpu` extra installs neither FlashAttention-2 nor SGLang's kernels |
 | `--api-key` | Unset | Bearer token for public routes |
 | `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation and System One requests; video requests use video job slots |
+| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation, System One and synchronous video requests |
+| `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
+| `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
 | `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
 | `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced; a rank reports a lane stalled after half of it |
 | `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
