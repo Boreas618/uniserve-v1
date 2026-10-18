@@ -847,7 +847,7 @@ class AudioEncoder(nn.Module):
     """Encode sample-major PCM tracks into latent rows.
 
     Tracks are encoded whole rather than by media unit. Subclasses define
-    ``latent_frames`` and ``latent_rate`` from their codec's compression;
+    ``latent_frames`` and ``latent_rate`` from their VAE's compression;
     ``output_layout``; ``unpack_samples``, the conversion of one track's
     ``[samples, channels]`` PCM into the native encoder input; and
     ``pack_latents``, the conversion of the track's native latents into its

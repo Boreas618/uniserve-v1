@@ -67,9 +67,9 @@ class LatentDecoder(nn.Module):
                 "their device"
             )
 
-        from .spatial import SpatialDecoder
+        from .tiled import TiledDecoder
 
         values = latents.float() * self.std + self.mean
-        if isinstance(self.decoder, SpatialDecoder):
+        if isinstance(self.decoder, TiledDecoder):
             return self.decoder.decode(values, tiled=True)
         return self.decoder(values)

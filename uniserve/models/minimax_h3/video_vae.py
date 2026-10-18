@@ -59,8 +59,8 @@ from uniserve.nn.rope import RotaryEmbedding
 from uniserve.nn.vae import (
     LatentDecoder,
     LatentEncoder,
-    SpatialDecoder,
-    SpatialEncoder,
+    TiledDecoder,
+    TiledEncoder,
 )
 from uniserve.quantization import QuantizedTensor
 
@@ -681,7 +681,7 @@ class Transformer(nn.Module):
         )
 
 
-class Decoder(SpatialDecoder):
+class Decoder(TiledDecoder):
     """Project latent channels and reconstruct overlapping spatial tiles."""
 
     decoder: Transformer
@@ -689,7 +689,7 @@ class Decoder(SpatialDecoder):
     def __init__(self, config: Config):
         # Tile extents and minimum overlaps are output pixels and match the
         # native diffusers decoder's default tiling; LatentDecoder.forward
-        # always decodes through SpatialDecoder.decode with tiling enabled.
+        # always decodes through TiledDecoder.decode with tiling enabled.
         super().__init__(
             Transformer(config),
             spatial_compression=config.spatial_compression,
@@ -1145,7 +1145,7 @@ class CausalCNN(nn.Module):
         return self.output(hidden, norm=self.norm)
 
 
-class Encoder(SpatialEncoder):
+class Encoder(TiledEncoder):
     """Encode overlapping spatial tiles of one clip into posterior moments."""
 
     encoder: CausalCNN

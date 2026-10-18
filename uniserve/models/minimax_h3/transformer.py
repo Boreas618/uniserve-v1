@@ -6,8 +6,9 @@ calls ``Transformer.forward`` once per solver step. Each
 ``TransformerLayer.forward_chunks`` yields ``(global row slice, rows)``
 chunks, so a layer's completed rows feed the next layer's attention
 projection before the whole shard is finished. Timestep conditioning comes
-from ``Modulation`` products that ``weights._prepare_modulation`` precomputes
-at load time for the fixed schedule; no timestep embedding runs per request.
+from ``AdaLNCache`` products that ``weights._prepare_adaln_cache``
+precomputes at load time for the fixed schedule; no timestep embedding runs
+per request.
 A parallel-decoding student's output projections are likewise fused per
 evaluation at load time (``StepProjection``).
 """
@@ -24,10 +25,10 @@ from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh
 from uniserve.nn import (
+    AdaLNCache,
     ColumnParallelLinear,
     GatedMLP,
     Linear,
-    Modulation,
     RMSNorm,
     functional,
 )
@@ -317,7 +318,7 @@ class Transformer(nn.Module):
             attention: Dense or sparse attention for every layer.
             entries: Distinct timestep values the schedule evaluates.
             steps: Network evaluations of the schedule.
-            groups: Timestep groups a step reads (see ``Modulation``).
+            groups: Timestep groups a step reads (see ``AdaLNCache``).
         """
         super().__init__()
         if any(
@@ -354,9 +355,9 @@ class Transformer(nn.Module):
         # [layer, entry, 3 token tags x 6 vectors x hidden] per transformer
         # layer and [entry, shift + scale] for the final output norm, with
         # the [step, group] entries each step reads. The empty tensors are
-        # placeholders that the post-load hook weights._prepare_modulation
+        # placeholders that the post-load hook weights._prepare_adaln_cache
         # replaces.
-        self.modulation = Modulation(
+        self.adaln_cache = AdaLNCache(
             torch.empty(
                 config.num_hidden_layers,
                 entries,
@@ -415,7 +416,7 @@ class Transformer(nn.Module):
 
         chunks = ((inputs.token_slice, hidden),)
         # [resident layer, group, 18 * hidden] products of this step.
-        modulation = self.modulation(step)
+        modulation = self.adaln_cache(step)
         for index, layer in enumerate(self.layers.values()):
             layer = cast(TransformerLayer, layer)
             # The loop only composes generators; the layers run when
@@ -433,7 +434,7 @@ class Transformer(nn.Module):
         # The final pipeline stage projects each modality with its own head;
         # the output norm reads the generated video and audio timesteps,
         # groups 0 and 1.
-        modulation = self.modulation.output(step)
+        modulation = self.adaln_cache.output(step)
         results = []
         for index, (indices, projection) in enumerate(
             (
