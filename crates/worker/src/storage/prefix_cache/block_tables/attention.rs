@@ -75,8 +75,9 @@ impl GroupTable {
     }
 }
 
-/// Select the same page ranges for resident execution and startup scratch prefix cache.
-pub(crate) fn table_pages(
+/// Select the pages rows of resident tables read: each row's visible page
+/// range in every group, for serving and startup forwards alike.
+fn table_pages(
     tables: &[Vec<Arc<GroupTable>>],
     prefixes: &[u32],
     queries: &[u32],

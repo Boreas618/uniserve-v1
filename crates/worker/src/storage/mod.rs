@@ -29,6 +29,6 @@ pub(crate) use latent::{LatentCache, Scratch};
 pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
 pub(crate) use output::{OutputLease, OutputPool};
 pub use pinned_pool::PinnedPool;
-pub(crate) use prefix_cache::block_tables::{AttentionRow, TablePages, table_pages};
-pub(crate) use prefix_cache::{ScratchUnits, TransferBases, UnitAccesses};
+pub(crate) use prefix_cache::block_tables::{AttentionRow, TablePages};
+pub(crate) use prefix_cache::{TransferBases, UnitAccesses};
 pub(crate) use request_slots::{RequestSlots, SlotField};

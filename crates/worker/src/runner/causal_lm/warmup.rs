@@ -44,8 +44,8 @@ use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::sampling::RowSampling;
+use crate::storage::PrefixCache;
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{PrefixCache, ScratchUnits};
 use crate::stream::Issue;
 use crate::warmup::{Scenarios, WarmupHooks};
 use crate::{Error, Result};
@@ -91,62 +91,6 @@ impl WarmupHooks for CausalLMWarmup {
         }
         tokens(scenarios)
     }
-}
-
-/// Lend scratch units to slots `1..` as block tables of `lengths` tokens,
-/// issued to `stream`: the units are reset, then the tables installed.
-pub(crate) fn install_scratch(
-    prefix_cache: &mut PrefixCache,
-    lengths: &[usize],
-    stream: impl Issue,
-) -> Result<ScratchUnits> {
-    let shapes = prefix_cache.plan().group_shapes()?;
-    let count: usize = lengths
-        .iter()
-        .map(|&length| {
-            shapes
-                .iter()
-                .map(|shape| {
-                    length.max(1).div_ceil(shape.page_tokens as usize)
-                        * shape.units_per_page as usize
-                })
-                .sum::<usize>()
-        })
-        .sum();
-    let scratch = prefix_cache.scratch_units(count as u32, stream)?;
-    let mut unit = *scratch.units().start();
-    let mut tables = Vec::new();
-    for (row, &length) in lengths.iter().enumerate() {
-        for (group, shape) in shapes.iter().enumerate() {
-            let pages = length.max(1).div_ceil(shape.page_tokens as usize);
-            let units = pages * shape.units_per_page as usize;
-            tables.push(BlockTable {
-                request_pool_idx: row as u32 + 1,
-                group_id: group as u32,
-                start_page: 0,
-                unit_ids: (unit..unit + units as u32).map(UnitId).collect(),
-                allocated_tokens: (pages * shape.page_tokens as usize) as u32,
-            });
-            unit += units as u32;
-        }
-    }
-    prefix_cache.install(&tables, stream)?;
-    Ok(scratch)
-}
-
-/// Clear the scratch tables of slots `1..=rows` and return their units,
-/// issued to `stream`: the stream waits for what wrote the units, resets
-/// them and waits for the resets.
-pub(crate) fn release_scratch(
-    prefix_cache: &mut PrefixCache,
-    scratch: ScratchUnits,
-    rows: usize,
-    stream: impl Issue,
-) -> Result<()> {
-    let slots: Vec<u32> = (1..=rows as u32).collect();
-    let cleared = prefix_cache.release_slots(&slots, stream);
-    let finished = scratch.finish(prefix_cache, stream);
-    cleared.and(finished)
 }
 
 /// Rows of `lengths` host tokens for consecutive slots from `first`.
@@ -370,12 +314,12 @@ impl CausalLMRunners {
         };
 
         let before = Job::new();
-        let scratch = install_scratch(prefix_cache, lengths, before.on(stream))?;
+        let scratch = prefix_cache.install_scratch(lengths, before.on(stream))?;
         perform(before)?;
 
         let after = Job::new();
         let stepped = steps(self, prefix_cache, &after);
-        let released = release_scratch(prefix_cache, scratch, lengths.len(), after.on(stream));
+        let released = prefix_cache.release_scratch(scratch, lengths.len(), after.on(stream));
         let performed = perform(after);
         stepped.and(released).and(performed)
     }
@@ -470,7 +414,7 @@ impl CausalLMRunners {
             // The warm forwards read `features` on `stream` after their jobs
             // posted their completions. `features` is dropped only after
             // `warmup_bucket` returned, whose last job synchronizes `stream`
-            // behind them (`release_scratch`, through `ScratchUnits::finish`):
+            // behind them (`PrefixCache::release_scratch`, through `ScratchUnits::finish`):
             // `cuStreamSynchronize` returns once the device completed every
             // task issued to the stream, so no read is pending when the drop
             // queues the allocation's `cuMemFree`, whose own implicit

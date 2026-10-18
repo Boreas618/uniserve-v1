@@ -12,7 +12,6 @@ use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
-use crate::runner::causal_lm::warmup::{install_scratch, release_scratch};
 use crate::runner::component::Component;
 use crate::storage::{LatentCache, PrefixCache, UnitColumn};
 use crate::stream::Issue;
@@ -159,7 +158,7 @@ impl DenoiserRunners {
         // uses the workspace before serving starts.
         unsafe { samples.zero(before.on(stream.as_ref())) }?;
         let scratch =
-            install_scratch(prefix_cache, &[length as usize], before.on(stream.as_ref()))?;
+            prefix_cache.install_scratch(&[length as usize], before.on(stream.as_ref()))?;
         perform(lanes, before)?;
 
         let step = Job::new();
@@ -192,7 +191,7 @@ impl DenoiserRunners {
         }
 
         let after = Job::new();
-        let released = release_scratch(prefix_cache, scratch, 1, after.on(stream.as_ref()));
+        let released = prefix_cache.release_scratch(scratch, 1, after.on(stream.as_ref()));
         let performed = perform(lanes, after).map(drop);
         warmed.and(released).and(performed)
     }
@@ -248,7 +247,7 @@ impl DenoiserRunners {
             }
         }
         let lengths = vec![prefix; shape.images];
-        let scratch = install_scratch(prefix_cache, &lengths, before.on(stream.as_ref()))?;
+        let scratch = prefix_cache.install_scratch(&lengths, before.on(stream.as_ref()))?;
         perform(lanes, before)?;
 
         let job = Job::new();
@@ -260,12 +259,8 @@ impl DenoiserRunners {
             Err(error) => Err(error),
         };
         let after = Job::new();
-        let released = release_scratch(
-            prefix_cache,
-            scratch,
-            lengths.len(),
-            after.on(stream.as_ref()),
-        );
+        let released =
+            prefix_cache.release_scratch(scratch, lengths.len(), after.on(stream.as_ref()));
         let performed = perform(lanes, after).map(drop);
         stepped.and(released).and(performed)
     }
