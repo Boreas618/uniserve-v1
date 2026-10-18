@@ -240,7 +240,7 @@ impl Scheduler {
                         | MediaCall::AudioEncoding,
                     ) => "decoding",
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
-                    _ => unreachable!("media request completed a non-media computation"),
+                    _ => unreachable!("media request completed a non-media call"),
                 };
                 let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
                     phase: phase.to_owned(),
@@ -459,7 +459,7 @@ impl Scheduler {
                 invalid_result = true;
                 continue;
             }
-            let Some(computation) = self
+            let Some(kind) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -475,7 +475,7 @@ impl Scheduler {
             };
             // A group's batch timing is the maximum of each phase over its calls.
             let component = returned_groups
-                [crate::scheduler::stats::ExecutionDomainStats::index(computation)]
+                [crate::scheduler::stats::ExecutionDomainStats::index(kind)]
             .get_or_insert(TimingCounters::default());
             component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
             component.device_us = component.device_us.max(record.timing_counters.device_us);
@@ -503,7 +503,7 @@ impl Scheduler {
         let forward_stats = report.forward_stats;
         for result in &report.results {
             let record = &result.output;
-            if let Some(computation) = self
+            if let Some(kind) = self
                 .inflight
                 .pending_calls
                 .get(&record.request_key.request_id)
@@ -514,7 +514,7 @@ impl Scheduler {
                 })
                 .map(|inflight| inflight.call.kind)
             {
-                self.record_domain_completion(computation, record.status);
+                self.record_domain_completion(kind, record.status);
             }
         }
         for (index, returned) in returned_groups.into_iter().enumerate() {

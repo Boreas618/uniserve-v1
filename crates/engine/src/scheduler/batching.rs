@@ -11,7 +11,7 @@
 //! `num_scheduled_denoise_steps`), so a successor can be planned before its
 //! predecessor resolves. Each planned call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its `CallKind`:
-//! one batch per computation, each a single numerical call on one component.
+//! one batch per call kind, each a single numerical call on one component.
 //!
 //! The lane (`BatchKind`) only separates prefill from decode. `BatchKind::Media`
 //! calls are eligible in every pass, and a pass with no lane applies no filter.
@@ -24,7 +24,7 @@
 //! within the rows a worker stages per call (`PassRows`).
 
 mod call;
-mod computation;
+mod plan;
 
 use super::*;
 use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
@@ -70,7 +70,7 @@ impl Scheduler {
     /// it costs nothing once its request has left `running`. A verify call
     /// costs its input tokens plus one, and every other call its `max_tokens`
     /// bound.
-    fn computation_token_cost(&self, call: &Call) -> usize {
+    fn call_token_cost(&self, call: &Call) -> usize {
         match call.kind {
             CallKind::Media(MediaCall::Denoising) => {
                 let Some(state) = self.running.get(&call.request_key.request_id) else {
@@ -85,7 +85,7 @@ impl Scheduler {
         }
     }
 
-    /// Reserves persistent buffers, latent pages, and transfer capacity for one computation.
+    /// Reserves persistent buffers, latent pages, and transfer capacity for one call.
     ///
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
     /// order, or `None` when the call cannot run now: the guidance prefix of a
@@ -191,10 +191,10 @@ impl Scheduler {
         ids: &[RequestId],
         lane: Option<BatchKind>,
     ) -> Vec<ExecutionBatch> {
-        // One batch per computation: a batch is one numerical call on one
+        // One batch per call kind: a batch is one numerical call on one
         // component, so a rank receives it as a single homogeneous group. The
-        // component a call binds to follows from its computation, so the two
-        // together name one group. Computations keep the order in which their
+        // component a call binds to follows from its kind, so the two
+        // together name one group. Kinds keep the order in which their
         // first call was selected.
         let mut kind_order: Vec<CallKind> = Vec::new();
         let mut kind_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
@@ -256,7 +256,7 @@ impl Scheduler {
                 continue;
             }
             // Build one call when its exact resident resources fit.
-            if let Some(mut call) = self.next_generation_computation(id, budget, rows_left) {
+            if let Some(mut call) = self.next_generation_call(id, budget, rows_left) {
                 // A context prefill plans within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
@@ -318,7 +318,7 @@ impl Scheduler {
                     );
                     continue;
                 };
-                let cost = self.computation_token_cost(&call);
+                let cost = self.call_token_cost(&call);
                 budget = budget.saturating_sub(cost);
                 if call.readout.is_some() {
                     let rows = self.running.get(&id).and_then(|state| {

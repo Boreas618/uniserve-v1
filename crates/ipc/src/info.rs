@@ -417,10 +417,10 @@ pub struct WorkerInfo {
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum calls in one run. A prefill or decode run that no captured
-    /// graph holds runs eagerly, so the captured graphs bound no run.
+    /// Maximum calls in one batch. A prefill or decode batch that no captured
+    /// graph holds runs eagerly, so the captured graphs bound no batch.
     pub max_batch_calls: u32,
-    /// Maximum text tokens represented in one run.
+    /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,
     /// Number of resident request slots.
     pub request_slots: u32,
@@ -491,7 +491,7 @@ impl WorkerInfo {
                     && self.prefix_cache.is_none()
                     && self.latent_pages == 0
                     && self.media_components.is_empty()),
-            "a worker without call kinds must own no request computation"
+            "a worker without call kinds must own no request call"
         );
         ensure_valid!(
             self.supported_calls

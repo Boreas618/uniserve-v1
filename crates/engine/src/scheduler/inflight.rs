@@ -15,7 +15,7 @@
 use super::*;
 use uniserve_ipc::MediaCall;
 
-/// Algorithm inputs retained until their computation completes.
+/// Algorithm inputs retained until their call completes.
 pub(super) enum InflightInput {
     Generation {
         /// Physical cache start and exact token contribution, when known, from the

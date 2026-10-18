@@ -98,7 +98,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
                     physical = physical.saturating_add(call.bounds.max_tokens);
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         feedback_index += 1;
                         if feedback_index == state.req.image_generation.feedback_encoders.len() {
                             logical = logical
@@ -201,7 +201,7 @@ impl Scheduler {
             let call = &pending.call;
             if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
-            } else if consumes_image_features(call) && is_feedback_computation(call) {
+            } else if consumes_image_features(call) && is_feedback_call(call) {
                 index += 1;
                 if index == state.req.image_generation.feedback_encoders.len() {
                     index = 0;
@@ -248,8 +248,8 @@ impl Scheduler {
             .find_map(|pending| select(&pending.call))
     }
 
-    /// Selects the next computation from the last pending input, or from accepted
-    /// request progress when no computation remains. No request state is replayed.
+    /// Selects the next call from the last pending input, or from accepted
+    /// request progress when no call remains. No request state is replayed.
     pub(in crate::scheduler) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
         let state = self.running.get(&id)?;
         let pending = self
@@ -280,7 +280,7 @@ impl Scheduler {
                 }
                 CallKind::Forward(ForwardMode::TokenDenoising) => Phase::Readout,
                 CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                    if is_feedback_computation(call) {
+                    if is_feedback_call(call) {
                         if self.scheduled_feedback(id)?.0 == 0 {
                             Phase::DecodeUnd
                         } else {
@@ -299,7 +299,7 @@ impl Scheduler {
                 CallKind::Media(MediaCall::ImageDecoding) => Phase::FeedbackEncode,
                 CallKind::Media(MediaCall::VisionEncoding)
                 | CallKind::Media(MediaCall::LatentEncoding)
-                    if is_feedback_computation(call) =>
+                    if is_feedback_call(call) =>
                 {
                     Phase::FeedbackState
                 }
@@ -362,7 +362,7 @@ impl Scheduler {
             return self.state_predecessor(id);
         };
         // Accepted lengths are published in device request state; the successor
-        // needs the producing computation identity while its host report is pending.
+        // needs the producing call identity while its host report is pending.
         Some(call.call_id)
     }
 
@@ -483,7 +483,7 @@ impl Scheduler {
         // prompt/decode pipelining, using each predecessor's actual inputs.
         if target == CallKind::Forward(ForwardMode::Decode) {
             let feedback_continuation = consumes_image_features(&predecessor.call)
-                && is_feedback_computation(&predecessor.call)
+                && is_feedback_call(&predecessor.call)
                 && self
                     .scheduled_feedback(id)
                     .is_some_and(|(index, _)| index == 0)
@@ -577,7 +577,7 @@ impl Scheduler {
         }
     }
 
-    /// Determines the next pipelined computation from its submitted predecessor.
+    /// Determines the next pipelined call from its submitted predecessor.
     ///
     /// Returns `None`, among other cases, when the request is not running or
     /// has no call in flight, has not yet submitted its whole prompt or every
@@ -602,7 +602,7 @@ impl Scheduler {
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
         } else if consumes_image_features(last)
-            && is_feedback_computation(last)
+            && is_feedback_call(last)
             && self.scheduled_feedback(id)?.0 == 0
         {
             state.req.image_generation.sample_feedback_continuation
