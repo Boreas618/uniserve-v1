@@ -107,9 +107,9 @@ struct Trajectory {
     params: LatentParams,
     /// Steps in the admitted schedule.
     steps: u32,
-    /// The slot's committed step, from the latent pool's ledger: the step a
-    /// denoising call advances, and the schedule's end for image decoding.
-    step: u32,
+    /// The slot's committed step index, from the latent pool's ledger: the
+    /// step a denoising call advances.
+    step_index: u32,
 }
 
 impl ImageBatch<'_> {
@@ -147,7 +147,7 @@ impl ImageBatch<'_> {
             ));
         }
         let slot = self.batch.calls[index].slot;
-        let step = u32::try_from(self.parts.latents()?.pool.committed_step(slot))
+        let step_index = u32::try_from(self.parts.latents()?.pool.step_index(slot))
             .map_err(|_| Error::Invariant("a committed latent step exceeds u32".into()))?;
         Ok((
             Trajectory {
@@ -155,7 +155,7 @@ impl ImageBatch<'_> {
                 slot,
                 params,
                 steps: u32::from(image.steps),
-                step,
+                step_index,
             },
             image,
         ))
@@ -178,15 +178,15 @@ impl ImageBatch<'_> {
         Ok(coordinates.into())
     }
 
-    /// Export the version call `index` just wrote into `bank` (at solver
-    /// `step`) to other ranks and workers, when the rank publishes there
+    /// Export the version call `index` just wrote into `bank` (at
+    /// `step_index`) to other ranks and workers, when the rank publishes there
     /// and reports the component's results. Readers on this rank use the
     /// committed trajectory directly.
     fn publish_latent(
         &mut self,
         index: usize,
         bank: u8,
-        step: u32,
+        step_index: u32,
         params: &LatentParams,
         stream: impl Issue,
     ) -> Result<()> {
@@ -207,7 +207,7 @@ impl ImageBatch<'_> {
             self.batch.calls[index].slot,
             params,
             bank,
-            step,
+            step_index,
             stream,
         )?;
         // The batch's commit locates it once this work was performed.
@@ -360,7 +360,7 @@ impl ImageBatch<'_> {
                     slot: value.slot,
                     params: value.params.clone(),
                     steps: value.steps,
-                    step: value.step,
+                    step_index: value.step_index,
                 })
                 .collect();
             self.place(&values, issue)?
@@ -609,7 +609,7 @@ impl ImageBatch<'_> {
             }
             // Each denoising call advances the slot's committed trajectory
             // by the next step of its admitted schedule.
-            if trajectory.step >= trajectory.steps {
+            if trajectory.step_index >= trajectory.steps {
                 return Err(Error::Invalid(
                     "denoising continues past the admitted schedule".into(),
                 ));
@@ -670,7 +670,7 @@ impl ImageBatch<'_> {
                     slot: value.slot,
                     params: value.params.clone(),
                     steps: value.steps,
-                    step: value.step,
+                    step_index: value.step_index,
                 })
                 .collect();
             self.place(&values, job.on(stream.as_ref()))?
@@ -687,7 +687,7 @@ impl ImageBatch<'_> {
                     .as_ref()
                     .map_or(0, |input| i64::from(input.generation));
                 let committed = TrajectoryVersion {
-                    step: i64::from(trajectory.step),
+                    step_index: i64::from(trajectory.step_index),
                     generation,
                     units: i64::from(params.latent_units),
                     height: i64::from(params.height),
@@ -768,7 +768,7 @@ impl ImageBatch<'_> {
             let mut stepping: Stepping = Vec::new();
             let mut fills: Fills = Vec::new();
             for (position, (trajectory, _)) in trajectories.iter().enumerate() {
-                let step = trajectory.step;
+                let step = trajectory.step_index;
                 let key = plan.calls[trajectory.index].request_key;
                 let call_rows = descriptors
                     .get(&trajectory.index)
@@ -844,7 +844,7 @@ impl ImageBatch<'_> {
 
         // A finished trajectory's guidance prefixes retire with it.
         for (trajectory, _) in &trajectories {
-            if trajectory.step + 1 < trajectory.steps {
+            if trajectory.step_index + 1 < trajectory.steps {
                 continue;
             }
             let own = trajectory.slot as u32;
@@ -981,7 +981,7 @@ impl ImageBatch<'_> {
             self.publish_latent(
                 trajectory.index,
                 bank,
-                trajectory.step + 1,
+                trajectory.step_index + 1,
                 params,
                 job.on(stream.as_ref()),
             )?;
@@ -992,7 +992,7 @@ impl ImageBatch<'_> {
                     trajectory.slot,
                     call,
                     &trajectory.params,
-                    i64::from(trajectory.step),
+                    i64::from(trajectory.step_index),
                 )?,
             ));
         }

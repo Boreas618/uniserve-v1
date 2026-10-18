@@ -522,10 +522,10 @@ impl DenoiserRunner {
         LatentUpdate::for_call(slot, call, &params, 0)
     }
 
-    /// The step of `slot`'s committed trajectory, from the latent pool: the
-    /// step its next denoising call advances.
-    pub(crate) fn committed_step(&self, slot: usize) -> Result<i64> {
-        Ok(self.family.video()?.pool.committed_step(slot))
+    /// The step index of `slot`'s committed trajectory, from the latent
+    /// pool: the step its next denoising call advances.
+    pub(crate) fn step_index(&self, slot: usize) -> Result<i64> {
+        Ok(self.family.video()?.pool.step_index(slot))
     }
 
     /// Whether this rank retains a request's conditioning: whether it holds
@@ -675,12 +675,12 @@ impl DenoiserRunner {
         let video = self.family.video_mut()?;
         let params = video.trajectory(slot, call, canvas);
         let pages = video.slot_pages(&params)?;
-        let step = video.pool.committed_step(slot);
-        let evaluation = u32::try_from(step)
+        let step_index = video.pool.step_index(slot);
+        let evaluation = u32::try_from(step_index)
             .map_err(|_| Error::Invariant("a committed latent step exceeds u32".into()))?;
         let trajectory = TrajectoryVersion {
-            step,
-            generation: step + 1,
+            step_index,
+            generation: step_index + 1,
             units: i64::from(params.latent_units),
             height: i64::from(params.height),
             width: i64::from(params.width),
@@ -738,7 +738,10 @@ impl DenoiserRunner {
         );
         // SAFETY: as above; the scatter follows the step on the stream.
         unsafe { issue.copy(&scatter) }?;
-        Ok((LatentUpdate::for_call(slot, call, &params, step)?, mode))
+        Ok((
+            LatentUpdate::for_call(slot, call, &params, step_index)?,
+            mode,
+        ))
     }
 
     /// The final step's local sample of each modality, as `[rows, width]`

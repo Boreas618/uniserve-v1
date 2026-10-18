@@ -12,7 +12,7 @@ use crate::{Error, Result, lock};
 struct LatentSlot {
     pages: Vec<usize>,
     bank: u8,
-    step: i64,
+    step_index: i64,
     generation: i64,
     units: usize,
     height: i64,
@@ -23,8 +23,9 @@ struct LatentSlot {
 /// latent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TrajectoryVersion {
-    /// The denoising step the latent holds.
-    pub step: i64,
+    /// The solver steps the latent's trajectory has completed, which is
+    /// also the index of its next step.
+    pub step_index: i64,
     /// The generation every commit of the trajectory advances.
     pub generation: i64,
     /// Latent units of the trajectory.
@@ -42,16 +43,16 @@ pub(crate) struct LatentUpdate {
     pub request_pool_idx: i64,
     pub params: LatentParams,
     pub expected_generation: i64,
-    pub expected_step: i64,
+    pub expected_step_index: i64,
     pub generation: i64,
-    pub step: i64,
+    pub step_index: i64,
     pub release: bool,
 }
 
 impl LatentUpdate {
     /// Derive a completed numerical call's trajectory change from its plan
-    /// and the slot's committed step, the pool's ledger
-    /// ([`LatentPool::committed_step`]).
+    /// and the slot's committed `step_index`, the pool's ledger
+    /// ([`LatentPool::step_index`]).
     ///
     /// Latent preparation opens a trajectory at step zero, a denoising call
     /// advances the committed one by one step, and image decoding releases
@@ -62,49 +63,50 @@ impl LatentUpdate {
         slot: usize,
         call: &Call,
         params: &LatentParams,
-        committed_step: i64,
+        step_index: i64,
     ) -> Result<Self> {
-        let (expected_generation, expected_step, generation, step, release) = match call.code {
-            CallKind::Media(MediaCall::LatentPreparation) => (
-                0,
-                0,
-                call.latent_output
-                    .as_ref()
-                    .map_or(1, |output| i64::from(output.generation)),
-                0,
-                false,
-            ),
-            CallKind::Media(MediaCall::Denoising) => (
-                call.latent_input
-                    .as_ref()
-                    .map_or(committed_step + 1, |input| i64::from(input.generation)),
-                committed_step,
-                call.latent_output
-                    .as_ref()
-                    .map_or(committed_step + 2, |output| i64::from(output.generation)),
-                committed_step + 1,
-                false,
-            ),
-            CallKind::Media(MediaCall::ImageDecoding) => {
-                let input = call.latent_input.as_ref().ok_or_else(|| {
-                    Error::Invalid("image decoding has no latent trajectory".into())
-                })?;
-                (0, 0, i64::from(input.generation), committed_step, true)
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "call does not update a latent trajectory".into(),
-                ));
-            }
-        };
+        let (expected_generation, expected_step_index, generation, step_index, release) =
+            match call.code {
+                CallKind::Media(MediaCall::LatentPreparation) => (
+                    0,
+                    0,
+                    call.latent_output
+                        .as_ref()
+                        .map_or(1, |output| i64::from(output.generation)),
+                    0,
+                    false,
+                ),
+                CallKind::Media(MediaCall::Denoising) => (
+                    call.latent_input
+                        .as_ref()
+                        .map_or(step_index + 1, |input| i64::from(input.generation)),
+                    step_index,
+                    call.latent_output
+                        .as_ref()
+                        .map_or(step_index + 2, |output| i64::from(output.generation)),
+                    step_index + 1,
+                    false,
+                ),
+                CallKind::Media(MediaCall::ImageDecoding) => {
+                    let input = call.latent_input.as_ref().ok_or_else(|| {
+                        Error::Invalid("image decoding has no latent trajectory".into())
+                    })?;
+                    (0, 0, i64::from(input.generation), step_index, true)
+                }
+                _ => {
+                    return Err(Error::Invalid(
+                        "call does not update a latent trajectory".into(),
+                    ));
+                }
+            };
 
         Ok(Self {
             request_pool_idx: slot as i64,
             params: params.clone(),
             expected_generation,
-            expected_step,
+            expected_step_index,
             generation,
-            step,
+            step_index,
             release,
         })
     }
@@ -229,12 +231,13 @@ impl LatentPool {
         self.page_units
     }
 
-    /// The solver step of the slot's committed trajectory: the rank's ledger
-    /// of completed steps. A batch's commit advances it and an adopted
-    /// import sets it, so a call reads the step it advances here; an empty
-    /// slot is at step zero.
-    pub(crate) fn committed_step(&self, slot: usize) -> i64 {
-        self.slots[slot].step
+    /// The step index of the slot's committed trajectory: the solver steps
+    /// it has completed, which is also the index of the next one. The pool
+    /// is the rank's ledger of steps: a batch's commit advances it and an
+    /// adopted import sets it, so a call reads the step it advances here; an
+    /// empty slot is at step zero.
+    pub(crate) fn step_index(&self, slot: usize) -> i64 {
+        self.slots[slot].step_index
     }
 
     pub(crate) fn capacity_units(&self) -> usize {
@@ -326,7 +329,7 @@ impl LatentPool {
         pages: &[usize],
     ) -> Result<u8> {
         let current = &self.slots[slot];
-        if current.step != trajectory.step
+        if current.step_index != trajectory.step_index
             || current.generation != trajectory.generation
             || current.units as i64 != trajectory.units
             || current.height != trajectory.height
@@ -508,7 +511,7 @@ impl LatentPool {
         &self,
         write: &LatentImport,
         generation: i64,
-        step: i64,
+        step_index: i64,
         height: i64,
         width: i64,
     ) -> Result<()> {
@@ -518,7 +521,7 @@ impl LatentPool {
             return Err(Error::Invalid("latent import cannot be adopted".into()));
         }
         self.validate_metadata(&TrajectoryVersion {
-            step,
+            step_index,
             generation,
             units: write.units as i64,
             height,
@@ -538,13 +541,13 @@ impl LatentPool {
         &mut self,
         write: &LatentImport,
         generation: i64,
-        step: i64,
+        step_index: i64,
         height: i64,
         width: i64,
     ) {
         let current = &mut self.slots[write.request_pool_idx];
         current.bank = 0;
-        current.step = step;
+        current.step_index = step_index;
         current.generation = generation;
         current.units = write.units;
         current.height = height;
@@ -608,21 +611,25 @@ impl LatentPool {
                 units,
             )?;
 
-            let trajectory = |step, generation| TrajectoryVersion {
-                step,
+            let trajectory = |step_index, generation| TrajectoryVersion {
+                step_index,
                 generation,
                 units,
                 height,
                 width,
             };
             if update.release {
-                self.current_bank(slot, &trajectory(update.step, update.generation), &pages)?;
+                self.current_bank(
+                    slot,
+                    &trajectory(update.step_index, update.generation),
+                    &pages,
+                )?;
                 continue;
             }
 
-            self.validate_metadata(&trajectory(update.step, update.generation))?;
+            self.validate_metadata(&trajectory(update.step_index, update.generation))?;
             if update.expected_generation == 0 {
-                if update.expected_step != 0 || update.step != 0 {
+                if update.expected_step_index != 0 || update.step_index != 0 {
                     return Err(Error::Invalid(
                         "latent initialization must publish step zero".into(),
                     ));
@@ -634,10 +641,10 @@ impl LatentPool {
             } else {
                 self.current_bank(
                     slot,
-                    &trajectory(update.expected_step, update.expected_generation),
+                    &trajectory(update.expected_step_index, update.expected_generation),
                     &pages,
                 )?;
-                if update.step <= update.expected_step {
+                if update.step_index <= update.expected_step_index {
                     return Err(Error::Invalid(
                         "latent successor does not advance its step".into(),
                     ));
@@ -686,7 +693,7 @@ impl LatentPool {
             }
             current.bank = 1 - current.bank;
             current.generation = update.generation;
-            current.step = update.step;
+            current.step_index = update.step_index;
             current.units = params.latent_units as usize;
             current.height = i64::from(params.height);
             current.width = i64::from(params.width);
@@ -761,13 +768,13 @@ impl LatentPool {
 
     fn validate_metadata(&self, trajectory: &TrajectoryVersion) -> Result<()> {
         let TrajectoryVersion {
-            step,
+            step_index,
             generation,
             units,
             height,
             width,
         } = *trajectory;
-        if generation < 1 || step < 0 || units < 1 || height < 1 || width < 1 {
+        if generation < 1 || step_index < 0 || units < 1 || height < 1 || width < 1 {
             return Err(Error::Invalid(
                 "latent trajectory metadata is invalid".into(),
             ));
@@ -882,14 +889,14 @@ mod tests {
 
     /// The first commit of a seven-unit and of a four-unit trajectory.
     const SEVEN_UNITS: TrajectoryVersion = TrajectoryVersion {
-        step: 0,
+        step_index: 0,
         generation: 1,
         units: 7,
         height: 16,
         width: 112,
     };
     const FOUR_UNITS: TrajectoryVersion = TrajectoryVersion {
-        step: 0,
+        step_index: 0,
         generation: 1,
         units: 4,
         height: 16,
@@ -923,9 +930,9 @@ mod tests {
                 width: units * 16,
             },
             expected_generation: 0,
-            expected_step: 0,
+            expected_step_index: 0,
             generation: 1,
-            step: 0,
+            step_index: 0,
             release: false,
         }
     }
@@ -977,7 +984,7 @@ mod tests {
         pool.require_writable(1 - bank, &[1])?;
         update.expected_generation = 1;
         update.generation = 2;
-        update.step = 1;
+        update.step_index = 1;
         pool.validate_updates(std::slice::from_ref(&update))?;
         pool.apply_updates(&[update]);
 
@@ -1016,7 +1023,7 @@ mod tests {
         assert!(pool.supersede(1, request, &[1]).is_empty());
         update.expected_generation = 1;
         update.generation = 2;
-        update.step = 1;
+        update.step_index = 1;
         pool.validate_updates(std::slice::from_ref(&update))?;
         pool.apply_updates(&[update]);
 

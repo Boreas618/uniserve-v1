@@ -149,8 +149,10 @@ pub struct RequestOutput {
     pub cache_visible_len: u32,
     /// Cache extent initialized by execution, including rejected speculative positions.
     pub cache_computed_len: u32,
-    /// Completed denoising steps, independent of latent tensor dimensions.
-    pub num_completed_steps: u32,
+    /// Solver steps the call's trajectory has completed, which is also the
+    /// index of its next step (diffusers' `step_index`): the step a
+    /// denoising call's update publishes.
+    pub step_index: u32,
     /// Token identifiers accepted by the sampler.
     pub committed_tokens: Vec<u32>,
     /// Natural-log probability of the final accepted token, when requested.

@@ -259,7 +259,7 @@ fn merge_completion_record(
             && canonical.output.status == rank_completion.output.status
             && canonical.output.cache_visible_len == rank_completion.output.cache_visible_len
             && canonical.output.cache_computed_len == rank_completion.output.cache_computed_len
-            && canonical.output.num_completed_steps == rank_completion.output.num_completed_steps
+            && canonical.output.step_index == rank_completion.output.step_index
             && canonical.output.finish_flags == rank_completion.output.finish_flags,
         "completion result fields diverged"
     );

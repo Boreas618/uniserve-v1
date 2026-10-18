@@ -393,9 +393,10 @@ struct SimRequestState {
     cache_visible_len: u32,
     /// Index of the next synthetic text token, as `synth_logits` takes it.
     emitted: usize,
-    /// Denoising steps completed. Image decoding resets it to zero, as it
-    /// does on a worker rank.
-    flow_step: u16,
+    /// The step index of the request's trajectory: the solver steps it has
+    /// completed. Image decoding resets it to zero, as it does on a worker
+    /// rank.
+    step_index: u16,
     /// Boolean values of the request's resolved products that later calls
     /// may name as predicates: a token output's continuation value, a
     /// transition output's value (whether a sampled token is a transition
@@ -437,7 +438,7 @@ impl SimRequestState {
             positions_from_model: false,
             cache_visible_len: prefix_len,
             emitted: 0,
-            flow_step: 0,
+            step_index: 0,
             predicate_values: HashMap::new(),
             penalty_counts: BTreeMap::new(),
             state_call_id: uniserve_ipc::CallId::new(0, 0),
@@ -901,7 +902,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             cache_visible_len: 0,
             cache_computed_len: 0,
-            num_completed_steps: 0,
+            step_index: 0,
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),
@@ -1118,15 +1119,15 @@ impl SimEngine {
             CallKind::Media(MediaCall::LatentPreparation) => {}
             CallKind::Media(MediaCall::Denoising) => {
                 // A denoising call runs one step.
-                request.flow_step = request.flow_step.saturating_add(1);
+                request.step_index = request.step_index.saturating_add(1);
                 let total = request
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                record.num_completed_steps = u32::from(request.flow_step);
+                record.step_index = u32::from(request.step_index);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
-                record.finish_flags.length = request.flow_step >= total;
+                record.finish_flags.length = request.step_index >= total;
             }
             CallKind::Media(
                 MediaCall::VideoDecoding
@@ -1151,7 +1152,7 @@ impl SimEngine {
             CallKind::Media(MediaCall::ImageDecoding) => {
                 // A worker rank's image decoding releases the request's
                 // latent and resets its denoising step to zero.
-                request.flow_step = 0;
+                request.step_index = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
                         (image.height, image.width)
@@ -1196,7 +1197,7 @@ impl SimEngine {
             timing_counters: TimingCounters::default(),
             cache_visible_len: request.cache_visible_len,
             cache_computed_len: request.cache_visible_len,
-            num_completed_steps: u32::from(request.flow_step),
+            step_index: u32::from(request.step_index),
             committed_tokens: Vec::new(),
             candidate_logprobs: Vec::new(),
             finish_flags: FinishFlags::default(),

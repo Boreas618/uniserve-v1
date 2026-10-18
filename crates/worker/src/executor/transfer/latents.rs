@@ -4,7 +4,7 @@
 //! slot's latent pool. Exporting a version publishes those pages, as the
 //! logical tensor `[latent_units, width]`, through the rank's export
 //! mechanisms (`TransferHandle::Latent`, carrying the version's image size
-//! and step); the pool keeps the bank from being overwritten until every
+//! and step index); the pool keeps the bank from being overwritten until every
 //! location retired. A version stays published until it is freed, or
 //! until its trajectory's denoising writes over its bank two steps later,
 //! which revokes it; the write then waits only for the reads already
@@ -66,7 +66,7 @@ impl PendingExport {
 }
 
 /// Issue the export of the version of `slot`'s trajectory in `bank` (at
-/// solver `step`, with `params`' pages and image size) as `call`'s output
+/// `step_index`, with `params`' pages and image size) as `call`'s output
 /// `product` to `stream`, behind the work that wrote it. The export is
 /// registered with the pool at once, and its batch releases it from the
 /// pool if it fails before committing. [`locate_export`] publishes it once
@@ -84,7 +84,7 @@ pub(crate) fn issue_export(
     slot: usize,
     params: &LatentParams,
     bank: u8,
-    step: u32,
+    step_index: u32,
     stream: impl Issue,
 ) -> Result<PendingExport> {
     let shape = shape(storage, params);
@@ -139,7 +139,7 @@ pub(crate) fn issue_export(
             height: params.height,
             width: params.width,
             latent_units: params.latent_units,
-            step,
+            step_index,
             tensor: TensorTransfer {
                 shape: shape.to_vec(),
                 locations: Vec::new(),
@@ -190,7 +190,7 @@ pub(crate) fn locate_export(
 pub(crate) struct LatentInput {
     write: Arc<LatentImport>,
     reads: Vec<Arc<Read>>,
-    step: u32,
+    step_index: u32,
     height: u32,
     width: u32,
 }
@@ -226,7 +226,7 @@ pub(crate) fn import(
         height,
         width,
         latent_units,
-        step,
+        step_index,
         tensor,
     } = &export.value
     else {
@@ -273,7 +273,7 @@ pub(crate) fn import(
         Ok(reads) => Ok(LatentInput {
             write,
             reads,
-            step: *step,
+            step_index: *step_index,
             height: *height,
             width: *width,
         }),
@@ -290,16 +290,16 @@ pub(crate) fn import(
 /// order `stream` after every read's copy, then adopt it.
 pub(crate) fn adopt(pool: &mut LatentPool, input: &LatentInput, stream: impl Issue) -> Result<()> {
     let generation = i64::from(input.write.buffer.generation);
-    let (step, height, width) = (
-        i64::from(input.step),
+    let (step_index, height, width) = (
+        i64::from(input.step_index),
         i64::from(input.height),
         i64::from(input.width),
     );
-    pool.validate_adoption(&input.write, generation, step, height, width)?;
+    pool.validate_adoption(&input.write, generation, step_index, height, width)?;
     for read in &input.reads {
         read.result(stream)?;
     }
-    pool.adopt_import(&input.write, generation, step, height, width);
+    pool.adopt_import(&input.write, generation, step_index, height, width);
     Ok(())
 }
 
@@ -425,9 +425,9 @@ mod tests {
             request_pool_idx: SLOT as i64,
             params: params(pages),
             expected_generation: 0,
-            expected_step: 0,
+            expected_step_index: 0,
             generation: 1,
-            step: 0,
+            step_index: 0,
             release: false,
         };
         pool.validate_updates(std::slice::from_ref(&update))?;
@@ -435,7 +435,7 @@ mod tests {
         let bank = pool.current_bank(
             SLOT,
             &TrajectoryVersion {
-                step: 0,
+                step_index: 0,
                 generation: 1,
                 units: 3,
                 height: 16,
@@ -532,7 +532,7 @@ mod tests {
         adopt(&mut target, &input, None)?;
         assert!(input.adopted());
         let adopted = TrajectoryVersion {
-            step: 0,
+            step_index: 0,
             generation: 2,
             units: 3,
             height: 16,

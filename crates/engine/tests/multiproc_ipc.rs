@@ -4500,7 +4500,7 @@ fn media_rank() -> anyhow::Result<()> {
                             timing_counters: Default::default(),
                             cache_visible_len: call.coordinates.cache_visible_len + length,
                             cache_computed_len: call.coordinates.cache_computed_len + length,
-                            num_completed_steps: 0,
+                            step_index: 0,
                             committed_tokens: vec![1000],
                             sampled_logprob: None,
                             top_logprobs: Vec::new(),

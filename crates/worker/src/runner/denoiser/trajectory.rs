@@ -230,15 +230,15 @@ pub(crate) fn denoise(
         .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
     // Each call advances the slot's committed trajectory, the latent pool's
     // ledger, by the next step of the checkpoint's fixed schedule.
-    let step = denoiser.runner.committed_step(slot)?;
-    if step >= i64::from(num_steps) {
+    let step_index = denoiser.runner.step_index(slot)?;
+    if step_index >= i64::from(num_steps) {
         return Err(Error::Invalid(
             "denoising continues past the fixed schedule".into(),
         ));
     }
     // Only the call that completes denoising declares products: the final
     // samples its step publishes.
-    if !call.outputs.is_empty() && step + 1 != i64::from(num_steps) {
+    if !call.outputs.is_empty() && step_index + 1 != i64::from(num_steps) {
         return Err(Error::Invalid(
             "final latent products require completed denoising".into(),
         ));
