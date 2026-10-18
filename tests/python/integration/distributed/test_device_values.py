@@ -76,7 +76,7 @@ def test_cache_updates_follow_backing_and_preserve_existing_values_on_another_de
         state.write((0,), start=0, key=first, value=-first)
         current = torch.full((3, 1, 16), 896.0, device="cuda:1")
         indices = torch.tensor([1, 4, -1], device="cuda:1")
-        state.update(current, -current, indices=indices)
+        state.update(current, -current, slot_mapping=indices)
         expected = torch.zeros(12, 1, 16)
         expected[0] = 448
         expected[[1, 4]] = 896

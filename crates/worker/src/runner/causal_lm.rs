@@ -37,7 +37,7 @@
 //! row's last position. A prefill bucket adds one sequence holding every
 //! padding token, then empty sequences.
 //!
-//! Padding rows never write K/V (their write addresses are -1).
+//! Padding rows never write K/V (their slot mapping is -1).
 //!
 //! A rank's runners and the request state they share are
 //! [`CausalLMRunners`] ([`runners`]): a batch of token calls reserves its

@@ -14,7 +14,7 @@
 //! | each token's row | `T` |
 //!
 //! The Python half's [`AttentionMetadata`](`uniserve.runner.attention`)
-//! derives the device block tables, lengths, offsets and write indices from
+//! derives the device block tables, lengths, offsets and slot mapping from
 //! it and the slots' installed tables in one launch
 //! (`uniserve.nn.attention.gather`), and owns those device tensors.
 

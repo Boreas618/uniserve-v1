@@ -24,10 +24,10 @@ def _reject_invalid_index(rank, index):
     state = cache.state("attention")
     key = torch.ones(1, 1, 16, device="cuda")
     indices = torch.tensor([0], device="cuda")
-    state.update(key, key, indices=indices)
+    state.update(key, key, slot_mapping=indices)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        state.update(key, key, indices=indices)
+        state.update(key, key, slot_mapping=indices)
     indices.fill_(index)
     graph.replay()
     with pytest.raises(RuntimeError, match="device-side assert"):
@@ -90,11 +90,11 @@ def test_state_updates_replay_addresses_and_first_write_scales(quantized):
     )
     value = -key.clone()
     indices = torch.tensor([0, 1, -1], device="cuda")
-    state.update(key, value, indices=indices)
+    state.update(key, value, slot_mapping=indices)
     cache.zero_units((0, 1, 2))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        state.update(key, value, indices=indices)
+        state.update(key, value, slot_mapping=indices)
     for slots in ((4, 5, -1), (-1, 8, 0)):
         cache.zero_units((0, 1, 2))
         indices.copy_(torch.tensor(slots, device="cuda"))

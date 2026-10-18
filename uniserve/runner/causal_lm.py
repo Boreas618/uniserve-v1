@@ -381,7 +381,7 @@ class CausalLMRunner:
             query_lengths=self._attention_metadata.query_lengths[:rows],
             query_offsets=self._attention_metadata.query_offsets[: rows + 1],
             prefix_offsets=self._attention_metadata.prefix_offsets[: rows + 1],
-            write_indices=self._attention_metadata.write_indices[:, :rows],
+            slot_mapping=self._attention_metadata.slot_mapping[:, :rows],
             columns=int(max(widths)),
         )
         return self._attention_metadata.batch(

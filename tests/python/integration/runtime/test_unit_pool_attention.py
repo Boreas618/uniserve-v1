@@ -240,9 +240,9 @@ def _call(state, rows, *, kind, window, units, generator, padding):
         device="cuda",
         start_pages=None if window is None else starts,
     )
-    writes = paged.write_indices.clone()
+    writes = paged.slot_mapping.clone()
     writes[live:] = -1
-    return replace(paged, write_indices=writes), live
+    return replace(paged, slot_mapping=writes), live
 
 
 def _widen(batch, width):
@@ -275,7 +275,7 @@ def _projections(tokens, layer, generator):
 def _reference(reference, q, k, v, batch, out):
     """Evaluate ``batch`` portably over the cache the native call wrote."""
     if isinstance(batch, PagedInput):
-        batch = replace(batch, write_indices=None)
+        batch = replace(batch, slot_mapping=None)
     return reference(q, k, v, batch, scale=1.0, out=out)
 
 
@@ -436,8 +436,8 @@ def _assign(target, source):
     ]
     if table.start_page is not None:
         pairs.append((table.start_page, values.start_page))
-    if getattr(target, "write_indices", None) is not None:
-        pairs.append((target.write_indices, source.write_indices))
+    if getattr(target, "slot_mapping", None) is not None:
+        pairs.append((target.slot_mapping, source.slot_mapping))
     for destination, value in pairs:
         destination.copy_(value)
 

@@ -275,7 +275,7 @@ class _Session:
                     entries[0].queries,
                     entries[0].prefixes,
                     entry.block_table,
-                    entry.write_indices,
+                    entry.slot_mapping,
                     entry.causal,
                 )
             entries[number] = entry
