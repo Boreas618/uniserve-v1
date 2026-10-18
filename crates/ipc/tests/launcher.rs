@@ -39,7 +39,6 @@ fn every_instruction_round_trips_through_a_frame() {
 #[test]
 fn every_report_round_trips_through_a_frame() {
     let reservation = Report::Reservation(Reservation {
-        worker_id: "model".into(),
         port: 4100,
         listen_fd: 7,
     });
