@@ -10,7 +10,6 @@
 //! | condition | status |
 //! | --- | --- |
 //! | argument or descriptor error | 2, after a usage line |
-//! | debug build of the library | 1 |
 //! | the head cannot be reached or refuses the registration | 1 |
 //! | SIGINT before serving | 130 |
 //! | SIGTERM before serving | signal death |
@@ -61,10 +60,6 @@ pub(crate) fn main(argv: &[String], import: tvm_ffi::Function) -> i64 {
         Ok(arguments) => arguments,
         Err(error) => return usage(error),
     };
-    if cfg!(debug_assertions) {
-        tracing::error!("libuniserve_worker is a debug build; install a release build");
-        return 1;
-    }
     match run(&arguments, import, &signals) {
         Ok(()) => {
             tracing::info!("worker shut down");
