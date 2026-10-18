@@ -25,9 +25,6 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
-    /// Requested computation exceeds loaded model capacity.
-    #[error(transparent)]
-    Capacity(#[from] uniserve_core::GenerationResourceError),
     /// Multimodal request controls or geometry are invalid.
     #[error(transparent)]
     Omni(#[from] crate::serving::omni::OmniError),

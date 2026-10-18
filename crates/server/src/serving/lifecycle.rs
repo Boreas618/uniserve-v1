@@ -1,9 +1,8 @@
 //! Request lifecycle: the terminal-outcome latch of each registered request and
 //! the response stream that feeds every event to the request registry, a
-//! request's observable lifecycle state and statistics
-//! ([`RequestStatsSnapshot`]), the runtime's aggregate lifecycle counters
-//! ([`RuntimeMetricsSnapshot`]), and the precedence of external cancel and
-//! abort commands over engine output.
+//! request's lifecycle state as the registry tracks it, the runtime's
+//! aggregate lifecycle counters ([`RuntimeMetricsSnapshot`]), and the
+//! precedence of external cancel and abort commands over engine output.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,10 +15,7 @@ use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{
-    CacheAccounting, RequestOutput, RequestOutputStream, ResourceAccounting, Result,
-    RuntimeTimings, ServeError, ServeRequestId,
-};
+use super::{RequestOutput, RequestOutputStream, Result, ServeError, ServeRequestId};
 use crate::engine_client::requests::RequestRegistry;
 
 #[derive(Debug, Error)]
@@ -30,9 +26,9 @@ pub enum ServeControlError {
     Engine(#[from] crate::engine_client::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Observable lifecycle phase of one serving request.
-pub enum RequestLifecycleState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle phase of one serving request, as `RequestRegistry` tracks it.
+pub(crate) enum RequestLifecycleState {
     /// The public request is being validated and tokenized.
     Compiling,
     /// The tokenized request is being submitted to the engine.
@@ -57,66 +53,6 @@ pub enum RequestLifecycleState {
     Aborted,
     /// The request failed.
     Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Point-in-time lifecycle state, usage, and timing statistics for one request.
-///
-/// `RequestRegistry` maintains it from the public events it observes and retains it for a
-/// bounded number of completed requests.
-pub struct RequestStatsSnapshot {
-    /// Caller-visible request identifier.
-    pub request_id: ServeRequestId,
-    /// Model name used for the request.
-    pub served_name: String,
-    /// Stable model profile description.
-    pub description: String,
-    /// Latest observed lifecycle phase.
-    pub state: RequestLifecycleState,
-    /// Number of prompt tokens submitted to the engine.
-    pub prompt_tokens: u32,
-    /// Number of generated tokens included in user-visible output.
-    pub visible_output_tokens: u32,
-    /// Number of generated tokens consumed by internal protocol sections.
-    pub internal_tokens: u32,
-    /// Number of generated images.
-    pub image_count: u32,
-    /// Total image-generation steps completed.
-    pub image_steps: u32,
-    /// Cache policy and pin counts.
-    pub cache: CacheAccounting,
-    /// Prefix cache and media resources reserved for the request.
-    pub resources: ResourceAccounting,
-    /// Request phase durations.
-    pub timings: RuntimeTimings,
-}
-
-impl RequestStatsSnapshot {
-    /// Creates a zeroed snapshot for a request entering engine submission.
-    pub(crate) fn submitting(
-        request_id: ServeRequestId,
-        served_name: String,
-        description: String,
-        compile_us: u64,
-    ) -> Self {
-        Self {
-            request_id,
-            served_name,
-            description,
-            state: RequestLifecycleState::Submitting,
-            prompt_tokens: 0,
-            visible_output_tokens: 0,
-            internal_tokens: 0,
-            image_count: 0,
-            image_steps: 0,
-            cache: CacheAccounting::default(),
-            resources: ResourceAccounting::default(),
-            timings: RuntimeTimings {
-                compile_us,
-                ..RuntimeTimings::default()
-            },
-        }
-    }
 }
 
 /// Cumulative per-runtime lifecycle counters. They use relaxed ordering: each is read
