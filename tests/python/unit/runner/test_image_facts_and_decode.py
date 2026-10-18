@@ -36,8 +36,9 @@ def test_the_stub_reports_its_image_facts(loaded):
     ]
     # The stub places an end token only.
     assert EncoderRunner.injection_tokens(model) == [-1, 1007]
-    # Patch size, latent channels, downsample, framing and longest sequence.
-    assert DenoiserRunner.image_layout(model) == [16, 3, 16, 2, 1024]
+    # Patch size, latent channels, downsample, framing, longest sequence
+    # and the language positions a generated image spans.
+    assert DenoiserRunner.image_layout(model) == [16, 3, 16, 2, 1024, 2]
     assert DenoiserRunner.image_unconditional(model) == "start"
     assert DenoiserRunner.prediction_dtype(model) == "bfloat16"
     # The stub decodes RGB patches in [-1, 1].
