@@ -35,10 +35,6 @@ use uniserve_server::{
 
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
-/// Call batches kept in flight against a worker when neither the command
-/// line nor the deployment file sets its queue depth.
-const DEFAULT_QUEUE_DEPTH: usize = 2;
-
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
 #[command(
@@ -221,7 +217,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value = "ffprobe", value_name = "PATH")]
     pub ffprobe: std::path::PathBuf,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub max_total_tokens: Option<u64>,
     /// Recompute prompt prefixes instead of reusing or retaining cached KV pages.
     #[arg(long = "disable-prefix-cache")]
@@ -236,7 +232,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// name the ranks' attention registry (`uniserve.backends.attention`)
     /// gives it; `auto` selects a native kernel for each call. The ranks
     /// refuse a name the registry does not provide when they load.
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_ATTENTION_BACKEND)]
     pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = WorkerProcessArgs::default_python(), hide = true)]
@@ -323,7 +319,11 @@ pub(crate) struct SharedRuntimeArgs {
     /// is alive but stuck, and a rank reports a lane stalled after half of
     /// it. A batch that legitimately runs longer, such as the first
     /// evaluation of a layout prepared on arrival, needs a larger value.
-    #[arg(long = "watchdog-timeout", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        long = "watchdog-timeout",
+        default_value_t = WorkerProcessArgs::DEFAULT_WATCHDOG_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub watchdog_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
@@ -486,7 +486,9 @@ impl SharedRuntimeArgs {
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
         worker_process.base_model = self.base_model.clone();
-        let queue_depth = self.queue_depth.unwrap_or(DEFAULT_QUEUE_DEPTH);
+        let queue_depth = self
+            .queue_depth
+            .unwrap_or(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH);
         worker_process.queue_depth = queue_depth;
         worker_process.watchdog_timeout = Duration::from_secs(self.watchdog_timeout);
         worker_process.max_message_bytes = self.max_message_bytes;
@@ -587,10 +589,18 @@ impl SharedRuntimeArgs {
 #[educe(Debug)]
 pub(crate) struct WorkerProcessOptions {
     /// Independent microbatches overlapping attention and disaggregated experts.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_EXPERT_MICROBATCHES,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub expert_microbatches: u32,
     /// Checkpoint loader format used by every model worker.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
+    #[arg(
+        long,
+        default_value = WorkerProcessArgs::DEFAULT_LOAD_FORMAT,
+        value_parser = ["auto", "safetensors", "pt", "dummy", "layered"]
+    )]
     pub load_format: String,
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
@@ -598,10 +608,7 @@ pub(crate) struct WorkerProcessOptions {
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
-    /// JSON map of checkpoint-relative paths to SHA-256 checksums.
-    #[arg(long)]
-    pub checksum_manifest: Option<std::path::PathBuf>,
-    #[arg(long = "dtype", default_value = "bfloat16")]
+    #[arg(long = "dtype", default_value_t = WorkerProcessArgs::DEFAULT_MODEL_DTYPE)]
     pub model_dtype: ModelDtype,
     /// JSON quantization policy, for example {"mode":"balanced"}.
     /// An empty object selects the model-owned default.
@@ -617,10 +624,15 @@ pub(crate) struct WorkerProcessOptions {
     /// Each worker rank's share of its device's total memory for static
     /// allocations, weights and KV cache, in (0, 1]. A deployment file's
     /// `mem_fraction_static` overrides it for one worker.
-    #[arg(long, default_value = "0.70", value_parser = parse_mem_fraction_static)]
+    #[arg(
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_MEM_FRACTION_STATIC,
+        value_parser = parse_mem_fraction_static
+    )]
     pub mem_fraction_static: f64,
-    /// Parallelism mesh forwarded to the worker, e.g.
-    /// `tower=text:cuda:0;gen:cuda:1`.
+    /// Parallelism mesh forwarded to the worker: `tower=gen:<device>` places
+    /// the generation tower's modules on a device other than the rank's,
+    /// e.g. `tower=gen:cuda:1`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
     #[arg(long, hide = true)]
@@ -631,20 +643,34 @@ pub(crate) struct WorkerProcessOptions {
     /// GPU computation capture policy. Auto captures graphs unless serving does not capture the
     /// attention provider's calls, and then runs eagerly; full rejects that provider; off disables
     /// all graphs.
-    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
+    #[arg(
+        long,
+        default_value = WorkerProcessArgs::DEFAULT_GRAPH_POLICY,
+        value_parser = ["off", "auto", "full"]
+    )]
     pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
     /// Replay a startup-captured CUDA graph for every prefill call
     /// (default). `false` runs prefill eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        default_value_t = WorkerProcessArgs::DEFAULT_PREFILL_CUDA_GRAPH,
+        hide = true
+    )]
     pub prefill_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub prefill_graph_token_sizes: Option<String>,
     /// Capture image denoising calls at the configured flow shapes and
     /// replay those whose exact input signature was captured (default).
     /// `false` runs image denoising eagerly, for debugging only.
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        default_value_t = WorkerProcessArgs::DEFAULT_FLOW_CUDA_GRAPH,
+        hide = true
+    )]
     pub flow_cuda_graph: bool,
     #[arg(long, hide = true)]
     pub flow_graph_batch_sizes: Option<String>,
@@ -662,19 +688,32 @@ pub(crate) struct WorkerProcessOptions {
     /// `ffmpeg` executable the media reader decodes reference videos with.
     /// The reference conditioning decodes with FFmpeg 8.1.2, whose LANCZOS
     /// scaler a reference video's pixels depend on.
-    #[arg(long, default_value = "ffmpeg", value_name = "PATH")]
+    #[arg(long, default_value = WorkerProcessArgs::DEFAULT_FFMPEG, value_name = "PATH")]
     pub ffmpeg: std::path::PathBuf,
-    #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
+    #[arg(
+        long,
+        default_value_t = WorkerProcessArgs::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
+        value_parser = clap::value_parser!(u64).range(1..),
+        hide = true
+    )]
     pub flashinfer_workspace_size: u64,
     #[arg(long, hide = true)]
     pub flashinfer_use_tensor_core: Option<String>,
-    #[arg(long, default_value = "fa2", hide = true)]
+    #[arg(
+        long,
+        default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_DECODE_BACKEND.as_str(),
+        hide = true
+    )]
     pub flashinfer_decode_backend: FlashInferBackend,
-    #[arg(long, default_value = "auto", hide = true)]
+    #[arg(
+        long,
+        default_value = WorkerProcessArgs::DEFAULT_FLASHINFER_PREFILL_BACKEND.as_str(),
+        hide = true
+    )]
     pub flashinfer_prefill_backend: FlashInferBackend,
-    #[arg(long, hide = true)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), hide = true)]
     pub flashinfer_decode_split_tile_size: Option<u32>,
-    #[arg(long, hide = true)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), hide = true)]
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     #[arg(long, hide = true)]
     pub flashinfer_disable_split_kv: bool,
@@ -688,7 +727,6 @@ impl WorkerProcessOptions {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
             load_threads: self.load_threads,
-            checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype,
             quantization_config: self.quantization_config.clone(),
             prefix_cache_dtype: self.prefix_cache_dtype,
@@ -764,6 +802,22 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The command line owns the range of every launch capacity it takes, so
+    /// a zero reaches no rank.
+    #[test]
+    fn serve_rejects_zero_launch_capacities() {
+        for option in [
+            "--max-total-tokens",
+            "--flashinfer-workspace-size",
+            "--flashinfer-decode-split-tile-size",
+            "--flashinfer-prefill-split-tile-size",
+        ] {
+            let result =
+                <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model", option, "0"]);
+            assert!(result.is_err(), "{option} 0 must be refused");
+        }
+    }
+
     #[test]
     fn serve_rejects_zero_checkpoint_readers() {
         let result = <Cli as clap::Parser>::try_parse_from([
@@ -819,14 +873,12 @@ mod tests {
             "/models/cache",
             "--load-threads",
             "4",
-            "--checksum-manifest",
-            "/models/checksums.json",
             "--graph-policy",
             "off",
             "--prefill-cuda-graph",
             "true",
             "--worker-mesh",
-            "tower=text:cpu",
+            "tower=gen:cuda:1",
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",

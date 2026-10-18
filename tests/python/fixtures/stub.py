@@ -30,7 +30,6 @@ def read_config(**overrides):
         "io_mode": "eager",
         "download_dir": None,
         "num_threads": None,
-        "checksum_manifest": None,
         "device": "cpu",
         "generation_device": None,
         "components": json.dumps({"model": LOCAL}),

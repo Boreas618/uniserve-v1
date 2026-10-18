@@ -96,14 +96,50 @@ impl WorkerProcessArgs {
     }
 }
 
+impl WorkerProcessArgs {
+    /// Call batches kept in flight against a rank unless a launch sets its
+    /// queue depth.
+    pub const DEFAULT_QUEUE_DEPTH: usize = 2;
+    /// How long a submitted batch may go without rank progress before the
+    /// group is replaced (`--watchdog-timeout`), as SGLang's default.
+    pub const DEFAULT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    /// Checkpoint loader format that detects the files' own format.
+    pub const DEFAULT_LOAD_FORMAT: &'static str = "auto";
+    /// Share of device memory a rank may hold for weights and KV cache.
+    pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
+    /// Attention provider name: a native kernel chosen per call.
+    pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
+    /// CUDA graph policy that captures what serving captures.
+    pub const DEFAULT_GRAPH_POLICY: &'static str = "auto";
+    /// FlashInfer workspace capacity in bytes.
+    pub const DEFAULT_FLASHINFER_WORKSPACE_SIZE: u64 = 512 * 1024 * 1024;
+    /// FlashInfer backend of decode attention.
+    pub const DEFAULT_FLASHINFER_DECODE_BACKEND: FlashInferBackend = FlashInferBackend::Fa2;
+    /// FlashInfer backend of prefill attention.
+    pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
+    /// The `ffmpeg` executable a media reader decodes reference videos with.
+    pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
+    /// Independent microbatches of attention and remote experts.
+    pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
+    /// Numeric data type of model parameters and activations.
+    pub const DEFAULT_MODEL_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
+    /// Whether every prefill call replays a CUDA graph.
+    pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
+    /// Whether image denoising calls replay CUDA graphs.
+    pub const DEFAULT_FLOW_CUDA_GRAPH: bool = true;
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
+    ///
+    /// The tuning values are the `DEFAULT_*` constants of this type, which
+    /// the `uniserve` command line also takes as its option defaults.
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
             python: Self::default_python(),
             launcher_timeout: std::time::Duration::from_secs(120),
-            watchdog_timeout: std::time::Duration::from_secs(300),
+            watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
             base_model: None,
             ranks: vec![crate::WorkerRank {
@@ -117,7 +153,7 @@ impl Default for WorkerProcessArgs {
             role: crate::WorkerRole::Model,
             peers: Default::default(),
             stub: false,
-            queue_depth: 2,
+            queue_depth: Self::DEFAULT_QUEUE_DEPTH,
             max_message_bytes: 8 << 20,
             max_total_tokens: None,
             block_size: None,
@@ -128,34 +164,33 @@ impl Default for WorkerProcessArgs {
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
                 as u32,
-            attention_backend: "auto".into(),
+            attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
             transfer: Default::default(),
-            load_format: "auto".to_string(),
+            load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
             download_dir: None,
             load_threads: None,
-            checksum_manifest: None,
-            model_dtype: uniserve_core::ModelDtype::BFloat16,
+            model_dtype: Self::DEFAULT_MODEL_DTYPE,
             quantization_config: serde_json::json!({}),
             prefix_cache_dtype: None,
-            mem_fraction_static: 0.70,
+            mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
-            graph_policy: "auto".into(),
+            graph_policy: Self::DEFAULT_GRAPH_POLICY.into(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: true,
+            prefill_cuda_graph: Self::DEFAULT_PREFILL_CUDA_GRAPH,
             prefill_outputs: true,
             prefill_graph_token_sizes: None,
-            flow_cuda_graph: true,
+            flow_cuda_graph: Self::DEFAULT_FLOW_CUDA_GRAPH,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
             video_canvases: Vec::new(),
             canvas_sampling: None,
-            flashinfer_workspace_size: 512 * 1024 * 1024,
+            flashinfer_workspace_size: Self::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
             flashinfer_use_tensor_core: None,
-            flashinfer_decode_backend: FlashInferBackend::Fa2,
-            flashinfer_prefill_backend: FlashInferBackend::Auto,
+            flashinfer_decode_backend: Self::DEFAULT_FLASHINFER_DECODE_BACKEND,
+            flashinfer_prefill_backend: Self::DEFAULT_FLASHINFER_PREFILL_BACKEND,
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
@@ -163,10 +198,10 @@ impl Default for WorkerProcessArgs {
             max_video_seconds: 15.0,
             max_condition_rows: 0,
             encoder_cache_entries: 256,
-            ffmpeg: "ffmpeg".into(),
+            ffmpeg: Self::DEFAULT_FFMPEG.into(),
             min_video_seconds: None,
             expert_parallel: None,
-            expert_microbatches: 1,
+            expert_microbatches: Self::DEFAULT_EXPERT_MICROBATCHES,
         }
     }
 }
@@ -201,10 +236,10 @@ impl WorkerProcessArgs {
 
     /// Builds the typed launch descriptor the worker process consumes.
     ///
-    /// Every tuning value is stated explicitly, so the launching side is the
-    /// single source of defaults and the worker never re-derives one. The
-    /// head answers the rank's registration with it; only the head's address
-    /// and the rank's identity travel on argv.
+    /// Every launch value is stated explicitly, so the launching side is the
+    /// single source of defaults and the rank never re-derives one. The head
+    /// answers the rank's registration with it; only the head's address and
+    /// the rank's identity travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
     /// does not fit `u32` or the role does not serialize.
@@ -305,7 +340,6 @@ impl WorkerProcessArgs {
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.as_deref().map(path),
             load_threads: self.load_threads,
-            checksum_manifest: self.checksum_manifest.as_deref().map(path),
             model_dtype: self.model_dtype.as_str().to_owned(),
             quantization_config: self.quantization_config.clone(),
             prefix_cache_dtype: self

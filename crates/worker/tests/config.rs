@@ -40,7 +40,6 @@ fn defaults() -> Value {
         "load_format": "auto",
         "download_dir": null,
         "load_threads": null,
-        "checksum_manifest": null,
         "model_dtype": "bfloat16",
         "quantization_config": {},
         "prefix_cache_dtype": null,
@@ -101,51 +100,31 @@ fn two_rank_model() -> Value {
 
 #[test]
 fn the_tower_placement_resolves_the_generation_device() {
-    for mesh in ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"] {
-        let launch = resolved(json!({"device": "cuda:0", "mesh": mesh})).unwrap();
-        assert_eq!(launch.execution.device, Device::Cuda(DeviceId(0)));
-        assert_eq!(
-            launch.execution.generation_device,
-            Some(Device::Cuda(DeviceId(1)))
-        );
-        assert_eq!(launch.device(), Device::Cuda(DeviceId(0)));
-    }
-    for mesh in ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"] {
-        assert!(
-            resolved(json!({"device": "cuda:0", "mesh": mesh})).is_err(),
-            "{mesh}"
-        );
+    let launch = resolved(json!({"device": "cuda:0", "mesh": "tower=gen:cuda:1"})).unwrap();
+    assert_eq!(launch.execution.device, Device::Cuda(DeviceId(0)));
+    assert_eq!(
+        launch.execution.generation_device,
+        Some(Device::Cuda(DeviceId(1)))
+    );
+    assert_eq!(launch.device(), Device::Cuda(DeviceId(0)));
+
+    // The text tower runs on the rank's device, which the declaration does
+    // not restate, and the generation tower on another one.
+    for (mesh, message) in [
+        ("tower=text:cuda:0;gen:cuda:1", "tower=gen:<device>"),
+        ("tower=gen:cuda", "other than the rank's"),
+        ("tower=gen:bogus", "--worker-mesh tower gen"),
+    ] {
+        let error = launch_error(json!({"device": "cuda:0", "mesh": mesh}));
+        assert!(error.contains(message), "{mesh}: {error}");
     }
 }
 
 #[test]
 fn a_malformed_device_names_its_option() {
-    for (device, mesh, option) in [
-        ("gpu0", Value::Null, "--device"),
-        ("cuda:x", Value::Null, "--device"),
-        (
-            "cuda:0",
-            json!("tower=text:cpu:x;gen:cuda:1"),
-            "--mesh tower text",
-        ),
-        ("cuda:0", json!("tower=gen:bogus"), "--mesh tower gen"),
-    ] {
-        let error = resolved(json!({"device": device, "mesh": mesh})).unwrap_err();
-        assert!(error.contains(option), "{error}");
-    }
-}
-
-#[test]
-fn the_mem_fraction_static_lies_in_the_unit_interval() {
-    assert_eq!(
-        resolved(json!({"mem_fraction_static": 1.0}))
-            .unwrap()
-            .execution
-            .mem_fraction_static,
-        1.0
-    );
-    for fraction in [0.0, -0.5, 1.5] {
-        assert!(resolved(json!({"mem_fraction_static": fraction})).is_err());
+    for device in ["gpu0", "cuda:x"] {
+        let error = launch_error(json!({"device": device}));
+        assert!(error.contains("--device"), "{error}");
     }
 }
 
@@ -155,33 +134,28 @@ fn engine_capacities_and_precision_reach_the_worker() {
         "max_batch_calls": 128,
         "max_batch_tokens": 16384,
         "max_request_pool_size": 257,
+        "max_model_len": 32768,
+        "max_total_tokens": 65536,
+        "mem_fraction_static": 0.5,
+        "prefix_cache_dtype": "float16",
         "quantization_config": {"mode": "performance", "components": {"text_encoder": "bf16"}},
     }))
     .unwrap();
     assert_eq!(launch.execution.max_batch_calls, 128);
     assert_eq!(launch.execution.max_batch_tokens, 16384);
     assert_eq!(launch.execution.max_request_pool_size, 257);
+    assert_eq!(launch.execution.max_model_len, 32768);
+    assert_eq!(launch.execution.max_total_tokens, Some(65536));
+    assert_eq!(launch.execution.mem_fraction_static, 0.5);
+    assert_eq!(
+        launch.execution.prefix_cache_dtype.as_deref(),
+        Some("float16")
+    );
     let quantization: Value =
         serde_json::from_str(&launch.model.as_ref().unwrap().quantization).unwrap();
     assert_eq!(
         quantization,
         json!({"mode": "performance", "components": {"text_encoder": "bf16"}})
-    );
-}
-
-#[test]
-fn a_cache_dtype_selector_overrides_the_launch_dtype() {
-    let launch = resolved(json!({
-        "prefix_cache_dtype": "bfloat16",
-        "quantization_config": {"kv_cache_dtype": "float16"},
-    }))
-    .unwrap();
-    assert_eq!(
-        launch.execution.prefix_cache_dtype.as_deref(),
-        Some("float16")
-    );
-    assert!(
-        launch_error(json!({"quantization_config": {"kv_cache_dtype": 7}})).contains("KV dtype")
     );
 }
 
@@ -280,13 +254,6 @@ fn video_canvases_keep_the_order_the_deployment_names() {
             .video_canvases
             .is_empty()
     );
-
-    for canvases in [
-        json!([{"width": 1344, "height": 768}, {"width": 1344, "height": 768}]),
-        json!([{"width": 0, "height": 768}]),
-    ] {
-        assert!(resolved(json!({"video_canvases": canvases})).is_err());
-    }
 }
 
 #[test]
@@ -297,25 +264,12 @@ fn attention_options_are_checked() {
     .unwrap();
     assert_eq!(launch.attention.workspace_size, 64 << 20);
     assert_eq!(launch.attention.use_tensor_core, Some(true));
-    assert!(
-        launch_error(json!({"flashinfer_workspace_size": 0})).contains("FlashInfer workspace size")
-    );
-    assert!(resolved(json!({"flashinfer_workspace_size": -5})).is_err());
+    assert!(launch_error(json!({"flashinfer_use_tensor_core": "maybe"})).contains("bool"));
 }
 
+/// The group's first rank serves the rendezvous on the socket it inherits.
 #[test]
-fn the_rendezvous_socket_belongs_to_exactly_the_first_rank() {
-    for (rank, address, fd) in [
-        (0, json!("127.0.0.1:29500"), Value::Null),
-        (1, json!("127.0.0.1:29500"), json!(7)),
-        (0, Value::Null, json!(7)),
-    ] {
-        let error = launch_error(json!({
-            "rank": rank, "local_rank": rank, "world_size": 2, "components": two_rank_model(),
-            "rendezvous_address": address, "rendezvous_listen_fd": fd,
-        }));
-        assert!(error.contains("rendezvous socket"), "{error}");
-    }
+fn the_first_rank_inherits_its_rendezvous_socket() {
     let launch = resolved(json!({
         "rank": 0, "world_size": 2, "components": two_rank_model(),
         "rendezvous_address": "127.0.0.1:29500", "rendezvous_listen_fd": 7,
@@ -340,44 +294,6 @@ fn an_expert_parallel_replica_names_its_union_and_store() {
     assert_eq!(union.rendezvous.address, "10.0.0.2:29600");
     assert_eq!(union.rendezvous.listen_fd, Some(9));
     assert_eq!(launch.execution.expert_exchange, "megamoe");
-
-    for (union, message) in [
-        (
-            json!({"rank": 1, "size": 4, "address": "h:1", "listen_fd": 9, "exchange": "alltoall"}),
-            "rank 0",
-        ),
-        (
-            json!({"rank": 0, "size": 4, "address": "h:1", "listen_fd": null, "exchange": "alltoall"}),
-            "rank 0",
-        ),
-        (
-            json!({"rank": 0, "size": 1, "address": "h:1", "listen_fd": 9, "exchange": "alltoall"}),
-            "two",
-        ),
-        (
-            json!({"rank": 4, "size": 4, "address": "h:1", "listen_fd": null, "exchange": "alltoall"}),
-            "rank",
-        ),
-        (
-            json!({"rank": 0, "size": 4, "address": "h:1", "listen_fd": 9, "exchange": "ring"}),
-            "exchange",
-        ),
-    ] {
-        let mut union = union;
-        union
-            .as_object_mut()
-            .unwrap()
-            .insert("attention_ranks".into(), json!(0));
-        let error = launch_error(json!({"expert_parallel": union}));
-        assert!(error.contains(message), "{error}");
-    }
-    let error = launch_error(json!({
-        "world_size": 2, "components": two_rank_model(),
-        "rendezvous_address": "127.0.0.1:29500", "rendezvous_listen_fd": 7,
-        "expert_parallel": {"rank": 0, "size": 2, "attention_ranks": 0, "address": "h:1",
-            "listen_fd": 9, "exchange": "alltoall"},
-    }));
-    assert!(error.contains("only rank"), "{error}");
 }
 
 #[test]
@@ -404,31 +320,6 @@ fn disaggregated_ranks_keep_their_local_rank_and_role() {
         assert_eq!((union.rank, union.attention_ranks), (union_rank, 4));
         assert_eq!(launch.execution.expert_microbatches, 2);
         assert_eq!(launch.components.is_empty(), role == "experts");
-    }
-    for count in [json!(0), json!(true), json!(2)] {
-        assert!(resolved(json!({"expert_microbatches": count})).is_err());
-    }
-    for (role, union_rank, attention, exchange) in [
-        ("model", 3, 4, "deepep"),
-        ("model", 4, 4, "deepep"),
-        ("experts", 2, 4, "deepep"),
-        ("experts", 4, 4, "alltoall"),
-        ("experts", 4, 8, "deepep"),
-    ] {
-        let components = if role == "experts" {
-            json!({})
-        } else {
-            two_rank_model()
-        };
-        assert!(
-            resolved(json!({
-                "role": role, "rank": 0, "world_size": 2, "components": components,
-                "expert_parallel": {"rank": union_rank, "size": 8, "attention_ranks": attention,
-                    "address": "10.0.0.2:29600", "listen_fd": null, "exchange": exchange},
-            }))
-            .is_err(),
-            "{role} {union_rank} {attention} {exchange}"
-        );
     }
 }
 
@@ -458,7 +349,6 @@ fn the_encoder_cache_holds_the_launched_entry_count() {
 
 #[test]
 fn channel_and_transfer_values_are_checked() {
-    assert!(launch_error(json!({"queue_depth": 0})).contains("--queue-depth must be positive"));
     assert!(launch_error(json!({"transfer_backends": "local,local"})).contains("unique"));
     assert!(launch_error(json!({"export_backends": "posix_shm"})).contains("bound transports"));
     assert!(

@@ -1,8 +1,8 @@
 """A BF16 model serving from a KV cache of the other half precision.
 
 Qwen3 with BF16 weights serves once with a BF16 cache and once with an FP16
-cache (``--quantization-config '{"kv_cache_dtype": "float16"}'``), with CUDA
-graphs captured for prefill and decode. The FP16 deployment's attention reads
+cache (``--kv-cache-dtype float16``), with CUDA graphs captured for prefill and
+decode. The FP16 deployment's attention reads
 and writes its pages in FP16, so its greedy outputs differ from the BF16
 deployment's only by rounding. They are compared by the rule of vLLM's
 ``check_logprobs_close``: the two outputs of a prompt agree token for token
@@ -136,7 +136,7 @@ def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(tmp_path: Path):
         tmp_path,
         checkpoint,
         "float16-cache",
-        ["--quantization-config", json.dumps({"kv_cache_dtype": "float16"})],
+        ["--kv-cache-dtype", "float16"],
     )
 
     for prompt, expected, actual in zip(

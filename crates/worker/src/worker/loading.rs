@@ -62,7 +62,6 @@ impl Description {
                     .num_threads
                     .map(|threads| Any::from(i64::from(threads)))
                     .unwrap_or_default(),
-                optional(launch.load.checksum_manifest.as_deref()),
                 text(&execution.device.to_string()),
                 optional(generation.as_deref()),
                 text(&components),

@@ -3,12 +3,13 @@
 //! A rank is started with the head's address, its own identity and the launch
 //! it belongs to, and the head answers the rank's registration with one
 //! [`LaunchDescriptor`], which
-//! carries every other launch value. The rank's runtime validates and
-//! resolves the raw values once, before any model work, and reports a
-//! violation as a usage error.
+//! carries every other launch value. The rank's runtime resolves the raw
+//! values once, before any model work, and reports a value it cannot run
+//! with as a usage error.
 //!
-//! Every tuning value is stated explicitly: the launching side is the single
-//! source of defaults and the worker never re-derives one.
+//! Every launch value is stated explicitly: the launching side is the single
+//! source of defaults and validates the values it owns, and the rank never
+//! re-derives or re-checks one.
 //!
 //! Both launching sides, the head and a host's `uniserve-host` launcher, start
 //! a rank with [`rank_command`], hand it the sockets it serves with
@@ -432,7 +433,8 @@ pub struct LaunchDescriptor {
     pub expert_microbatches: u32,
     /// Torch process-group backend override.
     pub distributed_backend: Option<String>,
-    /// Tower placement, `tower=text:<device>;gen:<device>`.
+    /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
+    /// on a device other than the rank's.
     pub mesh: Option<String>,
     /// Execution lanes and their SM partitions.
     pub lane: Vec<LaneConfig>,
@@ -443,7 +445,6 @@ pub struct LaunchDescriptor {
     pub load_format: String,
     pub download_dir: Option<String>,
     pub load_threads: Option<u32>,
-    pub checksum_manifest: Option<String>,
     /// Compute dtype name.
     pub model_dtype: String,
     /// Precision selectors, a JSON object.

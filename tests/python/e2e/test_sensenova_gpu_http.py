@@ -382,7 +382,7 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
         "tower",
         devices=devices,
         ranks=1,
-        extra=("--worker-mesh", "tower=text:cuda:0;gen:cuda:1"),
+        extra=("--worker-mesh", "tower=gen:cuda:1"),
     )
     assert tower == one
 
