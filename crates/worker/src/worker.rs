@@ -78,7 +78,7 @@ use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
-use loading::{ComponentMesh, Description, ExpertPartition, sequence_kind};
+use loading::{ComponentMesh, Description, ExpertPartition, head_projection, sequence_kind};
 
 use planning::{cache_width, log_capacity, plan};
 use storage::allocate_storage;
@@ -186,6 +186,7 @@ impl Worker {
                     mesh,
                     units: placed.units.clone(),
                     sequence: sequence_kind(&placed.config),
+                    projection: head_projection(&placed.config),
                 })
             })
             .collect();

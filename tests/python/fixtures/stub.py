@@ -59,6 +59,8 @@ def load_model(description, **overrides):
         "meshes": [],
         "mesh_units": [],
         "mesh_sequences": [],
+        "mesh_projections": [],
+        "mesh_projection_rows": [],
         "expert_world": None,
         "attention_ranks": 0,
         "expert_dedicated": False,

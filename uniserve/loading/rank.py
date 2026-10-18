@@ -351,6 +351,8 @@ def load_model(
     meshes: Sequence[Any],
     mesh_units: Sequence[Any],
     mesh_sequences: Sequence[str],
+    mesh_projections: Sequence[str],
+    mesh_projection_rows: Sequence[int | None],
     expert_world: Any,
     attention_ranks: int,
     expert_dedicated: bool,
@@ -384,6 +386,10 @@ def load_model(
         meshes: Each component's device mesh.
         mesh_units: Each component's unit mesh, or ``None``.
         mesh_sequences: Each component's sequence-parallel kind.
+        mesh_projections: Each component's Ulysses head projection mode,
+            ``gather`` or ``exchange``.
+        mesh_projection_rows: Each component's exchange step in rows, or
+            ``None`` to exchange its whole shard at once.
         expert_world: The torch world holding the expert union's
             communicator; ``None`` without an expert union.
         attention_ranks: Attention ranks of a disaggregated union.
@@ -429,8 +435,11 @@ def load_model(
             units[str(component)] = mesh_units[index].get_group("units")
         for path in mesh_paths[first : first + count]:
             placed[str(path)] = meshes[index]
+            rows = mesh_projection_rows[index]
             attention[str(path)] = attention_parallel(
-                str(mesh_sequences[index])
+                str(mesh_sequences[index]),
+                str(mesh_projections[index]),
+                None if rows is None else int(rows),
             )
         first += count
 

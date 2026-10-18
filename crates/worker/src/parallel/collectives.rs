@@ -275,6 +275,37 @@ impl StreamCommunicator {
         Ok(())
     }
 
+    /// Sends and receives per-peer spans as one grouped submission on the
+    /// transfer stream and returns its completion event. Each operation is
+    /// `(peer, send, address, count, dtype)`: `send` sends the span to the
+    /// group-local `peer`, otherwise it receives from it.
+    ///
+    /// # Safety
+    /// Every span holds its declared elements on this device and stays alive,
+    /// unread (received spans) or unmodified (sent spans), until a consumer
+    /// joined the returned event, including across graph replays.
+    pub(crate) unsafe fn start_exchange(
+        &mut self,
+        operations: &[(i32, bool, u64, usize, DataType)],
+    ) -> Result<Arc<Event>> {
+        self.start(|owner| {
+            owner.grouped(|owner| {
+                let (communicator, stream) = owner.submission(true)?;
+                for &(peer, send, data, count, dtype) in operations {
+                    // SAFETY: forwarded from the caller.
+                    unsafe {
+                        if send {
+                            communicator.send(data, count, dtype, peer, stream)
+                        } else {
+                            communicator.recv(data, count, dtype, peer, stream)
+                        }
+                    }?;
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// Group matching point-to-point operations into one NCCL submission.
     /// The group is ended even when `call` fails.
     pub(crate) fn grouped<R>(&mut self, call: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
@@ -599,12 +630,16 @@ pub struct CollectiveFunctions {
     pub recv: tvm_ffi::Function,
     /// `(output, value, destination, source)`.
     pub send_recv: tvm_ffi::Function,
+    /// `(values, peers, sends)`: one grouped transfer on the transfer fork,
+    /// sending `values[i]` to `peers[i]` when `sends[i]` is 1 and receiving
+    /// it otherwise, returning the token `wait` joins.
+    pub start_exchange: tvm_ffi::Function,
 }
 
 impl CollectiveFunctions {
     /// The functions in the order `NativeCollectives` takes them after the
     /// communicator's name.
-    fn arguments(self) -> [Any; 12] {
+    fn arguments(self) -> [Any; 13] {
         [
             self.all_reduce,
             self.all_gather,
@@ -618,6 +653,7 @@ impl CollectiveFunctions {
             self.send,
             self.recv,
             self.send_recv,
+            self.start_exchange,
         ]
         .map(Any::from)
     }
@@ -698,6 +734,41 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
             },
         ) as Box<Call>
     };
+    let exchanged = {
+        let tokens = Arc::clone(&tokens);
+        let exchange_peer = peer.clone();
+        Box::new(
+            move |comm: &mut StreamCommunicator, args: &[AnyView<'_>]| -> Result<Any> {
+                let [values, peers, sends] = args else {
+                    return Err(Error::Invalid(
+                        "start_exchange takes values, peers and directions".into(),
+                    ));
+                };
+                let values: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(Any::from(*values))
+                    .map_err(|error| Error::numerical("collective", &error))?;
+                let (peers, sends) = (integers(peers)?, integers(sends)?);
+                if peers.len() != values.len() || sends.len() != values.len() {
+                    return Err(Error::Invalid(
+                        "start_exchange takes one peer and direction per value".into(),
+                    ));
+                }
+                let mut operations = Vec::with_capacity(values.len());
+                for ((value, &peer), &send) in values.iter().zip(&peers).zip(&sends) {
+                    let (data, count, kind) = operand(&AnyView::from(&value))?;
+                    let peer = exchange_peer(&AnyView::from(&Any::from(peer)))?;
+                    operations.push((peer, send != 0, data, count, kind));
+                }
+                // SAFETY: every value is a live device view the caller keeps
+                // until it waits on the returned token.
+                let event = unsafe { comm.start_exchange(&operations) }?;
+                let mut tokens = lock(&tokens);
+                tokens.0 += 1;
+                let token = tokens.0;
+                tokens.1.insert(token, event);
+                Ok(Any::from(token))
+            },
+        ) as Box<Call>
+    };
     let gather_peer = peer.clone();
     let broadcast_peer = peer.clone();
     let send_peer = peer.clone();
@@ -732,6 +803,7 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
     }));
     let start_all_gather = function(started(false));
     let start_all_to_all = function(started(true));
+    let start_exchange = function(exchanged);
     let wait = function(joined);
     let all_to_all = function(Box::new(|comm, args| {
         let [output, value, output_splits, input_splits] = args else {
@@ -906,5 +978,6 @@ fn functions(group: &GroupComm) -> CollectiveFunctions {
         send,
         recv,
         send_recv,
+        start_exchange,
     }
 }
