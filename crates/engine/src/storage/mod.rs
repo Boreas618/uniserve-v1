@@ -15,7 +15,7 @@
 //! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
-use uniserve_core::{ByteAllocator, HashAlgo};
+use uniserve_core::ByteAllocator;
 use uniserve_ipc::{RequestKey, WorkerInfo};
 
 pub(crate) use crate::prefix_cache::CacheAllocation;
@@ -87,7 +87,6 @@ pub(crate) struct RequestPool {
     /// Unassigned rows as a LIFO stack, initially ordered so that `allocate`
     /// hands out the lowest row first.
     free: Vec<u32>,
-    capacity: usize,
 }
 
 impl RequestPool {
@@ -99,13 +98,7 @@ impl RequestPool {
         let capacity = capacity.clamp(1, u32::MAX as usize);
         Self {
             free: (1..=capacity as u32).rev().collect(),
-            capacity,
         }
-    }
-
-    /// Returns the allocator capacity.
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// Returns whether every row is assigned, so `allocate` would fail.
@@ -338,10 +331,6 @@ impl PrefixCacheManager {
 
     pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
         self.coordinator.set_prefix_enabled(enabled);
-    }
-
-    pub(crate) fn set_hash_algo(&mut self, algo: HashAlgo) {
-        self.coordinator.set_hash_algo(algo);
     }
 }
 
