@@ -193,11 +193,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
     }
     let stub = descriptor.no_model;
     let model = text(Some(&descriptor.model));
-    if stub && !descriptor.allow_stub {
-        return Err(DescriptorError::new(
-            "--no-model loads synthetic outputs and requires --allow-stub",
-        ));
-    }
     if !stub && model.is_none() {
         return Err(DescriptorError::new(
             "--model is required for a model worker",

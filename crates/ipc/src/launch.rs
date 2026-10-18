@@ -438,8 +438,6 @@ pub struct LaunchDescriptor {
     pub lane: Vec<LaneConfig>,
     /// Load the deterministic stub model instead of a checkpoint.
     pub no_model: bool,
-    /// Acknowledges that the stub model produces synthetic outputs.
-    pub allow_stub: bool,
 
     /// Checkpoint format or loading mode.
     pub load_format: String,

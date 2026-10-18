@@ -37,7 +37,6 @@ fn defaults() -> Value {
         "mesh": null,
         "lane": [],
         "no_model": false,
-        "allow_stub": false,
         "load_format": "auto",
         "download_dir": null,
         "load_threads": null,
@@ -434,10 +433,9 @@ fn disaggregated_ranks_keep_their_local_rank_and_role() {
 }
 
 #[test]
-fn the_stub_model_must_be_acknowledged() {
-    let launch = resolved(json!({"model": "", "no_model": true, "allow_stub": true})).unwrap();
+fn no_model_alone_launches_the_stub_model() {
+    let launch = resolved(json!({"model": "", "no_model": true})).unwrap();
     assert!(launch.stub && launch.model.is_none());
-    assert!(launch_error(json!({"model": "", "no_model": true})).contains("--allow-stub"));
     assert!(launch_error(json!({"model": " "})).contains("--model is required"));
 }
 
@@ -450,7 +448,6 @@ fn the_encoder_cache_holds_the_launched_entry_count() {
     let stub = resolved(json!({
         "model": "",
         "no_model": true,
-        "allow_stub": true,
         "encoder_cache_entries": 32
     }))
     .unwrap();
