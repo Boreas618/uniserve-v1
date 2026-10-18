@@ -127,7 +127,8 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     # The official first-frame presentation holds 1935 text rows and its
-    # keyframe 1008 condition rows, within the default condition capacity.
+    # keyframe 1008 condition rows; without a stated condition capacity the
+    # deployment provisions the two keyframes a request may bring.
     options = [
         "--max-video-seconds",
         "8",
