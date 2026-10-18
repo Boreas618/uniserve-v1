@@ -250,7 +250,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
 
     # The reference normalizes and rotates the projections up front with the
     # public functional, then attends the prepared chunks.
-    from uniserve.nn.functional import qk_norm_rope
+    from uniserve.nn.functional import Rounding, qk_norm_rope
 
     normalized_q, normalized_k = qk_norm_rope(
         q,
@@ -261,6 +261,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
         (sin,),
         eps=1e-6,
         axis_dims=(128,),
+        rounding=Rounding.ONCE,
     )
 
     def chunks(query, key):
@@ -314,6 +315,7 @@ def test_norm_rope_prepared_chunks_match_normalized_projections(stream):
             (sin,),
             eps=1e-6,
             axis_dims=(128,),
+            rounding=Rounding.ONCE,
         )
         expected = attend(normalized_q, normalized_k, None)
         torch.testing.assert_close(
