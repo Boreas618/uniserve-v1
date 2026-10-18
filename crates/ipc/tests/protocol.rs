@@ -1696,23 +1696,17 @@ fn worker_info_rejects_duplicate_set_members() {
 
 /// A cache pool needs an allocatable unit; every page size must be a power of
 /// two dividing the largest one; a layer belongs to one group; heads stay
-/// within their logical bounds; and a sliding window retains no sink.
+/// within their logical bounds.
 #[test]
 fn worker_info_rejects_inconsistent_cache_groups() {
     let valid = full_caps();
     assert!(valid.clone().validate().is_ok());
-    let cases: [fn(&mut PrefixCacheInfo); 6] = [
+    let cases: [fn(&mut PrefixCacheInfo); 5] = [
         |cache| cache.num_units = 1,
         |cache| cache.groups[1].page_tokens = 48,
         |cache| cache.groups[1].layer_ids.push(0),
         |cache| cache.groups[0].layer_ids.clear(),
         |cache| cache.groups[0].kv_head_offset = 1,
-        |cache| {
-            cache.groups[1].kind = CacheGroupKind::SlidingWindow {
-                window: 4096,
-                sink: 64,
-            }
-        },
     ];
     for invalidate in cases {
         let mut info = valid.clone();
@@ -1721,18 +1715,16 @@ fn worker_info_rejects_inconsistent_cache_groups() {
     }
 }
 
-/// Stages combine into the narrowest pool with the largest unit and the
-/// union of their layers, and must agree on every group's page shape.
+/// Stages combine into the narrowest pool with the union of their layers,
+/// and must agree on every group's page shape.
 #[test]
 fn cache_stages_merge_into_the_narrowest_pool() {
     let first = full_caps().prefix_cache.unwrap();
     let mut second = first.clone();
     second.num_units = 1024;
-    second.unit_bytes = first.unit_bytes * 2;
     second.groups[0].layer_ids = vec![28, 29];
     let merged = first.merge(&second).unwrap();
     assert_eq!(merged.num_units, 1024);
-    assert_eq!(merged.unit_bytes, first.unit_bytes * 2);
     assert_eq!(merged.groups[0].layer_ids.len(), 16);
     assert_eq!(merged.groups[1].layer_ids, first.groups[1].layer_ids);
 
@@ -1959,10 +1951,7 @@ fn full_caps() -> WorkerInfo {
                     ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
                 },
                 CacheGroup {
-                    kind: CacheGroupKind::SlidingWindow {
-                        window: 4096,
-                        sink: 0,
-                    },
+                    kind: CacheGroupKind::SlidingWindow { window: 4096 },
                     page_tokens: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
