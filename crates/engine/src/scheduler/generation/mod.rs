@@ -28,8 +28,8 @@ use uniserve_core::{
     GenerationRequest, ImageEncoderInput, ImageIngestStep, ImageInput, RequestId, SamplingParams,
 };
 use uniserve_ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, DrawLayout,
-    Readout, RequestKey, RequestOutput, Rng, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
+    RequestKey, RequestOutput, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 
 /// Builds an unstamped product reference for a planned call output.
@@ -503,10 +503,9 @@ fn computation(request: &GenerationRequest, code: CallKind) -> Call {
 /// readout or generates canvases, or the context ends with a block of this
 /// call.
 ///
-/// The RNG coordinate is `end`, the exclusive prompt end. The prompt of a
-/// readout or of a canvas-generating request only conditions its canvases, so
-/// its prefill samples nothing and declares no RNG coordinate. A context that
-/// ends with an image block samples nothing either: understanding decode
+/// The prompt of a readout or of a canvas-generating request only conditions
+/// its canvases, so its prefill samples nothing. A context that ends with an
+/// image block samples nothing either: understanding decode
 /// then starts from BOS, as after a trailing latent block. Fails with
 /// `InvalidPromptRange` for a range past the prompt, or an empty one that
 /// carries no block.
@@ -546,14 +545,9 @@ pub(super) fn plan_prompt(
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    call.rng = Some(Rng {
-        seed: request.sampling.seed.unwrap_or(0),
-        semantic_index_base: u64::from(end),
-        draw_layout: DrawLayout::TargetSampling,
-    });
     // Prompt position zero reports no logprob, so a chunk starting there
     // covers one position fewer; `validate_generation_result` recovers the
-    // same offset from the call's RNG coordinate.
+    // same offset from the call's coordinates.
     let prompt_positions = if request.sampling.prompt_logprobs_requested() {
         end.saturating_sub(start)
             .saturating_sub(u32::from(start == 0))
@@ -667,7 +661,6 @@ pub(super) fn plan_canvas_commit(
 /// `relay_input` continues from the predecessor's device-resident token.
 pub(super) fn plan_decode(
     request: &GenerationRequest,
-    logical_position: u32,
     spec_token_ids: Option<Vec<u32>>,
     input_token: u32,
     relay_input: bool,
@@ -692,11 +685,6 @@ pub(super) fn plan_decode(
         .is_some_and(|state| !state.transition_token_ids.is_empty())
         .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    call.rng = Some(Rng {
-        seed: request.sampling.seed.unwrap_or(0),
-        semantic_index_base: u64::from(logical_position.saturating_add(1)),
-        draw_layout: DrawLayout::TargetSampling,
-    });
     finish_plan(request, call, 0)
 }
 
@@ -705,11 +693,7 @@ pub(super) fn plan_decode(
 /// The call is a prefill that reads `feature` and may write up to the
 /// encoder's `cache_token_capacity` cache tokens. `feedback` declares the completion
 /// predicate that feedback writes report. `sample_continuation` declares a
-/// sampled-token output, drawn at `sampling_index` when one is given.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one image extension's request, encoder input and sampling continuation"
-)]
+/// sampled-token output.
 pub(super) fn plan_image_extend(
     limits: &uniserve_core::GenerationLimits,
     request: &GenerationRequest,
@@ -718,7 +702,6 @@ pub(super) fn plan_image_extend(
     feedback: bool,
     sample_continuation: bool,
     sampling_state: Option<SamplingState>,
-    sampling_index: Option<u64>,
 ) -> Result<Call, PlanningError> {
     let capacity = encoder.cache_token_capacity(limits)?;
     let mut call = computation(request, CallKind::Forward(ForwardMode::Prefill));
@@ -735,13 +718,6 @@ pub(super) fn plan_image_extend(
             .is_some_and(|state| !state.transition_token_ids.is_empty()))
     .then(|| output_tensor(3, DType::U8));
     call.sampling_state = sampling_state;
-    if call.token_output.is_some() {
-        call.rng = sampling_index.map(|semantic_index_base| Rng {
-            seed: request.sampling.seed.unwrap_or(0),
-            semantic_index_base,
-            draw_layout: DrawLayout::TargetSampling,
-        });
-    }
     finish_plan(request, call, 0)
 }
 
@@ -848,11 +824,7 @@ pub(super) fn plan_diffusion_prepare(
         latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
     )?);
     call.completion_output = Some(output_tensor(1, DType::U8));
-    call.rng = Some(Rng {
-        seed: request.image.seed.unwrap_or(0),
-        semantic_index_base: u64::from(image_id),
-        draw_layout: DrawLayout::FlowNoise,
-    });
+    call.image_index = Some(image_id);
     finish_plan(request, call, 0)
 }
 
@@ -1289,16 +1261,13 @@ pub(crate) fn validate_generation_result(
     }
 
     // Prompt logprobs cover every input token of a prompt-extending prefill
-    // except prompt position zero. A prefill's RNG coordinate is its exclusive
-    // prompt end (`plan_prompt`), so a coordinate equal to the input length
-    // marks the chunk starting at position zero; this reads only the call,
-    // not request progress, which cancellation may have stopped.
+    // except prompt position zero, so a chunk starting there reports one
+    // position fewer; this reads only the call's stated coordinates, not
+    // request progress, which cancellation may have stopped.
     let prompt_tokens = (is_prompt_extend(call) && request.sampling.prompt_logprobs_requested())
         .then(|| {
             &call.input_token_ids[usize::from(
-                call.rng.as_ref().is_some_and(|rng| {
-                    rng.semantic_index_base == call.input_token_ids.len() as u64
-                }) && !call.input_token_ids.is_empty(),
+                call.coordinates.logical_position == 0 && !call.input_token_ids.is_empty(),
             )..]
         });
     match (

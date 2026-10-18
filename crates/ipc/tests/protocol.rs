@@ -81,11 +81,7 @@ fn ar_decode_call() -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: Some(Rng {
-            seed: 99,
-            semantic_index_base: 4,
-            draw_layout: DrawLayout::TargetSampling,
-        }),
+        image_index: (kind == CallKind::Media(MediaCall::LatentPreparation)).then_some(4),
     }
 }
 
@@ -154,7 +150,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         inputs: Vec::new(),
         outputs: Vec::new(),
         predicate: None,
-        rng: None,
+        image_index: None,
     }
 }
 
@@ -523,6 +519,36 @@ fn every_call_kind_round_trips_through_ipc() {
     }
 }
 
+/// A latent preparation names the image whose noise it draws only when it
+/// initializes an image trajectory's latent product; a video denoiser's
+/// latent preparation, whose rank holds the slot's pages, names none.
+#[test]
+fn only_an_image_latent_preparation_names_its_image_index() {
+    let call_id = CallId::new(12, 0);
+    let mut video = call_for(CallKind::Media(MediaCall::LatentPreparation), call_id);
+    video
+        .validate()
+        .expect("a video latent preparation names no image");
+    video.image_index = Some(1);
+    assert!(
+        video.validate().is_err(),
+        "a video preparation draws no image"
+    );
+
+    let mut image = call_for(CallKind::Media(MediaCall::LatentPreparation), call_id);
+    image.latent_output = Some(output_product(call_id));
+    assert!(
+        image.validate().is_err(),
+        "an image preparation names its image"
+    );
+    image.image_index = Some(0);
+    assert!(image.validate().is_err(), "image indices count from one");
+    image.image_index = Some(1);
+    image
+        .validate()
+        .expect("an image latent preparation with its image index");
+}
+
 /// A token-denoising readout reaches the rank with its canvas and slots, and
 /// its completion returns the candidates' log-probabilities in candidate
 /// order.
@@ -765,7 +791,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
             predicate: None,
-            rng: None,
+            image_index: None,
         };
         // A video decode range may start past the first unit, while an audio
         // decode range must start at it. Neither call may omit its range.
@@ -1888,15 +1914,8 @@ fn comprehensive_batches() -> Vec<Batch> {
                 DType::U8,
                 ShapeBound::default(),
             )),
-            rng: Some(Rng {
-                seed: 99 + index as u64,
-                semantic_index_base: 4,
-                draw_layout: match index % 3 {
-                    0 => DrawLayout::TargetSampling,
-                    1 => DrawLayout::SpeculativeProposal,
-                    _ => DrawLayout::FlowNoise,
-                },
-            }),
+            image_index: (kind == CallKind::Media(MediaCall::LatentPreparation))
+                .then_some(4 + index as u32),
         });
         // The admissions ride on the first batch of the pass, as a scheduler
         // places them ahead of the calls that use them.

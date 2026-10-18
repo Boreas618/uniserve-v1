@@ -44,9 +44,9 @@ use uniserve_engine::{
 };
 use uniserve_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, BufferAllocation,
-    CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, DrawLayout,
-    ErrorCode, ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest,
-    RequestKey, Rng, ShapeBound, TensorRef, TransferMode,
+    CacheUnitAllocation, Call, CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode,
+    ForwardBatch, ForwardMode, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
+    ShapeBound, TensorRef, TransferMode,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -1184,7 +1184,7 @@ fn sampled_first_token(
     let sampling = &mut admission.ar.as_mut().unwrap().sampling;
     sampling.temperature = 100.0;
     sampling.seed = seed;
-    let mut batch = token_batch(
+    let batch = token_batch(
         batch_id,
         batch_id,
         admission.request_key,
@@ -1195,12 +1195,6 @@ fn sampled_first_token(
         UnitId(slot),
         0,
     );
-    // The draw at the position after the prompt.
-    batch.calls[0].rng = Some(Rng {
-        seed: seed.unwrap_or(0),
-        semantic_index_base: 2,
-        draw_layout: DrawLayout::TargetSampling,
-    });
     let result = execute(executor, batch)?;
     let record = &result.results[0].output;
     assert_eq!(record.status, CallStatus::Ok);
@@ -3519,11 +3513,7 @@ mod trajectory {
         call.cache_input = Some(conditioning);
         call.latent_output = Some(initial.clone());
         call.completion_output = Some(output(key, batch_id, 1, generation, DType::U8));
-        call.rng = Some(uniserve_ipc::Rng {
-            seed: 7,
-            semantic_index_base: 1,
-            draw_layout: uniserve_ipc::DrawLayout::FlowNoise,
-        });
+        call.image_index = Some(1);
         call.bounds = Bounds {
             max_tokens: 1,
             max_latent_bytes: LATENT_BYTES,

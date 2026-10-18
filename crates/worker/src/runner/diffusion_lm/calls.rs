@@ -296,7 +296,7 @@ mod tests {
             completion_output: None,
             transition_output: None,
             predicate: None,
-            rng: None,
+            image_index: None,
             sampling_state: None,
             input_token_ids: (0..tokens as u32).map(|token| 100 + token).collect(),
             readout,
