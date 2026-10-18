@@ -46,10 +46,6 @@ impl TransferCapacity {
         lock(&self.state)
     }
 
-    pub(crate) fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
     pub(crate) fn ticket_capacity(&self) -> usize {
         self.ticket_capacity
     }

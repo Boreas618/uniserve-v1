@@ -35,9 +35,6 @@ use crate::storage::memory::Memory;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 
-/// Registered exports of one shared-memory or CUDA VMM endpoint.
-const REGISTERED_EXPORTS: usize = 256;
-
 /// A transfer mechanism.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportKind {
@@ -219,27 +216,20 @@ impl Transport {
         options: &TransportOptions,
     ) -> Result<Self> {
         let suffix = uuid::Uuid::new_v4().simple();
-        let endpoint = |limit| {
-            ExportTable::new(
-                format!("uniserve-buffers-{suffix}"),
-                limit,
-                Arc::clone(&events),
-            )
-        };
+        let endpoint =
+            || ExportTable::new(format!("uniserve-buffers-{suffix}"), Arc::clone(&events));
         let backend = match kind {
             TransportKind::Local => Backend::Local {
-                // Nonempty exports make the byte budget an upper bound on
-                // registration count as well.
-                endpoint: endpoint(capacity.capacity() as usize)?,
+                endpoint: endpoint(),
                 next: AtomicU64::new(0),
             },
             TransportKind::Shm => Backend::Shared {
-                endpoint: endpoint(REGISTERED_EXPORTS)?,
+                endpoint: endpoint(),
                 slot: options.acknowledgment_slot,
                 host_slots: options.host_slots.clone(),
             },
             TransportKind::CudaVmm => Backend::Cuda(CudaExports::new(
-                endpoint(REGISTERED_EXPORTS)?,
+                endpoint(),
                 options.acknowledgment_slot,
                 options.cross_host_consumers,
                 options.vmm_pool_bytes,
@@ -295,11 +285,10 @@ impl Transport {
         }
     }
 
-    /// Whether this mechanism reads `locator`: a location of its kind, which
-    /// for a POSIX segment must be on this rank's node.
+    /// Whether this mechanism reads `locator`, a location of its kind: a
+    /// POSIX segment only on this rank's node.
     pub(crate) fn reads(&self, locator: &Locator) -> bool {
-        TransportKind::of(locator) == self.kind()
-            && (self.kind() != TransportKind::Shm || locator.source.node == self.source.node)
+        self.kind() != TransportKind::Shm || locator.source.node == self.source.node
     }
 
     /// Whether this mechanism reaches any of `consumers` (every mechanism

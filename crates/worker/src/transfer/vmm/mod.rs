@@ -434,7 +434,7 @@ impl CudaExports {
                     }
                 }
             }
-            self.endpoint.register(locator.clone(), Arc::clone(&buffer))
+            self.endpoint.register(&locator, Arc::clone(&buffer))
         })();
         if let Err(error) = registered {
             TransportBuffer::reclaim(buffer, events, None)?;
@@ -453,20 +453,15 @@ impl CudaExports {
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
     ) -> Result<ReadCall> {
-        let TransferTransport::CudaVmm {
-            allocation_handle, ..
-        } = &locator.transport
-        else {
+        if !matches!(locator.transport, TransferTransport::CudaVmm { .. }) {
             return Err(Error::Invalid(
                 "CUDA VMM read requires a CUDA VMM locator".into(),
             ));
-        };
-        let same_node = locator.source.node == source.node;
-        if !same_node && !AllocationHandle::decode(allocation_handle)?.crosses_hosts() {
-            return Err(Error::Invalid(
-                "a device product crosses hosts only as a fabric handle".into(),
-            ));
         }
+        // The engine places a CUDA VMM edge across hosts only where both
+        // devices export fabric handles (`WorkerExecutor::try_new`), so a
+        // read from another host imports a fabric handle.
+        let same_node = locator.source.node == source.node;
         if !matches!(device, MemoryKind::Cuda(_)) {
             return Err(Error::Invalid(
                 "CUDA VMM destination must be a CUDA device".into(),

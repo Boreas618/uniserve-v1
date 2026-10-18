@@ -1,10 +1,13 @@
 //! Registered transport exports of one endpoint and their reclamation.
 //!
 //! Every registering transport (local, shared memory, CUDA VMM) owns one
-//! [`ExportTable`]: a bounded [`BufferRegistry`] of its exports, keyed by the
-//! locator's transport identity. Endpoints are also published in a
-//! process-wide map by name, so a reader in the same address space resolves
-//! a local or CUDA VMM locator to the producer's storage directly.
+//! [`ExportTable`]: a [`BufferRegistry`] of its exports, keyed by the
+//! locator's transport identity (the endpoint name and the local key, the
+//! segment name or the CUDA VMM export id). A locator reaches a consumer only
+//! through the engine, which binds only locators a producer reported, so the
+//! key alone finds an export. Endpoints are also published in a process-wide
+//! map by name, so a reader in the same address space resolves a local or
+//! CUDA VMM locator to the producer's storage directly.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
@@ -25,18 +28,14 @@ pub(crate) enum SourceKey {
     Cuda(String),
 }
 
-/// A registered export: its immutable locator and its physical backing.
+/// A registered export's physical backing.
 pub(crate) struct Source {
-    locator: Arc<Locator>,
     buffer: Arc<TransportBuffer>,
 }
 
 impl Source {
-    pub(crate) fn new(locator: Locator, buffer: Arc<TransportBuffer>) -> Self {
-        Self {
-            locator: Arc::new(locator),
-            buffer,
-        }
+    pub(crate) fn new(buffer: Arc<TransportBuffer>) -> Self {
+        Self { buffer }
     }
 }
 
@@ -70,16 +69,16 @@ pub(crate) struct ExportTable {
 }
 
 impl ExportTable {
-    pub(crate) fn new(name: String, capacity: usize, events: Arc<EventPool>) -> Result<Arc<Self>> {
+    pub(crate) fn new(name: String, events: Arc<EventPool>) -> Arc<Self> {
         let endpoint = Arc::new(Self {
             name,
             events,
-            state: Mutex::new(Table::new(capacity)?),
+            state: Mutex::new(Table::new()),
             retirements: Mutex::new(None),
             wake: Mutex::new(None),
         });
         lock(&ENDPOINTS).insert(endpoint.name.clone(), Arc::downgrade(&endpoint));
-        Ok(endpoint)
+        endpoint
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -113,33 +112,20 @@ impl ExportTable {
         Ok(key)
     }
 
-    fn buffer<'a>(
-        state: &'a mut Table,
-        key: &SourceKey,
-        locator: &Locator,
-    ) -> Result<&'a mut RegisteredBuffer> {
-        let buffer = state
+    fn buffer<'a>(state: &'a mut Table, key: &SourceKey) -> Result<&'a mut RegisteredBuffer> {
+        state
             .get_mut(key)
-            .ok_or_else(|| Error::Invalid("buffer is no longer registered".into()))?;
-        // The immutable locator describes the actual view, including its fence.
-        if *buffer.source().locator != *locator {
-            return Err(Error::Invalid(
-                "buffer locator changed its registered view".into(),
-            ));
-        }
-        Ok(buffer)
+            .ok_or_else(|| Error::Invalid("buffer is no longer registered".into()))
     }
 
-    /// Register an export's backing; the backing retires through the
-    /// registry once the export is released and its readers finished.
-    pub(crate) fn register(&self, locator: Locator, buffer: Arc<TransportBuffer>) -> Result<()> {
-        let key = self.key(&locator)?;
+    /// Register an export's backing under `locator`'s key; the backing
+    /// retires through the registry once the export is released and its
+    /// readers finished.
+    pub(crate) fn register(&self, locator: &Locator, buffer: Arc<TransportBuffer>) -> Result<()> {
+        let key = self.key(locator)?;
         self.remove_finished();
-        self.lock().register(
-            key,
-            Source::new(locator, buffer),
-            Arc::new(Retirement::default()),
-        )
+        self.lock()
+            .register(key, Source::new(buffer), Arc::new(Retirement::default()))
     }
 
     /// Revoke future reads. The returned signal completes after physical
@@ -151,7 +137,7 @@ impl ExportTable {
             if state.get_mut(&key).is_none() {
                 return Ok(None);
             }
-            let buffer = Self::buffer(&mut state, &key, locator)?;
+            let buffer = Self::buffer(&mut state, &key)?;
             buffer.release();
             Arc::clone(buffer.retirement())
         };
@@ -163,9 +149,7 @@ impl ExportTable {
     pub(crate) fn retirement(&self, locator: &Locator) -> Result<Arc<Retirement>> {
         let key = self.key(locator)?;
         let mut state = self.lock();
-        Ok(Arc::clone(
-            Self::buffer(&mut state, &key, locator)?.retirement(),
-        ))
+        Ok(Arc::clone(Self::buffer(&mut state, &key)?.retirement()))
     }
 
     /// Admit a process-local reader of `locator`'s export, wherever its
@@ -187,7 +171,7 @@ impl ExportTable {
         let key = owner.key(locator)?;
         let buffer = {
             let mut state = owner.lock();
-            Arc::clone(&Self::buffer(&mut state, &key, locator)?.acquire()?.buffer)
+            Arc::clone(&Self::buffer(&mut state, &key)?.acquire()?.buffer)
         };
         Ok((buffer, SourceGrant { owner, key }))
     }
