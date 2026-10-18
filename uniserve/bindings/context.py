@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     from uniserve.nn._binding import ChunkStorage, MergedKey
     from uniserve.nn.attention._parallel import (
         AttentionBuffers,
-        OutputBuffers,
         ParallelAttention,
     )
 
@@ -532,14 +531,10 @@ class ExecutionContext:
         # pairs hold for the context's lifetime.
         from uniserve.distributed.collectives import stream_bindings
         from uniserve.nn import _binding
-        from uniserve.nn.attention._parallel import (
-            context_bindings,
-            output_bindings,
-        )
+        from uniserve.nn.attention._parallel import context_bindings
 
         self._variables: tuple[tuple[contextvars.ContextVar, Any], ...] = (
             (stream_bindings, self.collectives),
-            (output_bindings, self._vsa_output),
             (context_bindings, self._vsa_context),
             (_binding.matmul, self._operators),
             (_binding.merged_matmul, self._merged),
@@ -561,10 +556,9 @@ class ExecutionContext:
         "_vsa",
         "_vsa_operators",
         "_moe",
-        "_vsa_output",
         "_vsa_context",
         "_context_backing",
-        "_vsa_transport",
+        "_vsa_storage",
         "_exchange",
         "_chunks",
         "_gather_pools",
@@ -583,12 +577,12 @@ class ExecutionContext:
     # (device, dtype, heads, head_dim, pattern) -> (provider name, operator)
     _vsa_operators: dict[tuple, tuple[str, Any]]
     _moe: dict[int, MoEBinding]
-    _vsa_output: dict[ParallelAttention, OutputBuffers]
     _vsa_context: dict[ParallelAttention, AttentionBuffers]
-    # (key group, rows, heads, head_dim, dtype) -> context K/V buffers
+    # (context group, rows, heads, head_dim, dtype) -> context K/V buffers
     _context_backing: dict[tuple, AttentionBuffers]
-    # (three groups, rows, heads, head_dim, dtype) -> output, context buffers
-    _vsa_transport: dict[tuple, tuple[OutputBuffers, AttentionBuffers | None]]
+    # (context group, rows, heads, head_dim, dtype) -> the gathered K/V of a
+    # context-partitioned sparse attention layer
+    _vsa_storage: dict[tuple, AttentionBuffers]
     # module id -> attention exchange storage
     _exchange: dict[int, ExchangeBuffers]
     # module id -> gather storage for chunked token exchange
@@ -640,9 +634,6 @@ class ExecutionContext:
     def _moe_workspace(self, requirements, device):
         return self.scratch("moe", requirements, device)
 
-    def _vsa_buffers(self, slot, requirements, device):
-        return self.scratch(("vsa", slot), requirements, device)
-
     def _attention_workspace(self, requirements, device):
         persistent = {
             name: config
@@ -689,20 +680,6 @@ class ExecutionContext:
         )
         self._exchange[id(layer)] = ExchangeBuffers(views)
 
-    def _bind_output(self, parallel, **options):
-        """Back and bind one layer's Ulysses output storage."""
-        from uniserve.nn.attention.storage import (
-            bind_output_storage,
-            output_requirements,
-        )
-
-        requirements = output_requirements((parallel,), **options)
-        tensors, peers = {}, {}
-        for key, requirement in requirements.items():
-            tensors[key], fields = self.workspace.storage(requirement)
-            peers[key] = fields.get("output", ())
-        return bind_output_storage(requirements, tensors, peers)[parallel]
-
     def _bind_context(self, parallel, **options):
         """Back and bind one layer's context K/V storage, if it needs any."""
         from uniserve.nn.attention.storage import (
@@ -734,7 +711,7 @@ class ExecutionContext:
         if context_size == 1 or rows == 0:
             return None
         heads, head_dim = layer.local_kv_heads, layer.head_dim
-        key = (parallel.key_group, rows, heads, head_dim, dtype)
+        key = (group, rows, heads, head_dim, dtype)
         buffers = self._context_backing.get(key)
         if buffers is None:
             buffers = self._bind_context(
@@ -749,41 +726,43 @@ class ExecutionContext:
         return buffers
 
     def _vsa_exchange(self, layer, rows, heads, head_dim, dtype):
-        parallel = getattr(layer, "parallel", None)
-        if parallel is None:
-            return None
-        ulysses, context_group = parallel.ulysses_group, parallel.context_group
-        groups = (ulysses, context_group, parallel.key_group)
+        """Bind the gathered K/V storage of a context-partitioned VSA layer.
+
+        ``rows`` are the layer's rows of one context interval. Context
+        storage serves every row count up to its own (``ParallelAttention``
+        borrows compact leading views), so storage prepared for more rows
+        serves this call too.
+
+        Raises:
+            RuntimeError: The storage would first be created during graph
+                capture.
+        """
+        parallel = layer.context_parallel
+        group = parallel.context_group
         dimensions = (heads, head_dim, dtype)
         key = next(
             (
                 key
-                for key in self._vsa_transport
-                if key[:3] == groups
-                and key[3] >= rows
-                and key[4:] == dimensions
+                for key in self._vsa_storage
+                if key[0] == group and key[1] >= rows and key[2:] == dimensions
             ),
-            (*groups, rows, *dimensions),
+            (group, rows, *dimensions),
         )
-        if key not in self._vsa_transport:
+        if key not in self._vsa_storage:
             if capturing(self._device):
                 raise RuntimeError(
                     "prepare VSA communication storage before capture"
                 )
-            options = {
-                "rows": rows,
-                "heads": heads,
-                "head_dim": head_dim,
-                "dtype": dtype,
-            }
-            output = self._bind_output(parallel, **options)
-            context = self._bind_context(parallel, **options)
-            self._vsa_transport[key] = (output, context)
-        output, context = self._vsa_transport[key]
-        self._vsa_output[parallel] = output
-        if context is not None:
-            self._vsa_context[parallel] = context
-        return parallel
+            buffers = self._bind_context(
+                parallel,
+                rows=key[1],
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
+            )
+            assert buffers is not None
+            self._vsa_storage[key] = buffers
+        self._vsa_context[parallel] = self._vsa_storage[key]
 
     # Preparation.
 
@@ -856,7 +835,6 @@ class ExecutionContext:
                 getattr(module, "prepare_constants")(size, out=self.constants)
 
             representations = {"": (self._device, self._dtype)}
-            vsa_slot = 0
             for path, child in module.named_modules():
                 parent = path.rpartition(".")[0]
                 device, dtype = _layer_representation(
@@ -889,17 +867,13 @@ class ExecutionContext:
                     if text:
                         binding.prepare(size)
                 if isinstance(child, BlockAttention):
-                    # Alternate projection buffers so output consumption can
-                    # overlap the next layer's input preparation.
                     self._vsa[id(child)] = VsaBinding(
                         self._backends["vsa"],
                         self.scratch,
                         self._attention_workspace,
-                        functools.partial(self._vsa_buffers, vsa_slot % 2),
                         self._vsa_exchange,
                         self._vsa_operators,
                     )
-                    vsa_slot += 1
                 if isinstance(child, Attention):
                     self._bind_attention(
                         AttentionBinding,

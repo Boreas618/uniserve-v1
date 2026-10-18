@@ -13,14 +13,13 @@ from safetensors.torch import save_file
 from torch.nn import functional as F
 
 from tests.python.fixtures.h3 import dmd_denoiser
-from tests.python.fixtures.vsa import reference_attention
+from tests.python.fixtures.vsa import layout_tables, segment_reference
 from uniserve import cuda_graph, loading
 from uniserve.bindings.context import ExecutionContext
-from uniserve.bindings.workspace import TensorBuffers
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
 from uniserve.models.minimax_h3 import (
-    AttentionInput,
+    SegmentInput,
     Transformer,
     TransformerConfig,
 )
@@ -34,8 +33,14 @@ from uniserve.nn.attention import vsa
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
+# The layout's 64-row tiles: one dense tile of text and audio, a video
+# segment of two tiles and an empty alignment tile.
+VALID = (64, 17, 64, 0)
+SEGMENTS = (-1, 0, 0, -1)
+KEEP = (1,)
 
-def _reference(hidden, source, config, step, tags, cosine, sine, valid):
+
+def _reference(hidden, source, config, step, tags, cosine, sine):
     def parameter(name, dtype=torch.bfloat16):
         return source[name].to(device=hidden.device, dtype=dtype)
 
@@ -118,7 +123,9 @@ def _reference(hidden, source, config, step, tags, cosine, sine, valid):
                 second * cosine[:, None] + first * sine[:, None]
             )
             projections[branch] = value.bfloat16()
-        attended, live = reference_attention(*projections, valid)
+        attended, live = segment_reference(
+            *projections, valid=VALID, indices=SEGMENTS, keep=KEEP, tile=64
+        )
         update = linear(attended.flatten(1), prefix + ".attn.to_out.0")
         residual = hidden.float() + gate_a * update.float()
         normalized = residual * torch.rsqrt(
@@ -200,7 +207,6 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
             steps=4,
             groups=2,
         ),
-        # The FastH3 student's transformer, which rounds once.
         denoiser.transformer,
         checkpoint=(
             checkpoint.Config("denoiser").resolve(
@@ -223,7 +229,7 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
             )
         ),
     ).model
-    valid = torch.tensor([64, 17, 64, 0], dtype=torch.int32, device="cuda")
+    valid = torch.tensor(VALID, dtype=torch.int32, device="cuda")
     tags = torch.zeros(256, dtype=torch.int64, device="cuda")
     tags[:32], tags[32:64] = 1, 2
     live = torch.arange(256, device="cuda") % 64 < valid.repeat_interleave(64)
@@ -246,21 +252,15 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
     group = DeviceMesh(ranks=(0,), shape=(1,), axes=("tp",), rank=0).get_group(
         ()
     )
-    sparse = vsa.Input(
-        256,
-        1,
-        2,
-        3,
-        valid,
-        torch.tensor([0], device="cuda", dtype=torch.int32),
-        torch.arange(3, device="cuda", dtype=torch.int32),
-        torch.tensor(1, device="cuda", dtype=torch.int32),
-    )
-    inputs = AttentionInput(
+    inputs = SegmentInput(
         slice(0, 256),
         group,
-        sparse,
-        selections["text"],
+        vsa.Segments(
+            64,
+            256,
+            *layout_tables(VALID, SEGMENTS, KEEP, "cuda"),
+            dense_prefix_tiles=1,
+        ),
         selections["video"],
         selections["audio"],
     )
@@ -269,62 +269,41 @@ def test_loaded_modulated_sparse_transformer_and_graph(tmp_path):
         "sin": sine,
         "modulation_indices": (tags == 2).long() * 3 + tags,
     }
-    requirements = {
-        f"attention.{slot}.{name}": config
-        for slot in range(2)
-        for name, config in model.layers["0"]
-        .attention.workspace_buffers(256, 256, dtype=torch.bfloat16)
-        .items()
-    }
     hidden = torch.randn(
         256, config.hidden_size, device="cuda", dtype=torch.bfloat16
     )
-    with TensorBuffers.allocate(requirements, device="cuda") as owner:
-        workspace = owner.view(requirements)
-        # The solver step is device data, so one captured evaluation serves
-        # every step once the index holds it.
-        step = torch.zeros(1, dtype=torch.int64, device="cuda")
-        stream = torch.cuda.Stream(device="cuda")
-        stream.wait_stream(torch.cuda.current_stream())
-        with ExecutionContext(model, vsa="cute", stream=stream) as context:
-            context.prepare(None)
-            for index in range(4):
-                step.fill_(index)
-                expected = _reference(
-                    hidden, source, config, index, tags, cosine, sine, valid
-                )
-                actual = model(
-                    hidden,
-                    inputs,
-                    step=step,
-                    tables=tables,
-                    workspace=workspace,
-                )
-                for result, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(
-                        result, reference, rtol=2e-2, atol=2e-2
-                    )
-            step.fill_(3)
-            graph = cuda_graph.capture(
-                lambda: model(
-                    hidden,
-                    inputs,
-                    step=step,
-                    tables=tables,
-                    workspace=workspace,
-                ),
-                stream=stream,
+    # The solver step is device data, so one captured evaluation serves every
+    # step once the index holds it.
+    step = torch.zeros(1, dtype=torch.int64, device="cuda")
+    stream = torch.cuda.Stream(device="cuda")
+    stream.wait_stream(torch.cuda.current_stream())
+    with ExecutionContext(model, vsa="sm100", stream=stream) as context:
+        context.prepare(None)
+        for index in range(4):
+            step.fill_(index)
+            expected = _reference(
+                hidden, source, config, index, tags, cosine, sine
             )
-            for index in (1, 3):
-                step.fill_(index)
-                hidden.mul_(0.5)
-                actual = graph.replay()
-                expected = _reference(
-                    hidden, source, config, index, tags, cosine, sine, valid
+            actual = model(hidden, inputs, step=step, tables=tables)
+            for result, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(
+                    result, reference, rtol=2e-2, atol=2e-2
                 )
-                for result, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(
-                        result, reference, rtol=2e-2, atol=2e-2
-                    )
-            stream.synchronize()
-            graph.release()
+        step.fill_(3)
+        graph = cuda_graph.capture(
+            lambda: model(hidden, inputs, step=step, tables=tables),
+            stream=stream,
+        )
+        for index in (1, 3):
+            step.fill_(index)
+            hidden.mul_(0.5)
+            actual = graph.replay()
+            expected = _reference(
+                hidden, source, config, index, tags, cosine, sine
+            )
+            for result, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(
+                    result, reference, rtol=2e-2, atol=2e-2
+                )
+        stream.synchronize()
+        graph.release()
