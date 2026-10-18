@@ -1025,7 +1025,7 @@ impl ConditionPlan {
     /// video and audio rows without tiles, or the rows of the whole tiles
     /// they fill, a video's in tiles of its `(latent frames, height / 32,
     /// width / 32)` token grid. `None` for a keyframe under tiles, which a
-    /// region packing does not hold. `canvas` is the generated canvas.
+    /// segment packing does not hold. `canvas` is the generated canvas.
     pub fn packed_rows(&self, canvas: Canvas, tiles: Option<ConditionTiles>) -> Option<u64> {
         let (role, media) = self.media(canvas);
         super::packed_rows(
@@ -2314,7 +2314,7 @@ pub(super) mod tests {
     }
 
     /// The worker counts an admitted condition's rows from its description:
-    /// for every planned condition of the vectors, densely and in the region
+    /// for every planned condition of the vectors, densely and in the segment
     /// tiles of both tile sizes, the described condition packs into exactly
     /// the rows its plan does, and a keyframe under tiles into none.
     #[test]

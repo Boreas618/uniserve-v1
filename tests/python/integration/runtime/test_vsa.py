@@ -431,7 +431,7 @@ def test_row_production_over_many_intervals_matches_one_call(
 def test_empty_prefix_tiles_leave_live_rows_unchanged(provider, stream):
     """A prefix tile without valid rows changes no live row's attention.
 
-    The capacity domain holds a text region of two tiles for a prompt that
+    The capacity domain holds a text segment of two tiles for a prompt that
     fills one: its second text tile has no valid rows and carries large
     values, and the live prefix lists name only the text and audio tiles.
     Every live row must attend exactly as in the domain without that tile.

@@ -108,7 +108,7 @@ result = generate(
 
 ## Layouts and conditions
 
-A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Regional sparse layouts retain each reference region's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
+A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
 
 Visual conditions are encoded in independent temporal units and assembled in the declared latent order. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
 

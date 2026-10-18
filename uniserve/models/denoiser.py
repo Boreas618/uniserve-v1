@@ -24,7 +24,7 @@ SizeT = TypeVar("SizeT")
 
 @dataclass(frozen=True, slots=True)
 class ConditionTiles:
-    """Whole-tile condition packing of a multi-region video denoiser.
+    """Whole-tile condition packing of a multi-segment video denoiser.
 
     Each condition occupies whole tiles of ``rows`` rows: its audio rows
     fill tiles of their own, then an image's rows fill tiles, while a
@@ -293,7 +293,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """How ``make_size`` counts condition rows.
 
         ``None`` packs conditions densely, one row per condition token; a
-        multi-region network returns the whole tiles it packs them in. A
+        multi-segment network returns the whole tiles it packs them in. A
         serving owner admits requests by the same count.
         """
         return None

@@ -320,7 +320,7 @@ impl ServingRuntime {
         .await
     }
 
-    /// Prepares a video request (media ingestion included) within its request lifecycle and
+    /// Prepares a video request (media processing included) within its request lifecycle and
     /// streams its output.
     ///
     /// Also returns the prepared request, whose duration, canvas and sampling describe the
@@ -331,7 +331,7 @@ impl ServingRuntime {
         request_id: ServeRequestId,
         request: crate::openai::VideoGenerationRequest,
     ) -> crate::openai::Result<(
-        Option<crate::serving::video::PreparedVideo>,
+        Option<crate::serving::video::ProcessedVideo>,
         RequestOutputStream,
     )> {
         let (prepared, outline) = tokio::sync::oneshot::channel();

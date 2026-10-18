@@ -298,7 +298,7 @@ pub struct VideoDenoiserInfo {
     /// The checkpoint's packed sequence capacity in rows, when it has one.
     pub max_sequence_rows: Option<u32>,
     /// How the denoiser packs condition rows: in whole tiles for a
-    /// multi-region denoiser, or densely, one row per condition token, when
+    /// multi-segment denoiser, or densely, one row per condition token, when
     /// absent.
     pub condition_tiles: Option<ConditionTiles>,
 }
