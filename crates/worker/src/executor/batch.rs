@@ -932,7 +932,7 @@ mod tests {
 
     use uniserve_core::{RequestId, SamplingParams};
     use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
-    use uniserve_ipc::{ArRequestParams, BufferAllocation, NewRequest, RequestKey, ShapeBound};
+    use uniserve_ipc::{BufferAllocation, GenerationParams, NewRequest, RequestKey, ShapeBound};
 
     use super::*;
     use crate::storage::BufferPool;
@@ -999,7 +999,7 @@ mod tests {
         NewRequest {
             request_key: key(request),
             request_pool_idx: request as u32,
-            ar: Some(ArRequestParams {
+            generation: Some(GenerationParams {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),

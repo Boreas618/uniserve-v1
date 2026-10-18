@@ -410,7 +410,7 @@ mod tests {
 
     use uniserve_core::{RequestId, SamplingParams};
     use uniserve_ipc::{
-        ArRequestParams, Batch as Plan, BatchCommand, Channel, IpcError, Listener, NewRequest,
+        Batch as Plan, BatchCommand, Channel, GenerationParams, IpcError, Listener, NewRequest,
         RequestKey, WorkerRequest, WorkerResponse,
     };
 
@@ -488,7 +488,7 @@ mod tests {
 
     /// A Submit of a lifecycle batch starting request `id` in `slot`.
     fn submit(message_id: u64, batch_id: u64, id: u64, slot: u32) -> Result<WorkerRequest> {
-        let ar = ArRequestParams {
+        let generation = GenerationParams {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
@@ -497,7 +497,7 @@ mod tests {
         let request = NewRequest::new(
             RequestKey::new(1, RequestId(id), 1),
             slot,
-            Some(ar),
+            Some(generation),
             None,
             0,
         )
