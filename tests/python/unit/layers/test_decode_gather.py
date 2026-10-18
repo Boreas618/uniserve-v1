@@ -37,7 +37,7 @@ def test_decode_rows_read_their_slots_and_slot_zero_is_padding() -> None:
         "query_lengths": torch.full((rows,), -7, dtype=torch.int32),
         "query_offsets": torch.full((rows + 1,), -7, dtype=torch.int32),
         "prefix_offsets": torch.full((rows + 1,), -7, dtype=torch.int32),
-        "write_indices": torch.full((2, rows), -7, dtype=torch.int64),
+        "slot_mapping": torch.full((2, rows), -7, dtype=torch.int64),
     }
     gather_request_decode_inputs(
         request_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64),
@@ -69,7 +69,7 @@ def test_decode_rows_read_their_slots_and_slot_zero_is_padding() -> None:
     ]
 
     # The token is appended at its cache length; padding writes nothing.
-    assert outputs["write_indices"].tolist() == [
+    assert outputs["slot_mapping"].tolist() == [
         [20 * 4 + 2, -1, 12 * 4 + 1],
         [40 * 4 + 2, -1, 32 * 4 + 1],
     ]

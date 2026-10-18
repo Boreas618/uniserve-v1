@@ -10,7 +10,7 @@ LM, an image denoiser) owns one set of device metadata for ``R`` rows and
 | ``start_pages`` | int32 | ``[Tb, R]`` |
 | ``cache_lengths``, ``query_lengths`` | int32 | ``[R]`` |
 | ``query_offsets``, ``prefix_offsets`` | int32 | ``[R + 1]`` |
-| ``write_indices`` | int64 | ``[Tb, T]`` |
+| ``slot_mapping`` | int64 | ``[Tb, T]`` |
 
 Per forward the rank packs the rows' slots, lengths and selected page
 counts into one host column (``row_columns``, the Rust half's
@@ -90,7 +90,7 @@ class AttentionMetadata:
         self.query_lengths = zeros(rows)
         self.query_offsets = zeros(rows + 1)
         self.prefix_offsets = zeros(rows + 1)
-        self.write_indices = torch.full(
+        self.slot_mapping = torch.full(
             (tables, tokens), -1, dtype=torch.int64, device=device
         )
 
@@ -120,7 +120,7 @@ class AttentionMetadata:
             query_lengths=self.query_lengths,
             query_offsets=self.query_offsets,
             prefix_offsets=self.prefix_offsets,
-            write_indices=self.write_indices,
+            slot_mapping=self.slot_mapping,
         )
 
     def batch(
@@ -143,7 +143,7 @@ class AttentionMetadata:
         the rows' causality differs, the caller staged it in
         ``causal_values`` for operators that consume the device column
         (``None`` for a forward whose rows agree). Rows that write the
-        cache read paged inputs with write indices; read-only rows
+        cache read paged inputs with a slot mapping; read-only rows
         (``writes`` false) read their segments without writing.
         """
         rows, tokens = int(rows), int(tokens)
@@ -184,7 +184,7 @@ class AttentionMetadata:
                     query,
                     prefix,
                     blocks,
-                    self.write_indices[table, :tokens],
+                    self.slot_mapping[table, :tokens],
                     mode,
                     flags,
                 )

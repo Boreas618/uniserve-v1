@@ -1458,8 +1458,8 @@ class DenoiserRunner:
         """Gather ``count`` rows of ``tokens`` tokens and view them.
 
         The gather fills the block tables, start pages, lengths, offsets
-        and write indices from the slot tables in one launch. Rows that
-        write keys and values read paged inputs with write indices;
+        and slot mappings from the slot tables in one launch. Rows that
+        write keys and values read paged inputs with a slot mapping;
         read-only rows read their segments without writing. No row is
         causal.
         """
