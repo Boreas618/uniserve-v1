@@ -30,6 +30,34 @@ impl Deref for ImportHandle {
     }
 }
 
+/// Revive `buffer`, a copy of an imported product this rank released, for
+/// a later reader; true when it holds the product's value for that reader.
+///
+/// A copy released after it received its value still holds it: its storage
+/// returns only once a reclaim removes it, and its pending fences order
+/// only accesses already issued. Reviving it registers it under its
+/// producing call again, so its owner's release retires it once more. A
+/// copy released before its value arrived (an abandoned import, whose reads
+/// were cancelled) cannot serve and stays released.
+fn revive(state: &mut State, buffer: &ProductBuffer) -> bool {
+    let mut value = lock(buffer);
+    if !value.released {
+        return true;
+    }
+    if !value.state.produced() {
+        return false;
+    }
+    value.released = false;
+    let id = value.id;
+    drop(value);
+    state
+        .calls
+        .entry((id.owner, id.producer_call_id))
+        .or_default()
+        .insert(buffer_key(id));
+    true
+}
+
 pub(super) fn import_read(imported: &ImportHandle) -> Arc<ProductRead> {
     let buffer = lock(imported).buffer.clone();
     Arc::new(ProductRead {
@@ -91,6 +119,13 @@ impl ProductStore {
         let key = buffer_key(id);
         let shape = tensor.shape.clone();
         let mut state = lock(&self.state);
+        // A copy of the product this rank released (a consumed predicate)
+        // stays indexed until a reclaim finds its accesses retired, and
+        // nothing reclaims between that release and the next call reading
+        // the product. Reclaim first, as every binding does: a retired copy
+        // leaves and the product is read anew, and a copy still draining is
+        // revived (`revive`).
+        self.reclaim(&mut state)?;
 
         if let Some(pending) = state.imports.get(&key).cloned() {
             let mut value = lock(&pending);
@@ -104,7 +139,7 @@ impl ProductStore {
                     "product import conflicts with pending materialization".into(),
                 ));
             }
-            if lock(&buffer).released {
+            if !revive(&mut state, &buffer) {
                 return Err(Error::Invalid(
                     "product import requires a live published generation".into(),
                 ));
@@ -123,13 +158,10 @@ impl ProductStore {
         let (buffer, destination, missing) = match existing {
             Some(_) => {
                 let buffer = Self::require_reference(&state, reference)?;
+                // A committed copy is produced, so it always revives.
+                revive(&mut state, &buffer);
                 let value = lock(&buffer);
                 let views = buffer.views();
-                if value.released {
-                    return Err(Error::Invalid(
-                        "product import requires a live published generation".into(),
-                    ));
-                }
                 if device != value.device || views.metadata != metadata {
                     return Err(Error::Invalid(
                         "product import conflicts with resident ownership".into(),
