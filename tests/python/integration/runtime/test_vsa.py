@@ -167,7 +167,7 @@ def test_selection_compression_and_graph_replay(provider, stream):
         # prepared shapes.
         projections.mul_(0.5)
         valid[1] = 9
-        segments.valid_sizes[1] = 9
+        segments.variable_block_sizes[1] = 9
         want, attending = expected()
         graph.replay()
         torch.testing.assert_close(
