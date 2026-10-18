@@ -223,7 +223,7 @@ impl WorkerExecutor {
                     BatchCommand::Free { buffer } => {
                         self.buffer_workers.remove(&buffer);
                         self.buffer_allocations
-                            .retain(|(_, identity), _| *identity != buffer);
+                            .retain(|(_, _, identity), _| *identity != buffer);
                         self.buffer_routes.retain(|identity, _| *identity != buffer);
                         self.cache_transfers.remove(&buffer);
                         self.transfer_products
@@ -254,7 +254,7 @@ impl WorkerExecutor {
         self.cache_transfers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
         self.buffer_allocations
-            .retain(|(_, buffer), _| buffer.owner != request || retained.contains(buffer));
+            .retain(|(_, _, buffer), _| buffer.owner != request || retained.contains(buffer));
         self.buffer_workers
             .retain(|buffer, _| buffer.owner != request || retained.contains(buffer));
     }

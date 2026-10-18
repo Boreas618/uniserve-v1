@@ -148,6 +148,7 @@ impl SimExecutor {
             executor_info: ExecutorInfo {
                 workers: vec![(WorkerId("sim".to_owned()), info.clone())],
                 video_codecs: BTreeMap::new(),
+                rank_buffer_bytes: BTreeMap::new(),
             },
             depth,
             to_worker,

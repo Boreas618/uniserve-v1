@@ -241,9 +241,7 @@ pub(super) fn allocate_storage(
     // lanes, one per request slot and unresolved call, on the primary
     // device where every binding computes.
     let devices = vec![config.device.memory()];
-    let physical = plan.physical_buffer_pool_bytes.max(1);
-    let buffer_pool =
-        BufferPool::allocate(physical, physical < plan.info.buffer_pool_bytes, &devices)?;
+    let buffer_pool = BufferPool::allocate(plan.info.buffer_pool_bytes.max(1), &devices)?;
     let tensors = ProductStore::new(
         plan.arena.device_product_bytes.max(1) as usize,
         plan.info.encoder_entry_bytes.max(1) as usize,

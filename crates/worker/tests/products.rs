@@ -48,19 +48,14 @@ fn allocation(product: &TensorRef, offset: u64, bytes: u64) -> BufferAllocation 
     }
 }
 
-fn store(
-    pool_bytes: u64,
-    compact: bool,
-    request_capacity: usize,
-    relay_depth: usize,
-) -> Result<ProductStore> {
+fn store(pool_bytes: u64, request_capacity: usize, relay_depth: usize) -> Result<ProductStore> {
     ProductStore::new(
         1024,
         1024,
         vec![CPU],
         request_capacity,
         relay_depth,
-        BufferPool::allocate(pool_bytes, compact, &[CPU])?,
+        BufferPool::allocate(pool_bytes, &[CPU])?,
         EventPool::new(),
     )
 }
@@ -139,7 +134,7 @@ fn publish(
 
 #[test]
 fn released_storage_returns_only_after_its_last_reader() -> Result<()> {
-    let store = store(256, false, 0, 0)?;
+    let store = store(256, 0, 0)?;
     let product = reference(1, 0, WireDType::F32, &[2, 3]);
     let buffer = persistent(&store, &product, allocation(&product, 0, 24), None)?;
     publish(&store, &buffer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
@@ -175,24 +170,8 @@ fn released_storage_returns_only_after_its_last_reader() -> Result<()> {
 }
 
 #[test]
-fn compact_pools_place_products_in_the_first_aligned_gap() -> Result<()> {
-    let store = store(1024, true, 0, 0)?;
-    let first = reference(1, 0, WireDType::F32, &[4]);
-    let second = reference(1, 1, WireDType::F32, &[4]);
-    let a = persistent(&store, &first, allocation(&first, 4096, 512), None)?;
-    let b = persistent(&store, &second, allocation(&second, 8192, 512), None)?;
-    assert_eq!(b.view().address() - a.view().address(), 256);
-
-    store.abandon_writes(std::slice::from_ref(&a))?;
-    let third = reference(2, 0, WireDType::F32, &[4]);
-    let c = persistent(&store, &third, allocation(&third, 0, 16), None)?;
-    assert_eq!(c.view().address(), a.view().address());
-    Ok(())
-}
-
-#[test]
 fn deferred_writes_stay_undiscoverable_until_produced_and_committed() -> Result<()> {
-    let store = store(256, false, 0, 0)?;
+    let store = store(256, 0, 0)?;
     let product = reference(1, 0, WireDType::F32, &[2]);
     let buffer = persistent(&store, &product, allocation(&product, 0, 8), None)?;
     store.defer_write(&buffer)?;
@@ -211,7 +190,7 @@ fn deferred_writes_stay_undiscoverable_until_produced_and_committed() -> Result<
 
 #[test]
 fn a_failed_group_binding_releases_every_group_of_the_call() -> Result<()> {
-    let store = store(256, false, 2, 1)?;
+    let store = store(256, 2, 1)?;
     let product = reference(1, 0, WireDType::F32, &[2]);
     let scalar = reference(1, 1, WireDType::I32, &[]);
     let allocations = HashMap::from([(product.buffer_id(), allocation(&product, 0, 8))]);
@@ -232,7 +211,7 @@ fn a_failed_group_binding_releases_every_group_of_the_call() -> Result<()> {
 
 #[test]
 fn relay_lanes_are_bounded_by_the_unresolved_window() -> Result<()> {
-    let store = store(256, false, 2, 1)?;
+    let store = store(256, 2, 1)?;
     let slots = HashMap::from([(request(), 1)]);
     let placement = OutputPlacement {
         request_slots: Some(&slots),
@@ -302,7 +281,7 @@ fn call(consumers: Vec<u32>) -> Call {
 
 #[test]
 fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Result<()> {
-    let store = store(1024, false, 0, 0)?;
+    let store = store(1024, 0, 0)?;
     let transports = transports(64)?;
     let product = reference(1, 0, WireDType::F32, &[4, 3]);
     // A shard holding rows [2, 4) of the logical [4, 3] tensor.
@@ -357,8 +336,8 @@ fn shard_exports_carry_their_logical_origin_and_failures_return_bytes() -> Resul
 
 #[test]
 fn imports_share_pending_reads_and_widen_resident_shards() -> Result<()> {
-    let producer = store(1024, false, 0, 0)?;
-    let consumer = store(1024, false, 0, 0)?;
+    let producer = store(1024, 0, 0)?;
+    let consumer = store(1024, 0, 0)?;
     let transports = transports(1024)?;
     let product = reference(1, 0, WireDType::F32, &[4, 3]);
     let values: Vec<f32> = (0..12).map(|value| value as f32).collect();

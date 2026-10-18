@@ -38,26 +38,12 @@ pub(crate) struct VideoCapacity {
     pub(crate) outputs: BTreeMap<String, Vec<OutputInfo>>,
 }
 
-/// The producer and consumer calls of video products.
-const EDGES: [(MediaCall, MediaCall); 10] = [
-    (MediaCall::MediaReading, MediaCall::VisionEncoding),
-    (MediaCall::MediaReading, MediaCall::LatentEncoding),
-    (MediaCall::VisionEncoding, MediaCall::TextEncoding),
-    (MediaCall::LatentEncoding, MediaCall::LatentPreparation),
-    (MediaCall::TextEncoding, MediaCall::LatentPreparation),
-    (MediaCall::Denoising, MediaCall::VideoDecoding),
-    (MediaCall::Denoising, MediaCall::AudioDecoding),
-    (MediaCall::VideoDecoding, MediaCall::VideoEncoding),
-    (MediaCall::AudioDecoding, MediaCall::AudioEncoding),
-    (MediaCall::VideoEncoding, MediaCall::Muxing),
-];
-
 /// The products every component of the deployment publishes: the model's
 /// own (the media timeline's and the text conditioning), the video codec's
 /// encoded unit rows and, for conditioned tasks, the media reader's
 /// condition media. Every rank plans them all, whichever components it
-/// holds, because the engine places a request's products in one logical
-/// buffer pool that every rank sizes alike.
+/// holds, and backs those of the components it executes or reads
+/// ([`local_product_bytes`]).
 pub(crate) fn outputs(
     model: &VideoModel,
     media: &MediaPlan,
@@ -121,20 +107,30 @@ fn encoded_units(model: &VideoModel, media: &MediaPlan) -> Result<OutputInfo> {
     })
 }
 
-/// Product bytes this rank retains per request: every product a component
-/// it holds publishes, or that a call it serves reads.
+/// Product bytes this rank backs per request: every product of a component
+/// it executes, or that a call it serves reads through the video graph's
+/// persistent product edges (`MediaCall::readers`). The engine places a
+/// request's products in this rank's pool by the same rule
+/// (`MediaStorage::new`).
 pub(crate) fn local_product_bytes(
     outputs: &BTreeMap<String, Vec<OutputInfo>>,
     routes: &BTreeMap<MediaCall, String>,
     held: &BTreeSet<String>,
 ) -> u64 {
     let mut consumers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (producer, consumer) in EDGES {
-        if let (Some(producer), Some(consumer)) = (routes.get(&producer), routes.get(&consumer)) {
-            consumers
-                .entry(producer.as_str())
-                .or_default()
-                .insert(consumer.as_str());
+    for producer in MediaCall::ALL {
+        let readers = producer
+            .readers()
+            .iter()
+            .filter(|reader| !reader.reads_resident_state());
+        for consumer in readers {
+            if let (Some(producer), Some(consumer)) = (routes.get(&producer), routes.get(consumer))
+            {
+                consumers
+                    .entry(producer.as_str())
+                    .or_default()
+                    .insert(consumer.as_str());
+            }
         }
     }
     outputs
@@ -240,11 +236,6 @@ impl VideoCapacity {
         local_product_bytes: u64,
         codec_ranks: Option<usize>,
     ) -> Result<MediaFacts> {
-        let product_bytes = self
-            .outputs
-            .values()
-            .map(|outputs| product_bytes(outputs))
-            .sum();
         let artifact_import_regions = match codec_ranks {
             Some(ranks) if ranks > 0 => {
                 let units = model.unit_frames(self.media.max_frames())?.len();
@@ -258,7 +249,6 @@ impl VideoCapacity {
             state_bytes: self.envelope.as_ref().map_or(0, StateEnvelope::slot_bytes)
                 + self.overlap_bytes,
             local_product_bytes,
-            product_bytes,
             latent: self.sampling.then(|| self.latent(slots)),
             stores_latent: self.envelope.is_some(),
             artifact_import_regions,

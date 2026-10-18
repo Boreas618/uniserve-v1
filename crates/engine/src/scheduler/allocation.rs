@@ -27,7 +27,8 @@ pub(super) struct Storage {
     pub(super) latent_pool: LatentPool,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(super) buffer_pool: BufferPool,
-    /// Per-worker row and buffer address spaces of the media workers.
+    /// Per-worker row address spaces and per-rank buffer address spaces of
+    /// the media workers.
     pub(super) media_storage: HashMap<crate::WorkerId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
@@ -70,15 +71,17 @@ impl Storage {
         Ok(())
     }
 
+    /// Returns `allocation` to the buffer pool of `rank` of `worker`.
     pub(super) fn free_media_buffer(
         &mut self,
         worker: &crate::WorkerId,
+        rank: u32,
         allocation: BufferSpan,
     ) -> Result<(), UnknownMediaWorker> {
         self.media_storage
             .get_mut(worker)
+            .and_then(|storage| storage.buffers.get_mut(rank as usize))
             .ok_or_else(|| UnknownMediaWorker(worker.clone()))?
-            .buffers
             .free(allocation);
         Ok(())
     }
@@ -216,50 +219,128 @@ pub(super) struct MediaAllocations {
     pub(super) request_slots: HashMap<crate::WorkerId, RequestSlot>,
 }
 
-/// A request reserves each declared result in every Worker address space on
-/// its route. Video ranges occupy disjoint slices of the temporal result,
-/// independent of decoder Worker width.
+/// A request reserves each declared result in the buffer pool of every rank
+/// that backs it, on every worker of its route. Video ranges occupy disjoint
+/// slices of the temporal result, independent of decoder Worker width.
 pub(super) struct MediaTensorAllocation {
-    pub(super) allocations: HashMap<crate::WorkerId, BufferSpan>,
+    /// The span on each backing rank, keyed by worker and rank.
+    pub(super) allocations: HashMap<(crate::WorkerId, u32), BufferSpan>,
     pub(super) dtype: DType,
     pub(super) shape_bound: ShapeBound,
 }
 
-/// Independent scheduler address space for one physical media WorkerGroup.
+/// Independent scheduler address spaces for one physical media WorkerGroup.
 /// Replicas intentionally reuse row numbers and byte offsets in their own
 /// processes; the worker identity keeps those physical addresses distinct.
+///
+/// Request rows are one address space for the group. Each rank has its own
+/// buffer pool, holding only the results of the components it executes and of
+/// the components that read them, so the pool the engine allocates from is
+/// the pool the rank backs.
 pub(super) struct MediaStorage {
     pub(super) requests: RequestPool,
-    pub(super) buffers: BufferPool,
+    /// The buffer address space of each rank, in rank order.
+    pub(super) buffers: Vec<BufferPool>,
+    /// The ranks that back the declared results of each component.
+    holders: HashMap<String, Vec<u32>>,
+}
+
+impl MediaStorage {
+    /// Builds the address spaces of a group whose ranks back `rank_bytes`.
+    ///
+    /// A rank backs a component's results when it is one of the component's
+    /// ranks in `components` or one of a reading component's, where readers
+    /// follow the video graph's persistent product edges
+    /// (`MediaCall::readers`) through the deployment's `routing`; the worker
+    /// sizes each rank's pool by the same rule. A group that declares no
+    /// components backs every result on every rank.
+    pub(super) fn new(
+        request_slots: usize,
+        rank_bytes: &[u64],
+        components: &[uniserve_ipc::ComponentInfo],
+        routing: &BTreeMap<MediaCall, String>,
+    ) -> Self {
+        let ranks = rank_bytes.len() as u32;
+        let placed = components
+            .iter()
+            .map(|component| (component.name.as_str(), &component.config.ranks))
+            .collect::<HashMap<_, _>>();
+        let holders = routing
+            .values()
+            .map(String::as_str)
+            .chain(placed.keys().copied())
+            .map(|name| {
+                let mut holding = BTreeSet::new();
+                if components.is_empty() {
+                    holding.extend(0..ranks);
+                }
+                let readers = routing
+                    .iter()
+                    .filter(|(_, component)| component.as_str() == name)
+                    .flat_map(|(call, _)| call.readers())
+                    .filter(|reader| !reader.reads_resident_state())
+                    .filter_map(|reader| routing.get(reader).map(String::as_str));
+                for component in std::iter::once(name).chain(readers) {
+                    if let Some(members) = placed.get(component) {
+                        holding.extend(members.iter().map(|rank| *rank as u32));
+                    }
+                }
+                holding.retain(|rank| *rank < ranks);
+                (name.to_owned(), holding.into_iter().collect())
+            })
+            .collect();
+        Self {
+            requests: RequestPool::new(request_slots),
+            buffers: rank_bytes
+                .iter()
+                .map(|bytes| BufferPool::new(*bytes))
+                .collect(),
+            holders,
+        }
+    }
+
+    /// The ranks that back the declared results of `component`, in rank
+    /// order; none for a component no route or placement names.
+    pub(super) fn holders(&self, component: &str) -> &[u32] {
+        self.holders.get(component).map_or(&[], Vec::as_slice)
+    }
 }
 
 impl MediaTensorAllocation {
-    /// Returns the span `product` occupies in `worker`'s reservation.
+    /// Returns the span `product` occupies in each reservation `worker`
+    /// holds, one per backing rank in rank order.
     ///
     /// A product covering part of the result starts `start_unit` units into
     /// it, where one unit is the product's bytes divided by its static leading
     /// dimension. With `start_unit` zero, or a leading dimension that is not
     /// static, the product binds at the start of the reservation.
-    ///
-    /// Panics when `worker` holds no reservation for this result.
     pub(super) fn bind(
         &self,
         product: &TensorRef,
         start_unit: u32,
         worker: &crate::WorkerId,
-    ) -> BufferAllocation {
-        let offset = self.allocations[worker].offset;
+    ) -> Vec<RankBuffer> {
         let unit_bytes = match product.shape_bound.dims.first() {
             Some(DimBound::Static(units)) if start_unit > 0 => {
                 product.max_bytes() / u64::from(*units)
             }
             _ => 0,
         };
-        BufferAllocation {
-            buffer: product.buffer_id(),
-            offset: offset + u64::from(start_unit) * unit_bytes,
-            bytes: product.max_bytes(),
-        }
+        let mut spans = self
+            .allocations
+            .iter()
+            .filter(|((owner, _), _)| owner == worker)
+            .map(|((_, rank), span)| RankBuffer {
+                rank: *rank,
+                allocation: BufferAllocation {
+                    buffer: product.buffer_id(),
+                    offset: span.offset + u64::from(start_unit) * unit_bytes,
+                    bytes: product.max_bytes(),
+                },
+            })
+            .collect::<Vec<_>>();
+        spans.sort_unstable_by_key(|span| span.rank);
+        spans
     }
 }
 
@@ -276,8 +357,8 @@ impl MediaAllocations {
     pub(super) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaWorker> {
         let mut released = Ok(());
         for tensor in self.tensors.into_values() {
-            for (worker, allocation) in tensor.allocations {
-                released = released.and(storage.free_media_buffer(&worker, allocation));
+            for ((worker, rank), allocation) in tensor.allocations {
+                released = released.and(storage.free_media_buffer(&worker, rank, allocation));
             }
         }
         for (worker, allocation) in self.request_slots {

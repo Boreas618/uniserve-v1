@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use super::registry::Registry;
 use super::{BatchSubmitError, RankProcess};
-use crate::executor::{WorkerExecError, WorkerFailure};
+use crate::executor::{RankBuffer, WorkerExecError, WorkerFailure};
 use anyhow::Context;
 use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
@@ -738,10 +738,15 @@ impl WorkerGroup {
     /// `readers` names, for the batch's routed media calls, the worker each
     /// consuming component was routed to; each call's products then name
     /// only those workers' reading ranks (see `media_consumer_slots`).
+    ///
+    /// `buffers` places the batch's persistent buffers in each rank's own
+    /// pool; a rank receives the spans of the buffers its calls read and
+    /// write. The batch itself carries no spans (`Batch::validate_unplaced`).
     pub fn submit_batch(
         &mut self,
         batch: Batch,
         readers: &CallReaders,
+        buffers: &[RankBuffer],
     ) -> Result<(), BatchSubmitError> {
         if self.closed {
             return Err(BatchSubmitError::Failed(anyhow::anyhow!(
@@ -763,13 +768,14 @@ impl WorkerGroup {
             return Err(BatchSubmitError::WouldBlock(Box::new(batch)));
         }
         batch
-            .validate()
+            .validate_unplaced()
             .map_err(anyhow::Error::from)
             .map_err(BatchSubmitError::Failed)?;
         let rank_batches = rank_projection(
             &batch,
             &self.process_args.components,
             self.workers.len(),
+            buffers,
             |call, members, rank| {
                 let routed = readers.get(&(call.request_key, call.call_id));
                 self.consumer_slots(call, routed, members, rank)

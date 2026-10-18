@@ -394,17 +394,19 @@ impl WorkerGroup {
         let mut info = workers[0].info().clone();
 
         // A rank's product storage follows the components it holds, which an
-        // asymmetric placement makes rank-specific: a rank that imports a
-        // component's product reserves the whole logical allocation for it,
-        // and a rank that neither produces nor consumes it reserves nothing.
-        // The group reports the smallest, because the engine places work
-        // against one pool per group and must not place more than the
-        // smallest rank can hold.
+        // asymmetric placement makes rank-specific: a rank that executes or
+        // reads a component backs the whole allocation of its products, and
+        // a rank that does neither backs nothing. The executor places media
+        // buffers rank by rank from each rank's own report
+        // (`ExecutorInfo::rank_buffer_bytes`). The runtime's shared pool is
+        // one layout every rank holds, so the group reports the smallest
+        // nonzero pool, which no rank that holds products falls short of.
         info.buffer_pool_bytes = workers
             .iter()
             .map(|worker| worker.info().buffer_pool_bytes)
+            .filter(|bytes| *bytes > 0)
             .min()
-            .unwrap_or(info.buffer_pool_bytes);
+            .unwrap_or(0);
 
         // A rank's transfer entries follow the products it imports, which
         // its components set; the group holds what its narrowest rank does.

@@ -29,19 +29,18 @@ struct Arena {
     active: HashMap<BufferId, Arc<BufferBinding>>,
 }
 
-/// Bind nonoverlapping ranges of fixed per-device arenas.
+/// Bind nonoverlapping ranges of fixed per-device arenas at the offsets the
+/// engine placed them, in the pool this rank backs.
 /// The owner serializes binding, view creation and release.
 pub struct BufferPool {
     byte_capacity: u64,
-    compact: bool,
     arenas: HashMap<MemoryKind, Arena>,
 }
 
 impl BufferPool {
-    fn new(byte_capacity: u64, compact: bool, arenas: HashMap<MemoryKind, Arc<Memory>>) -> Self {
+    fn new(byte_capacity: u64, arenas: HashMap<MemoryKind, Arc<Memory>>) -> Self {
         Self {
             byte_capacity,
-            compact,
             arenas: arenas
                 .into_iter()
                 .map(|(device, backing)| {
@@ -57,9 +56,8 @@ impl BufferPool {
         }
     }
 
-    /// Reserve a scheduler allocation and borrow its arena for view creation.
-    /// Compact pools use the first aligned physical gap; other pools retain
-    /// the scheduler offset. Release this handle if view creation fails.
+    /// Reserve a scheduler allocation at its offset and borrow its arena for
+    /// view creation. Release this handle if view creation fails.
     pub fn bind(
         &mut self,
         allocation: BufferAllocation,
@@ -83,12 +81,7 @@ impl BufferPool {
             ));
         }
 
-        let extent = if self.compact {
-            align(required)
-                .ok_or_else(|| Error::Invalid("buffer allocation byte extent overflows".into()))?
-        } else {
-            allocation.bytes
-        };
+        let extent = allocation.bytes;
         let arena = self.arenas.get_mut(&device).ok_or_else(|| {
             Error::Invalid("buffer allocation names an undeclared worker device".into())
         })?;
@@ -96,11 +89,7 @@ impl BufferPool {
             return Err(Error::Invalid("buffer allocation is already bound".into()));
         }
 
-        let start = if self.compact {
-            compact_offset(arena, extent, self.byte_capacity)?
-        } else {
-            allocation.offset
-        };
+        let start = allocation.offset;
         let end = start
             .checked_add(extent)
             .filter(|&end| end <= self.byte_capacity)
@@ -146,45 +135,12 @@ impl BufferPool {
     }
 }
 
-fn compact_offset(arena: &Arena, extent: u64, capacity: u64) -> Result<u64> {
-    let mut spans: Vec<_> = arena
-        .active
-        .values()
-        .map(|binding| (binding.physical_offset, binding.physical_bytes))
-        .collect();
-    spans.sort_unstable();
-
-    let mut cursor = 0;
-    for &(offset, bytes) in &spans {
-        if let Some(start) = align(cursor)
-            && start.checked_add(extent).is_some_and(|end| end <= offset)
-        {
-            return Ok(start);
-        }
-        cursor = cursor.max(offset + bytes);
-    }
-
-    align(cursor)
-        .filter(|&start| start.checked_add(extent).is_some_and(|end| end <= capacity))
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "physical buffer allocation exceeds the worker buffer pool: \
-                 {extent} bytes requested from {capacity} bytes with live spans {spans:?}",
-            ))
-        })
-}
-
-/// Match the 256-byte product alignment used by startup capacity accounting.
-fn align(bytes: u64) -> Option<u64> {
-    bytes.checked_add(255).map(|bytes| bytes / 256 * 256)
-}
-
 impl BufferPool {
     /// Allocate one arena of `byte_capacity` bytes per memory in `devices`.
     /// Device arenas are exportable
     /// allocations, so CUDA VMM exports of persistent products are made in
     /// place; host arenas serve CPU lanes. Contents are uninitialized.
-    pub fn allocate(byte_capacity: u64, compact: bool, devices: &[MemoryKind]) -> Result<Self> {
+    pub fn allocate(byte_capacity: u64, devices: &[MemoryKind]) -> Result<Self> {
         let bytes = usize::try_from(byte_capacity)
             .map_err(|_| Error::Invalid("buffer pool capacity overflows".into()))?;
         let arenas = devices
@@ -197,6 +153,6 @@ impl BufferPool {
                 Ok((device, arena))
             })
             .collect::<Result<_>>()?;
-        Ok(Self::new(byte_capacity, compact, arenas))
+        Ok(Self::new(byte_capacity, arenas))
     }
 }

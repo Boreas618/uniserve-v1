@@ -9,6 +9,7 @@ use anyhow::Context;
 use uniserve_ipc::Batch;
 
 use super::WorkerGroup;
+use crate::executor::RankBuffer;
 
 /// Refuses a placement whose muxer or media reader is not on the head's host.
 ///
@@ -213,12 +214,20 @@ impl WorkerGroup {
 /// Restrict a physical invocation to each component's actual members. Request and
 /// storage commands retain group-wide visibility, including on otherwise idle
 /// ranks; they do not create synthetic computation completions.
+///
+/// `placed` holds the persistent spans of each rank's own buffer pool; a
+/// rank's projection keeps those of the buffers its calls read and write.
 pub(super) fn rank_projection(
     batch: &Batch,
     components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
+    placed: &[RankBuffer],
     consumer_slots: impl Fn(&uniserve_ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
+    anyhow::ensure!(
+        batch.buffer_allocations.is_empty(),
+        "a group batch carries no buffer spans; each rank's spans arrive beside it"
+    );
     let members = batch
         .calls
         .iter()
@@ -335,9 +344,11 @@ pub(super) fn rank_projection(
             )
             .map(|product| product.buffer_id())
             .collect::<HashSet<_>>();
-        projection
-            .buffer_allocations
-            .retain(|allocation| buffers.contains(&allocation.buffer));
+        projection.buffer_allocations = placed
+            .iter()
+            .filter(|span| span.rank as usize == rank && buffers.contains(&span.allocation.buffer))
+            .map(|span| span.allocation)
+            .collect();
         if projection.calls.is_empty() && projection.commands.is_empty() {
             continue;
         }
