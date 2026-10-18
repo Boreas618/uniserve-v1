@@ -757,9 +757,9 @@ pub struct PlanLimits {
     /// declares it: the frame counts it generates and a reference video's
     /// encoded frames and latent units follow from it.
     pub frames: FrameClips,
-    /// The only canvases the deployment serves, those its workers prepare;
-    /// `None` serves every canvas the rules produce.
-    pub canvases: Option<Vec<Canvas>>,
+    /// The only canvases the deployment serves: those its workers prepare
+    /// and declare in their handshake.
+    pub canvases: Vec<Canvas>,
     /// How the deployment sizes references.
     pub references: ReferenceConfig,
 }
@@ -767,14 +767,10 @@ pub struct PlanLimits {
 impl PlanLimits {
     /// The `target.short_edge` values the deployment serves, in the order of
     /// its canvases: each served canvas's training-bucket short edge, or the
-    /// canvas rule's 768 for a canvas no bucket has and without restricted
-    /// canvases.
+    /// canvas rule's 768 for a canvas no bucket has.
     pub fn short_edges(&self) -> Vec<u32> {
-        let Some(canvases) = &self.canvases else {
-            return vec![CANVAS_SHORT_EDGE];
-        };
         let mut edges = Vec::new();
-        for &canvas in canvases {
+        for &canvas in &self.canvases {
             let edge = bucket_short_edge(canvas).unwrap_or(CANVAS_SHORT_EDGE);
             if !edges.contains(&edge) {
                 edges.push(edge);
@@ -1714,16 +1710,16 @@ pub fn served_canvases(limits: &PlanLimits) -> Vec<(u32, String, Canvas)> {
 }
 
 fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), VideoInputError> {
-    match &limits.canvases {
-        Some(canvases) if !canvases.contains(&size) => Err(VideoInputError::invalid(
-            RequestField::TargetAspectRatio,
-            format!(
-                "resolves to {}x{}, which this deployment does not serve",
-                size.width, size.height
-            ),
-        )),
-        _ => Ok(()),
+    if limits.canvases.contains(&size) {
+        return Ok(());
     }
+    Err(VideoInputError::invalid(
+        RequestField::TargetAspectRatio,
+        format!(
+            "resolves to {}x{}, which this deployment does not serve",
+            size.width, size.height
+        ),
+    ))
 }
 
 /// Applies every rule that needs no media, in a fixed order: the served task,
@@ -2232,14 +2228,30 @@ pub(super) mod tests {
         tail_latent_frames: 2,
     };
 
-    /// Limits that serve every task, duration and canvas the model does.
+    /// The canvases of the vectors' accepted requests: what a deployment that
+    /// prepares them all serves.
+    pub(in crate::video) fn vector_canvases() -> Vec<Canvas> {
+        let mut canvases = Vec::new();
+        for case in fixture()["requests"].as_array().unwrap() {
+            if let Some(expected) = case.get("expected") {
+                let canvas = size(&expected["canvas"]);
+                if !canvases.contains(&canvas) {
+                    canvases.push(canvas);
+                }
+            }
+        }
+        canvases
+    }
+
+    /// Limits that serve every task and duration the model does, at the
+    /// canvases of the vectors.
     pub(in crate::video) fn limits() -> PlanLimits {
         PlanLimits {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
             frame_rate: FRAME_RATE,
             frames: FRAMES,
-            canvases: None,
+            canvases: vector_canvases(),
             // The fixture's cases follow the released pipeline.
             references: ReferenceConfig::RELEASED,
         }
@@ -3062,17 +3074,17 @@ pub(super) mod tests {
         duration_seconds: Some(5.0),
     };
 
-    /// A restricted checkpoint serves only its canvases; others are rejected
-    /// on the aspect ratio before any media is needed.
+    /// A deployment serves only the canvases its workers prepare; others are
+    /// rejected on the aspect ratio before any media is needed.
     #[test]
-    fn checkpoint_canvases_restrict_the_target() {
+    fn prepared_canvases_restrict_the_target() {
         let fixture = fixture();
         let vision = vision(&fixture);
         let limits = PlanLimits {
-            canvases: Some(vec![Canvas {
+            canvases: vec![Canvas {
                 width: 1344,
                 height: 768,
-            }]),
+            }],
             ..limits()
         };
         let plan =
@@ -3097,7 +3109,7 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         let canvas = |width, height| Canvas { width, height };
         let served = PlanLimits {
-            canvases: Some(vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)]),
+            canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
             ..limits()
         };
         assert_eq!(served.short_edges(), vec![768, 480]);
@@ -3129,7 +3141,7 @@ pub(super) mod tests {
             assert_eq!(error.field(), Some(field), "{short_edge} {aspect_ratio}");
         }
 
-        // Without restricted canvases the canvas rule's 768 is the only
+        // A deployment that prepares only 768p canvases serves no other
         // short edge.
         let target = Target {
             short_edge: 480,

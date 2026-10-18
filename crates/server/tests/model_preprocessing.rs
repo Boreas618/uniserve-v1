@@ -13,7 +13,7 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::video::plan::ProcessorConfig;
+use uniserve_core::video::plan::{NAMED_ASPECT_RATIOS, ProcessorConfig, canvas};
 use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::VideoMediaSettings;
@@ -68,7 +68,10 @@ fn base_denoiser() -> VideoDenoiserInfo {
             clip_latent_frames: 5,
             tail_latent_frames: 2,
         },
-        canvases: Vec::new(),
+        canvases: NAMED_ASPECT_RATIOS
+            .iter()
+            .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
+            .collect(),
         max_sequence_rows: None,
     }
 }

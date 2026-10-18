@@ -289,8 +289,7 @@ pub struct VideoDenoiserInfo {
     /// frames the deployment generates and their decode units.
     pub frames: uniserve_core::FrameClips,
     /// The only canvases the deployment serves: those it prepares, in the
-    /// order it names them. Empty declares every canvas of the model's
-    /// canvas rule.
+    /// order it names them.
     pub canvases: Vec<uniserve_core::Canvas>,
     /// The checkpoint's packed sequence capacity in rows, when it has one.
     pub max_sequence_rows: Option<u32>,

@@ -17,10 +17,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use uniserve_core::video::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
-    MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
-    MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
-    ProcessorConfig, ReferenceConfig, Target,
+    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES,
+    MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES, MAX_VIDEO_SECONDS,
+    MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits, ProcessorConfig, ReferenceConfig, Target,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -90,6 +89,10 @@ impl VideoService {
         denoiser
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid video denoiser handshake: {error}"))?;
+        anyhow::ensure!(
+            !denoiser.canvases.is_empty(),
+            "invalid video denoiser handshake: the worker prepared no canvas"
+        );
         references.validate().map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
@@ -113,9 +116,7 @@ impl VideoService {
             max_video_seconds,
             frame_rate: denoiser.frame_rate,
             frames: denoiser.frames,
-            // An empty list means the denoiser generates every canvas of the
-            // canvas rule.
-            canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
+            canvases: denoiser.canvases.clone(),
             references,
         };
         Ok(Self {
@@ -195,9 +196,8 @@ impl VideoService {
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": named,
-                "free_aspect_range": [MIN_ASPECT_RATIO, MAX_ASPECT_RATIO],
                 "sizes": sizes,
-                "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
+                "canvases": self.denoiser.canvases,
             },
             "fps": self.denoiser.frame_rate,
             "audio_sample_rate": self.denoiser.audio_sample_rate,
@@ -337,7 +337,7 @@ mod tests {
     };
     use uniserve_engine::VideoDenoiserInfo;
 
-    use super::super::tests::{character_tokenizer, vision};
+    use super::super::tests::{character_tokenizer, served_canvases, vision};
     use super::VideoService;
     use crate::config::VideoMediaSettings;
     use crate::openai::VideoGenerationRequest;
@@ -372,7 +372,7 @@ mod tests {
                     clip_latent_frames: 5,
                     tail_latent_frames: 2,
                 },
-                canvases: Vec::new(),
+                canvases: served_canvases(),
                 max_sequence_rows,
             },
             vision(),
