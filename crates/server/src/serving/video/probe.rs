@@ -377,6 +377,8 @@ impl MediaProber {
         Ok(MediaFacts::Video(VideoFacts {
             display_width: video.display.0,
             display_height: video.display.1,
+            width: video.size.0,
+            height: video.size.1,
             frame_rate: video.frame_rate,
             frames,
             soundtrack,
@@ -641,7 +643,10 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VideoStream {
     index: u32,
+    /// The display aspect in lowest terms.
     display: (u64, u64),
+    /// The displayed size in pixels.
+    size: (u32, u32),
     frame_rate: FrameRate,
 }
 
@@ -750,6 +755,10 @@ fn video_streams(output: &ProbeOutput) -> Result<(VideoStream, Option<AudioStrea
     );
     let divisor = gcd(display.0, display.1);
     display = (display.0 / divisor, display.1 / divisor);
+    // The displayed size keeps the coded height and scales the width; coded
+    // sizes stay far below 2^53, so the arithmetic is exact up to rounding.
+    let scaled = f64::from(width) * f64::from(sample_width) / f64::from(sample_height);
+    let mut size = (scaled.round_ties_even() as u32, height);
     if let Some(rotation) = stream.rotation() {
         let turns = rotation / 90.0;
         if (turns - turns.round()).abs() > 1e-6 {
@@ -759,6 +768,7 @@ fn video_streams(output: &ProbeOutput) -> Result<(VideoStream, Option<AudioStrea
         }
         if turns.round().rem_euclid(2.0) == 1.0 {
             display = (display.1, display.0);
+            size = (size.1, size.0);
         }
     }
 
@@ -775,6 +785,7 @@ fn video_streams(output: &ProbeOutput) -> Result<(VideoStream, Option<AudioStrea
         VideoStream {
             index: stream.index,
             display,
+            size,
             frame_rate: FrameRate {
                 numerator,
                 denominator,
@@ -1064,8 +1075,8 @@ mod tests {
 
     const MOV: &str = "mov,mp4,m4a,3gp,3g2,mj2";
 
-    /// A video's display aspect follows its sample aspect ratio and display
-    /// rotation; its first audio stream is its soundtrack.
+    /// A video's display aspect and size follow its sample aspect ratio and
+    /// display rotation; its first audio stream is its soundtrack.
     #[test]
     fn video_streams_report_display_aspect_and_soundtrack() {
         let output = probe_output(json!({
@@ -1074,6 +1085,7 @@ mod tests {
         }));
         let (video, soundtrack) = video_streams(&output).unwrap();
         assert_eq!(video.display, (16, 9));
+        assert_eq!(video.size, (320, 180));
         assert_eq!(
             video.frame_rate,
             FrameRate {
@@ -1090,17 +1102,20 @@ mod tests {
             let output = probe_output(json!({"streams": [stream], "format": {"format_name": MOV}}));
             let (video, soundtrack) = video_streams(&output).unwrap();
             assert_eq!(video.display, (9, 16));
+            assert_eq!(video.size, (180, 320));
             assert!(soundtrack.is_none());
         }
         let legacy = h264(json!({"tags": {"rotate": "180"}}));
         let output = probe_output(json!({"streams": [legacy], "format": {"format_name": MOV}}));
         assert_eq!(video_streams(&output).unwrap().0.display, (16, 9));
 
-        // HEVC 352x288 at a 12:11 sample aspect displays at 4:3.
+        // HEVC 352x288 at a 12:11 sample aspect displays at 4:3, 384 pixels
+        // wide.
         let hevc = h264(json!({"codec_name": "hevc", "width": 352, "height": 288,
                                "sample_aspect_ratio": "12:11", "avg_frame_rate": "25/1"}));
         let output = probe_output(json!({"streams": [hevc], "format": {"format_name": MOV}}));
-        assert_eq!(video_streams(&output).unwrap().0.display, (4, 3));
+        let (video, _) = video_streams(&output).unwrap();
+        assert_eq!((video.display, video.size), ((4, 3), (384, 288)));
 
         // Cover art is not the video stream; an unknown average rate falls
         // back to the real base rate.
@@ -1253,6 +1268,8 @@ mod tests {
         let expected = MediaFacts::Video(VideoFacts {
             display_width: 16,
             display_height: 9,
+            width: 320,
+            height: 180,
             frame_rate: FrameRate {
                 numerator: 30000,
                 denominator: 1001,
@@ -1270,6 +1287,7 @@ mod tests {
             panic!("not a video");
         };
         assert_eq!((probed.display_width, probed.display_height), (9, 16));
+        assert_eq!((probed.width, probed.height), (180, 320));
 
         // An edit list that starts mid-GOP discards the leading frames; the
         // decoder's own count is the oracle.

@@ -18,7 +18,7 @@ use tvm_ffi::{Any, AnyView, Array, Function};
 use uniserve_core::video::plan::{
     self, AudioClip, AudioFacts, BUCKET_SHORT_EDGES, ConditionSpec, ConditionType, FrameRate,
     ImageFacts, MAX_VIDEO_SECONDS, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared,
-    RequestPlan, Role, Target, VideoFacts, VideoInputError, Vision, VisionConfig,
+    ReferenceConfig, RequestPlan, Role, Target, VideoFacts, VideoInputError, Vision, VisionConfig,
 };
 use uniserve_core::video::presentation::{self, Segment, Tokenizer};
 use uniserve_core::{Canvas, VideoTask};
@@ -223,9 +223,9 @@ fn vision_config(values: &[i64]) -> Result<VisionConfig> {
 
 /// The probed facts of one condition: `kind` is `image`, `video` or
 /// `audio`; `values` are an image's `[width, height]`, a video's
-/// `[display_width, display_height, rate_numerator, rate_denominator,
-/// frames]` followed by its soundtrack's `[sample_rate, samples]` when it has
-/// one, and an audio file's `[sample_rate, samples]`.
+/// `[display_width, display_height, width, height, rate_numerator,
+/// rate_denominator, frames]` followed by its soundtrack's `[sample_rate,
+/// samples]` when it has one, and an audio file's `[sample_rate, samples]`.
 fn media_facts(kind: &str, values: &[i64]) -> Result<MediaFacts> {
     let narrow =
         |value: i64| u32::try_from(value).map_err(|_| value_error("a media fact is out of range"));
@@ -246,6 +246,8 @@ fn media_facts(kind: &str, values: &[i64]) -> Result<MediaFacts> {
         (
             "video",
             &[
+                display_width,
+                display_height,
                 width,
                 height,
                 numerator,
@@ -263,8 +265,10 @@ fn media_facts(kind: &str, values: &[i64]) -> Result<MediaFacts> {
                 return Err(value_error("a video frame rate must be positive"));
             }
             Ok(MediaFacts::Video(VideoFacts {
-                display_width: wide(width)?,
-                display_height: wide(height)?,
+                display_width: wide(display_width)?,
+                display_height: wide(display_height)?,
+                width: narrow(width)?,
+                height: narrow(height)?,
                 frame_rate: FrameRate {
                     numerator: narrow(numerator)?,
                     denominator: narrow(denominator)?,
@@ -481,10 +485,11 @@ fn presentation_function(plan: RequestPlan) -> Function {
 ///   `None` when the request names none;
 /// - `conditions`: one list per condition in request order ([`condition`]);
 /// - `vision`: the seven values of [`video_vision_config`];
-/// - `limits`: `[tasks, max_seconds, canvases]`: the served task names, the
-///   longest served duration (`None` for the model's 15 seconds) and the
-///   only canvases served as `[width, height, ...]` (`None` for every
-///   canvas the rules produce).
+/// - `limits`: `[tasks, max_seconds, canvases, references]`: the served task
+///   names, the longest served duration (`None` for the model's 15
+///   seconds), the only canvases served as `[width, height, ...]` (`None`
+///   for every canvas the rules produce) and the reference sizing
+///   `[image_short_edge, enlarge]` (`plan::ReferenceConfig`).
 ///
 /// `plan` is `None` for a rejected request, otherwise `[sizes,
 /// duration_seconds, conditions, present]`: `sizes` are `[width, height,
@@ -499,8 +504,10 @@ fn video_plan(
     vision: Array<Any>,
     limits: Array<Any>,
 ) -> Result<Array<Any>> {
-    if target.len() != 3 || limits.len() != 3 {
-        return Err(value_error("a target and limits have three fields each"));
+    if target.len() != 3 || limits.len() != 4 {
+        return Err(value_error(
+            "a target has three fields and limits have four",
+        ));
     }
     let aspect_ratio = tvm_ffi::String::try_from(target.get(1)?)?;
     let target = Target {
@@ -542,6 +549,19 @@ fn video_plan(
                 })
                 .collect()
         })?,
+        references: {
+            let values = integers(limits.get(3)?)?;
+            let &[image_short_edge, enlarge] = values.as_slice() else {
+                return Err(value_error("references are [image_short_edge, enlarge]"));
+            };
+            let config = ReferenceConfig {
+                image_short_edge: u32::try_from(image_short_edge)
+                    .map_err(|_| value_error("a reference short edge is out of range"))?,
+                enlarge: enlarge != 0,
+            };
+            config.validate().map_err(|message| value_error(&message))?;
+            config
+        },
     };
 
     let planned = match plan::plan_request(
