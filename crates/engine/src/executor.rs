@@ -187,6 +187,28 @@ impl ExecutorInfo {
             .collect())
     }
 
+    /// Returns the media units one call of `call` covers at once: the ranks
+    /// of a distributed serving component times its `units_per_rank`, or one
+    /// for any other component, on the narrowest worker serving the call.
+    ///
+    /// Returns `None` when no worker serves `call`, or the width does not
+    /// fit in `u32`.
+    pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
+        self.workers
+            .iter()
+            .filter_map(|(worker, info)| {
+                let component = info.media_components.get(&call)?;
+                let config = self.component_config(worker, component)?;
+                let units = if config.distribution.is_some() {
+                    config.ranks.len() * config.units_per_rank.max(1)
+                } else {
+                    1
+                };
+                u32::try_from(units).ok()
+            })
+            .min()
+    }
+
     /// Derives the runtime's immutable capacity view from concrete pools.
     /// The returned value is not part of executor identity and is never
     /// reported as a physical worker.
@@ -1483,6 +1505,78 @@ mod tests {
         assert_eq!(routing.len(), 8);
         assert_eq!(routing[&MediaCall::VideoEncoding], "video_codec");
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
+    }
+
+    /// A distributed component's lane is its ranks times its units per rank,
+    /// an undistributed one's a single unit, and the narrowest replica binds;
+    /// a call no worker serves has no lane.
+    #[test]
+    fn media_lanes_count_the_units_one_call_covers() {
+        let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
+        let temporal = |ranks: Vec<usize>, units_per_rank: usize| ComponentConfig {
+            distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
+            units_per_rank,
+            ..parallel(ranks)
+        };
+        // A pool placing each named component as configured.
+        let pool =
+            |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, ComponentConfig)>| {
+                let (id, info) = media_pool(id, routes, 0);
+                let placement = PoolPlacement {
+                    queue_depth: 1,
+                    ranks: 8,
+                    components: configs
+                        .into_iter()
+                        .map(|(name, config)| (name.to_owned(), config))
+                        .collect(),
+                };
+                ((id.clone(), info), (id, placement))
+            };
+        let encoder = |id: &str, config: ComponentConfig| {
+            pool(
+                id,
+                &[(MediaCall::LatentEncoding, "latent_encoder")],
+                vec![("latent_encoder", config)],
+            )
+        };
+        let lanes = |pools: Vec<((WorkerId, WorkerInfo), (WorkerId, PoolPlacement))>| {
+            let (workers, placements) = pools.into_iter().unzip();
+            ExecutorInfo {
+                workers,
+                placements,
+                ..ExecutorInfo::default()
+            }
+            .media_lane_units(MediaCall::LatentEncoding)
+        };
+
+        assert_eq!(
+            lanes(vec![encoder("a", temporal((0..4).collect(), 1))]),
+            Some(4)
+        );
+        assert_eq!(
+            lanes(vec![encoder("a", temporal((0..4).collect(), 2))]),
+            Some(8)
+        );
+        assert_eq!(
+            lanes(vec![
+                encoder("a", temporal((0..4).collect(), 1)),
+                encoder("b", temporal((0..2).collect(), 1)),
+            ]),
+            Some(2)
+        );
+        assert_eq!(
+            lanes(vec![encoder("a", parallel((0..4).collect()))]),
+            Some(1)
+        );
+
+        assert_eq!(
+            lanes(vec![pool(
+                "a",
+                &[(MediaCall::Denoising, "denoiser")],
+                Vec::new()
+            )]),
+            None
+        );
     }
 
     /// A deployment whose denoiser serves a conditioned task must place the

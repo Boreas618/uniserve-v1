@@ -173,6 +173,11 @@ class TiledEncoder(nn.Module):
     Tiles are encoded one after another: an encoder's activations at input
     resolution dominate its memory, so the peak stays that of one tile
     whatever the raster.
+
+    A band of latent rows can be encoded on its own: only the tile rows the
+    band's latents depend on are encoded and stitched, with the same tile
+    grid and arithmetic as the whole raster, so separate callers can encode
+    the bands of one raster and their rows equal the whole encoding's exactly.
     """
 
     def __init__(
@@ -199,14 +204,27 @@ class TiledEncoder(nn.Module):
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encoder(pixels)
 
-    def encode(self, pixels: torch.Tensor, *, tiled: bool) -> torch.Tensor:
+    def encode(
+        self, pixels: torch.Tensor, *, tiled: bool, rows: slice | None = None
+    ) -> torch.Tensor:
         """Encode ``[..., height, width]`` pixels into ``[..., h, w]`` latents.
 
         The raster must align with the spatial compression ratio when tiled.
+        ``rows`` keeps latent rows ``rows.start`` to ``rows.stop`` of the
+        ``h`` axis of a tiled encoding and encodes only the tile rows they
+        depend on; the result equals those rows of the whole encoding
+        exactly. None keeps every row.
+
+        Raises:
+            ValueError: The raster is empty or misaligned, ``rows`` is given
+                to an untiled encoding, or it is empty, stepped or outside
+                the latent raster.
         """
         if pixels.ndim < 3 or pixels.shape[0] < 1:
             raise ValueError("tiled encoding requires a nonempty raster")
         if not tiled:
+            if rows is not None:
+                raise ValueError("a band of latent rows needs a tiled encoding")
             return self(pixels)
 
         ratio = self.spatial_compression
@@ -216,24 +234,59 @@ class TiledEncoder(nn.Module):
         x_indices, x_lengths, x_overlaps = split_tiles(
             int(pixels.shape[-1]), self.tile_width, self.overlap_width, ratio
         )
-        rows = [
+        latent_height = int(pixels.shape[-2]) // ratio
+        if rows is None:
+            rows = slice(0, latent_height)
+        if (
+            rows.step not in (None, 1)
+            or rows.start is None
+            or rows.stop is None
+            or not 0 <= rows.start < rows.stop <= latent_height
+        ):
+            raise ValueError(
+                f"latent rows {rows} must be a nonempty run of the "
+                f"{latent_height} latent rows"
+            )
+
+        # After stitching, tile row i owns latent rows owned[i] to
+        # owned[i + 1]; the first ``overlap / ratio`` of them cross-fade with
+        # tile row i - 1, which is encoded too when the band starts there.
+        owned = [position // ratio for position in y_indices] + [latent_height]
+        first = max(
+            index
+            for index in range(len(y_indices))
+            if owned[index] <= rows.start
+        )
+        last = max(
+            index for index in range(len(y_indices)) if owned[index] < rows.stop
+        )
+        begin = first
+        if first and rows.start < owned[first] + y_overlaps[first - 1] // ratio:
+            begin = first - 1
+
+        tiles = [
             [
                 self(
                     pixels[
                         ...,
-                        y_pos : y_pos + y_length,
+                        y_indices[row] : y_indices[row] + y_lengths[row],
                         x_pos : x_pos + x_length,
                     ]
                 )
                 for x_pos, x_length in zip(x_indices, x_lengths, strict=True)
             ]
-            for y_pos, y_length in zip(y_indices, y_lengths, strict=True)
+            for row in range(begin, last + 1)
         ]
 
         # Pixel overlaps are multiples of the ratio, so every seam spans whole
-        # latent positions.
-        return stitch_tiles(
-            rows,
-            [overlap // ratio for overlap in y_overlaps],
+        # latent positions. Stitching a run of tile rows performs the whole
+        # raster's blends of those rows, since each blend reads only the
+        # unmodified tile above or to the left; the run's last row keeps its
+        # lower overlap, which the crop removes with any rows past the band.
+        stitched = stitch_tiles(
+            tiles,
+            [overlap // ratio for overlap in y_overlaps[begin:last]],
             [overlap // ratio for overlap in x_overlaps],
         )
+        offset = owned[begin]
+        return stitched[..., rows.start - offset : rows.stop - offset, :]

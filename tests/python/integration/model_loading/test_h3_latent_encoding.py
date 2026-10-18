@@ -4,7 +4,8 @@ The released video and audio VAE encoders load through the public loader and
 encode a keyframe, a portrait reference image, a multi-clip reference video
 and mono and stereo soundtracks; the native diffusers modules, driven by the
 MiniMax-H3 pipeline's own conditioning helpers, give the reference values.
-Video units are encoded in separate calls, as separate ranks encode them.
+Video units, and the row bands of a reference image, are encoded in separate
+calls, as separate ranks encode them.
 """
 
 import json
@@ -238,6 +239,32 @@ def test_video_conditioning_matches_native_encoding(
     torch.testing.assert_close(
         assembled.cpu(), expected, rtol=FP16_ULP, atol=FP16_ULP
     )
+
+
+def test_reference_image_bands_match_the_whole_encoding(video_encoders):
+    """A reference image encoded in bands equals its whole encoding exactly.
+
+    A 16:9 reference at its 2048-pixel short edge, 64 rows of 32-pixel
+    patches, is split into the four bands of 16 patch rows a four-rank latent
+    encoder takes, each encoded in its own call; the assembled rows are the
+    single call's bit for bit.
+    """
+    encoder, _ = video_encoders
+    frame = image.Config(2048, 3648)
+    pixels = _frames(1, frame.height, frame.width, seed=2048)
+    with torch.inference_mode():
+        (whole,) = encoder.encode(
+            (pixels,), frames=(slice(0, 1),), num_frames=(1,)
+        )
+        assembled = torch.full_like(whole.tensor, torch.nan)
+        group = encoder.row_group
+        for band in range(4):
+            rows = slice(band * 16 * group, (band + 1) * 16 * group)
+            (result,) = encoder.encode(
+                (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+            )
+            assembled[result.layout.local_slice] = result.tensor
+    assert torch.equal(assembled, whole.tensor)
 
 
 def _track(num_samples: int, channels: int, seed: int):
