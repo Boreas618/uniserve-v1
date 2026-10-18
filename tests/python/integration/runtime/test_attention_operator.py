@@ -158,6 +158,64 @@ def test_paged_attention_observes_updates_and_mutated_block_tables(quantized):
     torch.testing.assert_close(out, _expected(q, keys, values))
 
 
+def test_a_padded_bucket_reads_the_padding_unit_for_uncovered_pages():
+    # A graph bucket pads its live rows with one sequence over the sentinel
+    # unit: its table row is cleared, its queries are the bucket's padding
+    # tokens and its writes are skipped. The bucket runs eagerly once before
+    # its capture, so the padding row's key span can exceed its table:
+    # here one page covers the live row, and the padding row's three
+    # tokens span two.
+    config = mha.Config(1, 4, (0,), torch.float32)
+    cache = UnitPool.allocate(
+        Config({"attention": config}),
+        num_units=3,
+        block_size=2,
+        device="cpu",
+    )
+    state = cache.state("attention")
+    operator = _operator(state)
+    key = torch.arange(12).reshape(3, 1, 4).float() / 4
+    value = key + 1
+    state.write((1,), start=0, key=key[:1], value=value[:1])
+    live = PagedInput.from_blocks(
+        blocks=((1,),),
+        query_lengths=(1,),
+        prefix_lengths=(1,),
+        block_size=2,
+        causal=True,
+        device="cpu",
+    )
+    padding = 3
+    batch = PagedInput(
+        SequenceLengths.from_lengths((1, padding), device="cpu"),
+        SequenceLengths.from_lengths((1, 0), device="cpu"),
+        BlockTable(
+            torch.cat(
+                (
+                    live.block_table.indices,
+                    torch.zeros_like(live.block_table.indices),
+                )
+            ),
+            2,
+        ),
+        torch.cat(
+            (live.slot_mapping, torch.full((padding,), -1, dtype=torch.int64))
+        ),
+        (True, True),
+    )
+    q = torch.ones(1 + padding, 2, 4)
+    k = torch.cat((key[1:2], torch.zeros(padding, 1, 4)))
+    v = torch.cat((value[1:2], torch.zeros(padding, 1, 4)))
+    out = torch.empty_like(q)
+    operator.bind(batch)
+    operator(q, k, v, batch, scale=0.5, out=out)
+    keys, values = state.read((1,), start=0, length=2)
+    torch.testing.assert_close(out[:1], _expected(q[:1], keys, values))
+    # The padding row's outputs are discarded; they are finite reads of the
+    # sentinel unit.
+    assert torch.isfinite(out[1:]).all()
+
+
 @pytest.mark.parametrize("prefix_length", [0, 1, 2, 3])
 def test_segmented_attention_merges_visible_current_tokens_with_prefix(
     prefix_length,
