@@ -242,8 +242,8 @@ pub(super) fn validate_and_order_rank_report(
     Ok(())
 }
 
-/// Merge one participant into the output owner's result. Accepted progress and
-/// allocation generations agree; cache exports contribute immutable rank locations.
+/// Merge one participant into the output owner's result. Accepted progress
+/// agrees; cache exports contribute immutable rank locations.
 fn merge_completion_record(
     canonical: &mut CallResult,
     rank_completion: &CallResult,
@@ -257,7 +257,6 @@ fn merge_completion_record(
         canonical.output.committed_tokens.as_slice()
             == rank_completion.output.committed_tokens.as_slice()
             && canonical.output.status == rank_completion.output.status
-            && canonical.output.position == rank_completion.output.position
             && canonical.output.cache_visible_len == rank_completion.output.cache_visible_len
             && canonical.output.cache_computed_len == rank_completion.output.cache_computed_len
             && canonical.output.num_completed_steps == rank_completion.output.num_completed_steps
@@ -271,10 +270,6 @@ fn merge_completion_record(
             && rank_completion.output.prompt_logprobs.is_empty()
             && rank_completion.output.candidate_logprobs.is_empty(),
         "non-designated rank returned public output"
-    );
-    anyhow::ensure!(
-        canonical.output.product_generations == rank_completion.output.product_generations,
-        "designated-rank product generations diverged"
     );
     match (
         &mut canonical.output.cache_output,

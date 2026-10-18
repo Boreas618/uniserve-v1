@@ -591,7 +591,7 @@ fn failed_output(
                 .map(|request| request.progress())
                 .transpose()?
                 .unwrap_or_default();
-            let mut output = request_output(key, call.call_id, call.code, progress)?;
+            let mut output = request_output(key, call.call_id, progress)?;
             output.status = CallStatus::Error;
             output.error_code = Some(code);
             Ok(output)

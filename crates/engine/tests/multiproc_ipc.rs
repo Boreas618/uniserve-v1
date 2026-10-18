@@ -1085,7 +1085,6 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     // The first chunk scores its second token only.
     assert_eq!(first_record.prompt_logprobs.len(), 1);
     assert_eq!(first_record.prompt_logprobs[0][0].token_id, 8);
-    assert_eq!(first_record.position, 2);
     assert_eq!(first_record.cache_visible_len, 2);
 
     // A repeated or conflicting batch id is refused before submission.
@@ -1123,7 +1122,7 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     let record = &continued.results[0].output;
     assert_eq!(record.status, CallStatus::Ok);
     assert_eq!(record.committed_tokens, vec![1001]);
-    assert_eq!(record.position, 3);
+    assert_eq!(record.cache_visible_len, 3);
     assert!(record.sampled_logprob.is_some());
     assert_eq!(record.top_logprobs[0].token_id, 1001);
     assert!(record.prompt_logprobs.is_empty());
@@ -1402,7 +1401,6 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     assert_eq!(outputs[&verify_id].cache_computed_len, 5);
     assert_eq!(outputs[&resumed_id].committed_tokens, vec![1002]);
     assert_eq!(outputs[&resumed_id].cache_visible_len, 4);
-    assert_eq!(outputs[&resumed_id].position, 4);
     executor.close()?;
     Ok(())
 }
@@ -4515,14 +4513,8 @@ fn media_rank() -> anyhow::Result<()> {
                             request_key: call.request_key,
                             call_id: call.call_id,
                             status: CallStatus::Ok,
-                            product_generations: call
-                                .tensor_outputs()
-                                .map(|output| output.generation)
-                                .collect(),
                             error_code: None,
                             timing_counters: Default::default(),
-                            code: call.code,
-                            position: call.coordinates.logical_position + length,
                             cache_visible_len: call.coordinates.cache_visible_len + length,
                             cache_computed_len: call.coordinates.cache_computed_len + length,
                             num_completed_steps: 0,
@@ -4737,11 +4729,11 @@ fn image_admission(
     Ok(admission)
 }
 
-/// The coordinates a call entering after `output` executes at, as the engine
-/// derives them from the completion it observed.
+/// The coordinates a call entering after `output` executes at, for a request
+/// whose completions advance its logical position with its visible cache.
 fn coordinates_after(output: &uniserve_ipc::RequestOutput) -> CallCoordinates {
     CallCoordinates {
-        logical_position: output.position,
+        logical_position: output.cache_visible_len,
         cache_visible_len: output.cache_visible_len,
         cache_computed_len: output.cache_computed_len,
         flow_step: output.num_completed_steps,

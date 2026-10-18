@@ -101,16 +101,10 @@ pub struct RequestOutput {
     pub call_id: CallId,
     /// Terminal execution status.
     pub status: CallStatus,
-    /// Allocation generations for products emitted by the call.
-    pub product_generations: Vec<u32>,
     /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
-    /// Kind that produced this result; must match the submitted call.
-    pub code: CallKind,
-    /// Model position for the next input, including image-feedback position advances.
-    pub position: u32,
     /// Accepted cache prefix available to a successor.
     pub cache_visible_len: u32,
     /// Cache extent initialized by execution, including rejected speculative positions.
@@ -137,7 +131,13 @@ pub struct RequestOutput {
 }
 
 impl RequestOutput {
-    /// Validates completion identity, status, accepted lengths, and product generations.
+    /// Validates completion identity, status, accepted lengths, and the
+    /// ownership of a cache export.
+    ///
+    /// Rules that relate a completion to the kind of the call it answers
+    /// belong to the engine, which holds the call: a cache export answers a
+    /// successful cache-export call, and candidate log-probabilities a
+    /// successful token-denoising call.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.call_id.batch_id > 0,
@@ -147,7 +147,6 @@ impl RequestOutput {
             export.validate()?;
             ensure_valid!(
                 self.status == CallStatus::Ok
-                    && self.code == CallKind::Transfer(TransferMode::CacheExport)
                     && export.source.owner == self.request_key
                     && export.source.producer_call_id == self.call_id,
                 "cache export does not belong to its successful completion"
@@ -169,14 +168,12 @@ impl RequestOutput {
             ),
         }
         ensure_valid!(
-            self.candidate_logprobs.is_empty()
-                || (self.status == CallStatus::Ok
-                    && self.code == CallKind::Forward(ForwardMode::TokenDenoising)),
-            "candidate log-probabilities belong to a successful token-denoising completion"
+            self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
+            "candidate log-probabilities belong to a successful completion"
         );
         if self.status == CallStatus::Predicated {
             ensure_valid!(
-                self.committed_tokens.as_slice().is_empty() && self.product_generations.is_empty(),
+                self.committed_tokens.as_slice().is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
             ensure_valid!(
