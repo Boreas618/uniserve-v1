@@ -340,16 +340,14 @@ impl PrefixCache {
     }
 
     /// Prepare newly assigned units for a new owner on `column`'s stream.
-    /// Fails if an export, import or execution still overlaps any of them.
+    /// Fails if an export, import or execution still overlaps any of them,
+    /// or a unit lies outside the pool (`UnitColumn::recycle`).
     pub fn recycle(
         &mut self,
         units: &[u32],
         column: &UnitColumn,
         stream: impl Issue,
     ) -> Result<()> {
-        if units.iter().collect::<HashSet<_>>().len() != units.len() {
-            return Err(Error::Invalid("recycled cache units repeat a unit".into()));
-        }
         let unit_tokens = self.plan().unit_tokens();
         let spans: Vec<_> = units.iter().map(|&unit| (unit, 0, unit_tokens)).collect();
         self.accesses.require_reusable(&spans)?;

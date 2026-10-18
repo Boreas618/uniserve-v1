@@ -704,11 +704,8 @@ impl Recorded {
         plan: &BatchPlan,
         located: &Located,
     ) -> Result<()> {
-        {
-            let output = lock(&self.batch.buffer);
-            for (state, call) in self.batch.calls.iter().zip(&plan.calls) {
-                state.output.validate_output(&output, call)?;
-            }
+        for (state, call) in self.batch.calls.iter().zip(&plan.calls) {
+            state.output.validate_output(call)?;
         }
         located.publications.validate(&storage.tensors)?;
         prefix_cache::validate(storage, &located.published, &self.installations)

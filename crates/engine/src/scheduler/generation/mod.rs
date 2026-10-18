@@ -101,9 +101,9 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 /// row's entries are its own token, the requested top-k candidates
 /// (`n_logprobs` or `n_prompt_logprobs`), and the distinct ids of
 /// `logprob_token_ids`. A call reports at most one generated row and
-/// `prompt_positions` prompt rows. The worker's `PendingOutput::validate_output`
-/// measures its actual payload the same way and rejects one above
-/// `max_completion_bytes`.
+/// `prompt_positions` prompt rows. The worker leases a batch's completion
+/// storage from the sum of its calls' `max_completion_bytes` and refuses a
+/// capture beyond its lease.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
     prompt_positions: u32,
