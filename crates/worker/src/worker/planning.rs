@@ -20,7 +20,7 @@ use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::ffi::DType;
 use crate::parallel::world::World;
-use crate::runner::causal_lm::start::{TextBounds, reserved_bytes};
+use crate::runner::causal_lm::start::reserved_bytes;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::diffusion_lm::{self};
@@ -322,20 +322,7 @@ pub(super) fn plan(
     } else {
         None
     };
-    let mut plan = layout.finish(config, cache);
-    if let (Some(cache), Some(info)) = (&plan.cache, &plan.info.prefix_cache) {
-        // Batches never exceed the largest captured graph bucket.
-        let bounds = TextBounds::new(
-            config,
-            plan.info.request_slots as usize,
-            cache,
-            Some(info.num_units),
-            device.is_cuda(),
-        )?;
-        let (prefill, decode) = bounds.graph_calls();
-        plan.bound_graph_calls(prefill, decode);
-    }
-    Ok((plan, None))
+    Ok((layout.finish(config, cache), None))
 }
 
 /// The layout of a video rank: request slots sized by every rank's storage

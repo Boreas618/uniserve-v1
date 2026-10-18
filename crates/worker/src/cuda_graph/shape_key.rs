@@ -230,9 +230,13 @@ impl TextShapes {
         &self.prefill
     }
 
-    /// Return `(rows, tokens, decode, outputs)`, or None for eager prefill.
-    /// Decode never borrows a prefill bucket. A cache-only prefill uses a
-    /// hidden-state graph only when no cache-only graph family was captured.
+    /// Return `(rows, tokens, decode, outputs)` of the smallest captured
+    /// bucket that holds the forward, or None when no bucket holds it: the
+    /// forward then runs eagerly, as every forward does without graphs. The
+    /// capture catalog is therefore no bound on the batches the engine
+    /// forms. Decode never borrows a prefill bucket. A cache-only prefill
+    /// uses a hidden-state graph only when no cache-only graph family was
+    /// captured.
     pub(crate) fn select(
         &self,
         forward: &TextForward<'_>,
@@ -253,40 +257,32 @@ impl TextShapes {
             ));
         }
         if decode && queries.iter().all(|&length| length == 1) {
-            if causal == Some(true)
-                && last_logits
-                && let Some(&size) = self.decode.iter().find(|&&size| size >= rows)
-            {
-                return Ok(Some((size, size, true, true)));
+            if causal != Some(true) || !last_logits {
+                return Ok(None);
             }
-            return Err(Error::Invalid(format!(
-                "no decode graph for {rows} rows; configured maximum is {} rows",
-                self.decode.iter().copied().max().unwrap_or(0)
-            )));
+            return Ok(self
+                .decode
+                .iter()
+                .find(|&&size| size >= rows)
+                .map(|&size| (size, size, true, true)));
         }
 
         let outputs = !(cache_only && self.cache_only);
-        if outputs && !self.outputs {
+        if (outputs && !self.outputs) || queries.contains(&0) {
             return Ok(None);
         }
-        if !queries.contains(&0)
-            && let Some(shape) = self
-                .prefill
-                .iter()
-                .filter(|shape| {
-                    shape.outputs == outputs
-                        && shape.causal == causal
-                        && shape.embeddings == embeddings
-                        && shape.row_bucket > rows
-                        && shape.token_bucket >= tokens
-                })
-                .min_by_key(|shape| (shape.row_bucket, shape.token_bucket))
-        {
-            return Ok(Some((shape.row_bucket, shape.token_bucket, false, outputs)));
-        }
-        Err(Error::Invalid(format!(
-            "no prefill graph for {rows} rows and {tokens} tokens with causal={causal:?}, embeddings={embeddings} and outputs={outputs}"
-        )))
+        Ok(self
+            .prefill
+            .iter()
+            .filter(|shape| {
+                shape.outputs == outputs
+                    && shape.causal == causal
+                    && shape.embeddings == embeddings
+                    && shape.row_bucket > rows
+                    && shape.token_bucket >= tokens
+            })
+            .min_by_key(|shape| (shape.row_bucket, shape.token_bucket))
+            .map(|shape| (shape.row_bucket, shape.token_bucket, false, outputs)))
     }
 }
 
@@ -357,6 +353,10 @@ mod tests {
         }
     }
 
+    /// A decode takes the first configured size that holds it and never a
+    /// prefill bucket; a decode no size holds, or one no decode graph
+    /// computes (non-causal rows, outputs other than the last logits), runs
+    /// eagerly.
     #[test]
     fn decode_keeps_configured_order_and_never_uses_prefill_capacity() -> Result<()> {
         let shapes = TextShapes::new(vec![8, 4, 16], vec![prefill(32, 64, Some(true), true)]);
@@ -368,35 +368,27 @@ mod tests {
             })?,
             Some((8, 8, true, true))
         );
-        assert!(
-            shapes
-                .select(&TextForward {
-                    queries: &[1; 17],
-                    tokens: 17,
-                    ..DECODE
-                })
-                .is_err()
-        );
-        assert!(
-            shapes
-                .select(&TextForward {
-                    queries: &[1],
-                    tokens: 1,
-                    causal: Some(false),
-                    ..DECODE
-                })
-                .is_err()
-        );
-        assert!(
-            shapes
-                .select(&TextForward {
-                    queries: &[1],
-                    tokens: 1,
-                    last_logits: false,
-                    ..DECODE
-                })
-                .is_err()
-        );
+        for forward in [
+            TextForward {
+                queries: &[1; 17],
+                tokens: 17,
+                ..DECODE
+            },
+            TextForward {
+                queries: &[1],
+                tokens: 1,
+                causal: Some(false),
+                ..DECODE
+            },
+            TextForward {
+                queries: &[1],
+                tokens: 1,
+                last_logits: false,
+                ..DECODE
+            },
+        ] {
+            assert_eq!(shapes.select(&forward)?, None);
+        }
         Ok(())
     }
 
@@ -446,20 +438,32 @@ mod tests {
             })?,
             Some((8, 16, false, true))
         );
+        // Embedding rows and rows beyond every bucket have no graph and run
+        // eagerly.
+        for forward in [
+            TextForward {
+                queries: &[2],
+                tokens: 2,
+                embeddings: true,
+                ..PREFILL
+            },
+            TextForward {
+                queries: &[1; 8],
+                tokens: 8,
+                ..PREFILL
+            },
+            TextForward {
+                queries: &[0],
+                tokens: 0,
+                ..PREFILL
+            },
+        ] {
+            assert_eq!(shapes.select(&forward)?, None);
+        }
         assert!(
             shapes
                 .select(&TextForward {
-                    queries: &[2],
-                    tokens: 2,
-                    embeddings: true,
-                    ..PREFILL
-                })
-                .is_err()
-        );
-        assert!(
-            shapes
-                .select(&TextForward {
-                    queries: &[0],
+                    queries: &[],
                     tokens: 0,
                     ..PREFILL
                 })
