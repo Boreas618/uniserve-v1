@@ -81,9 +81,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 5.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w1.load]
 num_prompts = 8
@@ -110,9 +107,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 15.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w2.load]
 num_prompts = 4
@@ -152,9 +146,6 @@ task = "fl2va"
 aspect_ratio = "auto"
 seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-w3.load]
 num_prompts = 8
@@ -195,9 +186,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-reference-w4.load]
 num_prompts = 8
@@ -225,9 +213,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-reference-w5.load]
 num_prompts = 8
@@ -268,9 +253,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-omniref-w4.load]
 num_prompts = 8
@@ -298,9 +280,6 @@ task = "ref2va"
 aspect_ratio = "auto"
 seconds = 5.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 9
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-4-omniref-w5.load]
 num_prompts = 8
@@ -403,9 +382,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 5.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-w1.load]
 num_prompts = 8
@@ -432,9 +408,6 @@ endpoint = "/v1/videos/sync"
 task = "t2va"
 aspect_ratio = "16:9"
 seconds = 15.0
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 [benchmarks.gb200-8-w2.load]
 num_prompts = 4
@@ -991,9 +964,6 @@ task = "fl2va"
 aspect_ratio = "auto"
 seconds = 8.0
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-num_inference_steps = 50
-flow_shift = 12.0
-audio_flow_shift = 3.0
 
 
 [benchmarks.gb200-8-w3.load]
