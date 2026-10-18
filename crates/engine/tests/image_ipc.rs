@@ -178,7 +178,6 @@ fn request(
         cache: Default::default(),
         image_generation: policy(feedback),
         readout: Vec::new(),
-        canvas: None,
     }
 }
 

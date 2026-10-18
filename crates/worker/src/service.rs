@@ -493,7 +493,6 @@ mod tests {
             negative_token_ids: Vec::new(),
             finish_token_ids: Vec::new(),
             initial_position: 0,
-            canvas: None,
         };
         let request = NewRequest::new(
             RequestKey::new(1, RequestId(id), 1),

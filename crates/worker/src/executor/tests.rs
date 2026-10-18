@@ -83,7 +83,6 @@ fn start(key: RequestKey, slot: u32) -> Result<BatchCommand> {
         negative_token_ids: Vec::new(),
         finish_token_ids: Vec::new(),
         initial_position: 0,
-        canvas: None,
     };
     let request = NewRequest::new(key, slot, Some(ar), None, 0)
         .map_err(|error| Error::Invalid(error.to_string()))?;
