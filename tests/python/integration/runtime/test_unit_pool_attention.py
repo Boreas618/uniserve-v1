@@ -41,6 +41,7 @@ from uniserve.nn.attention import (
 )
 from uniserve.prefix_cache import Config, mha
 from uniserve.prefix_cache.units import UnitPool
+from uniserve.quantization import Quantizer
 
 pytestmark = [
     pytest.mark.integration,
@@ -487,4 +488,32 @@ def test_windowed_layers_without_native_storage_raise_when_prepared():
             cache=None,
             workspace={},
             window=1023,
+        )
+
+
+def test_a_per_block_fp8_cache_has_no_native_kernel_and_raises_when_prepared():
+    # Native kernels read half-precision pages only; each provider refuses
+    # per-block FP8 scales itself.
+    cache = UnitPool.allocate(
+        Config({"attention": mha.Config(2, 128, (0,), torch.bfloat16)}),
+        num_units=4,
+        block_size=64,
+        device="cuda",
+        quantization={"attention": Quantizer("fp8", axis=0)},
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"no native attention kernel.*dimension 128.*"
+            r"per-block FP8 cache of 64-token pages"
+        ),
+    ):
+        resolve("auto", device=torch.device("cuda", 0)).prepare(
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            size=TextSize(8, 1),
+            cache=cache.state("attention"),
+            workspace={},
         )

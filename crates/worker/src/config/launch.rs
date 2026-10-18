@@ -226,9 +226,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         Some(serde_json::Value::String(dtype)) => Some(dtype.clone()),
         Some(_) => return Err(DescriptorError::new("worker KV dtype is unsupported")),
     };
-    if device.is_cuda() || generation.is_some_and(Device::is_cuda) {
-        cuda_representation(&descriptor, prefix_cache_dtype_override.as_deref())?;
-    }
 
     if descriptor.queue_depth == 0 {
         return Err(DescriptorError::new("--queue-depth must be positive"));
@@ -361,30 +358,6 @@ fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {
         ));
     }
     Ok(names)
-}
-
-/// Refuse precisions no native CUDA attention kernel computes.
-fn cuda_representation(
-    descriptor: &LaunchDescriptor,
-    prefix_cache_dtype_override: Option<&str>,
-) -> Result<(), DescriptorError> {
-    if descriptor.model_dtype == "float32" {
-        return Err(DescriptorError::new(
-            "--dtype float32 has no native CUDA attention kernel: CUDA attention computes in bfloat16 or float16",
-        ));
-    }
-    let dtype = prefix_cache_dtype_override.or(descriptor.prefix_cache_dtype.as_deref());
-    if dtype == Some("float8_e4m3fn") {
-        let option = if prefix_cache_dtype_override.is_some() {
-            "--quantization-config kv_cache_dtype"
-        } else {
-            "--kv-cache-dtype"
-        };
-        return Err(DescriptorError::new(format!(
-            "{option} float8_e4m3fn has no native CUDA attention kernel: the cache keeps one FP8 scale per block, which no native kernel reads (the FP8-KV TensorRT-LLM kernels take FP8 queries with per-tensor BMM1/BMM2 scales); use a bfloat16 or float16 KV cache"
-        )));
-    }
-    Ok(())
 }
 
 fn rendezvous(descriptor: &LaunchDescriptor) -> Result<Option<RendezvousConfig>, DescriptorError> {
