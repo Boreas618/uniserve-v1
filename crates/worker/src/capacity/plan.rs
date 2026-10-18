@@ -144,7 +144,6 @@ pub(crate) struct Report {
 /// Media-timeline facts of a video model.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MediaFacts {
-    pub num_steps: u32,
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Device bytes of one request's state buffers.
     pub state_bytes: u64,
@@ -218,7 +217,6 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
 fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
     Ok(WorkerInfo {
         media_components: report.media_components,
-        num_inference_steps: 0,
         video_denoiser: None,
         endpoint: report.endpoint,
         fabric_handles: report.fabric_handles,
@@ -419,7 +417,6 @@ pub(crate) fn request_layout(
     // The pool this rank backs, which the engine places this rank's buffers
     // in: the products of the components it executes and reads.
     info.buffer_pool_bytes = slots as u64 * media.local_product_bytes;
-    info.num_inference_steps = media.num_steps;
     info.video_denoiser = media.video_denoiser.clone();
     if let Some(plan) = &media.latent {
         info.latent_page_units = narrow(plan.page_units, "latent page units")?;
@@ -726,7 +723,6 @@ pub(crate) mod tests {
             ..cpu_config()
         };
         let media = MediaFacts {
-            num_steps: 8,
             video_denoiser: None,
             state_bytes: 1000,
             local_product_bytes: 4096,
@@ -751,7 +747,6 @@ pub(crate) mod tests {
         // Twelve positions over three slots keep three unresolved outputs.
         assert_eq!(plan.info.max_unresolved_calls, 3);
         assert_eq!(plan.info.buffer_pool_bytes, 3 * 4096);
-        assert_eq!(plan.info.num_inference_steps, 8);
     }
 
     #[test]
@@ -771,7 +766,6 @@ pub(crate) mod tests {
             with_workspace: false,
         };
         let facts = |stores_latent| MediaFacts {
-            num_steps: 8,
             video_denoiser: None,
             state_bytes: 1000,
             local_product_bytes: 4096,

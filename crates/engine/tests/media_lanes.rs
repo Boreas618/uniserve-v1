@@ -147,7 +147,6 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         .filter(|call| **call != MediaCall::ImageDecoding)
         .map(|call| CallKind::Media(*call))
         .collect();
-    info.num_inference_steps = STEPS;
     info.video_denoiser = Some(VideoDenoiserInfo {
         tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
         schedule_points: STEPS + 1,
@@ -269,7 +268,6 @@ fn video_request(id: u64, video_units: u32) -> Request {
         sampling: DiffusionSamplingParams {
             num_frames: 16,
             video_units,
-            num_inference_steps: STEPS,
             seed: id,
             // The fixture decoder's raster (`video_worker`).
             width: 24,
@@ -408,7 +406,6 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             sampling: DiffusionSamplingParams {
                 num_frames: 128,
                 video_units: 32,
-                num_inference_steps: STEPS,
                 seed: 1,
                 width: 24,
                 height: 16,
@@ -931,7 +928,6 @@ fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
         sampling: DiffusionSamplingParams {
             num_frames: 16,
             video_units: 2,
-            num_inference_steps: STEPS,
             seed: id,
             width: 24,
             height: 16,

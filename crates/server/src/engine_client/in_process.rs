@@ -155,9 +155,7 @@ impl EngineClient {
             message: "an engine client needs at least one engine core".to_string(),
         })?;
         for core in &cores[1..] {
-            if core.generation_limits() != first.generation_limits()
-                || core.info().denoise_steps() != first.info().denoise_steps()
-            {
+            if core.generation_limits() != first.generation_limits() {
                 return Err(Error::ClientClosed {
                     message: "data-parallel replicas report different limits".to_string(),
                 });
