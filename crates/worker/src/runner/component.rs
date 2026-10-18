@@ -80,6 +80,7 @@ pub(crate) const DENOISER_GRAPHS: usize = 1000;
 pub(crate) const DECODER_GRAPHS: usize = 1001;
 pub(crate) const TEXT_GRAPHS: usize = 1002;
 pub(crate) const AUDIO_GRAPHS: usize = 1003;
+pub(crate) const LATENT_GRAPHS: usize = 1004;
 
 /// What a video model's runners on a rank are built from at startup.
 pub(crate) struct VideoSetup<'a> {

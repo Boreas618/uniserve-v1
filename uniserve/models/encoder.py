@@ -18,7 +18,7 @@ from uniserve.nn.attention import (
     SequenceLengths,
     VarlenInput,
 )
-from uniserve.nn.vae import LatentEncoder
+from uniserve.nn.vae import LatentEncoder, TiledEncoder
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from .inputs import EmbeddingReplacement, VisionInput
@@ -697,6 +697,28 @@ class VideoEncoder(nn.Module):
         The height is a whole number of row groups.
         """
         raise NotImplementedError
+
+    def still_tile(
+        self, device: torch.device
+    ) -> tuple[TiledEncoder, torch.Tensor] | None:
+        """Return the tiled encoder of still frames and one tile's input.
+
+        A latent encoder over a ``TiledEncoder`` encodes every still frame
+        at least a tile high and wide in tiles of one shape: the native input
+        of a tile-sized frame, which ``unpack_pixels`` returns with the
+        frame's raster as its trailing axes. Returns that encoder and a zero
+        tile of its native input on ``device``, or None when the latent
+        encoder does not tile.
+        """
+        tiled = self.encoder.encoder
+        if not isinstance(tiled, TiledEncoder):
+            return None
+        frame = torch.zeros(
+            (1, tiled.tile_height, tiled.tile_width, 3),
+            dtype=torch.uint8,
+            device=device,
+        )
+        return tiled, self.unpack_pixels(frame, slice(0, 1), 1)
 
     def load_kernels(self) -> None:
         """Build or load the native kernels ``encode`` launches.

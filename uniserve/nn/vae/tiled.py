@@ -7,6 +7,7 @@ import math
 import torch
 from torch import nn
 
+from uniserve.nn import _binding
 from uniserve.nn.video import blend_decoded_overlap
 
 
@@ -178,6 +179,11 @@ class TiledEncoder(nn.Module):
     band's latents depend on are encoded and stitched, with the same tile
     grid and arithmetic as the whole raster, so separate callers can encode
     the bands of one raster and their rows equal the whole encoding's exactly.
+
+    An execution context may bind an operator that returns exactly the
+    encoding of any one tile (``forward``), such as the replay of a graph
+    captured at the tile shape; a tiled encoding then encodes its tiles
+    through it.
     """
 
     def __init__(
@@ -264,9 +270,10 @@ class TiledEncoder(nn.Module):
         if first and rows.start < owned[first] + y_overlaps[first - 1] // ratio:
             begin = first - 1
 
+        encode = _binding.tile_operators.get().get(id(self), self)
         tiles = [
             [
-                self(
+                encode(
                     pixels[
                         ...,
                         y_indices[row] : y_indices[row] + y_lengths[row],

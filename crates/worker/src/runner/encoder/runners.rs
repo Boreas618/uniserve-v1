@@ -43,6 +43,8 @@ pub(crate) struct EncoderRunners {
     pub(crate) text_pool: Option<Arc<GraphPool>>,
     /// A video model's condition latent encoders.
     pub(crate) latent: Option<Component<EncoderRunner>>,
+    /// The condition latent encoders' graph pool, when graphs are captured.
+    pub(crate) latent_pool: Option<Arc<GraphPool>>,
     /// An image model's encoders, in construction order.
     pub(crate) image: Vec<EncoderRunner>,
     /// The image encoder serving each component's call kind.
@@ -138,6 +140,23 @@ impl EncoderRunners {
                 vision.seal();
             }
         }
+        Ok(())
+    }
+
+    /// Capture the condition latent encoders' still-frame tile encoding,
+    /// each step a job of the latent encoder's lane on `lanes`, then wait
+    /// for the encoders' stream. Without a graph pool nothing is captured.
+    pub(crate) fn capture_tiles(&mut self, lanes: &JobQueues) -> Result<()> {
+        let (Some(latent), Some(pool)) = (&mut self.latent, &self.latent_pool) else {
+            return Ok(());
+        };
+        let kind = CallKind::Media(MediaCall::LatentEncoding);
+        latent
+            .runner
+            .capture_tile(pool, &mut |job| perform(lanes, kind, job))?;
+        let job = Job::new();
+        job.on(latent.runner.stream()).synchronize()?;
+        perform(lanes, kind, job)?;
         Ok(())
     }
 

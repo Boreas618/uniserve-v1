@@ -8,7 +8,9 @@ use crate::Result;
 use crate::config::placement::Placed;
 use crate::executor::video::extent;
 use crate::runner::RunnerSetup;
-use crate::runner::component::{Component, TEXT_GRAPHS, VideoSetup, call_path, cuda_device};
+use crate::runner::component::{
+    Component, LATENT_GRAPHS, TEXT_GRAPHS, VideoSetup, call_path, cuda_device,
+};
 
 impl EncoderRunners {
     /// Build the text encoder of a placed component and, when the component
@@ -79,6 +81,8 @@ impl EncoderRunners {
         let attention = setup.attention.clone();
         let device = placed.device;
         let (stream, scratch) = setup.stream(MediaCall::LatentEncoding, device)?;
+        // The pool the still-frame tile encoding is captured into.
+        self.latent_pool = setup.graph_pool(LATENT_GRAPHS, device)?;
         let setup = |capability| -> Result<RunnerSetup<'_>> {
             Ok(RunnerSetup {
                 loaded,

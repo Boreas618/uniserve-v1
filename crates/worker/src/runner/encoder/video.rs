@@ -17,14 +17,15 @@ use super::{
     TextSize,
 };
 use crate::config::Device;
+use crate::cuda_graph::{GraphPool, GraphTable, Lookup};
 use crate::executor::batch::CallState;
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
 use crate::executor::video::{
     MediaBatch, Parts, VideoCall, bind_rows, decode_range, product_name, publish, publish_bound,
     row_width, stream_of,
 };
-use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
-use crate::lane::{Completion, Job};
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
+use crate::lane::{Capture, Completion, Job};
 use crate::runner::RunnerSetup;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
 use crate::storage::PinnedPool;
@@ -57,6 +58,15 @@ enum Posterior {
 
 /// The condition latent encoders of a video model: the Python runners of
 /// its video encoder and of its audio encoder, one per input shapes.
+///
+/// A video encoder whose latent encoder tiles encodes every still frame as
+/// tiles of one shape, each many small kernels, so its eager encoding is
+/// bound by the host launching them. With graph pools, startup captures one
+/// tile's encoding ([`Self::capture_tile`]), and every video runner
+/// constructed afterwards replays it for each still-frame tile of that
+/// shape, inside its eager forward; video clips' tiles stay eager, since
+/// their encoding already keeps the device busy and a graph would keep a
+/// clip tile's activations resident.
 pub(super) struct Conditions {
     video: RunnerClass,
     audio: RunnerClass,
@@ -83,6 +93,23 @@ pub(super) struct Conditions {
     posteriors: HashMap<[i64; 3], Posterior>,
     /// The sizes of `posteriors`, oldest first; at most [`POSTERIORS`].
     posterior_order: VecDeque<[i64; 3]>,
+    /// `[1, height, width, 3]` of a still frame one tile in size; empty when
+    /// the video encoder does not tile still frames.
+    still_tile: Vec<i64>,
+    /// The constructor of a tile runner (`EncoderRunner.tile`) with the
+    /// video runners' fixed arguments, and the forward a tile's graph
+    /// captures (`EncoderRunner.encode_tile`).
+    tile_runner: MethodCall,
+    encode_tile: Function,
+    /// The captured still-frame tile encoding, once startup captured it.
+    tile: Option<StillTile>,
+}
+
+/// A captured still-frame tile encoding: the Python tile runner, whose
+/// input and output the graph addresses, and the graph.
+struct StillTile {
+    runner: Methods,
+    graphs: GraphTable<Vec<i64>>,
 }
 
 /// The encoder of a condition's medium.
@@ -129,24 +156,33 @@ pub(crate) enum ConditionSetup {
 
 impl Conditions {
     fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+        let method = |name: &str| Interpreter::import(&format!("{ENCODER}.{name}"));
         // Condition encoders are constructed per input shape while serving;
         // the natively built kernels they launch load now, so no encoding
         // compiles one.
-        Interpreter::import(&format!("{ENCODER}.load_condition_kernels"))?
-            .call(&[video.loaded.view()])?;
+        method("load_condition_kernels")?.call(&[video.loaded.view()])?;
+        let still_tile = integers(method("still_tile")?.call_values(&[
+            video.loaded.to_any(),
+            Any::from(tvm_ffi::String::from(video.path)),
+        ])?)
+        .map_err(|error| Error::numerical(&format!("{ENCODER}.still_tile"), &error))?;
         Ok(Self {
-            unit_frames: Interpreter::import(&format!("{ENCODER}.unit_frames"))?,
+            unit_frames: method("unit_frames")?,
             loaded: video.loaded.clone(),
             video: RunnerClass::new(ENCODER, "encode", video.arguments())?,
             audio: RunnerClass::new(ENCODER, "encode", audio.arguments())?,
             frames: HashMap::new(),
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
-            posterior_elements: Interpreter::import(&format!("{ENCODER}.posterior_elements"))?,
-            draw_posterior: Interpreter::import(&format!("{ENCODER}.draw_posterior"))?,
+            posterior_elements: method("posterior_elements")?,
+            draw_posterior: method("draw_posterior")?,
             device: video.device,
             posteriors: HashMap::new(),
             posterior_order: VecDeque::new(),
+            still_tile,
+            tile_runner: MethodCall::new(&method("tile")?, video.arguments()),
+            encode_tile: method("encode_tile")?,
+            tile: None,
         })
     }
 
@@ -186,6 +222,71 @@ impl Conditions {
             if let Some(released) = self.posterior_order.remove(index) {
                 self.posteriors.remove(&released);
             }
+        }
+    }
+
+    /// Capture the encoding of one still-frame tile into `pool`, the
+    /// encoder's graph pool on `device`, on `stream`, the stream every
+    /// video runner computes on. Each step is a job `perform` performs on
+    /// the encoder's lane: the construction of a tile runner, then its eager
+    /// encoding, which compiles the tile's kernels outside the capture, and
+    /// the capture. Nothing is captured for a video encoder that does not
+    /// tile still frames.
+    fn capture_tile(
+        &mut self,
+        pool: &GraphPool,
+        stream: &Stream,
+        device: DeviceId,
+        perform: &mut dyn FnMut(Job) -> Result<Completion>,
+    ) -> Result<()> {
+        if self.still_tile.is_empty() || self.tile.is_some() {
+            return Ok(());
+        }
+        let job = Job::new();
+        job.call_handle(self.tile_runner.clone());
+        let runner = self.video.constructed(perform(job)?.handle()?);
+
+        let encode = MethodCall::new(
+            &self.encode_tile,
+            vec![Argument::Handle(runner.runner().clone())],
+        );
+        let job = Job::new();
+        job.call(encode.clone());
+        job.capture(Capture {
+            functions: runner.graphs.clone(),
+            pool: pool.value.clone(),
+            peers: Vec::new(),
+            stream: stream.raw(),
+            device,
+            method: encode,
+            breaks: None,
+        });
+        let graph = perform(job)?.captured()?;
+        let mut graphs = GraphTable::new(
+            format!("{ENCODER}.encode_tile"),
+            runner.graphs.release.clone(),
+        );
+        graphs.insert(self.still_tile.clone(), None, graph)?;
+        graphs.seal();
+        self.tile = Some(StillTile { runner, graphs });
+        Ok(())
+    }
+
+    /// The tile arguments a video runner is constructed with: the tile
+    /// runner and the graph of its captured tile encoding, or none before
+    /// startup captured them.
+    fn tile_arguments(&self) -> Result<[Argument; 2]> {
+        let Some(tile) = &self.tile else {
+            return Ok([Argument::None, Argument::None]);
+        };
+        match tile.graphs.lookup(&self.still_tile, None)? {
+            Lookup::Replay(graph) => Ok([
+                Argument::Handle(tile.runner.runner().clone()),
+                Argument::Handle(graph.handle().clone()),
+            ]),
+            Lookup::Capture => Err(Error::Invariant(
+                "a captured still-frame tile encoding is resident".into(),
+            )),
         }
     }
 
@@ -271,7 +372,12 @@ impl Conditions {
             if constructed.contains_key(&shapes) || recorded {
                 continue;
             }
-            job.call_handle(class.construction(vec![Argument::Integers(shapes.clone())]));
+            // A video runner replays the captured still-frame tile.
+            let mut arguments = vec![Argument::Integers(shapes.clone())];
+            if medium == ConditionMedium::Video {
+                arguments.extend(self.tile_arguments()?);
+            }
+            job.call_handle(class.construction(arguments));
             runners.push((medium, shapes));
         }
         if !runners.is_empty() {
@@ -439,9 +545,16 @@ impl Conditions {
         calls
     }
 
+    /// Close the runners, then the tile runner and its graph, which the
+    /// video runners replay. The caller drained the encoders' stream.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let video = self.video.close(aborted, self.video_runners.values());
-        video.and(self.audio.close(aborted, self.audio_runners.values()))
+        let mut result = video.and(self.audio.close(aborted, self.audio_runners.values()));
+        if let Some(tile) = &mut self.tile {
+            result = result.and(self.video.close(aborted, [&tile.runner]));
+            result = result.and(tile.graphs.close(aborted));
+        }
+        result
     }
 }
 
@@ -575,6 +688,26 @@ impl EncoderRunner {
             context: None,
             conditions: Some(Box::new(Conditions::new(video, audio)?)),
         })
+    }
+
+    /// Capture the condition encoders' still-frame tile encoding into
+    /// `pool`, each step a job `perform` performs on the encoders' lane
+    /// ([`Conditions::capture_tile`]).
+    pub(crate) fn capture_tile(
+        &mut self,
+        pool: &GraphPool,
+        perform: &mut dyn FnMut(Job) -> Result<Completion>,
+    ) -> Result<()> {
+        let (Some(stream), Device::Cuda(device)) = (self.stream.clone(), self.device) else {
+            return Ok(());
+        };
+        if pool.device != device {
+            return Err(Error::Invariant(
+                "an encoder captures into a pool of its device".into(),
+            ));
+        }
+        self.condition_encoders()?
+            .capture_tile(pool, &stream, device, perform)
     }
 
     fn condition_encoders(&mut self) -> Result<&mut Conditions> {

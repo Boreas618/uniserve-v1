@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import GenericAlias, MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -456,6 +456,12 @@ class ExecutionContext:
         collectives: Stream-bound collective bindings selected during an
             activation (the parallel runtime supplies them for its streams);
             ``None`` uses the process groups directly.
+        tiles: ``TiledEncoder`` modules mapped to borrowed operators, each
+            returning exactly that encoder's encoding of any one tile, such
+            as the replay of a graph captured at the tile shape; the
+            encoders' tiled calls within an activation encode their tiles
+            through them. Their owner keeps them valid for the context's
+            lifetime.
     """
 
     __class_getitem__: classmethod[Any, [Any], GenericAlias] = classmethod(
@@ -480,6 +486,8 @@ class ExecutionContext:
         weights=None,
         workspace=None,
         collectives: Mapping | None = None,
+        tiles: Mapping[nn.Module, Callable[[torch.Tensor], torch.Tensor]]
+        | None = None,
     ) -> None:
         from uniserve.distributed import communicators
 
@@ -525,6 +533,10 @@ class ExecutionContext:
         self._closed = False
         self._max_tokens: int | None = None
         self._clear_bindings()
+        # Borrowed tile operators by encoder id, the key the encoders read.
+        self._tiles = {
+            id(encoder): operator for encoder, operator in (tiles or {}).items()
+        }
 
         # The context variables an activation sets and the values it sets
         # them to. The tables are cleared in place, never replaced, so the
@@ -543,6 +555,7 @@ class ExecutionContext:
             (_binding.moe, self._moe),
             (_binding.attention_storage, self._exchange),
             (_binding.linear_chunks, self._chunks),
+            (_binding.tile_operators, self._tiles),
         )
 
     # Binding tables an activation installs into context variables. They are
@@ -1166,6 +1179,8 @@ class ExecutionContext:
         if aborted:
             _retained.append(self.__dict__.copy())
             return
+        # The tile operators are borrowed; their owner releases them.
+        self._tiles.clear()
         try:
             self._release()
         finally:
