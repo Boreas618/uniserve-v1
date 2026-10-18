@@ -4,10 +4,10 @@
 //! [`WorkerLaunch`] the rank runs with. All deployment decisions are made
 //! here; the numerical library receives only resolved values.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use uniserve_core::ComponentConfig;
-use uniserve_ipc::{CallKind, ForwardMode, LaunchDescriptor, MediaCall, TransferMode};
+use uniserve_ipc::LaunchDescriptor;
 
 use super::device::{Device, generation_device};
 use super::{DescriptorError, WorkerConfig};
@@ -123,8 +123,6 @@ pub struct WorkerLaunch {
     pub stub: bool,
     /// Placed components by name; empty for an expert-only rank.
     pub components: BTreeMap<String, ComponentConfig>,
-    /// Call kinds the deployment allows this rank to serve.
-    pub supported_calls: BTreeSet<CallKind>,
 }
 
 impl WorkerLaunch {
@@ -134,47 +132,6 @@ impl WorkerLaunch {
     }
 }
 
-/// Capability groups selectable with `--supported-calls`, and their kinds.
-const CAPABILITY_GROUPS: &[(&str, &[CallKind])] = {
-    use CallKind::{Forward, Media, Transfer};
-    &[
-        ("ar_extend", &[Forward(ForwardMode::Prefill)]),
-        ("ar_decode", &[Forward(ForwardMode::Decode)]),
-        ("ar_verify", &[Forward(ForwardMode::Verify)]),
-        ("token_denoising", &[Forward(ForwardMode::TokenDenoising)]),
-        ("encoder_vision", &[Media(MediaCall::VisionEncoding)]),
-        ("encoder_latent", &[Media(MediaCall::LatentEncoding)]),
-        ("encoder_text", &[Media(MediaCall::TextEncoding)]),
-        ("transfer_product", &[Transfer(TransferMode::Tensor)]),
-        ("transfer_kv_export", &[Transfer(TransferMode::CacheExport)]),
-        (
-            "transfer_kv_install",
-            &[Transfer(TransferMode::CacheInstall)],
-        ),
-        ("diffusion_prepare", &[Media(MediaCall::LatentPreparation)]),
-        ("diffusion_step", &[Media(MediaCall::Denoising)]),
-        (
-            "diffusion_finalize",
-            &[Media(MediaCall::ImageDecoding), Media(MediaCall::Muxing)],
-        ),
-        (
-            "diffusion_decode",
-            &[
-                Media(MediaCall::VideoDecoding),
-                Media(MediaCall::AudioDecoding),
-            ],
-        ),
-        ("media_read", &[Media(MediaCall::MediaReading)]),
-        (
-            "media_append",
-            &[
-                Media(MediaCall::VideoEncoding),
-                Media(MediaCall::AudioEncoding),
-            ],
-        ),
-    ]
-};
-
 /// Validate and resolve a launch descriptor.
 ///
 /// Fails with the first violated rule. Messages name the launch option the
@@ -182,19 +139,15 @@ const CAPABILITY_GROUPS: &[(&str, &[CallKind])] = {
 pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorError> {
     let role = descriptor.role.trim().to_owned();
     let experts = expert_parallel(&descriptor, &role)?;
-    let supported_calls = if role == "experts" {
-        if experts
+    if role == "experts"
+        && experts
             .as_ref()
             .is_none_or(|union| !union.disaggregated() || union.rank < union.attention_ranks)
-        {
-            return Err(DescriptorError::new(
-                "expert workers require a disaggregated expert union",
-            ));
-        }
-        BTreeSet::new()
-    } else {
-        supported_calls(descriptor.supported_calls.as_deref())?
-    };
+    {
+        return Err(DescriptorError::new(
+            "expert workers require a disaggregated expert union",
+        ));
+    }
 
     let device = Device::parse(&descriptor.device, "--device")?;
     let generation = generation_device(descriptor.mesh.as_deref().unwrap_or_default(), device)?;
@@ -290,7 +243,6 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         load,
         stub,
         components,
-        supported_calls,
     })
 }
 
@@ -300,41 +252,6 @@ fn text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-}
-
-fn supported_calls(value: Option<&str>) -> Result<BTreeSet<CallKind>, DescriptorError> {
-    let all = CAPABILITY_GROUPS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(",");
-    let selected = value.map_or(all, str::to_owned);
-    let mut seen = HashSet::new();
-    let mut calls = BTreeSet::new();
-    for name in selected
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        if !seen.insert(name) {
-            return Err(DescriptorError::new(
-                "supported calls contain duplicate entries",
-            ));
-        }
-        let (_, kinds) = CAPABILITY_GROUPS
-            .iter()
-            .find(|(group, _)| *group == name)
-            .ok_or_else(|| {
-                DescriptorError::new(format!("unknown call in supported calls {selected:?}"))
-            })?;
-        calls.extend(kinds.iter().copied());
-    }
-    if calls.is_empty() {
-        return Err(DescriptorError::new(
-            "supported calls must list at least one group",
-        ));
-    }
-    Ok(calls)
 }
 
 fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {

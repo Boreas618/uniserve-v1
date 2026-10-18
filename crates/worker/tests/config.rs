@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 use uniserve_cuda::DeviceId;
-use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
+use uniserve_ipc::{CallKind, ForwardMode};
 use uniserve_worker::config::{Device, WorkerLaunch, resolve};
 
 /// Neutral values for every descriptor field, as the engine emits them for
@@ -26,7 +26,6 @@ fn defaults() -> Value {
         "world_size": 1,
         "components": {"model": {"ranks": [0]}},
         "deployment_components": ["model"],
-        "supported_calls": null,
         "transfer_backends": "local",
         "export_backends": "local",
         "rendezvous_address": null,
@@ -232,40 +231,6 @@ fn execution_lanes_bind_disjoint_calls() {
 }
 
 #[test]
-fn capability_selectors_choose_concrete_call_kinds() {
-    let selected = |selector: &str| {
-        resolved(json!({"supported_calls": selector}))
-            .unwrap()
-            .supported_calls
-            .into_iter()
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        selected("ar_decode"),
-        vec![CallKind::Forward(ForwardMode::Decode)]
-    );
-    assert_eq!(
-        selected("diffusion_finalize"),
-        vec![
-            CallKind::Media(MediaCall::ImageDecoding),
-            CallKind::Media(MediaCall::Muxing)
-        ]
-    );
-    assert_eq!(
-        selected("media_append"),
-        vec![
-            CallKind::Media(MediaCall::VideoEncoding),
-            CallKind::Media(MediaCall::AudioEncoding)
-        ]
-    );
-    // Without a selector the worker serves every call kind it implements.
-    let every = resolved(json!({})).unwrap().supported_calls;
-    assert_eq!(every.len(), CallKind::ALL.len());
-    assert!(launch_error(json!({"supported_calls": "ar_decode,ar_decode"})).contains("duplicate"));
-    assert!(launch_error(json!({"supported_calls": "everything"})).contains("unknown call"));
-}
-
-#[test]
 fn bucket_lists_are_positive_and_strictly_increasing() {
     let launch =
         resolved(json!({"video_text_capacities": "1024,4096,8192", "min_video_seconds": 4.0}))
@@ -439,7 +404,7 @@ fn disaggregated_ranks_keep_their_local_rank_and_role() {
         let union = launch.expert_parallel.as_ref().unwrap();
         assert_eq!((union.rank, union.attention_ranks), (union_rank, 4));
         assert_eq!(launch.execution.expert_microbatches, 2);
-        assert_eq!(launch.supported_calls.is_empty(), role == "experts");
+        assert_eq!(launch.components.is_empty(), role == "experts");
     }
     for count in [json!(0), json!(true), json!(2)] {
         assert!(resolved(json!({"expert_microbatches": count})).is_err());

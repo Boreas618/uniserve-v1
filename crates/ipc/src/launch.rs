@@ -414,9 +414,6 @@ pub struct LaunchDescriptor {
     pub components: BTreeMap<String, ComponentConfig>,
     /// Component names every group of the deployment places.
     pub deployment_components: Vec<String>,
-    /// Comma-separated capability groups to serve; `None` serves every
-    /// capability the model implements.
-    pub supported_calls: Option<String>,
     /// Comma-separated transfer mechanisms this rank binds.
     pub transfer_backends: String,
     /// Comma-separated transfer mechanisms this rank exports through.
