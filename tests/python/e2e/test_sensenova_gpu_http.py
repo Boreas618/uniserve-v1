@@ -234,7 +234,6 @@ def test_sensenova_public_production_lineage(
                 json={
                     "model": SERVED_MODEL,
                     "prompt": "A blue square.",
-                    "n": 1,
                     "steps": 1,
                     "seed": 7,
                 },
@@ -362,7 +361,6 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
                 json={
                     "model": SERVED_MODEL,
                     "prompt": "A blue square.",
-                    "n": 1,
                     "steps": 2,
                     "seed": 7,
                 },
