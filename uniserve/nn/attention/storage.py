@@ -145,7 +145,6 @@ def context_requirements(
     heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    block_size: int,
 ) -> dict[tuple[Communicator, int], StorageRequirement]:
     """Declare the compact context K/V domain shared by serialized layers.
 
@@ -155,15 +154,10 @@ def context_requirements(
     allocation, keyed by ``(group, rows)``.
 
     Raises:
-        ValueError: An extent is not positive or rows are not a whole number
-            of validity blocks.
+        ValueError: An extent is not positive.
     """
-    if min(rows, heads, head_dim, block_size) < 1:
+    if min(rows, heads, head_dim) < 1:
         raise ValueError("attention context extents must be positive")
-    if rows % block_size:
-        raise ValueError(
-            "attention context rows must align to its validity blocks"
-        )
 
     members: dict[tuple[Communicator, int], list[ParallelAttention]] = {}
     for layer in layers:
@@ -178,12 +172,6 @@ def context_requirements(
             {
                 "key": BufferConfig((domain, heads, head_dim), dtype),
                 "value": BufferConfig((domain, heads, head_dim), dtype),
-                # Per-block valid-row counts, local fence, per-peer fences.
-                "valid_sizes": BufferConfig(
-                    (domain // block_size,), torch.int32
-                ),
-                "sync_input": BufferConfig((1,), torch.int32),
-                "sync_output": BufferConfig((group.size,), torch.int32),
             },
             (),
             tuple(owners),
@@ -197,22 +185,18 @@ def bind_context_storage(
 ) -> Mapping[ParallelAttention, AttentionBuffers]:
     """Bind each context-parallel layer's views over caller storage.
 
-    Clears each local fence on the current stream; each rank's own window
-    of the replicated domain starts at ``rank * rows``.
+    Each rank's own window of the replicated domain starts at
+    ``rank * rows``.
     """
     bindings = {}
     for (group, rows), requirement in requirements.items():
         views = _checked(requirement, tensors[(group, rows)])
-        views["sync_input"].zero_()
         begin = group.rank * rows
         buffers = AttentionBuffers(
             views["key"],
             views["value"],
             views["key"][begin : begin + rows],
             views["value"][begin : begin + rows],
-            views["valid_sizes"],
-            views["sync_input"],
-            views["sync_output"],
         )
         bindings.update(dict.fromkeys(requirement.layers, buffers))
     return MappingProxyType(bindings)
