@@ -181,7 +181,7 @@ fn completion_record() -> RequestOutput {
         timing_counters: TimingCounters::default(),
         cache_visible_len: 5,
         cache_computed_len: 5,
-        num_completed_steps: 0,
+        step_index: 0,
 
         committed_tokens: vec![271],
         candidate_logprobs: Vec::new(),
@@ -2023,7 +2023,7 @@ fn full_run_result() -> BatchOutput {
             host_us: 44,
         },
         cache_visible_len: 6,
-        num_completed_steps: 7,
+        step_index: 7,
         cache_computed_len: 8,
 
         committed_tokens: vec![271, 272],
