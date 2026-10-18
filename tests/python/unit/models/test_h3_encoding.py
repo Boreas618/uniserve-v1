@@ -85,6 +85,39 @@ def test_video_encoding_rejects_inputs_outside_the_unit_contract():
         )
 
 
+def test_video_encoding_takes_its_conditions_posterior_draw():
+    # The posterior is sampled, so every unit takes its condition's complete
+    # draw, which spans the condition's whole latent.
+    encoder = _video_encoder()
+    frames = torch.zeros((17, 64, 64, 3), dtype=torch.uint8)
+    size = video.Config(39, image.Config(64, 64))
+    shape = encoder.posterior_shape(size)
+    assert shape == (1, encoder.config.latent_channels, 12, 4, 4)
+
+    with pytest.raises(ValueError, match="takes its video's draw"):
+        encoder.encode((frames,), frames=(slice(0, 17),), num_frames=(39,))
+    with pytest.raises(ValueError, match="span its video's latent"):
+        encoder.encode(
+            (frames,),
+            frames=(slice(0, 17),),
+            num_frames=(39,),
+            noise=(torch.zeros(shape[:2] + (5,) + shape[3:]),),
+        )
+
+
+def test_posterior_draw_depends_on_the_condition_size_alone():
+    # Every condition of one size samples the same posterior, so a draw
+    # serves every unit, round and request of that size.
+    encoder = _video_encoder()
+    size = video.Config(22, image.Config(64, 96))
+    first, second = (torch.empty(encoder.posterior_shape(size)) for _ in "ab")
+    encoder.draw_noise(size, first)
+    encoder.draw_noise(size, second)
+
+    assert torch.equal(first, second)
+    assert first.std() > 0.5
+
+
 @pytest.mark.parametrize(
     ("num_samples", "frames"), ((160000, 200), (160001, 201), (799, 1))
 )

@@ -221,13 +221,18 @@ def test_video_conditioning_matches_native_encoding(
 
     # Every unit is encoded in its own call, last first, and placed where its
     # layout says its rows belong.
-    layout = encoder.output_layout(
-        video.Config(num_frames, image.Config(height, width))
-    )["video"]
+    # The condition's posterior is drawn once and passed with every unit.
+    size = video.Config(num_frames, image.Config(height, width))
+    layout = encoder.output_layout(size)["video"]
+    noise = torch.empty(encoder.posterior_shape(size))
+    encoder.draw_noise(size, noise)
     assembled = torch.full(layout.shape, torch.nan, device="cuda")
     for unit in reversed(encoder.frame_slices(num_frames)):
         (result,) = encoder.encode(
-            (pixels[unit],), frames=(unit,), num_frames=(num_frames,)
+            (pixels[unit],),
+            frames=(unit,),
+            num_frames=(num_frames,),
+            noise=(noise,),
         )
         assembled[result.layout.local_slice] = result.tensor
     torch.testing.assert_close(

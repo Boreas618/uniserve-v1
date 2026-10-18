@@ -657,10 +657,12 @@ class VideoEncoder(nn.Module):
     ``unpack_pixels``, the conversion of one unit's frames into the native
     encoder input; and ``pack_latents``, the conversion of that unit's native
     NCTHW latents into its output rows. An encoder whose posterior is sampled
-    defines ``posterior_noise``: the draw spans the video's complete latent
-    and each unit takes the share of its own latent frames, which reproduces
-    the draw of a whole-video encoding. Inputs remain borrowed; results are
-    new tensors.
+    defines ``posterior_shape`` and ``draw_noise``: the draw spans the
+    video's complete latent and depends on the video's size alone, so a
+    caller draws it once per size and passes it with every unit of that
+    size; each unit takes the share of its own latent frames, which
+    reproduces the draw of a whole-video encoding. Inputs remain borrowed;
+    results are new tensors.
     """
 
     def __init__(self, encoder: LatentEncoder):
@@ -688,13 +690,22 @@ class VideoEncoder(nn.Module):
         nothing.
         """
 
-    def posterior_noise(self, size: video.Config) -> torch.Tensor | None:
-        """Return one video's complete NCTHW posterior draw, or None.
+    def posterior_shape(self, size: video.Config) -> tuple[int, ...] | None:
+        """Return the NCTHW shape of one video's complete posterior draw.
 
-        None leaves the latent to the latent encoder's own posterior: its
-        mean, a draw of its own, or no posterior at all.
+        None when ``encode`` takes no draw, leaving the latent to the latent
+        encoder's own posterior: its mean, or no posterior at all.
         """
         return None
+
+    def draw_noise(self, size: video.Config, out: torch.Tensor) -> None:
+        """Fill ``out`` with one video's complete posterior draw.
+
+        ``out`` is FP32 of ``posterior_shape(size)``, on any device; the draw
+        has the same values wherever it is stored. Defined by an encoder
+        whose ``posterior_shape`` is not None.
+        """
+        raise ValueError(f"{type(self).__qualname__} takes no posterior draw")
 
     def unpack_pixels(
         self, pixels: torch.Tensor, frames: slice, num_frames: int
@@ -717,22 +728,26 @@ class VideoEncoder(nn.Module):
         *,
         frames: tuple[slice, ...],
         num_frames: tuple[int, ...],
+        noise: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[TensorOutput, ...]:
         """Encode units of RGB24 videos into their latent rows.
 
         ``pixels[i]`` holds exactly the frames that ``frames[i]`` selects from
         a video of ``num_frames[i]`` frames, as ``[frames, height, width, 3]``
-        uint8, and ``frames[i]`` must be one of that video's units. Each
-        result holds its unit's rows at their place in the video's complete
-        latent.
+        uint8, and ``frames[i]`` must be one of that video's units. An
+        encoder that samples its posterior takes ``noise[i]``, the complete
+        draw of unit ``i``'s video (``draw_noise``), which units of one video
+        share; other encoders take no ``noise``. Each result holds its unit's
+        rows at their place in the video's complete latent.
         """
         if (
             not pixels
             or len(pixels) != len(frames)
             or len(pixels) != len(num_frames)
+            or (noise is not None and len(noise) != len(pixels))
         ):
             raise ValueError(
-                "video frames, unit slices and durations must align"
+                "video frames, unit slices, durations and draws must align"
             )
 
         units = []
@@ -756,12 +771,9 @@ class VideoEncoder(nn.Module):
                 )
             units.append(legal.index(interval))
 
-        # One posterior draw per video size serves every unit of this call
-        # that belongs to a video of that size.
-        draws: dict[video.Config, torch.Tensor | None] = {}
         outputs = []
-        for value, interval, count, unit in zip(
-            pixels, frames, num_frames, units, strict=True
+        for index, (value, interval, count, unit) in enumerate(
+            zip(pixels, frames, num_frames, units, strict=True)
         ):
             size = video.Config(
                 count, image.Config(int(value.shape[1]), int(value.shape[2]))
@@ -776,11 +788,22 @@ class VideoEncoder(nn.Module):
                 )
             rows_per_frame = layout.shape[0] // windows[-1].stop
 
-            if size not in draws:
-                draws[size] = self.posterior_noise(size)
-            noise = draws[size]
+            shape = self.posterior_shape(size)
+            if (shape is None) != (noise is None):
+                raise ValueError(
+                    "a sampled posterior takes its video's draw, and only it"
+                )
+            draw = None
             if noise is not None:
-                noise = noise[:, :, window].to(value.device)
+                if tuple(noise[index].shape) != shape:
+                    raise ValueError(
+                        "a posterior draw must span its video's latent"
+                    )
+                # The unit's latent frames of its video's draw. A caller's
+                # draw stays unchanged while the copy reads it.
+                draw = noise[index][:, :, window].to(
+                    value.device, non_blocking=True
+                )
 
             # A unit whose input was padded to the encoder's temporal extent
             # yields trailing latent frames beyond its own; the window keeps
@@ -788,7 +811,7 @@ class VideoEncoder(nn.Module):
             latents = self.encoder(
                 self.unpack_pixels(value, interval, count),
                 window=(slice(None), slice(None), slice(0, extent)),
-                noise=noise,
+                noise=draw,
             )
             rows = self.pack_latents(latents)
             if (
