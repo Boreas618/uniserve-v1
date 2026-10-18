@@ -453,10 +453,10 @@ impl ImageOwners {
                         .into_iter()
                         .filter(|(name, _)| name != "verified_lengths" && name != "alloced_lens")
                         .collect();
-                    let page_tokens: Vec<i64> = bounds
+                    let block_size: Vec<i64> = bounds
                         .tables
                         .iter()
-                        .map(|table| i64::from(table.page_tokens))
+                        .map(|table| i64::from(table.block_size))
                         .collect();
                     let windowed: Vec<i64> = bounds
                         .tables
@@ -472,7 +472,7 @@ impl ImageOwners {
                             samples,
                             slot_timesteps: latents.storage.timesteps().clone(),
                             slot_tables,
-                            page_tokens,
+                            block_size,
                             windowed,
                         },
                     )?;

@@ -10,7 +10,7 @@
 //! 3. The process world: host groups, the torch world, component groups
 //!    and meshes.
 //! 4. Loading, model facts, execution streams.
-//! 5. Capacity: page size, request slots, cache units and latent pages, all
+//! 5. Capacity: block size, request slots, cache units and latent pages, all
 //!    agreed over the group; the auxiliary-device check.
 //! 6. Request storage and the runners, created by the storage and
 //!    capability runtimes on the plan and handed to the backend.

@@ -15,7 +15,7 @@ pytestmark = pytest.mark.unit
 LAYERS, TOTAL_HEADS, DIM = 2, 4, 4
 
 
-def _pool(heads, page_tokens, compute, quantized):
+def _pool(heads, block_size, compute, quantized):
     """One destination group of ``LAYERS`` layers storing ``heads``."""
     config = Config(
         {
@@ -28,7 +28,7 @@ def _pool(heads, page_tokens, compute, quantized):
     return UnitPool.allocate(
         config,
         num_units=8,
-        block_size=page_tokens,
+        block_size=block_size,
         device="cpu",
         quantization={name: Quantizer("fp8", axis=0) for name in config.layers}
         if quantized
@@ -36,7 +36,7 @@ def _pool(heads, page_tokens, compute, quantized):
     )
 
 
-def _export(generator, start, end, page_tokens, scale_heads, compute):
+def _export(generator, start, end, block_size, scale_heads, compute):
     """A logical FP8 export of tokens ``[start, end)``.
 
     Returns encoded ``[2, tokens, layers, heads, dim]`` values, their
@@ -44,7 +44,7 @@ def _export(generator, start, end, page_tokens, scale_heads, compute):
     rounded through ``compute`` as every reader decodes them.
     """
     tokens = end - start
-    pages = math.ceil((start % page_tokens + tokens) / page_tokens)
+    pages = math.ceil((start % block_size + tokens) / block_size)
     encoded = (
         torch.randn(2, tokens, LAYERS, TOTAL_HEADS, DIM, generator=generator)
         * 200
@@ -57,7 +57,7 @@ def _export(generator, start, end, page_tokens, scale_heads, compute):
         * 3
         + 0.5
     )
-    page = (torch.arange(tokens) + start % page_tokens) // page_tokens
+    page = (torch.arange(tokens) + start % block_size) // block_size
     group = torch.arange(TOTAL_HEADS) // scale_heads
     # [2, tokens, layers, heads] scales selected per element.
     selected = scales.permute(1, 0, 2, 3)[:, page][..., group]
@@ -65,13 +65,11 @@ def _export(generator, start, end, page_tokens, scale_heads, compute):
     return encoded, scales, decoded
 
 
-def _convert(
-    pool, export, heads, start, end, page_tokens, scale_heads, compute
-):
+def _convert(pool, export, heads, start, end, block_size, scale_heads, compute):
     """Import ``[start, end)`` as the worker does: one call per page span."""
     encoded, scales, _ = export
     group = pool.groups[0]
-    destination_tokens = group.page_tokens
+    destination_tokens = group.block_size
     h0, count_heads = heads[0], len(heads)
     elements = destination_tokens * LAYERS * count_heads * DIM
     rounding = tuple(torch.zeros(8 * elements, dtype=torch.uint8) for _ in "kv")
@@ -80,9 +78,9 @@ def _convert(
     while position < end:
         page, offset = divmod(position, destination_tokens)
         count = min(end - position, destination_tokens - offset)
-        source_offset = position % page_tokens
-        first = position // page_tokens - start // page_tokens
-        pages = math.ceil((source_offset + count) / page_tokens)
+        source_offset = position % block_size
+        first = position // block_size - start // block_size
+        pages = math.ceil((source_offset + count) / block_size)
         # The raw span sits at the start of each field's byte buffer.
         source = []
         for field in (0, 1):
@@ -103,7 +101,7 @@ def _convert(
             (page + 1,),
             offset,
             source_offset,
-            page_tokens,
+            block_size,
             scale_heads,
             compute,
         )
@@ -112,11 +110,11 @@ def _convert(
 
 def _reference(pool, decoded, heads, start, end):
     """Write the decoded values through the layers' own write path."""
-    page_tokens = pool.groups[0].page_tokens
+    block_size = pool.groups[0].block_size
     position = start
     while position < end:
-        page, offset = divmod(position, page_tokens)
-        count = min(end - position, page_tokens - offset)
+        page, offset = divmod(position, block_size)
+        count = min(end - position, block_size - offset)
         rows = slice(position - start, position - start + count)
         for layer in range(LAYERS):
             pool.state(f"layers.{layer}").write(
@@ -153,7 +151,7 @@ def _assert_same_pool(actual, expected):
     [
         # Equal pages, a span starting mid-page.
         (4, 4, 2, 11),
-        # Resharded page sizes in both directions.
+        # Resharded block sizes in both directions.
         (4, 8, 6, 21),
         (8, 4, 3, 19),
     ],

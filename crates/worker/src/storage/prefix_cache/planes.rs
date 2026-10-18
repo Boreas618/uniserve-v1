@@ -237,7 +237,7 @@ impl CachePlanes {
     ) -> Result<StorageView> {
         self.require_unit(unit)?;
         let plan = &self.plan.groups[group];
-        if offset + count > plan.page_tokens {
+        if offset + count > plan.block_size {
             return Err(Error::Invalid("a page view exceeds its page".into()));
         }
         let element = plan.dtype.bytes() as u64;
@@ -276,7 +276,7 @@ impl CachePlanes {
     ) -> Result<StorageView> {
         self.require_unit(unit)?;
         let plan = &self.plan.groups[group];
-        if offset + count > plan.page_tokens || column >= self.plan.columns {
+        if offset + count > plan.block_size || column >= self.plan.columns {
             return Err(Error::Invalid("a layer view exceeds its plane".into()));
         }
         let row = i64::from(plan.num_kv_heads) * i64::from(plan.head_dim);

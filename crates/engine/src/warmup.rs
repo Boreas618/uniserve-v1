@@ -445,7 +445,7 @@ mod tests {
         ];
         sim.mut_info_for_test().diffusion_lm_step_rows = 3;
         sim.set_queue_depth(8);
-        sim.set_page_tokens(16);
+        sim.set_block_size(16);
         let canvas = CanvasSampling {
             canvas_length: 16,
             max_steps: 2,

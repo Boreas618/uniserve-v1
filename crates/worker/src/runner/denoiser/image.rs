@@ -187,10 +187,10 @@ pub(crate) struct DiffusionStorage {
     /// The latent pool's per-slot timesteps `[slots + 1, 1]` float32.
     pub slot_timesteps: StorageView,
     /// The prefix cache's slot tables (`unit_tables`, `start_pages`,
-    /// `table_shapes`), and each numerical block table's page tokens and
+    /// `table_shapes`), and each numerical block table's block size and
     /// whether it is windowed.
     pub slot_tables: Vec<(String, StorageView)>,
-    pub page_tokens: Vec<i64>,
+    pub block_size: Vec<i64>,
     pub windowed: Vec<i64>,
 }
 
@@ -304,7 +304,7 @@ impl DenoiserRunner {
             Any::from(capacity.tokens as i64),
             Any::from(capacity.units as i64),
             Any::from(capacity.width as i64),
-            Any::from(integer_list(storage.page_tokens.iter().copied())),
+            Any::from(integer_list(storage.block_size.iter().copied())),
             Any::from(integer_list(storage.windowed.iter().copied())),
             storage.samples.handle()?.to_any(),
             storage.slot_timesteps.handle()?.to_any(),

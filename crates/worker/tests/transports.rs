@@ -786,7 +786,7 @@ fn cache_plan(head_dim: u32) -> CachePlan {
         dtype: PrefixCacheDtype::BFloat16,
         groups: vec![CacheGroupPlan {
             window: None,
-            page_tokens: 8,
+            block_size: 8,
             units_per_page: 1,
             layers: vec!["a".into(), "b".into()],
             layer_ids: vec![0, 1],

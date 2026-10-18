@@ -251,7 +251,7 @@ pub struct CacheGroupTransfer {
     pub start: u32,
     /// Tokens per source page. With quantized storage it also determines how
     /// many scale rows the carried tokens span.
-    pub page_tokens: u32,
+    pub block_size: u32,
     /// Published cache tensors: keys, values, and scales when the storage is
     /// quantized, in that order.
     pub tensors: Vec<TensorTransfer>,
@@ -262,11 +262,11 @@ impl CacheGroupTransfer {
     fn validate(&self, base_extent: u32, exported_extent: u32) -> ValidationResult<()> {
         let Self {
             start,
-            page_tokens,
+            block_size,
             tensors,
         } = self;
         ensure_valid!(
-            *page_tokens > 0 && base_extent <= *start && *start <= exported_extent,
+            *block_size > 0 && base_extent <= *start && *start <= exported_extent,
             "cache group transfer interval is invalid"
         );
         ensure_valid!(
@@ -312,8 +312,8 @@ impl CacheGroupTransfer {
             // holds `start`, so a partially filled boundary page contributes
             // its already installed tokens to the count.
             let scales = &tensors[2];
-            let tokens = u64::from(start % page_tokens) + u64::from(exported_extent - start);
-            let pages = tokens.div_ceil(u64::from(*page_tokens));
+            let tokens = u64::from(start % block_size) + u64::from(exported_extent - start);
+            let pages = tokens.div_ceil(u64::from(*block_size));
             ensure_valid!(
                 scales.shape.len() == 4
                     && scales.shape[..3] == [pages, 2, key.shape[1]]
@@ -423,7 +423,7 @@ impl CacheTransfer {
                 && self.compute_dtype == other.compute_dtype
                 && self.groups.len() == other.groups.len()
                 && self.groups.iter().zip(&other.groups).all(|(left, right)| {
-                    left.start == right.start && left.page_tokens == right.page_tokens
+                    left.start == right.start && left.block_size == right.block_size
                 }),
             "cache locations disagree on export metadata"
         );

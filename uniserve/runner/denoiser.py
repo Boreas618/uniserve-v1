@@ -516,7 +516,7 @@ class DenoiserRunner:
         tokens: int,
         units: int,
         width: int,
-        page_tokens: Sequence[int],
+        block_size: Sequence[int],
         windowed: Sequence[int],
         samples: torch.Tensor,
         slot_timesteps: torch.Tensor,
@@ -542,7 +542,7 @@ class DenoiserRunner:
                 with ``rows``, the size the operators are prepared for.
             units: The most latent rows one forward predicts.
             width: The most pages one row selects from a block table.
-            page_tokens: Tokens per page of each numerical block table.
+            block_size: Tokens per page of each numerical block table.
             windowed: Whether each numerical block table retires pages
                 behind an attention window.
             samples: The latent pool's step workspace ``[units, width]``,
@@ -554,7 +554,7 @@ class DenoiserRunner:
                 units from its installed start page on.
             start_pages: ``[groups, S]`` int32, each slot's installed start
                 page.
-            table_shapes: ``[tables, 3]`` int32 ``(group, page tokens,
+            table_shapes: ``[tables, 3]`` int32 ``(group, block size,
                 window or -1)``.
         """
         path = str(path)
@@ -599,7 +599,7 @@ class DenoiserRunner:
             )
             runner._step = torch.zeros(1, dtype=torch.int64, device=target)
             runner._attention_metadata = AttentionMetadata(
-                page_tokens,
+                block_size,
                 windowed,
                 unit_tables,
                 start_pages,

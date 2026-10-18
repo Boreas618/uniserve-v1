@@ -73,7 +73,7 @@ def _units(plan, first: int) -> list[list[int]]:
     """Distinct units for one slot holding ``TOKENS`` tokens per group."""
     groups = []
     for group in plan.planes.groups:
-        count = -(-TOKENS // group.page_tokens) * group.units_per_page
+        count = -(-TOKENS // group.block_size) * group.units_per_page
         groups.append(list(range(first, first + count)))
         first += count
     return groups
