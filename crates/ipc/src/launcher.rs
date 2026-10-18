@@ -72,11 +72,13 @@ pub enum Report {
     Exit(RankExit),
 }
 
-/// A launcher's answer to [`Instruction::Reserve`].
+/// A launcher's answer to the [`Instruction::Reserve`] the head sent last.
+///
+/// The head keeps at most one reservation outstanding per launcher and reads
+/// its answer before it sends that launcher anything else, so the answer
+/// names no group: it is the reserved group's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reservation {
-    /// Worker group the socket is held for.
-    pub worker_id: String,
     /// Port the launcher bound on its host for the group's collective store.
     pub port: u16,
     /// The descriptor number the launcher holds the bound socket at. The

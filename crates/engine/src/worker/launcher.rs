@@ -242,11 +242,9 @@ impl LauncherRegistry {
         let deadline = Instant::now() + RESERVATION_TIMEOUT;
         loop {
             match launcher.channel.try_recv::<Report>() {
+                // The only reservation outstanding on this launcher is this
+                // group's: this call sent it and has not returned.
                 Ok(Some(Report::Reservation(reservation))) => {
-                    anyhow::ensure!(
-                        reservation.worker_id == worker_id && reservation.port > 0,
-                        "invalid rendezvous reservation"
-                    );
                     return Ok(super::rendezvous::Rendezvous {
                         address: std::net::SocketAddr::new(address, reservation.port).to_string(),
                         listener: None,

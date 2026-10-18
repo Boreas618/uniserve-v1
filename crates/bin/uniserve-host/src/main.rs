@@ -159,7 +159,6 @@ fn supervise(
                     .context("reserving a collective store address")?;
                 let port = listener.local_addr()?.port();
                 let reservation = Report::Reservation(Reservation {
-                    worker_id: worker_id.clone(),
                     port,
                     // The first rank inherits the socket at this number.
                     listen_fd: listener.as_raw_fd(),
