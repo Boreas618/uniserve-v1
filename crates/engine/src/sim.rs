@@ -903,11 +903,8 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Ok,
-            product_generations: call.tensor_outputs().map(|out| out.generation).collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
             num_completed_steps: 0,
@@ -917,7 +914,6 @@ impl SimEngine {
             media_output: None,
             cache_output: None,
         };
-        record.position = request.logical_position;
         set_cache_lengths(&mut record, request.cache_visible_len);
 
         match call.code {
@@ -952,7 +948,6 @@ impl SimEngine {
                             .logical_position
                             .saturating_add(call.bounds.max_tokens);
                     }
-                    record.position = request.logical_position;
                     set_cache_lengths(&mut record, request.cache_visible_len);
                 } else if samples_token {
                     let index = request.emitted;
@@ -968,7 +963,6 @@ impl SimEngine {
                     )?
                     else {
                         record.status = CallStatus::Error;
-                        record.product_generations.clear();
                         record.error_code = Some(ErrorCode::InvalidCall);
                         return Ok(record);
                     };
@@ -1008,7 +1002,6 @@ impl SimEngine {
                             .predicate_values
                             .insert(completion.clone(), transition);
                     }
-                    record.position = 1;
                     // Positions and cache advance by the query length: the whole
                     // bound for a prefill, one token for decode and verify.
                     if !visual_state {
@@ -1022,7 +1015,6 @@ impl SimEngine {
                             request.logical_position.saturating_add(query_tokens);
                         request.cache_visible_len =
                             request.cache_visible_len.saturating_add(query_tokens);
-                        record.position = request.logical_position;
                         set_cache_lengths(&mut record, request.cache_visible_len);
                     }
                     match work {
@@ -1200,8 +1192,7 @@ impl SimEngine {
 
     /// Builds the `Predicated` completion of a call whose predicate is false.
     ///
-    /// The completion carries no product generations and reports the
-    /// request's unchanged progress.
+    /// The completion reports the request's unchanged progress.
     fn predicated_completion(call: &Call, request: &SimRequestState) -> RequestOutput {
         RequestOutput {
             sampled_logprob: None,
@@ -1210,11 +1201,8 @@ impl SimEngine {
             request_key: call.request_key,
             call_id: call.call_id,
             status: CallStatus::Predicated,
-            product_generations: Vec::new(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            code: call.code,
-            position: request.logical_position,
             cache_visible_len: request.cache_visible_len,
             cache_computed_len: request.cache_visible_len,
             num_completed_steps: u32::from(request.flow_step),
