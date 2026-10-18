@@ -3,7 +3,7 @@
 //! its condition latent encoders ([`Conditions`]), and the encoding of a
 //! request's prompt, vision blocks and conditions into denoiser rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
@@ -22,18 +22,37 @@ use crate::executor::video::{
     MediaBatch, Parts, VideoCall, bind_rows, decode_range, product_name, publish, publish_bound,
     row_width, stream_of,
 };
-use crate::ffi::{DType, Function, Handle, Interpreter, integer_list};
+use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Completion, Job};
 use crate::runner::RunnerSetup;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
 use crate::storage::PinnedPool;
-use crate::storage::memory::StorageView;
+use crate::storage::memory::{Memory, StorageView};
 use crate::{Error, Result};
 
 /// A condition encoding was recorded before the job that constructs its
 /// encoder completed.
 const MISSING_ENCODER: Error =
     Error::State("a condition encoding was recorded before its encoder was constructed");
+
+/// A condition encoding was recorded before its posterior draw was filled.
+const MISSING_POSTERIOR: Error =
+    Error::State("a condition encoding was recorded before its posterior draw was filled");
+
+/// The posterior draws [`Conditions`] holds at most: one per condition size,
+/// the oldest released first. Sixteen draws of five-second 16:9 references
+/// take about 230 MB of page-locked memory.
+const POSTERIORS: usize = 16;
+
+/// A condition size's posterior draw.
+enum Posterior {
+    /// The video encoder takes no draw: its latent is the posterior's mean.
+    None,
+    /// Page-locked storage of the draw, not yet filled.
+    Undrawn(StorageView),
+    /// The filled draw, which every encoding of the size reads.
+    Drawn(StorageView),
+}
 
 /// The condition latent encoders of a video model: the Python runners of
 /// its video encoder and of its audio encoder, one per input shapes.
@@ -49,6 +68,20 @@ pub(super) struct Conditions {
     /// before the first call's ([`Self::setup`]).
     video_runners: HashMap<Vec<i64>, Methods>,
     audio_runners: HashMap<Vec<i64>, Methods>,
+    /// Elements of the posterior draw of a condition of some size, 0 when
+    /// the video encoder takes none.
+    posterior_elements: Function,
+    /// Fills a condition size's posterior draw.
+    draw_posterior: Function,
+    /// The device whose copies read the draws' page-locked storage.
+    device: DeviceId,
+    /// The posterior draw of each condition size `[frames, width, height]`.
+    /// The draw depends on the size alone (the reference samples every
+    /// condition under one fixed seed), so one draw serves every unit,
+    /// round and request of the size.
+    posteriors: HashMap<[i64; 3], Posterior>,
+    /// The sizes of `posteriors`, oldest first; at most [`POSTERIORS`].
+    posterior_order: VecDeque<[i64; 3]>,
 }
 
 /// The encoder of a condition's medium.
@@ -78,6 +111,11 @@ pub(crate) enum ConditionSetup {
     Frames(Vec<i64>),
     /// The encoders of these input shapes.
     Runners(Vec<(ConditionMedium, Vec<i64>)>),
+    /// The posterior draw sizes of conditions of these sizes, `[frames,
+    /// width, height]`.
+    Posteriors(Vec<[i64; 3]>),
+    /// The posterior draws of conditions of these sizes, filled.
+    Draws(Vec<[i64; 3]>),
 }
 
 impl Conditions {
@@ -95,7 +133,51 @@ impl Conditions {
             frames: HashMap::new(),
             video_runners: HashMap::new(),
             audio_runners: HashMap::new(),
+            posterior_elements: Interpreter::import(&format!("{ENCODER}.posterior_elements"))?,
+            draw_posterior: Interpreter::import(&format!("{ENCODER}.draw_posterior"))?,
+            device: video.device,
+            posteriors: HashMap::new(),
+            posterior_order: VecDeque::new(),
         })
+    }
+
+    /// The condition sizes `[frames, width, height]` of the visual units
+    /// of `inputs`, each once.
+    fn unit_sizes(inputs: &[ConditionInput]) -> Vec<[i64; 3]> {
+        let mut sizes: Vec<[i64; 3]> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                ConditionInput::Units { units, .. } => Some(units),
+                ConditionInput::Tracks { .. } => None,
+            })
+            .flatten()
+            .map(|&[_, frames, width, height, _]| [frames, width, height])
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
+
+    /// Hold `posterior` for `size`, releasing the oldest draws past
+    /// [`POSTERIORS`] that no size of `current` (the sizes the batch being
+    /// set up encodes) reads. A job that already recorded a released draw
+    /// keeps its storage alive.
+    fn hold_posterior(&mut self, size: [i64; 3], posterior: Posterior, current: &[[i64; 3]]) {
+        if self.posteriors.insert(size, posterior).is_none() {
+            self.posterior_order.push_back(size);
+        }
+        while self.posterior_order.len() > POSTERIORS {
+            let Some(index) = self
+                .posterior_order
+                .iter()
+                .position(|held| !current.contains(held))
+            else {
+                break;
+            };
+            if let Some(released) = self.posterior_order.remove(index) {
+                self.posteriors.remove(&released);
+            }
+        }
     }
 
     /// The input shapes of a call encoding `units`: each unit's frames at
@@ -183,7 +265,50 @@ impl Conditions {
             job.call_handle(class.construction(vec![Argument::Integers(shapes.clone())]));
             runners.push((medium, shapes));
         }
-        Ok((!runners.is_empty()).then_some(ConditionSetup::Runners(runners)))
+        if !runners.is_empty() {
+            return Ok(Some(ConditionSetup::Runners(runners)));
+        }
+
+        // A condition size's posterior draw is sized, then filled, once;
+        // both are calls of the library, so the job makes them.
+        let sizes = Self::unit_sizes(inputs);
+        let unknown: Vec<[i64; 3]> = sizes
+            .iter()
+            .copied()
+            .filter(|size| !self.posteriors.contains_key(size))
+            .collect();
+        if !unknown.is_empty() {
+            for &[frames, width, height] in &unknown {
+                job.call_returning(MethodCall::new(
+                    &self.posterior_elements,
+                    vec![
+                        Argument::Handle(self.loaded.clone()),
+                        Argument::Integer(frames),
+                        Argument::Integer(width),
+                        Argument::Integer(height),
+                    ],
+                ));
+            }
+            return Ok(Some(ConditionSetup::Posteriors(unknown)));
+        }
+        let mut undrawn = Vec::new();
+        for size in sizes {
+            if let Some(Posterior::Undrawn(noise)) = self.posteriors.get(&size) {
+                let [frames, width, height] = size;
+                job.call(MethodCall::new(
+                    &self.draw_posterior,
+                    vec![
+                        Argument::Handle(self.loaded.clone()),
+                        Argument::Integer(frames),
+                        Argument::Integer(width),
+                        Argument::Integer(height),
+                        Argument::Tensor(noise.clone()),
+                    ],
+                ));
+                undrawn.push(size);
+            }
+        }
+        Ok((!undrawn.is_empty()).then_some(ConditionSetup::Draws(undrawn)))
     }
 
     /// Keep what the job of `setup` returned.
@@ -207,6 +332,37 @@ impl Conditions {
                     };
                 }
             }
+            ConditionSetup::Posteriors(sizes) => {
+                for &size in &sizes {
+                    let elements = completion.returned()?.first().copied().ok_or_else(|| {
+                        Error::Interface(format!(
+                            "{} returned no count",
+                            self.posterior_elements.name()
+                        ))
+                    })?;
+                    let posterior = if elements == 0 {
+                        Posterior::None
+                    } else {
+                        let memory = Memory::pinned(self.device, elements as usize * 4)?;
+                        Posterior::Undrawn(StorageView::contiguous(
+                            memory as Arc<dyn Backing>,
+                            0,
+                            DType::F32,
+                            &[elements],
+                        )?)
+                    };
+                    self.hold_posterior(size, posterior, &sizes);
+                }
+            }
+            ConditionSetup::Draws(sizes) => {
+                // The job that filled them completed, so later encodings read
+                // complete draws.
+                for size in sizes {
+                    if let Some(Posterior::Undrawn(noise)) = self.posteriors.remove(&size) {
+                        self.posteriors.insert(size, Posterior::Drawn(noise));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -224,15 +380,22 @@ impl Conditions {
             .unit_shapes(units)?
             .and_then(|shapes| self.video_runners.get(&shapes))
             .ok_or(MISSING_ENCODER)?;
-        job.call(MethodCall::new(
-            &self.video.forward,
-            vec![
-                Argument::Handle(runner.runner().clone()),
-                Argument::Tensor(pixels.clone()),
-                Argument::Tensor(out.clone()),
-                Argument::Integers(units.iter().flatten().copied().collect()),
-            ],
-        ));
+        let mut arguments = vec![
+            Argument::Handle(runner.runner().clone()),
+            Argument::Tensor(pixels.clone()),
+            Argument::Tensor(out.clone()),
+            Argument::Integers(units.iter().flatten().copied().collect()),
+        ];
+        // Each unit reads its condition size's posterior draw; an encoder
+        // that takes no draw reads none.
+        for &[_, frames, width, height, _] in units {
+            match self.posteriors.get(&[frames, width, height]) {
+                Some(Posterior::Drawn(noise)) => arguments.push(Argument::Tensor(noise.clone())),
+                Some(Posterior::None) => {}
+                _ => return Err(MISSING_POSTERIOR),
+            }
+        }
+        job.call(MethodCall::new(&self.video.forward, arguments));
         Ok(())
     }
 

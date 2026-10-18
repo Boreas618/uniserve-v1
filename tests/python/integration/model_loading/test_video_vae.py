@@ -182,13 +182,18 @@ def test_unit_encoding_assembles_the_native_whole_video_conditioning(
 
     # Encode every unit in its own call, last first, as separate ranks would,
     # and place each result's rows where its layout says they belong.
-    layout = model.output_layout(
-        video.Config(num_frames, image.Config(272, 20))
-    )["video"]
+    # The video's posterior is drawn once and passed with every unit.
+    size = video.Config(num_frames, image.Config(272, 20))
+    layout = model.output_layout(size)["video"]
+    noise = torch.empty(model.posterior_shape(size))
+    model.draw_noise(size, noise)
     assembled = torch.full(layout.shape, torch.nan)
     for unit in reversed(model.frame_slices(num_frames)):
         (result,) = model.encode(
-            (pixels[unit],), frames=(unit,), num_frames=(num_frames,)
+            (pixels[unit],),
+            frames=(unit,),
+            num_frames=(num_frames,),
+            noise=(noise,),
         )
         assembled[result.layout.local_slice] = result.tensor
     torch.testing.assert_close(
