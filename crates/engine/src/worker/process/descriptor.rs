@@ -128,7 +128,7 @@ impl Default for WorkerProcessArgs {
             max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
                 + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
                 as u32,
-            attention_backend: uniserve_ipc::AttentionBackend::Auto,
+            attention_backend: "auto".into(),
             capability_groups: Vec::new(),
             transfer: Default::default(),
             load_format: "auto".to_string(),
@@ -322,7 +322,7 @@ impl WorkerProcessArgs {
                 .map(|value| value.as_str().to_owned()),
             cache_memory_fraction: self.cache_storage_fraction,
             cache_token_capacity: self.cache_token_capacity,
-            attention_backend: self.attention_backend,
+            attention_backend: self.attention_backend.clone(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,
             max_batch_tokens: self.max_batch_tokens,

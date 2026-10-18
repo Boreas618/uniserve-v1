@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use educe::Educe;
 use serde::de::DeserializeOwned;
@@ -19,7 +18,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{ModelDtype, PrefixCacheDtype};
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, FlashInferBackend, LaneConfig,
     TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
@@ -233,10 +232,12 @@ pub(crate) struct SharedRuntimeArgs {
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
     pub device: String,
-    /// Attention provider serving every attention call of the model; `auto`
-    /// selects a native kernel for each call.
-    #[arg(long, default_value = "auto", value_parser = attention_backend())]
-    pub attention_backend: AttentionBackend,
+    /// Attention provider serving every attention call of the model, by the
+    /// name the ranks' attention registry (`uniserve.backends.attention`)
+    /// gives it; `auto` selects a native kernel for each call. The ranks
+    /// refuse a name the registry does not provide when they load.
+    #[arg(long, default_value = "auto")]
+    pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = WorkerProcessArgs::default_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
@@ -491,7 +492,7 @@ impl SharedRuntimeArgs {
         worker_process.max_message_bytes = self.max_message_bytes;
         worker_process.cache_token_capacity = self.cache_token_capacity;
         worker_process.block_size = self.block_size;
-        worker_process.attention_backend = self.attention_backend;
+        worker_process.attention_backend = self.attention_backend.clone();
 
         EngineSettings {
             max_batch: self.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
@@ -743,13 +744,6 @@ fn parse_storage_fraction(value: &str) -> Result<f64, String> {
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// Parses `--attention-backend` against the worker's provider names, which
-/// `--help` lists and a refused value's error repeats.
-fn attention_backend() -> impl TypedValueParser<Value = AttentionBackend> {
-    PossibleValuesParser::new(AttentionBackend::ALL.map(AttentionBackend::as_str))
-        .try_map(|name| name.parse::<AttentionBackend>())
 }
 
 #[cfg(test)]
@@ -1033,47 +1027,24 @@ mod tests {
         assert!(serve(&["--image-fetch-max-bytes", "0"]).is_err());
     }
 
-    /// `--attention-backend` accepts each provider name of the worker's
-    /// attention library and forwards it unchanged; any other name is refused
-    /// while parsing, with the accepted names.
+    /// `--attention-backend` reaches the ranks' launch verbatim: the ranks'
+    /// attention registry owns the provider names, so a name it does not
+    /// provide is refused when the ranks load, not while parsing.
     #[test]
-    fn serve_forwards_each_attention_provider_name() {
-        let names = [
-            "auto",
-            "flash_attn",
-            "flash_attn_4",
-            "flashinfer",
-            "prefix_block",
-            "sgl_kernel",
-            "torch",
-            "trtllm",
-        ];
-        let serve = |name: &str| {
-            <Cli as clap::Parser>::try_parse_from([
+    fn serve_forwards_the_attention_provider_name_verbatim() {
+        for name in ["flash_attn_4", "sdpa"] {
+            let cli = <Cli as clap::Parser>::try_parse_from([
                 "uniserve",
                 "serve",
                 "model",
                 "--attention-backend",
                 name,
             ])
-        };
-
-        for name in names {
-            let Command::Serve(args) = serve(name).expect("provider name").command;
+            .expect("any provider name parses");
+            let Command::Serve(args) = cli.command;
             let config = args.to_uniserve_config();
-            assert_eq!(
-                config.engine.worker_process.attention_backend.as_str(),
-                name
-            );
+            assert_eq!(config.engine.worker_process.attention_backend, name);
         }
-
-        let error = serve("sdpa").expect_err("unknown provider name");
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
-        let message = error.to_string();
-        assert!(
-            message.contains(&format!("[possible values: {}]", names.join(", "))),
-            "{message}"
-        );
     }
 
     #[test]

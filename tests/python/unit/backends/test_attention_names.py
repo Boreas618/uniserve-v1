@@ -3,22 +3,9 @@
 import pytest
 import torch
 
-from uniserve.backends.attention import resolve
+from uniserve.backends.attention import PROVIDERS, resolve
 
 pytestmark = pytest.mark.unit
-
-# Every value ``uniserve serve --attention-backend`` accepts besides
-# ``auto`` (README.md). The worker resolves the name unchanged, and the
-# provider it selects reports that name in the startup kernel table.
-PROVIDERS = (
-    "flash_attn",
-    "flash_attn_4",
-    "flashinfer",
-    "prefix_block",
-    "sgl_kernel",
-    "torch",
-    "trtllm",
-)
 
 
 @pytest.mark.parametrize("name", PROVIDERS)

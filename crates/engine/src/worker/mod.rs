@@ -108,8 +108,10 @@ pub struct WorkerProcessArgs {
     /// and block tables. A worker that fits its request tensors to device
     /// storage takes this as the largest pool it may choose.
     pub max_request_pool_size: u32,
-    /// Attention implementation selected for model execution.
-    pub attention_backend: uniserve_ipc::AttentionBackend,
+    /// Attention provider name, forwarded to the ranks verbatim. The ranks'
+    /// attention registry owns the names and refuses one it does not
+    /// provide when the model loads; `auto` lets it select per call.
+    pub attention_backend: String,
     /// Optional public worker capability selectors; empty uses the model default.
     /// Startup resolves each selector to its concrete computation set.
     pub capability_groups: Vec<String>,

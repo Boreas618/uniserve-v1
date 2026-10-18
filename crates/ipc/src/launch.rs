@@ -24,7 +24,7 @@ use std::process::{Child, Command, ExitStatus};
 use serde::{Deserialize, Serialize};
 use uniserve_core::{Canvas, CanvasSampling, ComponentConfig};
 
-use crate::{AttentionBackend, LaneConfig};
+use crate::LaneConfig;
 
 /// The command that starts one rank with the interpreter `python`.
 ///
@@ -457,8 +457,11 @@ pub struct LaunchDescriptor {
     /// Fraction of device memory this rank may hold, in (0, 1].
     pub cache_memory_fraction: f64,
     pub cache_token_capacity: Option<u64>,
-    /// Attention provider selection of the rank's model.
-    pub attention_backend: AttentionBackend,
+    /// Attention provider name of the rank's model, as `--attention-backend`
+    /// gave it. The rank's attention registry (`uniserve.backends.attention`)
+    /// owns the names and refuses one it does not provide when the model
+    /// loads; `auto` selects a native kernel per call.
+    pub attention_backend: String,
     pub block_size: Option<u32>,
     pub max_batch_calls: u32,
     pub max_batch_tokens: u32,
