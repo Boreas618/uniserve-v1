@@ -252,8 +252,7 @@ impl WorkerExecutor {
     ///
     /// Fails when the command wake cannot be created, `workers` is empty, a
     /// worker identity repeats, a group was initialized with transfer
-    /// bindings other than `transfer`, a worker
-    /// reports invalid capabilities, the workers expose different outputs for
+    /// bindings other than `transfer`, the workers expose different outputs for
     /// a replicated component, the media routing or video codec pairing is
     /// refused, a transfer edge names an unbound worker or rank, repeats a
     /// physical rank pair, or uses a mechanism that cannot serve the edge's
@@ -279,10 +278,6 @@ impl WorkerExecutor {
                 routing.insert(id.clone(), index).is_none(),
                 "worker identity {id} is repeated"
             );
-            executor
-                .info()
-                .validate()
-                .with_context(|| format!("worker {id} reported invalid capabilities"))?;
         }
         let mut executor_info = ExecutorInfo::from_workers(
             workers

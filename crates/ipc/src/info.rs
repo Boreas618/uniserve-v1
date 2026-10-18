@@ -374,7 +374,9 @@ impl ImageWarmup {
 
 /// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency. Launch values
+/// [`WorkerInfo::validate`] checks only internal consistency; the rank runs it
+/// on the report it builds, and the engine takes the report as sent. Launch
+/// values
 /// (world size, devices, transfer mechanisms, queue depth and component
 /// placement) are the engine's and are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -6,9 +6,10 @@
 //! the [`TransferTransport`] a consumer opens. A published cache extent travels
 //! as a [`CacheTransfer`] identified by a [`BufferId`] alone.
 //!
-//! The validators here are the wire contract: a [`Frame`] runs
-//! them, through `Batch::validate` and `BatchOutput::validate`, whenever it
-//! encodes or decodes a batch or a batch result.
+//! The validators here are the wire contract. A message is checked once,
+//! where it is built: the engine runs them through `Batch::validate` for a
+//! batch and each rank's projection of it, and a rank through
+//! `BatchOutput::validate` for a batch's result.
 
 use super::*;
 

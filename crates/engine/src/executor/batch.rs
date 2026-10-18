@@ -164,15 +164,16 @@ impl ExecutionBatch {
         retired
     }
 
-    /// Validates call identities, execution ownership, and command payloads.
+    /// Validates the scheduler's own bookkeeping: call identities, execution
+    /// ownership and placement.
     ///
-    /// Requires at least one call or command; checks each call and its
-    /// placement, that call identities are unique and belong to this batch,
-    /// and that every `Start` is unique and names a request with a call in
-    /// this batch; and validates every command, input transfer, and cache input.
-    /// Wire-level constraints between calls (one kind and component per batch,
-    /// allocation tables matching their calls, non-overlapping spans) are left
-    /// to `Batch::validate`, which `into_protocol` runs.
+    /// Requires at least one call or command; checks that call identities are
+    /// unique and belong to this batch, that each placement describes its own
+    /// call, and that every `Start` is unique and names a request with a call
+    /// in this batch. The records themselves and the wire-level constraints
+    /// between calls (one kind and component per batch, allocation tables
+    /// matching their calls, non-overlapping spans) are checked once, by
+    /// `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty(),
@@ -182,7 +183,6 @@ impl ExecutionBatch {
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
         let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
         for (call, placement) in &self.requests {
-            call.validate()?;
             anyhow::ensure!(
                 call.call_id.batch_id == self.id,
                 "computation identity belongs to another logical batch"
@@ -200,28 +200,19 @@ impl ExecutionBatch {
             // A placement describes one call, so its forward rows may only
             // name local call index zero.
             placement.forward.validate(1)?;
-            for table in &placement.block_tables {
-                table.validate()?;
-            }
-            for units in &placement.new_cache_units {
-                units.validate()?;
-            }
             if let Some(latent) = &placement.latent {
-                latent.validate()?;
                 anyhow::ensure!(
                     (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's latent execution"
                 );
             }
             if let Some(decode) = &placement.decode {
-                decode.validate()?;
                 anyhow::ensure!(
                     (decode.request_key, decode.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's decode execution"
                 );
             }
             for buffer in &placement.buffers {
-                buffer.allocation.validate()?;
                 anyhow::ensure!(
                     call.buffer_inputs()
                         .chain(call.buffer_outputs())
@@ -233,7 +224,6 @@ impl ExecutionBatch {
 
         let mut admitted = std::collections::HashSet::new();
         for admission in self.admissions() {
-            admission.validate()?;
             anyhow::ensure!(
                 admitted.insert(admission.request_key),
                 "logical batch repeats a request start"
@@ -242,17 +232,6 @@ impl ExecutionBatch {
                 requests.contains(&admission.request_key),
                 "logical batch starts a request without a call"
             );
-        }
-
-        for command in &self.commands {
-            command.validate()?;
-        }
-
-        for transfer in &self.input_transfers {
-            transfer.validate()?;
-        }
-        for export in &self.cache_inputs {
-            export.validate()?;
         }
         Ok(())
     }

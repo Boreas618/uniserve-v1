@@ -7,8 +7,10 @@
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with [`ForwardBatch::select`] and sets each call's `consumer_slots`),
 //! and sends it as the message of a [`Frame`]. A rank answers with one
-//! [`BatchOutput`] of per-call [`RequestOutput`] completions. The rank
-//! runtime (`uniserve-worker`) consumes these types directly.
+//! [`BatchOutput`] of per-call [`RequestOutput`] completions, which it
+//! validates where it builds the response. The rank runtime
+//! (`uniserve-worker`) consumes these types directly; a frame carries a
+//! message its sender validated, and its receiver does not check it again.
 //!
 //! Besides its calls, a batch carries the cache page tables of its requests
 //! ([`BlockTable`], with the units newly acquired for them in
@@ -644,10 +646,10 @@ impl Batch {
             );
         }
 
-        // Admissions create request state independently of call execution.
+        // Admissions create request state independently of call execution;
+        // each is validated once, as the `Start` command below.
         let mut admitted = HashSet::new();
         for admission in self.admissions() {
-            admission.validate()?;
             ensure_valid!(
                 admitted.insert(admission.request_key),
                 "a submission batch carries a duplicate admission"
