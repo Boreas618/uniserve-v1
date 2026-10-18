@@ -209,7 +209,7 @@ def test_the_top_k_sampler_selects_what_the_general_path_selects(
         bias=[],
         bias_values=[],
         logprob_tasks=[],
-        logprob_requests=[],
+        logprob_counts=[],
         force_finish=[0] * rows,
         finish_ids=[-1] * rows,
         transition_ids=[-1] * rows,

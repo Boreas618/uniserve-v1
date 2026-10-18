@@ -69,7 +69,6 @@ from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import execution_context, kernel_records
 from uniserve.sampling.greedy import greedy
 from uniserve.sampling.logprobs import (
-    LogprobRequest,
     prompt_logprobs,
 )
 from uniserve.sampling.select import (
@@ -148,28 +147,6 @@ def _vocabulary(model) -> tuple[Any, VocabShard, Any]:
         VocabShard(size, slice(start, stop), padded, tensor),
         tensor,
     )
-
-
-def _requests(
-    counts: Sequence[int], ids: Sequence[int]
-) -> list[LogprobRequest]:
-    """What each requesting task reports.
-
-    ``counts`` holds each task's top count and ``ids`` the row-major
-    ``[tasks, width]`` matrix of its explicit token ids, padded with -1.
-    """
-    width = len(ids) // len(counts) if len(counts) else 0
-    return [
-        LogprobRequest(
-            int(count),
-            tuple(
-                int(token)
-                for token in ids[index * width : (index + 1) * width]
-                if int(token) >= 0
-            ),
-        )
-        for index, count in enumerate(counts)
-    ]
 
 
 class CausalLMRunner:
@@ -916,7 +893,6 @@ class CausalLMRunner:
         bias_values: Sequence[float],
         logprob_tasks: Sequence[int],
         logprob_counts: Sequence[int],
-        logprob_ids: Sequence[int],
         logprob_offset: int,
         force_finish: Sequence[int],
         finish_ids: Sequence[int],
@@ -974,7 +950,7 @@ class CausalLMRunner:
             bias=bias,
             bias_values=bias_values,
             logprob_tasks=logprob_tasks,
-            logprob_requests=_requests(logprob_counts, logprob_ids),
+            logprob_counts=[int(count) for count in logprob_counts],
             force_finish=force_finish,
             finish_ids=finish_ids,
             transition_ids=transition_ids,
@@ -1013,7 +989,6 @@ class CausalLMRunner:
         bias_values: Sequence[float],
         logprob_tasks: Sequence[int],
         logprob_counts: Sequence[int],
-        logprob_ids: Sequence[int],
         logprob_offset: int,
         force_finish: Sequence[int],
         finish_ids: Sequence[int],
@@ -1055,9 +1030,8 @@ class CausalLMRunner:
             draws: ``[T]`` float32 uniform draws and ``params`` ``[T,
                 PARAMETER_COLUMNS]`` float32 parameters, one row per task
                 from row ``parameters`` on.
-            logprob_tasks: The tasks that report logprobs: each its top
-                ``logprob_counts`` entries and its row of ``logprob_ids``
-                (row-major, padded with -1), packed into ``logprobs`` from
+            logprob_tasks: The tasks that report logprobs, each its top
+                ``logprob_counts`` entries, packed into ``logprobs`` from
                 ``logprob_offset`` on.
 
         The other arguments are those of :meth:`sample_greedy`.
@@ -1086,7 +1060,6 @@ class CausalLMRunner:
                 bias_values,
                 logprob_tasks,
                 logprob_counts,
-                logprob_ids,
                 logprob_offset,
                 force_finish,
                 finish_ids,
@@ -1126,7 +1099,6 @@ class CausalLMRunner:
         bias_values: Sequence[float],
         logprob_tasks: Sequence[int],
         logprob_counts: Sequence[int],
-        logprob_ids: Sequence[int],
         logprob_offset: int,
         force_finish: Sequence[int],
         finish_ids: Sequence[int],
@@ -1190,7 +1162,6 @@ class CausalLMRunner:
                 bias_values,
                 logprob_tasks,
                 logprob_counts,
-                logprob_ids,
                 logprob_offset,
                 force_finish,
                 finish_ids,
@@ -1217,7 +1188,6 @@ class CausalLMRunner:
         offsets: Sequence[int],
         tails: Sequence[int],
         tops: Sequence[int],
-        ids: Sequence[int],
         hidden: torch.Tensor,
         logit_rows: torch.Tensor,
         input_ids: torch.Tensor,
@@ -1245,15 +1215,12 @@ class CausalLMRunner:
             offsets: Where its logprob words start in ``logprobs``.
             tails: The row of ``prompt_tail`` its last logits go to.
             tops: Its top count.
-            ids: Row-major ``[chunks, width]`` explicit token ids it
-                reports, padded with -1.
         """
         with torch.inference_mode(), self._context.activate():
             candidates = self._project(
                 hidden, logit_rows[: int(count)], int(count), None
             )
-            requests = _requests(tops, ids)
-            for index, request in enumerate(requests):
+            for index, top in enumerate(tops):
                 row, scored = int(rows[index]), int(row_counts[index])
                 tail = int(tails[index])
                 if not scored:
@@ -1272,7 +1239,7 @@ class CausalLMRunner:
                     )[0]
                 token = int(tokens[index])
                 retained, packed = prompt_logprobs(
-                    input_ids[token : token + scored], chunk, previous, request
+                    input_ids[token : token + scored], chunk, previous, int(top)
                 )
                 prompt_tail[tail].copy_(retained)
                 if packed is not None:
