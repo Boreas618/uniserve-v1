@@ -1,9 +1,9 @@
-"""Row kernels of segment-wise video sparse attention over 128-row tiles.
+"""Row and selection kernels of segment-wise video sparse attention.
 
 Segment attention (``uniserve.nn.attention.vsa.SegmentAttention``) keeps the
-eager arithmetic of its checkpoint's recipe; these kernels perform two of its
-row passes without materializing full-sequence temporaries and reproduce the
-eager results bit for bit:
+eager arithmetic of its checkpoint's recipe; these kernels perform its row
+passes and its tile selection without materializing full-sequence
+temporaries and reproduce the eager results bit for bit:
 
 - ``zero_tile_padding`` writes zeros to the rows past each tile's valid size,
   so a plain per-tile sum of the rows equals the sum of the masked rows. Only
@@ -11,6 +11,11 @@ eager results bit for bit:
 - ``add_gated_tiles`` adds each tile's gated compression to its rows,
   ``out + compressed[tile] * gate`` with the product and the sum each rounded
   to the tensors' dtype, as two eager element-wise operations round them.
+- ``select_tiles`` chooses every query tile's key tiles from its pooled
+  scores in one pass, the result of the stable sorts, cumulative sums and
+  scatters of ``uniserve.nn.attention.vsa.segments.select``: each segment's
+  kept tiles come from a bisection for its threshold score rather than a
+  sort.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -133,6 +138,95 @@ if triton is not None:
             total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
         )
 
+    @triton.jit
+    def _select_tiles_kernel(
+        scores,
+        tile_segments,
+        valid_sizes,
+        segment_keep,
+        indices,
+        counts,
+        tiles,
+        block: tl.constexpr,
+    ):
+        """Choose one query tile's key tiles for one head.
+
+        A video query tile ranks the key tiles of every segment by descending
+        score, ties by ascending tile, and keeps each segment's leading
+        ``segment_keep`` tiles besides every live dense tile; a dense query
+        tile keeps every live tile and an empty one none. The kept tiles are
+        stored first in ascending order, then the others in ascending order.
+
+        A segment's ``keep``-th highest score key is the largest threshold
+        that ``keep`` of its keys reach; bisection over the 32-bit key range
+        finds it exactly. The segment keeps every tile above it and, of the
+        tiles at it, the first ones in tile order until ``keep`` are kept:
+        the tiles a stable descending sort ranks first.
+        """
+        query = tl.program_id(0)
+        head = tl.program_id(1)
+        row = (head * tiles + query).to(tl.int64)
+        keys = tl.arange(0, block)
+        present = keys < tiles
+        segments = tl.load(tile_segments + keys, mask=present, other=-1)
+        live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
+        query_segment = tl.load(tile_segments + query)
+        query_live = tl.load(valid_sizes + query) > 0
+
+        mask = live & query_live
+        if query_live & (query_segment >= 0):
+            values = tl.load(
+                scores + row * tiles + keys, mask=present, other=0.0
+            )
+            # Ascending order key of the FP32 score: the sign-flipped bits,
+            # with -0 as +0 and every NaN above +inf, as the stable sort
+            # orders them.
+            bits = (values + 0.0).to(tl.int32, bitcast=True).to(tl.int64)
+            bits = bits & 0xFFFFFFFF
+            ascending = tl.where(
+                bits >= 0x80000000, 0xFFFFFFFF - bits, bits | 0x80000000
+            )
+            ascending = tl.where(values != values, 0xFFFFFFFF, ascending)
+
+            # The same order on signed 32-bit keys, which halve the lanes'
+            # registers: every key and threshold shifts down by 2**31.
+            signed = (ascending - 0x80000000).to(tl.int32)
+
+            chosen = present & (segments < -1)
+            for segment in range(tl.max(segments, axis=0) + 1):
+                members = present & (segments == segment)
+                keep = tl.minimum(
+                    tl.load(segment_keep + segment),
+                    tl.sum(members.to(tl.int32), axis=0),
+                )
+                # Invariant: at least ``keep`` member keys reach ``lower`` and
+                # fewer reach ``upper``; 32 halvings leave adjacent bounds.
+                lower = tl.zeros((), dtype=tl.int64)
+                upper = tl.full((), 1 << 32, dtype=tl.int64)
+                for _ in tl.static_range(32):
+                    middle = lower + (upper - lower) // 2
+                    bound = (middle - 0x80000000).to(tl.int32)
+                    reach = tl.sum(
+                        (members & (signed >= bound)).to(tl.int32), axis=0
+                    )
+                    lower = tl.where(reach >= keep, middle, lower)
+                    upper = tl.where(reach >= keep, upper, middle)
+                threshold = (lower - 0x80000000).to(tl.int32)
+                above = members & (signed > threshold)
+                tied = members & (signed == threshold)
+                room = keep - tl.sum(above.to(tl.int32), axis=0)
+                tied_before = tl.cumsum(tied.to(tl.int32), axis=0) - 1
+                chosen = chosen | above | (tied & (tied_before < room))
+            mask = (live & (segments < 0)) | chosen
+        mask = mask & present
+
+        count = tl.sum(mask.to(tl.int32), axis=0)
+        kept_before = tl.cumsum(mask.to(tl.int32), axis=0) - 1
+        others_before = tl.cumsum((present & ~mask).to(tl.int32), axis=0) - 1
+        slots = tl.where(mask, kept_before, count + others_before)
+        tl.store(indices + row * tiles + slots, keys, mask=present)
+        tl.store(counts + row, count)
+
 
 def _rows_layout(value: torch.Tensor, name: str) -> None:
     if value.ndim != 3 or value.stride(2) != 1:
@@ -240,4 +334,73 @@ def add_gated_tiles(
     )
 
 
-__all__ = ["add_gated_tiles", "zero_tile_padding"]
+def select_tiles(
+    scores: torch.Tensor,
+    tile_segments: torch.Tensor,
+    valid_sizes: torch.Tensor,
+    segment_keep: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose every query tile's key tiles from its pooled scores.
+
+    ``scores`` is the contiguous FP32 ``[heads, tiles, tiles]`` (query tile,
+    key tile) matrix and the tables are the int32 per-tile vectors of
+    ``uniserve.nn.attention.vsa.Segments``. A dense query tile keeps every
+    live key tile; a video query tile keeps every live dense tile and, of
+    each segment ``r``, the ``segment_keep[r]`` tiles of that segment with
+    the highest scores, equal scores in ascending tile order, NaN above
+    every number and -0 equal to +0; an empty query tile keeps none.
+
+    Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
+    tile's kept tiles first in ascending order followed by the unkept tiles
+    in ascending order, and ``[heads, tiles]`` int32 counts.
+
+    Raises:
+        RuntimeError: Triton cannot launch on the scores' device.
+        ValueError: The scores or tables do not describe one tile set.
+    """
+    if not launchable(scores.device):
+        raise RuntimeError("tile selection requires Triton")
+    heads, query_tiles, tiles = (int(size) for size in scores.shape)
+    tables = (tile_segments, valid_sizes, segment_keep)
+    if (
+        scores.ndim != 3
+        or scores.dtype != torch.float32
+        or not scores.is_contiguous()
+        or query_tiles != tiles
+        or any(
+            table.shape != (tiles,)
+            or table.dtype != torch.int32
+            or table.device != scores.device
+            for table in tables
+        )
+    ):
+        raise ValueError(
+            "tile selection needs [heads, tiles, tiles] FP32 scores and "
+            "int32 tables of the same tiles"
+        )
+    indices = torch.empty(
+        (heads, tiles, tiles), dtype=torch.int32, device=scores.device
+    )
+    counts = torch.empty(
+        (heads, tiles), dtype=torch.int32, device=scores.device
+    )
+    if heads == 0 or tiles == 0:
+        return indices, counts
+    block = triton.next_power_of_2(tiles)
+    _select_tiles_kernel[(tiles, heads)](
+        scores,
+        tile_segments,
+        valid_sizes,
+        segment_keep,
+        indices,
+        counts,
+        tiles,
+        block,
+        # Each bisection step reduces the whole row; four warps reduce rows
+        # of up to 2048 lanes fastest, eight the longer rows.
+        num_warps=4 if block <= 2048 else 8,
+    )
+    return indices, counts
+
+
+__all__ = ["add_gated_tiles", "select_tiles", "zero_tile_padding"]
