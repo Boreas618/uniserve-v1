@@ -644,6 +644,7 @@ pub(crate) fn start_video(
             setup.config.ffmpeg.clone(),
             setup.model.facts.frame_rate,
             capacity,
+            setup.config.device.cuda(),
         )?)
     };
     Ok((encoders, denoisers, decoders, media))
