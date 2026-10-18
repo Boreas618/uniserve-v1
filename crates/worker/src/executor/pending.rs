@@ -310,8 +310,9 @@ impl PendingOutput {
                 return Ok(());
             }
             if values[row] == 0 {
+                // The request's constraints left no valid distribution.
                 self.output.status = CallStatus::Error;
-                self.output.error_code = Some(ErrorCode::InvalidCall);
+                self.output.error_code = Some(ErrorCode::InvalidDescriptor);
                 return Ok(());
             }
             self.accept_tokens(values[count * 2 + row], values[count * 3 + row])?;

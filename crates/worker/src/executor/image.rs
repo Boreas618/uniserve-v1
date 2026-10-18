@@ -931,11 +931,13 @@ impl HostStage for Encodings {
                 Some(Outcome::Failed(error)) => {
                     tracing::error!("image encoding failed: {error}");
                     output.output.status = CallStatus::Error;
-                    output.output.error_code = Some(ErrorCode::InvalidCall);
+                    output.output.error_code = Some(ErrorCode::ComputeError);
                 }
+                // The call's host task always completes before its batch
+                // materializes, so a missing outcome breaks the batch's order.
                 Some(Outcome::Cancelled) | None => {
                     output.output.status = CallStatus::Error;
-                    output.output.error_code = Some(ErrorCode::Internal);
+                    output.output.error_code = Some(ErrorCode::InvariantViolation);
                 }
             }
         }

@@ -558,18 +558,6 @@ pub(crate) trait HostStage {
     fn cancel(&mut self);
 }
 
-/// The wire code of a batch failure classified as `code`.
-fn error_code(code: crate::ErrorCode) -> ErrorCode {
-    match code {
-        crate::ErrorCode::ResourceError => ErrorCode::ResourceExhausted,
-        crate::ErrorCode::ComputeError => ErrorCode::ComputeError,
-        crate::ErrorCode::InvariantViolation | crate::ErrorCode::FatalWorkerFailure => {
-            ErrorCode::Internal
-        }
-        _ => ErrorCode::InvalidCall,
-    }
-}
-
 /// Every call of `plan` fails with `code`, reporting its accepted progress.
 fn failed_output(
     requests: &RequestPool,
@@ -632,12 +620,7 @@ pub(crate) fn fail(
             .map(|trace| format!("\n{trace}"))
             .unwrap_or_default()
     );
-    let output = failed_output(
-        backend.requests(),
-        &plan,
-        batch.predecessors(),
-        error_code(error.code),
-    )?;
+    let output = failed_output(backend.requests(), &plan, batch.predecessors(), error.code)?;
     batch.complete(BatchResult {
         output,
         media: Vec::new(),

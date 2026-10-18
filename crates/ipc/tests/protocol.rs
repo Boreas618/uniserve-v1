@@ -2055,7 +2055,7 @@ fn full_run_result() -> BatchOutput {
     error_record.request_key = key_for_request(102);
     error_record.call_id = CallId::new(11, 2);
     error_record.status = CallStatus::Error;
-    error_record.error_code = Some(ErrorCode::ResourceExhausted);
+    error_record.error_code = Some(ErrorCode::ResourceError);
     error_record.finish_flags = FinishFlags {
         eos: false,
         length: false,
@@ -2100,7 +2100,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
             message_id: Some(17),
             error: WorkerResponseError {
                 message: "device fault on decode".into(),
-                code: Some("compute_error".into()),
+                code: Some(ErrorCode::ComputeError),
                 fatal: false,
                 phase: Some("execute".into()),
                 route: Some("und.decode".into()),

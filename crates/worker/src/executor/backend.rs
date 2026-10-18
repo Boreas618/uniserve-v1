@@ -908,7 +908,7 @@ impl WorkerBackend {
             .iter()
             .map(|call| format!("{}/{:?}", call.request_key.request_id.0, call.call_id))
             .collect();
-        if error.code.traces() {
+        if crate::error::traces(error.code) {
             tracing::error!(
                 "worker request {:?} failed: {error} [code={} calls={calls:?}]{}",
                 kind.as_str(),

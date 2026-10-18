@@ -65,7 +65,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_ipc::ErrorCode::ResourceExhausted);
+                record.error_code = Some(uniserve_ipc::ErrorCode::ResourceError);
                 None
             }
         };

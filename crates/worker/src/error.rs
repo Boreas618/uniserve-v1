@@ -103,54 +103,20 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Stable worker error identifiers carried as the response's `code`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
-    UnsupportedCall,
-    InvalidDescriptor,
-    UnsupportedSetup,
-    InputError,
-    ComputeError,
-    ResourceError,
-    InvariantViolation,
-    FatalWorkerFailure,
-}
+/// The failure classes a rank reports: the protocol's one vocabulary, used
+/// as they are in completions and error responses.
+pub use uniserve_ipc::ErrorCode;
 
-impl ErrorCode {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::UnsupportedCall => "UnsupportedCall",
-            Self::InvalidDescriptor => "InvalidDescriptor",
-            Self::UnsupportedSetup => "UnsupportedSetup",
-            Self::InputError => "InputError",
-            Self::ComputeError => "ComputeError",
-            Self::ResourceError => "ResourceError",
-            Self::InvariantViolation => "InvariantViolation",
-            Self::FatalWorkerFailure => "FatalWorkerFailure",
-        }
-    }
-
-    /// A failure of this kind leaves the rank unsafe to serve further work.
-    pub(crate) const fn fatal(self) -> bool {
-        matches!(self, Self::InvariantViolation | Self::FatalWorkerFailure)
-    }
-
-    /// Failures worth a full traceback in the rank's log.
-    pub(crate) const fn traces(self) -> bool {
-        matches!(
-            self,
-            Self::ComputeError
-                | Self::ResourceError
-                | Self::InvariantViolation
-                | Self::FatalWorkerFailure
-        )
-    }
-}
-
-impl std::fmt::Display for ErrorCode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
+/// Whether a failure of class `code` is worth a full traceback in the rank's
+/// log.
+pub(crate) const fn traces(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::ComputeError
+            | ErrorCode::ResourceError
+            | ErrorCode::InvariantViolation
+            | ErrorCode::FatalWorkerFailure
+    )
 }
 
 /// Failure texts that mark a context-corrupting CUDA failure, which requires
@@ -294,7 +260,7 @@ impl WorkerError {
     pub(crate) fn response(&self) -> WorkerResponseError {
         WorkerResponseError {
             message: self.detail.message.clone(),
-            code: Some(self.code.as_str().to_owned()),
+            code: Some(self.code),
             fatal: self.fatal,
             phase: self.detail.phase.clone(),
             route: self.detail.route.clone(),
@@ -532,7 +498,7 @@ mod tests {
             .with_phase("batch export")
             .with_route("prefill")
             .response();
-        assert_eq!(response.code.as_deref(), Some("InvariantViolation"));
+        assert_eq!(response.code, Some(ErrorCode::InvariantViolation));
         assert_eq!(response.phase.as_deref(), Some("batch export"));
         assert_eq!(response.route.as_deref(), Some("prefill"));
     }
