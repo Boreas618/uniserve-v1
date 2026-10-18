@@ -70,6 +70,7 @@ from .packing import (
     DensePacking,
     SegmentExtent,
     SegmentPacking,
+    align_num_frames,
     audio_latent_frames,
     condition_segments,
     dense_packing,
@@ -197,11 +198,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     numerical attention input and never represents a second computation batch.
     """
 
-    # A native temporal window covers 17 new frames and carries a 5-frame
-    # overlap, so a legal input length is 5 + 17k with a 22-frame minimum.
-    NATIVE_WINDOW_FRAMES = 17
-    NATIVE_OVERLAP_FRAMES = 5
-
     def __init__(self, config: DenoiserConfig):
         super().__init__(
             modalities=("video", "audio"),
@@ -276,8 +272,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     def legal_frame_count(self, requested: int) -> int:
         """Round a requested duration up to the next complete native window."""
-        window, overlap = self.NATIVE_WINDOW_FRAMES, self.NATIVE_OVERLAP_FRAMES
-        return max(overlap + window, requested + (overlap - requested) % window)
+        return align_num_frames(requested)
 
     def make_size(
         self,
