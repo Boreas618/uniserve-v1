@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationFeatures, GenerationLimits,
-    ImageEncoderInput, ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
+    ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -69,15 +69,16 @@ impl SenseNovaProfile {
     /// Pixel budget a request's input images share.
     const MAX_TOTAL_PIXELS: u64 = 4096 * 4096;
 
-    /// Returns bounded runtime capabilities for the selected dtype.
+    /// Returns the profile's runtime sizing for the selected dtype.
     ///
     /// Each grid-token bound is the largest image the profile admits: the
     /// largest resolution bucket for a generated canvas, and the pixel bound
     /// of an input image, plus the feedback marker, for the ViT grid. The
-    /// vision feature bytes and the encoder cache are not stated here: the
-    /// engine scheduler's `resolve_generation_limits` takes them from the
-    /// capacities the loaded worker reports, and clamps the latent capacity
-    /// and the served features to the worker's as well.
+    /// served features, the latent capacity, the vision feature bytes and
+    /// the encoder cache are not stated here: the fixed resolution buckets
+    /// bound a canvas's sides, and the engine scheduler's
+    /// `resolve_generation_limits` takes the features from the loaded
+    /// workers' call kinds and the capacities from what they report.
     pub fn runtime_limits(&self, model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
         let unit_pixels = u64::from(Self::LATENT_DOWNSAMPLE).pow(2);
@@ -91,10 +92,7 @@ impl SenseNovaProfile {
         let max_vision_units = Self::MAX_IMAGE_PIXELS / u64::from(Self::VISION_STRIDE).pow(2);
         let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
         GenerationLimits {
-            features: GenerationFeatures::UNDERSTANDING
-                | GenerationFeatures::VISION_ENCODE
-                | GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 4_096,
+            max_latent_units: u64::MAX,
             latent_downsample: Self::LATENT_DOWNSAMPLE,
             max_vae_grid_tokens: u32::try_from(max_latent_units).unwrap_or(u32::MAX),
             max_vit_grid_tokens: u32::try_from(max_vision_units)
@@ -106,6 +104,7 @@ impl SenseNovaProfile {
             commit_marker_tokens: 0,
             max_cfg_branches: 3,
             encoder_cache_entries: u32::MAX,
+            ..GenerationLimits::default()
         }
     }
 
