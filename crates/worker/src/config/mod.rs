@@ -51,13 +51,14 @@ pub struct WorkerConfig {
 
     /// Tokens per cache page in the group with the widest token rows; unset until binding.
     pub block_size: Option<usize>,
-    pub cache_token_capacity: Option<usize>,
+    pub max_total_tokens: Option<usize>,
     /// Attention provider name the model is loaded with, resolved by the
     /// attention registry (`uniserve.backends.attention.resolve`).
     pub attention_backend: String,
     pub max_batch_calls: usize,
     pub max_batch_tokens: usize,
-    pub max_sequence_tokens: usize,
+    /// Longest sequence a request may reach, in tokens (`--max-model-len`).
+    pub max_model_len: usize,
 
     /// Maximum admitted video duration, in seconds.
     pub max_video_seconds: f64,
@@ -85,8 +86,9 @@ pub struct WorkerConfig {
     pub pool_storage_bytes: Option<usize>,
     pub model_dtype: String,
     pub prefix_cache_dtype: Option<String>,
-    /// Fraction of total device storage available to this process.
-    pub cache_storage_fraction: f64,
+    /// Fraction of the device's total memory this process may hold for
+    /// static allocations, weights and KV cache (`--mem-fraction-static`).
+    pub mem_fraction_static: f64,
     pub lanes: Vec<LaneConfig>,
 
     pub graph_policy: String,
@@ -110,11 +112,11 @@ impl Default for WorkerConfig {
             expert_exchange: "alltoall".into(),
             expert_microbatches: 1,
             block_size: None,
-            cache_token_capacity: None,
+            max_total_tokens: None,
             attention_backend: "auto".into(),
             max_batch_calls: 1024,
             max_batch_tokens: 8192,
-            max_sequence_tokens: 16384,
+            max_model_len: 16384,
             max_video_seconds: 15.0,
             max_condition_rows: 0,
             ffmpeg: "ffmpeg".into(),
@@ -129,7 +131,7 @@ impl Default for WorkerConfig {
             pool_storage_bytes: None,
             model_dtype: "bfloat16".into(),
             prefix_cache_dtype: None,
-            cache_storage_fraction: 0.7,
+            mem_fraction_static: 0.7,
             lanes: vec![],
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: default_decode_sizes(),
@@ -179,7 +181,7 @@ impl WorkerConfig {
             )));
         }
         Ok(Self {
-            cache_token_capacity: None,
+            max_total_tokens: None,
             generation_device: None,
             max_batch_calls: slots,
             max_batch_tokens: slots,
@@ -219,7 +221,7 @@ impl WorkerConfig {
             || [
                 self.max_batch_calls,
                 self.max_batch_tokens,
-                self.max_sequence_tokens,
+                self.max_model_len,
                 self.max_request_pool_size,
                 self.encoder_cache_entries,
             ]
@@ -270,9 +272,9 @@ impl WorkerConfig {
             }
         }
 
-        if !(self.cache_storage_fraction > 0.0 && self.cache_storage_fraction <= 1.0) {
+        if !(self.mem_fraction_static > 0.0 && self.mem_fraction_static <= 1.0) {
             return Err(invalid(
-                "worker configuration KV storage fraction must be in (0, 1]",
+                "worker configuration mem_fraction_static must be in (0, 1]",
             ));
         }
 

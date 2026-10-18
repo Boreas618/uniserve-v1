@@ -324,7 +324,7 @@ impl ImageOwners {
             max_images: max_calls,
             row_budget: config.max_batch_tokens,
             text_capacities: Vec::new(),
-            max_text_tokens: config.max_sequence_tokens,
+            max_text_tokens: config.max_model_len,
         };
 
         // The denoiser's attention geometry and the cache pool its context

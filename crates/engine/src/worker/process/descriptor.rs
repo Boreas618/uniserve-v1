@@ -119,7 +119,7 @@ impl Default for WorkerProcessArgs {
             stub: false,
             queue_depth: 2,
             max_message_bytes: 8 << 20,
-            cache_token_capacity: None,
+            max_total_tokens: None,
             block_size: None,
             max_batch_calls: 128,
             max_batch_tokens: 16_384,
@@ -137,7 +137,7 @@ impl Default for WorkerProcessArgs {
             model_dtype: uniserve_core::ModelDtype::BFloat16,
             quantization_config: serde_json::json!({}),
             prefix_cache_dtype: None,
-            cache_storage_fraction: 0.70,
+            mem_fraction_static: 0.70,
             mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
@@ -312,8 +312,8 @@ impl WorkerProcessArgs {
                 .prefix_cache_dtype
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
-            cache_memory_fraction: self.cache_storage_fraction,
-            cache_token_capacity: self.cache_token_capacity,
+            mem_fraction_static: self.mem_fraction_static,
+            max_total_tokens: self.max_total_tokens,
             attention_backend: self.attention_backend.clone(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,

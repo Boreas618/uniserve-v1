@@ -108,7 +108,7 @@ impl LatentPlan {
     pub(crate) fn image(
         slots: usize,
         max_tokens: usize,
-        cache_token_capacity: Option<usize>,
+        max_total_tokens: Option<usize>,
         block_size: usize,
         width: usize,
         dtype: crate::ffi::DType,
@@ -116,7 +116,7 @@ impl LatentPlan {
         let units = if max_tokens == 0 {
             0
         } else {
-            max_tokens.max(cache_token_capacity.unwrap_or(max_tokens))
+            max_tokens.max(max_total_tokens.unwrap_or(max_tokens))
         };
         Self {
             request_pool_size: slots,
@@ -369,7 +369,7 @@ impl TokenLayout {
                 .div_ceil(unit_bytes);
 
         let cuda = config.device.is_cuda();
-        let tokens = config.cache_token_capacity.map(|tokens| tokens as u64);
+        let tokens = config.max_total_tokens.map(|tokens| tokens as u64);
         let available = config.pool_storage_bytes.map(|bytes| bytes as u64);
         if cuda && tokens.is_none() && available.is_none() {
             return Err(Error::Invalid(

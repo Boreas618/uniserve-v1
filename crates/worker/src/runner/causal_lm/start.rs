@@ -79,7 +79,7 @@ impl TextBounds {
         let mut tables = Vec::new();
         let mut widths = Vec::new();
         for shape in &shapes {
-            let mut width = shape.table_width(config.max_sequence_tokens as u64, tokens as u64);
+            let mut width = shape.table_width(config.max_model_len as u64, tokens as u64);
             if let Some(units) = units {
                 // A table cannot select more pages than the pool holds.
                 width = width.min(
