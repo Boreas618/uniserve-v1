@@ -99,8 +99,9 @@ impl<'a> Service<'a> {
     /// admission, which is [`Ending::Closed`].
     ///
     /// Once the head's channel fails nothing more can be admitted or
-    /// delivered: the run ends [`Ending::Orphaned`] when nothing was in
-    /// flight at that moment, and [`Ending::Abandoned`] otherwise.
+    /// delivered: the run ends [`Ending::Orphaned`] when no admitted batch
+    /// is unfinished and the jobs in flight finish before the stall bound,
+    /// and [`Ending::Abandoned`] otherwise.
     pub(crate) fn run(&mut self) -> Result<Ending, WorkerError> {
         let error = match self.serve() {
             Ok(()) => return Ok(Ending::Closed),
@@ -121,21 +122,34 @@ impl<'a> Service<'a> {
         Ok(Ending::Abandoned(error))
     }
 
-    /// Whether nothing the rank issued can still run on a device: no
-    /// admitted batch is unfinished and every job given to a lane or the
-    /// Python thread has completed.
+    /// Whether nothing the rank issued can still run on a device once its
+    /// head is gone: no admitted batch is unfinished, and every job given
+    /// to a lane or the Python thread has completed.
     ///
-    /// A job counts as in flight until its completion is taken, so the
-    /// completions that arrived while the rank waited are taken first, as
-    /// serving would have; with no batch admitted, taking them starts
-    /// nothing.
+    /// An answered batch can leave jobs in flight, such as the release of
+    /// its storage, whose completions announce nothing. Nothing more is
+    /// admitted, so those jobs are let finish: their completions are taken
+    /// as they arrive, as serving would have, until none is in flight. A
+    /// job still in flight when it reaches the stall bound is stuck, and
+    /// the rank is not settled.
     fn settled(&mut self) -> bool {
-        if self.executor.has_work() {
-            return false;
+        loop {
+            if self.executor.has_work() || self.executor.advance().is_err() {
+                return false;
+            }
+            if self.executor.has_work() {
+                return false;
+            }
+            let Some((_, since)) = self.executor.backend().oldest_job() else {
+                return true;
+            };
+            let Some(left) = self.stall_bound.checked_sub(since.elapsed()) else {
+                return false;
+            };
+            if self.executor.backend().await_completion(left).is_err() {
+                return false;
+            }
         }
-        self.executor.advance().is_ok()
-            && !self.executor.has_work()
-            && self.executor.backend().oldest_job().is_none()
     }
 
     /// Drain accepted results before acknowledging Close. A fatal result stops

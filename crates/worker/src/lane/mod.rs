@@ -465,6 +465,24 @@ impl JobQueues {
         })
     }
 
+    /// Wait on the calling thread, at most `timeout`, for the next
+    /// completion of a job in flight, and keep it for [`Self::take`].
+    /// Returns whether one arrived. For a rank that admits nothing more,
+    /// whose control thread waits for the jobs it issued instead of
+    /// serving: a job started without a wake ([`Self::start`]) completes
+    /// unannounced.
+    pub(crate) fn await_completion(&self, timeout: Duration) -> Result<bool> {
+        match self.shared.completions.recv_timeout(timeout) {
+            Ok(posted) => {
+                self.received(posted.0);
+                self.arrived().push_back(posted);
+                Ok(true)
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(false),
+            Err(RecvTimeoutError::Disconnected) => Err(LOST),
+        }
+    }
+
     /// Fire `wake` behind every completion from now on, so the control
     /// thread, which blocks on its socket and its wake descriptor, learns
     /// of a completion it does not wait for.
