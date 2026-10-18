@@ -12,10 +12,8 @@
 //! forward of their own and execute the announced capacities until the
 //! sources announce zero.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
 use tvm_ffi::{Any, AnyView};
 
 use super::host::HostGroup;
@@ -92,7 +90,6 @@ impl ExpertExchange {
         ranks: &[usize],
         rank: usize,
         memberships: &[Vec<usize>],
-        attention_ranks: usize,
         max_tokens: usize,
         fused: bool,
     ) -> Result<Self> {
@@ -102,40 +99,19 @@ impl ExpertExchange {
             ));
         }
 
-        let source_count = if attention_ranks == 0 {
-            ranks.len()
-        } else {
-            attention_ranks
-        };
-        if source_count > ranks.len() || memberships.len() != ranks.len() {
-            return Err(Error::Invalid(
-                "expert source membership is incomplete".into(),
-            ));
-        }
-
+        // Every source rank declares the group of ranks that execute its
+        // forwards together, which the deployment forms from one worker's
+        // ranks; expert-only ranks declare none. A group is recorded once,
+        // by its first member.
         let mut sources = Vec::new();
         for (index, members) in memberships.iter().enumerate() {
             let peers = members
                 .iter()
                 .map(|member| ranks.iter().position(|rank| rank == member))
                 .collect::<Option<Vec<_>>>()
-                .filter(|peers| {
-                    if peers.is_empty() {
-                        return index >= source_count;
-                    }
-
-                    peers.contains(&index)
-                        && peers.iter().copied().collect::<HashSet<_>>().len() == peers.len()
-                        && peers
-                            .iter()
-                            .all(|&peer| peer < source_count && memberships[peer] == *members)
-                })
                 .ok_or_else(|| {
-                    Error::Invalid(
-                        "expert sources must declare disjoint, consistent groups of ranks that execute each forward together".into(),
-                    )
+                    Error::Invalid("an expert source names a rank outside the union".into())
                 })?;
-
             if peers.first() == Some(&index) {
                 sources.push(peers);
             }
@@ -257,23 +233,11 @@ pub struct Agreement {
 }
 
 /// The sizes of one expert layer, as the library's `layers` lists them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpertLayer {
     pub num_experts: usize,
     pub top_k: usize,
     pub hidden_size: usize,
-}
-
-/// What every rank of a union must agree on before warmup enters
-/// collectives: step capacities, microbatches and the expert layer
-/// sequence on every rank, and the source ranks' warmup and capture plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ExpertPlan {
-    pub capacities: Vec<usize>,
-    pub microbatches: usize,
-    pub layers: Vec<ExpertLayer>,
-    /// The source's graph and runner plan; `None` on expert-only ranks.
-    pub calls: Option<serde_json::Value>,
 }
 
 /// The host side of an expert union: its host group and step selection.
@@ -350,7 +314,6 @@ impl ExpertParallel {
                 &ranks,
                 group.rank(),
                 &memberships,
-                attention_ranks,
                 max_tokens,
                 transport.fused(),
             )?;
@@ -468,45 +431,6 @@ impl ExpertParallel {
     pub fn barrier(&self) -> Result<()> {
         lock(&self.host).barrier()
     }
-
-    /// Compare every rank's plan before warmup enters collectives. Every
-    /// rank must declare the same capacities, microbatches and expert layer
-    /// sequence; source ranks also the same warmup and capture plan.
-    pub(crate) fn compare_plans(&self, plan: &ExpertPlan) -> Result<()> {
-        let encoded = serde_json::to_vec(plan)
-            .map_err(|error| Error::Invariant(format!("expert plan encoding: {error}")))?;
-        let plans = lock(&self.host).all_gather_bytes(&encoded)?;
-        let decoded = plans
-            .iter()
-            .map(|bytes| {
-                serde_json::from_slice::<serde_json::Value>(bytes)
-                    .map_err(|_| Error::transport("an expert plan record is malformed"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let common = |plan: &serde_json::Value| {
-            (
-                plan.get("capacities").cloned(),
-                plan.get("microbatches").cloned(),
-                plan.get("layers").cloned(),
-            )
-        };
-        let sources = if self.attention_ranks == 0 {
-            decoded.len()
-        } else {
-            self.attention_ranks
-        };
-        let consistent = decoded
-            .iter()
-            .all(|plan| common(plan) == common(&decoded[0]))
-            && decoded[..sources].iter().all(|plan| *plan == decoded[0]);
-        if !consistent {
-            return Err(Error::Invalid(format!(
-                "expert-parallel ranks have different plans: {}",
-                serde_json::Value::Array(decoded)
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// Host collectives over `host`, for numerical transports that bootstrap
@@ -604,7 +528,6 @@ mod tests {
             &[8, 12, 20, 40, 41],
             rank,
             &[vec![8, 20], vec![12], vec![8, 20], vec![], vec![]],
-            3,
             192,
             fused,
         )
@@ -745,57 +668,8 @@ mod tests {
             )
             .unwrap();
             let announced = parallel.warmup(if rank == 0 { 32 } else { 0 }).unwrap();
-            let plan = ExpertPlan {
-                capacities: parallel.capacities().to_vec(),
-                microbatches: 1,
-                layers: vec![ExpertLayer {
-                    num_experts: 8,
-                    top_k: 2,
-                    hidden_size: 16,
-                }],
-                calls: (rank < 2).then(|| serde_json::json!({"decode": [1, 2]})),
-            };
-            parallel.compare_plans(&plan).unwrap();
             (parallel.max_tokens(), announced)
         });
         assert!(results.iter().all(|&result| result == (48, 32)));
-    }
-
-    #[test]
-    fn different_source_plans_are_refused_on_every_rank() {
-        let results = union(2, |rank, group| {
-            let parallel = ExpertParallel::configure(
-                Arc::new(Mutex::new(group)),
-                0,
-                &[rank],
-                8,
-                ExpertTransport::AllToAll,
-            )
-            .unwrap();
-            parallel
-                .compare_plans(&ExpertPlan {
-                    capacities: parallel.capacities().to_vec(),
-                    microbatches: 1,
-                    layers: Vec::new(),
-                    calls: Some(serde_json::json!({"decode": [rank + 1]})),
-                })
-                .is_err()
-        });
-        assert_eq!(results, vec![true, true]);
-    }
-
-    #[test]
-    fn overlapping_source_groups_are_rejected() {
-        assert!(
-            ExpertExchange::new(
-                &[0, 1, 2],
-                0,
-                &[vec![0, 2], vec![1, 2], vec![0, 2]],
-                0,
-                32,
-                false,
-            )
-            .is_err()
-        );
     }
 }

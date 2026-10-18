@@ -36,8 +36,9 @@
 //! handed over for joins ([`ExpertUnion::bind_joins`]); an expert-only rank
 //! constructs its expert layers itself ([`ExpertUnion::bind_experts`]).
 //!
-//! Warmup reaches the same collectives in the same order on every member:
-//! [`WarmupHooks::prepare`] compares plans before any collective step;
+//! Warmup reaches the same collectives in the same order on every member,
+//! because every rank derives its capacities, microbatches and captures
+//! from the one placement and checkpoint of the deployment:
 //! [`WarmupHooks::capture`], after the runners captured their graphs (each
 //! capture's eager warmup an expert step the sources announced), lets
 //! expert-only ranks follow the announcements until the sources announce
@@ -50,7 +51,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tvm_ffi::Any;
 use uniserve_cuda::{DeviceId, Stream};
 
-use super::experts::{ExpertLayer, ExpertPlan, host_bootstrap};
+use super::experts::{ExpertLayer, host_bootstrap};
 use super::joins::{GraphFunctions, JoinGraphs};
 use super::world::World;
 use super::{ExpertParallel, ExpertTransport, MicrobatchLanes, yield_microbatch};
@@ -146,8 +147,6 @@ pub(crate) struct ExpertUnion {
     layers_owners: Vec<Handle>,
     /// One graph pool per microbatch for captured joins.
     pub(super) pools: Vec<Handle>,
-    /// The layers that exchange tokens, compared across the union.
-    layers: Vec<ExpertLayer>,
     /// The yield hook given to every exchange, retained for its lifetime.
     _yield_turn: Option<Handle>,
     closed: bool,
@@ -443,7 +442,6 @@ impl ExpertUnion {
             warming: AtomicBool::new(true),
             layers_owners: Vec::new(),
             pools: Vec::new(),
-            layers,
             _yield_turn: yield_turn.clone().map(Handle::new).transpose()?,
             closed: false,
         };
@@ -523,7 +521,7 @@ impl ExpertUnion {
         tracing::info!(
             "expert union member {rank} of {size}: {} transport over {} layers, {microbatches} microbatches, {max_tokens} tokens per rank and step",
             transport.as_str(),
-            runtime.layers.len(),
+            layers.len(),
         );
         Ok(Some(runtime))
     }
@@ -573,17 +571,6 @@ impl ExpertUnion {
         let owners = self.layers_owners.clone();
         self.bind_joins(&owners.iter().collect::<Vec<_>>())
     }
-
-    /// Compare every rank's plan before warmup enters collectives. `calls`
-    /// is a source rank's warmup and capture plan.
-    pub(crate) fn compare_plans(&self, calls: Option<serde_json::Value>) -> Result<()> {
-        self.parallel.compare_plans(&ExpertPlan {
-            capacities: self.parallel.capacities().to_vec(),
-            microbatches: self.microbatches.len(),
-            layers: self.layers.clone(),
-            calls,
-        })
-    }
 }
 
 /// The expert union's warmup work.
@@ -594,23 +581,6 @@ fn failed(phase: &'static str) -> impl Fn(Error) -> WorkerError {
 }
 
 impl WarmupHooks for ExpertWarmup {
-    fn prepare(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
-        let text = backend.text_mut().map(|text| text.capture_plan());
-        let diffusion_lm: Vec<_> = backend
-            .diffusion_lm_mut()
-            .iter()
-            .map(|runner| runner.capture_plan())
-            .collect();
-        let calls = (text.is_some() || !diffusion_lm.is_empty())
-            .then(|| serde_json::json!({"text": text, "diffusion_lm": diffusion_lm}));
-        let Some(experts) = backend.experts() else {
-            return Ok(());
-        };
-        experts
-            .compare_plans(calls)
-            .map_err(failed("expert plan comparison"))
-    }
-
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let Some(experts) = backend.experts().cloned() else {
             return Ok(());
