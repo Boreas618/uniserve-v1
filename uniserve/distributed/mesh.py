@@ -128,13 +128,29 @@ class Communicator:
     def start_all_to_all(
         self, output: torch.Tensor, value: torch.Tensor
     ) -> communication.Transfer:
-        """Publish equal backend-ordered peer payloads of ``value``.
+        """Publish equal backend-ordered peer partitions of ``value``.
 
-        Leading-axis partitions follow :attr:`backend_order`; read ``output``
-        after the returned transfer's ``wait``.
+        Contiguous ``value`` and ``output`` hold one equal partition per
+        member along their leading elements, ordered by
+        :attr:`backend_order`: partition ``p`` of ``value`` goes to the member
+        at backend position ``p``, and partition ``p`` of ``output`` comes
+        from it. Read ``output`` after the returned transfer's ``wait``; both
+        tensors stay live until then.
         """
-        if output.shape != value.shape:
-            raise ValueError("exchange output must match the input payloads")
+        if (
+            output.shape != value.shape
+            or output.dtype != value.dtype
+            or not output.is_contiguous()
+            or not value.is_contiguous()
+            or value.numel() % self.size
+        ):
+            raise ValueError(
+                "exchange output must match contiguous equal input partitions"
+            )
+        if self.size == 1:
+            # A one-member exchange is a copy of the member's own partition.
+            output.copy_(value)
+            return communication.Transfer(None, value.device)
         return communication.start_all_to_all(output, value, self._require())
 
     def all_reduce(
