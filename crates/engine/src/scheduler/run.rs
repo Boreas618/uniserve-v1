@@ -66,20 +66,25 @@ fn resolve_generation_limits(
 /// Largest number of request-pool rows a runtime keeps outside
 /// `max_num_seqs` (`guidance_prefix_rows`). A launch sizes worker request pools
 /// before the loaded capabilities decide the actual reserve.
-pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 1;
+pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 2;
 
 /// Request-pool rows the runtime keeps outside `max_num_seqs`.
 ///
-/// A cache runtime with denoising keeps one row: a running request's
-/// multi-branch guidance prefix (`Scheduler::ensure_guidance_prefix`) allocates
-/// its own row from the same request pool. Other runtimes keep none.
+/// A cache runtime with denoising keeps a row for a running request's
+/// text-unconditional guidance prefix, and another for its
+/// image-unconditional prefix when the worker states one for its model
+/// (`WorkerInfo::image_unconditional_token_ids`): each prefix
+/// (`Scheduler::ensure_guidance_prefix`) allocates its own row from the same
+/// request pool. Other runtimes keep none.
 pub(crate) fn guidance_prefix_rows(info: &WorkerInfo) -> usize {
-    usize::from(
-        info.uses_cache()
-            && info
-                .supported_calls
-                .contains(&CallKind::Media(MediaCall::Denoising)),
-    )
+    let denoises = info.uses_cache()
+        && info
+            .supported_calls
+            .contains(&CallKind::Media(MediaCall::Denoising));
+    if !denoises {
+        return 0;
+    }
+    1 + usize::from(info.image_unconditional_token_ids.is_some())
 }
 
 impl Scheduler {

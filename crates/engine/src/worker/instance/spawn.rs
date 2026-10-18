@@ -416,14 +416,25 @@ impl WorkerGroup {
             .min()
             .unwrap_or(info.transfer_tickets);
 
-        // A rank states the shapes the engine warms only for what it holds:
-        // the image denoiser's ranks its image shapes, a diffusion LM's ranks
-        // its step rows, every other rank none. The group's are those its
-        // stating ranks agree on.
+        // A rank states the shapes the engine warms, and the image
+        // denoiser's image-unconditional prefix, only for what it holds: the
+        // image denoiser's ranks its image shapes and that prefix, a diffusion
+        // LM's ranks its step rows, every other rank none. The group's are
+        // those its stating ranks agree on.
         let mut image_warmups = Vec::new();
         let mut diffusion_lm_step_rows = 0;
+        let mut image_unconditional = None;
         for (rank, worker) in workers.iter().enumerate() {
             let stated = worker.info();
+            if let Some(tokens) = &stated.image_unconditional_token_ids {
+                anyhow::ensure!(
+                    image_unconditional
+                        .as_ref()
+                        .is_none_or(|known| known == tokens),
+                    "physical rank {rank} states another image-unconditional prefix than another denoiser rank"
+                );
+                image_unconditional = Some(tokens.clone());
+            }
             if !stated.image_warmups.is_empty() {
                 anyhow::ensure!(
                     image_warmups.is_empty() || image_warmups == stated.image_warmups,
@@ -442,6 +453,7 @@ impl WorkerGroup {
         }
         info.image_warmups = image_warmups;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
+        info.image_unconditional_token_ids = image_unconditional;
 
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.info();

@@ -189,9 +189,9 @@ impl ImageOwners {
     /// without one (flow graphs off), a square raster of the largest image
     /// the latent pool's `latent_units` and the denoiser's sequence bound
     /// hold. A guided shape needs a request slot beside its request's for
-    /// its alternative prefix, so a rank of one slot states only the
-    /// unguided shape; a guided shape carries the tokens the model frames
-    /// for an empty negative prompt, which its warmup request admits as its
+    /// its guidance prefix, so a rank of one slot states only the unguided
+    /// shape; a guided shape carries the tokens the model frames for an
+    /// empty negative prompt, which its warmup request admits as its
     /// negative tokens. Empty on a rank without an image denoiser.
     pub(crate) fn warmups(
         &self,
@@ -221,38 +221,53 @@ impl ImageOwners {
                 .rev()
                 .find(|shape| shape.branches == branches)
                 .map_or((side, side), |shape| (shape.height, shape.width));
-            // A second branch conditions on the negative prompt, here an
-            // empty one; a third also on the image-unconditional source. The
-            // engine places both in one alternative prefix sized from the
-            // request's negative tokens, so they must frame alike.
-            let mut sources = Vec::new();
-            if branches > 1 {
-                sources.push(BranchSource::NegativeOrStart);
-            }
-            if branches > 2 {
-                sources.push(layout.image_unconditional);
-            }
-            let mut alternatives = Vec::new();
-            for source in sources {
-                let prefix = self.policy.prefix_of(source)?;
-                let tokens = prefix.tokens.to_vec();
-                if !prefix.reuses_conditioning && !alternatives.contains(&tokens) {
-                    alternatives.push(tokens);
-                }
-            }
-            if alternatives.len() > 1 {
-                return Err(Error::Interface(
-                    "image guidance frames more than one alternative prefix".into(),
-                ));
-            }
+            // Text guidance (every guided shape) conditions on the negative
+            // prompt, here an empty one, as the server renders a client's.
+            let negative_token_ids = if branches > 1 {
+                self.policy
+                    .prefix_of(BranchSource::NegativeOrStart)?
+                    .tokens
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
             warmups.push(uniserve_ipc::ImageWarmup {
                 height,
                 width,
                 branches: branches as u8,
-                negative_token_ids: alternatives.pop().unwrap_or_default(),
+                negative_token_ids,
             });
         }
         Ok(warmups)
+    }
+
+    /// The tokens this rank's image denoiser's image-unconditional branch
+    /// attends to (`WorkerInfo::image_unconditional_token_ids`): the model's
+    /// framing of the branch's source, which serving frames alike for every
+    /// request, and which the engine reserves and prefills a guidance prefix
+    /// of. `None` when the branch reuses the request's own context, and on a
+    /// rank without an image denoiser.
+    ///
+    /// Fails for a model whose image-unconditional branch conditions on the
+    /// negative prompt: the engine places that branch's prefix only by the
+    /// model's fixed framing or the request's own context.
+    pub(crate) fn image_unconditional_prefix(&self) -> Result<Option<Vec<u32>>> {
+        let Some(layout) = self
+            .model
+            .denoiser
+            .filter(|_| self.denoisers.image.is_some())
+        else {
+            return Ok(None);
+        };
+        if layout.image_unconditional == BranchSource::NegativeOrStart {
+            return Err(Error::Interface(
+                "an image-unconditional branch conditioned on the negative prompt has no \
+                 guidance prefix the engine places"
+                    .into(),
+            ));
+        }
+        let prefix = self.policy.prefix_of(layout.image_unconditional)?;
+        Ok((!prefix.reuses_conditioning).then(|| prefix.tokens.to_vec()))
     }
 
     /// Create the runners of every image call on this rank, or `None` on

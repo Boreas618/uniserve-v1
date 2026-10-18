@@ -1498,7 +1498,7 @@ impl Scheduler {
                     .guidance_prefix
                     .take()
                     .into_iter()
-                    .map(|prefix| prefix.allocations)
+                    .flat_map(GuidancePrefixState::into_allocations)
                     .collect();
                 let mut buffers = HashMap::new();
                 match st.allocations.take() {
@@ -1564,8 +1564,11 @@ impl Scheduler {
         // Unregistered requests have no outstanding worker reference, so their
         // allocations can return to the scheduler immediately.
         if !awaits_close {
-            if let Some(prefix) = guidance_prefix {
-                prefix.allocations.free(&mut self.storage);
+            for allocations in guidance_prefix
+                .into_iter()
+                .flat_map(GuidancePrefixState::into_allocations)
+            {
+                allocations.free(&mut self.storage);
             }
             if let Some(allocations) = allocations {
                 allocations.free(&mut self.storage);

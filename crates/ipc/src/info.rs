@@ -408,6 +408,12 @@ pub struct WorkerInfo {
     /// covers, every row count of which the engine warms; zero when the rank
     /// generates no blocks.
     pub diffusion_lm_step_rows: u32,
+    /// The tokens the image-unconditional guidance branch of this rank's
+    /// image denoiser attends to, the model's framing of that branch's
+    /// source, the same for every request; the engine reserves and prefills
+    /// a guidance prefix of them. `None` when that branch attends to the
+    /// request's own context, and on a rank without an image denoiser.
+    pub image_unconditional_token_ids: Option<Vec<u32>>,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -639,6 +645,7 @@ impl Default for WorkerInfo {
             video_denoiser: None,
             image_warmups: Vec::new(),
             diffusion_lm_step_rows: 0,
+            image_unconditional_token_ids: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),

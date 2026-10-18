@@ -139,6 +139,163 @@ fn encoder_products_obey_worker_entry_capacity() {
     assert_eq!(limits.encoder_cache_entries, 64);
 }
 
+/// One forward row: the request slot it reads, its sequence and query
+/// lengths, and whether it writes the cache (a prefix prefill).
+type Row = (u32, u32, u32, bool);
+
+/// A request slot and the tokens a row reads there.
+type Read = (u32, u32);
+
+/// Serves one two-step guided image request with `negative` prompt tokens on
+/// a simulator whose worker states `image_unconditional` for its
+/// image-unconditional branch, and returns the forward rows of the first
+/// denoising call.
+fn first_denoising_rows(
+    image_unconditional: Option<Vec<u32>>,
+    cfg_text_scale: f32,
+    cfg_img_scale: f32,
+    negative: Vec<u32>,
+) -> Vec<Row> {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().image_unconditional_token_ids = image_unconditional;
+    let mut executor = SimExecutor::new(sim);
+    let dispatched = executor.observe();
+    let scheduler = support::scheduler(Box::new(executor), ctrl(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let mut request = generation_request(
+        RequestId(1),
+        text_input(vec![4, 5, 6]),
+        SamplingParams::default(),
+        ImageParams {
+            steps: 2,
+            cfg_text_scale,
+            cfg_img_scale,
+            ..Default::default()
+        },
+        GenerationConstraint::GenOnly,
+        0,
+    );
+    request.negative_prompt_token_ids = negative;
+    let mut events = handle.submit(request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut finished = None;
+    while finished.is_none() && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(EngineCoreOutput::Finished { reason, .. }) => finished = Some(reason),
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+    assert_eq!(finished, Some(FinishReason::ImageDone));
+
+    let (_, placement) = dispatched
+        .try_iter()
+        .filter_map(|event| match event {
+            BatchEvent::Submitted(batch) => Some(batch),
+            _ => None,
+        })
+        .flat_map(|batch| batch.requests)
+        .find(|(call, _)| call.code == CallKind::Media(MediaCall::Denoising))
+        .expect("the request denoises");
+    let forward = placement.forward;
+    (0..forward.request_pool_indices.len())
+        .map(|row| {
+            (
+                forward.request_pool_indices[row],
+                forward.seq_lens[row],
+                forward.query_lens[row],
+                forward.write_cache[row],
+            )
+        })
+        .collect()
+}
+
+/// The guidance prefixes a call prefills, as (slot, tokens), and the context
+/// each branch row reads, as (slot, context tokens), in evaluation order.
+fn prefixes_and_branches(rows: &[Row]) -> (Vec<Read>, Vec<Read>) {
+    let prefills = rows
+        .iter()
+        .filter(|(_, seq, query, write)| *write && seq == query)
+        .map(|(slot, _, query, _)| (*slot, *query))
+        .collect();
+    let branches = rows
+        .iter()
+        .filter(|(_, _, _, write)| !*write)
+        .map(|(slot, seq, query, _)| (*slot, seq - query))
+        .collect();
+    (prefills, branches)
+}
+
+/// Each guidance branch reads the prefix it attends to: the
+/// text-unconditional branch the request's negative prompt tokens, and the
+/// image-unconditional branch the prefix its worker states for the model,
+/// each in its own slot and prefilled there; a branch with the same tokens
+/// shares a prefix, and a branch the worker states no prefix for reads the
+/// request's own context.
+#[test]
+fn each_guidance_branch_reads_the_prefix_it_attends_to() {
+    let negative = vec![9, 9];
+    let start = vec![1, 2, 3];
+
+    // Text and image guidance: two prefixes of two and three tokens.
+    let (prefills, branches) = prefixes_and_branches(&first_denoising_rows(
+        Some(start.clone()),
+        4.0,
+        2.0,
+        negative.clone(),
+    ));
+    assert_eq!(prefills.len(), 2, "{prefills:?}");
+    assert_ne!(prefills[0].0, prefills[1].0);
+    assert_eq!(branches.len(), 3);
+    assert_eq!(&branches[1..], &[(prefills[0].0, 2), (prefills[1].0, 3)]);
+    let own = branches[0];
+    assert!(prefills.iter().all(|(slot, _)| *slot != own.0));
+
+    // Image guidance alone: the image-unconditional prefix only.
+    let (prefills, branches) = prefixes_and_branches(&first_denoising_rows(
+        Some(start.clone()),
+        1.0,
+        2.0,
+        negative.clone(),
+    ));
+    assert_eq!(
+        prefills
+            .iter()
+            .map(|(_, tokens)| *tokens)
+            .collect::<Vec<_>>(),
+        [3]
+    );
+    assert_eq!(branches[1..], [(prefills[0].0, 3)]);
+
+    // The same tokens for both branches: one shared prefix.
+    let (prefills, branches) = prefixes_and_branches(&first_denoising_rows(
+        Some(negative.clone()),
+        4.0,
+        2.0,
+        negative.clone(),
+    ));
+    assert_eq!(prefills.len(), 1);
+    assert_eq!(branches[1..], [(prefills[0].0, 2), (prefills[0].0, 2)]);
+
+    // No stated prefix: the image-unconditional row reads the request's own
+    // context, as the conditioned row does.
+    let (prefills, branches) =
+        prefixes_and_branches(&first_denoising_rows(None, 4.0, 2.0, negative));
+    assert_eq!(
+        prefills
+            .iter()
+            .map(|(_, tokens)| *tokens)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(branches[2], branches[0]);
+}
+
 /// A generated image reserves its latent at the model's bytes per latent
 /// unit, whichever worker capacity clamps the latent feature bytes. A worker
 /// whose encoder entries hold a quarter of the simulator's feature bytes

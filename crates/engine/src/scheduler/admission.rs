@@ -177,7 +177,7 @@ impl Scheduler {
             .validate_resources(&self.generation_limits)
             .and_then(|()| req.max_cache_tokens(&self.generation_limits))
         {
-            Ok(tokens) => tokens,
+            Ok(tokens) => tokens.saturating_add(self.image_unconditional_tokens(&req)),
             Err(error) => {
                 let _ = event_tx.send(EngineCoreOutput::Rejected {
                     kind: RejectionKind::Invalid,
@@ -833,70 +833,114 @@ impl Scheduler {
             * ceil_div_u64((width as u64).max(1), downsample)
     }
 
-    /// Materializes the negative-prompt cache prefix required by multi-branch guidance.
+    /// Materializes the cache prefixes multi-branch guidance attends to.
     ///
-    /// Allocates the prefix its own request row and cache tables sized to the
-    /// negative prompt, and stores them in `RequestState::guidance_prefix`.
-    /// Returns `true` when the prefix is in place, the request uses a single
-    /// guidance branch, or the request is not running. Returns `false`,
-    /// holding nothing new, when no request row or cache capacity is free, or
-    /// (after latching engine-fatal) the prefix cache is missing;
-    /// `reserve_generation_resources` then declines the denoising call.
+    /// The text-unconditional branch attends to the negative prompt tokens,
+    /// and the image-unconditional branch to the prefix the worker states
+    /// for its model, or to the request's own context when it states none;
+    /// two branches with the same tokens share one prefix. Each prefix gets
+    /// its own request row and cache tables sized to its tokens, stored in
+    /// `RequestState::guidance_prefix`. Returns `true` when the prefixes are
+    /// in place, the request needs none, or the request is not running.
+    /// Returns `false`, holding nothing new, when no request row or cache
+    /// capacity is free, or (after latching engine-fatal) the prefix cache
+    /// is missing; `reserve_generation_resources` then declines the
+    /// denoising call.
     pub(super) fn ensure_guidance_prefix(&mut self, id: RequestId) -> bool {
-        let (prefix_tokens, needs_alternative) = self
-            .running
-            .get(&id)
-            .map(|state| {
-                (
-                    state.req.negative_prompt_token_ids.len(),
-                    cfg_branch_count(&state.req.image) > 1,
-                )
-            })
-            .unwrap_or_default();
-        if !needs_alternative
-            || self
-                .running
-                .get(&id)
-                .is_some_and(|state| state.guidance_prefix.is_some())
-        {
+        let Some(state) = self.running.get(&id) else {
+            return true;
+        };
+        if state.guidance_prefix.is_some() {
             return true;
         }
-        if !self.running.contains_key(&id) {
-            return false;
+        let negative = &state.req.negative_prompt_token_ids;
+        let text = state.req.image.guides_text().then_some(negative);
+        let image = self
+            .info
+            .image_unconditional_token_ids
+            .as_ref()
+            .filter(|_| state.req.image.guides_image());
+        let mut lengths = Vec::new();
+        let text_index = text.map(|tokens| {
+            lengths.push(tokens.len() as u32);
+            lengths.len() - 1
+        });
+        let image_index = image.map(|tokens| match (text, text_index) {
+            (Some(text), Some(index)) if text == tokens => index,
+            _ => {
+                lengths.push(tokens.len() as u32);
+                lengths.len() - 1
+            }
+        });
+        if lengths.is_empty() {
+            return true;
         }
-        let Ok(request_slot) = self.storage.request_pool.allocate() else {
+
+        let mut prefixes = Vec::with_capacity(lengths.len());
+        for tokens in lengths {
+            match self.allocate_guidance_prefix(tokens) {
+                Some(prefix) => prefixes.push(prefix),
+                None => {
+                    for prefix in prefixes {
+                        prefix.allocations.free(&mut self.storage);
+                    }
+                    return false;
+                }
+            }
+        }
+        let Some(state) = self.running.get_mut(&id) else {
+            for prefix in prefixes {
+                prefix.allocations.free(&mut self.storage);
+            }
             return false;
         };
+        state.guidance_prefix = Some(GuidancePrefixState {
+            prefixes,
+            text: text_index,
+            image: image_index,
+            diffusion_finalized: false,
+        });
+        true
+    }
+
+    /// Allocates one guidance prefix of `tokens` tokens: a request row and
+    /// cache tables. `None`, holding nothing, when either is unavailable.
+    fn allocate_guidance_prefix(&mut self, tokens: u32) -> Option<GuidancePrefix> {
+        let request_slot = self.storage.request_pool.allocate().ok()?;
         let Some(cache) = self.storage.cache() else {
             self.storage.request_pool.free(request_slot);
             self.invariant_broken("a running token request has a prefix cache");
-            return false;
+            return None;
         };
-        let Ok(prefix_cache) = cache.allocate(prefix_tokens as u32) else {
+        let Ok(prefix_cache) = cache.allocate(tokens) else {
             self.storage.request_pool.free(request_slot);
-            return false;
+            return None;
         };
         let new_units = prefix_cache
             .tables
             .iter()
             .map(|table| (table.group_id() as u32, table.unit_ids()))
             .collect();
-        let allocations = RequestAllocations {
-            request_slot,
-            prefix_cache,
-            latent: None,
-            buffers: HashMap::new(),
-        };
-        let Some(state) = self.running.get_mut(&id) else {
-            allocations.free(&mut self.storage);
-            return false;
-        };
-        state.guidance_prefix = Some(GuidancePrefixState {
-            allocations,
+        Some(GuidancePrefix {
+            allocations: RequestAllocations {
+                request_slot,
+                prefix_cache,
+                latent: None,
+                buffers: HashMap::new(),
+            },
             new_units,
-            diffusion_finalized: false,
-        });
-        true
+            tokens,
+        })
+    }
+
+    /// The cache tokens a request's image-unconditional guidance prefix
+    /// holds, beside those `GenerationRequest::max_cache_tokens` counts.
+    pub(super) fn image_unconditional_tokens(&self, request: &GenerationRequest) -> usize {
+        self.info
+            .image_unconditional_token_ids
+            .as_ref()
+            .filter(|_| request.generates_images() && request.image.guides_image())
+            .map_or(0, Vec::len)
     }
 
     /// Releases the request's guidance-prefix allocations.
@@ -905,8 +949,11 @@ impl Scheduler {
             .running
             .get_mut(&id)
             .and_then(|state| state.guidance_prefix.take());
-        if let Some(prefix) = prefix {
-            prefix.allocations.free(&mut self.storage);
+        for allocations in prefix
+            .into_iter()
+            .flat_map(GuidancePrefixState::into_allocations)
+        {
+            allocations.free(&mut self.storage);
         }
     }
 

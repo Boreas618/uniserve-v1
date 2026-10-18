@@ -385,3 +385,42 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
         extra=("--worker-mesh", "tower=text:cuda:0;gen:cuda:1"),
     )
     assert tower == one
+
+
+@pytest.mark.timeout(900)
+def test_image_guidance_with_a_negative_prompt_generates_its_image(
+    tmp_path: Path,
+):
+    """Image guidance beside a negative prompt generates the image.
+
+    SenseNova's image-unconditional branch conditions on the start of a
+    conversation, while its text-unconditional branch conditions on the
+    rendered negative prompt. A request with a negative prompt and image
+    guidance therefore evaluates a guidance prefix other than its negative
+    prompt's: with image guidance alone, and with text and image guidance
+    together. Both generate the requested image.
+    """
+    model = active_model()
+    with production_server(tmp_path, model, "default", "full") as base_url:
+        for guidance_scale, image_guidance_scale in [(1.0, 2.0), (4.0, 2.0)]:
+            response = httpx.post(
+                f"{base_url}/v1/images/generations",
+                json={
+                    "model": SERVED_MODEL,
+                    "prompt": "A blue square.",
+                    "negative_prompt": "blurry, low quality",
+                    "guidance_scale": guidance_scale,
+                    "image_guidance_scale": image_guidance_scale,
+                    "steps": 2,
+                    "seed": 7,
+                },
+                timeout=600,
+            )
+            assert response.status_code == 200, (
+                guidance_scale,
+                image_guidance_scale,
+                response.text,
+            )
+            images = response.json()["data"]
+            assert len(images) == 1
+            assert_generated_image(images[0])

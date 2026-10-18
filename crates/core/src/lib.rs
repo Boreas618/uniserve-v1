@@ -598,15 +598,19 @@ impl ImageParams {
     /// count is one conditional branch plus one per active axis, so it lies in
     /// `1..=3`.
     pub fn cfg_branch_count(&self) -> u8 {
-        let text_off = scale_approx(self.cfg_text_scale, 1.0);
-        let image_off = scale_approx(self.cfg_img_scale, 1.0);
-        if text_off && image_off {
-            1
-        } else if text_off || image_off {
-            2
-        } else {
-            3
-        }
+        1 + u8::from(self.guides_text()) + u8::from(self.guides_image())
+    }
+
+    /// Whether text guidance is active: its text-unconditional branch is
+    /// evaluated beside the conditioned one.
+    pub fn guides_text(&self) -> bool {
+        !scale_approx(self.cfg_text_scale, 1.0)
+    }
+
+    /// Whether image guidance is active: its image-unconditional branch is
+    /// evaluated beside the conditioned one.
+    pub fn guides_image(&self) -> bool {
+        !scale_approx(self.cfg_img_scale, 1.0)
     }
 
     /// Text and image guidance scales whose [`Self::cfg_branch_count`] is

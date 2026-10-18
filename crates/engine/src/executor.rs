@@ -371,6 +371,8 @@ impl ExecutorInfo {
         // and the widest diffusion LM step of any worker is warmed down to
         // one row.
         merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
+        merged.image_unconditional_token_ids =
+            flow.and_then(|info| info.image_unconditional_token_ids.clone());
         merged.diffusion_lm_step_rows = self
             .workers
             .iter()
