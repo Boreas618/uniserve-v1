@@ -55,9 +55,8 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::EngineCoreOutput;
 
 pub use input::{
-    DecodeControls, ImageGenControls, ModalitySelection, ModelEventIdentity, OutputDetail,
-    OutputProcessorPolicy, PromptInput, ResponseOptions, SamplingConfig, StopConfig,
-    TextPromptRequest,
+    DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, OutputProcessorPolicy,
+    PromptInput, ResponseOptions, SamplingConfig, StopConfig, TextPromptRequest,
 };
 pub use media::ImageInput;
 pub(crate) use model::LoadedModel;
@@ -78,15 +77,12 @@ use assembly::{assemble_chat_event_stream, assemble_event_stream};
 use error::malformed_output;
 pub use error::{OutputProcessingError, ServeError, TokenizeError};
 pub(crate) use lifecycle::LifecycleTerminal;
+pub(crate) use lifecycle::RequestLifecycleState;
 use lifecycle::{
     LifecycleGuard, LifecycleTrackedStream, RuntimeLifecycleMetrics, control_aware_event_stream,
 };
-pub use lifecycle::{
-    RequestLifecycleState, RequestStatsSnapshot, RuntimeMetricsSnapshot, ServeControlError,
-};
-pub use output::{
-    CacheAccounting, FinishStatus, RequestOutput, ResourceAccounting, RuntimeTimings, StopCause,
-};
+pub use lifecycle::{RuntimeMetricsSnapshot, ServeControlError};
+pub use output::{FinishStatus, RequestOutput, RuntimeTimings, StopCause};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -188,7 +184,7 @@ pub(crate) fn cache_isolation_key(namespace: Option<&str>, salt: Option<&str>) -
 /// Tokenized input retains only the response processing its computation needs.
 ///
 /// Media requests carry no `ResponseOptions`: their stream is assembled from the prompt
-/// length and the runtime's model identity.
+/// length alone.
 enum Prepared {
     Generation(Box<(uniserve_core::GenerationRequest, ResponseOptions)>),
     Diffusion(uniserve_core::DiffusionRequest),
@@ -271,16 +267,6 @@ impl ServingRuntime {
         let mut snapshot = self.metrics.snapshot();
         snapshot.active = self.engine.requests.active_count() as u64;
         snapshot
-    }
-
-    /// Returns current lifecycle statistics for one request.
-    pub fn request_stats(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.stats(request_id)
-    }
-
-    /// Waits for one request to leave the active registry and returns its final snapshot.
-    pub async fn drain_request(&self, request_id: &str) -> Option<RequestStatsSnapshot> {
-        self.engine.requests.drain_request(request_id).await
     }
 
     /// Waits until every active request leaves the runtime.
@@ -410,11 +396,10 @@ impl ServingRuntime {
         // image fetching and time spent queued for the blocking pool count toward
         // compilation.
         let compile_started = Instant::now();
-        let identity = self.model.event_identity();
 
         let engine_request_id = self
             .engine
-            .register_request(request_id.to_string(), Some(identity))
+            .register_request(request_id.to_string(), true)
             .map_err(|error| {
                 self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
                 match error {
@@ -499,7 +484,6 @@ impl ServingRuntime {
             Prepared::Generation(prepared) => {
                 let (request, response) = *prepared;
                 let ResponseOptions {
-                    request_id: _,
                     tokenizer,
                     prompt_token_ids,
                     decode,
@@ -507,9 +491,6 @@ impl ServingRuntime {
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
                     output_processor,
-                    identity,
-                    cache,
-                    resources,
                 } = response;
                 let engine_stream = self
                     .engine
@@ -517,12 +498,8 @@ impl ServingRuntime {
                     .await;
 
                 let event_context = EventContext {
-                    served_name: identity.served_name.clone(),
-                    description: identity.description.clone(),
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache,
-                    resources,
                     metrics: Arc::clone(&self.metrics),
                 };
 
@@ -557,12 +534,8 @@ impl ServingRuntime {
             Prepared::Diffusion(request) => {
                 let prompt_tokens = request.prompt_token_ids.len();
                 let context = EventContext {
-                    served_name: self.model.served_model_name().to_owned(),
-                    description: self.model.event_identity().description,
                     compile_duration_us,
                     started: lifecycle.started,
-                    cache: CacheAccounting::default(),
-                    resources: ResourceAccounting::default(),
                     metrics: Arc::clone(&self.metrics),
                 };
                 self.engine
@@ -683,11 +656,7 @@ impl ServingRuntime {
 #[derive(Debug, Clone)]
 struct EventContext {
     started: Instant,
-    served_name: String,
-    description: String,
     compile_duration_us: u64,
-    cache: CacheAccounting,
-    resources: ResourceAccounting,
     // The assemblers increment `scheduled` when the engine reports scheduling.
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
@@ -737,19 +706,7 @@ mod tests {
     fn event_context() -> EventContext {
         EventContext {
             started: Instant::now(),
-            served_name: "profile".to_string(),
-            description: "bagel".to_string(),
             compile_duration_us: 7,
-            cache: CacheAccounting {
-                read_enabled: true,
-                write_enabled: true,
-                encoder_pin_count: 0,
-            },
-            resources: ResourceAccounting {
-                expected_cache_tokens: 2,
-                replayable: true,
-                ..ResourceAccounting::default()
-            },
             metrics: Arc::new(RuntimeLifecycleMetrics::default()),
         }
     }

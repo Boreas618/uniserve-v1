@@ -1,39 +1,11 @@
 //! The events of a serving stream ([`RequestOutput`]) with their terminal
-//! status and stop cause, and the cache, resource and timing accounting they
-//! carry.
+//! status and stop cause, and the timings they carry.
 
 use serde::{Deserialize, Serialize};
 
 use super::ServeRequestId;
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
 use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs, FinishReason, StopReason};
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Cache policy and encoder-cache pin count resolved for one request during preprocessing.
-pub struct CacheAccounting {
-    /// Whether the request may reuse existing cache entries.
-    pub read_enabled: bool,
-    /// Whether the request may publish reusable cache entries.
-    pub write_enabled: bool,
-    /// Number of encoder-cache entries pinned for the request lifetime.
-    pub encoder_pin_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Prefix cache, latent, and encoder-cache requirements computed for one request during
-/// preprocessing.
-/// Media requests report `ResourceAccounting::default()`.
-pub struct ResourceAccounting {
-    /// Cache-token capacity required for the request.
-    pub expected_cache_tokens: u64,
-    /// Latent image units reserved for generation.
-    pub image_latent_units: u64,
-    /// Number of encoder-cache entries retained by the request.
-    pub encoder_cache_pins: usize,
-    /// For a generation request, false when generated images feed back into the request's
-    /// context (`GenerationRequest::feeds_back_images`).
-    pub replayable: bool,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 /// Queue, execution, and end-to-end duration totals.
@@ -65,10 +37,6 @@ pub enum RequestOutput {
     Accepted {
         /// Caller-visible request identifier.
         request_id: ServeRequestId,
-        /// Model name used for the request.
-        served_name: String,
-        /// Stable model profile description.
-        description: String,
         /// Validation and tokenization duration in microseconds.
         compile_duration_us: u64,
         /// Number of prompt tokens submitted to the engine.
@@ -88,10 +56,6 @@ pub enum RequestOutput {
         /// Engine wall-clock time, in UNIX seconds, at which the scheduler admitted the
         /// request for execution.
         scheduled_at: Option<f64>,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// Prefix cache and media resources reserved for the request.
-        resources: ResourceAccounting,
     },
     /// Newly decoded user-visible text.
     TextDelta {
@@ -209,10 +173,6 @@ pub enum RequestOutput {
         image_count: u32,
         /// Total image-generation steps completed.
         image_steps: u32,
-        /// Cache policy and pin counts.
-        cache: CacheAccounting,
-        /// Prefix cache and media resources reserved for the request.
-        resources: ResourceAccounting,
         /// Request phase durations.
         timings: RuntimeTimings,
     },
