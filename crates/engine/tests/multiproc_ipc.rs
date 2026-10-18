@@ -2074,7 +2074,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         load_format: "auto".into(),
         download_dir: None,
         load_threads: None,
-        checksum_manifest: None,
         model_dtype: "bfloat16".into(),
         quantization_config: serde_json::json!({}),
         prefix_cache_dtype: None,

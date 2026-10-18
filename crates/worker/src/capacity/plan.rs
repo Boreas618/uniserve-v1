@@ -514,7 +514,7 @@ pub(crate) fn slot_requirements(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use uniserve_cuda::DeviceId;
     use uniserve_ipc::{DType, DimBound, ShapeBound};
 
@@ -523,6 +523,49 @@ mod tests {
 
     fn group() -> HostGroup {
         HostGroup::single(0)
+    }
+
+    /// The configuration of a one-rank CPU worker launched with the head's
+    /// defaults; each test states the values it plans with.
+    pub(crate) fn cpu_config() -> WorkerConfig {
+        WorkerConfig {
+            device: Device::Cpu,
+            rank: 0,
+            world_size: 1,
+            role: "model".into(),
+            expert_exchange: "alltoall".into(),
+            expert_microbatches: 1,
+            block_size: None,
+            max_total_tokens: None,
+            attention_backend: "auto".into(),
+            max_batch_calls: 1024,
+            max_batch_tokens: 8192,
+            max_model_len: 16384,
+            max_video_seconds: 15.0,
+            max_condition_rows: 0,
+            ffmpeg: "ffmpeg".into(),
+            min_video_seconds: None,
+            video_text_capacities: Vec::new(),
+            video_canvases: Vec::new(),
+            deployment_components: Vec::new(),
+            canvas_sampling: None,
+            max_request_pool_size: 128,
+            encoder_cache_entries: 256,
+            generation_device: None,
+            pool_storage_bytes: None,
+            model_dtype: "bfloat16".into(),
+            prefix_cache_dtype: None,
+            mem_fraction_static: 0.7,
+            lanes: Vec::new(),
+            graph_policy: "auto".into(),
+            decode_graph_batch_sizes: crate::config::default_decode_sizes(),
+            prefill_cuda_graph: true,
+            prefill_outputs: true,
+            prefill_graph_token_sizes: crate::config::default_prefill_sizes(),
+            flow_cuda_graph: true,
+            flow_graph_batch_sizes: crate::config::DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
+            flow_graph_shapes: crate::config::DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
+        }
     }
 
     fn report() -> Report {
@@ -627,7 +670,7 @@ mod tests {
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
             pool_storage_bytes: Some((20 * gib) as usize),
-            ..WorkerConfig::default()
+            ..cpu_config()
         };
         let facts = TokenFacts {
             image_processor: false,
@@ -671,7 +714,7 @@ mod tests {
                 max_batch_tokens: None,
                 max_inflight: None,
             }],
-            ..WorkerConfig::default()
+            ..cpu_config()
         };
         let facts = TokenFacts {
             image_processor: true,
@@ -703,7 +746,7 @@ mod tests {
     fn slot_requirements_grow_with_the_slot_count() {
         let config = WorkerConfig {
             max_batch_calls: 4,
-            ..WorkerConfig::default()
+            ..cpu_config()
         };
         let media = MediaFacts {
             num_steps: 8,
@@ -739,7 +782,7 @@ mod tests {
         let config = WorkerConfig {
             max_batch_calls: 2,
             max_request_pool_size: 2,
-            ..WorkerConfig::default()
+            ..cpu_config()
         };
         // Two slots of eight pages each, and the sentinel page.
         let pool = LatentPlan {

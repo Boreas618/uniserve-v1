@@ -102,48 +102,11 @@ pub struct WorkerConfig {
     pub flow_graph_shapes: Vec<(usize, usize)>,
 }
 
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            device: Device::Cpu,
-            rank: 0,
-            world_size: 1,
-            role: "model".into(),
-            expert_exchange: "alltoall".into(),
-            expert_microbatches: 1,
-            block_size: None,
-            max_total_tokens: None,
-            attention_backend: "auto".into(),
-            max_batch_calls: 1024,
-            max_batch_tokens: 8192,
-            max_model_len: 16384,
-            max_video_seconds: 15.0,
-            max_condition_rows: 0,
-            ffmpeg: "ffmpeg".into(),
-            min_video_seconds: None,
-            video_text_capacities: vec![],
-            video_canvases: vec![],
-            deployment_components: vec![],
-            canvas_sampling: None,
-            max_request_pool_size: 128,
-            encoder_cache_entries: 256,
-            generation_device: None,
-            pool_storage_bytes: None,
-            model_dtype: "bfloat16".into(),
-            prefix_cache_dtype: None,
-            mem_fraction_static: 0.7,
-            lanes: vec![],
-            graph_policy: "auto".into(),
-            decode_graph_batch_sizes: default_decode_sizes(),
-            prefill_cuda_graph: true,
-            prefill_outputs: true,
-            prefill_graph_token_sizes: default_prefill_sizes(),
-            flow_cuda_graph: true,
-            flow_graph_batch_sizes: vec![1, 2, 3, 4],
-            flow_graph_shapes: vec![(1152, 2048), (2048, 1152)],
-        }
-    }
-}
+/// Image denoising batch sizes captured when the launch names none.
+pub(crate) const DEFAULT_FLOW_GRAPH_BATCH_SIZES: [usize; 4] = [1, 2, 3, 4];
+
+/// Image capture sizes, in (height, width) pixels, when the launch names none.
+pub(crate) const DEFAULT_FLOW_GRAPH_SHAPES: [(usize, usize); 2] = [(1152, 2048), (2048, 1152)];
 
 /// Default decode buckets: dense small batches followed by strides of eight.
 pub(crate) fn default_decode_sizes() -> Vec<usize> {
@@ -198,21 +161,12 @@ impl WorkerConfig {
         )
     }
 
-    /// Check process placement and physical resource bounds before allocation.
+    /// Check what the rank alone knows or derives: its rank within its
+    /// world, its request slot bounds, positive capacities, and the lanes
+    /// taken together. The command line and the engine check the launch
+    /// values they own, each lane among them, before a rank starts.
     pub(crate) fn validate(&self) -> Result<()> {
         let invalid = |message: &str| Error::Invalid(message.into());
-        if !matches!(self.graph_policy.as_str(), "off" | "auto" | "full") {
-            return Err(invalid("graph policy must be off, auto, or full"));
-        }
-
-        if !matches!(self.role.as_str(), "model" | "experts") {
-            return Err(invalid("worker role must be model or experts"));
-        }
-
-        if self.expert_microbatches < 1 {
-            return Err(invalid("expert microbatches must be at least one"));
-        }
-
         if self.world_size == 0 || self.rank >= self.world_size {
             return Err(invalid("worker configuration process rank is invalid"));
         }
@@ -230,37 +184,8 @@ impl WorkerConfig {
             return Err(invalid("worker configuration capacities must be positive"));
         }
 
-        if !self.max_video_seconds.is_finite() || self.max_video_seconds <= 0.0 {
-            return Err(invalid(
-                "video duration capacity must be finite and positive",
-            ));
-        }
-
-        if self.ffmpeg.is_empty() {
-            return Err(invalid("the media reader needs an ffmpeg path"));
-        }
-
-        if self.min_video_seconds.is_some_and(|seconds| {
-            !seconds.is_finite() || seconds <= 0.0 || seconds > self.max_video_seconds
-        }) {
-            return Err(invalid(
-                "shortest video duration must lie within the capacity",
-            ));
-        }
-
-        if self.video_text_capacities.contains(&0) {
-            return Err(invalid("video text capacities must be positive"));
-        }
-
-        for (index, canvas) in self.video_canvases.iter().enumerate() {
-            if canvas.width == 0 || canvas.height == 0 {
-                return Err(invalid("video canvases must have positive sides"));
-            }
-            if self.video_canvases[..index].contains(canvas) {
-                return Err(invalid("video canvases must be distinct"));
-            }
-        }
-
+        // Each lane is valid on its own; the rank binds every call kind to at
+        // most one of them.
         let mut lane_ids = std::collections::HashSet::new();
         let mut operations = std::collections::HashSet::new();
         for lane in &self.lanes {
@@ -270,25 +195,6 @@ impl WorkerConfig {
             if lane.call_kinds.iter().any(|kind| !operations.insert(*kind)) {
                 return Err(invalid("call kinds must have one execution lane binding"));
             }
-        }
-
-        if !(self.mem_fraction_static > 0.0 && self.mem_fraction_static <= 1.0) {
-            return Err(invalid(
-                "worker configuration mem_fraction_static must be in (0, 1]",
-            ));
-        }
-
-        if !matches!(
-            self.model_dtype.as_str(),
-            "float16" | "bfloat16" | "float32"
-        ) {
-            return Err(invalid("worker model dtype is unsupported"));
-        }
-
-        if self.prefix_cache_dtype.as_deref().is_some_and(|dtype| {
-            !matches!(dtype, "float16" | "bfloat16" | "float32" | "float8_e4m3fn")
-        }) {
-            return Err(invalid("worker KV dtype is unsupported"));
         }
 
         Ok(())
@@ -303,7 +209,7 @@ mod tests {
     /// refuses a queue that holds none.
     #[test]
     fn media_slots_take_three_queue_positions_each() -> Result<()> {
-        let config = WorkerConfig::default();
+        let config = crate::capacity::plan::tests::cpu_config();
         for (queue_depth, slots) in [(3, 1), (6, 2), (8, 2), (24, 8)] {
             let media = config.for_media_slots(queue_depth)?;
             assert_eq!(
@@ -318,7 +224,7 @@ mod tests {
         // The batch call bound caps the slots.
         let narrow = WorkerConfig {
             max_batch_calls: 1,
-            ..WorkerConfig::default()
+            ..config.clone()
         };
         assert_eq!(narrow.for_media_slots(24)?.max_request_pool_size, 1);
         Ok(())

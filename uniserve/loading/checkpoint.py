@@ -6,7 +6,6 @@ import fnmatch
 import hashlib
 import json
 import math
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -205,8 +204,7 @@ class Source:
     locally, as ``(name, shape, dtype)`` entries copied from those files'
     headers, with safetensors dtype names such as ``"BF16"``. Such entries
     carry metadata but no values, so only dummy reads, which generate values
-    from metadata alone, accept a source with headers, and a checksum
-    manifest verifies the local files only.
+    from metadata alone, accept a source with headers.
     """
 
     name: str
@@ -252,7 +250,6 @@ class Source:
                 "checkpoint headers describe tensors without local values; "
                 "only dummy reads accept them"
             )
-        _checksums(self, io.checksum_manifest)
         suffixes = {path.suffix for path in self.files}
         supported = (
             {".safetensors", ".pt", ".bin"}
@@ -530,9 +527,7 @@ class Reader:
         self._closed = False
         # Whether the source files still have to be read into the page cache
         # before the first tensor payload is read (``_prefetch``).
-        self._unfetched = io.mode != "dummy" and (
-            io.prefetch if io.prefetch is not None else io.mmap
-        )
+        self._unfetched = io.mode != "dummy" and io.mmap
         try:
             self._open()
         except BaseException:
@@ -702,9 +697,6 @@ class Reader:
         self._files.clear()
         self._states.clear()
         self._stack.close()
-        if self.io.drop_cache_after_load:
-            for path in self.source.files:
-                _advise(path, "POSIX_FADV_DONTNEED")
 
     def __enter__(self):
         self._require_open()
@@ -912,31 +904,3 @@ def _populate(path):
     with path.open("rb", buffering=0) as handle:
         while handle.readinto(chunk):
             pass
-
-
-def _advise(path, kind):
-    advice = getattr(os, kind, None)
-    if advice is not None and hasattr(os, "posix_fadvise"):
-        with path.open("rb") as handle:
-            os.posix_fadvise(handle.fileno(), 0, 0, advice)
-
-
-def _checksums(source, manifest):
-    """Verify every source file against a sha256 manifest, when one is given."""
-    if manifest is None:
-        return
-    value = json.loads(manifest.read_text())
-    if isinstance(value, dict) and isinstance(value.get("files"), dict):
-        value = value["files"]
-    if not isinstance(value, dict):
-        raise ValueError("checksum manifest requires a relative-path mapping")
-
-    for path in source.files:
-        name = path.relative_to(source.root).as_posix()
-        expected = value.get(name)
-        if not isinstance(expected, str):
-            raise ValueError(f"checksum manifest has no entry for {name!r}")
-        with path.open("rb") as handle:
-            actual = hashlib.file_digest(handle, "sha256").hexdigest()
-        if actual != expected.lower().removeprefix("sha256:"):
-            raise ValueError(f"checksum mismatch for checkpoint file {name!r}")
