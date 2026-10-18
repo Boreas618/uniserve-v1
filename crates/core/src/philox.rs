@@ -1,14 +1,14 @@
-//! Counter-based random draws shared by scheduler simulations and model workers.
+//! Counter-based random draws of the rank's token sampler and of the engine
+//! simulator.
 //!
 //! Philox4x32-10 maps request lineage and semantic draw coordinates to stable
 //! uniforms. This addressing makes a draw independent of batching, execution
 //! depth, completion order, and replay.
 //!
-//! The engine simulator draws through this module; the model worker draws
-//! through `uniserve.nn.rng`, which implements the same mapping in
-//! Python. The two must stay bit-identical in the key fold, counter layout,
-//! round function, and uniform conversion, or simulated and real sampling
-//! diverge for the same seed.
+//! The rank's control plane generates its sampler's draws through this module
+//! (`crates/worker/src/sampling`) and passes them to the sampling kernels as
+//! tensor contents; the engine simulator draws the same values for the same
+//! coordinates.
 //!
 //! Layout:
 //!

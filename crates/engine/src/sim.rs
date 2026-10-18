@@ -28,10 +28,7 @@ use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
-use uniserve_core::{
-    CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, TokenLogprob,
-    try_apply_sampling_counts,
-};
+use uniserve_core::{CommandWaker, ImageParams, RequestId, SamplingParams, TokenLogprob};
 use uniserve_ipc::{
     BatchOutput, Call, CallKind, CallStatus, DrawLayout, ErrorCode, FinishFlags, NewRequest,
     RequestOutput, SamplingState, TensorRef, TimingCounters, WorkerInfo,
@@ -476,6 +473,178 @@ impl SimRequestState {
     }
 }
 
+/// Token chosen for one simulated sampling step with its scores.
+struct SampleOutput {
+    /// Selected vocabulary token.
+    token: u32,
+    /// Natural-log probability of the selected token among the candidates
+    /// the request's masks leave.
+    logprob: f32,
+    /// Ranked candidates as `(token_id, logprob, rank)`, the sampled token
+    /// first, then the most probable alternatives and the explicitly
+    /// requested tokens, without duplicates; `rank` is the one-based
+    /// competition rank. Empty when the request asks for no logprobs.
+    top: Vec<(u32, f32, u32)>,
+}
+
+/// Selects a simulated token from `logits` under the request's sampling
+/// parameters.
+///
+/// Applies, in order, the allowed-token and suppression masks, repetition,
+/// frequency and presence penalties over `recent_counts` (`(token, count)`
+/// pairs), logit bias and temperature, then takes the first maximum when the
+/// temperature is zero and otherwise inverts the cumulative distribution at
+/// `draw`, a uniform in `[0, 1)`. The simulator exists to exercise the
+/// scheduler with tokens that depend on exactly what the scheduler stages, so
+/// the rank's truncation processors (top-k, top-p, min-p, typical) are not
+/// simulated.
+///
+/// Returns `None` when the masks leave no finite candidate. `logits` is
+/// modified in place.
+fn select_token(
+    logits: &mut [f32],
+    sampling: &SamplingParams,
+    recent_counts: &[(u32, u32)],
+    allowed: Option<&[u32]>,
+    suppress: Option<&[u32]>,
+    draw: f32,
+) -> Option<SampleOutput> {
+    const MASKED: f32 = f32::NEG_INFINITY;
+    let vocabulary = logits.len();
+
+    if let Some(allowed) = allowed {
+        let mut keep = vec![false; vocabulary];
+        for &token in allowed {
+            if let Some(slot) = keep.get_mut(token as usize) {
+                *slot = true;
+            }
+        }
+        for (logit, keep) in logits.iter_mut().zip(keep) {
+            if !keep {
+                *logit = MASKED;
+            }
+        }
+    }
+    for &token in suppress.unwrap_or_default() {
+        if let Some(logit) = logits.get_mut(token as usize) {
+            *logit = MASKED;
+        }
+    }
+
+    // Repetition scales a logit away from selection by its sign; frequency
+    // and presence subtract.
+    for &(token, count) in recent_counts {
+        let Some(logit) = logits.get_mut(token as usize) else {
+            continue;
+        };
+        if count == 0 || *logit == MASKED {
+            continue;
+        }
+        if sampling.repetition_penalty != 1.0 {
+            *logit = if *logit > 0.0 {
+                *logit / sampling.repetition_penalty
+            } else {
+                *logit * sampling.repetition_penalty
+            };
+        }
+        *logit -= sampling.frequency_penalty * count as f32 + sampling.presence_penalty;
+    }
+    for &(token, bias) in &sampling.logit_bias {
+        if let Some(logit) = logits.get_mut(token as usize)
+            && *logit != MASKED
+        {
+            *logit += bias;
+        }
+    }
+
+    let greedy = sampling.temperature <= 0.0;
+    if !greedy {
+        for logit in logits.iter_mut().filter(|logit| **logit != MASKED) {
+            *logit /= sampling.temperature;
+        }
+    }
+
+    let peak = logits.iter().copied().fold(MASKED, f32::max);
+    if !peak.is_finite() {
+        return None;
+    }
+    let weights: Vec<f32> = logits
+        .iter()
+        .map(|&logit| {
+            if logit == MASKED {
+                0.0
+            } else {
+                (logit - peak).exp()
+            }
+        })
+        .collect();
+    let total: f32 = weights.iter().sum();
+
+    let token = if greedy {
+        logits.iter().position(|&logit| logit == peak)?
+    } else {
+        // The first candidate whose cumulative mass passes the draw; the last
+        // candidate when rounding leaves the total at or below it.
+        let target = draw * total;
+        let mut cumulative = 0.0;
+        let mut selected = 0;
+        for (index, &weight) in weights.iter().enumerate() {
+            if weight > 0.0 {
+                cumulative += weight;
+                selected = index;
+                if cumulative > target {
+                    break;
+                }
+            }
+        }
+        selected
+    };
+
+    // Scores follow the final masked, temperature-scaled distribution.
+    let log_total = total.ln();
+    let logprob_of = |index: usize| {
+        if logits[index] == MASKED {
+            MASKED
+        } else {
+            logits[index] - peak - log_total
+        }
+    };
+    let rank_of = |value: f32| {
+        1 + (0..vocabulary)
+            .filter(|&index| logprob_of(index) > value)
+            .count() as u32
+    };
+    let sampled_logprob = logprob_of(token);
+
+    let mut top = Vec::new();
+    if sampling.generated_logprobs_requested() {
+        top.push((token as u32, sampled_logprob, rank_of(sampled_logprob)));
+        let mut order: Vec<usize> = (0..vocabulary)
+            .filter(|&index| logits[index] != MASKED)
+            .collect();
+        // Stable, so tied candidates keep ascending vocabulary order.
+        order.sort_by(|&a, &b| logprob_of(b).total_cmp(&logprob_of(a)));
+        let requested = sampling.logprob_token_ids.iter().map(|&id| id as usize);
+        for index in order
+            .into_iter()
+            .take(sampling.n_logprobs as usize)
+            .chain(requested)
+        {
+            let token_id = index as u32;
+            if index < vocabulary && !top.iter().any(|&(existing, ..)| existing == token_id) {
+                let value = logprob_of(index);
+                top.push((token_id, value, rank_of(value)));
+            }
+        }
+    }
+
+    Some(SampleOutput {
+        token: token as u32,
+        logprob: sampled_logprob,
+        top,
+    })
+}
+
 /// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
@@ -597,8 +766,10 @@ impl SimEngine {
 
     /// Applies request sampling controls to deterministic simulated logits.
     ///
-    /// Returns `None` when the sampling pipeline finds no valid distribution
-    /// (see `try_apply_sampling_counts`). Errors when a stochastic call has no
+    /// Returns `None` when the request's masks leave no candidate (see
+    /// `select_token`). The draw of a stochastic call is the one the rank's
+    /// control plane generates for the call's coordinates
+    /// (`philox::sampling_uniform`). Errors when a stochastic call has no
     /// RNG coordinates, uses a draw layout other than `TargetSampling`, or
     /// states a seed other than the admitted one (zero when unset). A request
     /// admitted without an autoregressive branch takes the natural synthetic
@@ -660,13 +831,12 @@ impl SimEngine {
                     .copied()
                     .map(|token| [token]);
                 let allowed = forced.as_ref().map(|slot| slot.as_slice()).or(allowed);
-                Ok(try_apply_sampling_counts(
+                Ok(select_token(
                     &mut logits,
                     sampling,
                     &recent_counts,
                     allowed,
                     suppress,
-                    sampling.n_logprobs as usize,
                     draw,
                 ))
             }
