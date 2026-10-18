@@ -14,15 +14,13 @@ prompt and conditions fit (``holds``) evaluates in that layout and shares its
 constants, workspace and captured graphs; the tables that depend on the
 exact prompt and conditions are request state, filled by ``prepare_state``.
 
-Single-segment sparse attention packs ``packing.TilePacking`` (text in whole
-64-row tiles, the media timeline at the exact prompt length). Dense attention
-packs ``packing.DensePacking``: the generated rows lead at fixed offsets, so a
-shard's sample rows are a layout constant, and each rank gathers its prefix
-rows (text, then conditions) from the request's prefix source. Multi-segment
-sparse attention packs ``packing.SegmentPacking``: text and condition tiles at
-the layout's capacities, then the generated audio and video tiles at fixed
-offsets; its prefix rows gather from the prefix source as dense attention's
-do, and its tile and segment tables are request state.
+Dense attention packs ``packing.DensePacking``: the generated rows lead at
+fixed offsets, so a shard's sample rows are a layout constant, and each rank
+gathers its prefix rows (text, then conditions) from the request's prefix
+source. Sparse attention packs ``packing.SegmentPacking``: text and condition
+tiles at the layout's capacities, then the generated audio and video tiles at
+fixed offsets; its prefix rows gather from the prefix source as dense
+attention's do, and its tile and segment tables are request state.
 """
 
 from __future__ import annotations
@@ -62,20 +60,16 @@ from .config import (
     UniformGrid,
 )
 from .inputs import (
-    AttentionInput,
     DenoiserInput,
     DenoiserSize,
     SegmentInput,
     SequenceInput,
 )
 from .packing import (
-    AUDIO_TAG,
     VIDEO_TILE_SHAPES,
     DensePacking,
     SegmentExtent,
     SegmentPacking,
-    TileExtent,
-    TilePacking,
     audio_latent_frames,
     condition_segments,
     dense_packing,
@@ -86,8 +80,6 @@ from .packing import (
     segment_packing,
     segment_tables,
     segment_tiles,
-    tile_extent,
-    tile_packing,
     video_latent_frames,
 )
 from .processing import NAMED_ASPECT_RATIOS, canvas
@@ -261,14 +253,13 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
     @property
     def condition_tiles(self) -> ConditionTiles | None:
-        """The segment packing's tiles under multi-segment sparse attention.
+        """The segment packing's tiles under sparse attention.
 
         ``make_size`` counts a condition's rows as ``segment_tiles`` of
-        ``VIDEO_TILE_SHAPES[tile]`` video tiles; dense attention and
-        single-segment sparse attention, which takes no conditions, count
+        ``VIDEO_TILE_SHAPES[tile]`` video tiles; dense attention counts
         densely.
         """
-        if not self.segmented:
+        if self.dense:
             return None
         return ConditionTiles(self._tile, VIDEO_TILE_SHAPES[self._tile])
 
@@ -276,19 +267,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def dense(self) -> bool:
         """Whether this denoiser attends densely (see ``DensePacking``)."""
         return isinstance(self.config.attention, DenseAttention)
-
-    @property
-    def segmented(self) -> bool:
-        """Whether this denoiser's sparse attention selects per segment.
-
-        Such a denoiser packs ``SegmentPacking``; a sparse denoiser without
-        reference segments packs ``TilePacking``.
-        """
-        attention = self.config.attention
-        return (
-            isinstance(attention, SparseAttention)
-            and attention.reference_keep is not None
-        )
 
     @property
     def _tile(self) -> int:
@@ -315,18 +293,17 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         The condition rows are the packed rows of ``conditions``
         (``packing.condition_segments``).
 
-        Under multi-segment sparse attention the condition rows are the
-        conditions' whole tiles (``packing.segment_tiles``), the rows the
-        segment packing gives them.
+        Under sparse attention the condition rows are the conditions' whole
+        tiles (``packing.segment_tiles``), the rows the segment packing gives
+        them.
 
         Raises:
             ValueError: A canvas the checkpoint does not generate, an invalid
                 frame count, prompt length or vision span, or conditions this
                 network does not take: keyframes without an ``fl2va`` or
-                ``ref2va`` task, references without ``ref2va``, any condition
-                under single-segment sparse attention, or a keyframe under
-                multi-segment sparse attention, whose segment packing has no
-                keyframe rows.
+                ``ref2va`` task, references without ``ref2va``, or a keyframe
+                under sparse attention, whose segment packing has no keyframe
+                rows.
         """
         canvases = self.config.canvases
         if canvases is not None and canvas not in canvases:
@@ -335,23 +312,19 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
         segments = condition_segments(tuple(conditions), canvas)
         tasks = self.config.tasks
-        if segments and not (self.dense or self.segmented):
-            raise ValueError(
-                "single-segment sparse H3 attention takes no conditions"
-            )
         if any(segment.anchor is None for segment in segments) and (
             "ref2va" not in tasks
         ):
             raise ValueError("this H3 denoiser takes no references")
         if segments and not {"fl2va", "ref2va"} & set(tasks):
             raise ValueError("this H3 denoiser takes no keyframes")
-        if self.segmented:
-            rows = self._tile * sum(
-                segment_tiles(segment, self._tile) for segment in segments
-            )
-        else:
+        if self.dense:
             rows = sum(
                 segment.video_rows + segment.audio_rows for segment in segments
+            )
+        else:
+            rows = self._tile * sum(
+                segment_tiles(segment, self._tile) for segment in segments
             )
         return DenoiserSize(
             num_frames,
@@ -365,9 +338,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def layout_size(self, size: DenoiserSize) -> DenoiserSize:
         """Return the smallest layout that holds ``size``.
 
-        Text and conditions occupy whole tiles (64 rows, or the segment
-        packing's tile), so the smallest segments are the prompt's and the
-        conditions' own tiles.
+        Text and conditions occupy whole tiles (64 rows under dense attention,
+        the sparse attention's tile otherwise), so the smallest segments are
+        the prompt's and the conditions' own tiles.
         """
         tile = self._tile
         return DenoiserSize(
@@ -408,13 +381,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def text_condition_rows(self, layout: DenoiserSize) -> int:
         """Rows of a request's retained conditioning in ``layout``.
 
-        Single-segment sparse attention retains the refined text over the
-        layout's text rows. Dense and multi-segment sparse attention retain
-        the prefix source: the text rows, the projected condition rows, and
-        one zero row the generated and padding rows gather.
+        The retained conditioning is the prefix source: the text rows, the
+        projected condition rows, and one zero row the generated and padding
+        rows gather.
         """
-        if not (self.dense or self.segmented):
-            return layout.num_text_tokens
         return layout.num_text_tokens + layout.condition_rows + 1
 
     def condition_noise_shapes(
@@ -454,20 +424,18 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     ) -> DenoiserSize:
         """Return ``layout`` with a condition segment of ``condition_rows``.
 
-        Conditions occupy whole tiles (64 rows, or the segment packing's
-        tile), as ``layout_size`` rounds them, and a larger segment is kept.
+        Conditions occupy whole tiles (64 rows under dense attention, the
+        sparse attention's tile otherwise), as ``layout_size`` rounds them,
+        and a larger segment is kept.
         The checkpoint's ``max_sequence_rows`` bounds the widened layout's
         generated, text and condition rows.
 
         Raises:
-            ValueError: Single-segment sparse attention, which takes no
-                conditions, a negative row count, or a widened layout beyond
-                ``max_sequence_rows``.
+            ValueError: A network without a conditioned task, a negative
+                row count, or a widened layout beyond ``max_sequence_rows``.
         """
-        if not (self.dense or self.segmented):
-            raise ValueError(
-                "single-segment sparse H3 attention takes no conditions"
-            )
+        if not {"fl2va", "ref2va"} & set(self.config.tasks):
+            raise ValueError("this H3 denoiser takes no conditions")
         if type(condition_rows) is not int or condition_rows < 0:
             raise ValueError("H3 condition rows must be a nonnegative count")
         tile = self._tile
@@ -634,33 +602,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         distribution = query.input_distribution
         return distribution.mesh.get_group(distribution.shard_axes(0))
 
-    def _tile_rows(
-        self, size: DenoiserSize, layout: DenoiserSize | None
-    ) -> dict[str, Any]:
-        # ``size``'s prompt in ``layout``'s text segment (its own tiles by
-        # default). The alignment is a multiple of both the default 256-row
-        # alignment and one 64-row tile per sequence rank, so every rank's
-        # shard holds whole tiles.
-        return {
-            "num_text_tokens": size.num_text_tokens,
-            "num_frames": size.num_frames,
-            "canvas": size.canvas,
-            "token_multiple": 64 * math.lcm(4, self.sequence_group().size),
-            "text_rows": None if layout is None else layout.num_text_tokens,
-        }
-
-    def _tile_extent(
-        self, size: DenoiserSize, layout: DenoiserSize | None = None
-    ) -> TileExtent:
-        # The row and tile counts alone: evaluating a layout reads no table
-        # of its packing, which is request state (``prepare_state``).
-        return tile_extent(**self._tile_rows(size, layout))
-
-    def _tile_packing(
-        self, size: DenoiserSize, layout: DenoiserSize | None = None
-    ) -> TilePacking:
-        return tile_packing(**self._tile_rows(size, layout))
-
     def _dense_packing(self, layout: DenoiserSize) -> DensePacking:
         # Every rank's shard holds a whole number of 128-row blocks.
         return dense_packing(
@@ -671,8 +612,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             token_multiple=128 * self.sequence_group().size,
         )
 
-    def _segment_rows(self, layout: DenoiserSize) -> dict[str, Any]:
-        # Every rank's shard holds a whole number of tiles.
+    def _segment_rows(self, size: DenoiserSize) -> dict[str, Any]:
+        # Text and conditions fill whole tiles of the smallest layout that
+        # holds ``size``, and every rank's shard holds a whole number of
+        # tiles.
+        layout = self.layout_size(size)
         return {
             "num_frames": layout.num_frames,
             "canvas": layout.canvas,
@@ -682,19 +626,18 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             "token_multiple": self._tile * self.sequence_group().size,
         }
 
-    def _segment_extent(self, layout: DenoiserSize) -> SegmentExtent:
-        # The row and tile counts alone, as ``_tile_extent``.
-        return segment_extent(**self._segment_rows(layout))
+    def _segment_extent(self, size: DenoiserSize) -> SegmentExtent:
+        # The row and tile counts alone: evaluating a layout reads no table
+        # of its packing, which is request state (``prepare_state``).
+        return segment_extent(**self._segment_rows(size))
 
-    def _segment_packing(self, layout: DenoiserSize) -> SegmentPacking:
-        return segment_packing(**self._segment_rows(layout))
+    def _segment_packing(self, size: DenoiserSize) -> SegmentPacking:
+        return segment_packing(**self._segment_rows(size))
 
     def _padded_tokens(self, layout: DenoiserSize) -> int:
         if self.dense:
             return self._dense_packing(layout).padded_tokens
-        if self.segmented:
-            return self._segment_extent(layout).padded_tokens
-        return self._tile_extent(layout).padded_tokens
+        return self._segment_extent(layout).padded_tokens
 
     def _token_slice(self, padded_tokens: int) -> slice:
         group = self.sequence_group()
@@ -766,11 +709,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 high = min(max(interval.stop - start, 0), count)
                 result[name] = slice(low, high)
             return result
-        extent = (
-            self._segment_extent(size)
-            if self.segmented
-            else self._tile_extent(size)
-        )
+        extent = self._segment_extent(size)
         interval = self._token_slice(extent.padded_tokens)
         return {
             "video": slice(
@@ -815,16 +754,12 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
 
         The state is each modality's local canonical sample and the tables
         that depend on the exact prompt (and conditions) within its layout.
-        Sparse attention reads every tile's valid row count, the rotary
-        ``cos``/``sin`` of every packed row, and the live dense prefix tiles
-        (``vsa.Input``): the prefix key list, the dense key list and the
-        live prefix count. Dense attention reads, for this rank's rows, the
-        prefix source row each takes, its rotary ``cos``/``sin`` and its
-        modulation row, and the used row count every query sees
-        (``visible_end``). Multi-segment sparse attention reads this rank's
-        prefix source rows and modulation rows, the rotary ``cos``/``sin`` of
-        every packed row, and the segment tables of every tile
-        (``vsa.Segments``). Their shapes follow the layout alone.
+        Dense attention reads, for this rank's rows, the prefix source row
+        each takes, its rotary ``cos``/``sin`` and its modulation row, and the
+        used row count every query sees (``visible_end``). Sparse attention
+        reads this rank's prefix source rows and modulation rows, the rotary
+        ``cos``/``sin`` of every packed row, and the segment tables of every
+        tile (``vsa.Segments``). Their shapes follow the layout alone.
         """
         size = self.layout_size(size)
         samples = {
@@ -835,10 +770,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             for name, layout in self.output_layout(size).items()
         }
         width = self._rotary_width()
-        packing: DensePacking | SegmentExtent | TileExtent
         if self.dense:
-            packing = self._dense_packing(size)
-            rows = packing.padded_tokens // self.sequence_group().size
+            dense = self._dense_packing(size)
+            rows = dense.padded_tokens // self.sequence_group().size
             return {
                 **samples,
                 "prefix_index": BufferConfig((rows,), torch.int64),
@@ -848,41 +782,25 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 # One endpoint that every query row shares.
                 "visible_end": BufferConfig((1, 1), torch.int32),
             }
-        if self.segmented:
-            packing = self._segment_extent(size)
-            rows = packing.padded_tokens
-            local = rows // self.sequence_group().size
-            tiles = rows // packing.tile
-            return {
-                **samples,
-                "prefix_index": BufferConfig((local,), torch.int64),
-                "cos": BufferConfig((rows, width), torch.float32),
-                "sin": BufferConfig((rows, width), torch.float32),
-                "modulation_indices": BufferConfig((local,), torch.int64),
-                **{
-                    name: BufferConfig((tiles,), torch.int32)
-                    for name in (
-                        "valid_sizes",
-                        "tile_segments",
-                        "segment_starts",
-                        "segment_keep",
-                    )
-                },
-            }
-        packing = self._tile_extent(size)
-        rows = packing.padded_tokens
+        extent = self._segment_extent(size)
+        rows = extent.padded_tokens
+        local = rows // self.sequence_group().size
+        tiles = rows // extent.tile
         return {
             **samples,
-            "tile_valid_sizes": BufferConfig((rows // 64,), torch.int32),
+            "prefix_index": BufferConfig((local,), torch.int64),
             "cos": BufferConfig((rows, width), torch.float32),
             "sin": BufferConfig((rows, width), torch.float32),
-            "prefix_key_indices": BufferConfig(
-                (packing.prefix_tiles,), torch.int32
-            ),
-            "dense_key_indices": BufferConfig(
-                (packing.prefix_tiles + packing.video_tiles,), torch.int32
-            ),
-            "prefix_count": BufferConfig((1,), torch.int32),
+            "modulation_indices": BufferConfig((local,), torch.int64),
+            **{
+                name: BufferConfig((tiles,), torch.int32)
+                for name in (
+                    "valid_sizes",
+                    "tile_segments",
+                    "segment_starts",
+                    "segment_keep",
+                )
+            },
         }
 
     def _dense_state(
@@ -920,7 +838,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         """Fill a request's segment tables: this rank's rows, every tile."""
         packing = self._segment_packing(layout)
         attention = cast(SparseAttention, self.config.attention)
-        assert attention.reference_keep is not None
         tables = segment_tables(
             packing,
             num_frames=size.num_frames,
@@ -950,40 +867,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             "segment_keep": tables.segment_keep,
         }
 
-    def _tile_state(
-        self, size: DenoiserSize, layout: DenoiserSize
-    ) -> dict[str, torch.Tensor]:
-        """Fill a request's tile tables over every packed row."""
-        packing = self._tile_packing(size, layout)
-        cosine, sine = self.rotary(
-            packing.position_ids,
-            dtype=torch.float32,
-            sequence_length=packing.padded_tokens,
-        )
-        # Live prefix tiles first; the unread tail of each list repeats key
-        # tile 0 so every entry names a tile of the domain.
-        prefix = packing.tile_valid_sizes[: packing.prefix_tiles]
-        live = torch.nonzero(prefix).flatten().to(torch.int32)
-        video = torch.arange(
-            packing.prefix_tiles,
-            packing.prefix_tiles + packing.video_tiles,
-            dtype=torch.int32,
-        )
-        prefix_keys = torch.zeros(packing.prefix_tiles, dtype=torch.int32)
-        prefix_keys[: live.numel()] = live
-        dense_keys = torch.zeros(
-            packing.prefix_tiles + packing.video_tiles, dtype=torch.int32
-        )
-        dense_keys[: live.numel() + video.numel()] = torch.cat((live, video))
-        return {
-            "tile_valid_sizes": packing.tile_valid_sizes,
-            "cos": cosine.flatten(1),
-            "sin": sine.flatten(1),
-            "prefix_key_indices": prefix_keys,
-            "dense_key_indices": dense_keys,
-            "prefix_count": torch.tensor([live.numel()], dtype=torch.int32),
-        }
-
     @torch.inference_mode()
     def prepare_state(
         self,
@@ -994,16 +877,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     ) -> None:
         """Fill the prompt-dependent tables of one request on the host.
 
-        Under sparse attention the prompt is packed in its layout's text
-        segment: text tiles past the prompt hold no valid rows, the tile
-        holding the prompt's end holds only its remaining rows, and every row
-        after the text segment sits at the prompt's exact length on the rotary
-        timeline; the dense prefix key lists name only the prefix tiles
-        holding valid rows. Under dense attention the prefix rows follow the
-        generated rows contiguously and every query sees exactly the used
-        rows. Under multi-segment sparse attention the prompt and the
-        conditions fill their tiles from the first and the segment tables
-        name each tile's segment (``packing.segment_tables``).
+        Under dense attention the prefix rows follow the generated rows
+        contiguously and every query sees exactly the used rows. Under sparse
+        attention the prompt and the conditions fill their tiles from the
+        first, text tiles past the prompt hold no valid rows, and the segment
+        tables name each tile's segment (``packing.segment_tables``).
         """
         tables = set(self.state_buffers(layouts[0]) if layouts else ()) - set(
             self.modalities
@@ -1020,10 +898,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
         if self.dense:
             values = self._dense_state(sizes[0], layouts[0])
-        elif self.segmented:
-            values = self._segment_state(sizes[0], layouts[0])
         else:
-            values = self._tile_state(sizes[0], layouts[0])
+            values = self._segment_state(sizes[0], layouts[0])
         for name, value in values.items():
             if out[name].shape != value.shape or out[name].dtype != value.dtype:
                 raise ValueError(
@@ -1038,39 +914,11 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         # complete native draw it takes: the video raster row, or the
         # channel-major audio row.
         size = self.layout_size(size)
-        packing: SegmentPacking | DensePacking
-        if self.segmented:
-            packing = self._segment_packing(size)
-            interval = self._token_slice(packing.padded_tokens)
-            values = {}
-            for name, indices, raster in (
-                (
-                    "video",
-                    packing.video_indices,
-                    packing.video_raster_indices,
-                ),
-                (
-                    "audio",
-                    packing.audio_indices,
-                    torch.arange(packing.audio_rows, dtype=torch.int64),
-                ),
-            ):
-                selected = (indices >= interval.start) & (
-                    indices < interval.stop
-                )
-                values[f"local_{name}_indices"] = (
-                    indices[selected] - interval.start
-                )
-                values[f"{name}_indices"] = raster[selected]
-            return values
+        values: dict[str, torch.Tensor] = {}
         if self.dense:
-            packing = self._dense_packing(size)
-            interval = self._token_slice(packing.padded_tokens)
-            values = {}
-            for name, start in (
-                ("video", 0),
-                ("audio", packing.video_rows),
-            ):
+            dense = self._dense_packing(size)
+            interval = self._token_slice(dense.padded_tokens)
+            for name, start in (("video", 0), ("audio", dense.video_rows)):
                 rows = self._sample_ranges(size)[name]
                 values[f"local_{name}_indices"] = torch.arange(
                     start + rows.start - interval.start,
@@ -1083,42 +931,26 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             # Attention treats every padded row as one sequence whose keys
             # each query bounds by the request's used rows.
             values["sequence_lengths"] = torch.tensor(
-                [packing.padded_tokens], dtype=torch.int32
+                [dense.padded_tokens], dtype=torch.int32
             )
             values["sequence_offsets"] = torch.tensor(
-                [0, packing.padded_tokens], dtype=torch.int32
+                [0, dense.padded_tokens], dtype=torch.int32
             )
             return values
 
-        # Text also records the global packed row, which ``forward`` uses to
-        # gather the text features.
-        tiles = self._tile_packing(size)
-        interval = self._token_slice(tiles.padded_tokens)
-        values = {}
-        for name, indices in (
-            ("text", tiles.text_indices),
-            ("video", tiles.video_indices),
-            ("audio", tiles.audio_indices),
+        packing = self._segment_packing(size)
+        interval = self._token_slice(packing.padded_tokens)
+        for name, indices, raster in (
+            ("video", packing.video_indices, packing.video_raster_indices),
+            (
+                "audio",
+                packing.audio_indices,
+                torch.arange(packing.audio_rows, dtype=torch.int64),
+            ),
         ):
             selected = (indices >= interval.start) & (indices < interval.stop)
             values[f"local_{name}_indices"] = indices[selected] - interval.start
-            if name == "text":
-                values["global_text_indices"] = indices[selected]
-            else:
-                raster = (
-                    tiles.video_raster_indices
-                    if name == "video"
-                    else torch.arange(indices.numel(), device="cpu")
-                )
-                values[f"{name}_indices"] = raster[selected]
-
-        # Each layer's modulation products form six rows: the video
-        # timestep's (video, text, audio) groups, then the audio timestep's.
-        # Video and text tokens read their group under the video timestep
-        # (rows 0 and 1); audio tokens read the audio group under the audio
-        # timestep (row 5).
-        tags = tiles.token_tags[interval]
-        values["modulation_indices"] = (tags == AUDIO_TAG).long() * 3 + tags
+            values[f"{name}_indices"] = raster[selected]
         return values
 
     def constant_buffers(
@@ -1164,9 +996,8 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     def workspace_buffers(
         self, size: DenoiserSize
     ) -> Mapping[str, BufferConfig]:
-        tokens = self._padded_tokens(size)
-        interval = self._token_slice(tokens)
-        hidden = {
+        interval = self._token_slice(self._padded_tokens(size))
+        return {
             "hidden": BufferConfig(
                 (
                     interval.stop - interval.start,
@@ -1174,34 +1005,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 ),
                 torch.bfloat16,
             )
-        }
-        if self.dense or self.segmented:
-            return hidden
-        # Query rows are split across the group that shards the q
-        # projection's output tokens; keys cover every packed row. Resident
-        # layers are TransformerLayers whose merged attention branches are
-        # column-parallel linears.
-        layer = cast(
-            TransformerLayer, next(iter(self.transformer.layers.values()))
-        )
-        attention = layer.attention
-        query = cast(
-            ColumnParallelLinear, attention.projection.projections["q"]
-        )
-        distribution = query.output_distribution
-        context = distribution.mesh.get_group(distribution.shard_axes(0))
-        return {
-            **hidden,
-            # Adjacent layers coexist while completed residual chunks feed the
-            # next projection. Two numerical scratch sets keep their key pools
-            # and fine-attention products independent until final consumption.
-            **{
-                f"attention.{slot}.{name}": config
-                for slot in range(min(2, len(self.transformer.layers)))
-                for name, config in attention.workspace_buffers(
-                    tokens, tokens // context.size, dtype=torch.bfloat16
-                ).items()
-            },
         }
 
     @torch.inference_mode()
@@ -1283,11 +1086,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 "H3 denoising evaluates a layout; prompt-dependent tables are "
                 "request state"
             )
-        attention: AttentionInput | SequenceInput | SegmentInput
-        packing: DensePacking | SegmentExtent
+        attention: SequenceInput | SegmentInput
         if self.dense:
-            packing = self._dense_packing(size)
-            tokens = packing.padded_tokens
+            dense = self._dense_packing(size)
+            tokens = dense.padded_tokens
             lengths = SequenceLengths(
                 constants["sequence_lengths"],
                 constants["sequence_offsets"],
@@ -1307,46 +1109,27 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                 constants["local_video_indices"],
                 constants["local_audio_indices"],
             )
-            prefix_rows = self.text_condition_rows(size)
-        elif self.segmented:
-            packing = self._segment_extent(size)
-            tokens = packing.padded_tokens
+        else:
+            extent = self._segment_extent(size)
+            sparsity = cast(SparseAttention, self.config.attention).sparsity
+            tokens = extent.padded_tokens
             attention = SegmentInput(
                 self._token_slice(tokens),
                 self.sequence_group(),
                 vsa.Segments(
-                    packing.tile,
+                    extent.tile,
                     tokens,
                     state["valid_sizes"],
                     state["tile_segments"],
                     state["segment_starts"],
                     state["segment_keep"],
+                    dense_prefix_tiles=extent.dense_prefix_tiles,
+                    key_bounds=extent.key_bounds(sparsity),
                 ),
                 constants["local_video_indices"],
                 constants["local_audio_indices"],
             )
-            prefix_rows = self.text_condition_rows(size)
-        else:
-            tiles = self._tile_extent(size)
-            tokens = tiles.padded_tokens
-            attention = AttentionInput(
-                self._token_slice(tokens),
-                self.sequence_group(),
-                vsa.Input(
-                    tiles.padded_tokens,
-                    tiles.prefix_tiles,
-                    tiles.video_tiles,
-                    tiles.prefix_tiles + tiles.video_tiles,
-                    state["tile_valid_sizes"],
-                    state["prefix_key_indices"],
-                    state["dense_key_indices"],
-                    state["prefix_count"],
-                ),
-                constants["local_text_indices"],
-                constants["local_video_indices"],
-                constants["local_audio_indices"],
-            )
-            prefix_rows = size.num_text_tokens
+        prefix_rows = self.text_condition_rows(size)
         interval = attention.token_slice
         hidden = workspace["hidden"]
         width = self.config.transformer.hidden_size
@@ -1366,25 +1149,9 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                     "H3 text features must be refined tokens "
                     "with the declared width"
                 )
-            if self.dense or self.segmented:
-                # Every local row gathers its prefix source row; generated
-                # and padding rows gather the zero row.
-                torch.index_select(text, 0, state["prefix_index"], out=hidden)
-            else:
-                # Scatter text into the packed token rows; padding rows stay
-                # zero. Text occupies the leading packed rows, so a text
-                # row's global index is also its row in ``text``. Text
-                # features cover the layout's text rows, zero past the
-                # prompt, so every prompt length within one layout gathers
-                # the same rows.
-                hidden.zero_()
-                hidden.index_copy_(
-                    0,
-                    constants["local_text_indices"],
-                    text.index_select(0, constants["global_text_indices"]).to(
-                        hidden.dtype
-                    ),
-                )
+            # Every local row gathers its prefix source row; generated and
+            # padding rows gather the zero row.
+            torch.index_select(text, 0, state["prefix_index"], out=hidden)
             # Scatter projected latents into their local rows.
             for name, projection, indices in (
                 (
@@ -1416,24 +1183,15 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
                     ),
                 )
 
-        tables = (
-            state
-            if self.dense or self.segmented
-            else {
-                **state,
-                "modulation_indices": constants["modulation_indices"],
-            }
-        )
         predictions = self.transformer(
             hidden,
             attention,
             step=inputs.step,
             tables={
-                "modulation_indices": tables["modulation_indices"],
+                "modulation_indices": state["modulation_indices"],
                 "cos": state["cos"],
                 "sin": state["sin"],
             },
-            workspace=workspace,
         )
         if not predictions:
             return dict.fromkeys(self.modalities, (None,))
