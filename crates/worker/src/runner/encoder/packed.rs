@@ -4,10 +4,7 @@
 
 use uniserve_cuda::{CopyBatch, SourceOrder};
 
-use super::{
-    Encoded, EncoderGraph, EncoderInfo, EncoderRunner, ImagePixels, MAX_PACKED_IMAGES,
-    PreparedImage, Tower,
-};
+use super::{Encoded, EncoderGraph, EncoderInfo, EncoderRunner, ImagePixels, PreparedImage, Tower};
 use crate::lane::Job;
 use crate::runner::methods::Argument;
 use crate::storage::memory::StorageView;
@@ -57,11 +54,6 @@ pub(crate) fn packed_grids(
         });
     }
     Ok(grids)
-}
-
-/// Packed vision slots of one numerical call.
-pub(super) fn packed_capacity(max_images: usize) -> usize {
-    max_images.clamp(1, MAX_PACKED_IMAGES)
 }
 
 /// Packed vision buffers: `pixels [capacity * max_patches, row_width]`,

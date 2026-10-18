@@ -48,8 +48,9 @@
 //! one shared pixel buffer, slot grids and a feature buffer, captured once
 //! per slot count `capacity..=1` (largest first, so smaller captures reuse
 //! the pool blocks of larger ones) with `capacity = min(max_batch_calls,
-//! 16)`. A batch replays full chunks of `capacity` images, then the exact
-//! remainder. Rust writes the slot grids ([`packed_grids`]) before every
+//! max_slots)`, the slots the encoder declares one call holds
+//! (`PatchEncoder.max_slots`). A batch replays full chunks of `capacity`
+//! images, then the exact remainder. Rust writes the slot grids ([`packed_grids`]) before every
 //! call; images are independent of their slot neighbours by the encoder's
 //! contract, so a chunk may mix image sizes.
 //!
@@ -95,7 +96,7 @@ use crate::{Error, Result};
 pub(crate) use image::{EncodeResume, ImageFacts, ImagePixels, image_placement};
 pub use image::{ImagePreparation, PreparedImage, Tower};
 pub(crate) use packed::packed_grids;
-use packed::{PackedVision, grid_bytes, packed_capacity};
+use packed::{PackedVision, grid_bytes};
 pub(crate) use text::PromptVision;
 use text::TextBuffers;
 use video::Conditions;
@@ -105,11 +106,6 @@ pub(crate) use video::{
 };
 
 const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
-
-/// The largest packed vision slot count: it bounds retained activations
-/// independently of the admitted batch size. Larger batches replay full
-/// chunks and then their exact remaining slot count.
-pub(crate) const MAX_PACKED_IMAGES: usize = 16;
 
 /// The text workload an encoder's execution context is prepared for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +124,11 @@ pub struct VisionEncoder {
     pub output_dtype: DType,
     /// Patch rows of one packed slot; `None` for an unpacked encoder.
     pub max_patches: Option<u32>,
+    /// Slots one packed call holds; `None` for an unpacked encoder. It
+    /// bounds the activations a packed graph retains independently of the
+    /// admitted batch size: a larger batch replays full chunks and then its
+    /// exact remaining slot count.
+    pub max_slots: Option<u32>,
     /// Patch rows of the largest image the image policy admits.
     pub image_patches: u32,
     /// Values per packed patch row.
@@ -143,6 +144,11 @@ impl VisionEncoder {
     pub(crate) fn slot_tokens(&self) -> Option<u32> {
         self.max_patches
             .map(|patches| patches / (self.downsample * self.downsample))
+    }
+
+    /// Packed slots of one numerical call for batches of `max_images`.
+    pub(crate) fn packed_capacity(&self, max_images: usize) -> usize {
+        max_images.clamp(1, self.max_slots.unwrap_or(1) as usize)
     }
 }
 
@@ -234,10 +240,16 @@ impl EncoderInfo {
             "vision" => {
                 let patch_size = extent("patch_size")?;
                 let max_patches = extent("max_patches")?;
+                let max_slots = extent("max_slots")?;
                 let downsample = extent("downsample")?;
                 if downsample == 0 || max_patches % (downsample * downsample) != 0 {
                     return Err(Error::Interface(
                         "packed vision slots must hold whole output features".into(),
+                    ));
+                }
+                if (max_patches > 0) != (max_slots > 0) {
+                    return Err(Error::Interface(
+                        "packed vision declares both its slot rows and its slots per call".into(),
                     ));
                 }
                 Self::Vision(VisionEncoder {
@@ -246,6 +258,7 @@ impl EncoderInfo {
                     output_size: extent("output_width")?,
                     output_dtype: output_dtype()?,
                     max_patches: (max_patches > 0).then_some(max_patches),
+                    max_slots: (max_slots > 0).then_some(max_slots),
                     image_patches: extent("image_patches")?,
                     // A patch row holds the RGB values of one patch.
                     row_width: 3 * patch_size * patch_size,
@@ -285,7 +298,7 @@ impl EncoderInfo {
                 Some(max_patches) => {
                     // Every packed slot is two segments: its image and its
                     // padding.
-                    let slots = packed_capacity(config.max_images);
+                    let slots = vision.packed_capacity(config.max_images);
                     TextSize {
                         tokens: slots * max_patches as usize,
                         rows: 2 * slots,
@@ -537,7 +550,7 @@ impl EncoderRunner {
                 if let (Some(max_patches), Some(slot_tokens)) =
                     (vision.max_patches, vision.slot_tokens())
                 {
-                    let capacity = packed_capacity(config.max_images) as i64;
+                    let capacity = vision.packed_capacity(config.max_images) as i64;
                     let pixels = allocate(
                         device,
                         vision.pixel_dtype,
@@ -1296,6 +1309,7 @@ mod tests {
             output_size: 32,
             output_dtype: DType::BF16,
             max_patches: Some(2520),
+            max_slots: Some(16),
             image_patches: 2520,
             row_width: 768,
             pixel_dtype: DType::F32,

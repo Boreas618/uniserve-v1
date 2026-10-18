@@ -28,11 +28,6 @@ const ENCODER: &str = "uniserve.runner.encoder.EncoderRunner";
 const DENOISER: &str = "uniserve.runner.denoiser.DenoiserRunner";
 const DECODER: &str = "uniserve.runner.decoder.DecoderRunner";
 
-/// Language positions a generated image spans in its conversation: its
-/// closing framing token sits this far past the opening one, and the
-/// request's logical position advances by it after the image.
-pub(crate) const ROPE_ADVANCE: u64 = 2;
-
 /// A model's image processing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageProcessing {
@@ -61,6 +56,11 @@ pub(crate) struct ImageDenoiserLayout {
     pub image_unconditional: BranchSource,
     /// The longest image sequence, in latent patch rows (framing excluded).
     pub max_sequence_tokens: u32,
+    /// Language positions a generated image spans in its conversation: a
+    /// framed image's closing token sits this far past the position before
+    /// the image, and the request's logical position advances by it after
+    /// the image (`ImageDenoiser.rope_advance`).
+    pub rope_advance: u32,
     pub prediction_dtype: DType,
 }
 
@@ -112,7 +112,7 @@ impl ImageDenoiserLayout {
     /// The positions of a latent image inserted as conditioning (a latent
     /// ingest or feedback prefill): the image's positions one past the
     /// conditioning position, with the opening framing token at it and the
-    /// closing one `ROPE_ADVANCE` past it.
+    /// closing one `rope_advance` past it.
     pub(crate) fn conditioning_positions(
         &self,
         height: u32,
@@ -127,7 +127,7 @@ impl ImageDenoiserLayout {
         let mut positions = self.positions(height, width, conditioning_position + 1)?;
         let last = positions[0].len() - 1;
         positions[0][0] = conditioning_position as i64;
-        positions[0][last] = (conditioning_position + ROPE_ADVANCE) as i64;
+        positions[0][last] = (conditioning_position + u64::from(self.rope_advance)) as i64;
         Ok(positions)
     }
 }
@@ -236,6 +236,7 @@ impl ImageModel {
                 downsample,
                 framing_tokens,
                 max_sequence_tokens,
+                rope_advance,
             ] => {
                 let extent = |value: i64| -> Result<u32> {
                     u32::try_from(value).map_err(|_| {
@@ -252,6 +253,7 @@ impl ImageModel {
                     framing_tokens: extent(framing_tokens)?,
                     image_unconditional: BranchSource::parse(unconditional.as_str())?,
                     max_sequence_tokens: extent(max_sequence_tokens)?,
+                    rope_advance: extent(rope_advance)?,
                     prediction_dtype: dtype(&prediction, prediction.call_as(&model)?)?,
                 };
                 if layout.downsample == 0 || !matches!(layout.framing_tokens, 0 | 2) {
@@ -263,7 +265,7 @@ impl ImageModel {
             }
             _ => {
                 return Err(Error::Interface(
-                    "an image denoiser's layout names five sizes".into(),
+                    "an image denoiser's layout names six sizes".into(),
                 ));
             }
         };
@@ -441,6 +443,7 @@ mod tests {
             framing_tokens: framing,
             image_unconditional: BranchSource::Conditioning,
             max_sequence_tokens: 4096,
+            rope_advance: 2,
             prediction_dtype: DType::BF16,
         }
     }

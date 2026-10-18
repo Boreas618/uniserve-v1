@@ -70,6 +70,7 @@ def test_vision_features_fill_their_products(loaded):
     assert EncoderRunner.patch_size(*info) == 16
     assert EncoderRunner.downsample(*info) == 1
     assert EncoderRunner.max_patches(*info) == 0
+    assert EncoderRunner.max_slots(*info) == 0
     assert EncoderRunner.pixel_dtype(info[0]) == "bfloat16"
 
     images = [
