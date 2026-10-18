@@ -33,7 +33,7 @@ use super::read::{NativeRead, ReadCall};
 use super::transport::{Staged, read_destination};
 use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_planner};
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Memory, Residency, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 use handle::AllocationHandle;
@@ -77,6 +77,54 @@ pub(crate) struct CudaExports {
     pools: Mutex<HashMap<DeviceId, Arc<DevicePool>>>,
     grants: Mutex<Option<Arc<DescriptorGrants>>>,
     failed: Mutex<Option<FailedExport>>,
+    /// This rank's mappings of other ranks' resident allocations, kept for
+    /// every later read of them ([`ImportedAllocations`]).
+    imports: Arc<ImportedAllocations>,
+}
+
+/// A mapped fabric allocation of another rank, by the exporter's endpoint,
+/// the device it is mapped on, its fabric handle and its size.
+type ImportKey = (String, DeviceId, [u8; 64], u64);
+
+/// The mappings a rank keeps of other ranks' resident allocations.
+///
+/// Importing and mapping an allocation costs a fixed tens of milliseconds
+/// whatever its size, and the driver serializes these calls across
+/// processes, while a producer exports resident storage (its product
+/// arenas, pools and cache planes) again and again. A fabric handle names
+/// one physical allocation for as long as any import holds it, so a kept
+/// mapping never aliases another allocation, and a read through it sees the
+/// allocation's current contents; the export's ready event and
+/// acknowledgment still order the read. Producers create their resident
+/// allocations once, so the mappings are bounded by them and live until the
+/// transport closes. A transient allocation, and a descriptor handle (whose
+/// import needs a grant per export), is mapped for its read alone.
+#[derive(Default)]
+pub(crate) struct ImportedAllocations {
+    mappings: Mutex<HashMap<ImportKey, Arc<Memory>>>,
+}
+
+impl ImportedAllocations {
+    /// The kept mapping of `key`, made by `import` when there is none.
+    /// Reads importing the same allocation at once keep the first mapping.
+    fn mapping(
+        &self,
+        key: ImportKey,
+        import: impl FnOnce() -> Result<Arc<Memory>>,
+    ) -> Result<Arc<Memory>> {
+        if let Some(mapping) = lock(&self.mappings).get(&key) {
+            return Ok(Arc::clone(mapping));
+        }
+        let imported = import()?;
+        Ok(Arc::clone(
+            lock(&self.mappings).entry(key).or_insert(imported),
+        ))
+    }
+
+    /// Drop every kept mapping; reads in flight retain their own.
+    fn clear(&self) {
+        lock(&self.mappings).clear();
+    }
 }
 
 impl CudaExports {
@@ -94,6 +142,7 @@ impl CudaExports {
             pools: Mutex::new(HashMap::new()),
             grants: Mutex::new(None),
             failed: Mutex::new(None),
+            imports: Arc::new(ImportedAllocations::default()),
         }
     }
 
@@ -152,56 +201,67 @@ impl CudaExports {
 
         let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
-            let (spans, handle, size, offset) = match Memory::exportable_containing(first) {
-                Some((memory, offset)) => {
-                    let allocation = memory.allocation().ok_or_else(|| {
-                        Error::Invariant("an exportable allocation is device memory".into())
-                    })?;
-                    let shareable = allocation.export()?.ok_or_else(|| {
-                        Error::Invariant("a registered exportable allocation has a handle".into())
-                    })?;
-                    let handle = AllocationHandle::of(&shareable);
-                    if let ShareableHandle::Descriptor(fd) = shareable {
-                        state.descriptor = Some(fd);
+            let (spans, handle, size, offset, residency) =
+                match Memory::exportable_containing(first) {
+                    Some((memory, offset, residency)) => {
+                        let allocation = memory.allocation().ok_or_else(|| {
+                            Error::Invariant("an exportable allocation is device memory".into())
+                        })?;
+                        let shareable = allocation.export()?.ok_or_else(|| {
+                            Error::Invariant(
+                                "a registered exportable allocation has a handle".into(),
+                            )
+                        })?;
+                        let handle = AllocationHandle::of(&shareable);
+                        if let ShareableHandle::Descriptor(fd) = shareable {
+                            state.descriptor = Some(fd);
+                        }
+                        (
+                            source.clone(),
+                            handle,
+                            memory.bytes() as u64,
+                            offset,
+                            residency,
+                        )
                     }
-                    (source.clone(), handle, memory.bytes() as u64, offset)
-                }
-                None => {
-                    let pool = self.pool(device)?;
-                    let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
-                    let Some(chunk) = chunk else {
-                        return Ok(None);
-                    };
-                    state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
-                    let memory = Arc::clone(lock(&pool.pool).backing()?);
-                    // Readers map the whole allocation, whose length the
-                    // driver rounded up to its granularity.
-                    let storage_bytes = memory.bytes() as u64;
-                    let backing = memory as Arc<dyn Backing>;
-                    let shape: Vec<i64> =
-                        source.shape().iter().map(|&extent| extent as i64).collect();
-                    let payload = Spans::single(StorageView::contiguous(
-                        backing,
-                        chunk.payload_offset(),
-                        source.dtype(),
-                        &shape,
-                    )?)?;
+                    None => {
+                        let pool = self.pool(device)?;
+                        let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
+                        let Some(chunk) = chunk else {
+                            return Ok(None);
+                        };
+                        state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
+                        let memory = Arc::clone(lock(&pool.pool).backing()?);
+                        // Readers map the whole allocation, whose length the
+                        // driver rounded up to its granularity.
+                        let storage_bytes = memory.bytes() as u64;
+                        let backing = memory as Arc<dyn Backing>;
+                        let shape: Vec<i64> =
+                            source.shape().iter().map(|&extent| extent as i64).collect();
+                        let payload = Spans::single(StorageView::contiguous(
+                            backing,
+                            chunk.payload_offset(),
+                            source.dtype(),
+                            &shape,
+                        )?)?;
 
-                    let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
-                    payload.plan_copy(source, &mut plan)?;
-                    state.submitted = true;
-                    // SAFETY: the chunk stays reserved and the producer's spans
-                    // stay retained (`copied`) until the export retires.
-                    unsafe { issue.copy_strided(&plan) }?;
-                    state.copied = Some(source.clone());
-                    (
-                        payload,
-                        pool.handle,
-                        storage_bytes,
-                        chunk.payload_offset() as u64,
-                    )
-                }
-            };
+                        let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
+                        payload.plan_copy(source, &mut plan)?;
+                        state.submitted = true;
+                        // SAFETY: the chunk stays reserved and the producer's spans
+                        // stay retained (`copied`) until the export retires.
+                        unsafe { issue.copy_strided(&plan) }?;
+                        state.copied = Some(source.clone());
+                        // The pool lives as long as the transport.
+                        (
+                            payload,
+                            pool.handle,
+                            storage_bytes,
+                            chunk.payload_offset() as u64,
+                            Residency::Resident,
+                        )
+                    }
+                };
 
             // CUDA IPC events are host-local. Cross-host exports establish
             // readiness before sending their allocation handle to readers.
@@ -237,6 +297,7 @@ impl CudaExports {
                     .allocation
                     .as_ref()
                     .map_or(-1, |(_, chunk)| chunk.offset as i64),
+                resident: residency == Residency::Resident,
             })?;
 
             let pooled = state.allocation.is_some();
@@ -399,6 +460,7 @@ impl CudaExports {
             let pools = std::mem::take(&mut *lock(&self.pools));
             drop(pools);
         }
+        self.imports.clear();
         let grants = lock(&self.grants).take();
         if let Some(grants) = grants {
             result =
@@ -474,6 +536,7 @@ impl CudaExports {
             slot: self.slot,
             local: locator.source.address_space == source.address_space,
             same_node,
+            imports: Arc::clone(&self.imports),
         }))
     }
 }
@@ -565,6 +628,8 @@ pub(crate) struct CudaRead {
     /// registry instead of a mapping.
     pub(crate) local: bool,
     pub(crate) same_node: bool,
+    /// The reading rank's kept mappings of resident allocations.
+    pub(crate) imports: Arc<ImportedAllocations>,
 }
 
 impl CudaRead {
@@ -643,6 +708,7 @@ impl CudaRead {
             ready_event_handle,
             allocation_handle,
             acknowledgment_offset,
+            resident,
         } = &self.locator.transport
         else {
             return Err(Error::Invalid(
@@ -659,15 +725,24 @@ impl CudaRead {
             import_device = source;
         }
 
-        let handle = AllocationHandle::decode(allocation_handle)?.import(endpoint, export_id)?;
-        let mapping = Memory::mapped(PeerMapping::import(
-            import_device,
-            &handle,
-            *storage_size_bytes as usize,
-        )?);
-        // The mapping retains the imported allocation; the descriptor is no
-        // longer needed.
-        drop(handle);
+        let published = AllocationHandle::decode(allocation_handle)?;
+        let map = || -> Result<Arc<Memory>> {
+            let handle = published.import(endpoint, export_id)?;
+            // The mapping retains the imported allocation; the descriptor is
+            // no longer needed once it is made.
+            Ok(Memory::mapped(PeerMapping::import(
+                import_device,
+                &handle,
+                *storage_size_bytes as usize,
+            )?))
+        };
+        let mapping = match published {
+            AllocationHandle::Fabric(bytes) if *resident => self.imports.mapping(
+                (endpoint.clone(), import_device, bytes, *storage_size_bytes),
+                map,
+            )?,
+            _ => map()?,
+        };
 
         let dtype = DType::parse(&self.locator.dtype)?;
         if storage_offsets_bytes

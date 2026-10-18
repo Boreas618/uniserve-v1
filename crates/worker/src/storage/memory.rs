@@ -12,8 +12,9 @@
 //! allocation before dropping it.
 //!
 //! Exportable device allocations (`cuMemCreate` with a shareable handle) are
-//! recorded in a process-wide registry by address, so a transport can export
-//! any view of them in place ([`Memory::exportable_containing`]).
+//! recorded in a process-wide registry by address, with how long they live,
+//! so a transport can export any view of them in place
+//! ([`Memory::exportable_containing`]).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -45,10 +46,21 @@ enum Kind {
     Mapped(PeerMapping),
 }
 
-/// Exportable allocations by base address. Entries are weak: the registry
-/// never extends an allocation's lifetime, and a dropped allocation removes
-/// its own entry.
-static EXPORTABLE: Mutex<BTreeMap<u64, Weak<Memory>>> = Mutex::new(BTreeMap::new());
+/// How long an exportable allocation lives, which its exports state so a
+/// reader knows whether it may keep its mapping for later reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Residency {
+    /// Storage the rank keeps until it closes: product arenas, pools, cache
+    /// planes, latent pages.
+    Resident,
+    /// Storage made for one export and released when that export retires.
+    Transient,
+}
+
+/// Exportable allocations by base address, with their residency. Entries
+/// are weak: the registry never extends an allocation's lifetime, and a
+/// dropped allocation removes its own entry.
+static EXPORTABLE: Mutex<BTreeMap<u64, (Weak<Memory>, Residency)>> = Mutex::new(BTreeMap::new());
 
 impl Memory {
     /// Device memory on `device`. Contents are uninitialized.
@@ -60,20 +72,39 @@ impl Memory {
     }
 
     /// Device memory that can be exported in place to other processes, with
-    /// read-write access for `device` and every device in `access`. The
-    /// length is rounded up to the allocation granularity. Contents are
-    /// uninitialized.
+    /// read-write access for `device` and every device in `access`, kept by
+    /// the rank until it closes. The length is rounded up to the allocation
+    /// granularity. Contents are uninitialized.
     pub(crate) fn exportable(
         device: DeviceId,
         bytes: usize,
         access: &[DeviceId],
+    ) -> Result<Arc<Self>> {
+        Self::register_exportable(device, bytes, access, Residency::Resident)
+    }
+
+    /// Exportable device memory, as [`Memory::exportable`], that holds the
+    /// payload of one export and is released when that export retires.
+    pub(crate) fn export_staging(
+        device: DeviceId,
+        bytes: usize,
+        access: &[DeviceId],
+    ) -> Result<Arc<Self>> {
+        Self::register_exportable(device, bytes, access, Residency::Transient)
+    }
+
+    fn register_exportable(
+        device: DeviceId,
+        bytes: usize,
+        access: &[DeviceId],
+        residency: Residency,
     ) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::exportable(device, bytes, access)?;
         let address = allocation.address();
         let memory = Arc::new(Self {
             kind: Kind::Device(allocation),
         });
-        lock(&EXPORTABLE).insert(address, Arc::downgrade(&memory));
+        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&memory), residency));
         Ok(memory)
     }
 
@@ -122,12 +153,12 @@ impl Memory {
     }
 
     /// The live exportable allocation containing `address`, with the
-    /// address's byte offset inside it.
-    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
+    /// address's byte offset inside it and the allocation's residency.
+    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64, Residency)> {
         let registry = lock(&EXPORTABLE);
-        let (&base, memory) = registry.range(..=address).next_back()?;
+        let (&base, (memory, residency)) = registry.range(..=address).next_back()?;
         let memory = memory.upgrade()?;
-        (address < base + memory.bytes() as u64).then(|| (memory, address - base))
+        (address < base + memory.bytes() as u64).then(|| (memory, address - base, *residency))
     }
 
     /// The allocation's host-visible bytes. `None` for device memory.
@@ -159,7 +190,7 @@ impl Drop for Memory {
             // dead entry.
             if registry
                 .get(&allocation.address())
-                .is_some_and(|entry| entry.strong_count() == 0)
+                .is_some_and(|(entry, _)| entry.strong_count() == 0)
             {
                 registry.remove(&allocation.address());
             }
