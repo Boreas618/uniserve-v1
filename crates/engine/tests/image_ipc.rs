@@ -65,6 +65,8 @@ fn engine() -> anyhow::Result<EngineCore> {
         latent_downsample: 16,
         max_vae_grid_tokens: 1024,
         max_vit_grid_tokens: 1024,
+        // The density the latent feature bytes give over the VAE grid.
+        latent_bytes_per_unit: (4 << 20) / 1024,
         max_latent_feature_bytes: 4 << 20,
         max_vision_feature_bytes: 4 << 20,
         commit_marker_tokens: 2,
