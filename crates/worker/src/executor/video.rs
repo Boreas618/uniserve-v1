@@ -272,7 +272,7 @@ impl MediaBatch {
         }
         for state in &mut self.batch.calls {
             if let Some(update) = state.forward.latent.take() {
-                state.output.apply_latent_update(&update);
+                state.output.apply_latent_update(&update).map_err(&fatal)?;
             }
         }
         self.publications.register(tensors).map_err(&fatal)?;
@@ -941,16 +941,6 @@ pub(crate) fn complete(
         }
         Done::Failed(failure) => fail(backend, batch, failure),
     }
-}
-
-pub(crate) fn latent_params<'a>(
-    plan: &'a BatchPlan,
-    call: &Call,
-) -> Result<&'a uniserve_ipc::LatentParams> {
-    plan.latent_params
-        .iter()
-        .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
-        .ok_or_else(|| Error::Invalid("a video trajectory call has no latent pages".into()))
 }
 
 pub(crate) fn decode_range<'a>(

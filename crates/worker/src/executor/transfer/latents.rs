@@ -209,7 +209,8 @@ impl LatentInput {
 
 /// Read the latent version `export` describes into bank zero of `params`'
 /// pages of `slot` (the consuming call's), ordered after `stream`. The
-/// version's size and step must be the call's. A refusal for read credits
+/// version's size must be the call's; its step, the producing rank's ledger,
+/// becomes the slot's once adopted. A refusal for read credits
 /// starts no read and leaves the slot free, so the same import can be
 /// admitted again once credits return.
 pub(crate) fn import(
@@ -233,14 +234,7 @@ pub(crate) fn import(
             "a latent import names another product kind".into(),
         ));
     };
-    if (*latent_units, *height, *width, *step)
-        != (
-            params.latent_units,
-            params.height,
-            params.width,
-            params.start_step,
-        )
-    {
+    if (*latent_units, *height, *width) != (params.latent_units, params.height, params.width) {
         return Err(Error::Invalid(
             "latent transfer disagrees with its scheduler parameters".into(),
         ));
@@ -388,8 +382,8 @@ mod tests {
         )
     }
 
-    /// Three units of a 16x16 image on `pages`, at solver step `step`.
-    fn params(pages: &[u32], step: u32) -> LatentParams {
+    /// Three units of a 16x16 image on `pages`.
+    fn params(pages: &[u32]) -> LatentParams {
         LatentParams {
             request_key: key(),
             call_id: CallId::new(5, 0),
@@ -397,8 +391,6 @@ mod tests {
             latent_units: 3,
             height: 16,
             width: 16,
-            start_step: step,
-            step_count: 0,
         }
     }
 
@@ -431,7 +423,7 @@ mod tests {
     fn commit(pool: &mut LatentPool, storage: &LatentStorage, pages: &[u32]) -> Result<u8> {
         let update = LatentUpdate {
             request_pool_idx: SLOT as i64,
-            params: params(pages, 0),
+            params: params(pages),
             expected_generation: 0,
             expected_step: 0,
             generation: 1,
@@ -491,7 +483,7 @@ mod tests {
             &call,
             &latent(2),
             SLOT,
-            &params(pages, 0),
+            &params(pages),
             bank,
             0,
             None::<&uniserve_cuda::Stream>,
@@ -529,7 +521,7 @@ mod tests {
             &target_storage,
             &transports,
             &export,
-            &params(&[3, 1], 0),
+            &params(&[3, 1]),
             SLOT,
             None,
         )?;
@@ -567,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn an_import_reads_only_the_version_its_call_was_scheduled() -> Result<()> {
+    fn an_import_of_another_raster_is_refused_before_claiming_pages() -> Result<()> {
         let transports = transports()?;
         let (mut source, source_storage) = pool()?;
         let bank = commit(&mut source, &source_storage, &[2, 3])?;
@@ -581,16 +573,20 @@ mod tests {
             &mut publications,
         )?;
 
-        // Another step of the trajectory is refused before any page is
-        // claimed; the scheduled one is then admitted into the same slot.
+        // A call addressing another raster is refused before any page is
+        // claimed; the matching one is then admitted into the same slot.
         let (mut target, target_storage) = pool()?;
+        let other = LatentParams {
+            height: 32,
+            ..params(&[1, 2])
+        };
         assert!(
             import(
                 &mut target,
                 &target_storage,
                 &transports,
                 &export,
-                &params(&[1, 2], 4),
+                &other,
                 SLOT,
                 None,
             )
@@ -601,7 +597,7 @@ mod tests {
             &target_storage,
             &transports,
             &export,
-            &params(&[1, 2], 0),
+            &params(&[1, 2]),
             SLOT,
             None,
         )?;

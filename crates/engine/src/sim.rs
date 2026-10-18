@@ -883,7 +883,6 @@ impl SimEngine {
                 logical_position: request.logical_position,
                 cache_visible_len: request.cache_visible_len,
                 cache_computed_len: request.cache_visible_len,
-                flow_step: u32::from(request.flow_step),
             };
             anyhow::ensure!(
                 stated == held,
@@ -1684,7 +1683,6 @@ mod tests {
             logical_position: 2,
             cache_visible_len: 2,
             cache_computed_len: 2,
-            flow_step: 0,
         };
         selected.requests.push(successor);
 

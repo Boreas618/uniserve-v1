@@ -134,18 +134,6 @@ impl Scheduler {
             | CallKind::Media(MediaCall::Denoising) => Some(CacheLengths { visible, input: 0 }),
             _ => None,
         };
-        // Latent preparation opens the trajectory at step zero, a denoising
-        // call starts after the steps already scheduled, and image decoding
-        // sits at the end of the schedule.
-        let start_step = match call.code {
-            CallKind::Media(MediaCall::LatentPreparation) => Some(0),
-            CallKind::Media(MediaCall::Denoising) => self.num_scheduled_denoise_steps(request_id),
-            CallKind::Media(MediaCall::ImageDecoding) => self
-                .running
-                .get(&request_id)
-                .map(|state| u32::from(state.req.image.steps)),
-            _ => None,
-        };
         // An image-feature extension declares the cache tokens of the encoder
         // that produced its feature: the scheduled feedback encoder, or the
         // current input image's encoder.
@@ -458,13 +446,9 @@ impl Scheduler {
 
         let mut latent = None;
 
-        // Latent allocations describe the request-owned page table and the
-        // exact denoising interval executed by this call.
-        if matches!(
-            call.code,
-            CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
-        ) || call.latent_input.is_some()
-        {
+        // Latent allocations describe the request-owned page table this call
+        // addresses; the worker's latent pool keeps the trajectory's steps.
+        if call.addresses_latent_pages() {
             let Some(state) = self.running.get(&request_id) else {
                 self.fatal = true;
                 return None;
@@ -486,24 +470,10 @@ impl Scheduler {
                 height: state.req.image.height,
                 width: state.req.image.width,
             };
-            let Some(start_step) = start_step else {
-                tracing::error!(
-                    request_id = request_id.0,
-                    call = call.code.as_str(),
-                    "latent call has no submitted step"
-                );
-                self.fatal = true;
-                return None;
-            };
-            // A denoising call covers one step; latent preparation and
-            // image decoding cover none.
-            let step_count = u32::from(call.code == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,
                 &placement,
-                start_step,
-                step_count,
             ));
         }
 
@@ -538,10 +508,7 @@ impl Scheduler {
         let submitted_us = uniserve_core::now_monotonic_us();
         self.register_inflight(
             call.clone(),
-            InflightInput::Generation {
-                image_cache,
-                latent: latent.clone(),
-            },
+            InflightInput::Generation { image_cache },
             submitted_us.saturating_sub(planned_us),
         );
         // The runtime's buffer pool is one address space, so every rank of

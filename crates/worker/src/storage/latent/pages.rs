@@ -49,12 +49,21 @@ pub(crate) struct LatentUpdate {
 }
 
 impl LatentUpdate {
-    /// Derive a completed numerical call's trajectory change from its plan.
-    /// Standalone media keeps one slot-local trajectory, versioned by step;
-    /// transferred image trajectories use the call's explicit generations.
-    pub(crate) fn for_call(slot: usize, call: &Call, params: &LatentParams) -> Result<Self> {
-        let start = i64::from(params.start_step);
-        let end = start + i64::from(params.step_count);
+    /// Derive a completed numerical call's trajectory change from its plan
+    /// and the slot's committed step, the pool's ledger
+    /// ([`LatentPool::committed_step`]).
+    ///
+    /// Latent preparation opens a trajectory at step zero, a denoising call
+    /// advances the committed one by one step, and image decoding releases
+    /// it as committed. Standalone media keeps one slot-local trajectory,
+    /// versioned by step; transferred image trajectories use the call's
+    /// explicit generations.
+    pub(crate) fn for_call(
+        slot: usize,
+        call: &Call,
+        params: &LatentParams,
+        committed_step: i64,
+    ) -> Result<Self> {
         let (expected_generation, expected_step, generation, step, release) = match call.code {
             CallKind::Media(MediaCall::LatentPreparation) => (
                 0,
@@ -68,19 +77,19 @@ impl LatentUpdate {
             CallKind::Media(MediaCall::Denoising) => (
                 call.latent_input
                     .as_ref()
-                    .map_or(start + 1, |input| i64::from(input.generation)),
-                start,
+                    .map_or(committed_step + 1, |input| i64::from(input.generation)),
+                committed_step,
                 call.latent_output
                     .as_ref()
-                    .map_or(end + 1, |output| i64::from(output.generation)),
-                end,
+                    .map_or(committed_step + 2, |output| i64::from(output.generation)),
+                committed_step + 1,
                 false,
             ),
             CallKind::Media(MediaCall::ImageDecoding) => {
                 let input = call.latent_input.as_ref().ok_or_else(|| {
                     Error::Invalid("image decoding has no latent trajectory".into())
                 })?;
-                (0, 0, i64::from(input.generation), start, true)
+                (0, 0, i64::from(input.generation), committed_step, true)
             }
             _ => {
                 return Err(Error::Invalid(
@@ -218,6 +227,14 @@ impl LatentPool {
 
     pub(crate) fn page_units(&self) -> usize {
         self.page_units
+    }
+
+    /// The solver step of the slot's committed trajectory: the rank's ledger
+    /// of completed steps. A batch's commit advances it and an adopted
+    /// import sets it, so a call reads the step it advances here; an empty
+    /// slot is at step zero.
+    pub(crate) fn committed_step(&self, slot: usize) -> i64 {
+        self.slots[slot].step
     }
 
     pub(crate) fn capacity_units(&self) -> usize {
@@ -904,8 +921,6 @@ mod tests {
                 latent_units: units,
                 height: 16,
                 width: units * 16,
-                start_step: 0,
-                step_count: 1,
             },
             expected_generation: 0,
             expected_step: 0,

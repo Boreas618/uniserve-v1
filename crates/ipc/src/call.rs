@@ -220,8 +220,6 @@ pub struct CallCoordinates {
     pub cache_visible_len: u32,
     /// Tokens whose prefix cache is initialized at submission; never below the visible extent.
     pub cache_computed_len: u32,
-    /// Denoising steps completed for this request at submission.
-    pub flow_step: u32,
 }
 
 impl CallCoordinates {
@@ -479,6 +477,15 @@ impl Call {
             cache_input: None,
             cache_output: None,
         }
+    }
+
+    /// Returns whether the call reads or writes a latent product held in the
+    /// scheduler-allocated latent pages of an image trajectory, which its
+    /// batch then describes with [`LatentParams`]. A standalone video
+    /// denoiser's calls address pages their rank fixes per request slot and
+    /// carry no latent product.
+    pub fn addresses_latent_pages(&self) -> bool {
+        self.latent_input.is_some() || self.latent_output.is_some()
     }
 
     /// A context prefill interleaves prompt tokens and input-image blocks.

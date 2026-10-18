@@ -218,7 +218,7 @@ impl Scheduler {
     }
 
     /// Returns the steps of a request's trajectory covered once its submitted
-    /// calls complete, from their latent intervals.
+    /// calls complete.
     pub(in crate::scheduler) fn scheduled_steps(&self, id: RequestId, progress: &Denoising) -> u32 {
         progress.scheduled(
             self.inflight
@@ -227,45 +227,10 @@ impl Scheduler {
                 .into_iter()
                 .flatten()
                 .filter_map(|pending| match pending.call.code {
-                    CallKind::Media(media_call) => Some((media_call, pending.input.latent())),
+                    CallKind::Media(media_call) => Some(media_call),
                     _ => None,
                 }),
         )
-    }
-
-    /// Returns where a video request's samples live on its denoiser worker.
-    ///
-    /// A standalone denoiser's latent pool gives every request slot the same
-    /// run of consecutive pages after its sentinel page, so the worker's
-    /// advertised pool and slot count name the pages of `slot`. The raster is
-    /// the video the samples decode to.
-    ///
-    /// Page zero is the sentinel and request slots are numbered from one
-    /// (`RequestPool::new`), so slot `s` owns the
-    /// `(latent_pages - 1) / request_slots` pages that start at
-    /// `1 + (s - 1) * pages`.
-    ///
-    /// Returns `None` when `worker` is not a loaded worker.
-    fn sample_placement(
-        &self,
-        worker: &crate::WorkerId,
-        slot: u32,
-        sampling: &uniserve_core::DiffusionSamplingParams,
-    ) -> Option<LatentPlacement> {
-        let (_, info) = self
-            .executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)?;
-        let pages = info.latent_pages.saturating_sub(1) / info.request_slots.max(1);
-        let first = 1 + slot.saturating_sub(1) * pages;
-        Some(LatentPlacement {
-            page_table: (first..first + pages).collect(),
-            latent_units: pages * info.latent_page_units,
-            height: sampling.height,
-            width: sampling.width,
-        })
     }
 
     /// Returns the component whose lanes one media call occupies.
@@ -464,7 +429,6 @@ impl Scheduler {
                 let units = match &inflight.input {
                     InflightInput::Media {
                         decode: Some(range),
-                        ..
                     } => range.max_units,
                     _ => 1,
                 };
@@ -780,13 +744,6 @@ impl Scheduler {
             output_starts.push((reservation.clone(), start));
         }
 
-        // The step interval of a call that advances the trajectory; its
-        // pages follow from the worker the call is placed on.
-        let interval = stateful.then_some(if media_call == MediaCall::Denoising {
-            (step, 1)
-        } else {
-            (0, 0)
-        });
         let completion_output = if outputs.is_empty() && stateful {
             Some(self.media_completion_product(request_key, call_id)?)
         } else {
@@ -794,7 +751,6 @@ impl Scheduler {
         };
 
         let mut call = Call::new(request_key, call_id, work);
-        call.coordinates.flow_step = step;
         call.component = component.to_owned();
         call.inputs = inputs;
         call.outputs = outputs;
@@ -847,7 +803,7 @@ impl Scheduler {
                 }
             }
             MediaCall::LatentPreparation => state.latent_preparation_scheduled = true,
-            // Submitted steps are derived from the call's latent interval.
+            // Submitted steps are derived from the pending denoising calls.
             MediaCall::Denoising => {}
             MediaCall::VideoDecoding => {
                 let range = decode.as_ref().ok_or("a video decode has an input range")?;
@@ -921,25 +877,9 @@ impl Scheduler {
             })
             .collect();
 
-        // Request slots are allocated per worker, so the slot and the latent
-        // pages it owns are those of the selected worker.
+        // Request slots are allocated per worker; the denoiser derives the
+        // latent pages of its slot from its own pool.
         let request_pool_idx = state.allocations.request_slot(&worker);
-        let sampling = state.request.sampling;
-        let latent = match interval {
-            Some((start_step, step_count)) => {
-                let samples = self
-                    .sample_placement(&worker, request_pool_idx, &sampling)
-                    .ok_or("a placed call's worker is loaded")?;
-                Some(Denoising::params(
-                    request_key,
-                    call_id,
-                    &samples,
-                    start_step,
-                    step_count,
-                ))
-            }
-            None => None,
-        };
 
         // Admission routed every component of the request, so the replicas
         // reading this call's products are known here: the producer names
@@ -965,7 +905,7 @@ impl Scheduler {
             block_tables: Vec::new(),
             new_cache_units: Vec::new(),
             forward: uniserve_ipc::ForwardBatch::default(),
-            latent,
+            latent: None,
             decode,
             buffers,
             readers: Some(readers),
@@ -973,7 +913,6 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Media {
-                latent: placement.latent.clone(),
                 decode: placement.decode.clone(),
             },
             0,
