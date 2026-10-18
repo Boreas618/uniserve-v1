@@ -74,3 +74,14 @@ def test_the_image_sequence_limit_is_required(tmp_path):
 
     with pytest.raises(ValueError, match="max_image_seq_len"):
         _read(tmp_path, metadata)
+
+
+def test_a_scaled_rotary_recipe_is_refused(tmp_path):
+    metadata = neo_metadata()
+    metadata["llm_config"]["rope_scaling"] = {
+        "rope_type": "yarn",
+        "factor": 2.0,
+    }
+
+    with pytest.raises(ValueError, match="default rotary recipe"):
+        _read(tmp_path, metadata)
