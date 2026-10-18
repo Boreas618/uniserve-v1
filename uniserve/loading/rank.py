@@ -49,7 +49,6 @@ from uniserve.models.components import (
     describe_components,
     placements,
 )
-from uniserve.nn.attention.vsa import BlockAttention
 from uniserve.nn.moe import FusedMoE
 from uniserve.nn.vae.patch import PatchAutoencoder
 
@@ -211,9 +210,8 @@ def read_config(
         expert_split: Routed experts run on dedicated ranks.
 
     Raises:
-        SetupError: The placement does not fit the declarations, no installed
-            sparse attention provider serves a resident tile on the device,
-            a generation device has no flow route to place, or a split expert
+        SetupError: The placement does not fit the declarations, a
+            generation device has no flow route to place, or a split expert
             deployment has no routed expert layer.
     """
     stub = bool(stub)
@@ -250,13 +248,6 @@ def read_config(
     calls = (
         {} if role == "experts" else describe_components(model, entries=entries)
     )
-    resident = {
-        call.path
-        for name, placement in placed.items()
-        if rank in placement.ranks
-        for call in calls.get(name, ())
-    }
-    _require_sparse_tiles(model, resident, str(device))
     generation = _text(generation_device)
     if generation is not None:
         _devices(model, generation)
@@ -565,31 +556,6 @@ def _bind_calls(
             if isinstance(call.module, VideoPostprocessor):
                 call.module.units = ring
     return calls
-
-
-def _require_sparse_tiles(
-    model: nn.Module, paths: set[str], device: str
-) -> None:
-    """Refuse a device that no installed VSA provider serves for a tile.
-
-    A resident sparse attention layer's tile size fixes the block kernel it
-    needs; 128-row tiles have an SM100 kernel only.
-    """
-    from uniserve.backends.attention import vsa as providers
-
-    tiles = sorted(
-        {
-            child.tile_size
-            for path in paths
-            for child in model.get_submodule(path).modules()
-            if isinstance(child, BlockAttention)
-        }
-    )
-    for tile in tiles:
-        try:
-            providers.resolve("auto", device=torch.device(device), tile=tile)
-        except RuntimeError as error:
-            raise SetupError(str(error)) from error
 
 
 def _devices(
