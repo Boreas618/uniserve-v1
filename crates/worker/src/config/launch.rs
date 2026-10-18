@@ -138,12 +138,13 @@ impl WorkerLaunch {
 /// Resolve a launch descriptor.
 ///
 /// The command line and the engine validate the launch values they own
-/// before they write the descriptor, so this checks only what the rank
-/// alone knows: its device, the transports it can bind, the precisions its
-/// device computes, and the text values it parses (`--worker-mesh`, the
-/// graph catalogs, the lanes taken together). Fails with the first
-/// violated rule; messages name the launch option the operator sets,
-/// because the engine reports them as the rank's exit cause.
+/// before they write the descriptor (`--lane` validates each lane where
+/// the operator states it), so this checks only what the rank alone knows:
+/// its device, the transports it can bind, the precisions its device
+/// computes, and the text values it parses (`--worker-mesh`, the graph
+/// catalogs, the lanes taken together). Fails with the first violated
+/// rule; messages name the launch option the operator sets, because the
+/// engine reports them as the rank's exit cause.
 pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorError> {
     let role = descriptor.role.trim().to_owned();
     let experts = expert_parallel(&descriptor)?;
@@ -413,10 +414,6 @@ fn execution(
             }
             config.flow_graph_shapes.push(shape);
         }
-    }
-    for lane in &config.lanes {
-        lane.validate()
-            .map_err(|error| DescriptorError::new(error.to_string()))?;
     }
     if let Some(sampling) = descriptor.canvas_sampling {
         if let Some(parameter) = sampling.invalid_parameter() {
