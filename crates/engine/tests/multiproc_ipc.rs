@@ -2071,7 +2071,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         mesh: None,
         lane: Vec::new(),
         no_model: true,
-        allow_stub: true,
         load_format: "auto".into(),
         download_dir: None,
         load_threads: None,
