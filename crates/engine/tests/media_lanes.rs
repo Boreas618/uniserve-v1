@@ -9,6 +9,8 @@
 
 #![cfg(test)]
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +26,8 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
-    Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, RequestPlacement, Scheduler,
-    SimEngine, SimExecutor, SpecialTokenIds, VideoDenoiserInfo, WorkerId,
+    Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, RequestPlacement, SchedulerConfig,
+    SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
 };
 use uniserve_ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
@@ -383,7 +385,8 @@ impl Served {
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut executor = SimExecutor::new(video_worker(1, 1));
     let boundary = executor.observe();
-    let scheduler = Scheduler::new(Box::new(executor), SpecialTokenIds::default(), 32).unwrap();
+    let scheduler =
+        support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let mut stream = handle
@@ -495,10 +498,16 @@ fn serve_through(
     requests: Vec<Request>,
     max_num_waiting: Option<usize>,
 ) -> Served {
-    let mut scheduler = Scheduler::new(executor, SpecialTokenIds::default(), 32).unwrap();
-    if let Some(bound) = max_num_waiting {
-        scheduler.set_max_num_waiting(bound);
-    }
+    let scheduler = support::scheduler_with(
+        executor,
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            max_num_waiting,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
 

@@ -16,14 +16,22 @@ use uniserve_core::EngineCoreOutput;
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageIngestStep, ImageParams, ImageTrigger,
-    RequestId, SamplingParams,
+    ModelDtype, RequestId, SamplingParams,
 };
-use uniserve_engine::{EngineHandle, Scheduler, SimEngine, SimExecutor, SpecialTokenIds};
+use uniserve_engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
 
 fn main() -> anyhow::Result<()> {
-    let ctrl = SpecialTokenIds::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(executor, ctrl, 32)?;
+    let sched = Scheduler::new(
+        executor,
+        SimEngine::special_tokens(),
+        SchedulerConfig {
+            max_batch: 32,
+            ..Default::default()
+        },
+        ModelDtype::BFloat16,
+        SimEngine::generation_limits(),
+    )?;
 
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
