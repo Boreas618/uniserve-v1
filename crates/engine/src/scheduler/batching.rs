@@ -64,12 +64,12 @@ impl Scheduler {
         batches
     }
 
-    /// Charges actual token work, including each denoising step and CFG branch.
+    /// Charges actual token work, including each CFG branch of a denoising step.
     ///
-    /// A denoising call costs its latent units times its guidance branches
-    /// times its step count, which it declares as `bounds.max_tokens`; it
-    /// costs nothing once its request has left `running`. A verify call costs
-    /// its input tokens plus one, and every other call its `max_tokens` bound.
+    /// A denoising call costs its latent units times its guidance branches;
+    /// it costs nothing once its request has left `running`. A verify call
+    /// costs its input tokens plus one, and every other call its `max_tokens`
+    /// bound.
     fn computation_token_cost(&self, call: &Call) -> usize {
         match call.code {
             CallKind::Media(MediaCall::Denoising) => {
@@ -79,7 +79,6 @@ impl Scheduler {
                 usize::try_from(self.worker_image_latent_units_for(state).max(1))
                     .unwrap_or(usize::MAX)
                     .saturating_mul(usize::from(state.req.image.cfg_branch_count().max(1)))
-                    .saturating_mul(call.bounds.max_tokens.max(1) as usize)
             }
             CallKind::Forward(ForwardMode::Verify) => 1 + call.input_token_ids.len(),
             _ => call.bounds.max_tokens as usize,
