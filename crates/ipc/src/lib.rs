@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use uniserve_core::{
     CacheGroup, ImageParams, PrefixCacheDtype, RequestId, SamplingParams, TokenLogprob, UnitId,
 };
-pub use uniserve_core::{CallId, ForwardStats};
+pub use uniserve_core::{CallId, ForwardStats, MediaCall};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
