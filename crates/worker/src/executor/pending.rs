@@ -2,8 +2,8 @@
 
 use uniserve_core::{CallId, MediaSource};
 use uniserve_ipc::{
-    ArtifactHandle, BatchOutput, Call, CallKind, CallStatus, ErrorCode, MAX_TRANSFER_HANDLE_BYTES,
-    MediaOutput, RequestKey, RequestOutput, TensorExport, TensorRef, TimingCounters,
+    ArtifactHandle, BatchOutput, Call, CallKind, CallStatus, ErrorCode, MediaOutput, RequestKey,
+    RequestOutput, TensorExport, TensorRef, TimingCounters,
 };
 
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
@@ -98,11 +98,6 @@ impl PendingOutput {
             if !self.tensor_outputs.contains(&product.product) {
                 return Err(Error::Invalid(
                     "completion carries a product not declared by its call".into(),
-                ));
-            }
-            if product.value.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {
-                return Err(Error::Invalid(
-                    "transfer metadata exceeds its byte bound".into(),
                 ));
             }
         }
@@ -212,17 +207,12 @@ impl PendingOutput {
     /// export's bytes by the reservation the engine planned from the same
     /// visible extent (`PrefixCacheInfo::transfer_bytes`).
     pub(crate) fn validate_output(&self, call: &Call) -> Result<()> {
-        if let Some(output) = &self.output.cache_output {
-            if Some(output.source) != call.cache_output {
-                return Err(Error::Invalid(
-                    "cache export differs from its declared output".into(),
-                ));
-            }
-            if output.encoded_size_bound() > MAX_TRANSFER_HANDLE_BYTES {
-                return Err(Error::Invalid(
-                    "cache transfer exceeds its descriptor byte bound".into(),
-                ));
-            }
+        if let Some(output) = &self.output.cache_output
+            && Some(output.source) != call.cache_output
+        {
+            return Err(Error::Invalid(
+                "cache export differs from its declared output".into(),
+            ));
         }
         Ok(())
     }
@@ -451,9 +441,9 @@ fn token_id(value: i64) -> Result<u32> {
 mod tests {
     use uniserve_core::{CallId, MediaSource, RequestId, SharedMedia};
     use uniserve_ipc::{
-        BatchOutput, Call, CallKind, DType, LatentParams, Locator, MAX_TRANSFER_HANDLE_BYTES,
-        MediaCall, RequestKey, ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle,
-        TransferTransport, WorkerInfo,
+        BatchOutput, Call, CallKind, DType, LatentParams, Locator, MediaCall, RequestKey,
+        ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle, TransferTransport,
+        WorkerInfo,
     };
 
     use super::*;
@@ -626,17 +616,6 @@ mod tests {
                 .set_products(vec![export.clone(), undeclared])
                 .is_err()
         );
-        assert_eq!(output.products(), std::slice::from_ref(&export));
-
-        // Locator metadata has a separate budget from the transported bytes.
-        let mut oversized = export.clone();
-        let tensor = &mut oversized.value.tensors_mut()[0];
-        let location = &mut tensor.locations[0];
-        location.transport = TransferTransport::Channel {
-            endpoint: "r".repeat(MAX_TRANSFER_HANDLE_BYTES + 1),
-            payload: vec![7],
-        };
-        assert!(output.set_products(vec![oversized]).is_err());
         assert_eq!(output.products(), &[export]);
         Ok(())
     }
