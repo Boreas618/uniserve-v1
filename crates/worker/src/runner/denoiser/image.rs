@@ -824,13 +824,13 @@ impl ImageDenoiser {
 //
 // A trajectory starts with latent preparation: its guidance plan opens, its
 // seeded initial latent is drawn into the step workspace and scattered into
-// bank 1 of its pages. Each denoising call then advances it by an interval
-// of solver steps: the committed bank is gathered into the step workspace;
-// every step fills the slot's timestep, resolves the guidance branches it
-// evaluates (prefilling missing guidance prefixes through the text
-// image), predicts every branch of every image (one numerical call per
-// image size) and integrates each image's predictions; the interval's
-// result is scattered into the other bank. Commits become visible when the
+// bank 1 of its pages. Each denoising call then advances it by one solver
+// step: the committed bank is gathered into the step workspace; the step
+// fills the slot's timestep, resolves the guidance branches it evaluates
+// (prefilling missing guidance prefixes through the text image), predicts
+// every branch of every image (one numerical call per image size) and
+// integrates each image's predictions; the result is scattered into the
+// other bank. Commits become visible when the
 // batch commits.
 
 #[cfg(test)]

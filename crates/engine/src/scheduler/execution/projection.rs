@@ -730,16 +730,13 @@ impl Scheduler {
     ///
     /// Mirrors the per-kind counts of `call_output_bound`, which charges a
     /// call once it is in flight, for the kinds `peek_next_call_variant`
-    /// predicts; a denoising call is budgeted at `denoise_step_burst` steps.
+    /// predicts.
     pub(in crate::scheduler) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_call_variant(id) {
             Some(
                 CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode),
             ) => 4,
-            Some(CallKind::Media(MediaCall::Denoising)) => {
-                usize::from(self.denoise_step_burst).saturating_add(2)
-            }
-            Some(CallKind::Media(MediaCall::ImageDecoding)) => 3,
+            Some(CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding)) => 3,
             Some(_) | None => 2,
         }
     }

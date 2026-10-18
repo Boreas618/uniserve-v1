@@ -476,13 +476,9 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            // A denoising call declares its planned step count as its token
-            // bound; the interval repeats it for the worker.
-            let step_count = if call.code == CallKind::Media(MediaCall::Denoising) {
-                call.bounds.max_tokens
-            } else {
-                0
-            };
+            // A denoising call covers one step; latent preparation and
+            // image decoding cover none.
+            let step_count = u32::from(call.code == CallKind::Media(MediaCall::Denoising));
             latent = Some(Denoising::params(
                 call.request_key,
                 call.call_id,

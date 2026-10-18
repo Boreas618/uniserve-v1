@@ -595,7 +595,7 @@ impl Scheduler {
 
         // A video request advances its ladder one step per call.
         let step = self.scheduled_steps(id, &state.denoising);
-        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step, 1);
+        let last_step = media_call == MediaCall::Denoising && state.denoising.ends(step);
         let units = state.graph.condition_units();
         let visual_round = media_call == MediaCall::LatentEncoding
             && state.scheduled_condition_units < units.len() as u32;
