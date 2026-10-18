@@ -71,7 +71,7 @@ use crate::lane::{
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
 use crate::storage::memory::{Memory, StorageView};
-use crate::storage::{GroupShape, GroupTable, OutputPool, PrefixCache, TablePages, table_pages};
+use crate::storage::{AttentionRow, OutputPool, PrefixCache, TablePages};
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 
@@ -151,8 +151,6 @@ pub(crate) struct DiffusionLMRunner {
     shapes: Shapes,
     /// Page columns every table's rows hold in a graph.
     graph_widths: Vec<usize>,
-    /// The cache groups of the numerical tables, in table order.
-    groups: Vec<GroupShape>,
     /// The allocator pool graphs are captured into; `None` runs eagerly.
     pool: Option<Handle>,
     /// The lane's stream; `None` for a CPU lane.
@@ -850,9 +848,10 @@ impl DiffusionLMRunner {
         })
     }
 
-    /// Run every forward shape serving can select, over scratch prefixes
-    /// of the prefix cache: row `r` of a synthetic forward reads a
-    /// one-token prefix from its own page of every cache group. Denoising
+    /// Run every forward shape serving can select, over scratch tables of
+    /// the prefix cache: row `r` of a synthetic forward reads a one-token
+    /// prefix through the resident table of slot `r + 1`, one page of every
+    /// cache group, staged as serving stages a readout's rows. Denoising
     /// steps run in slots `1..`; their synthetic state is harmless because
     /// a request's first step starts its block before reading any of it.
     ///
@@ -867,26 +866,20 @@ impl DiffusionLMRunner {
     /// expert step; every rank warms the same sequence.
     ///
     /// Every forward is a job of the runner's lane (`lanes`). The scratch
-    /// units are startup work this call issues itself, between jobs.
+    /// tables are startup work this call issues itself, between jobs.
     fn warm(
         &mut self,
         prefix_cache: &mut PrefixCache,
         experts: Option<&Arc<ExpertUnion>>,
         lanes: &JobQueues,
     ) -> Result<()> {
-        let row_units: usize = self
-            .groups
-            .iter()
-            .map(|group| group.units_per_page as usize)
-            .sum();
-        let scratch = prefix_cache.scratch_units(
-            (self.shapes.capacity() * row_units) as u32,
-            self.stream.as_ref(),
-        )?;
-        let first = *scratch.units().start() as usize;
-        let warmed = self.warm_shapes(first, row_units, experts, lanes);
-        let finished = scratch.finish(prefix_cache, self.stream.as_ref());
-        warmed.and(finished)?;
+        // One page of every group for each of the largest bucket's rows, as
+        // resident tables of slots `1..`.
+        let rows = self.shapes.capacity();
+        let scratch = prefix_cache.install_scratch(&vec![1; rows], self.stream.as_ref())?;
+        let warmed = self.warm_shapes(prefix_cache, experts, lanes);
+        let released = prefix_cache.release_scratch(scratch, rows, self.stream.as_ref());
+        warmed.and(released)?;
         if let Some(stream) = &self.stream {
             stream.synchronize()?;
         }
@@ -932,8 +925,7 @@ impl DiffusionLMRunner {
 
     fn warm_shapes(
         &mut self,
-        first_unit: usize,
-        row_units: usize,
+        prefix_cache: &mut PrefixCache,
         experts: Option<&Arc<ExpertUnion>>,
         lanes: &JobQueues,
     ) -> Result<()> {
@@ -967,7 +959,7 @@ impl DiffusionLMRunner {
                 return Ok(());
             }
             for count in 1..=self.chunk_rows {
-                let pages = self.scratch_pages(count, length, first_unit, row_units)?;
+                let pages = scratch_pages(prefix_cache, count, length)?;
                 let job = Job::new();
                 let recorded = self.denoise(
                     &synthetic_steps(count, true),
@@ -990,7 +982,7 @@ impl DiffusionLMRunner {
         }
         for &count in &rows {
             for &length in &lengths {
-                let pages = self.scratch_pages(count, length, first_unit, row_units)?;
+                let pages = scratch_pages(prefix_cache, count, length)?;
                 let pass = ReadoutPass {
                     rows: vec![
                         Sequence {
@@ -1022,7 +1014,7 @@ impl DiffusionLMRunner {
         }
         if self.sampling.is_some() {
             for &count in &rows {
-                let pages = self.scratch_pages(count, length, first_unit, row_units)?;
+                let pages = scratch_pages(prefix_cache, count, length)?;
                 let padded = self
                     .shapes
                     .denoise(count)
@@ -1080,39 +1072,25 @@ impl DiffusionLMRunner {
         }
         Ok(())
     }
+}
 
-    /// Pages of `count` rows of `length` tokens reading a one-token prefix
-    /// on scratch units: row `r` reads units `first_unit + r * row_units
-    /// ..`, one page of every group in table order.
-    fn scratch_pages(
-        &self,
-        count: usize,
-        length: usize,
-        first_unit: usize,
-        row_units: usize,
-    ) -> Result<Vec<TablePages>> {
-        let tables = (0..count)
-            .map(|row| {
-                let mut next = (first_unit + row * row_units..).map(|unit| unit as u32);
-                self.groups
-                    .iter()
-                    .map(|&shape| {
-                        let units = (&mut next)
-                            .take(shape.units_per_page as usize)
-                            .map(uniserve_core::UnitId)
-                            .collect();
-                        Arc::new(GroupTable {
-                            shape,
-                            start_page: 0,
-                            units,
-                            allocated_tokens: shape.page_tokens,
-                        })
-                    })
-                    .collect()
-            })
-            .collect::<Vec<Vec<_>>>();
-        table_pages(&tables, &vec![1; count], &vec![length as u32; count])
-    }
+/// The pages `count` rows of `length` tokens read over a one-token prefix
+/// in the scratch tables of slots `1..=count`, selected from the resident
+/// tables as a serving readout's are.
+fn scratch_pages(
+    prefix_cache: &mut PrefixCache,
+    count: usize,
+    length: usize,
+) -> Result<Vec<TablePages>> {
+    let rows: Vec<AttentionRow> = (1..=count as u32)
+        .map(|slot| AttentionRow {
+            slot,
+            prefix: 1,
+            query: length as u32,
+            write: false,
+        })
+        .collect();
+    prefix_cache.prepare_attention(&rows)
 }
 
 /// Denoising steps of slots `1..=count` with a one-token prefix, at step

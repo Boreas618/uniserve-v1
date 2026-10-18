@@ -28,7 +28,7 @@ use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::runner::scratch::Scratches;
-use crate::storage::{CachePlan, GroupShape, OutputPool, PrefixCache};
+use crate::storage::{CachePlan, OutputPool, PrefixCache};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result};
@@ -45,7 +45,6 @@ struct Bounds {
     /// doubles its blocks.
     rows: usize,
     tokens: usize,
-    groups: Vec<GroupShape>,
     /// Tokens per page and whether pages retire behind a window, per
     /// numerical block table.
     page_tokens: Vec<i64>,
@@ -131,7 +130,6 @@ impl Bounds {
             capacity,
             rows,
             tokens,
-            groups,
             page_tokens,
             windowed,
             widths,
@@ -474,7 +472,6 @@ impl DiffusionLMRunner {
                 chunk_rows,
                 shapes,
                 graph_widths: bounds.widths,
-                groups: bounds.groups,
                 pool,
                 stream,
                 plans_attention: true,
