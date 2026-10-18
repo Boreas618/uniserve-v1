@@ -189,14 +189,13 @@ impl Scheduler {
                 })
             }
             Phase::DenoiseGen => {
-                // Each scheduled interval consumes only the remaining model steps.
-                // Accepted completion remains separately tracked on the request.
+                // Each call covers the next step of the schedule, and none
+                // is planned once every step is submitted. Accepted
+                // completion remains separately tracked on the request.
                 let st = self.running.get(&id)?;
-                let scheduled = self.num_scheduled_denoise_steps(id)?;
-                let (_, count) = st
-                    .denoising
-                    .next(scheduled, u32::from(self.denoise_step_burst))?;
-                let denoise_step_count = u16::try_from(count).ok()?;
+                if self.num_scheduled_denoise_steps(id)? >= st.denoising.steps() {
+                    return None;
+                }
                 let conditioning = self.cache_conditioning(id)?;
                 let latent = self
                     .pending_output(id, |call| call.latent_output.as_ref())
@@ -207,7 +206,6 @@ impl Scheduler {
                         &scheduler.generation_limits,
                         scheduler.latent_dtype,
                         request,
-                        denoise_step_count,
                         conditioning,
                         latent,
                     )

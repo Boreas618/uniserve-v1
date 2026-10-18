@@ -1,8 +1,8 @@
 //! Denoising an image batch: the active trajectories of its denoising calls,
-//! their initial latents and guidance plans, and the solver steps that evaluate
-//! their rows grouped by image size and integrate their predictions, each
-//! denoising resumed between the jobs it records ([`DenoiseResume`],
-//! [`PlanResume`]).
+//! their initial latents and guidance plans, and the solver step each call
+//! covers, which evaluates their rows grouped by image size and integrates
+//! their predictions, each denoising resumed between the jobs it records
+//! ([`DenoiseResume`], [`PlanResume`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ type Stepping = Vec<(usize, u32, BranchSet, f32)>;
 /// slot the prefix is written to and its tokens.
 type Fills = Vec<(usize, u32, Arc<[u32]>)>;
 
-/// What a denoising keeps between its solver steps.
+/// What a denoising keeps between the jobs it records.
 pub(crate) struct Denoising {
     /// Each active call's trajectory and admitted image, with its placed
     /// samples in `scratch`.
@@ -64,14 +64,10 @@ pub(crate) struct Denoising {
     layout: ImageDenoiserLayout,
     component: String,
     stats: ForwardStats,
-    /// Solver steps of the longest interval, and the next one to record.
-    intervals: u32,
-    offset: u32,
 }
 
 /// A denoising between two of its jobs: the job on the lane ends with the
-/// text runner's evaluation of the guidance prefixes step `state.offset`
-/// misses.
+/// text runner's evaluation of the guidance prefixes its step misses.
 pub(crate) struct DenoiseResume {
     state: Denoising,
     stepping: Stepping,
@@ -510,7 +506,7 @@ impl ImageBatch<'_> {
         Ok(descriptors)
     }
 
-    /// Advance every active trajectory by its assigned interval. Missing
+    /// Advance every active trajectory by its one solver step. Missing
     /// guidance prefixes are evaluated by `text` first, as expert steps on a
     /// rank with `experts`.
     pub(crate) fn denoise(
@@ -578,13 +574,13 @@ impl ImageBatch<'_> {
         progress
     }
 
-    /// Record what precedes the solver steps: the wait on the text
-    /// runners' order, the reservation of the rows' slots, the resumption
-    /// of each trajectory and the gather of its committed version. The
-    /// denoising is one job unless it opens a trajectory, whose plan call
-    /// then ends the job, or a step misses guidance prefixes: the job then
-    /// ends with the text runner's evaluation of them, which is completed
-    /// before the step is recorded.
+    /// Record what precedes the solver step: the wait on the text runners'
+    /// order, the reservation of the rows' slots, the resumption of each
+    /// trajectory and the gather of its committed version. The denoising is
+    /// one job unless it opens a trajectory, whose plan call then ends the
+    /// job, or the step misses guidance prefixes: the job then ends with the
+    /// text runner's evaluation of them, which is completed before the step
+    /// is recorded.
     fn begin_denoise(
         &mut self,
         job: &Job,
@@ -626,12 +622,11 @@ impl ImageBatch<'_> {
             if call.rng.is_some() {
                 return Err(Error::Invalid("denoising draws no random values".into()));
             }
-            if params.step_count == 0
-                || params.start_step + params.step_count > trajectory.steps
-                || params.step_count > call.bounds.max_tokens
-            {
+            // The engine plans every denoising call as the next step of its
+            // trajectory's schedule.
+            if params.step_count != 1 || params.start_step >= trajectory.steps {
                 return Err(Error::Invalid(
-                    "denoising interval lies outside the admitted schedule".into(),
+                    "a denoising call covers one step of the admitted schedule".into(),
                 ));
             }
             let conditioning = self.conditioning(index)?;
@@ -661,7 +656,7 @@ impl ImageBatch<'_> {
     }
 
     /// Record the resumption of each trajectory, whose guidance plan is
-    /// open, the gather of its committed version and the solver steps.
+    /// open, the gather of its committed version and the solver step.
     fn gather_denoise(
         &mut self,
         job: &Job,
@@ -729,11 +724,6 @@ impl ImageBatch<'_> {
             .first()
             .map(|(trajectory, _)| plan.calls[trajectory.index].component.clone())
             .unwrap_or_default();
-        let intervals = trajectories
-            .iter()
-            .map(|(trajectory, _)| trajectory.params.step_count)
-            .max()
-            .unwrap_or(0);
         self.denoise_steps(
             job,
             Denoising {
@@ -743,8 +733,6 @@ impl ImageBatch<'_> {
                 layout,
                 component,
                 stats: ForwardStats::default(),
-                intervals,
-                offset: 0,
             },
             None,
             text,
@@ -752,7 +740,7 @@ impl ImageBatch<'_> {
         )
     }
 
-    /// Record the solver steps from `state.offset` on, then the release of
+    /// Record the solver step of every trajectory, then the release of
     /// finished trajectories' guidance prefixes and the record on the text
     /// runners' order. `resumed` is the step whose guidance prefixes the
     /// last job evaluated, with that job's completion.
@@ -760,7 +748,7 @@ impl ImageBatch<'_> {
         &mut self,
         job: &Job,
         state: Denoising,
-        mut resumed: Option<(Stepping, Fills, Step, &mut Completion)>,
+        resumed: Option<(Stepping, Fills, Step, &mut Completion)>,
         mut text: Option<&mut CausalLMRunners>,
         experts: Option<&Arc<ExpertUnion>>,
     ) -> Result<Progress> {
@@ -773,37 +761,28 @@ impl ImageBatch<'_> {
             layout,
             component,
             mut stats,
-            intervals,
-            offset: first,
         } = state;
-        for offset in first..intervals {
-            if let Some((stepping, fills, step, completion)) = resumed.take() {
-                // The last job evaluated this step's guidance prefixes.
-                let text = text.as_deref_mut().ok_or_else(|| {
-                    Error::Unsupported("guidance prefixes require the text image".into())
-                })?;
-                text.complete_prefill(step, completion)?;
-                text.order().wait(job.on(stream.as_ref()))?;
-                for (position, slot, tokens) in &fills {
-                    let (trajectory, _) = &trajectories[*position];
-                    let key = plan.calls[trajectory.index].request_key;
-                    if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
-                        open.prefilled(*slot, tokens.len() as u64);
-                    }
+        let stepping = if let Some((stepping, fills, step, completion)) = resumed {
+            // The last job evaluated this step's guidance prefixes.
+            let text = text.as_deref_mut().ok_or_else(|| {
+                Error::Unsupported("guidance prefixes require the text image".into())
+            })?;
+            text.complete_prefill(step, completion)?;
+            text.order().wait(job.on(stream.as_ref()))?;
+            for (position, slot, tokens) in &fills {
+                let (trajectory, _) = &trajectories[*position];
+                let key = plan.calls[trajectory.index].request_key;
+                if let Some(open) = self.parts.trajectories.get(trajectory.slot, key) {
+                    open.prefilled(*slot, tokens.len() as u64);
                 }
-                self.denoise_step(job, &trajectories, &scratch, &stepping, &mut stats, offset)?;
-                continue;
             }
-
-            // Timesteps and guidance branches of this step.
+            stepping
+        } else {
+            // Timesteps and guidance branches of each trajectory's step.
             let mut stepping: Stepping = Vec::new();
             let mut fills: Fills = Vec::new();
-            for (position, ((trajectory, _), _)) in trajectories.iter().zip(&scratch).enumerate() {
-                let params = &trajectory.params;
-                if offset >= params.step_count {
-                    continue;
-                }
-                let step = params.start_step + offset;
+            for (position, (trajectory, _)) in trajectories.iter().enumerate() {
+                let step = trajectory.params.start_step;
                 let key = plan.calls[trajectory.index].request_key;
                 let call_rows = descriptors
                     .get(&trajectory.index)
@@ -866,8 +845,6 @@ impl ImageBatch<'_> {
                             layout,
                             component,
                             stats,
-                            intervals,
-                            offset,
                         },
                         stepping,
                         fills,
@@ -875,13 +852,13 @@ impl ImageBatch<'_> {
                     },
                 ))));
             }
-            self.denoise_step(job, &trajectories, &scratch, &stepping, &mut stats, offset)?;
-        }
+            stepping
+        };
+        self.denoise_step(job, &trajectories, &scratch, &stepping, &mut stats)?;
 
         // A finished trajectory's guidance prefixes retire with it.
         for (trajectory, _) in &trajectories {
-            let params = &trajectory.params;
-            if params.start_step + params.step_count < trajectory.steps {
+            if trajectory.params.start_step + 1 < trajectory.steps {
                 continue;
             }
             let own = trajectory.slot as u32;
@@ -913,9 +890,8 @@ impl ImageBatch<'_> {
 
     /// Record one solver step of the stepping trajectories: the rows of
     /// their guidance branches, grouped by image size, each group's
-    /// prediction and integration, and for an interval that ends at this
-    /// step the scatter of its successor into the other bank with its
-    /// export.
+    /// prediction and integration, and the scatter of each successor into
+    /// the other bank with its export.
     fn denoise_step(
         &mut self,
         job: &Job,
@@ -923,7 +899,6 @@ impl ImageBatch<'_> {
         scratch: &[Scratch],
         stepping: &Stepping,
         stats: &mut ForwardStats,
-        offset: u32,
     ) -> Result<()> {
         let plan = self.plan;
         let stream = self.batch.stream.clone();
@@ -1010,12 +985,8 @@ impl ImageBatch<'_> {
                 .integrate(&updates, job)?;
         }
 
-        // Intervals ending at this step publish their successor into
-        // the other bank.
+        // Every trajectory publishes its successor into the other bank.
         for ((trajectory, _), scratch) in trajectories.iter().zip(scratch) {
-            if offset + 1 != trajectory.params.step_count {
-                continue;
-            }
             let latents = self.parts.latents()?;
             let bank = latents.pool.next_bank(trajectory.slot);
             latents.pool.require_writable(bank, &scratch.pages)?;
@@ -1024,7 +995,7 @@ impl ImageBatch<'_> {
             self.publish_latent(
                 trajectory.index,
                 bank,
-                params.start_step + params.step_count,
+                params.start_step + 1,
                 params,
                 job.on(stream.as_ref()),
             )?;
