@@ -115,21 +115,20 @@ impl SimExecutor {
                 // Batches execute one at a time in submission order. Each
                 // returns whole, as one terminal result carrying an `Applied`
                 // receipt for every command other than `Start`; an execution
-                // or output validation error is forwarded to `poll` instead.
+                // error is forwarded to `poll` instead.
                 while let Ok(job) = jobs.recv() {
                     match job {
                         Job::Batch(batch) => {
                             let commands = batch.commands.clone();
-                            let result = engine.execute(batch).and_then(|report| {
-                                report.validate()?;
-                                Ok((
+                            let result = engine.execute(batch).map(|report| {
+                                (
                                     logical_result(
                                         crate::executor::WorkerResult::receive(report),
                                         true,
                                         &commands,
                                     ),
                                     commands,
-                                ))
+                                )
                             });
                             if results_tx.send(result).is_err() {
                                 break;
@@ -1434,16 +1433,14 @@ impl SimEngine {
     /// last, so calls in the same batch still execute against a finishing
     /// request.
     ///
-    /// Errors on a batch that fails validation, a readmission with a
-    /// different descriptor, a call for a request that is not admitted or
+    /// Errors on a readmission with a different descriptor, a call for a request that is not admitted or
     /// whose key differs from the admission, a predicate naming an unresolved
     /// product, or any `execute_call` error. An error abandons the rest of
     /// the batch and its `Finish` commands; admissions, `Free` commands,
     /// earlier calls, and whatever the failing call applied before the error
     /// keep their effects on request state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
-        batch.validate()?;
-
+        // `SimExecutor::submit` validated the batch.
         let batch_id = batch.id;
         let closed = batch
             .commands

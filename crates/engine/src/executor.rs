@@ -86,11 +86,11 @@ pub struct ExecutorInfo {
 }
 
 impl ExecutorInfo {
-    /// Validates and constructs capability information for multiple pools.
+    /// Constructs capability information for multiple pools.
     ///
-    /// Fails when `pools` is empty, repeats a pool id, contains a record that
-    /// fails `WorkerInfo::validate`, or holds replicas of one component that
-    /// expose different numerical outputs.
+    /// Each rank validated the report it built, so the records are taken as
+    /// they are. Fails when `pools` is empty, repeats a pool id, or holds
+    /// replicas of one component that expose different numerical outputs.
     pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
@@ -100,7 +100,6 @@ impl ExecutorInfo {
         let mut components: BTreeMap<&str, &uniserve_ipc::ComponentInfo> = BTreeMap::new();
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
-            info.validate()?;
             for component in &info.components {
                 if let Some(other) = components.get(component.name.as_str()) {
                     anyhow::ensure!(

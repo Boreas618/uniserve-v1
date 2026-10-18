@@ -280,13 +280,27 @@ impl<'a> Service<'a> {
                     let message_id = *message_id;
                     let result = self.executor.poll(submission);
                     match result {
-                        Ok(Some(result)) => {
-                            media = result.media;
-                            WorkerResponse::Result {
-                                message_id,
-                                result: result.output,
+                        // The result is checked once, here, where the rank
+                        // builds its response; the head does not check it
+                        // again. A result that breaks the contract is the
+                        // rank's own defect, and its media names are dropped
+                        // with it.
+                        Ok(Some(result)) => match result.output.validate() {
+                            Ok(()) => {
+                                media = result.media;
+                                WorkerResponse::Result {
+                                    message_id,
+                                    result: result.output,
+                                }
                             }
-                        }
+                            Err(invalid) => self.error_response(
+                                message_id,
+                                WorkerError::classify(
+                                    Error::Invariant(format!("batch result: {invalid}")),
+                                    None,
+                                ),
+                            )?,
+                        },
                         Ok(None) => continue,
                         Err(error) => self.error_response(message_id, error)?,
                     }
