@@ -280,28 +280,25 @@ impl Scheduler {
     /// rank. The worker is the request's owner of `component` when it has
     /// one, otherwise the first candidate that can execute `work`.
     ///
-    /// Returns `None` when no such worker is loaded, when its bound component
-    /// has no binding on that worker, or when the width does not fit in
-    /// `u32`.
+    /// Returns `None` when no such worker is loaded, when the worker was
+    /// launched without its bound component, or when the width does not fit
+    /// in `u32`.
     fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
         let owner = self
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let (_, bound, info) = self
+        let (worker, bound, _) = self
             .placement
             .component_candidates(self.executor.as_ref(), work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
-        let component = info
-            .components
-            .iter()
-            .find(|component| component.name == bound)?;
-        let units_per_rank = if component.config.distribution.is_some() {
-            component.config.units_per_rank.max(1)
+        let config = self.executor.info().component_config(worker, bound)?;
+        let units_per_rank = if config.distribution.is_some() {
+            config.units_per_rank.max(1)
         } else {
             1
         };
-        u32::try_from(component.config.ranks.len().saturating_mul(units_per_rank)).ok()
+        u32::try_from(config.ranks.len().saturating_mul(units_per_rank)).ok()
     }
 
     /// Returns a component's device lane capacity in media units.
@@ -310,24 +307,14 @@ impl Scheduler {
     /// ranks reconstruct together; every other component's lane is exclusive
     /// and admits one request at a time.
     ///
-    /// Returns `None` for an exclusive lane, and when `worker` is not loaded
-    /// or holds no binding named `component`.
+    /// Returns `None` for an exclusive lane, and when `worker` was launched
+    /// without a component named `component`.
     fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
-        self.executor
-            .info()
-            .workers
-            .iter()
-            .find(|(id, _)| id == worker)
-            .and_then(|(_, info)| {
-                info.components
-                    .iter()
-                    .find(|binding| binding.name == component)
-            })
-            .and_then(|binding| {
-                binding.config.distribution.as_ref().map(|_| {
-                    (binding.config.ranks.len() * binding.config.units_per_rank.max(1)) as u32
-                })
-            })
+        let config = self.executor.info().component_config(worker, component)?;
+        config
+            .distribution
+            .as_ref()
+            .map(|_| (config.ranks.len() * config.units_per_rank.max(1)) as u32)
     }
 
     /// Returns the lanes one media call occupies and how much of each.
@@ -393,25 +380,20 @@ impl Scheduler {
             .placement
             .affinity
             .get(&(request, component.to_owned()));
-        let Some((worker, info)) = self.executor.info().workers.iter().find(|(id, info)| {
-            owner.is_none_or(|owner| id == owner)
-                && info
-                    .components
-                    .iter()
-                    .any(|binding| binding.name == component)
+        let executor = self.executor.info();
+        let Some((worker, config)) = executor.workers.iter().find_map(|(id, _)| {
+            if owner.is_some_and(|owner| id != owner) {
+                return None;
+            }
+            executor
+                .component_config(id, component)
+                .map(|config| (id, config))
         }) else {
             return Vec::new();
         };
-        let Some(binding) = info
-            .components
-            .iter()
-            .find(|binding| binding.name == component)
-        else {
-            return Vec::new();
-        };
-        let ranks = &binding.config.ranks;
-        let per_rank = binding.config.units_per_rank.max(1) as u32;
-        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match binding.config.distribution {
+        let ranks = &config.ranks;
+        let per_rank = config.units_per_rank.max(1) as u32;
+        let (width, tasks): (usize, Box<dyn Fn(usize) -> u32>) = match config.distribution {
             Some(_) => (
                 (units.max(1) as usize)
                     .div_ceil(per_rank as usize)

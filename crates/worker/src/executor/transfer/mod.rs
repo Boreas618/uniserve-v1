@@ -237,7 +237,7 @@ fn open(
     Opening::open(
         parts.requests,
         &storage.tensors,
-        parts.info,
+        parts.placement,
         parts.rank,
         plan,
         device,

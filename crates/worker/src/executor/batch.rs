@@ -50,10 +50,10 @@ use uniserve_core::CallId;
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
-    ForwardStats, MediaCall, RequestKey, TensorRef, WorkerInfo,
+    ForwardStats, MediaCall, RequestKey, TensorRef,
 };
 
-use crate::config::placement::Capability;
+use crate::config::placement::{Capability, GroupPlacement};
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::products::ProductOwners;
@@ -143,7 +143,7 @@ impl<F: Default> Opening<F> {
     pub(crate) fn open(
         requests: &mut RequestPool,
         tensors: &ProductStore,
-        info: &WorkerInfo,
+        placement: &GroupPlacement,
         rank: usize,
         plan: &BatchPlan,
         device: Option<DeviceId>,
@@ -155,7 +155,7 @@ impl<F: Default> Opening<F> {
             .calls
             .first()
             .ok_or_else(|| Error::Invariant("a batch has calls".into()))?;
-        let reports = reports_output(info, rank, &first.component)?;
+        let reports = placement.reports_output(rank, &first.component)?;
 
         let calls: Vec<_> = plan
             .calls
@@ -556,17 +556,6 @@ pub(crate) trait HostStage {
 
     /// Withdraw work of a batch that will not be materialized.
     fn cancel(&mut self);
-}
-
-/// The rank that reports a component's host results: its first member.
-pub(crate) fn reports_output(info: &WorkerInfo, rank: usize, component: &str) -> Result<bool> {
-    match info.components.iter().find(|value| value.name == component) {
-        Some(value) => Ok(value.config.ranks.first() == Some(&rank)),
-        None if info.world_size == 1 => Ok(true),
-        None => Err(Error::Unsupported(format!(
-            "component {component:?} has no output rank"
-        ))),
-    }
 }
 
 /// The wire code of a batch failure classified as `code`.
@@ -1146,7 +1135,10 @@ mod tests {
         let mut opening = Opening::open(
             &mut requests,
             &store,
-            &WorkerInfo::default(),
+            &GroupPlacement {
+                world_size: 1,
+                ..GroupPlacement::default()
+            },
             0,
             &plan,
             None,

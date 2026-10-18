@@ -592,6 +592,37 @@ impl Placed {
     }
 }
 
+/// The placement a rank's group was launched with, which every rank of the
+/// group shares: each component's members by name, and the group's rank
+/// count. The rank reads it from its launch; its report does not carry it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct GroupPlacement {
+    pub(crate) components: BTreeMap<String, ComponentConfig>,
+    pub(crate) world_size: usize,
+}
+
+impl GroupPlacement {
+    /// Whether `rank` is one of `component`'s members.
+    pub(crate) fn holds(&self, rank: usize, component: &str) -> bool {
+        self.components
+            .get(component)
+            .is_some_and(|config| config.ranks.contains(&rank))
+    }
+
+    /// Whether `rank` reports `component`'s host results: the component's
+    /// first member. A component the launch does not place is reported by
+    /// the only rank of a one-rank group, and by no rank of a larger one.
+    pub(crate) fn reports_output(&self, rank: usize, component: &str) -> Result<bool> {
+        match self.components.get(component) {
+            Some(config) => Ok(config.ranks.first() == Some(&rank)),
+            None if self.world_size == 1 => Ok(true),
+            None => Err(Error::Unsupported(format!(
+                "component {component:?} has no output rank"
+            ))),
+        }
+    }
+}
+
 /// The components placed on this rank.
 #[derive(Default)]
 pub(crate) struct Components {

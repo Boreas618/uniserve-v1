@@ -696,10 +696,13 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
     info.host_lane_capacity = 1;
     info.components = vec![ComponentInfo {
         name: "model".to_owned(),
-        config: ComponentConfig::parallel(vec![0], Default::default()),
         outputs: Vec::new(),
     }];
     info.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
+    sim.place_components(BTreeMap::from([(
+        "model".to_owned(),
+        ComponentConfig::parallel(vec![0], Default::default()),
+    )]));
     let running = Running::start(sim, SchedulerConfig::default());
 
     // Each prompt opens with its image, so every encode is ready at once.

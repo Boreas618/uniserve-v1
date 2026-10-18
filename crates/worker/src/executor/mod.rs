@@ -376,6 +376,12 @@ impl Executor {
         })
     }
 
+    /// Unresolved batches the rank admits at once: the queue depth it was
+    /// launched with.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn backend(&self) -> &WorkerBackend {
         &self.backend
     }

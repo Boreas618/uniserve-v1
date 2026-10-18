@@ -634,8 +634,7 @@ pub(crate) fn start_video(
     let media = if host_components.is_empty() {
         None
     } else {
-        let info = setup.info;
-        let capacity = (info.queue_depth as usize * info.max_batch_calls.max(1) as usize).max(1);
+        let capacity = (setup.queue_depth * setup.info.max_batch_calls.max(1) as usize).max(1);
         Some(MediaRunner::new(
             setup.loaded,
             host_components,

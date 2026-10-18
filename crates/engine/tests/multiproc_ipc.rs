@@ -250,7 +250,6 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
                 anyhow::bail!("Info failed: {info:?}");
             };
             info.validate()?;
-            anyhow::ensure!(info.queue_depth == 8, "queue depth changed");
             anyhow::ensure!(
                 info.prefix_cache.is_some(),
                 "the stub reports no cache pool"
@@ -584,18 +583,16 @@ fn a_rank_without_its_head_closes_when_idle_and_ends_at_once_when_stuck() -> any
     Ok(())
 }
 
-/// A two-rank group reports its launch in its Info, retires finished
+/// A two-rank group reports its capacities in its Info, retires finished
 /// requests, refuses a repeated batch, and once closed reports nothing and
 /// refuses work.
 #[test]
-fn a_rank_group_reports_its_launch_and_refuses_work_after_close() -> anyhow::Result<()> {
+fn a_rank_group_reports_its_capacities_and_refuses_work_after_close() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info().clone();
     assert_eq!(info.endpoint.rank, 0);
-    assert_eq!(info.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
     assert!(info.prefix_cache.is_some());
 
     // Admit two requests, then finish one while admitting a third into the
@@ -1051,7 +1048,6 @@ fn closing_a_group_lets_every_rank_finish_a_collective_teardown() -> anyhow::Res
 fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info();
-    assert_eq!(info.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
 
