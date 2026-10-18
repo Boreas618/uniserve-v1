@@ -76,6 +76,13 @@ pub enum TransferTransport {
         /// for storage exported where it lies rather than copied into the
         /// producer's device pool.
         acknowledgment_offset: i64,
+        /// Whether the allocation lives as long as the producing rank (its
+        /// product arenas, pools and cache planes) rather than as long as
+        /// this export (staging of one export). A reader may keep its
+        /// mapping of a resident allocation for later reads of the same
+        /// allocation; a kept mapping of a transient one would hold memory
+        /// its producer released.
+        resident: bool,
     },
     /// A host product carried on the rank channel's data path.
     ///

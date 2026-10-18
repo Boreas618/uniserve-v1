@@ -841,6 +841,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
             ready_event_handle: vec![9; 64],
             allocation_handle: vec![7; 64],
             acknowledgment_offset: -1,
+            resident: true,
         },
         TransferTransport::PosixShm {
             endpoint: "uniserve-shm-physical-incarnation".into(),

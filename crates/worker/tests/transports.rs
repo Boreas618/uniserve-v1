@@ -590,9 +590,16 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 
 /// A device f32 tensor of `shape` holding `0, 1, 2, ...`.
 fn device_counting(shape: &[i64], stream: &Stream) -> Result<StorageView> {
+    device_counting_from(shape, 0, stream)
+}
+
+/// A device f32 tensor of `shape` holding `first, first + 1, ...`.
+fn device_counting_from(shape: &[i64], first: i64, stream: &Stream) -> Result<StorageView> {
     let elements: i64 = shape.iter().product();
     let memory = Memory::device(DEVICE, elements as usize * 4)?;
-    let values: Vec<f32> = (0..elements).map(|value| value as f32).collect();
+    let values: Vec<f32> = (first..first + elements)
+        .map(|value| value as f32)
+        .collect();
     let mut batch = CopyBatch::new(SourceOrder::DuringCall);
     batch.push(memory.address(), values.as_ptr() as u64, values.len() * 4);
     // SAFETY: the allocation holds the values; the source is read during
@@ -902,6 +909,98 @@ fn vmm_exports_are_imported_by_another_process() -> Result<()> {
     exports::release(&locations)?;
     settle(&transports, &capacity, &events)?;
     assert!(retirements.iter().all(|retirement| retirement.succeeded()));
+    transports.close()
+}
+
+/// Producer half: export two device tensors, each through a chunk of the one
+/// VMM pool allocation, and run this test binary as the consumer, which
+/// reads both through one transport: it maps the resident pool once and
+/// every read sees its own export's values.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn reads_of_one_resident_allocation_see_each_export() -> Result<()> {
+    let _driver = exclusive_driver();
+    let stream = Stream::new(DEVICE)?;
+    let (transports, capacity, events) =
+        device_transports(&[TransportKind::CudaVmm], "producer", 0)?;
+    let mut held = Vec::new();
+    let mut locators = Vec::new();
+    for first in [0, 1000] {
+        let source = Spans::single(device_counting_from(&[16, 8], first, &stream)?)?;
+        let locations = located(&transports, &source, None, &[1], Some(&stream), |_| Ok(()))?;
+        let (_, locator) = locations
+            .iter()
+            .find(|(_, locator)| TransportKind::of(locator) == TransportKind::CudaVmm)
+            .ok_or(Error::State("no CUDA VMM location was exported"))?;
+        // The pool is the producer's for as long as its transport.
+        assert!(matches!(
+            &locator.transport,
+            TransferTransport::CudaVmm { resident: true, .. }
+        ));
+        locators.push(locator.clone());
+        held.push(locations);
+    }
+
+    let locators = serde_json::to_string(&locators)
+        .map_err(|error| Error::Invalid(format!("unserializable locators: {error}")))?;
+    let executable = std::env::current_exe()
+        .map_err(|error| Error::Invalid(format!("no test executable: {error}")))?;
+    let status = Command::new(executable)
+        .args([
+            "--exact",
+            "resident_allocation_consumer",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD_LOCATOR, locators)
+        .status()
+        .map_err(|error| Error::Invalid(format!("cannot run the consumer: {error}")))?;
+    assert!(status.success(), "the consumer process failed");
+
+    for locations in &held {
+        exports::release(locations)?;
+    }
+    settle(&transports, &capacity, &events)?;
+    transports.close()
+}
+
+/// Consumer half, run by `reads_of_one_resident_allocation_see_each_export`.
+#[test]
+#[ignore = "runs as the consumer process of the resident allocation test"]
+fn resident_allocation_consumer() -> Result<()> {
+    let _driver = exclusive_driver();
+    let Ok(locators) = std::env::var(CHILD_LOCATOR) else {
+        return Ok(());
+    };
+    let locators: Vec<Locator> = serde_json::from_str(&locators)
+        .map_err(|error| Error::Invalid(format!("unreadable locators: {error}")))?;
+    let (transports, _, _) = device_transports(&[TransportKind::CudaVmm], "consumer", 1)?;
+    let transport = transports
+        .get(TransportKind::CudaVmm)
+        .ok_or(Error::State("no CUDA VMM transport is bound"))?;
+    let stream = Stream::new(DEVICE)?;
+    for (locator, first) in locators.iter().zip([0, 1000]) {
+        let destination = device_destination(&[16, 8])?;
+        let read = fetch(
+            transport,
+            locator,
+            MemoryKind::Cuda(DEVICE),
+            Some(&destination),
+            None,
+            Some(&stream),
+        )?;
+        read.wait_ready();
+        let value = read.result(Some(&stream))?;
+        assert_eq!(
+            floats(&download(value.first(), &stream)?),
+            (first..first + 128)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>()
+        );
+        while !read.retirement().succeeded() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     transports.close()
 }
 
