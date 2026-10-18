@@ -11,6 +11,7 @@
 //! `launcher` the per-host launchers that start ranks placed on other hosts.
 
 mod executor;
+mod incarnations;
 mod instance;
 mod launcher;
 mod process;
@@ -18,6 +19,7 @@ mod registry;
 mod rendezvous;
 
 pub use executor::WorkerExecutor;
+pub(crate) use incarnations::IncarnationRegistry;
 pub use instance::{CallReaders, WorkerGroup};
 pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
 use process::{PendingRank, RankProcess};

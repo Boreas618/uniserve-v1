@@ -278,7 +278,6 @@ impl WorkerProcessArgs {
             .collect();
 
         Ok(LaunchDescriptor {
-            worker_id: self.worker_id.clone(),
             // A rank cannot name the ranks that read what it publishes: it
             // knows its own component, not which component consumes its
             // products. The head states a product's readers on the call that

@@ -12,7 +12,6 @@ use uniserve_worker::config::{Device, WorkerLaunch, resolve};
 /// a single-rank CPU worker.
 fn defaults() -> Value {
     json!({
-        "worker_id": "worker",
         "acknowledgment_slot": 0,
         "host_slots": [0],
         "products_cross_hosts": false,

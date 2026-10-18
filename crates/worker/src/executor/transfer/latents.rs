@@ -371,8 +371,6 @@ mod tests {
     fn transports() -> Result<Transports> {
         let options = TransportOptions {
             source: WorkerEndpoint {
-                worker_id: "worker".into(),
-                rank: 0,
                 node: "node".into(),
                 address_space: "process".into(),
                 incarnation: "incarnation".into(),

@@ -1671,7 +1671,6 @@ mod tests {
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
         let second = Arc::new(WorkerEndpoint {
-            worker_id: "replica".into(),
             incarnation: "replica-loaded".into(),
             ..first.as_ref().clone()
         });
