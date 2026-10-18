@@ -15,6 +15,8 @@
 
 #![cfg(test)]
 
+mod support;
+
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,8 +26,8 @@ use uniserve_core::{
     RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    BatchEvent, EngineHandle, EventRx, ExecutionBatch, Scheduler, SchedulerConfig, SimEngine,
-    SimExecutor, SpecialTokenIds, sim_canvas_stop_step, sim_text_token,
+    BatchEvent, EngineHandle, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimExecutor,
+    sim_canvas_stop_step, sim_text_token,
 };
 use uniserve_ipc::{Call, CallKind, ForwardBatch, ForwardMode};
 
@@ -92,7 +94,8 @@ impl Running {
         let mut executor = SimExecutor::new(sim);
         let batches = executor.observe();
         let scheduler =
-            Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
+            support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
+                .unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let thread = thread::spawn(move || scheduler.run(rx));
@@ -620,7 +623,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     let mut executor = SimExecutor::new(sim);
     let observed = executor.observe();
     let scheduler =
-        Scheduler::with_config(Box::new(executor), SpecialTokenIds::default(), config).unwrap();
+        support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let generating_events = handle.submit(generating).unwrap();

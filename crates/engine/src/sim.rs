@@ -24,6 +24,7 @@ use crate::executor::{
     BatchResult, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError, WorkerId,
     logical_result,
 };
+use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
@@ -147,7 +148,10 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         Self {
-            executor_info: ExecutorInfo::single(WorkerId("sim".to_owned()), info.clone()),
+            executor_info: ExecutorInfo {
+                workers: vec![(WorkerId("sim".to_owned()), info.clone())],
+                video_codecs: BTreeMap::new(),
+            },
             depth,
             to_worker,
             from_worker,
@@ -494,6 +498,39 @@ pub struct SimEngine {
 }
 
 impl SimEngine {
+    /// Control tokens consistent with the simulator's synthetic text: its fake
+    /// EOS id terminates a request.
+    pub fn special_tokens() -> SpecialTokenIds {
+        SpecialTokenIds {
+            bos: 151_644,
+            eos: vec![FAKE_EOS_TOKEN, 151_643],
+            end_of_image: 151_653,
+        }
+    }
+
+    /// Model limits of a deployment that serves every call kind the
+    /// simulator implements without a model-imposed bound.
+    ///
+    /// The scheduler intersects them with the capacities and call kinds the
+    /// simulated worker reports.
+    pub fn generation_limits() -> uniserve_core::GenerationLimits {
+        uniserve_core::GenerationLimits {
+            features: uniserve_core::GenerationFeatures::UNDERSTANDING
+                | uniserve_core::GenerationFeatures::VISION_ENCODE
+                | uniserve_core::GenerationFeatures::LATENT_ENCODE
+                | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
+            max_latent_units: u64::MAX,
+            latent_downsample: 16,
+            max_vae_grid_tokens: u32::MAX,
+            max_vit_grid_tokens: u32::MAX,
+            max_latent_feature_bytes: 256 << 20,
+            max_vision_feature_bytes: 256 << 20,
+            commit_marker_tokens: 2,
+            max_cfg_branches: 3,
+            encoder_cache_entries: 256,
+        }
+    }
+
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         // Unset fields, including the prefix cache and a queue depth of one, come
