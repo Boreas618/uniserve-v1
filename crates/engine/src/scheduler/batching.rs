@@ -17,11 +17,11 @@
 //! calls are eligible in every pass, and a pass with no lane applies no filter.
 //!
 //! A pass's prefill calls, and likewise its decode calls, travel as one
-//! numerical call, which workers evaluate with graphs captured at startup; a
-//! prefill or decode batch holds at most the calls those graphs hold, as
-//! the workers report it (`Scheduler::call_limit`). A context prefill with
-//! vision blocks stages several forward rows; a pass's prefill rows, like its
-//! canvas rows, stay within the rows a worker stages per call (`PassRows`).
+//! numerical call, bounded by the batch's call and token budgets and the
+//! workers' pools; a worker replays a captured graph for a call one holds
+//! and runs any other eagerly. A context prefill with vision blocks stages
+//! several forward rows; a pass's prefill rows, like its canvas rows, stay
+//! within the rows a worker stages per call (`PassRows`).
 
 mod call;
 mod computation;
@@ -180,30 +180,10 @@ impl Scheduler {
         Some(buffer_allocations)
     }
 
-    /// Returns the most calls one batch of `code` may hold.
-    ///
-    /// Workers report the rows their captured prefill and decode graphs hold
-    /// (`WorkerInfo::max_prefill_calls`, `WorkerInfo::max_decode_calls`); zero
-    /// means those calls run eagerly and only the pass's call bound applies,
-    /// as it does to every other computation.
-    pub(super) fn call_limit(&self, code: CallKind) -> usize {
-        let reported = match code {
-            CallKind::Forward(ForwardMode::Prefill) => self.info.max_prefill_calls,
-            CallKind::Forward(ForwardMode::Decode) => self.info.max_decode_calls,
-            _ => 0,
-        };
-        match reported {
-            0 => self.config.max_batch,
-            limit => self.config.max_batch.min(limit as usize),
-        }
-    }
-
     /// Selects compatible call kinds within one lane's token and sequence budgets.
     ///
     /// Walks `ids` in assembly order until `max_batch` calls are selected or
-    /// the token budget is spent. A prefill or decode batch stops growing
-    /// at its `call_limit`; requests whose next call is of that computation
-    /// then wait for a later pass. Every selected call is registered in flight
+    /// the token budget is spent. Every selected call is registered in flight
     /// before this returns. A failed call preparation returns no batches; most
     /// such failures latch engine-fatal first.
     pub(super) fn assemble_batch(
@@ -223,25 +203,12 @@ impl Scheduler {
         // chunks are clipped to its remaining capacity.
         let mut budget: usize = self.config.max_num_batched_tokens;
         // Context calls expand into one forward row per text/image segment.
-        // Both input buffers and the reported prefill graph capacity bound those
+        // The worker's input buffers and the pass's call bound limit those
         // numerical rows, independently of the number of requests batched.
         let row_capacity = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut rows_left = PassRows {
             canvas: row_capacity,
-            context: row_capacity.min(self.call_limit(CallKind::Forward(ForwardMode::Prefill))),
-        };
-        let limits = [
-            CallKind::Forward(ForwardMode::Prefill),
-            CallKind::Forward(ForwardMode::Decode),
-        ]
-        .map(|code| (code, self.call_limit(code)));
-        let full = |batches: &HashMap<CallKind, ExecutionBatch>, code: CallKind| {
-            limits.iter().any(|(bounded, limit)| {
-                *bounded == code
-                    && batches
-                        .get(&code)
-                        .is_some_and(|batch| batch.requests.len() >= *limit)
-            })
+            context: row_capacity.min(self.config.max_batch),
         };
         // Host-lane occupancy, built when the pass meets its first encoder
         // call carrying inline image bytes and charged with each one it
@@ -267,9 +234,6 @@ impl Scheduler {
                 continue;
             }
             let next_type = self.peek_next_call_variant(id);
-            if next_type.is_some_and(|code| full(&code_batches, code)) {
-                continue;
-            }
             // The lane check rejects only a prefill call in a decode pass or
             // the reverse; `BatchKind::Media` calls pass.
             if let (Some(target), Some(call_variant)) = (lane, next_type)
@@ -293,14 +257,11 @@ impl Scheduler {
             }
             // Build one call when its exact resident resources fit.
             if let Some(mut call) = self.next_generation_computation(id, budget, rows_left) {
-                // A planned call joins its computation's batch only while it
-                // has room; otherwise it waits for a later pass, as a call
-                // without resources does below. A context prefill plans
-                // within the pass's context rows.
+                // A context prefill plans within the pass's context rows;
+                // otherwise it waits for a later pass, as a call without
+                // resources does below.
                 let prefill = call.code == CallKind::Forward(ForwardMode::Prefill);
-                if full(&code_batches, call.code)
-                    || (prefill && generation::prefill_rows(&call) > rows_left.context)
-                {
+                if prefill && generation::prefill_rows(&call) > rows_left.context {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent

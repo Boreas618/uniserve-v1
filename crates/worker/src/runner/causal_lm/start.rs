@@ -2,7 +2,7 @@
 //!
 //! [`TextBounds`] derives every text bound from the worker configuration and
 //! the cache plan, once for capacity planning (bytes to reserve beside the cache
-//! pool, graph-bounded call limits) and again for allocation, so both agree.
+//! pool) and again for allocation, so both agree.
 //! [`CausalLMRunners::start`] then creates one runner per execution stream
 //! serving text call kinds: it allocates the runner's columns and graph
 //! pool and constructs the Python runner, whose execution context borrows
@@ -47,9 +47,8 @@ pub(crate) const TEXT_KINDS: [CallKind; 3] = [
 /// plan.
 #[derive(Debug, Clone)]
 pub(crate) struct TextBounds {
-    /// Rows a batch may carry.
-    pub(crate) max_rows: usize,
-    /// Row capacity of the columns: batch rows or a prefill bucket.
+    /// Row capacity of the columns: the rows a batch may carry, or a wider
+    /// prefill bucket.
     pub(crate) rows: usize,
     pub(crate) tokens: usize,
     pub(crate) tables: Vec<TableShape>,
@@ -142,7 +141,6 @@ impl TextBounds {
             .fold(max_rows, usize::max);
         let tokens = decode.iter().copied().fold(tokens, usize::max);
         Ok(Self {
-            max_rows,
             rows,
             tokens,
             tables,
@@ -176,20 +174,6 @@ impl TextBounds {
             embeddings: false,
             dtype,
         }
-    }
-
-    /// Calls a decode and a prefill batch may carry: the largest captured
-    /// buckets (each prefill bucket keeps one padding sequence). Zero leaves
-    /// a kind bounded by the batch call limit alone.
-    pub(crate) fn graph_calls(&self) -> (u32, u32) {
-        let prefill = self
-            .prefill
-            .iter()
-            .map(|shape| shape.row_bucket - 1)
-            .max()
-            .map_or(0, |rows| rows.min(self.max_rows));
-        let decode = self.decode.iter().copied().max().unwrap_or(0);
-        (prefill as u32, decode as u32)
     }
 }
 

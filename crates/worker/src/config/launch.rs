@@ -673,8 +673,8 @@ fn execution(
         }
         if config.expert_exchange == "alltoall" {
             // Each local graph also captures larger transfer capacities.
-            // Geometric small buckets bound that product; the largest gap
-            // remains within the ordinary default cache padding reservation.
+            // Geometric small buckets, then 512-token spacing, bound that
+            // product.
             config.prefill_graph_token_sizes = [4, 8, 16, 32, 64, 128, 256, 512]
                 .into_iter()
                 .chain((1024..=16384).step_by(512))

@@ -164,21 +164,6 @@ pub(crate) fn default_prefill_sizes() -> Vec<usize> {
 /// A prefill bucket reserves at least one inert padding sequence.
 pub(crate) const PREFILL_ROW_BUCKETS: &[usize] = &[8, 16, 32];
 
-/// Additional cache pages that the widest default graph padding may occupy.
-pub(crate) fn graph_padding_block_count(block_size: usize) -> usize {
-    let decode = default_decode_sizes().into_iter().max().unwrap_or(1) - 1;
-    let prefill = default_prefill_sizes()
-        .into_iter()
-        .scan(0, |previous, size| {
-            let gap = size - *previous;
-            *previous = size;
-            Some(gap)
-        })
-        .max()
-        .unwrap_or(0);
-    decode.max(prefill).div_ceil(block_size.max(1))
-}
-
 impl WorkerConfig {
     /// Bound request concurrency for a model that decodes resident media.
     ///
