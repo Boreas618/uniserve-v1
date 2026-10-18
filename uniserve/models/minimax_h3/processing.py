@@ -9,10 +9,10 @@ generated from the diffusers reference pipeline.
 
 This module calls the parts of the same rules that the model package and its
 tools use, through the rank runtime library (``uniserve._worker``): the
-canvas rule, the FastH3 training buckets, the largest references a request
-may bring, which a denoiser provisions its condition capacity for, the
-canvas a target names without media, the frame count of a duration and the
-named aspect ratios.
+tasks, the canvas rule, the FastH3 training buckets, the largest references
+a request may bring, which a denoiser provisions its condition capacity for,
+the canvas a target names without media, the frame count of a duration and
+the named aspect ratios.
 """
 
 from __future__ import annotations
@@ -62,11 +62,24 @@ NAMED_ASPECT_RATIOS = _ratios(library()["video_aspect_ratios"]())
 
 
 class Task(StrEnum):
-    """A MiniMax-H3 task, by its request name."""
+    """A MiniMax-H3 task, by its request name.
+
+    The members are the rules' tasks (``uniserve_core::VideoTask``) in their
+    canonical order; importing the module refuses an enum that differs from
+    them, so a task the rules add or rename cannot be missed here.
+    """
 
     T2VA = "t2va"
     FL2VA = "fl2va"
     REF2VA = "ref2va"
+
+
+_RULE_TASKS = tuple(str(name) for name in library()["video_tasks"]())
+if tuple(task.value for task in Task) != _RULE_TASKS:
+    raise ImportError(
+        f"processing.Task names {[task.value for task in Task]}, but the "
+        f"request rules name the tasks {list(_RULE_TASKS)}"
+    )
 
 
 class PlanError(ValueError):
