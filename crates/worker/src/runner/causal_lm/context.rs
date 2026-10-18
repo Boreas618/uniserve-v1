@@ -30,7 +30,6 @@ use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
 use crate::runner::denoiser::image_model::GridKey;
-use crate::runner::denoiser::image_model::ROPE_ADVANCE;
 use crate::runner::vision::{BlockPositions, PositionLayout, VisionBlock};
 use crate::storage::memory::StorageView;
 use crate::storage::{BlockTables, Metadata, ProductRead, ProductStore};
@@ -391,7 +390,7 @@ pub(super) fn visual(
 
     // A completed feedback moves the language position past the image.
     let builder = image.as_ref().ok().and_then(|image| image.facts().denoiser);
-    let advance = if builder.is_some() { ROPE_ADVANCE } else { 1 };
+    let advance = builder.map_or(1, |layout| u64::from(layout.rope_advance));
     let position = start
         + if call.completion_output.is_some() {
             advance

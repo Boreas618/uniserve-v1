@@ -535,6 +535,14 @@ class EncoderRunner:
         return int(_module(loaded, path).max_patches or 0)
 
     @staticmethod
+    def max_slots(loaded, path: str) -> int:
+        """Slots one packed call of a vision encoder holds.
+
+        0 for an unpacked encoder.
+        """
+        return int(_module(loaded, path).max_slots or 0)
+
+    @staticmethod
     def image_patches(loaded, path: str) -> int:
         """Patch rows of the largest image the image policy admits.
 
