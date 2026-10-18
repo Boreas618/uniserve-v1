@@ -104,6 +104,55 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
         graph.release()
 
 
+@pytest.mark.parametrize("rows", [128, 200])
+@torch.inference_mode()
+def test_natively_swizzled_nvfp4_activations_project_as_their_repack(rows):
+    """An activation whose scales the encoder produced 128x4-swizzled.
+
+    Its projection reads those scales as the padded matrices they are made
+    as and equals the projection of the same values repacked to the linear
+    layout, up to the last bit the two FP4 kernels may round differently.
+    """
+    import flashinfer
+
+    from uniserve.nn.functional import linear
+
+    generator = torch.Generator(device="cuda:0").manual_seed(409)
+    source = torch.randn(
+        (rows, 512), device="cuda:0", dtype=torch.bfloat16, generator=generator
+    )
+    weight = torch.randn(
+        (384, 512), device="cuda:0", dtype=torch.bfloat16, generator=generator
+    )
+    converter = Quantizer("nvfp4")
+    tensor_scale = source.float().abs().amax() / (448 * 6)
+    values, scales = flashinfer.nvfp4_quantize(
+        source,
+        1.0 / tensor_scale,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        backend="cuda",
+        enable_pdl=False,
+    )
+    native = converter.from_tensors(
+        {
+            "values": values,
+            "block_scale": scales.reshape(-1),
+            "tensor_scale": tensor_scale,
+        },
+        shape=tuple(source.shape),
+        dtype=source.dtype,
+        scale_layout=ScaleLayout.SWIZZLED_128X4,
+    )
+    linear_layout = native.repack(scale_layout=ScaleLayout.LINEAR)
+    encoded = converter.quantize(weight)
+
+    swizzled = linear(native, encoded)
+    expected = linear(linear_layout, encoded)
+    # One BF16 rounding apart: the kernels accumulate in FP32 and may round
+    # the last bit of an element differently.
+    torch.testing.assert_close(swizzled, expected, rtol=2**-7, atol=2**-7)
+
+
 @pytest.mark.parametrize("format", [None, "fp8", "mxfp8", "nvfp4"])
 @pytest.mark.parametrize("branch_width", [None, 4])
 @torch.inference_mode()
