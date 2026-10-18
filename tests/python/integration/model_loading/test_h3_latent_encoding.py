@@ -267,6 +267,53 @@ def test_reference_image_bands_match_the_whole_encoding(video_encoders):
     assert torch.equal(assembled, whole.tensor)
 
 
+@pytest.mark.parametrize(
+    ("height", "width", "rows"),
+    (
+        # A band of a 16:9 reference at its 2048-pixel short edge, and a
+        # keyframe on the 16:9 canvas.
+        (2048, 3648, slice(32, 64)),
+        (768, 1344, None),
+    ),
+)
+def test_still_frame_tiles_replay_their_eager_encoding(
+    video_encoders, height, width, rows
+):
+    """A still frame's tiles encode the same through a captured tile graph.
+
+    One tile's encoding is captured, as a rank captures it at startup, and an
+    execution context binds its replay as the tiled encoder's tile operator:
+    the encoding through it equals the eager one bit for bit.
+    """
+    encoder, _ = video_encoders
+    spatial, static = encoder.still_tile(torch.device("cuda"))
+    pixels = _frames(1, height, width, seed=height + width)
+    with torch.inference_mode():
+        (eager,) = encoder.encode(
+            (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+        )
+        output = torch.empty_like(spatial(static))
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output.copy_(spatial(static))
+
+        def replay(tile):
+            if tile.shape != static.shape:
+                return spatial(tile)
+            static.copy_(tile)
+            graph.replay()
+            return output.clone()
+
+        context = ExecutionContext(encoder, tiles={spatial: replay})
+        with context.activate():
+            (replayed,) = encoder.encode(
+                (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+            )
+        context.close()
+    assert torch.equal(replayed.tensor, eager.tensor)
+
+
 def _track(num_samples: int, channels: int, seed: int):
     """Return ``[samples, channels]`` float32 PCM on the GPU.
 

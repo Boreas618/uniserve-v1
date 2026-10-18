@@ -58,6 +58,7 @@ impl From<&StorageView> for Argument {
 /// possibly on another thread (a microbatch's forward, the Python thread's
 /// own work). A view crosses as its torch tensor
 /// ([`StorageView::handle`]), wrapped by the first call that passes it.
+#[derive(Clone)]
 pub(crate) struct MethodCall {
     function: Function,
     arguments: Vec<Argument>,
