@@ -6,7 +6,9 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use uniserve_ipc::{BatchCommand, BufferId, RequestKey};
+use uniserve_ipc::{
+    BatchCommand, BufferId, CallKind, CallStatus, ForwardMode, RequestKey, TransferMode,
+};
 
 use super::WorkerExecutor;
 use crate::executor::WorkerResult;
@@ -87,9 +89,21 @@ impl WorkerExecutor {
                     .get(&identity)
                     .context("worker returned an unknown call")?;
                 anyhow::ensure!(seen.insert(identity), "worker returned a duplicate call");
+                // A completion's payload must fit the kind of the call it
+                // answers: only a successful cache-export call exports cache
+                // state, and only a successful token-denoising call reports
+                // candidate log-probabilities.
+                let output = &completion.output;
+                let successful = output.status == CallStatus::Ok;
                 anyhow::ensure!(
-                    completion.output.code == *kind,
-                    "worker returned a computation code that disagrees with its call"
+                    output.cache_output.is_none()
+                        || (successful && *kind == CallKind::Transfer(TransferMode::CacheExport)),
+                    "worker returned a cache export for a call that does not export one"
+                );
+                anyhow::ensure!(
+                    output.candidate_logprobs.is_empty()
+                        || (successful && *kind == CallKind::Forward(ForwardMode::TokenDenoising)),
+                    "worker returned candidate log-probabilities for a call that reads none"
                 );
             }
             anyhow::ensure!(

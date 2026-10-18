@@ -2,7 +2,7 @@
 
 use uniserve_core::{CallId, MediaSource};
 use uniserve_ipc::{
-    ArtifactHandle, BatchOutput, Call, CallKind, CallStatus, ErrorCode, MediaOutput, RequestKey,
+    ArtifactHandle, BatchOutput, Call, CallStatus, ErrorCode, MediaOutput, RequestKey,
     RequestOutput, TensorExport, TensorRef, TimingCounters,
 };
 
@@ -62,12 +62,8 @@ impl PendingOutput {
             cache_computed_len: u64::from(coordinates.cache_computed_len),
             ..previous
         };
-        let mut output = request_output(call.request_key, call.call_id, call.code, progress)?;
+        let output = request_output(call.request_key, call.call_id, progress)?;
         let tensor_outputs: Vec<_> = call.tensor_outputs().cloned().collect();
-        output.product_generations = tensor_outputs
-            .iter()
-            .map(|output| output.generation)
-            .collect();
 
         Ok(Self {
             output,
@@ -237,7 +233,6 @@ impl PendingOutput {
         if self.output.status != CallStatus::Ok {
             self.progress = parent;
             self.output.committed_tokens.clear();
-            self.output.product_generations.clear();
             self.output.finish_flags = Default::default();
             self.output.cache_output = None;
         }
@@ -394,18 +389,14 @@ impl PendingOutput {
 pub(crate) fn request_output(
     key: RequestKey,
     id: CallId,
-    code: CallKind,
     progress: RequestProgress,
 ) -> Result<RequestOutput> {
     let mut output = RequestOutput {
         request_key: key,
         call_id: id,
-        code,
         status: CallStatus::Ok,
-        product_generations: Vec::new(),
         error_code: None,
         timing_counters: Default::default(),
-        position: 0,
         cache_visible_len: 0,
         cache_computed_len: 0,
         num_completed_steps: 0,
@@ -426,7 +417,6 @@ fn set_progress(output: &mut RequestOutput, progress: RequestProgress) -> Result
     let narrow = |value| {
         u32::try_from(value).map_err(|_| Error::State("request coordinate exceeds its wire range"))
     };
-    output.position = narrow(progress.logical_position)?;
     output.cache_visible_len = narrow(progress.cache_visible_len)?;
     output.cache_computed_len = narrow(progress.cache_computed_len)?;
     output.num_completed_steps = narrow(progress.flow_step)?;
@@ -777,7 +767,7 @@ mod tests {
         assert_eq!(output.output.committed_tokens, [11, 12, 99]);
         // Each committed token advances the position, the draws and the
         // visible cache; the initialized extent is the forward's.
-        assert_eq!(output.output.position as u64, POSITION + 3);
+        assert_eq!(output.progress.logical_position, POSITION + 3);
         assert_eq!(output.progress.rng_counter, DRAWS + 3);
         assert_eq!(output.output.cache_visible_len as u64, VISIBLE + 3);
         assert_eq!(output.output.cache_computed_len as u64, INITIALIZED);
@@ -796,7 +786,7 @@ mod tests {
         // even the sampler's token.
         let output = verify(Some(2), INITIALIZED, 12, 2)?;
         assert_eq!(output.output.committed_tokens, [11, 12]);
-        assert_eq!(output.output.position as u64, POSITION + 2);
+        assert_eq!(output.progress.logical_position, POSITION + 2);
         assert_eq!(output.output.cache_visible_len as u64, VISIBLE + 2);
 
         // A rejection before the terminal draft commits its correction.

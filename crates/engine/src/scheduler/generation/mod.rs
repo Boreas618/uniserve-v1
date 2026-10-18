@@ -1047,10 +1047,7 @@ pub(crate) fn validate_generation_result(
         });
     }
     if record.status == CallStatus::Predicated {
-        if call.predicate.as_ref().is_none()
-            || !record.committed_tokens.as_slice().is_empty()
-            || !record.product_generations.is_empty()
-        {
+        if call.predicate.as_ref().is_none() || !record.committed_tokens.as_slice().is_empty() {
             return Err(GenerationResultError::Status {
                 detail: "invalid_predicated_result",
             });
@@ -1075,19 +1072,6 @@ pub(crate) fn validate_generation_result(
                 detail: "denoise_step_mismatch",
             });
         }
-    }
-
-    // The worker reports one generation per tensor output, in
-    // `Call::tensor_outputs` order.
-    if !record
-        .product_generations
-        .iter()
-        .copied()
-        .eq(call.tensor_outputs().map(|tensor| tensor.generation))
-    {
-        return Err(GenerationResultError::Product {
-            detail: "tensor_generation_mismatch",
-        });
     }
 
     // A readout reports one finite log-probability per declared candidate,
@@ -1415,8 +1399,6 @@ pub(crate) enum GenerationResultError {
     Identity { detail: &'static str },
     #[error("worker progress invalid: {detail}")]
     Progress { detail: &'static str },
-    #[error("worker product invalid: {detail}")]
-    Product { detail: &'static str },
     #[error("worker token result invalid: {detail}")]
     Token { detail: &'static str },
     #[error("worker logprob result invalid: {detail}")]
