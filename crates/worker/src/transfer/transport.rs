@@ -760,8 +760,6 @@ mod tests {
     fn locator(shape: Vec<u64>, offset: Vec<u64>) -> Locator {
         Locator {
             source: WorkerEndpoint {
-                worker_id: "w".into(),
-                rank: 0,
                 node: "n".into(),
                 address_space: "a".into(),
                 incarnation: "i".into(),

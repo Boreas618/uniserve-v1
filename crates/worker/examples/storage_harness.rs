@@ -85,8 +85,6 @@ fn tables(slot: u32, groups: &[Vec<UnitId>], tokens: u32, plan: &CachePlan) -> V
 
 fn endpoint() -> WorkerEndpoint {
     WorkerEndpoint {
-        worker_id: "harness".into(),
-        rank: 0,
         node: "node".into(),
         address_space: "harness".into(),
         incarnation: "harness".into(),

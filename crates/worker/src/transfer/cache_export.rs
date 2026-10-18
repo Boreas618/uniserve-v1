@@ -565,8 +565,6 @@ mod tests {
             EventPool::new(),
             &TransportOptions {
                 source: WorkerEndpoint {
-                    worker_id: "worker".into(),
-                    rank: 0,
                     node: "node".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),

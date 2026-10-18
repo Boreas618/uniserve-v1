@@ -200,7 +200,7 @@ pub(super) fn plan(
         "loaded numerics"
     );
     let report = Report {
-        endpoint: endpoint(&launch.worker_id, config.rank)?,
+        endpoint: endpoint()?,
         device_exports: exports_device_products(launch),
         fabric_handles,
         supported_calls: supported,

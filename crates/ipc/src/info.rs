@@ -238,12 +238,12 @@ impl OutputInfo {
 
 /// A loaded rank incarnation in an explicitly identified host address space.
 /// Backend addresses and storage generations are carried by each export.
+///
+/// The endpoint names the incarnation alone: the engine launched the
+/// process as one worker's rank and resolves an incarnation to that worker
+/// and rank itself, so a rank does not report them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
-    /// Logical instance selected by the engine.
-    pub worker_id: String,
-    /// Member coordinate within that instance.
-    pub rank: u32,
     /// Host identity, independent of process-local device ordinals.
     pub node: String,
     /// Process lifetime identity; multiple Workers may share it.
@@ -256,10 +256,7 @@ impl WorkerEndpoint {
     /// Checks identities before accepting startup metadata or an export.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            !self.worker_id.is_empty()
-                && !self.node.is_empty()
-                && !self.address_space.is_empty()
-                && !self.incarnation.is_empty(),
+            !self.node.is_empty() && !self.address_space.is_empty() && !self.incarnation.is_empty(),
             "worker endpoint identity is incomplete"
         );
         Ok(())
@@ -573,8 +570,6 @@ impl Default for WorkerInfo {
             image_unconditional_token_ids: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
-                worker_id: "worker".into(),
-                rank: 0,
                 node: "simulation".into(),
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),

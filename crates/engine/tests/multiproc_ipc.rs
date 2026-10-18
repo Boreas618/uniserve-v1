@@ -110,7 +110,7 @@ impl RawHead {
         let mut child = std::process::Command::new(worker_python())
             .args(["-m", "uniserve.worker"])
             .args(["--head", &listener.addresses()[0]])
-            .args(["--worker-id", &descriptor.worker_id])
+            .args(["--worker-id", STUB_WORKER])
             .args(["--rank", &descriptor.rank.to_string()])
             .args(["--generation", "1"])
             .stderr(log)
@@ -138,7 +138,7 @@ impl RawHead {
             anyhow::ensure!(
                 registration
                     == uniserve_ipc::Registration::Rank {
-                        worker_id: descriptor.worker_id.clone(),
+                        worker_id: STUB_WORKER.into(),
                         rank: descriptor.rank,
                         generation: 1,
                         version: uniserve_ipc::VERSION.into(),
@@ -590,7 +590,6 @@ fn a_rank_without_its_head_closes_when_idle_and_ends_at_once_when_stuck() -> any
 fn a_rank_group_reports_its_capacities_and_refuses_work_after_close() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info().clone();
-    assert_eq!(info.endpoint.rank, 0);
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
     assert!(info.prefix_cache.is_some());
@@ -697,7 +696,7 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
     let loss = loss
         .downcast_ref::<WorkerFailure>()
         .context("expected scoped WorkerGroup loss")?;
-    assert_eq!(loss.worker_id.0, initial_endpoint.worker_id);
+    assert_eq!(loss.worker_id.0, WorkerProcessArgs::default().worker_id);
     assert_eq!(loss.endpoints.len(), WORLD_SIZE);
     assert!(loss.endpoints.contains(&initial_endpoint));
     let requests = loss
@@ -722,10 +721,6 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
         lifecycle_batch(4, vec![text_admission(23, 1, 1)?], Vec::new()),
     )?;
     assert_eq!(recovered.batch_id, 4);
-    assert_eq!(
-        executor.info().endpoint.worker_id,
-        initial_endpoint.worker_id
-    );
     assert_ne!(
         executor.info().endpoint.incarnation,
         initial_endpoint.incarnation
@@ -2033,12 +2028,15 @@ fn rank_group_args(max_message_bytes: usize) -> WorkerProcessArgs {
 
 /// Builds the launch descriptor for a weightless CPU worker used by IPC tests.
 ///
+/// The worker id a directly driven stub rank registers with: its argv
+/// states it, as a launch's does.
+const STUB_WORKER: &str = "worker";
+
 /// Production launches receive the same typed descriptor from the engine;
 /// these tests state one directly because they drive the worker process
 /// without a group.
 fn stub_launch_descriptor() -> LaunchDescriptor {
     LaunchDescriptor {
-        worker_id: "worker".into(),
         acknowledgment_slot: 0,
         host_slots: vec![0],
         products_cross_hosts: false,
@@ -3002,13 +3000,15 @@ fn a_cache_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
         .context("cache export has no physical locations")?;
     assert_eq!(export.source, buffer);
     assert_eq!(export.exported_extent, 2);
+    // Every rank of the group contributes a location from its own
+    // incarnation.
     for tensor in export.tensors() {
-        let ranks = tensor
+        let sources = tensor
             .locations
             .iter()
-            .map(|location| location.source.rank)
+            .map(|location| &location.source.incarnation)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ranks, (0..WORLD_SIZE as u32).collect());
+        assert_eq!(sources.len(), WORLD_SIZE);
     }
     // A repeated batch id is refused.
     assert!(execute(&mut executor, publish).is_err());
@@ -3023,10 +3023,11 @@ fn a_cache_export_names_a_location_on_every_rank() -> anyhow::Result<()> {
 #[test]
 fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result<()> {
     let mut args = rank_group_args(8 << 20);
-    // `publisher` is the worker id `SlowShmExport` names as the source of its
-    // segment.
-    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?;
+    // The segment stands in for a product that rank 0 of this worker
+    // published over shared storage.
+    args.transfer = uniserve_engine::TransferConfig::parse("worker->worker=posix_shm")?;
     let mut executor = WorkerGroup::spawn(args)?;
+    let publisher = executor.info().endpoint.clone();
 
     let slow_admission = text_admission(31, 1, 1)?;
     let mut slow = token_batch(
@@ -3050,11 +3051,11 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
     };
     // The slow call's predicate is the external segment, which stays pending
     // until `SlowShmExport::publish` runs.
-    let export = SlowShmExport::start(executor.info().endpoint.node.clone())?;
+    let export = SlowShmExport::start()?;
     slow.calls[0].predicate = Some(predicate.clone());
     slow.input_products.push(uniserve_ipc::TensorExport {
         product: predicate,
-        value: export.descriptor()?,
+        value: export.descriptor(&publisher)?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
@@ -3138,7 +3139,7 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
         .collect();
     batch.input_products.push(uniserve_ipc::TensorExport {
         product: input,
-        value: export.descriptor()?,
+        value: export.descriptor(&publisher)?,
     });
     executor.submit_placed(batch)?;
     let transferred = executor
@@ -4493,7 +4494,6 @@ fn media_rank() -> anyhow::Result<()> {
     let case = std::env::var(MEDIA_RANK_CASE)?;
     let mut info: uniserve_ipc::WorkerInfo =
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_RANK_INFO)?)?)?;
-    info.endpoint.rank = descriptor.rank;
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
 
@@ -4582,8 +4582,11 @@ fn media_rank() -> anyhow::Result<()> {
 #[test]
 fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
     let mut args = rank_group_args(8 << 20);
-    args.transfer = uniserve_engine::TransferConfig::parse("publisher->worker=posix_shm")?;
+    // The segment stands in for a product that rank 0 of this worker
+    // published over shared storage.
+    args.transfer = uniserve_engine::TransferConfig::parse("worker->worker=posix_shm")?;
     let mut executor = WorkerGroup::spawn(args)?;
+    let publisher = executor.info().endpoint.clone();
 
     let admission = text_admission(34, 1, 1)?;
     let mut gated = token_batch(
@@ -4605,11 +4608,11 @@ fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
         dtype: DType::U8,
         shape_bound: ShapeBound::default(),
     };
-    let export = SlowShmExport::start(executor.info().endpoint.node.clone())?;
+    let export = SlowShmExport::start()?;
     gated.calls[0].predicate = Some(predicate.clone());
     gated.input_products.push(uniserve_ipc::TensorExport {
         product: predicate,
-        value: export.descriptor()?,
+        value: export.descriptor(&publisher)?,
     });
     executor.submit_placed(gated)?;
     export.fail()?;
@@ -4863,7 +4866,6 @@ fn product_transfer(
 struct SlowShmExport {
     name: std::ffi::CString,
     endpoint: String,
-    node: String,
     file: std::fs::File,
     published: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4876,7 +4878,7 @@ const SEGMENT_READY: u32 = 1;
 const SEGMENT_FAILED: u32 = 2;
 
 impl SlowShmExport {
-    fn start(node: String) -> anyhow::Result<Self> {
+    fn start() -> anyhow::Result<Self> {
         use std::os::fd::FromRawFd as _;
 
         let nonce = std::time::SystemTime::now()
@@ -4899,7 +4901,6 @@ impl SlowShmExport {
         let export = Self {
             name,
             endpoint,
-            node,
             // SAFETY: this File takes sole ownership of the descriptor.
             file: unsafe { std::fs::File::from_raw_fd(descriptor) },
             published: Default::default(),
@@ -4932,7 +4933,12 @@ impl SlowShmExport {
         Ok(())
     }
 
-    fn descriptor(&self) -> anyhow::Result<uniserve_ipc::TransferHandle> {
+    /// Describes the segment as a product published by `source`, a rank the
+    /// engine launched.
+    fn descriptor(
+        &self,
+        source: &uniserve_ipc::WorkerEndpoint,
+    ) -> anyhow::Result<uniserve_ipc::TransferHandle> {
         use uniserve_ipc::{Locator, TensorTransfer, TransferHandle, TransferTransport};
 
         Ok(TransferHandle::DeviceProduct {
@@ -4942,13 +4948,7 @@ impl SlowShmExport {
             tensor: TensorTransfer {
                 shape: vec![1],
                 locations: vec![Locator {
-                    source: uniserve_ipc::WorkerEndpoint {
-                        worker_id: "publisher".into(),
-                        rank: 0,
-                        node: self.node.clone(),
-                        address_space: format!("rust:{}", std::process::id()),
-                        incarnation: self.endpoint.clone(),
-                    },
+                    source: source.clone(),
                     transport: TransferTransport::PosixShm {
                         endpoint: self.endpoint.clone(),
                         name: self.name.to_str()?.to_owned(),

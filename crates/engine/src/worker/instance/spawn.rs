@@ -15,7 +15,7 @@ use super::routing::refuse_shared_storage_off_head;
 use super::{FailureDomain, WorkerGroup};
 use crate::worker::WorkerProcessArgs;
 use crate::worker::registry::Registry;
-use crate::worker::{PendingRank, RankProcess};
+use crate::worker::{IncarnationRegistry, PendingRank, RankProcess};
 
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (Vec<RankProcess>, Option<crate::worker::launcher::Launchers>);
@@ -371,14 +371,14 @@ impl WorkerGroup {
 
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
-    /// Every rank must report valid info naming its launched rank and the
-    /// group's worker identity. The group takes rank 0's report: the
-    /// ranks derive every shared capacity (page size, request slots, cache
-    /// units) collectively before they report, so the reports differ only in
-    /// the fields reconciled here. The muxer must run on the head's host, and
-    /// the ranks' cache regions must cover every layer's KV heads without a
-    /// gap. Once all checks pass, no rank's startup may be cancelled and every
-    /// rank this process started must still be running.
+    /// Every rank must report valid info; the group registers each rank's
+    /// incarnation as the rank it launched. The group takes rank 0's report:
+    /// the ranks derive every shared capacity (page size, request slots,
+    /// cache units) collectively before they report, so the reports differ
+    /// only in the fields reconciled here. The muxer must run on the head's
+    /// host, and the ranks' cache regions must cover every layer's KV heads
+    /// without a gap. Once all checks pass, no rank's startup may be
+    /// cancelled and every rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
@@ -458,15 +458,6 @@ impl WorkerGroup {
             rank_info
                 .validate()
                 .with_context(|| format!("physical rank {rank} reported invalid worker info"))?;
-            anyhow::ensure!(
-                rank_info.endpoint.rank == rank as u32,
-                "physical rank {rank} reported rank {}",
-                rank_info.endpoint.rank,
-            );
-            anyhow::ensure!(
-                rank_info.endpoint.worker_id == process_args.worker_id,
-                "physical rank {rank} reported another WorkerGroup identity"
-            );
         }
 
         refuse_shared_storage_off_head(
@@ -547,6 +538,12 @@ impl WorkerGroup {
         // The group admits the batches it launched its ranks to hold.
         let depth = process_args.queue_depth.max(1);
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
+        // Each process serves the rank the group launched it as.
+        let incarnations = IncarnationRegistry::default();
+        incarnations.assign(
+            &crate::WorkerId(process_args.worker_id.clone()),
+            workers.iter().map(|worker| &worker.info().endpoint),
+        );
         Ok(Self {
             launchers,
             registry,
@@ -557,6 +554,7 @@ impl WorkerGroup {
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
             media_routing: info.media_components.clone(),
+            incarnations,
             info,
             process_args,
             resident_requests: HashSet::new(),

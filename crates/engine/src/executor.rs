@@ -1037,7 +1037,10 @@ impl TransferConfig {
     /// `destination`: a location survives when the first edge matching its
     /// source and `destination` carries the mechanism it was published on, or,
     /// with no matching edge, when it is a local location on `destination`
-    /// itself. `WorkerGroup` calls this for each rank's projected batch.
+    /// itself. An endpoint's worker and rank are the ones `incarnations`
+    /// holds for its incarnation; a location whose source is not a live
+    /// incarnation matches no edge. `WorkerGroup` calls this for each rank's
+    /// projected batch.
     ///
     /// # Errors
     ///
@@ -1048,16 +1051,18 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         products: &mut [uniserve_ipc::TensorExport],
         cache_inputs: &mut [uniserve_ipc::CacheTransfer],
         destination: &uniserve_ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
+        let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
         for payload in products.iter_mut() {
             let buffer = payload.product.buffer_id();
             let mut bound = true;
             for tensor in payload.value.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(buffer);
@@ -1066,7 +1071,7 @@ impl TransferConfig {
         for export in cache_inputs.iter_mut() {
             let mut bound = true;
             for tensor in export.tensors_mut() {
-                bound &= self.bind_locations(tensor, destination);
+                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
             }
             if !bound {
                 unroutable.push(export.source);
@@ -1076,7 +1081,10 @@ impl TransferConfig {
             return Ok(());
         }
         Err(UnroutableInputs {
-            destination: format!("{}:{}", destination.worker_id, destination.rank),
+            destination: position.map_or_else(
+                || destination.incarnation.clone(),
+                |(worker, rank)| format!("{}:{rank}", worker.0),
+            ),
             buffers: unroutable,
         })
     }
@@ -1085,8 +1093,10 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
+        incarnations: &crate::worker::IncarnationRegistry,
         tensor: &mut uniserve_ipc::TensorTransfer,
         destination: &uniserve_ipc::WorkerEndpoint,
+        destination_position: Option<&(WorkerId, u32)>,
     ) -> bool {
         use uniserve_ipc::TransferTransport;
 
@@ -1100,17 +1110,23 @@ impl TransferConfig {
                 TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
                 TransferTransport::Channel { .. } => TransferBackend::Channel,
             };
+            let source = incarnations.position(&location.source);
             self.edges
                 .iter()
                 .find(|edge| {
-                    edge.source_worker.0 == location.source.worker_id
+                    let (Some((source_worker, source_rank)), Some((worker, rank))) =
+                        (&source, destination_position)
+                    else {
+                        return false;
+                    };
+                    edge.source_worker == *source_worker
                         && edge
                             .source_rank
-                            .is_none_or(|rank| rank == location.source.rank)
-                        && edge.destination_worker.0 == destination.worker_id
+                            .is_none_or(|expected| expected == *source_rank)
+                        && edge.destination_worker == *worker
                         && edge
                             .destination_rank
-                            .is_none_or(|rank| rank == destination.rank)
+                            .is_none_or(|expected| expected == *rank)
                 })
                 .map_or_else(
                     || &location.source == destination && published == TransferBackend::Local,
@@ -1368,7 +1384,6 @@ mod tests {
         request_slots: u32,
     ) -> (WorkerId, WorkerInfo) {
         let mut info = media_info(routes, steps);
-        info.endpoint.worker_id = id.to_owned();
         info.request_slots = request_slots;
         info.components = routes
             .iter()
@@ -1647,8 +1662,6 @@ mod tests {
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
         let endpoint = |worker: &str| Endpoint {
-            worker_id: worker.to_owned(),
-            rank: 0,
             node: "host".to_owned(),
             address_space: format!("{worker}-process"),
             incarnation: format!("{worker}-incarnation"),
@@ -1695,11 +1708,105 @@ mod tests {
             },
         }];
 
+        let incarnations = crate::worker::IncarnationRegistry::default();
+        let decoder = endpoint("decoder");
+        incarnations.assign(&WorkerId("denoiser".to_owned()), [&producer]);
+        incarnations.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
         let refusal = transfer
-            .bind_inputs(&mut products, &mut [], &endpoint("decoder"))
+            .bind_inputs(&incarnations, &mut products, &mut [], &decoder)
             .unwrap_err();
         assert_eq!(refusal.buffers, vec![product.buffer_id()]);
         assert_eq!(refusal.destination, "decoder:0");
+    }
+
+    /// A publication binds to the edge of the worker and rank its source
+    /// incarnation serves; once a group replaces its ranks, the replaced
+    /// incarnation's publication binds to nothing and the replacement takes
+    /// the same edge.
+    #[test]
+    fn a_replaced_rank_incarnation_no_longer_binds_to_its_edge() {
+        use uniserve_ipc::{
+            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
+            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+        };
+
+        // Rank 1 of the denoiser sends to the decoder over shared storage,
+        // and no other rank of the denoiser has an edge.
+        let transfer = TransferConfig::parse("denoiser:1->decoder=posix_shm").unwrap();
+        let endpoint = |incarnation: &str| Endpoint {
+            node: "host".to_owned(),
+            address_space: format!("{incarnation}-process"),
+            incarnation: incarnation.to_owned(),
+        };
+        let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
+        let decoder = endpoint("decoder-0");
+        let incarnations = crate::worker::IncarnationRegistry::default();
+        incarnations.assign(&WorkerId("denoiser".to_owned()), &denoiser);
+        incarnations.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+
+        let product = TensorRef {
+            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+            dtype: DType::F32,
+            shape_bound: ShapeBound {
+                dims: vec![DimBound::Static(1)],
+            },
+        };
+        let published_by = |source: &Endpoint| TensorExport {
+            product: product.clone(),
+            value: TransferHandle::DeviceProduct {
+                height: 0,
+                width: 0,
+                value_range: String::new(),
+                tensor: TensorTransfer {
+                    shape: vec![1],
+                    locations: vec![Locator {
+                        source: source.clone(),
+                        transport: TransferTransport::PosixShm {
+                            endpoint: source.incarnation.clone(),
+                            name: "segment".to_owned(),
+                        },
+                        nbytes: 4,
+                        dtype: "float32".to_owned(),
+                        shape: vec![1],
+                        offset: vec![0],
+                        device: "cpu".to_owned(),
+                    }],
+                },
+            },
+        };
+
+        let mut live = vec![published_by(&denoiser[1])];
+        transfer
+            .bind_inputs(&incarnations, &mut live, &mut [], &decoder)
+            .unwrap();
+
+        // Rank 0 holds no edge to the decoder.
+        let mut unbound = vec![published_by(&denoiser[0])];
+        assert!(
+            transfer
+                .bind_inputs(&incarnations, &mut unbound, &mut [], &decoder)
+                .is_err()
+        );
+
+        // The denoiser replaces both of its ranks. The old rank 1 incarnation
+        // is retired, and its replacement takes the same edge.
+        let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
+        incarnations.assign(&WorkerId("denoiser".to_owned()), &replacement);
+
+        let mut retired = vec![published_by(&denoiser[1])];
+        assert!(
+            transfer
+                .bind_inputs(&incarnations, &mut retired, &mut [], &decoder)
+                .is_err()
+        );
+        let mut replaced = vec![published_by(&replacement[1])];
+        transfer
+            .bind_inputs(&incarnations, &mut replaced, &mut [], &decoder)
+            .unwrap();
     }
 
     #[test]
