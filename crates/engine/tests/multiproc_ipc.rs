@@ -596,7 +596,6 @@ fn a_rank_group_reports_its_launch_and_refuses_work_after_close() -> anyhow::Res
     assert_eq!(info.max_batch_calls, 256);
     assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(info.queue_depth as usize, QUEUE_DEPTH);
-    assert_eq!(info.model_dtype, "bfloat16");
     assert!(info.prefix_cache.is_some());
 
     // Admit two requests, then finish one while admitting a third into the
@@ -941,17 +940,16 @@ fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
 }
 
 #[test]
-fn replacement_rejects_changed_numerical_policy_and_capacity() -> anyhow::Result<()> {
+fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     // Killing rank zero relaunches the group. Once replacement.json exists
     // the wrapper starts each relaunched rank as a `media_rank` process,
     // which answers Info with that file's worker info, so the replacement
-    // describes a different numerical policy or capacity; the head must
-    // refuse it and stop using the group.
+    // describes a different capacity; the head must refuse it and stop
+    // using the group.
     type Change = fn(&mut uniserve_ipc::WorkerInfo);
-    let changes: [(&str, Change); 3] = [
-        ("model dtype", |info| info.model_dtype = "float32".into()),
+    let changes: [(&str, Change); 2] = [
         ("batch tokens", |info| info.max_batch_tokens = 128),
         ("cache capacity", |info| {
             if let Some(prefix_cache) = info.prefix_cache.as_mut() {

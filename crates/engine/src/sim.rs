@@ -721,7 +721,6 @@ impl SimEngine {
             // One batch in flight (`queue_depth` 1) of up to
             // `max_batch_calls` calls, each holding one transfer entry.
             transfer_tickets: 1024,
-            model_name: "sim".to_owned(),
             ..WorkerInfo::default()
         };
         Self {

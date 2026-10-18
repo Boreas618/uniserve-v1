@@ -131,7 +131,6 @@ impl LatentPlan {
 
 /// Model-independent values of the report.
 pub(crate) struct Report {
-    pub model_name: String,
     pub endpoint: WorkerEndpoint,
     pub device: String,
     pub transfer_backends: Vec<String>,
@@ -139,12 +138,9 @@ pub(crate) struct Report {
     /// export pool on its primary device.
     pub device_exports: bool,
     pub fabric_handles: bool,
-    pub attention_backend: String,
     pub supported_calls: Vec<CallKind>,
     pub media_components: BTreeMap<MediaCall, String>,
     pub components: Vec<ComponentInfo>,
-    pub weight_formats: Vec<String>,
-    pub activation_formats: Vec<String>,
 }
 
 /// Media-timeline facts of a video model.
@@ -223,7 +219,6 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
 
 fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Result<WorkerInfo> {
     Ok(WorkerInfo {
-        model_name: report.model_name,
         media_components: report.media_components,
         num_inference_steps: 0,
         video_denoiser: None,
@@ -232,10 +227,6 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         transfer_backends: report.transfer_backends,
         fabric_handles: report.fabric_handles,
         world_size: narrow(config.world_size, "world size")?,
-        model_dtype: config.model_dtype.clone(),
-        attention_backend: report.attention_backend,
-        weight_formats: report.weight_formats,
-        activation_formats: report.activation_formats,
         components: report.components,
         supported_calls: report.supported_calls,
         queue_depth: narrow(queue_depth, "queue depth")?,
@@ -570,7 +561,6 @@ pub(crate) mod tests {
 
     fn report() -> Report {
         Report {
-            model_name: "model".into(),
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),
                 rank: 0,
@@ -582,12 +572,9 @@ pub(crate) mod tests {
             transfer_backends: vec!["local".into()],
             device_exports: false,
             fabric_handles: false,
-            attention_backend: "auto".into(),
             supported_calls: vec![CallKind::Forward(uniserve_ipc::ForwardMode::Prefill)],
             media_components: BTreeMap::new(),
             components: Vec::new(),
-            weight_formats: vec!["dense".into()],
-            activation_formats: vec!["dense".into()],
         }
     }
 

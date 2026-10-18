@@ -188,19 +188,24 @@ pub(super) fn plan(
         Device::Cuda(cuda) => HandleType::probe(cuda)? == HandleType::Fabric,
         Device::Cpu => false,
     };
+    // The rank owns its numerics: no other process decides anything from
+    // them, so they are stated once, here, rather than in its report.
+    tracing::info!(
+        dtype = %config.model_dtype,
+        attention = %model.attention_backend,
+        weights = ?model.weight_formats()?,
+        activations = ?model.activation_formats()?,
+        "loaded numerics"
+    );
     let report = Report {
-        model_name: model.model_name.clone(),
         endpoint: endpoint(&launch.worker_id, config.rank)?,
         device: config.device.to_string(),
         transfer_backends: launch.data_plane.backends.clone(),
         device_exports: exports_device_products(launch),
         fabric_handles,
-        attention_backend: model.attention_backend.clone(),
         supported_calls: supported,
         media_components,
         components: infos,
-        weight_formats: model.weight_formats()?,
-        activation_formats: model.activation_formats()?,
     };
     if let (Some(video), Some(capacity)) = (video, capacity) {
         let plan = video_layout(
