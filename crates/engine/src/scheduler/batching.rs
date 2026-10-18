@@ -71,7 +71,7 @@ impl Scheduler {
     /// costs its input tokens plus one, and every other call its `max_tokens`
     /// bound.
     fn computation_token_cost(&self, call: &Call) -> usize {
-        match call.code {
+        match call.kind {
             CallKind::Media(MediaCall::Denoising) => {
                 let Some(state) = self.running.get(&call.request_key.request_id) else {
                     return 0;
@@ -102,7 +102,7 @@ impl Scheduler {
     /// capacity.
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
-        if call.code == CallKind::Media(MediaCall::Denoising) && !self.ensure_guidance_prefix(id) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) && !self.ensure_guidance_prefix(id) {
             return None;
         }
         let uses_transfer = call.bounds.max_transfer_bytes > 0;
@@ -114,7 +114,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.code)?;
+            .worker_target(self.executor.as_ref(), &self.info, request_key, call.kind)?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
@@ -140,7 +140,7 @@ impl Scheduler {
         // across the trajectory's calls; a failed grow leaves the existing
         // pages allocated.
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(MediaCall::LatentPreparation) | CallKind::Media(MediaCall::Denoising)
         ) && self.worker_tracks_image_latent()
         {
@@ -196,8 +196,8 @@ impl Scheduler {
         // component a call binds to follows from its computation, so the two
         // together name one group. Computations keep the order in which their
         // first call was selected.
-        let mut code_order: Vec<CallKind> = Vec::new();
-        let mut code_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
+        let mut kind_order: Vec<CallKind> = Vec::new();
+        let mut kind_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -260,7 +260,7 @@ impl Scheduler {
                 // A context prefill plans within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
-                let prefill = call.code == CallKind::Forward(ForwardMode::Prefill);
+                let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
                 if prefill && generation::prefill_rows(&call) > rows_left.context {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.num_cache_units_sent = state
@@ -274,7 +274,7 @@ impl Scheduler {
                 // prepares the image, so it waits here, as a media call
                 // does, until those host lanes have room.
                 let image_lane =
-                    match call.code {
+                    match call.kind {
                         CallKind::Media(media_call) if call.input_image.is_some() => {
                             let Some(request_key) = self.running.get(&id).map(|state| {
                                 RequestKey::new(self.engine_id, id, state.request_epoch)
@@ -284,7 +284,7 @@ impl Scheduler {
                             let demand = self.image_lane_demand(request_key, media_call);
                             let ledger = image_lanes.get_or_insert_with(|| self.lane_occupancy());
                             if !ledger.admits(&demand, id, self) {
-                                self.record_domain_backpressure(call.code);
+                                self.record_domain_backpressure(call.kind);
                                 if let Some(state) = self.running.get_mut(&id) {
                                     state.num_cache_units_sent = state
                                         .num_cache_units_sent
@@ -304,7 +304,7 @@ impl Scheduler {
                 // row must not spend the pass before the request that holds
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
-                    self.record_domain_backpressure(call.code);
+                    self.record_domain_backpressure(call.kind);
                     // Planning a forward advanced `num_cache_units_sent` past its
                     // fresh units; roll it back so the next plan declares them.
                     if let Some(state) = self.running.get_mut(&id) {
@@ -336,9 +336,9 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let code = call.code;
-                let batch = code_batches.entry(code).or_insert_with(|| {
-                    code_order.push(code);
+                let kind = call.kind;
+                let batch = kind_batches.entry(kind).or_insert_with(|| {
+                    kind_order.push(kind);
                     ExecutionBatch::new(
                         self.inflight.next_batch_id(),
                         Vec::new(),
@@ -419,12 +419,12 @@ impl Scheduler {
                 selected += 1;
             }
         }
-        code_order.retain(|code| {
-            code_batches
-                .get(code)
+        kind_order.retain(|kind| {
+            kind_batches
+                .get(kind)
                 .is_some_and(|batch| !batch.requests.is_empty())
         });
-        let Some(&last) = code_order.last() else {
+        let Some(&last) = kind_order.last() else {
             return Vec::new();
         };
 
@@ -436,13 +436,13 @@ impl Scheduler {
         // submissions, not round trips, so a command-only batch costs the
         // round a queue slot and halves how many rounds a depth-two rank can
         // hold in flight.
-        let prompt_only = code_order
+        let prompt_only = kind_order
             .iter()
-            .all(|code| batch_kind(*code) == BatchKind::Prefill);
+            .all(|kind| batch_kind(*kind) == BatchKind::Prefill);
         let commands = if prompt_only {
-            let requests = code_order
+            let requests = kind_order
                 .iter()
-                .flat_map(|code| code_batches[code].requests.iter())
+                .flat_map(|kind| kind_batches[kind].requests.iter())
                 .map(|(call, _)| call.request_key.request_id)
                 .collect::<HashSet<_>>();
             self.take_commands(|command| {
@@ -452,13 +452,13 @@ impl Scheduler {
         } else {
             self.take_commands(|_| true)
         };
-        let mut batches = Vec::with_capacity(code_order.len());
-        for code in code_order {
-            let Some(mut batch) = code_batches.remove(&code) else {
+        let mut batches = Vec::with_capacity(kind_order.len());
+        for kind in kind_order {
+            let Some(mut batch) = kind_batches.remove(&kind) else {
                 self.invariant_broken("every selected call kind has its batch");
                 return Vec::new();
             };
-            if code == last {
+            if kind == last {
                 batch.commands.extend(commands.iter().cloned());
             }
             batches.push(self.finish_generation_batch(batch, submit_at));

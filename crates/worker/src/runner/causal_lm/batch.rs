@@ -183,11 +183,11 @@ impl Opening {
         {
             return Err(Error::Invalid("a token batch serves one component".into()));
         }
-        let group = runtime.route(&first.component, first.code).ok_or_else(|| {
+        let group = runtime.route(&first.component, first.kind).ok_or_else(|| {
             Error::Unsupported(format!(
                 "component {:?} has no text binding for {}",
                 first.component,
-                first.code.as_str()
+                first.kind.as_str()
             ))
         })?;
         let lane = runtime.groups[group][0];

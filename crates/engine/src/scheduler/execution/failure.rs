@@ -154,7 +154,7 @@ impl Scheduler {
                 );
                 return;
             };
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
         for batch in pending {
             if batch.requests.is_empty() && batch.commands.is_empty() {

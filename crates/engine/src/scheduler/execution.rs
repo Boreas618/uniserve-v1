@@ -423,7 +423,7 @@ impl Scheduler {
     /// `reserve_generation_resources`.
     pub(super) fn register_inflight(&mut self, call: Call, input: InflightInput, queue_us: u64) {
         let request_id = call.request_key.request_id;
-        let domain = self.stats.domains.get(call.code);
+        let domain = self.stats.domains.get(call.kind);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);
         domain.launched_calls.fetch_add(1, Ordering::Relaxed);
@@ -504,7 +504,7 @@ impl Scheduler {
     /// calls whose credits it returns.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.pending_calls.values().flatten() {
-            self.reclaim_domain_credit(inflight.call.code, true);
+            self.reclaim_domain_credit(inflight.call.kind, true);
         }
     }
 }

@@ -36,7 +36,7 @@ pub(super) struct Prepared {
 }
 
 pub(super) fn kind(call: &Call) -> Result<ForwardMode> {
-    match call.code {
+    match call.kind {
         CallKind::Forward(
             mode @ (ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify),
         ) => Ok(mode),
@@ -330,7 +330,7 @@ pub(super) fn own_selection(
         .sampling_state
         .as_ref()
         .is_some_and(|state| !state.transition_token_ids.is_empty());
-    if call.code != CallKind::Forward(ForwardMode::Decode)
+    if call.kind != CallKind::Forward(ForwardMode::Decode)
         || controls.finish_token_ids.len() > FINISH_IDS
         || transitions
         || transition_output

@@ -795,7 +795,7 @@ impl SimEngine {
                     // token's logical position, which a prefill reaches past
                     // its query tokens and a decode or verify one past its
                     // first, as a rank keys it.
-                    let query_tokens = match call.code {
+                    let query_tokens = match call.kind {
                         CallKind::Forward(ForwardMode::Prefill) => call.bounds.max_tokens,
                         _ => 1,
                     };
@@ -911,7 +911,7 @@ impl SimEngine {
         };
         set_cache_lengths(&mut record, request.cache_visible_len);
 
-        match call.code {
+        match call.kind {
             work @ (CallKind::Forward(ForwardMode::Prefill)
             | CallKind::Forward(ForwardMode::Decode)
             | CallKind::Forward(ForwardMode::Verify)) => {
@@ -1640,7 +1640,7 @@ mod tests {
             request_key,
             call_id: CallId::new(batch_id, request_index),
             component: "model".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Bounds {
                 max_tokens: 2,
                 ..Bounds::default()

@@ -120,7 +120,7 @@ fn open(context: &mut Context<'_>, job: &Job) -> Result<Opening> {
     if plan
         .calls
         .iter()
-        .any(|call| call.code != KIND || call.component != runner.component)
+        .any(|call| call.kind != KIND || call.component != runner.component)
     {
         return Err(Error::Invalid(format!(
             "a diffusion LM batch carries token-denoising calls of component {:?}",

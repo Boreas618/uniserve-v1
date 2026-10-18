@@ -36,7 +36,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|call| call.call.code == CallKind::Media(MediaCall::Denoising))
+                .any(|call| call.call.kind == CallKind::Media(MediaCall::Denoising))
     }
 
     /// Counts prompt tokens accepted or present in pending forward inputs.
@@ -87,7 +87,7 @@ impl Scheduler {
         let mut feedback_index = state.feedback_encoder_index;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            match call.code {
+            match call.kind {
                 // A context prefill adds its prompt tokens and vision blocks.
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => {
                     let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
@@ -151,7 +151,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .any(|pending| matches!(pending.call.code, CallKind::Forward(_)));
+            .any(|pending| matches!(pending.call.kind, CallKind::Forward(_)));
         Some(CallCoordinates {
             logical_position,
             cache_visible_len,
@@ -199,7 +199,7 @@ impl Scheduler {
         let mut images = 0;
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
             let call = &pending.call;
-            if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+            if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                 index = 0;
             } else if consumes_image_features(call) && is_feedback_computation(call) {
                 index += 1;
@@ -258,7 +258,7 @@ impl Scheduler {
             .get(&id)
             .and_then(|queue| queue.back());
         let phase = match pending.map(|pending| &pending.call) {
-            Some(call) => match call.code {
+            Some(call) => match call.kind {
                 CallKind::Forward(ForwardMode::Prefill) if is_prompt_extend(call) => Phase::Prefill,
                 CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Verify) => {
                     Phase::Prefill
@@ -500,7 +500,7 @@ impl Scheduler {
                 || (state.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|call| {
                     !matches!(
-                        call.call.code,
+                        call.call.kind,
                         CallKind::Forward(ForwardMode::Prefill)
                             | CallKind::Forward(ForwardMode::Decode)
                     )
@@ -597,7 +597,7 @@ impl Scheduler {
             return None;
         }
         let last = &self.inflight.pending_calls.get(&id)?.back()?.call;
-        let chainable = if last.code == CallKind::Media(MediaCall::ImageDecoding) {
+        let chainable = if last.kind == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
                     == Some(uniserve_core::FeedbackSource::DeviceProduct)
@@ -716,7 +716,7 @@ impl Scheduler {
             .get(&id)
             .into_iter()
             .flatten()
-            .map(|pending| output_bound(pending.call.code))
+            .map(|pending| output_bound(pending.call.kind))
             .sum::<usize>();
         let next = self
             .peek_next_call_variant(id)

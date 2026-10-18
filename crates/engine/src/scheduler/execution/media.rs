@@ -226,7 +226,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .filter_map(|pending| match pending.call.code {
+                .filter_map(|pending| match pending.call.kind {
                     CallKind::Media(media_call) => Some(media_call),
                     _ => None,
                 }),
@@ -416,7 +416,7 @@ impl Scheduler {
         let mut ledger = LaneLedger::default();
         for (id, queue) in &self.inflight.pending_calls {
             for inflight in queue {
-                let CallKind::Media(media_call) = inflight.call.code else {
+                let CallKind::Media(media_call) = inflight.call.kind else {
                     continue;
                 };
                 if inflight.call.input_image.is_some() {

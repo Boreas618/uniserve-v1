@@ -469,7 +469,7 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
         .requests
         .iter()
         .filter_map(|(call, placement)| {
-            let CallKind::Media(media_call) = call.code else {
+            let CallKind::Media(media_call) = call.kind else {
                 return None;
             };
             Some(ObservedCall {
@@ -570,7 +570,7 @@ fn serve_through(
         match event {
             BatchEvent::Submitted(batch) => {
                 readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
-                    let CallKind::Media(media_call) = call.code else {
+                    let CallKind::Media(media_call) = call.kind else {
                         return None;
                     };
                     Some((
@@ -942,7 +942,7 @@ fn call_indices(served: &Served, request: RequestId, media_call: MediaCall) -> V
         .iter()
         .enumerate()
         .filter(|(_, (call, _))| {
-            call.request_key.request_id == request && call.code == CallKind::Media(media_call)
+            call.request_key.request_id == request && call.kind == CallKind::Media(media_call)
         })
         .map(|(index, _)| index)
         .collect()
@@ -1306,7 +1306,7 @@ impl Executor for PooledExecutor {
             batch
                 .requests
                 .iter()
-                .any(|(call, _)| call.code == CallKind::Media(media_call))
+                .any(|(call, _)| call.kind == CallKind::Media(media_call))
         });
         if hands_back {
             self.hand_back = None;
@@ -1329,7 +1329,7 @@ impl Executor for PooledExecutor {
                 if !supplied && !self.published.contains(&input) {
                     return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                         "input {input:?} of {:?} has no registered producer",
-                        call.code
+                        call.kind
                     )));
                 }
             }
@@ -1418,7 +1418,7 @@ fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
         served
             .calls
             .iter()
-            .filter(|(call, _)| call.code == CallKind::Media(media_call))
+            .filter(|(call, _)| call.kind == CallKind::Media(media_call))
             .flat_map(|(call, placement)| {
                 let outputs = call
                     .buffer_outputs()

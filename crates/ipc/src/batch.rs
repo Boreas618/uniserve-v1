@@ -444,7 +444,7 @@ impl Batch {
         // executes it as a single homogeneous group and returns one result.
         ensure_valid!(
             self.calls.windows(2).all(|pair| {
-                pair[0].code == pair[1].code && pair[0].component == pair[1].component
+                pair[0].kind == pair[1].kind && pair[0].component == pair[1].component
             }),
             "a submission batch mixes call kinds or components"
         );
@@ -545,7 +545,7 @@ impl Batch {
             // visual condition units of one round, or its single audio call.
             ensure_valid!(
                 matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Media(
                         MediaCall::VideoDecoding
                             | MediaCall::AudioDecoding
@@ -560,13 +560,13 @@ impl Batch {
             // media units as its component has ranks, and one round covers
             // them all, so an audio decode range starts at the first unit.
             ensure_valid!(
-                !matches!(call.code, CallKind::Media(MediaCall::AudioDecoding))
+                !matches!(call.kind, CallKind::Media(MediaCall::AudioDecoding))
                     || (params.cursor == 0 && params.max_units >= 1),
                 "audio decode range must start at the first media unit"
             );
             // Audio encoding consumes the assembled track as one host call.
             ensure_valid!(
-                !matches!(call.code, CallKind::Media(MediaCall::AudioEncoding))
+                !matches!(call.kind, CallKind::Media(MediaCall::AudioEncoding))
                     || (params.cursor == 0 && params.max_units == 1),
                 "audio encode range must address its single sample stream"
             );
@@ -574,7 +574,7 @@ impl Batch {
 
         for call in &self.calls {
             let needs_range = matches!(
-                call.code,
+                call.kind,
                 CallKind::Media(
                     MediaCall::VideoDecoding
                         | MediaCall::AudioDecoding
@@ -727,7 +727,7 @@ impl Batch {
                 .collect::<Vec<_>>();
             ensure_valid!(
                 consumers.len() == 1
-                    && consumers[0].code == CallKind::Transfer(TransferMode::CacheInstall),
+                    && consumers[0].kind == CallKind::Transfer(TransferMode::CacheInstall),
                 "cache transfer requires one installation consumer"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {

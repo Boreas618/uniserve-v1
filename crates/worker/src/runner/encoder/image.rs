@@ -246,7 +246,7 @@ pub(crate) fn image_placement(
         .calls
         .first()
         .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
-    let runner = &image.encoders.image[image.encoders.route(&first.component, first.code)?];
+    let runner = &image.encoders.image[image.encoders.route(&first.component, first.kind)?];
     let stream = runner.stream().cloned();
     Ok((runner.device().cuda(), stream, 0))
 }

@@ -73,7 +73,7 @@ pub(crate) fn prepare_inputs(
     let Some(first) = plan.calls.first() else {
         return Ok(true);
     };
-    let tower = match first.code {
+    let tower = match first.kind {
         CallKind::Media(MediaCall::VisionEncoding) => Tower::Vit,
         CallKind::Media(MediaCall::LatentEncoding) => Tower::Vae,
         _ => return Ok(true),
@@ -90,7 +90,7 @@ pub(crate) fn prepare_inputs(
             };
             let request = parts.requests.get(call.request_key.request_id.0)?;
             let input_images = request.admission().input_images;
-            let route = image.encoders.route(&call.component, call.code)?;
+            let route = image.encoders.route(&call.component, call.kind)?;
             let runner = &image.encoders.image[route];
             let dtype = runner.pixel_dtype().ok_or_else(|| {
                 Error::Invariant("an image encoding is routed to an image encoder".into())

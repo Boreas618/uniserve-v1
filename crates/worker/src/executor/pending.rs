@@ -458,7 +458,7 @@ mod tests {
             call_id: CallId::new(1, 0),
             coordinates: Default::default(),
             component: "image".into(),
-            code: CallKind::Media(MediaCall::ImageDecoding),
+            kind: CallKind::Media(MediaCall::ImageDecoding),
             bounds: Default::default(),
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -518,7 +518,7 @@ mod tests {
                 shape_bound: ShapeBound::default(),
             };
 
-            call.code = CallKind::Media(MediaCall::LatentPreparation);
+            call.kind = CallKind::Media(MediaCall::LatentPreparation);
             call.latent_output = transferred.then(|| reference.clone());
             let initial = LatentUpdate::for_call(1, &call, &params, pool.step_index(1))?;
             pool.validate_updates(std::slice::from_ref(&initial))?;
@@ -535,7 +535,7 @@ mod tests {
 
             // A denoising call advances the pool's committed step by one, and
             // its completion reports the step it published.
-            call.code = CallKind::Media(MediaCall::Denoising);
+            call.kind = CallKind::Media(MediaCall::Denoising);
             call.latent_input = call.latent_output.take();
             reference.generation = 19;
             call.latent_output = transferred.then(|| reference.clone());
@@ -555,7 +555,7 @@ mod tests {
             assert_eq!(output.step_index, 1);
 
             if transferred {
-                call.code = CallKind::Media(MediaCall::ImageDecoding);
+                call.kind = CallKind::Media(MediaCall::ImageDecoding);
                 call.latent_input = call.latent_output.take();
                 let release = LatentUpdate::for_call(1, &call, &params, pool.step_index(1))?;
                 pool.validate_updates(std::slice::from_ref(&release))?;
@@ -753,7 +753,7 @@ mod tests {
         accepted: i64,
     ) -> Result<PendingOutput> {
         let mut call = call();
-        call.code = CallKind::Forward(uniserve_ipc::ForwardMode::Verify);
+        call.kind = CallKind::Forward(uniserve_ipc::ForwardMode::Verify);
         call.coordinates.logical_position = POSITION as u32;
         let previous = RequestProgress {
             rng_counter: DRAWS,

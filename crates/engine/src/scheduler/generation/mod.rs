@@ -187,7 +187,7 @@ pub(crate) enum GenerationPhase {
 /// declares a completion predicate. The vision blocks of input images are
 /// instead attention blocks of a context prefill (`is_prompt_extend`).
 pub(super) fn consumes_image_features(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && (call.latent_feature_input.is_some()
             || (!call.vision_inputs.is_empty() && call.completion_output.is_some()))
 }
@@ -199,7 +199,7 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 /// feedback, which is what separates the feedback variants here.
 pub(super) fn is_feedback_computation(call: &Call) -> bool {
     (matches!(
-        call.code,
+        call.kind,
         CallKind::Media(MediaCall::VisionEncoding) | CallKind::Media(MediaCall::LatentEncoding)
     ) || consumes_image_features(call))
         && call.completion_output.is_some()
@@ -233,7 +233,7 @@ pub(super) fn prefill_rows(call: &Call) -> usize {
 /// canvas-generating request's block commit is a prompt extension too, of the
 /// tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
-    call.code == CallKind::Forward(ForwardMode::Prefill)
+    call.kind == CallKind::Forward(ForwardMode::Prefill)
         && !consumes_image_features(call)
         && call.completion_output.is_none()
 }
@@ -267,13 +267,13 @@ impl RequestState {
             return Ok(());
         }
 
-        if matches!(call.code, CallKind::Forward(_)) {
+        if matches!(call.kind, CallKind::Forward(_)) {
             // A forward reports the extent it initialized, which a verifier
             // leaves above the prefix it accepted.
             self.cache_computed_len = record.cache_computed_len;
         }
 
-        match call.code {
+        match call.kind {
             // A block commit is planned only in `CommitCanvas`, and a prompt
             // chunk never is; the committed block extends the context and
             // the next block starts at step zero.
@@ -393,7 +393,7 @@ impl RequestState {
                 if call.latent_output.is_none() {
                     return Err(GenerationResultError::MissingLatentProduct);
                 }
-                if call.code == CallKind::Media(MediaCall::LatentPreparation) {
+                if call.kind == CallKind::Media(MediaCall::LatentPreparation) {
                     self.denoising.open(call.latent_output.clone());
                     self.phase = GenerationPhase::Denoising;
                 } else {
@@ -467,11 +467,11 @@ fn latent_output(output_index: u16, bytes: u64, dtype: DType) -> Result<TensorRe
 /// Every optional input and output is unset, the call id and the request
 /// key's engine id and epoch are zero placeholders, and the bound is one
 /// token; the `plan_*` builders fill in the rest.
-fn computation(request: &GenerationRequest, code: CallKind) -> Call {
+fn computation(request: &GenerationRequest, kind: CallKind) -> Call {
     let mut call = Call::new(
         RequestKey::new(0, request.request_id, 0),
         CallId::new(0, 0),
-        code,
+        kind,
     );
     call.bounds.max_tokens = 1;
     call
@@ -645,12 +645,12 @@ pub(super) fn plan_decode(
     sampling_state: Option<SamplingState>,
 ) -> Result<Call, PlanningError> {
     let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
-    let code = if draft_count == 0 {
+    let kind = if draft_count == 0 {
         CallKind::Forward(ForwardMode::Decode)
     } else {
         CallKind::Forward(ForwardMode::Verify)
     };
-    let mut call = computation(request, code);
+    let mut call = computation(request, kind);
     call.bounds.max_tokens = (1 + draft_count).min(u32::MAX as usize) as u32;
     call.input_token_ids = match spec_token_ids {
         Some(drafts) if !drafts.is_empty() => drafts,
@@ -846,7 +846,7 @@ fn finish_plan(
     mut call: Call,
     prompt_positions: u32,
 ) -> Result<Call, PlanningError> {
-    let image_completion_bytes = if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+    let image_completion_bytes = if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
         png_base64_bound(request.image.width, request.image.height)?
     } else {
         0
@@ -1016,7 +1016,7 @@ pub(crate) fn validate_generation_result(
         return Ok(());
     }
 
-    let call_variant = call.code;
+    let call_variant = call.kind;
     if record.status != CallStatus::Ok {
         return Err(GenerationResultError::Status {
             detail: "call_failed",

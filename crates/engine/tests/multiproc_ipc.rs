@@ -3581,7 +3581,7 @@ fn completed(
     worker: &str,
 ) -> anyhow::Result<uniserve_engine::BatchResult> {
     let id = batch.batch_id;
-    let code = batch.calls[0].code;
+    let kind = batch.calls[0].kind;
     executor.submit(place(batch, worker, Vec::new()))?;
     let result = poll_logical(executor)?.with_context(|| format!("batch {id} did not complete"))?;
     anyhow::ensure!(
@@ -3592,7 +3592,7 @@ fn completed(
     let output = &result.results[0].output;
     anyhow::ensure!(
         output.status == CallStatus::Ok,
-        "{code:?} on {worker} ended {:?} ({:?})",
+        "{kind:?} on {worker} ended {:?} ({:?})",
         output.status,
         output.error_code
     );

@@ -66,7 +66,7 @@ impl LatentUpdate {
         step_index: i64,
     ) -> Result<Self> {
         let (expected_generation, expected_step_index, generation, step_index, release) =
-            match call.code {
+            match call.kind {
                 CallKind::Media(MediaCall::LatentPreparation) => (
                     0,
                     0,

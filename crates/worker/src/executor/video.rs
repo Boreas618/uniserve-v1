@@ -604,7 +604,7 @@ pub(crate) fn product_name<'a>(
 }
 
 fn media_kind(call: &Call) -> MediaCall {
-    match call.code {
+    match call.kind {
         CallKind::Media(kind) => kind,
         _ => MediaCall::Denoising,
     }
@@ -774,7 +774,7 @@ fn record_forwards(
     };
     for (index, call) in plan.calls.iter().enumerate() {
         let slot = media.batch.calls[index].slot;
-        match call.code {
+        match call.kind {
             CallKind::Media(MediaCall::MediaReading) => {
                 crate::runner::media::read_media(parts, media, index, call, slot, &placement)?;
                 continue;
@@ -799,7 +799,7 @@ fn record_forwards(
         if !media.batch.calls[index].active {
             continue;
         }
-        match call.code {
+        match call.kind {
             CallKind::Media(MediaCall::TextEncoding) => crate::runner::encoder::encode_text(
                 parts, plan, media, index, slot, &placement, job,
             )?,

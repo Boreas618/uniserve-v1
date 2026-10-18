@@ -166,7 +166,7 @@ impl WorkerGroup {
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming: Vec<uniserve_ipc::MediaCall> = match (routed, call.code) {
+        let consuming: Vec<uniserve_ipc::MediaCall> = match (routed, call.kind) {
             (Some(readers), _) => self
                 .media_routing
                 .iter()
@@ -319,7 +319,7 @@ pub(super) fn rank_projection(
         // of a cache transfer batch belongs to its calls.
         let transfers_cache = projection.calls.iter().any(|call| {
             matches!(
-                call.code,
+                call.kind,
                 uniserve_ipc::CallKind::Transfer(
                     uniserve_ipc::TransferMode::CacheExport
                         | uniserve_ipc::TransferMode::CacheInstall

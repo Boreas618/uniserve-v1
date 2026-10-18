@@ -48,8 +48,9 @@ struct PendingWorker {
     /// `WorkerExecutor::worker_submissions`, and cleared by failure
     /// reconciliation when the group will send no report.
     submitted: bool,
-    /// Calls whose completion this worker has not yet returned, with the
-    /// computation code the completion must carry.
+    /// Calls whose completion this worker has not yet returned, with each
+    /// call's kind, which the completion is checked against when it is
+    /// joined with its call.
     calls: HashMap<(RequestKey, uniserve_ipc::CallId), uniserve_ipc::CallKind>,
 }
 
@@ -1042,7 +1043,7 @@ impl Executor for WorkerExecutor {
             // register the producer and holders of its outputs and the
             // worker-local buffer allocations its placement names.
             for (call, placement) in &batch.requests {
-                let variant = call.code;
+                let variant = call.kind;
                 let call_worker =
                     self.routing
                         .get(&placement.worker)
@@ -1248,7 +1249,7 @@ impl Executor for WorkerExecutor {
                         submitted: false,
                         calls: calls
                             .iter()
-                            .map(|(call, _)| ((call.request_key, call.call_id), call.code))
+                            .map(|(call, _)| ((call.request_key, call.call_id), call.kind))
                             .collect(),
                     },
                 );
