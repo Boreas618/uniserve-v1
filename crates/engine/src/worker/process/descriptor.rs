@@ -527,6 +527,23 @@ mod tests {
         }
     }
 
+    /// `--lane` is where a lane is validated: a lane without SM partition or
+    /// with a zero batch or in-flight limit is refused there, before any
+    /// rank starts, since a rank checks only what spans its lanes.
+    #[test]
+    fn a_lane_with_a_zero_budget_or_limit_is_refused() {
+        let lane = r#"{"lane_id":"decode","domains":["decode"]"#;
+        for field in [
+            r#""sm_budget":0"#,
+            r#""sm_budget":64,"max_batch_calls":0"#,
+            r#""sm_budget":64,"max_batch_tokens":0"#,
+            r#""sm_budget":64,"max_inflight":0"#,
+        ] {
+            let parsed = format!("{lane},{field}}}").parse::<LaneConfig>();
+            assert!(parsed.is_err(), "{field} must be refused");
+        }
+    }
+
     /// Every rank runs with the head's caching-allocator configuration,
     /// under whichever names the head sets, or with expandable segments when
     /// the head configures none, and with its host heap out of transparent
