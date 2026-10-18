@@ -301,10 +301,7 @@ impl WorkerProcessArgs {
             distributed_backend: self.distributed_backend.clone(),
             mesh: self.mesh.clone(),
             lane: self.lanes.clone(),
-            // The worker refuses `no_model` without `allow_stub`, so a stub
-            // launch states both.
             no_model: self.stub,
-            allow_stub: self.stub,
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.as_deref().map(path),
             load_threads: self.load_threads,
