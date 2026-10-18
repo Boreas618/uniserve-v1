@@ -29,15 +29,15 @@ def _audio_encoder() -> AudioEncoder:
 
 
 @pytest.mark.parametrize("num_frames", (1, 2, 17, 18, 22, 39, 56, 362))
-def test_video_units_partition_frames_and_latent_frames(num_frames):
+def test_video_clips_partition_frames_and_latent_frames(num_frames):
     encoder = _video_encoder()
-    frames = encoder.frame_slices(num_frames)
+    clips = encoder.clips(num_frames)
     latents = encoder.latent_slices(num_frames)
 
-    assert len(frames) == len(latents)
-    assert frames[0].start == 0 and frames[-1].stop == num_frames
+    assert len(clips) == len(latents)
+    assert clips[0].start == 0 and clips[-1].stop == num_frames
     assert latents[0].start == 0
-    for earlier, later in zip(frames, frames[1:], strict=False):
+    for earlier, later in zip(clips, clips[1:], strict=False):
         assert earlier.stop == later.start
         assert earlier.stop - earlier.start == 17
     for earlier, later in zip(latents, latents[1:], strict=False):
@@ -48,7 +48,7 @@ def test_video_units_partition_frames_and_latent_frames(num_frames):
     elif num_frames % 17 == 5:
         assert latents[-1].stop == video_latent_frames(num_frames)
     else:
-        assert latents[-1].stop == 5 * len(frames) - 3
+        assert latents[-1].stop == 5 * len(clips) - 3
 
 
 @pytest.mark.parametrize(
@@ -67,20 +67,18 @@ def test_video_rows_are_denoiser_patch_tokens(num_frames, height, width):
     assert layout.variable_axes == (0,)
 
 
-def test_video_encoding_rejects_inputs_outside_the_unit_contract():
+def test_video_encoding_rejects_inputs_outside_the_clip_contract():
     encoder = _video_encoder()
     frames = torch.zeros((17, 64, 64, 3), dtype=torch.uint8)
 
-    with pytest.raises(ValueError, match="complete encoding unit"):
-        encoder.encode((frames[:10],), frames=(slice(0, 10),), num_frames=(39,))
-    with pytest.raises(ValueError, match="covering their frame slice"):
-        encoder.encode(
-            (frames[:16],), frames=(slice(17, 34),), num_frames=(39,)
-        )
+    with pytest.raises(ValueError, match="one of the video's complete clips"):
+        encoder.encode((frames[:10],), clips=(slice(0, 10),), num_frames=(39,))
+    with pytest.raises(ValueError, match="covering their clip"):
+        encoder.encode((frames[:16],), clips=(slice(17, 34),), num_frames=(39,))
     with pytest.raises(ValueError, match="32-pixel latent patches"):
         encoder.encode(
             (torch.zeros((1, 48, 64, 3), dtype=torch.uint8),),
-            frames=(slice(0, 1),),
+            clips=(slice(0, 1),),
             num_frames=(1,),
         )
 
@@ -95,11 +93,11 @@ def test_video_encoding_takes_its_conditions_posterior_draw():
     assert shape == (1, encoder.config.latent_channels, 12, 4, 4)
 
     with pytest.raises(ValueError, match="takes its video's draw"):
-        encoder.encode((frames,), frames=(slice(0, 17),), num_frames=(39,))
+        encoder.encode((frames,), clips=(slice(0, 17),), num_frames=(39,))
     with pytest.raises(ValueError, match="span its video's latent"):
         encoder.encode(
             (frames,),
-            frames=(slice(0, 17),),
+            clips=(slice(0, 17),),
             num_frames=(39,),
             noise=(torch.zeros(shape[:2] + (5,) + shape[3:]),),
         )

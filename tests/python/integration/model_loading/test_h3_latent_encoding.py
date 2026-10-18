@@ -227,10 +227,10 @@ def test_video_conditioning_matches_native_encoding(
     noise = torch.empty(encoder.posterior_shape(size))
     encoder.draw_noise(size, noise)
     assembled = torch.full(layout.shape, torch.nan, device="cuda")
-    for unit in reversed(encoder.frame_slices(num_frames)):
+    for clip in reversed(encoder.clips(num_frames)):
         (result,) = encoder.encode(
-            (pixels[unit],),
-            frames=(unit,),
+            (pixels[clip],),
+            clips=(clip,),
             num_frames=(num_frames,),
             noise=(noise,),
         )

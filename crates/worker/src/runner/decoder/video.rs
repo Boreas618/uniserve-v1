@@ -1,4 +1,4 @@
-//! Video decoding: a rank's decoder of one segment ([`VideoDecoder`]), its unit
+//! Video decoding: a rank's decoder of one clip output ([`VideoDecoder`]), its unit
 //! forward captured once per unit shape, and the decoding of the rank's media
 //! unit of a video round ([`decode_video`]).
 
@@ -26,15 +26,15 @@ use crate::storage::{RequestSlots, SlotField};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
-/// A segment: the native frames and raster one unit decodes to.
-pub(crate) type Segment = (u32, Canvas);
+/// A clip output: the native frames and raster one unit's clip decodes to.
+pub(crate) type ClipOutput = (u32, Canvas);
 
-/// What fixes a video decoding forward's computation: the unit's segment,
+/// What fixes a video decoding forward's computation: the unit's clip output,
 /// whether the unit is its video's first and last, and how many ring
 /// members hold a unit of its round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UnitShape {
-    pub(crate) segment: Segment,
+    pub(crate) clip_output: ClipOutput,
     pub(crate) first: bool,
     pub(crate) last: bool,
     pub(crate) count: u32,
@@ -54,7 +54,7 @@ pub(crate) struct DecodeCapacity {
 ///
 /// A forward reads and writes four tensors at fixed addresses, so one
 /// captured graph per [`UnitShape`] serves every request: the request's
-/// packed latent, the rows of it the unit's window reads, the request's
+/// packed latent, the rows of it the unit's clip input reads, the request's
 /// retained overlap and the unit's RGB frames. The runner copies a
 /// request's values in and out of them natively around the forward.
 pub(super) struct VideoDecoder {
@@ -62,23 +62,23 @@ pub(super) struct VideoDecoder {
     loaded: Handle,
     pub(super) stream: Stream,
     pub(super) device: DeviceId,
-    /// The runner of each segment, in preparation order.
-    runners: Vec<(Segment, Methods)>,
+    /// The runner of each clip output, in preparation order.
+    runners: Vec<(ClipOutput, Methods)>,
     /// The retained overlap of each request slot (`[slots + 1, elements]`):
     /// the decoded tail a request's previous round left for its next.
     overlap: RequestSlots,
     /// `[rows, width]` FP32: a request's complete packed latent.
     latent: StorageView,
-    /// `[rows]` int64: the latent rows a unit's window reads.
+    /// `[rows]` int64: the latent rows a unit's clip input reads.
     rows: StorageView,
     /// The forward's view of the request's retained overlap.
     retained: StorageView,
     /// Flat uint8: the unit's `[frames, height, width, 3]` RGB frames.
     frames: StorageView,
-    /// The rows of each `(frames, canvas, unit)` window, as the model
+    /// The clip rows of each `(frames, canvas, unit)`, as the model
     /// names them.
-    windows: HashMap<(u32, Canvas, u32), Vec<u8>>,
-    window_rows: Function,
+    unit_rows: HashMap<(u32, Canvas, u32), Vec<u8>>,
+    clip_rows: Function,
     pub(super) graphs: GraphTable<UnitShape>,
     /// Captures a forward between its begin and end.
     capture: GraphFunctions,
@@ -119,8 +119,8 @@ impl VideoDecoder {
                 DType::U8,
                 &[frames * height * canvas_width * 3],
             )?,
-            windows: HashMap::new(),
-            window_rows: Interpreter::import(&format!("{DECODER}.window_rows"))?,
+            unit_rows: HashMap::new(),
+            clip_rows: Interpreter::import(&format!("{DECODER}.clip_rows"))?,
             graphs: GraphTable::new(format!("{}.decoder", setup.path), capture.release.clone()),
             capture,
             pool,
@@ -130,43 +130,43 @@ impl VideoDecoder {
         })
     }
 
-    /// Construct the runner of every segment, the largest first.
+    /// Construct the runner of every clip output, the largest first.
     ///
     /// Startup alone constructs (`DecoderRunners::prepare_startup`), for
-    /// every segment an admitted video decodes to: a serving rank
-    /// constructs no decoder runner, and a decode of a segment without one
+    /// every clip output an admitted video decodes to: a serving rank
+    /// constructs no decoder runner, and a decode of a clip output without one
     /// is refused.
-    pub(crate) fn prepare(&mut self, segments: &[Segment]) -> Result<()> {
-        for &segment in segments {
+    pub(crate) fn prepare(&mut self, clip_outputs: &[ClipOutput]) -> Result<()> {
+        for &clip_output in clip_outputs {
             if self
                 .runners
                 .iter()
-                .any(|(prepared, _)| *prepared == segment)
+                .any(|(prepared, _)| *prepared == clip_output)
             {
                 continue;
             }
-            let (frames, canvas) = segment;
+            let (frames, canvas) = clip_output;
             let runner = self.class.construct(vec![Argument::Integers(vec![
                 i64::from(frames),
                 i64::from(canvas.width),
                 i64::from(canvas.height),
             ])])?;
-            self.runners.push((segment, runner));
+            self.runners.push((clip_output, runner));
         }
         Ok(())
     }
 
     /// The arguments of `DecoderRunner.decode` for a unit of `shape` whose
-    /// window reads `rows` latent rows and whose video's longest unit has
+    /// clip input reads `rows` latent rows and whose video's longest unit has
     /// `longest` frames.
     fn arguments(&self, shape: UnitShape, rows: u64, longest: u32) -> Result<Vec<Argument>> {
-        let canvas = shape.segment.1;
+        let canvas = shape.clip_output.1;
         let runner = self
             .runners
             .iter()
-            .find(|(prepared, _)| *prepared == shape.segment)
+            .find(|(prepared, _)| *prepared == shape.clip_output)
             .map(|(_, runner)| runner)
-            .ok_or_else(|| Error::Invariant("a video segment has no decoder runner".into()))?;
+            .ok_or_else(|| Error::Invariant("a video clip output has no decoder runner".into()))?;
         let frames = self.unit_frames(canvas, longest)?;
         Ok(vec![
             Argument::Handle(runner.runner().clone()),
@@ -193,14 +193,14 @@ impl VideoDecoder {
             .reshape(DType::U8, &shape)
     }
 
-    /// Read from the model the window rows of unit `unit` of a
-    /// `frames`-frame video at `canvas`. Startup reads the window of every
-    /// unit of every admitted video; a decode takes its window from that
-    /// table ([`Self::window`]).
-    pub(super) fn read_window(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
+    /// Read from the model the clip rows of unit `unit` of a
+    /// `frames`-frame video at `canvas`. Startup reads the clip rows of every
+    /// unit of every admitted video; a decode takes its rows from that
+    /// table ([`Self::rows_of`]).
+    pub(super) fn read_clip_rows(&mut self, frames: u32, canvas: Canvas, unit: u32) -> Result<()> {
         let key = (frames, canvas, unit);
-        if !self.windows.contains_key(&key) {
-            let value = self.window_rows.call_values(&[
+        if !self.unit_rows.contains_key(&key) {
+            let value = self.clip_rows.call_values(&[
                 self.loaded.to_any(),
                 Any::from(i64::from(frames)),
                 Any::from(i64::from(canvas.width)),
@@ -208,28 +208,28 @@ impl VideoDecoder {
                 Any::from(i64::from(unit)),
             ])?;
             let rows = crate::ffi::integers(value)
-                .map_err(|error| Error::numerical(self.window_rows.name(), &error))?;
-            self.windows
+                .map_err(|error| Error::numerical(self.clip_rows.name(), &error))?;
+            self.unit_rows
                 .insert(key, rows.iter().flat_map(|row| row.to_ne_bytes()).collect());
         }
         Ok(())
     }
 
-    /// The window rows of unit `unit` of a `frames`-frame video at
+    /// The clip rows of unit `unit` of a `frames`-frame video at
     /// `canvas`, as native int64 bytes.
-    fn window(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<&[u8]> {
-        self.windows
+    fn rows_of(&self, frames: u32, canvas: Canvas, unit: u32) -> Result<&[u8]> {
+        self.unit_rows
             .get(&(frames, canvas, unit))
             .map(Vec::as_slice)
             .ok_or_else(|| Error::Invalid("the rank admits no video with this media unit".into()))
     }
 
     /// Record into `job` the decode and reconstruction of a zero latent as
-    /// a unit of `shape` whose window reads `rows` rows, the forward as
+    /// a unit of `shape` whose clip input reads `rows` rows, the forward as
     /// serving records it, so kernels compile and the ring's exchange of
     /// the round shape is prepared, then the wait for the stream. Every
     /// member holding a unit of the round records it, in the same order.
-    /// The forward's tensors are zero: the latent, the window rows and the
+    /// The forward's tensors are zero: the latent, the clip rows and the
     /// retained overlap.
     pub(crate) fn warm(
         &mut self,
@@ -280,7 +280,7 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Record in `job` the forward of a unit of `shape` whose window reads
+    /// Record in `job` the forward of a unit of `shape` whose clip input reads
     /// `rows` latent rows, on the decoder's stream: the launch of the
     /// shape's captured graph, or the eager call of `DecoderRunner.decode`,
     /// which serves a shape startup did not capture. With `capture`, a
@@ -351,7 +351,7 @@ impl VideoDecoder {
         out: &StorageView,
         job: &Job,
     ) -> Result<GraphMode> {
-        let canvas = shape.segment.1;
+        let canvas = shape.clip_output.1;
         let stream = self.stream.clone();
         let issue = job.on(Some(&stream));
         let latent_bytes = latent.numel() * latent.dtype().bytes() as u64;
@@ -363,14 +363,14 @@ impl VideoDecoder {
                 "a video latent exceeds the decoder's latent rows".into(),
             ));
         }
-        let window = self.window(frames, canvas, unit)?.to_vec();
-        let rows = (window.len() / 8) as u64;
+        let unit_rows = self.rows_of(frames, canvas, unit)?.to_vec();
+        let rows = (unit_rows.len() / 8) as u64;
         let slot_overlap = self.overlap.slot("video_overlap", slot as u32)?;
         let overlap_bytes = self.retained.numel() * self.retained.dtype().bytes() as u64;
-        // SAFETY: the decoder's window rows, kept until it closes after its
+        // SAFETY: the decoder's clip rows, kept until it closes after its
         // stream drained; the forwards reading them run on `issue`'s stream,
         // the earlier ones before this write and this unit's after it.
-        unsafe { self.rows.prefix(rows as i64)?.upload(&window, issue) }?;
+        unsafe { self.rows.prefix(rows as i64)?.upload(&unit_rows, issue) }?;
         // The two copies write disjoint tensors, so they need no order
         // between them.
         let mut inputs = CopyBatch::new(SourceOrder::Stream);
@@ -474,7 +474,7 @@ pub(crate) fn decode_video(
         ));
     }
     let unit = run.start;
-    let segment: Segment = parts.decoders.segment(frames, canvas, unit)?;
+    let clip_output: ClipOutput = parts.decoders.clip_output(frames, canvas, unit)?;
     let owners = parts.owners();
     let stream = stream_of(batch)?;
     let issue = job.on(Some(&stream));
@@ -518,7 +518,7 @@ pub(crate) fn decode_video(
         frames,
         unit,
         UnitShape {
-            segment,
+            clip_output,
             first: unit == 0,
             last: unit + 1 == total,
             count: range.max_units,
