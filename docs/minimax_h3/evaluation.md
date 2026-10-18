@@ -25,6 +25,8 @@ export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 
 The `gb200-8` suites start the head on `rank-0`; start `uniserve-host` on `rank-1` for each server the suite starts, as in [Two hosts](minimax_h3.md#two-hosts).
 
+The `gb200-4-bf16-w1-w2` suite of the same profile runs the W1 and W2 workloads of [MiniMax-H3 workloads](#minimax-h3-workloads) on FastH3 8-Step V2, on the `gb200-4-bf16` deployment.
+
 ## H200
 
 These use `FastVideo/FastVideo-FastH3-8-Step-V2` at revision `3da2ddfe1954d9cda4c05b643dc0f26007a655c5`, the evaluator's synthesized prompts with seed 1000, full graphs, `--mem-fraction-static 0.92` and `NCCL_CUMEM_HOST_ENABLE=1`. Latency is the mean ± SD of three requests at concurrency one after one warmup; the DP8 points use eight warmups and 16 requests at concurrency eight.
@@ -72,6 +74,6 @@ export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref`, `fast-h3-gb200-4` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, with the base revision it pins in the Hugging Face cache. The two-host SGLang suite, `sglang-gb200-8`, needs `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref` and `gb200-8` suites group points by checkpoint and placement. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, with the base revision it pins in the Hugging Face cache. The two-host SGLang suite, `sglang-gb200-8`, needs `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host placement.
