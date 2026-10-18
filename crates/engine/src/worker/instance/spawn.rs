@@ -372,11 +372,13 @@ impl WorkerGroup {
     /// Checks that the ranks' startup reports describe one group and builds it.
     ///
     /// Every rank must report valid info naming its launched rank, the group's
-    /// world size and worker identity, and must agree with rank 0 apart
-    /// from rank-specific fields and numerical settings. The muxer must run on
-    /// the head's host, and the ranks' cache regions must cover every layer's KV
-    /// heads without a gap. Once all checks pass, no rank's startup may be
-    /// cancelled and every rank this process started must still be running.
+    /// world size and worker identity. The group takes rank 0's report: the
+    /// ranks derive every shared capacity (page size, request slots, cache
+    /// units) collectively before they report, so the reports differ only in
+    /// the fields reconciled here. The muxer must run on the head's host, and
+    /// the ranks' cache regions must cover every layer's KV heads without a
+    /// gap. Once all checks pass, no rank's startup may be cancelled and every
+    /// rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
         mut workers: Vec<RankProcess>,
@@ -388,15 +390,8 @@ impl WorkerGroup {
         let world_size =
             u32::try_from(n).context("process world size exceeds the IPC representation")?;
 
-        // `info` starts as rank 0's report and becomes the group's; `canonical`
-        // is the reference every rank is compared with, without the numerical
-        // settings ranks may differ in.
+        // Rank 0's report becomes the group's.
         let mut info = workers[0].info().clone();
-        let mut canonical = info.clone();
-        canonical.model_dtype.clear();
-        canonical.attention_backend.clear();
-        canonical.weight_formats.clear();
-        canonical.activation_formats.clear();
 
         // A rank's product storage follows the components it holds, which an
         // asymmetric placement makes rank-specific: a rank that imports a
@@ -405,13 +400,11 @@ impl WorkerGroup {
         // The group reports the smallest, because the engine places work
         // against one pool per group and must not place more than the
         // smallest rank can hold.
-        let product_storage = workers
+        info.buffer_pool_bytes = workers
             .iter()
             .map(|worker| worker.info().buffer_pool_bytes)
             .min()
             .unwrap_or(info.buffer_pool_bytes);
-        info.buffer_pool_bytes = product_storage;
-        canonical.buffer_pool_bytes = product_storage;
 
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.info();
@@ -424,40 +417,9 @@ impl WorkerGroup {
                 rank_info.endpoint.rank,
                 rank_info.world_size,
             );
-            let mut normalized = rank_info.clone();
             anyhow::ensure!(
                 rank_info.endpoint.worker_id == process_args.worker_id,
                 "physical rank {rank} reported another WorkerGroup identity"
-            );
-            // Rank-specific fields take the reference's values before the
-            // comparison: the endpoint, device, transfer backends, product
-            // storage, the unit size, and each cache group's layers and head
-            // offset.
-            normalized.endpoint = canonical.endpoint.clone();
-            normalized.device = canonical.device.clone();
-            normalized.transfer_backends = canonical.transfer_backends.clone();
-            normalized.buffer_pool_bytes = canonical.buffer_pool_bytes;
-            if let (Some(local), Some(reference)) =
-                (&mut normalized.prefix_cache, &canonical.prefix_cache)
-            {
-                local.unit_bytes = reference.unit_bytes;
-                if local.groups.len() == reference.groups.len() {
-                    for (group, canonical) in local.groups.iter_mut().zip(&reference.groups) {
-                        group.layer_ids.clone_from(&canonical.layer_ids);
-                        group.kv_head_offset = canonical.kv_head_offset;
-                    }
-                }
-            }
-            // Placement may give ranks different numerical storage; replacement
-            // validation (`validate_replacement_info`) compares each rank with
-            // its own predecessor instead.
-            normalized.model_dtype.clear();
-            normalized.attention_backend.clear();
-            normalized.weight_formats.clear();
-            normalized.activation_formats.clear();
-            anyhow::ensure!(
-                normalized == canonical,
-                "physical rank {rank} worker info disagree with rank 0"
             );
         }
 
@@ -480,6 +442,14 @@ impl WorkerGroup {
                 .iter()
                 .filter_map(|worker| worker.info().prefix_cache.as_ref())
                 .collect();
+            // Every rank describes the same cache groups in one order; the
+            // coverage below reads group `index` of each.
+            anyhow::ensure!(
+                regions
+                    .iter()
+                    .all(|region| region.groups.len() == cache.groups.len()),
+                "physical ranks report different cache groups"
+            );
             let mut owners = BTreeMap::new();
             for (index, group) in cache.groups.iter_mut().enumerate() {
                 let mut layers: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
