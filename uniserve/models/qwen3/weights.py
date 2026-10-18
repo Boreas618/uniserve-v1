@@ -26,8 +26,8 @@ if TYPE_CHECKING:
 checkpoint_sources = (checkpoint.Config(name="primary"),)
 
 # Named presets that load_model accepts; a calibrated ModelOpt checkpoint
-# offers none. With no "default" entry, uniserve.models.registry.read_config
-# starts from "bf16".
+# offers none. uniserve.models.registry.read_config starts from the first,
+# "bf16".
 _PRECISIONS = MappingProxyType(
     {"bf16": weights.Config(), "fp16": weights.Config(dtype=torch.float16)}
 )

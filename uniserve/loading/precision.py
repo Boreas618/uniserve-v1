@@ -34,11 +34,11 @@ def weight_config(
     ``options`` is the launch's precision configuration. Exactly one source
     selects the base weight configuration: ``components`` selectors passed to
     the model package's ``weight_config`` factory (with ``mode`` or
-    ``quant_method`` as its preset, ``default`` without one); a named
-    precision in ``source.precisions``; a ``quant_method`` among the generic
-    formats, applied to every module; or, with no selector, the checkpoint's
-    own weights. ``ignored_layers`` then maps each listed module path to no
-    quantization, and the dtype comes from ``model_dtype``.
+    ``quant_method`` as its preset, the factory's own default without one);
+    a named precision in ``source.precisions``; a ``quant_method`` among the
+    generic formats, applied to every module; or, with no selector, the
+    checkpoint's own weights. ``ignored_layers`` then maps each listed module
+    path to no quantization, and the dtype comes from ``model_dtype``.
     ``kv_cache_dtype`` is accepted here and resolved by the worker.
 
     Raises:
@@ -85,11 +85,9 @@ def weight_config(
                 "this model exposes complete precision presets "
                 "without component selectors"
             )
-        result = factory(
-            source.model,
-            preset="default" if selected is None else selected,
-            **components,
-        )
+        # Without a selector the factory applies its own default preset.
+        preset = {} if selected is None else {"preset": selected}
+        result = factory(source.model, **preset, **components)
     elif selected is None:
         result = source.weights
     elif selected in source.precisions:
