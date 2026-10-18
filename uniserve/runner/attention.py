@@ -50,7 +50,7 @@ class AttentionMetadata:
     no cache entry. The tensors are allocated on the current stream.
 
     Args:
-        page_tokens: Each numerical table's tokens per page.
+        block_size: Each numerical table's tokens per page.
         windowed: Whether each table reads from a first selected page (1)
             or from its first page (0).
         unit_tables: The request slots' installed unit tables.
@@ -64,7 +64,7 @@ class AttentionMetadata:
 
     def __init__(
         self,
-        page_tokens: Sequence[int],
+        block_size: Sequence[int],
         windowed: Sequence[int],
         unit_tables: torch.Tensor,
         start_pages: torch.Tensor,
@@ -74,12 +74,12 @@ class AttentionMetadata:
         width: int,
         device: torch.device,
     ) -> None:
-        self.page_tokens = tuple(int(value) for value in page_tokens)
+        self.block_size = tuple(int(value) for value in block_size)
         self.windowed = tuple(bool(value) for value in windowed)
         self.unit_tables = unit_tables
         self.slot_start_pages = start_pages
         self.table_shapes = table_shapes
-        rows, tokens, tables = int(rows), int(tokens), len(self.page_tokens)
+        rows, tokens, tables = int(rows), int(tokens), len(self.block_size)
 
         def zeros(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int32, device=device)
@@ -175,7 +175,7 @@ class AttentionMetadata:
                 )
             blocks = BlockTable(
                 self.block_tables[table, :rows, : int(width)],
-                self.page_tokens[table],
+                self.block_size[table],
                 first,
                 host_first,
             )

@@ -924,7 +924,7 @@ impl CacheGroupKind {
 
 /// One cache group of a worker's unit pool, reported at handshake.
 ///
-/// A logical page of the group holds `page_tokens` tokens of every layer in
+/// A logical page of the group holds `block_size` tokens of every layer in
 /// the group and occupies `units_per_page` physical units. Unit and column
 /// geometry belong to the worker; the scheduler only needs the page shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -932,7 +932,7 @@ pub struct CacheGroup {
     /// History retention policy of the group.
     pub kind: CacheGroupKind,
     /// Tokens stored per logical page; a power of two.
-    pub page_tokens: u32,
+    pub block_size: u32,
     /// Physical units one logical page occupies.
     pub units_per_page: u32,
     /// Global cache-layer ids of this rank's layers in the group, in the
@@ -953,7 +953,7 @@ impl CacheGroup {
     /// geometry, whatever layers and heads each rank stores.
     pub fn same_page_shape(&self, other: &Self) -> bool {
         self.kind == other.kind
-            && self.page_tokens == other.page_tokens
+            && self.block_size == other.block_size
             && self.units_per_page == other.units_per_page
             && self.total_kv_heads == other.total_kv_heads
             && self.head_dim == other.head_dim

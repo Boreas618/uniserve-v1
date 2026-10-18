@@ -21,7 +21,7 @@ const ALIGNMENT: usize = 256;
 /// | `start_pages` | `i32` | `[groups, rows]` |
 /// | `alloced_lens` | `i32` | `[rows]` |
 /// | `verified_lengths` | `i32` | `[rows]` |
-/// | `table_shapes` | `i32` | `[tables, 3]`: group, page tokens, window or -1 |
+/// | `table_shapes` | `i32` | `[tables, 3]`: group, block size, window or -1 |
 ///
 /// `rows = request_pool_size + 1`; row 0 is the padding slot. Everything is
 /// zero after allocation except the constant `table_shapes`. Writes are
@@ -127,7 +127,7 @@ impl BlockTableStorage {
             .flat_map(|(group, shape)| {
                 let row = [
                     group as i32,
-                    shape.page_tokens as i32,
+                    shape.block_size as i32,
                     shape.window.map_or(-1, |window| window as i32),
                 ];
                 std::iter::repeat_n(row, shape.units_per_page as usize).flatten()

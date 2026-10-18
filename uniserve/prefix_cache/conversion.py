@@ -40,7 +40,7 @@ def copy_converted(
     units: Sequence[int],
     offset: int,
     source_offset: int,
-    source_page_tokens: int,
+    source_block_size: int,
     scale_heads: int,
     compute_dtype: torch.dtype,
 ) -> None:
@@ -65,7 +65,8 @@ def copy_converted(
         offset: First destination token within the page.
         source_offset: Token offset of the span's first token within its
             first source page.
-        source_page_tokens: Tokens per source page, which select scale rows.
+        source_block_size: Tokens per block of the source, which select
+            scale rows.
         scale_heads: Heads of one source scale group; 0 for a dense source.
         compute_dtype: The source's logical dtype, through which decoded
             values round before destination encoding.
@@ -98,7 +99,7 @@ def copy_converted(
             # rank's heads grouped by source scale group.
             cursor, scale_index, token_offset = 0, 0, source_offset
             while cursor < count:
-                length = min(source_page_tokens - token_offset, count - cursor)
+                length = min(source_block_size - token_offset, count - cursor)
                 head, head_group = 0, 0
                 while head < num_heads:
                     heads = min(
@@ -217,7 +218,7 @@ class PageConversion:
         count: int,
         offset: int,
         source_offset: int,
-        source_page_tokens: int,
+        source_block_size: int,
         scale_heads: int,
         pages: int,
         units: Sequence[int],
@@ -259,7 +260,7 @@ class PageConversion:
                 tuple(int(unit) for unit in units),
                 int(offset),
                 int(source_offset),
-                int(source_page_tokens),
+                int(source_block_size),
                 int(scale_heads),
                 getattr(torch, compute_dtype),
             )

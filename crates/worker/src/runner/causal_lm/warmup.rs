@@ -123,7 +123,7 @@ impl CausalLMRunners {
         let shapes = prefix_cache.plan().group_shapes()?;
         let pages: Vec<(usize, usize)> = shapes
             .iter()
-            .map(|shape| (shape.page_tokens as usize, shape.units_per_page as usize))
+            .map(|shape| (shape.block_size as usize, shape.units_per_page as usize))
             .collect();
         let units = prefix_cache.planes().num_units() as usize - 1;
         // Step capacities a graph of `tokens` tokens is captured at.

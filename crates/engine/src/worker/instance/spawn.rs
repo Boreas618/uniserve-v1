@@ -373,7 +373,7 @@ impl WorkerGroup {
     ///
     /// Each rank validated the report it built; the group registers each
     /// rank's incarnation as the rank it launched. The group takes rank 0's report:
-    /// the ranks derive every shared capacity (page size, request slots,
+    /// the ranks derive every shared capacity (block size, request slots,
     /// cache units) collectively before they report, so the reports differ
     /// only in the fields reconciled here. The muxer must run on the head's
     /// host, and the ranks' cache regions must cover every layer's KV heads

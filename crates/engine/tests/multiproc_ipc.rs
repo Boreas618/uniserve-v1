@@ -4031,7 +4031,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
         for rank in &mut args.ranks {
             rank.device = "cuda:0".into();
         }
-        // The model's own page size, attention selection and component.
+        // The model's own block size, attention selection and component.
         args.stub = false;
         args.model = model.clone();
         args.block_size = None;

@@ -1,4 +1,4 @@
-//! Capacity planning of a loaded rank ([`plan`]): the page size, request slots,
+//! Capacity planning of a loaded rank ([`plan`]): the block size, request slots,
 //! cache units and latent pages its device budget holds, agreed over the group,
 //! with a video rank's slot layout, and the planned capacity reported once for
 //! operators.
@@ -12,7 +12,7 @@ use uniserve_ipc::{CallKind, ComponentInfo};
 use super::loading::LoadedModel;
 use super::{endpoint, expert_exchange, exports_device_products};
 use crate::capacity::device::{DeviceBudget, total_bytes};
-use crate::capacity::plan::{Plan, Report, TokenFacts, TokenLayout, page_size};
+use crate::capacity::plan::{Plan, Report, TokenFacts, TokenLayout, resolve_block_size};
 use crate::capacity::video::VideoCapacity;
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
@@ -61,7 +61,7 @@ pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
             },
         );
     tracing::info!(
-        "planned capacity: {prefix_cache}, KV page size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
+        "planned capacity: {prefix_cache}, KV block size {} tokens, {} request slots, {} calls and {} tokens per batch, {} latent pages, {} buffer pool bytes",
         config.block_size.unwrap_or(0),
         info.request_slots,
         info.max_batch_calls,
@@ -120,7 +120,7 @@ pub(super) fn plan(
     let declarations = &model.declarations;
     let text = declarations.has(Capability::CausalLm);
     let prefix_cache_dtype = config.prefix_cache_dtype.clone();
-    let block_size = page_size(
+    let block_size = resolve_block_size(
         config.block_size,
         |size| {
             if text {

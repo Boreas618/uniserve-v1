@@ -83,9 +83,9 @@ if triton is not None:
         table = tl.program_id(1)
         program = tl.program_id(0)
 
-        # [group, page tokens, window or -1] of this table.
+        # [group, block size, window or -1] of this table.
         group = tl.load(table_shapes + table * 3)
-        page_tokens = tl.load(table_shapes + table * 3 + 1)
+        block_size = tl.load(table_shapes + table * 3 + 1)
         window = tl.load(table_shapes + table * 3 + 2)
         units = request_unit_tables + table * unit_table_stride
         slots_ptr = columns_ptr
@@ -104,7 +104,7 @@ if triton is not None:
             # query reaches back to; a full table from page zero.
             row_first = tl.where(
                 window >= 0,
-                tl.maximum(row_prefix - window, 0) // page_tokens,
+                tl.maximum(row_prefix - window, 0) // block_size,
                 0,
             )
             tl.store(
@@ -144,7 +144,7 @@ if triton is not None:
             )
             first = tl.where(
                 window >= 0,
-                tl.maximum(prefix - window, 0) // page_tokens,
+                tl.maximum(prefix - window, 0) // block_size,
                 0,
             )
             # Row ``slot`` of the resident table holds the units of pages
@@ -183,7 +183,7 @@ if triton is not None:
             # token - start and appends to that page's unit; a read-only row's
             # tokens address no cache slot (-1).
             position = prefix + token - start
-            column = position // page_tokens - installed
+            column = position // block_size - installed
             unit = tl.load(
                 units + slot * unit_row_stride + column,
                 mask=live
@@ -194,7 +194,7 @@ if triton is not None:
             )
             address = tl.where(
                 (writes != 0) & (unit >= 0),
-                unit.to(tl.int64) * page_tokens + position % page_tokens,
+                unit.to(tl.int64) * block_size + position % block_size,
                 -1,
             )
             tl.store(
@@ -229,11 +229,11 @@ def gather_request_rows(
     query length and whether it writes the cache; the exclusive query and
     prefix offsets (``rows + 1`` each); each table's selected page count per
     row; and each of the ``tokens`` tokens' row. For table ``t``, described
-    by ``table_shapes[t] = (group, page_tokens, window or -1)``, the launch
+    by ``table_shapes[t] = (group, block_size, window or -1)``, the launch
     writes rows ``0..rows`` of ``block_tables[t]`` (``width`` cells, zero
     past a row's selected pages) from the first page each row selects (page
     zero, or for a windowed table ``max(0, prefix - window) //
-    page_tokens``) into ``start_pages[t]``, and each token's append address
+    block_size``) into ``start_pages[t]``, and each token's append address
     into ``slot_mapping[t]`` (-1 for rows that do not write); and, shared by
     all tables, the lengths and offsets. ``request_unit_tables[t, slot]``
     holds the slot's units from its installed start page
@@ -359,9 +359,9 @@ def _gather_rows(
     position -= starts[owner]
     cells = torch.arange(width, device=columns.device)
 
-    for table, (group, page_tokens, window) in enumerate(table_shapes.tolist()):
+    for table, (group, block_size, window) in enumerate(table_shapes.tolist()):
         first = (
-            (prefix - window).clamp(min=0) // page_tokens
+            (prefix - window).clamp(min=0) // block_size
             if window >= 0
             else torch.zeros_like(prefix)
         )
@@ -382,14 +382,14 @@ def _gather_rows(
             selected, units, torch.zeros_like(units)
         )
 
-        column = position // page_tokens - installed[owner]
+        column = position // block_size - installed[owner]
         valid = writes[owner] & (column >= 0) & (column < request_width)
         unit = request_unit_tables[
             table, slots[owner], column.clamp(0, request_width - 1)
         ].to(torch.int64)
         slot_mapping[table, :tokens] = torch.where(
             valid & (unit >= 0),
-            unit * page_tokens + position % page_tokens,
+            unit * block_size + position % block_size,
             torch.full_like(unit, -1),
         )
 
@@ -461,9 +461,9 @@ if triton is not None:
         """
         table = tl.program_id(1)
 
-        # [group, page tokens, window or -1] of this table.
+        # [group, block size, window or -1] of this table.
         group = tl.load(table_shapes + table * 3)
-        page_tokens = tl.load(table_shapes + table * 3 + 1)
+        block_size = tl.load(table_shapes + table * 3 + 1)
         window = tl.load(table_shapes + table * 3 + 2)
         units = request_unit_tables + table * unit_table_stride
 
@@ -486,7 +486,7 @@ if triton is not None:
             # A windowed table selects pages from the first one the decode
             # query's window reaches; a full table from page zero.
             first = tl.where(
-                window >= 0, tl.maximum(cache - window, 0) // page_tokens, 0
+                window >= 0, tl.maximum(cache - window, 0) // block_size, 0
             )
             tl.store(
                 start_pages + table * start_page_stride + offsets,
@@ -496,7 +496,7 @@ if triton is not None:
 
             # Cache length identifies the append page and its token offset.
             # Inactive rows and unavailable pages keep the public -1 sentinel.
-            column = cache // page_tokens - installed
+            column = cache // block_size - installed
             write_units = tl.load(
                 units + slots * unit_row_stride + column,
                 mask=live_rows & (column >= 0) & (column < request_width),
@@ -504,7 +504,7 @@ if triton is not None:
             )
             writes = tl.where(
                 write_units >= 0,
-                write_units.to(tl.int64) * page_tokens + cache % page_tokens,
+                write_units.to(tl.int64) * block_size + cache % block_size,
                 -1,
             )
             tl.store(
@@ -579,7 +579,7 @@ if triton is not None:
             )
             cell_first = tl.where(
                 window >= 0,
-                tl.maximum(cell_cache - window, 0) // page_tokens,
+                tl.maximum(cell_cache - window, 0) // block_size,
                 0,
             )
             source = cell_first - cell_installed + cells
@@ -626,26 +626,26 @@ def _gather_decode_inputs(
     cache = torch.where(live, request_cache_lengths[slots].to(torch.int64), 0)
     cells = torch.arange(columns, device=slots.device)
 
-    for table, (group, page_tokens, window) in enumerate(table_shapes.tolist()):
+    for table, (group, block_size, window) in enumerate(table_shapes.tolist()):
         installed = torch.where(
             live, request_start_pages[group, slots].to(torch.int64), 0
         )
         first = (
-            (cache - window).clamp(min=0) // page_tokens
+            (cache - window).clamp(min=0) // block_size
             if window >= 0
             else torch.zeros_like(cache)
         )
         start_pages[table, :rows] = first
 
         # Cache length identifies the append page and its token offset.
-        column = cache // page_tokens - installed
+        column = cache // block_size - installed
         appendable = live & (column >= 0) & (column < request_width)
         unit = request_unit_tables[
             table, slots, column.clamp(0, request_width - 1)
         ].to(torch.int64)
         slot_mapping[table, :rows] = torch.where(
             appendable & (unit >= 0),
-            unit * page_tokens + cache % page_tokens,
+            unit * block_size + cache % block_size,
             -1,
         )
 
@@ -694,13 +694,13 @@ def gather_request_decode_inputs(
     a tensor, so a captured graph of it serves any rows of its shape.
 
     The function materializes, for every numerical table ``t`` described by
-    ``table_shapes[t] = (group, page_tokens, window or -1)``, the slots'
+    ``table_shapes[t] = (group, block_size, window or -1)``, the slots'
     units from their first selected page into ``block_tables[t]``, that page
     into ``start_pages[t]`` and the append address into
     ``slot_mapping[t]``; and, shared by all tables, next-token ids and
     position axes, cache/query lengths and offsets. A row's first selected
     page of a windowed table is the first page its window reaches,
-    ``max(0, cache - window) // page_tokens``; of a full table, page zero.
+    ``max(0, cache - window) // block_size``; of a full table, page zero.
     ``request_unit_tables[t, slot]`` holds the slot's units from its
     installed start page ``request_start_pages[group, slot]`` on. Each table
     writes ``columns`` cells per row. Padding rows are initialized for a

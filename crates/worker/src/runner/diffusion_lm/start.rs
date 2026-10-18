@@ -47,7 +47,7 @@ struct Bounds {
     tokens: usize,
     /// Tokens per page and whether pages retire behind a window, per
     /// numerical block table.
-    page_tokens: Vec<i64>,
+    block_size: Vec<i64>,
     windowed: Vec<i64>,
     /// Page columns every table's rows hold.
     widths: Vec<usize>,
@@ -99,7 +99,7 @@ impl Bounds {
             max_rows
         };
 
-        let mut page_tokens = Vec::new();
+        let mut block_size = Vec::new();
         let mut windowed = Vec::new();
         let mut widths = Vec::new();
         for group in &groups {
@@ -111,7 +111,7 @@ impl Bounds {
                 );
             }
             for _ in 0..group.units_per_page {
-                page_tokens.push(i64::from(group.page_tokens));
+                block_size.push(i64::from(group.block_size));
                 windowed.push(i64::from(group.window.is_some()));
                 widths.push(width as usize);
             }
@@ -130,7 +130,7 @@ impl Bounds {
             capacity,
             rows,
             tokens,
-            page_tokens,
+            block_size,
             windowed,
             widths,
             graphs,
@@ -393,7 +393,7 @@ impl DiffusionLMRunner {
                 },
                 bounds.tokens.into(),
                 bounds.rows.into(),
-                bounds.page_tokens.as_slice().into(),
+                bounds.block_size.as_slice().into(),
                 bounds.windowed.as_slice().into(),
                 chunk_rows.into(),
             ];
