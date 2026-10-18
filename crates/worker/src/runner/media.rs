@@ -1,5 +1,5 @@
-//! Host media on CPU ranks: condition reading, video unit and audio encoding
-//! and MP4 assembly.
+//! Host media: condition reading, video unit and audio encoding and MP4
+//! assembly.
 //!
 //! Host media has no model. [`MediaRunner`] calls the functions of the
 //! Python library's `uniserve.media` (and the model's patch packing)
@@ -10,22 +10,36 @@
 //! decoded condition products, the encoded unit rows) or delivers the
 //! finished MP4 before its result is sent
 //! ([`crate::executor::batch::HostStage`]).
+//!
+//! The codecs and the muxer run on CPU ranks. The media reader runs on a
+//! rank of the head's host, CPU or CUDA. A CPU rank's condition products are
+//! host bytes, which encoders on its host map and a rank on another host
+//! receives only over the rank channel, whose frames are bounded far below a
+//! reference video's pixels. A CUDA rank's products lie in its device
+//! storage: its task decodes into page-locked staging and copies it to them
+//! on the reader's own stream, and encoder ranks on every host read them
+//! through the device transport, so a deployment whose condition encoders
+//! span hosts places the reader on a CUDA rank.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use uniserve_core::ComponentConfig;
+use uniserve_cuda::DeviceId;
 use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransport};
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};
 use crate::executor::video::{MediaBatch, Parts, Publication, product_name};
-use crate::ffi::{Function, Handle, Interpreter, MemoryKind};
+use crate::ffi::{Backing, Function, Handle, Interpreter, MemoryKind};
 use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
-use crate::host::task::{MediaTask, UnitFrames};
+use crate::host::task::{MediaTask, UnitFrames, Upload};
 use crate::host::{HostLane, HostTask};
 use crate::runner::component::units;
+use crate::storage::PinnedPool;
+use crate::storage::memory::StorageView;
+use crate::stream::CUDAStream;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};
 
@@ -33,6 +47,10 @@ use crate::{Error, ProductBuffer, Result};
 /// lane they run on.
 pub(crate) struct MediaRunner {
     pub(crate) reader: Option<Arc<ConditionReader>>,
+    /// On a CUDA rank holding the media reader, where its products are
+    /// device storage: the page-locked staging the reader decodes into and
+    /// the stream it copies the staging to the products on.
+    staging: Option<DeviceStaging>,
     /// `uniserve.media.codec.encode_video_unit`.
     encode_video: Function,
     /// `uniserve.media.codec.encode_audio_track`.
@@ -43,16 +61,25 @@ pub(crate) struct MediaRunner {
     components: BTreeMap<String, ComponentConfig>,
 }
 
+/// A CUDA media reader's way to its device products.
+struct DeviceStaging {
+    device: DeviceId,
+    pinned: Arc<PinnedPool>,
+    stream: Arc<CUDAStream>,
+}
+
 impl MediaRunner {
-    /// The runner of the host `components` placed on this rank. A rank
-    /// placing the media reader reads conditions with `ffmpeg` at the
-    /// model's `frame_rate`; `capacity` bounds the lane's queued tasks.
+    /// The runner of the host `components` placed on this rank, whose
+    /// products lie on `device` (`None` for a CPU rank). A rank placing the
+    /// media reader reads conditions with `ffmpeg` at the model's
+    /// `frame_rate`; `capacity` bounds the lane's queued tasks.
     pub(crate) fn new(
         loaded: &Handle,
         components: BTreeMap<String, ComponentConfig>,
         ffmpeg: String,
         frame_rate: u32,
         capacity: usize,
+        device: Option<DeviceId>,
     ) -> Result<Self> {
         let reader = if components.contains_key("media_reader") {
             let functions = ReaderFunctions::new(loaded)?;
@@ -62,8 +89,17 @@ impl MediaRunner {
         } else {
             None
         };
+        let staging = match (&reader, device) {
+            (Some(_), Some(device)) => Some(DeviceStaging {
+                device,
+                pinned: PinnedPool::new(Some(device)),
+                stream: Arc::new(CUDAStream::create(device)?),
+            }),
+            _ => None,
+        };
         Ok(Self {
             reader,
+            staging,
             encode_video: Interpreter::import("uniserve.media.codec.encode_video_unit")?,
             encode_audio: Interpreter::import("uniserve.media.codec.encode_audio_track")?,
             mux: MuxFunctions::new()?,
@@ -118,6 +154,19 @@ fn bind_host(
     region: Option<Vec<Range<u64>>>,
     placement: &Placement<'_>,
 ) -> Result<ProductBuffer> {
+    bind_deferred(parts, product, shape, region, placement, MemoryKind::Host)
+}
+
+/// Bind one output in `memory` at its exact shape and defer its write to a
+/// task.
+fn bind_deferred(
+    parts: &Parts<'_>,
+    product: &TensorRef,
+    shape: Vec<u64>,
+    region: Option<Vec<Range<u64>>>,
+    placement: &Placement<'_>,
+    memory: MemoryKind,
+) -> Result<ProductBuffer> {
     let owners = parts.owners();
     let write = bind_outputs(
         owners.store,
@@ -126,7 +175,7 @@ fn bind_host(
             shape,
             region,
         }],
-        MemoryKind::Host,
+        memory,
         placement,
     )?
     .into_iter()
@@ -155,12 +204,15 @@ pub(crate) fn read_media(
         .media
         .and_then(|host| host.reader.clone())
         .ok_or_else(|| Error::Invalid("media reading requires the condition encoders".into()))?;
+    let staging = parts.media.and_then(|host| host.staging.as_ref());
+    let memory = staging.map_or(MemoryKind::Host, |staging| MemoryKind::Cuda(staging.device));
     let mut products = ConditionProducts {
         pixels: None,
         samples: None,
         patches: None,
     };
     let mut written = Vec::new();
+    let mut copies = Vec::new();
     for output in &call.outputs {
         let name = product_name(parts.info, call, output)?.to_owned();
         let (rows, width): (u64, u64) = match name.as_str() {
@@ -196,8 +248,17 @@ pub(crate) fn read_media(
                 )));
             }
         };
-        let write = bind_host(parts, output, vec![rows, width], None, placement)?;
-        let view = write.view();
+        let write = bind_deferred(parts, output, vec![rows, width], None, placement, memory)?;
+        let mut view = write.view();
+        if let Some(staging) = staging {
+            // The reader decodes into page-locked staging of the product's
+            // shape, which the task copies to the product.
+            let block = staging.pinned.lease(view.nbytes() as usize)?;
+            let host =
+                StorageView::contiguous(block as Arc<dyn Backing>, 0, view.dtype(), view.shape())?;
+            copies.push((host.clone(), view));
+            view = host;
+        }
         match name.as_str() {
             "condition_pixels" => products.pixels = Some(view),
             "condition_samples" => products.samples = Some(view),
@@ -205,17 +266,20 @@ pub(crate) fn read_media(
         }
         written.push((output.clone(), write));
     }
+    let stream = staging.map(|staging| Arc::clone(&staging.stream));
+    let upload = stream.clone().map(|stream| Upload { stream, copies });
     let task = submit(
         parts,
         MediaTask::Read {
             reader,
             conditions,
             products,
+            upload,
         },
     )?;
     let state = &mut batch.batch.calls[index].forward;
     state.tasks.push(task);
-    state.publication = Some(Publication::Products(written));
+    state.publication = Some(Publication::Products { written, stream });
     Ok(())
 }
 
