@@ -333,13 +333,15 @@ pub(super) fn context(
         begin = end;
     }
 
-    // The scheduler's forward rows of the call describe the same rows.
+    // The scheduler's forward rows of the call describe the same rows: one
+    // per prompt run and vision block, on the call's slot, each with its
+    // query. Their prefix lengths come from the same request state as the
+    // call's visible length, so they are not compared with it.
     let count: u64 = rows.iter().map(|row| u64::from(row.query)).sum();
     let aligned = descriptors.len() == rows.len()
         && descriptors.iter().zip(&rows).all(|(&descriptor, row)| {
             forward.request_pool_indices[descriptor] == slot
                 && forward.query_lens[descriptor] == row.query
-                && forward.seq_lens[descriptor] == row.prefix + row.query
         });
     if !aligned || count > u64::from(call.bounds.max_tokens) {
         return Err(Error::Invalid(
