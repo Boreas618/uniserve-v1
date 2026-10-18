@@ -206,7 +206,7 @@ pub(super) mod tests {
         Target, VideoInputError,
     };
     use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
-    use uniserve_core::{FrameClips, VideoTask};
+    use uniserve_core::{Canvas, FrameClips, VideoTask};
 
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -229,7 +229,27 @@ pub(super) mod tests {
         serde_json::from_value(fixture()["vision"].clone()).unwrap()
     }
 
-    /// Limits that serve every task, duration and canvas the model does.
+    /// The canvases of the vectors' accepted requests: what a deployment that
+    /// prepares them all serves.
+    pub(in crate::serving::video) fn served_canvases() -> Vec<Canvas> {
+        let mut canvases = Vec::new();
+        for case in fixture()["requests"].as_array().unwrap() {
+            if let Some(expected) = case.get("expected") {
+                let pair = &expected["canvas"];
+                let canvas = Canvas {
+                    width: pair[0].as_u64().unwrap() as u32,
+                    height: pair[1].as_u64().unwrap() as u32,
+                };
+                if !canvases.contains(&canvas) {
+                    canvases.push(canvas);
+                }
+            }
+        }
+        canvases
+    }
+
+    /// Limits that serve every task and duration the model does, at the
+    /// canvases of the vectors.
     fn limits() -> PlanLimits {
         PlanLimits {
             tasks: VideoTask::ALL.to_vec(),
@@ -241,7 +261,7 @@ pub(super) mod tests {
                 clip_latent_frames: 5,
                 tail_latent_frames: 2,
             },
-            canvases: None,
+            canvases: served_canvases(),
             // The fixture's requests follow the released pipeline.
             references: uniserve_core::video::plan::ReferenceConfig::RELEASED,
         }
