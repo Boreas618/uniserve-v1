@@ -1279,11 +1279,13 @@ class DenoiserRunner:
         """The image denoiser's latent layout; empty without one.
 
         ``[patch_size, latent_channels, downsample, framing_tokens,
-        max_sequence_tokens, rope_advance]``: ``downsample`` is pixels per
-        latent patch on each axis, ``framing_tokens`` the tokens framing a
-        generated image, ``max_sequence_tokens`` the longest image sequence
-        in latent patch rows, framing excluded, and ``rope_advance`` the
-        language positions a generated image spans in its conversation.
+        max_sequence_tokens, rope_advance, guidance_branches]``:
+        ``downsample`` is pixels per latent patch on each axis,
+        ``framing_tokens`` the tokens framing a generated image,
+        ``max_sequence_tokens`` the longest image sequence in latent patch
+        rows, framing excluded, ``rope_advance`` the language positions a
+        generated image spans in its conversation, and ``guidance_branches``
+        the most guidance branches one step evaluates.
         """
         denoiser = _image_denoiser(loaded)
         if denoiser is None:
@@ -1295,6 +1297,7 @@ class DenoiserRunner:
             int(denoiser.framing_tokens),
             int(denoiser.max_sequence_tokens),
             int(denoiser.rope_advance),
+            int(denoiser.guidance_branches),
         ]
 
     @staticmethod

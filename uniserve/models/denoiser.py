@@ -9,7 +9,7 @@ from typing import Any, Generic, Protocol, TypeVar
 import torch
 from torch import nn
 
-from uniserve.diffusion import NoiseScale, Schedule, Solver
+from uniserve.diffusion import Branch, NoiseScale, Schedule, Solver
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image, video
 from uniserve.nn.functional import patchify
@@ -434,13 +434,18 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
     image spans once it is part of a continuing conversation: the request's
     logical position after the image is its position before the image plus
     this, and a framed image's closing token sits this far past the position
-    before it. Execution owns the buffers and the stepping; the network
-    states these layout facts and assembles its own typed input.
+    before it. ``guidance_branches`` is the most branches one denoising
+    step's guidance evaluates (the conditioned prediction and each
+    unconditional one, ``uniserve.diffusion.Branch``), so execution prepares
+    one call shape for every count from one to it. Execution owns the buffers
+    and the stepping; the network states these layout facts and assembles its
+    own typed input.
     """
 
     framing_tokens: int = 0
     image_unconditional: BranchSource = BranchSource.START
     rope_advance: int
+    guidance_branches: int = len(Branch)
 
     @abstractmethod
     def make_schedules(
