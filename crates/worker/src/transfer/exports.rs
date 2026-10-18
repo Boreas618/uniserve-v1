@@ -55,7 +55,7 @@ pub fn export(
     } else {
         &[
             TransportKind::Local,
-            TransportKind::Shm,
+            TransportKind::PosixShm,
             TransportKind::Channel,
         ]
     };
@@ -81,7 +81,7 @@ pub fn export(
                 Exported::PoolExhausted => {
                     // Local was selected before VMM, so never repeat it.
                     let mut carried = false;
-                    for kind in [TransportKind::Shm, TransportKind::Channel] {
+                    for kind in [TransportKind::PosixShm, TransportKind::Channel] {
                         let Some(fallback) = transports.exporter(kind) else {
                             continue;
                         };

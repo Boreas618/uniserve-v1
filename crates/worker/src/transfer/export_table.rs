@@ -24,7 +24,7 @@ use crate::{Error, EventPool, Result, lock};
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) enum SourceKey {
     Local(u64),
-    Shm(String),
+    PosixShm(String),
     Cuda(String),
 }
 
@@ -93,7 +93,7 @@ impl ExportTable {
         let (endpoint, key) = match &locator.transport {
             TransferTransport::Local { endpoint, key } => (endpoint, SourceKey::Local(*key)),
             TransferTransport::PosixShm { endpoint, name } => {
-                (endpoint, SourceKey::Shm(name.clone()))
+                (endpoint, SourceKey::PosixShm(name.clone()))
             }
             TransferTransport::CudaVmm {
                 endpoint,
@@ -287,7 +287,7 @@ impl ExportTable {
             match &*installed {
                 Some(lane) => Arc::clone(lane),
                 None => {
-                    let lane = HostLane::new(256, 1, "uniserve-shm-retire")?;
+                    let lane = HostLane::new(256, 1, "uniserve-posix-shm-retire")?;
                     lane.set_wake(lock(&self.wake).clone());
                     let lane = Arc::new(lane);
                     *installed = Some(Arc::clone(&lane));
