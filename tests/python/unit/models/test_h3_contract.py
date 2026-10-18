@@ -21,6 +21,7 @@ from uniserve.models.minimax_h3 import (
 )
 from uniserve.models.minimax_h3.checkpoint import Kind, detect
 from uniserve.models.minimax_h3.config import Config, normalize, read_config
+from uniserve.models.minimax_h3.precision import weight_config
 
 pytestmark = pytest.mark.unit
 
@@ -242,15 +243,34 @@ def test_architecture_without_variant_metadata_is_rejected(tmp_path):
         read_config(tmp_path, IOConfig(), sources={})
 
 
+def test_a_checkpoint_defines_its_own_network_dimensions(checkpoint):
+    """Layer counts come from the checkpoint, not from released defaults."""
+    transformer = checkpoint / "transformer/config.json"
+    values = json.loads(transformer.read_text())
+    transformer.write_text(json.dumps({**values, "num_layers": 7}))
+    vae = checkpoint / "vae/config.json"
+    values = json.loads(vae.read_text())
+    vae.write_text(json.dumps({**values, "decoder_num_layers": 35}))
+
+    config = read_config(checkpoint, IOConfig(), sources={})
+    assert config.denoisers["denoiser"].transformer.num_hidden_layers == 7
+    assert config.video_vae.decoder_num_layers == 35
+
+    precision = weight_config(config)
+    layers = "denoiser.transformer.layers"
+    assert f"{layers}.6.mlp" in precision.quantization
+    assert f"{layers}.7.mlp" not in precision.quantization
+    decoder = "video_decoder.decoder.decoder.decoder.layers"
+    assert f"{decoder}.34.qkv" in precision.dtypes
+    assert f"{decoder}.35.qkv" not in precision.dtypes
+
+
 @pytest.mark.parametrize(
     "sidecar, field, value, error",
     [
-        (
-            "vae/config.json",
-            "decoder_num_layers",
-            35,
-            "video_vae.decoder_num_layers",
-        ),
+        ("vae/config.json", "clip_length", 33, "17-frame clips"),
+        ("vae/config.json", "token_drop", 2, "17-frame clips"),
+        ("audio_vae/config.json", "encoder_rates", [2, 4, 4, 5, 6], "hop 800"),
         (
             "audio_vae/config.json",
             "latents_std",

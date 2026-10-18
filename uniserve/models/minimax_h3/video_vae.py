@@ -270,6 +270,12 @@ class Config:
     def temporal_compression(self) -> int:
         return math.prod(self.temporal_downsample_factors)
 
+    # A clip's causal strides map its ``clip_length`` frames to this many
+    # latent frames; ``token_drop`` of them are cropped from the final clip.
+    @property
+    def clip_latents(self) -> int:
+        return math.ceil(self.clip_length / self.temporal_compression)
+
 
 def _residual_norm(hidden, update, scale, weight, bias, eps, projection):
     """Fold a scaled update into ``hidden`` and normalize it for a projection.
@@ -764,7 +770,7 @@ class Model(LatentDecoder):
         # A clip covers `span` latent frames; cropping `token_drop` frames
         # per clip leaves consecutive native windows sharing `overlap`
         # latent frames.
-        span = math.ceil(config.clip_length / config.temporal_compression)
+        span = config.clip_latents
         overlap = (-config.token_drop) % span
         super().__init__(
             Decoder(config),
