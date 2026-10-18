@@ -445,7 +445,7 @@ impl TokenBatch<'_> {
             } else {
                 position
             };
-            if call.code == CallKind::Forward(ForwardMode::Prefill)
+            if call.kind == CallKind::Forward(ForwardMode::Prefill)
                 && prepared.scores
                 && prepared.media.is_none()
             {

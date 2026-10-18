@@ -137,11 +137,11 @@ impl ProductStore {
             _ => String::new(),
         };
         let source_kind = if feature {
-            if call.code == CallKind::Media(MediaCall::VisionEncoding)
+            if call.kind == CallKind::Media(MediaCall::VisionEncoding)
                 || !call.vision_inputs.is_empty()
             {
                 Some(FeatureKind::Vision)
-            } else if call.code == CallKind::Media(MediaCall::LatentEncoding)
+            } else if call.kind == CallKind::Media(MediaCall::LatentEncoding)
                 || call.latent_feature_input.is_some()
             {
                 Some(FeatureKind::Latent)

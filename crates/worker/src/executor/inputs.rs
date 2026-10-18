@@ -623,7 +623,7 @@ fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job) -> Result<()>
         .as_ref()
         .ok_or(Error::State("a host-gated call has a predicate"))?;
     let device = component_device(backend, &call.component)?;
-    let stream = backend.transfer_stream(call.code, device)?;
+    let stream = backend.transfer_stream(call.kind, device)?;
     let storage = backend
         .rank_storage()
         .ok_or_else(|| Error::Unsupported("predicates require rank storage".into()))?;
@@ -688,7 +688,7 @@ fn consumer_kind(plan: &BatchPlan, product: &TensorRef) -> Result<CallKind> {
                 .chain(call.predicate.as_ref())
                 .any(|input| input == product)
         })
-        .map(|call| call.code)
+        .map(|call| call.kind)
         .ok_or_else(|| Error::Invalid("a supplied input product has no consumer".into()))
 }
 
@@ -742,7 +742,7 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
             Input::Borrowed => {}
         }
     }
-    let kind = plan.calls.first().map(|call| call.code);
+    let kind = plan.calls.first().map(|call| call.kind);
     for (device, reads) in reads {
         // The leases end on the stream that published them.
         let completed = kind

@@ -553,13 +553,13 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// request's event journal.
 const DEFAULT_OUTPUT_EVENTS: usize = 2;
 
-/// Returns the maximum number of output events one call of kind `code` can
+/// Returns the maximum number of output events one call of `kind` can
 /// add to its request's event journal.
 ///
 /// `Scheduler::output_window_ready` charges this for every in-flight call and
 /// for the call the request plans next.
-fn output_bound(code: CallKind) -> usize {
-    match code {
+fn output_bound(kind: CallKind) -> usize {
+    match kind {
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,
         CallKind::Media(MediaCall::Denoising | MediaCall::ImageDecoding) => 3,
         _ => DEFAULT_OUTPUT_EVENTS,

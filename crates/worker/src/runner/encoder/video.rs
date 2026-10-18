@@ -883,7 +883,7 @@ pub(crate) fn setup_conditions(
     let mut inputs = Vec::new();
     for (call, state) in plan.calls.iter().zip(calls) {
         // A skipped call encodes nothing.
-        if call.code != CallKind::Media(MediaCall::LatentEncoding) || !state.active {
+        if call.kind != CallKind::Media(MediaCall::LatentEncoding) || !state.active {
             continue;
         }
         inputs.extend(condition_input(parts, plan, call, state.slot)?);

@@ -330,7 +330,7 @@ mod tests {
                 batch
                     .requests
                     .iter()
-                    .filter(|(call, _)| call.code == kind)
+                    .filter(|(call, _)| call.kind == kind)
                     .count()
             })
             .filter(|&count| count > 0)

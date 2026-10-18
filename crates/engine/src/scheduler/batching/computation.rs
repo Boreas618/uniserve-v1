@@ -26,7 +26,7 @@ impl Scheduler {
         match planned {
             Ok(mut call) => {
                 if matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)

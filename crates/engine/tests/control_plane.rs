@@ -200,7 +200,7 @@ fn first_denoising_rows(
             _ => None,
         })
         .flat_map(|batch| batch.requests)
-        .find(|(call, _)| call.code == CallKind::Media(MediaCall::Denoising))
+        .find(|(call, _)| call.kind == CallKind::Media(MediaCall::Denoising))
         .expect("the request denoises");
     let forward = placement.forward;
     (0..forward.request_pool_indices.len())
@@ -349,7 +349,7 @@ fn a_generated_image_reserves_its_latent_at_the_model_density() {
             _ => None,
         })
         .flat_map(|batch| batch.requests)
-        .filter(|(call, _)| call.code == CallKind::Media(MediaCall::LatentPreparation))
+        .filter(|(call, _)| call.kind == CallKind::Media(MediaCall::LatentPreparation))
         .filter_map(|(call, _)| call.latent_output.map(|latent| latent.max_bytes()))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -888,7 +888,7 @@ fn cache_export_batch_calls(transfer_tickets: u32) -> Vec<usize> {
                 batch
                     .requests
                     .iter()
-                    .filter(|(call, _)| call.code == CallKind::Transfer(TransferMode::CacheExport))
+                    .filter(|(call, _)| call.kind == CallKind::Transfer(TransferMode::CacheExport))
                     .count(),
             ),
             _ => None,
@@ -965,7 +965,7 @@ fn forward_batches_hold_at_most_the_workers_batch_calls() {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        match batch.requests.first().map(|(call, _)| call.code) {
+        match batch.requests.first().map(|(call, _)| call.kind) {
             Some(CallKind::Forward(ForwardMode::Prefill)) => {
                 prefill_calls.push(batch.requests.len())
             }
@@ -2206,10 +2206,10 @@ fn a_latent_image_block_is_written_by_its_own_call() {
         .collect();
     let context: Vec<_> = calls
         .iter()
-        .take_while(|call| call.code != CallKind::Forward(ForwardMode::Decode))
+        .take_while(|call| call.kind != CallKind::Forward(ForwardMode::Decode))
         .collect();
     assert_eq!(
-        context.iter().map(|call| call.code).collect::<Vec<_>>(),
+        context.iter().map(|call| call.kind).collect::<Vec<_>>(),
         vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Media(MediaCall::LatentEncoding),

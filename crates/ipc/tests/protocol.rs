@@ -71,7 +71,7 @@ fn ar_decode_call() -> Call {
         request_key: request_key(),
         call_id: CallId::new(11, 0),
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: 1,
             ..Bounds::default()
@@ -140,7 +140,7 @@ fn call_for(kind: CallKind, call_id: CallId) -> Call {
         request_key: request_key(),
         call_id,
         component: "model".into(),
-        code: kind,
+        kind,
         bounds: Bounds {
             max_tokens: if denoises { 4 } else { 0 },
             ..Bounds::default()
@@ -420,7 +420,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             next_buffer_offset += bytes;
         }
         // Each forward call holds one fresh cache unit.
-        let capacity_units = u32::from(matches!(call.code, CallKind::Forward(_)));
+        let capacity_units = u32::from(matches!(call.kind, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -457,7 +457,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
         }
         if matches!(
-            call.code,
+            call.kind,
             CallKind::Media(
                 MediaCall::VideoDecoding
                     | MediaCall::VideoEncoding
@@ -760,7 +760,7 @@ fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
             request_key: request_key(),
             call_id: CallId::new(56 + index as u64, 0),
             component: (*entry).into(),
-            code: CallKind::Media(*stage),
+            kind: CallKind::Media(*stage),
             bounds: Bounds::default(),
             inputs: vec![latent.clone()],
             outputs: Vec::new(),
@@ -1486,7 +1486,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
 #[test]
 fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
     let mut call = ar_decode_call();
-    call.code = CallKind::Media(MediaCall::VisionEncoding);
+    call.kind = CallKind::Media(MediaCall::VisionEncoding);
     call.input_image = Some("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGN0SGhgIAUwkaR6VMOohiGlAQCjvQFA6eri4wAAAABJRU5ErkJggg==".into());
     call.token_output = None;
     let batch = batch_with_calls(1, vec![admission()], vec![call.clone()]);
@@ -1496,7 +1496,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         call.input_image
     );
 
-    for (code, image) in [
+    for (kind, image) in [
         (
             CallKind::Forward(ForwardMode::Decode),
             call.input_image.clone(),
@@ -1507,7 +1507,7 @@ fn image_encoder_input_round_trips_and_rejects_an_incompatible_computation() {
         ),
     ] {
         let mut invalid = call.clone();
-        invalid.code = code;
+        invalid.kind = kind;
         invalid.input_image = image;
         let batch = batch_with_calls(1, vec![admission()], vec![invalid]);
         assert!(batch.validate().is_err());
@@ -1855,7 +1855,7 @@ fn comprehensive_batches() -> Vec<Batch> {
             request_key: key,
             call_id,
             component: "model".into(),
-            code: kind,
+            kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
                 max_completion_bytes: 4096,
