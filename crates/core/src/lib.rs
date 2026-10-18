@@ -671,8 +671,6 @@ pub struct ImageParams {
     pub seed: Option<u64>,
     /// Maximum images this request may generate.
     pub max_images: u16,
-    /// Whether completed image bytes remain available to the caller.
-    pub retain_images: bool,
 }
 
 impl ImageParams {
@@ -943,7 +941,6 @@ impl Default for ImageParams {
             width: 512,
             seed: None,
             max_images: 1,
-            retain_images: true,
         }
     }
 }
