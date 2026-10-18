@@ -968,6 +968,12 @@ impl WorkerBackend {
         self.jobs.oldest()
     }
 
+    /// Wait at most `timeout` for the next completion of a job in flight,
+    /// kept for the next [`Executor::advance`]; whether one arrived.
+    pub(crate) fn await_completion(&self, timeout: std::time::Duration) -> Result<bool> {
+        self.jobs.await_completion(timeout)
+    }
+
     pub(crate) fn stall(
         &self,
         job: JobId,
