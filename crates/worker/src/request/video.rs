@@ -297,6 +297,53 @@ fn admitted_canvases(offered: &[Canvas], configured: &[Canvas]) -> Result<Vec<Ca
     Ok(configured.to_vec())
 }
 
+/// The first default text capacity, in prompt tokens: a short prompt pads to
+/// it alone.
+const TEXT_CAPACITY_FIRST: u32 = 1024;
+
+/// The step, in prompt tokens, of the default text capacities above the
+/// first. A request's layout holds at most one step of padding rows beyond
+/// its prompt's tiles.
+const TEXT_CAPACITY_STEP: u32 = 2048;
+
+/// The prompt capacities, in tokens, a deployment prepares layouts for, in
+/// increasing order.
+///
+/// The prompt capacity `max_text_tokens` (`--max-model-len`) is always the
+/// largest. `listed` (`--video-text-capacities`) names the capacities below
+/// it; a listed capacity equal to it repeats the largest. Without a list the
+/// capacities are [`TEXT_CAPACITY_FIRST`], then steps of
+/// [`TEXT_CAPACITY_STEP`] below the prompt capacity.
+///
+/// Fails, as an invalid setting, for a listed capacity of zero or one above
+/// the prompt capacity.
+fn prompt_capacities(listed: &[u32], max_text_tokens: u32) -> Result<Vec<u32>> {
+    if listed
+        .iter()
+        .any(|&tokens| tokens == 0 || tokens > max_text_tokens)
+    {
+        return Err(Error::Invalid(format!(
+            "video text capacities must be positive and not exceed the prompt capacity \
+             {max_text_tokens}, got {listed:?}"
+        )));
+    }
+    let below: Vec<u32> = if listed.is_empty() {
+        std::iter::once(TEXT_CAPACITY_FIRST)
+            .chain((TEXT_CAPACITY_STEP..max_text_tokens).step_by(TEXT_CAPACITY_STEP as usize))
+            .filter(|&tokens| tokens < max_text_tokens)
+            .collect()
+    } else {
+        listed.to_vec()
+    };
+    let mut capacities: Vec<u32> = below
+        .into_iter()
+        .chain(std::iter::once(max_text_tokens))
+        .collect();
+    capacities.sort_unstable();
+    capacities.dedup();
+    Ok(capacities)
+}
+
 /// The order a deployment prepares its canvases in.
 ///
 /// The leading canvas is the one whose largest layout takes the most state
@@ -328,9 +375,10 @@ fn preparation_order(extents: &[CanvasExtent]) -> Vec<Canvas> {
 impl MediaPlan {
     /// Plan a deployment's admitted sizes on the loaded denoiser.
     ///
-    /// `requested` are the configured prompt capacities (default
-    /// `[1024, 2048, 4096, ...]` up to the prompt capacity), each mapped to
-    /// the text rows of its layout, capped at the largest layout's.
+    /// `requested` are the configured prompt capacities below the prompt
+    /// capacity `max_text_tokens`, which is always the largest
+    /// ([`prompt_capacities`]); each maps to the text rows of its layout,
+    /// capped at the largest layout's.
     /// `stated_rows` is the deployment's condition capacity
     /// (`--max-condition-rows`); without it the plan provisions the rows of
     /// the largest condition set the denoiser admits at the longest frame
@@ -404,21 +452,7 @@ impl MediaPlan {
         let leading = model.layout_size(&VideoSize::plain(longest, reference, max_text_tokens))?;
         let largest_text = leading.text_rows;
 
-        let requested: Vec<u32> = if requested.is_empty() {
-            std::iter::once(1024)
-                .chain((2048..max_text_tokens).step_by(2048))
-                .chain(std::iter::once(max_text_tokens))
-                .collect()
-        } else {
-            requested.to_vec()
-        };
-        if requested.contains(&0) || requested.iter().copied().max().unwrap_or(0) < max_text_tokens
-        {
-            return Err(Error::Invalid(
-                "text capacities must be positive and hold the prompt capacity".into(),
-            ));
-        }
-        let mut text_capacities = requested
+        let mut text_capacities = prompt_capacities(requested, max_text_tokens)?
             .iter()
             .map(|&tokens| {
                 let layout = model.layout_size(&VideoSize::plain(longest, reference, tokens))?;
@@ -1142,6 +1176,32 @@ mod tests {
             maximum: layout(canvases[0], 121, 2048),
             layouts,
             largest: Vec::new(),
+        }
+    }
+
+    /// The prompt capacity is the largest text capacity by construction: a
+    /// list names the capacities below it, an entry equal to it repeats it,
+    /// one above it is refused, and the default steps stop below it.
+    #[test]
+    fn the_prompt_capacity_is_the_largest_text_capacity() {
+        assert_eq!(
+            prompt_capacities(&[1024, 4096], 16384).unwrap(),
+            vec![1024, 4096, 16384]
+        );
+        assert_eq!(
+            prompt_capacities(&[1024, 10240, 16384], 16384).unwrap(),
+            vec![1024, 10240, 16384]
+        );
+        assert_eq!(
+            prompt_capacities(&[], 8192).unwrap(),
+            vec![1024, 2048, 4096, 6144, 8192]
+        );
+        assert_eq!(prompt_capacities(&[], 1000).unwrap(), vec![1000]);
+        for listed in [&[1024, 32768][..], &[0, 1024]] {
+            assert!(matches!(
+                prompt_capacities(listed, 16384),
+                Err(Error::Invalid(_))
+            ));
         }
     }
 
