@@ -120,6 +120,35 @@ impl MediaCall {
             Self::Muxing => "muxing",
         }
     }
+
+    /// The calls that read this call's products in a video request's graph,
+    /// in the order the graph consumes them.
+    ///
+    /// The engine plans a request's consumption from this table, and both
+    /// the engine and the worker derive from it which ranks back a
+    /// component's persistent products: the ranks that execute the
+    /// component and those that execute a reader of its products. A reader
+    /// of resident state ([`Self::reads_resident_state`]) reads the
+    /// denoiser's latent pages instead of a persistent product.
+    pub const fn readers(self) -> &'static [Self] {
+        match self {
+            Self::MediaReading => &[Self::VisionEncoding, Self::LatentEncoding],
+            Self::VisionEncoding => &[Self::TextEncoding],
+            Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
+            Self::LatentPreparation => &[Self::Denoising],
+            Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
+            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoEncoding => &[Self::Muxing],
+            Self::AudioDecoding => &[Self::AudioEncoding],
+            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+        }
+    }
+
+    /// Whether this call reads its predecessor's trajectory from the
+    /// denoiser's resident latent pages instead of a persistent product.
+    pub const fn reads_resident_state(self) -> bool {
+        matches!(self, Self::Denoising)
+    }
 }
 
 /// The storage action performed between concrete producers and consumers.

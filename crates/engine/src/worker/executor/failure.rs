@@ -220,7 +220,7 @@ impl WorkerExecutor {
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
             self.buffer_allocations
-                .retain(|(worker, _), _| *worker != index);
+                .retain(|(worker, _, _), _| *worker != index);
             for workers in self.buffer_workers.values_mut() {
                 workers.remove(&index);
             }

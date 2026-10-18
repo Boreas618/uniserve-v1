@@ -39,8 +39,8 @@ use uniserve_core::{
     SamplingParams, UnitId,
 };
 use uniserve_engine::{
-    CallReaders, EngineConfig, EngineCore, Executor, WorkerConfig, WorkerFailure, WorkerGroup,
-    WorkerProcessArgs,
+    CallReaders, EngineConfig, EngineCore, Executor, RankBuffer, WorkerConfig, WorkerFailure,
+    WorkerGroup, WorkerProcessArgs,
 };
 use uniserve_ipc::{
     ArRequestParams, Batch, BatchCommand, BlockTable, Bounds, BufferAllocation,
@@ -623,7 +623,7 @@ fn a_rank_group_reports_its_launch_and_refuses_work_after_close() -> anyhow::Res
 
     // A repeated batch is refused.
     assert!(matches!(
-        executor.submit_batch(retire, &CallReaders::new()),
+        executor.submit_placed(retire),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
 
@@ -633,10 +633,7 @@ fn a_rank_group_reports_its_launch_and_refuses_work_after_close() -> anyhow::Res
     assert!(!executor.is_ready());
     assert!(executor.poll_batch(Duration::ZERO)?.is_none());
     assert!(matches!(
-        executor.submit_batch(
-            lifecycle_batch(100, Vec::new(), vec![finish(first_key)]),
-            &CallReaders::new()
-        ),
+        executor.submit_placed(lifecycle_batch(100, Vec::new(), vec![finish(first_key)]),),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
     executor.close()?;
@@ -692,10 +689,11 @@ fn a_lost_rank_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::
 
     // Keep this rank from completing the batch before the test terminates it.
     let paused = PausedProcess::new(victim.try_into()?)?;
-    executor.submit_batch(
-        lifecycle_batch(3, vec![text_admission(22, 1, 2)?], Vec::new()),
-        &CallReaders::new(),
-    )?;
+    executor.submit_placed(lifecycle_batch(
+        3,
+        vec![text_admission(22, 1, 2)?],
+        Vec::new(),
+    ))?;
     paused.terminate()?;
     let loss = executor
         .poll_batch(Duration::from_secs(30))
@@ -887,7 +885,7 @@ fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
         UnitId(1),
         0,
     );
-    group.submit_batch(stalling, &CallReaders::new())?;
+    group.submit_placed(stalling)?;
     let failure = group
         .poll_batch(Duration::from_secs(30))
         .expect_err("a stalled lane must fail its group");
@@ -1102,7 +1100,7 @@ fn a_rank_group_samples_scores_and_retires_token_calls() -> anyhow::Result<()> {
     assert_eq!(first_record.cache_visible_len, 2);
 
     // A repeated or conflicting batch id is refused before submission.
-    assert!(executor.submit_batch(initial, &CallReaders::new()).is_err());
+    assert!(executor.submit_placed(initial).is_err());
 
     // A Finish for another epoch of the same request id leaves the resident
     // epoch in place: the continuation below still runs.
@@ -1383,7 +1381,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             forward: batch.forward,
             latent: None,
             decode: None,
-            buffers: batch.buffer_allocations,
+            buffers: on_every_rank(batch.buffer_allocations),
             readers: Default::default(),
         };
         executor.submit(ExecutionBatch::new(
@@ -2128,12 +2126,31 @@ fn worker_python() -> PathBuf {
         })
 }
 
+/// Places a batch's buffer spans at the same offsets on every rank of the
+/// groups these tests launch, which share one layout of their pools.
+fn on_every_rank(allocations: Vec<BufferAllocation>) -> Vec<RankBuffer> {
+    RankBuffer::on_every_rank(&allocations, WORLD_SIZE as u32)
+}
+
+/// Submission of a batch that carries its buffer spans, which a group takes
+/// beside the batch as a rank-by-rank placement.
+trait SubmitPlaced {
+    fn submit_placed(&mut self, batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError>;
+}
+
+impl SubmitPlaced for WorkerGroup {
+    fn submit_placed(&mut self, mut batch: Batch) -> Result<(), uniserve_engine::BatchSubmitError> {
+        let spans = on_every_rank(std::mem::take(&mut batch.buffer_allocations));
+        self.submit_batch(batch, &CallReaders::new(), &spans)
+    }
+}
+
 /// Submits one batch and waits up to 30 seconds for its result.
 fn execute(
     executor: &mut WorkerGroup,
     batch: Batch,
 ) -> anyhow::Result<uniserve_engine::WorkerResult> {
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     executor
         .poll_batch(Duration::from_secs(30))?
         .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
@@ -2247,9 +2264,8 @@ fn independent_components_complete_on_their_assigned_ranks() -> anyhow::Result<(
     assert_eq!(encode_report.results[0].output.status, CallStatus::Ok);
 
     // Closing a request releases every participating rank's physical storage.
-    worker.submit_batch(
+    worker.submit_placed(
         Batch::new(4, vec![], vec![]).with_commands(vec![finish(first_key), finish(second_key)]),
-        &CallReaders::new(),
     )?;
     let report = worker
         .poll_batch(Duration::from_secs(5))?
@@ -3065,12 +3081,12 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
 
     // Resubmitting batch 1 is refused because batch ids must increase; the
     // original submission stays in flight.
-    executor.submit_batch(slow.clone(), &CallReaders::new())?;
+    executor.submit_placed(slow.clone())?;
     assert!(matches!(
-        executor.submit_batch(slow, &CallReaders::new()),
+        executor.submit_placed(slow),
         Err(uniserve_engine::BatchSubmitError::Failed(_))
     ));
-    executor.submit_batch(fast, &CallReaders::new())?;
+    executor.submit_placed(fast)?;
     // This worker's component spans both ranks, so its ranks stay inside the
     // same collective and hold one batch in flight. The blocked batch is at
     // the head of the channel, so nothing behind it runs until its
@@ -3133,7 +3149,7 @@ fn an_unpublished_external_input_holds_its_batch_until_ready() -> anyhow::Result
         product: input,
         value: export.descriptor()?,
     });
-    executor.submit_batch(batch, &CallReaders::new())?;
+    executor.submit_placed(batch)?;
     let transferred = executor
         .poll_batch(Duration::from_secs(30))?
         .context("tensor input did not reach its component")?;
@@ -4374,7 +4390,7 @@ fn media_storage_is_owned_through_rank_result_validation() -> anyhow::Result<()>
             UnitId(1),
             0,
         );
-        worker.submit_batch(batch, &CallReaders::new())?;
+        worker.submit_placed(batch)?;
 
         // A correlation or rank-ownership failure may fail the poll and must
         // deliver no result. A short extent still delivers the call's
@@ -4603,7 +4619,7 @@ fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
         product: predicate,
         value: export.descriptor()?,
     });
-    executor.submit_batch(gated, &CallReaders::new())?;
+    executor.submit_placed(gated)?;
     export.fail()?;
     let failed = executor
         .poll_batch(Duration::from_secs(30))?
@@ -4715,7 +4731,7 @@ fn place(
                 forward: batch.forward,
                 latent: batch.latent_params.into_iter().next(),
                 decode: batch.decode_ranges.into_iter().next(),
-                buffers: batch.buffer_allocations,
+                buffers: on_every_rank(batch.buffer_allocations),
                 readers: Default::default(),
             },
         )],

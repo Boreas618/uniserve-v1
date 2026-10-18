@@ -111,10 +111,12 @@ impl Scheduler {
             .map(|(id, worker)| {
                 (
                     id.clone(),
-                    MediaStorage {
-                        requests: RequestPool::new(worker.request_slots as usize),
-                        buffers: BufferPool::new(worker.buffer_pool_bytes),
-                    },
+                    MediaStorage::new(
+                        worker.request_slots as usize,
+                        &executor.info().rank_buffer_bytes(id),
+                        &worker.components,
+                        &info.media_components,
+                    ),
                 )
             })
             .collect();

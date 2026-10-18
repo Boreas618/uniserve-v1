@@ -1413,6 +1413,29 @@ fn batch_inputs_require_a_consumer_for_their_payload_kind() {
 }
 
 #[test]
+fn a_group_batch_is_unplaced_and_each_rank_projection_is_placed() {
+    let mut call = call_for(CallKind::Transfer(TransferMode::Tensor), CallId::new(1, 0));
+    let input = output_product(CallId::new(9, 0));
+    let output = output_product(CallId::new(1, 0));
+    call.bounds.max_transfer_bytes = input.max_bytes();
+    call.inputs = vec![input];
+    call.outputs = vec![output];
+
+    // A rank's batch names the span of every persistent output in that
+    // rank's own pool.
+    let placed = batch_with_calls(1, Vec::new(), vec![call]);
+    assert_eq!(placed.buffer_allocations.len(), 1);
+    placed.validate().unwrap();
+
+    // A group's batch is validated before any rank's spans are chosen.
+    let mut unplaced = placed.clone();
+    unplaced.buffer_allocations.clear();
+    assert!(unplaced.validate().is_err());
+    unplaced.validate_unplaced().unwrap();
+    assert!(placed.validate_unplaced().is_err());
+}
+
+#[test]
 fn batch_rejects_two_calls_for_one_request() {
     let batch = Batch {
         batch_id: 1,

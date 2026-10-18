@@ -194,7 +194,7 @@ fn host_rank(capacity: usize) -> Result<Executor> {
         vec![MemoryKind::Host],
         0,
         0,
-        BufferPool::allocate(1024, false, &[MemoryKind::Host])?,
+        BufferPool::allocate(1024, &[MemoryKind::Host])?,
         Arc::clone(&events),
     )?;
     let options = TransportOptions {

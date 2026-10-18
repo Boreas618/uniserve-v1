@@ -1124,7 +1124,7 @@ mod tests {
             vec![HOST],
             values.len() + 1,
             1,
-            BufferPool::allocate(1024, false, &[HOST])?,
+            BufferPool::allocate(1024, &[HOST])?,
             EventPool::new(),
         )?;
         let mut calls = Vec::new();

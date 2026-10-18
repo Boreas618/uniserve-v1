@@ -30,7 +30,7 @@ use std::time::Duration;
 use super::{BatchSubmitError, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -188,8 +188,9 @@ pub struct WorkerExecutor {
     /// call, until the buffer is freed or its request finishes without
     /// retaining it.
     buffer_routes: HashMap<BufferId, BufferRoute>,
-    /// Persistent buffer addresses are local to a physical Worker address space.
-    buffer_allocations: HashMap<(usize, BufferId), BufferAllocation>,
+    /// Persistent buffer addresses are local to the buffer pool of one rank of
+    /// a physical Worker, keyed by worker index, rank, and buffer.
+    buffer_allocations: HashMap<(usize, u32, BufferId), BufferAllocation>,
     /// Every worker that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     /// Tensor exports returned by producing workers, merged across the
@@ -212,6 +213,35 @@ pub struct WorkerExecutor {
     /// with `WouldBlock` until `poll` returns it.
     pending_failure: Option<WorkerFailure>,
     closed: bool,
+}
+
+/// Returns the spans a destination's ranks read a persistent dependency at.
+///
+/// A routed destination may reserve its own spans, which take precedence.
+/// Without one, a rank takes the span the producer's rank of that index held;
+/// the runtime's shared pool places a span at one offset on every rank, so a
+/// destination rank the producer's pool did not cover takes the offset the
+/// producer's ranks share. Empty when neither side holds a span.
+fn dependency_spans(
+    own: Vec<RankBuffer>,
+    produced: Vec<RankBuffer>,
+    ranks: u32,
+) -> Vec<RankBuffer> {
+    if !own.is_empty() {
+        return own;
+    }
+    let Some(first) = produced.first().copied() else {
+        return Vec::new();
+    };
+    (0..ranks)
+        .map(|rank| {
+            produced
+                .iter()
+                .find(|span| span.rank == rank)
+                .copied()
+                .unwrap_or(RankBuffer { rank, ..first })
+        })
+        .collect()
 }
 
 impl WorkerExecutor {
@@ -262,6 +292,17 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // Each rank reports the buffer bytes it backs.
+        executor_info.rank_buffer_bytes = workers
+            .iter()
+            .map(|(id, worker)| {
+                let bytes = (0..)
+                    .map_while(|rank| worker.rank_info(rank))
+                    .map(|info| info.buffer_pool_bytes)
+                    .collect();
+                (id.clone(), bytes)
+            })
+            .collect();
         // The video graph may span workers, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;
@@ -660,7 +701,7 @@ impl WorkerExecutor {
         let collective_seq = self.worker_collective_seqs[worker_index]
             .checked_add(1)
             .context("collective sequence space exhausted")?;
-        let mut wire = ExecutionBatch {
+        let (mut wire, mut rank_buffers) = ExecutionBatch {
             id: batch.id,
             requests: batch.requests.clone(),
             commands,
@@ -680,33 +721,44 @@ impl WorkerExecutor {
             {
                 continue;
             }
-            // A routed destination may reserve a different address from its
-            // producer, and that allocation takes precedence. Without one the
-            // producer's allocation is used.
-            let params = self
-                .buffer_allocations
-                .get(&(worker_index, *dependency))
-                .or_else(|| {
-                    let producer = self.buffer_routes.get(dependency)?;
-                    self.buffer_allocations
-                        .get(&(producer.worker_index, *dependency))
-                })
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "persistent dependency {:?} has no scheduler params",
-                        dependency
-                    )
-                })?;
-            if !wire
-                .buffer_allocations
-                .iter()
-                .any(|existing| existing.buffer == params.buffer)
-            {
-                wire.buffer_allocations.push(params);
+            // Spans are per rank, so each rank of the destination takes its
+            // own (`dependency_spans`).
+            let held = |worker: usize| {
+                let mut spans = self
+                    .buffer_allocations
+                    .iter()
+                    .filter(|((owner, _, buffer), _)| *owner == worker && buffer == dependency)
+                    .map(|((_, rank, _), allocation)| RankBuffer {
+                        rank: *rank,
+                        allocation: *allocation,
+                    })
+                    .collect::<Vec<_>>();
+                spans.sort_unstable_by_key(|span| span.rank);
+                spans
+            };
+            let produced = self
+                .buffer_routes
+                .get(dependency)
+                .map(|route| held(route.worker_index))
+                .unwrap_or_default();
+            let ranks = (0..)
+                .map_while(|rank| self.workers[worker_index].1.rank_info(rank))
+                .count();
+            let spans = dependency_spans(held(worker_index), produced, ranks as u32);
+            anyhow::ensure!(
+                !spans.is_empty(),
+                "persistent dependency {:?} has no scheduler params",
+                dependency
+            );
+            for span in spans {
+                if !rank_buffers.iter().any(|existing| {
+                    existing.rank == span.rank
+                        && existing.allocation.buffer == span.allocation.buffer
+                }) {
+                    rank_buffers.push(span);
+                }
             }
         }
-        wire.validate()?;
 
         // Drop every location whose source endpoint is not the current
         // incarnation of a bound rank.
@@ -743,7 +795,10 @@ impl WorkerExecutor {
                 Some(((call.request_key, call.call_id), readers))
             })
             .collect();
-        match self.workers[worker_index].1.submit_batch(wire, &readers) {
+        match self.workers[worker_index]
+            .1
+            .submit_batch(wire, &readers, &rank_buffers)
+        {
             Ok(()) => {}
             Err(BatchSubmitError::WouldBlock(_)) => return Ok(Dispatch::Deferred),
             Err(BatchSubmitError::Failed(error)) => {
@@ -1045,13 +1100,13 @@ impl Executor for WorkerExecutor {
                         .insert(call_worker);
                 }
                 for params in &placement.buffers {
-                    if let Some(existing) = self
-                        .buffer_allocations
-                        .insert((call_worker, params.buffer), *params)
-                    {
+                    if let Some(existing) = self.buffer_allocations.insert(
+                        (call_worker, params.rank, params.allocation.buffer),
+                        params.allocation,
+                    ) {
                         anyhow::ensure!(
-                            existing == *params,
-                            "buffer identity was assigned conflicting worker-local allocations"
+                            existing == params.allocation,
+                            "buffer identity was assigned conflicting rank-local allocations"
                         );
                     }
                 }
@@ -1060,7 +1115,7 @@ impl Executor for WorkerExecutor {
                         placement
                             .buffers
                             .iter()
-                            .any(|params| params.buffer == output.buffer_id()),
+                            .any(|params| params.allocation.buffer == output.buffer_id()),
                         "persistent product {:?} has no scheduler params",
                         output
                     );
@@ -1341,5 +1396,60 @@ impl Executor for WorkerExecutor {
             }
             first_error.map_or(Ok(()), Err)
         })
+    }
+}
+
+#[cfg(test)]
+mod dependency_span_tests {
+    use super::dependency_spans;
+    use crate::executor::RankBuffer;
+    use uniserve_core::RequestId;
+    use uniserve_ipc::{BufferAllocation, BufferId, CallId, RequestKey};
+
+    fn span(rank: u32, offset: u64) -> RankBuffer {
+        RankBuffer {
+            rank,
+            allocation: BufferAllocation {
+                buffer: BufferId {
+                    owner: RequestKey::new(1, RequestId(1), 1),
+                    producer_call_id: CallId::new(1, 0),
+                    output_index: 0,
+                    generation: 1,
+                },
+                offset,
+                bytes: 256,
+            },
+        }
+    }
+
+    #[test]
+    fn a_destination_that_reserved_its_own_spans_reads_them() {
+        let own = vec![span(0, 512), span(1, 1024)];
+        let produced = vec![span(0, 0)];
+
+        assert_eq!(dependency_spans(own.clone(), produced, 2), own);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producers_pool_did_not_cover_takes_the_shared_offset() {
+        // The producer ran on one rank; the destination has three.
+        let spans = dependency_spans(Vec::new(), vec![span(0, 768)], 3);
+
+        assert_eq!(spans, vec![span(0, 768), span(1, 768), span(2, 768)]);
+    }
+
+    #[test]
+    fn a_destination_rank_the_producer_covered_takes_that_ranks_span() {
+        let produced = vec![span(0, 0), span(1, 256)];
+
+        assert_eq!(
+            dependency_spans(Vec::new(), produced, 3),
+            vec![span(0, 0), span(1, 256), span(2, 0)]
+        );
+    }
+
+    #[test]
+    fn a_dependency_no_pool_placed_has_no_span() {
+        assert!(dependency_spans(Vec::new(), Vec::new(), 2).is_empty());
     }
 }

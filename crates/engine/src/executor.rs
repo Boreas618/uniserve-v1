@@ -34,7 +34,7 @@ use uniserve_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RequestPlacement};
+pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
 
 /// Concrete pool information reported through the execution boundary.
 #[derive(Debug, Clone)]
@@ -49,6 +49,16 @@ pub struct ExecutorInfo {
     /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
+    /// For each pool, the persistent buffer bytes each of its ranks backs,
+    /// in rank order, as the ranks reported them. Each rank has its own
+    /// buffer pool, sized to the products of the components it executes and
+    /// of the components that read them, so the engine places a pool's
+    /// media buffers rank by rank.
+    ///
+    /// `WorkerExecutor::try_new` fills this from its ranks; a pool absent
+    /// from it, as `single` and `from_workers` leave every pool, has
+    /// `world_size` ranks that each back its reported `buffer_pool_bytes`.
+    pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
 }
 
 impl ExecutorInfo {
@@ -88,7 +98,26 @@ impl ExecutorInfo {
         Ok(Self {
             workers: pools,
             video_codecs: BTreeMap::new(),
+            rank_buffer_bytes: BTreeMap::new(),
         })
+    }
+
+    /// The persistent buffer bytes each rank of `worker` backs, in rank
+    /// order; empty for a pool this info does not hold.
+    pub fn rank_buffer_bytes(&self, worker: &WorkerId) -> Vec<u64> {
+        if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
+            return bytes.clone();
+        }
+        self.workers
+            .iter()
+            .find(|(id, _)| id == worker)
+            .map(|(_, info)| vec![info.buffer_pool_bytes; info.world_size.max(1) as usize])
+            .unwrap_or_default()
+    }
+
+    /// The ranks `worker` holds; one for a pool this info does not hold.
+    pub fn rank_count(&self, worker: &WorkerId) -> usize {
+        self.rank_buffer_bytes(worker).len().max(1)
     }
 
     /// Resolves which component serves each media call across every worker.
@@ -1422,6 +1451,7 @@ mod tests {
                 (WorkerId("host".to_owned()), host),
             ],
             video_codecs: BTreeMap::new(),
+            rank_buffer_bytes: BTreeMap::new(),
         };
         let routing = info.media_routing().expect("the union is complete");
         assert_eq!(routing.len(), 8);
@@ -1458,6 +1488,7 @@ mod tests {
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],
                 video_codecs: BTreeMap::new(),
+                rank_buffer_bytes: BTreeMap::new(),
             }
         };
 
@@ -1490,6 +1521,7 @@ mod tests {
                 (WorkerId("host".to_owned()), host),
             ],
             video_codecs: BTreeMap::new(),
+            rank_buffer_bytes: BTreeMap::new(),
         };
         let message = info
             .media_routing()
@@ -1504,6 +1536,7 @@ mod tests {
                 (WorkerId("other".to_owned()), other),
             ],
             video_codecs: BTreeMap::new(),
+            rank_buffer_bytes: BTreeMap::new(),
         };
         let message = info
             .media_routing()
