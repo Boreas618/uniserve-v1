@@ -1787,7 +1787,6 @@ fn full_image() -> ImageParams {
         height: 1024,
         width: 768,
         seed: Some(77),
-        max_images: 2,
     }
 }
 

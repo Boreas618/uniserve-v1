@@ -644,9 +644,6 @@ impl Default for SamplingParams {
 }
 
 /// Image-generation parameters bounded for scheduler admission.
-///
-/// `max_images` limits the total media work and feedback resources reachable by
-/// one request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageParams {
     /// Number of denoising steps.
@@ -669,8 +666,6 @@ pub struct ImageParams {
     pub width: u32,
     /// Optional deterministic diffusion seed.
     pub seed: Option<u64>,
-    /// Maximum images this request may generate.
-    pub max_images: u16,
 }
 
 impl ImageParams {
@@ -761,9 +756,6 @@ pub enum ImageParamsError {
         /// Maximum supported scale.
         max: f32,
     },
-    /// A request that may generate images allows none.
-    #[error("max_images must be at least 1")]
-    MaxImages,
     /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
     NonFinite {
@@ -918,10 +910,6 @@ impl ImageParams {
                 hi: self.cfg_interval.1,
             });
         }
-
-        if self.max_images == 0 {
-            return Err(ImageParamsError::MaxImages);
-        }
         Ok(())
     }
 }
@@ -940,7 +928,6 @@ impl Default for ImageParams {
             height: 512,
             width: 512,
             seed: None,
-            max_images: 1,
         }
     }
 }
@@ -1120,15 +1107,6 @@ mod tests {
         assert!(matches!(
             neg_scale.validate(),
             Err(ImageParamsError::CfgScale { .. })
-        ));
-
-        let zero_images = ImageParams {
-            max_images: 0,
-            ..Default::default()
-        };
-        assert!(matches!(
-            zero_images.validate(),
-            Err(ImageParamsError::MaxImages)
         ));
     }
 

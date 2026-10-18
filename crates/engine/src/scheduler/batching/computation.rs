@@ -728,8 +728,7 @@ impl Scheduler {
         }
         // Disallow unavailable transitions before sampling. The sampled token,
         // its scores, and any device-resident successor input must agree.
-        if (!state.req.generates_images()
-            || projected_images_done >= state.req.image.max_images as usize)
+        if (!state.req.generates_images() || projected_images_done >= state.req.max_images as usize)
             && let Some(trigger) = state.req.image_generation.trigger.direct_token()
         {
             suppress.push(trigger);
@@ -738,7 +737,7 @@ impl Scheduler {
         suppress.dedup();
 
         let transition_token_ids = (state.req.generates_images()
-            && projected_images_done < state.req.image.max_images as usize)
+            && projected_images_done < state.req.max_images as usize)
             .then(|| state.req.image_generation.trigger.direct_token())
             .flatten()
             .into_iter()

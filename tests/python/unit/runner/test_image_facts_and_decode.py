@@ -57,9 +57,7 @@ def _tokenizer():
         "[UNK]": 0,
         "user": 1,
         "assistant": 2,
-        "positive": 3,
         "negative": 4,
-        "conditioned": 5,
         "unconditional": 6,
     }
     backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
@@ -68,48 +66,38 @@ def _tokenizer():
 
 
 @pytest.mark.parametrize(
-    "source,positive,negative,expected",
+    "source,negative,expected",
     [
-        ("conditioning", " positive ", "negative", ((1, 3, 2, 5), False)),
-        ("conditioning", "  ", "negative", ((), True)),
-        (
-            "conditioning",
-            "\u001cpositive\u0085",
-            "negative",
-            ((1, 3, 2, 5), False),
-        ),
-        ("negative_or_start", "positive", " negative ", ((1, 4, 2, 6), False)),
-        ("start", "positive", "negative", ((1, 2, 6), False)),
+        ("negative_or_start", " negative ", (1, 4, 2, 6)),
+        ("negative_or_start", "\u001cnegative\u0085", (1, 4, 2, 6)),
+        ("start", "negative", (1, 2, 6)),
     ],
 )
-def test_prefixes_frame_their_source_text(source, positive, negative, expected):
+def test_prefixes_frame_their_source_text(source, negative, expected):
     prompt = FlowPrompt(
         user_prefix="user ",
         user_suffix=" assistant ",
         assistant_suffix="",
-        conditioned_append=" conditioned",
         unconditional_append=" unconditional",
     )
     tokenizer = _tokenizer()
     assert (
         resolve_prefix(
-            prompt,
-            lambda: tokenizer,
-            source,
-            image_prompt=positive,
-            negative_prompt=negative,
+            prompt, lambda: tokenizer, source, negative_prompt=negative
         )
         == expected
     )
 
 
-def test_unframed_models_reuse_their_context_and_refuse_overrides(loaded):
+def test_the_conditioned_branch_has_no_prefix():
+    with pytest.raises(ValueError, match="no prefix"):
+        resolve_prefix(None, lambda: None, "conditioning", negative_prompt="")
+
+
+def test_unframed_models_leave_their_prefixes_empty(loaded):
     model = loaded
-    # ``[reuses, *tokens]``: no tokens either way.
-    assert DenoiserRunner.guidance_prefix(model, "conditioning", "", "") == [1]
-    assert DenoiserRunner.guidance_prefix(model, "start", "", "") == [0]
-    with pytest.raises(Exception, match="prompt override"):
-        DenoiserRunner.guidance_prefix(model, "conditioning", "positive", "")
+    assert DenoiserRunner.guidance_prefix(model, "start") == []
+    assert DenoiserRunner.guidance_prefix(model, "negative_or_start") == []
 
 
 def test_decoded_images_fill_their_products_and_staging(loaded):

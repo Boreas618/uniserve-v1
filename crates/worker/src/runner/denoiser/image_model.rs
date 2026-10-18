@@ -10,8 +10,8 @@
 //! Two host functions complete the policy: `EncoderRunner.patch_grid` (the
 //! vision tower's patch grid of an image, which places its features),
 //! asked in jobs of the Python thread at input admission and kept, and
-//! `DenoiserRunner.guidance_prefix` (a guidance prefix's tokens, by the
-//! model's prompt framing and tokenizer).
+//! `DenoiserRunner.guidance_prefix` (an unconditional guidance prefix's
+//! tokens, by the model's prompt framing and tokenizer).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -373,60 +373,50 @@ impl ImagePolicy {
         Ok(())
     }
 
-    /// Record the call asking the prefix a guidance branch of `source`
-    /// conditions on: the job's completion carries `[reuses, *tokens]`,
-    /// which [`Self::prefix`] reads.
-    ///
-    /// The model is given no image prompt and no negative prompt: the
-    /// conditioning and negative sources' prefixes are what the admission
-    /// fixes ([`BranchSource::admitted`]), and no other source reads them.
+    /// Record the call asking the prefix tokens an unconditional guidance
+    /// branch of `source` conditions on; the job's completion carries them,
+    /// and [`Self::prefix`] reads them. Only a source no admission fixes is
+    /// asked ([`BranchSource::admitted`]): the conditioned branch reads the
+    /// request's own context and the negative branch the admitted negative
+    /// tokens, so the model frames no prompt text of the request.
     pub(crate) fn ask_prefix(&self, source: BranchSource, job: &Job) {
         job.call_returning(MethodCall::new(
             &self.guidance_prefix,
             vec![
                 Argument::Handle(self.loaded.clone()),
                 Argument::Text(source.name().to_owned()),
-                Argument::Text(String::new()),
-                Argument::Text(String::new()),
             ],
         ));
     }
 
-    /// The prefix the model frames for a guidance branch of `source` of a
-    /// request without an image prompt or a negative prompt, asked now on
-    /// the Python thread (startup work).
+    /// The prefix tokens the model frames for an unconditional guidance
+    /// branch of `source`, asked now on the Python thread (startup work).
     pub(crate) fn prefix_of(&self, source: BranchSource) -> Result<Prefix> {
         let text = |value: &str| tvm_ffi::Any::from(tvm_ffi::String::from(value));
-        let values = self.guidance_prefix.call_values(&[
-            self.loaded.to_any(),
-            text(source.name()),
-            text(""),
-            text(""),
-        ])?;
+        let values = self
+            .guidance_prefix
+            .call_values(&[self.loaded.to_any(), text(source.name())])?;
         let values = integers(values)
             .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?;
         self.prefix(&values)
     }
 
-    /// The prefix a prefix call returned as `[reuses, *tokens]`.
+    /// The prefix whose tokens a prefix call returned.
     pub(crate) fn prefix(&self, values: &[i64]) -> Result<Prefix> {
-        let (reuses, tokens) = values.split_first().ok_or_else(|| {
-            Error::Interface(format!(
-                "{} returns [reuses, *tokens]",
-                self.guidance_prefix.name()
-            ))
-        })?;
-        let tokens = tokens
+        let tokens = values
             .iter()
             .map(|&token| {
                 u32::try_from(token).map_err(|_| {
-                    Error::Interface("guidance prefix token is outside the token range".into())
+                    Error::Interface(format!(
+                        "{} returns a token outside the token range",
+                        self.guidance_prefix.name()
+                    ))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Prefix {
             tokens: Arc::from(tokens),
-            reuses_conditioning: *reuses != 0,
+            reuses_conditioning: false,
         })
     }
 }

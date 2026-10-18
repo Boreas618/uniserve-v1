@@ -88,6 +88,7 @@ fn main() -> anyhow::Result<()> {
             constraint,
             sampling: SamplingParams::default(),
             image,
+            max_images: 1,
             max_und_tokens: 20,
             include_stop_token: false,
             stop_strings: Vec::new(),
