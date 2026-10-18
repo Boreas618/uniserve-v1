@@ -1471,7 +1471,6 @@ fn token_batch(
     call.component = "model".into();
     call.bounds = Bounds {
         max_tokens: tokens.len().max(1) as u32,
-        max_cache_units: u32::from(prefix_length == 0),
         ..Bounds::default()
     };
     let input_length = tokens.len() as u32;
@@ -2906,7 +2905,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     retained.encoder_output = Some(target.clone());
     retained.bounds = Bounds {
         max_transfer_bytes: feature.max_bytes(),
-        max_latent_bytes: feature.max_bytes(),
         ..Bounds::default()
     };
     let mut retained = Batch::new(15, vec![next], vec![retained]);
@@ -3405,7 +3403,6 @@ mod trajectory {
         call.input_token_ids = PROMPT.to_vec();
         call.bounds = Bounds {
             max_tokens: PROMPT.len() as u32,
-            max_cache_units: 1,
             ..Bounds::default()
         };
         let mut batch = single(batch_id, call);
@@ -3514,7 +3511,6 @@ mod trajectory {
         call.image_index = Some(1);
         call.bounds = Bounds {
             max_tokens: 1,
-            max_latent_bytes: LATENT_BYTES,
             ..Bounds::default()
         };
         let mut batch = single(batch_id, call);
@@ -3548,7 +3544,6 @@ mod trajectory {
         call.completion_output = Some(output(key, batch_id, 1, generation, DType::U8));
         call.bounds = Bounds {
             max_tokens: 1,
-            max_latent_bytes: LATENT_BYTES,
             ..Bounds::default()
         };
         let mut batch = single(batch_id, call);
@@ -4788,7 +4783,6 @@ fn encode_call(request_key: RequestKey, batch_id: u64, feature: &TensorRef) -> C
     call.input_image = Some(IMAGE.into());
     call.bounds = Bounds {
         max_tokens: 64,
-        max_latent_bytes: 8192,
         ..Bounds::default()
     };
     call

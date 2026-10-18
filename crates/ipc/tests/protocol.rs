@@ -75,7 +75,6 @@ fn ar_decode_call() -> Call {
         code: kind,
         bounds: Bounds {
             max_tokens: 1,
-            max_cache_units: 1,
             ..Bounds::default()
         },
         inputs: Vec::new(),
@@ -423,7 +422,8 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
             });
             next_buffer_offset += bytes;
         }
-        let capacity_units = call.bounds.max_cache_units;
+        // Each forward call holds one fresh cache unit.
+        let capacity_units = u32::from(matches!(call.code, CallKind::Forward(_)));
         if capacity_units > 0 {
             // The request id doubles as the request pool slot, which forward
             // rows, block tables, and unit allocations require to be positive.
@@ -1881,10 +1881,9 @@ fn comprehensive_batches() -> Vec<Batch> {
             code: kind,
             bounds: Bounds {
                 max_tokens: 7 + index as u32,
-                max_cache_units: 3,
-                max_latent_bytes: 1 << 20,
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
+                ..Bounds::default()
             },
             inputs: vec![tensor_for(
                 key,
