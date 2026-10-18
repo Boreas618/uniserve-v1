@@ -16,12 +16,14 @@
 //!    capability runtimes on the plan and handed to the backend.
 //! 7. The executor and the profiler.
 //!
-//! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]),
-//! [`Worker::run`] serves the channel, and [`Worker::close`] consumes the
-//! rank and releases its owners in dependency order: execution, runners,
-//! streams, requests, the process world, then deferred device memory. The
-//! launch closes every rank that started, unless the rank abandoned work
-//! its threads may wait in for good, which ends the process at once.
+//! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]) before the
+//! rank reports; the engine then warms the serving path with real requests
+//! of the shapes the report states. [`Worker::run`] serves the channel, and
+//! [`Worker::close`] consumes the rank and releases its owners in dependency
+//! order: execution, runners, streams, requests, the process world, then
+//! deferred device memory. The launch closes every rank that started,
+//! unless the rank abandoned work its threads may wait in for good, which
+//! ends the process at once.
 
 mod loading;
 mod planning;
@@ -71,7 +73,7 @@ use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
-use crate::warmup::{Scenarios, WarmupHooks};
+use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, sequence_kind};
 
@@ -398,6 +400,22 @@ impl Worker {
             }
             _ => None,
         };
+        // The shapes the engine warms the serving path with, through its
+        // scheduler, once the rank reported.
+        let info = {
+            let mut info = info;
+            if let Some(image) = &image {
+                info.image_warmups = image
+                    .warmups(info.request_slots, info.latent_capacity_units())
+                    .map_err(phase("bind"))?;
+            }
+            info.diffusion_lm_step_rows = diffusion_lm
+                .iter()
+                .map(DiffusionLMRunner::step_rows)
+                .max()
+                .unwrap_or(0);
+            info
+        };
         let mut backend =
             WorkerBackend::new(info.clone(), config.rank, components).map_err(phase("storage"))?;
         backend.set_rank_storage(storage);
@@ -537,28 +555,12 @@ impl Worker {
                 hooks.capture(executor.backend_mut())?;
             }
         }
-        {
-            let mut scenarios = Scenarios::new(executor);
-            scenarios.lifecycle()?;
-            if cuda && !scenarios.backend().requests().has_open_requests()? {
-                for hooks in &mut self.hooks {
-                    hooks.scenarios(&mut scenarios)?;
-                }
-            }
-        }
         let backend = executor.backend();
         if backend.components().holds_host() {
             self.require_codecs()?;
         }
         self.complete_startup()?;
 
-        let executor = &mut self.executor;
-        if !executor.backend().requests().request_ids().is_empty() {
-            return Err(Error::State("startup completed with resident requests").into());
-        }
-        // Synthetic batches consumed ids and collective sequences; serving
-        // starts from the engine's first batch.
-        executor.reset()?;
         if let Some(budget) = &self.budget {
             checks::startup(
                 &self.config,

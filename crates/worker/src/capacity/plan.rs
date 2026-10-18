@@ -253,6 +253,8 @@ fn base_info(report: Report, config: &WorkerConfig, queue_depth: usize) -> Resul
         encoder_entry_bytes: 0,
         max_unresolved_calls: 0,
         host_lane_capacity: 1,
+        image_warmups: Vec::new(),
+        diffusion_lm_step_rows: 0,
     })
 }
 

@@ -80,6 +80,16 @@ impl DenoiserRunners {
         }
     }
 
+    /// The image denoiser's captured steps, largest first; empty without an
+    /// image denoiser on this rank or with flow graphs off.
+    pub(crate) fn flow_shapes(&self) -> &[FlowShape] {
+        if self.image.is_some() {
+            &self.flow
+        } else {
+            &[]
+        }
+    }
+
     /// Capture the image denoiser's configured steps over scratch prefix
     /// cache of `prefix_cache`, with their samples in the step workspace of
     /// `latents`, as jobs of the lane on `lanes` serving denoising; a last

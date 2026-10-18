@@ -583,7 +583,9 @@ pub struct ImageParams {
     pub width: u32,
     /// Optional deterministic diffusion seed.
     pub seed: Option<u64>,
-    /// Negative text conditioning prompt.
+    /// Negative prompt text as the client gave it. The tokens image guidance
+    /// conditions on are `GenerationRequest::negative_prompt_token_ids`,
+    /// which the server renders from it.
     pub negative_prompt: String,
     /// Maximum images this request may generate.
     pub max_images: u16,
@@ -608,6 +610,18 @@ impl ImageParams {
             2
         } else {
             3
+        }
+    }
+
+    /// Text and image guidance scales whose [`Self::cfg_branch_count`] is
+    /// `branches`: no guidance for one branch, text guidance for two, text
+    /// and image guidance for three. `None` outside `1..=3`.
+    pub fn guidance_scales(branches: u8) -> Option<(f32, f32)> {
+        match branches {
+            1 => Some((1.0, 1.0)),
+            2 => Some((4.0, 1.0)),
+            3 => Some((4.0, 2.0)),
+            _ => None,
         }
     }
 }
@@ -947,6 +961,23 @@ mod tests {
     #[test]
     fn image_params_default_is_valid() {
         assert!(ImageParams::default().validate().is_ok());
+    }
+
+    /// The scales of a branch count evaluate that many guidance branches.
+    #[test]
+    fn guidance_scales_realize_their_branch_count() {
+        for branches in 1..=3 {
+            let (cfg_text_scale, cfg_img_scale) = ImageParams::guidance_scales(branches).unwrap();
+            let image = ImageParams {
+                cfg_text_scale,
+                cfg_img_scale,
+                ..ImageParams::default()
+            };
+            assert_eq!(image.cfg_branch_count(), branches);
+            assert!(image.validate().is_ok());
+        }
+        assert_eq!(ImageParams::guidance_scales(0), None);
+        assert_eq!(ImageParams::guidance_scales(4), None);
     }
 
     #[test]

@@ -406,6 +406,33 @@ impl WorkerGroup {
             .min()
             .unwrap_or(info.buffer_pool_bytes);
 
+        // A rank states the shapes the engine warms only for what it holds:
+        // the image denoiser's ranks its image shapes, a diffusion LM's ranks
+        // its step rows, every other rank none. The group's are those its
+        // stating ranks agree on.
+        let mut image_warmups = Vec::new();
+        let mut diffusion_lm_step_rows = 0;
+        for (rank, worker) in workers.iter().enumerate() {
+            let stated = worker.info();
+            if !stated.image_warmups.is_empty() {
+                anyhow::ensure!(
+                    image_warmups.is_empty() || image_warmups == stated.image_warmups,
+                    "physical rank {rank} states other image warmup shapes than another denoiser rank"
+                );
+                image_warmups.clone_from(&stated.image_warmups);
+            }
+            if stated.diffusion_lm_step_rows > 0 {
+                anyhow::ensure!(
+                    diffusion_lm_step_rows == 0
+                        || diffusion_lm_step_rows == stated.diffusion_lm_step_rows,
+                    "physical rank {rank} states other diffusion LM step rows than another rank"
+                );
+                diffusion_lm_step_rows = stated.diffusion_lm_step_rows;
+            }
+        }
+        info.image_warmups = image_warmups;
+        info.diffusion_lm_step_rows = diffusion_lm_step_rows;
+
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.info();
             rank_info

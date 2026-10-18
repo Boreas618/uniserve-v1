@@ -24,6 +24,7 @@ mod sim;
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
 pub mod storage;
+mod warmup;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};
@@ -35,7 +36,7 @@ pub use crate::executor::{
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
-    StreamCancelCause, SubmitError,
+    StreamCancelCause, Submission, SubmitError,
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{

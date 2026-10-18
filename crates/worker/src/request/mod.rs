@@ -149,12 +149,6 @@ impl RequestPool {
         self.requests.get(&request_id)
     }
 
-    pub(crate) fn request_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<_> = self.requests.keys().copied().collect();
-        ids.sort_unstable();
-        ids
-    }
-
     pub(crate) fn has_open_requests(&self) -> Result<bool> {
         for request in self.requests.values() {
             let state = request.state()?;

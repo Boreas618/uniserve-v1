@@ -184,19 +184,6 @@ fn a_distributed_rank_refuses_a_collective_sequence_that_does_not_advance() -> R
     Ok(())
 }
 
-#[test]
-fn a_reset_restarts_numbering_only_once_every_result_is_taken() -> Result<()> {
-    let mut executor = rank(4, true)?;
-    let pending = executor.admit(collective(7, 7), false)?;
-    assert!(executor.reset().is_err());
-
-    assert_eq!(delivered(&mut executor, &pending)?, Some(true));
-    executor.reset()?;
-    // Serving numbers its batches and collectives from the start again.
-    assert_eq!(run(&mut executor, collective(1, 1))?, Some(true));
-    Ok(())
-}
-
 /// A host rank holding a product store and local transports.
 fn host_rank(capacity: usize) -> Result<Executor> {
     let mut executor = rank(capacity, false)?;

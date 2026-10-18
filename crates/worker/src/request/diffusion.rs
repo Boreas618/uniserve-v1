@@ -12,8 +12,11 @@
 //! the request's own context; the unconditional branches to prefixes the
 //! scheduler placed in other request slots, which the runtime prefills the
 //! first time a branch is evaluated. A prefix's tokens are resolved once
-//! per source (`image.guidance_prefix`, the model's prompt framing and
-//! tokenizer) when the trajectory opens and kept with it; its physical
+//! per source when the trajectory opens and kept with it: the negative
+//! source's are the request's admitted negative tokens, which the engine
+//! sized that prefix's cache from ([`BranchSource::admitted`]), and the
+//! model frames the others (`image.guidance_prefix`, its prompt framing
+//! and tokenizer). A prefix's physical
 //! coordinates are resolved again for every submitted denoising call,
 //! because the scheduler may place a later interval's prefixes in other
 //! slots.
@@ -104,7 +107,9 @@ impl BranchSet {
 pub(crate) enum BranchSource {
     /// The image prompt, or the request's own context when blank.
     Conditioning,
-    /// The negative prompt (or admitted negative tokens), else the start.
+    /// The negative prompt. In serving its prefix is the request's admitted
+    /// negative tokens ([`Self::admitted`]); the model frames an empty
+    /// negative prompt as the start of a conversation.
     NegativeOrStart,
     /// The bare start of a conversation.
     Start,
@@ -128,6 +133,23 @@ impl BranchSource {
             Self::NegativeOrStart => "negative_or_start",
             Self::Start => "start",
         }
+    }
+
+    /// The prefix a branch of this source conditions on that the request's
+    /// admission fixes, given its admitted negative tokens `negative`; `None`
+    /// for a source the model frames.
+    ///
+    /// The negative source conditions on exactly the admitted tokens, also
+    /// when none were admitted. They are the request's final negative
+    /// conditioning tokens (`GenerationRequest::negative_prompt_token_ids`),
+    /// and the engine sizes the prefix's cache and its prefill from their
+    /// count, so a prefix the rank framed itself would not fit the slot the
+    /// engine placed it in.
+    pub(crate) fn admitted(self, negative: &[u32]) -> Option<Prefix> {
+        (self == Self::NegativeOrStart).then(|| Prefix {
+            tokens: Arc::from(negative),
+            reuses_conditioning: false,
+        })
     }
 }
 
@@ -505,6 +527,67 @@ mod tests {
             visible,
             capacity: 16,
         })
+    }
+
+    #[test]
+    fn the_negative_branch_conditions_on_exactly_the_admitted_tokens() -> Result<()> {
+        let given = BranchSource::NegativeOrStart.admitted(&[4, 5]);
+        assert_eq!(given.map(|prefix| prefix.tokens.to_vec()), Some(vec![4, 5]));
+        assert_eq!(BranchSource::Conditioning.admitted(&[4, 5]), None);
+        assert_eq!(BranchSource::Start.admitted(&[4, 5]), None);
+
+        // A request admitted without negative tokens: the engine reserves its
+        // alternative prefix no tokens and gives that branch's denoising row
+        // no context. The branch conditions on an empty prefix, which fits
+        // the slot and needs no prefill.
+        let empty = BranchSource::NegativeOrStart
+            .admitted(&[])
+            .ok_or_else(|| Error::State("the admission fixes no prefix for the negative source"))?;
+        assert!(empty.tokens.is_empty() && !empty.reuses_conditioning);
+        let mut trajectory = ImageTrajectory::new(
+            RequestKey::new(1, RequestId(7), 1),
+            (64, 64),
+            plan(&[3]),
+            [
+                (
+                    BranchSource::Conditioning,
+                    prefix(BranchSource::Conditioning),
+                ),
+                (BranchSource::NegativeOrStart, empty),
+            ]
+            .into(),
+        );
+        trajectory.begin_call(Coordinates {
+            slot: 3,
+            visible: 40,
+            capacity: 64,
+        });
+        let rows = [
+            ForwardSlot {
+                slot: 3,
+                seq_len: 41,
+                query_len: 1,
+            },
+            ForwardSlot {
+                slot: 5,
+                seq_len: 1,
+                query_len: 1,
+            },
+        ];
+        let fills = trajectory.resolve_branches(
+            BranchSet::from_mask(3)?,
+            BranchSource::Start,
+            &rows,
+            |slot, visible| {
+                Ok(Coordinates {
+                    slot,
+                    visible,
+                    capacity: 0,
+                })
+            },
+        )?;
+        assert!(fills.is_empty());
+        Ok(())
     }
 
     #[test]
