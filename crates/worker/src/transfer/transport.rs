@@ -312,8 +312,9 @@ impl Transport {
     /// memory) at `offset` in its logical tensor, for `consumers`'
     /// acknowledgment slots.
     ///
-    /// The export reserves its bytes before preparing backing; a successful
-    /// registration holds them until producer and consumer accesses retired.
+    /// `bytes` is this mechanism's share of the export's byte reservation,
+    /// which every mechanism publishing the same export shares; a successful
+    /// registration holds it until producer and consumer accesses retired.
     ///
     /// `stream` is what the export's device work is issued to: its fence,
     /// its copies into shared or pooled storage with the readiness mark
@@ -330,6 +331,7 @@ impl Transport {
         source: &Spans,
         offset: Option<&[u64]>,
         consumers: &[usize],
+        bytes: ByteReservation,
         stream: impl Issue,
     ) -> Result<Exported> {
         let view = ExportView::new(source, offset)?;
@@ -341,10 +343,9 @@ impl Transport {
             Backend::Shared { endpoint, .. } => endpoint.reap()?,
             Backend::Local { .. } | Backend::Channel { .. } => {}
         }
-        // The export's backing holds these bytes until it retires; a failed
-        // attempt returns them, except a VMM export whose producer stream
-        // could not drain, which retains them with everything it touched.
-        let bytes = ByteReservation::new(&self.capacity, view.nbytes)?;
+        // The export's backing holds its share until it retires; a failed
+        // attempt returns it, except a VMM export whose producer stream could
+        // not drain, which retains it with everything it touched.
 
         match &self.backend {
             Backend::Local { endpoint, next } => self
@@ -362,7 +363,7 @@ impl Transport {
                 |transport| Ok(view.locator(&self.source, transport)),
             ),
             Backend::Channel { name, .. } => {
-                // The location carries the bytes, so the budget covers only
+                // The location carries the bytes, so this share covers only
                 // the staging copy.
                 let result = self.export_channel(&view, name, stream);
                 bytes.release()?;

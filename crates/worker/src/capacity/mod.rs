@@ -133,8 +133,10 @@ pub(crate) struct ArenaCapacity {
     /// other products lie in the scheduler-placed buffer pool, which bounds
     /// them.
     pub device_product_bytes: u64,
-    /// The rank's transfer byte budget: bytes every export and read holds
-    /// until it retires, whether or not it occupies storage of its own.
+    /// The rank's transfer byte budget: bytes every exported product and
+    /// every read hold until they retire, whether or not they occupy storage
+    /// of their own. A product published through several mechanisms holds
+    /// its bytes once.
     pub transfer_bytes: u64,
     pub transfer_tickets: usize,
     /// Device bytes of the CUDA VMM export pool of the primary device, where

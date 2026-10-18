@@ -149,10 +149,18 @@ impl TransferCapacity {
     }
 }
 
-/// Bytes of a rank's transfer budget held by one export. The bytes return
-/// when the reservation is released or dropped: an attempt that fails on any
-/// path gives them back, and an export's backing keeps them until it retires.
+/// Bytes of a rank's transfer budget held by one export of a product. A
+/// product published through several mechanisms holds its bytes once: each
+/// mechanism's backing holds a share of the one reservation
+/// ([`Self::share`]). The bytes return when every share is released or
+/// dropped: an attempt that fails on any path gives its shares back, and an
+/// export's backings keep theirs until they retire.
 pub(crate) struct ByteReservation {
+    held: Arc<HeldBytes>,
+}
+
+/// The bytes a reservation's shares hold, returned when the last drops.
+struct HeldBytes {
     capacity: Arc<TransferCapacity>,
     bytes: u64,
 }
@@ -161,19 +169,35 @@ impl ByteReservation {
     pub(crate) fn new(capacity: &Arc<TransferCapacity>, bytes: u64) -> Result<Self> {
         capacity.acquire(bytes)?;
         Ok(Self {
-            capacity: Arc::clone(capacity),
-            bytes,
+            held: Arc::new(HeldBytes {
+                capacity: Arc::clone(capacity),
+                bytes,
+            }),
         })
     }
 
-    /// Return the bytes, reporting an accounting failure to the caller.
-    pub(crate) fn release(mut self) -> Result<()> {
-        let bytes = std::mem::take(&mut self.bytes);
-        self.capacity.release(bytes)
+    /// Another share of the same bytes, for another mechanism's backing of
+    /// the same export.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            held: Arc::clone(&self.held),
+        }
+    }
+
+    /// Give up this share; the last share returns the bytes, reporting an
+    /// accounting failure to the caller.
+    pub(crate) fn release(self) -> Result<()> {
+        match Arc::try_unwrap(self.held) {
+            Ok(mut held) => {
+                let bytes = std::mem::take(&mut held.bytes);
+                held.capacity.release(bytes)
+            }
+            Err(_) => Ok(()),
+        }
     }
 }
 
-impl Drop for ByteReservation {
+impl Drop for HeldBytes {
     fn drop(&mut self) {
         if self.bytes == 0 {
             return;
