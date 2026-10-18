@@ -2543,7 +2543,6 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
             ImageParams {
                 steps: 2,
                 max_images: 1,
-                retain_images: false,
                 ..Default::default()
             },
             GenerationConstraint::Default,
@@ -2843,7 +2842,6 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
         ImageParams {
             steps: 3,
             max_images: 1,
-            retain_images: true,
             ..Default::default()
         },
         GenerationConstraint::Default,

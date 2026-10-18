@@ -139,7 +139,6 @@ pub(super) fn preprocess_sensenova(
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
         generation.sampling.seed,
-        generation.constraint,
     )?;
     let mut multimodal_inputs = prepare_image_inputs(
         prompt_token_ids.len(),
@@ -219,7 +218,6 @@ pub(super) fn preprocess_bagel(
         &profile.resolution_policy,
         image_gen.unwrap_or_default(),
         generation.sampling.seed,
-        generation.constraint,
     )?;
     let multimodal_inputs = prepare_image_inputs(
         prompt_token_ids.len(),
@@ -544,14 +542,12 @@ pub(super) fn prepare_generation_resources(
 ///
 /// Request fields override profile defaults field by field. The sampling seed
 /// (already resolved from the image and text seeds) overrides the profile
-/// seed. Generated images are retained unless the request is image-only
-/// (`GenerationConstraint::GenOnly`).
+/// seed.
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
     image: crate::serving::ImageGenControls,
     sampling_seed: Option<u64>,
-    constraint: GenerationConstraint,
 ) -> OmniResult<ImageParams> {
     let resolution = resolve_resolution(
         resolution_policy,
@@ -579,7 +575,6 @@ fn resolve_image_params(
         width: resolution.width,
         seed: sampling_seed.or(defaults.seed),
         max_images,
-        retain_images: constraint != GenerationConstraint::GenOnly,
     })
 }
 
