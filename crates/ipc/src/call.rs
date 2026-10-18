@@ -428,6 +428,23 @@ pub struct Call {
 }
 
 impl Call {
+    /// Element types of the scalar outputs one call relays through its
+    /// request slot's lane: the token (`token_output`), the completion and
+    /// the transition (`completion_output`, `transition_output`), which
+    /// [`Self::validate`] requires of them.
+    pub const RELAY_DTYPES: [DType; 3] = [DType::I64, DType::U8, DType::U8];
+
+    /// Bytes one request slot's lane holds of a call's relayed scalars.
+    ///
+    /// A rank sizes its request-relay arenas per (request slot, lane) row
+    /// from it.
+    pub fn relay_row_bytes() -> u64 {
+        Self::RELAY_DTYPES
+            .iter()
+            .map(|dtype| dtype.element_bytes())
+            .sum()
+    }
+
     /// Create a computation with no inputs or outputs and zero resource bounds.
     /// The caller fills its numerical coordinates and limits before submission.
     pub fn new(request_key: RequestKey, call_id: CallId, code: CallKind) -> Self {

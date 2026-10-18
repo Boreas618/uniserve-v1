@@ -9,6 +9,8 @@ pub(crate) mod device;
 pub(crate) mod plan;
 pub(crate) mod video;
 
+use uniserve_ipc::Call;
+
 use crate::{Error, Result};
 
 pub(crate) const DEFAULT_NUM_UNITS: u64 = 4096;
@@ -267,11 +269,8 @@ impl ArenaCapacity {
 
 /// Bytes of the product store's relay arenas: one lane per unresolved call
 /// and one retirement lane, for every request slot and the padding slot
-/// zero. Arenas are allocated per dtype and field of the scalar outputs
-/// calls declare, which the engine states with each call, so a rank cannot
-/// derive them before serving: the budget is 18 bytes per lane, two int64
-/// values and two one-byte flags, the scalar outputs of the calls the
-/// engine forms.
+/// zero. A lane holds one element of every scalar a call relays
+/// (`Call::RELAY_DTYPES`), in arenas allocated per dtype and field.
 fn relay_bytes(requests: usize, window: usize) -> u64 {
-    ((requests + 1) * (window + 1) * 18) as u64
+    ((requests + 1) * (window + 1)) as u64 * Call::relay_row_bytes()
 }
