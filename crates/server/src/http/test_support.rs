@@ -24,7 +24,7 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::{InputProcessor, ServedSamplingControl, ServingRuntime, WorkerCapabilities};
+use crate::serving::{InputProcessor, ServingRuntime, WorkerCapabilities};
 use uniserve_core::video::plan::VisionConfig;
 
 /// Served model name the simulated state answers to.
@@ -85,7 +85,6 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         Some(renderer),
         WorkerCapabilities {
             limits: client.generation_limits(),
-            sampling_controls: ServedSamplingControl::ALL.to_vec(),
             max_model_tokens: 4096,
         },
         video,

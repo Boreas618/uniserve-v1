@@ -44,9 +44,6 @@ pub enum TokenizeError {
         /// Effective maximum generated-token count.
         max_tokens: u32,
     },
-    /// The selected model path cannot report token log probabilities.
-    #[error("this model does not support logprobs")]
-    UnsupportedLogprobs,
     /// The request contains an invalid combination of serving controls.
     #[error("{0}")]
     Invalid(String),

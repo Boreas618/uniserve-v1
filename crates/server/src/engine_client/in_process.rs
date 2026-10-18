@@ -161,7 +161,6 @@ impl EngineClient {
                 || core.model_dtype() != first.model_dtype()
                 || core.runtime_family() != first.runtime_family()
                 || core.info().denoise_steps() != first.info().denoise_steps()
-                || core.supports_token_sampling() != first.supports_token_sampling()
             {
                 return Err(Error::ClientClosed {
                     message: "data-parallel replicas serve different models or limits".to_string(),
@@ -236,11 +235,6 @@ impl EngineClient {
     /// reported at startup; `None` for a model without one.
     pub fn video_denoiser(&self) -> Option<uniserve_engine::VideoDenoiserInfo> {
         self.first().info().video_denoiser.clone()
-    }
-
-    /// Returns whether the worker supports token sampling calls.
-    pub fn supports_token_sampling(&self) -> bool {
-        self.first().supports_token_sampling()
     }
 
     /// Returns the worker's effective model dtype.
