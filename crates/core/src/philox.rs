@@ -13,10 +13,11 @@
 //! Layout:
 //!
 //! - key = a `splitmix` fold of `(session_seed, engine_id, request_id,
-//!   epoch, draw_layout)`, split into two 32-bit words. A request's stream
-//!   ([`request_sampling_key`]) folds its seed alone when it has one, so a
-//!   seeded request draws the same values whenever it is sent, and its
-//!   lineage when it has none;
+//!   epoch, 0)`, split into two 32-bit words; the final zero is the draw
+//!   space of target sampling, the one stream keyed here. A request's
+//!   stream ([`request_sampling_key`]) folds its seed alone when it has
+//!   one, so a seeded request draws the same values whenever it is sent,
+//!   and its lineage when it has none;
 //! - counter = `[semantic_token_index low, semantic_token_index high,
 //!   processor_stage, draw_index]`;
 //! - uniform = `(word0 >> 8) * 2^-24`, a 24-bit dyadic value in `[0, 1)`.
@@ -27,13 +28,8 @@ const PHILOX_KEY_BUMP_0: u32 = 0x9E37_79B9;
 const PHILOX_KEY_BUMP_1: u32 = 0xBB67_AE85;
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Target-model sampling draw space.
-///
-/// Draw-space values isolate semantic streams so activity in one stream
-/// cannot shift another.
-pub const DRAW_LAYOUT_TARGET: u64 = 0;
-/// Draw-space identifier for diffusion flow noise.
-pub const DRAW_LAYOUT_FLOW_NOISE: u64 = 2;
+/// The draw space of target sampling, folded as a key's last coordinate.
+const TARGET_DRAW_SPACE: u64 = 0;
 
 /// Folds one semantic coordinate into an evolving key with SplitMix64 avalanche.
 fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
@@ -77,22 +73,16 @@ pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     counter
 }
 
-/// Derives the 64-bit Philox key for one request lineage and draw space.
-pub fn sampling_key(
-    session_seed: u64,
-    engine_id: u64,
-    request_id: u64,
-    request_epoch: u64,
-    draw_layout: u64,
-) -> u64 {
+/// Derives the 64-bit Philox key for one request lineage.
+pub fn sampling_key(session_seed: u64, engine_id: u64, request_id: u64, request_epoch: u64) -> u64 {
     // Fold coordinates in protocol order so the same tuple addresses the same
     // random stream in every runtime.
-    [engine_id, request_id, request_epoch, draw_layout]
+    [engine_id, request_id, request_epoch, TARGET_DRAW_SPACE]
         .into_iter()
         .fold(session_seed, splitmix_coordinate)
 }
 
-/// Derives the key of one request's stream in one draw space.
+/// Derives the key of one request's stream.
 ///
 /// A seeded request's stream is a function of its seed alone: sending the
 /// same request again, on any engine and under any request identity, draws
@@ -104,11 +94,10 @@ pub fn request_sampling_key(
     engine_id: u64,
     request_id: u64,
     request_epoch: u64,
-    draw_layout: u64,
 ) -> u64 {
     match seed {
-        Some(seed) => sampling_key(seed, 0, 0, 0, draw_layout),
-        None => sampling_key(0, engine_id, request_id, request_epoch, draw_layout),
+        Some(seed) => sampling_key(seed, 0, 0, 0),
+        None => sampling_key(0, engine_id, request_id, request_epoch),
     }
 }
 
@@ -159,7 +148,7 @@ mod tests {
     #[test]
     fn a_uniform_draw_stays_in_the_unit_interval() {
         for coordinate in 0..4096u64 {
-            let key = sampling_key(0x1234_5678_9abc_def0, 7, 11, 3, DRAW_LAYOUT_TARGET);
+            let key = sampling_key(0x1234_5678_9abc_def0, 7, 11, 3);
             let draw = sampling_uniform(key, coordinate, 0, 0);
             assert!((0.0..1.0).contains(&draw), "draw {draw} out of range");
         }
@@ -167,44 +156,29 @@ mod tests {
 
     #[test]
     fn a_seeded_request_stream_depends_on_its_seed_alone() {
-        let seeded = request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_TARGET);
-        assert_eq!(
-            seeded,
-            request_sampling_key(Some(7), 4, 5, 6, DRAW_LAYOUT_TARGET)
-        );
-        assert_ne!(
-            seeded,
-            request_sampling_key(Some(8), 1, 2, 3, DRAW_LAYOUT_TARGET)
-        );
-        assert_ne!(
-            seeded,
-            request_sampling_key(Some(7), 1, 2, 3, DRAW_LAYOUT_FLOW_NOISE)
-        );
+        let seeded = request_sampling_key(Some(7), 1, 2, 3);
+        assert_eq!(seeded, request_sampling_key(Some(7), 4, 5, 6));
+        assert_ne!(seeded, request_sampling_key(Some(8), 1, 2, 3));
         // Unseeded requests keep one stream per lineage.
-        let unseeded = request_sampling_key(None, 1, 2, 3, DRAW_LAYOUT_TARGET);
-        assert_eq!(
-            unseeded,
-            request_sampling_key(None, 1, 2, 3, DRAW_LAYOUT_TARGET)
-        );
-        assert_ne!(
-            unseeded,
-            request_sampling_key(None, 1, 5, 3, DRAW_LAYOUT_TARGET)
-        );
-        assert_ne!(
-            unseeded,
-            request_sampling_key(None, 1, 2, 4, DRAW_LAYOUT_TARGET)
-        );
+        let unseeded = request_sampling_key(None, 1, 2, 3);
+        assert_eq!(unseeded, request_sampling_key(None, 1, 2, 3));
+        assert_ne!(unseeded, request_sampling_key(None, 1, 5, 3));
+        assert_ne!(unseeded, request_sampling_key(None, 1, 2, 4));
     }
 
+    /// A seeded request draws the same values whenever it is sent, by any
+    /// build: its keys are fixed values of its coordinates (the cases of
+    /// `tests/python/generated/sampling_rng_parity.json`).
     #[test]
-    fn draw_layout_separates_the_target_and_flow_noise_spaces() {
-        let session_seed = 0x0102_0304_0506_0708;
-        let target = sampling_key(session_seed, 1, 2, 3, DRAW_LAYOUT_TARGET);
-        let noise = sampling_key(session_seed, 1, 2, 3, DRAW_LAYOUT_FLOW_NOISE);
-        assert_ne!(target, noise);
-        assert_ne!(
-            sampling_uniform(target, 5, 0, 0),
-            sampling_uniform(noise, 5, 0, 0)
-        );
+    fn a_request_key_is_a_fixed_function_of_its_coordinates() {
+        for (coordinates, key) in [
+            ((0, 0, 0, 0), 2_391_539_541_053_276_776_u64),
+            ((0, 7, 11, 3), 9_525_647_252_769_408_357),
+            ((1, 4_000_000_000, 5, 900), 2_683_534_742_688_207_316),
+            ((u64::MAX, 7, 11, 3), 7_685_010_690_696_164_484),
+        ] {
+            let (seed, engine, request, epoch) = coordinates;
+            assert_eq!(sampling_key(seed, engine, request, epoch), key);
+        }
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use uniserve_core::SamplingParams;
-use uniserve_core::philox::{DRAW_LAYOUT_TARGET, request_sampling_key, sampling_uniform};
+use uniserve_core::philox::{request_sampling_key, sampling_uniform};
 use uniserve_ipc::Call;
 
 use crate::Result;
@@ -111,7 +111,6 @@ impl SamplingControls {
                 call.request_key.engine_id,
                 call.request_key.request_id.0,
                 call.request_key.request_epoch,
-                DRAW_LAYOUT_TARGET,
             );
             Some(
                 positions
