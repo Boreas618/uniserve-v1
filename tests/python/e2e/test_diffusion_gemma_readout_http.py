@@ -12,6 +12,8 @@ back in the official shape. The tests check what a client observes:
 - a fact stated at the start of the prompt is read back at prompt lengths
   around the 1023-token sliding window and beyond it, where only the full
   attention layers still see it;
+- with one compact canvas per question, a state asked more questions than
+  the worker's widest readout graph holds answers every one of them;
 - attached images, one or eight, are read in ``x_images`` order;
 - a stream of distinct images longer than the encoder cache retains is read
   in full, each image answered after the cache fills.
@@ -80,10 +82,11 @@ def _checkpoint(precision: str) -> Path:
     return path
 
 
-@pytest.fixture(scope="module", params=sorted(CHECKPOINTS))
-def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
-    """Serve one precision's checkpoint; yield its URL and directory."""
-    checkpoint = _checkpoint(request.param)
+def _serve(
+    precision: str, tmp_path_factory, options: list[str]
+) -> Iterator[tuple[str, Path]]:
+    """Serve a checkpoint with extra `options`; yield its URL and directory."""
+    checkpoint = _checkpoint(precision)
     try:
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
@@ -107,11 +110,28 @@ def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
         python,
         "--max-model-len",
         "8192",
+        *options,
         *shlex.split(os.environ.get("UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS", "")),
     ]
-    log = tmp_path_factory.mktemp(request.param) / "server.log"
+    log = tmp_path_factory.mktemp(precision) / "server.log"
     with server_process(args, base_url, log, timeout_s=1800.0):
         yield base_url, checkpoint
+
+
+@pytest.fixture(scope="module", params=sorted(CHECKPOINTS))
+def served(request, tmp_path_factory) -> Iterator[tuple[str, Path]]:
+    """Serve one precision's checkpoint; yield its URL and directory."""
+    yield from _serve(request.param, tmp_path_factory, [])
+
+
+@pytest.fixture(scope="module")
+def compact_served(tmp_path_factory) -> Iterator[tuple[str, Path]]:
+    """Serve the BF16 checkpoint with one compact canvas per question."""
+    yield from _serve(
+        "bf16",
+        tmp_path_factory,
+        ["--readout-layout", "independent", "--readout-canvas", "compact"],
+    )
 
 
 def _readout(base_url: str, body: dict) -> dict:
@@ -195,6 +215,40 @@ def test_a_fact_before_the_sliding_window_is_read_back(served, length):
     answer = response["answers"]["color"]
     _assert_well_formed(answer)
     assert _choice(answer) == "green"
+
+
+def test_more_questions_than_a_readout_graph_holds_are_answered(compact_served):
+    """Every one of 48 questions about one state is answered.
+
+    Each question has a compact canvas of its own, which costs few tokens, so
+    the engine reads all 48 canvases in one pass: more than the widest
+    readout graph holds, which the worker sizes for full canvases (8192
+    batched tokens over 256-token canvases make 32). The pass runs without
+    a graph and answers each question from the state.
+    """
+    base_url, _ = compact_served
+    questions = {
+        f"color_{index}": {
+            "type": "choice",
+            "instructions": "What is the secret color named in the state?",
+            "criteria": dict.fromkeys(COLORS),
+        }
+        for index in range(48)
+    }
+
+    response = _readout(
+        base_url,
+        {
+            "model": SERVED_MODEL,
+            "state": "The secret color is green.",
+            "questions": questions,
+        },
+    )
+
+    assert list(response["answers"]) == list(questions)
+    for answer in response["answers"].values():
+        _assert_well_formed(answer)
+        assert _choice(answer) == "green"
 
 
 def _png(color: tuple[int, int, int], size: tuple[int, int]) -> str:
