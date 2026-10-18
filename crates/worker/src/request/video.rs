@@ -226,14 +226,18 @@ pub(crate) struct MediaPlan {
     pub(crate) text_capacities: Vec<u32>,
     /// The longest admitted prompt.
     pub(crate) max_text_tokens: u32,
-    /// Condition rows a request may occupy; zero without conditioned tasks.
+    /// Condition rows a request may occupy: the deployment's stated
+    /// capacity, or without one the rows of the largest condition set the
+    /// denoiser admits; zero for a denoiser that admits none.
     pub(crate) condition_rows: u32,
     /// The leading canvas's longest layout at the prompt capacity, widened
     /// to the condition capacity. The denoiser prepares it first, so it
     /// sizes the storage every layout shares.
     pub(crate) maximum: VideoLayout,
     /// Startup layouts: canvases (in preparation order) by frame counts
-    /// (longest first) by prompt capacities (largest first).
+    /// (longest first) by prompt capacities (largest first). None for a
+    /// denoiser that is not text-only: every request it admits brings
+    /// conditions and evaluates in a layout of its own.
     pub(crate) layouts: Vec<VideoLayout>,
     /// Each canvas's longest layout at the prompt capacity, widened to the
     /// condition capacity; their envelope bounds every request's state.
@@ -327,16 +331,21 @@ impl MediaPlan {
     /// `requested` are the configured prompt capacities (default
     /// `[1024, 2048, 4096, ...]` up to the prompt capacity), each mapped to
     /// the text rows of its layout, capped at the largest layout's.
-    /// `canvases` are the canvases the deployment names, each one the
-    /// denoiser offers; without any the deployment prepares every offered
-    /// canvas.
+    /// `stated_rows` is the deployment's condition capacity
+    /// (`--max-condition-rows`); without it the plan provisions the rows of
+    /// the largest condition set the denoiser admits at the longest frame
+    /// count, on the admitted canvas where it packs the most, so no request
+    /// is refused for its conditions. A denoiser that admits no condition
+    /// gets none either way. `canvases` are the canvases the deployment
+    /// names, each one the denoiser offers; without any the deployment
+    /// prepares every offered canvas.
     pub(crate) fn new(
         model: &VideoModel,
         max_seconds: f64,
         min_seconds: Option<f64>,
         max_text_tokens: u32,
         requested: &[u32],
-        condition_rows: u32,
+        stated_rows: Option<u32>,
         canvases: &[Canvas],
     ) -> Result<Self> {
         let facts = &model.facts;
@@ -357,6 +366,15 @@ impl MediaPlan {
             ));
         }
         let admitted = admitted_canvases(&facts.canvases, canvases)?;
+        let mut admitted_rows = 0;
+        for &canvas in &admitted {
+            admitted_rows = admitted_rows.max(model.max_condition_rows(longest, canvas)?);
+        }
+        let condition_rows = if admitted_rows == 0 {
+            0
+        } else {
+            stated_rows.unwrap_or(admitted_rows)
+        };
         let widen = |layout: VideoLayout| {
             if condition_rows == 0 {
                 Ok(layout)
@@ -410,11 +428,15 @@ impl MediaPlan {
         text_capacities.sort_unstable();
         text_capacities.dedup();
 
+        // Only a request without conditions evaluates in a startup layout,
+        // so a denoiser that is not text-only prepares none.
         let mut layouts = Vec::new();
-        for &canvas in &ordered {
-            for &frames in frame_counts.iter().rev() {
-                for &tokens in text_capacities.iter().rev() {
-                    layouts.push(model.layout_size(&VideoSize::plain(frames, canvas, tokens))?);
+        if facts.text_only {
+            for &canvas in &ordered {
+                for &frames in frame_counts.iter().rev() {
+                    for &tokens in text_capacities.iter().rev() {
+                        layouts.push(model.layout_size(&VideoSize::plain(frames, canvas, tokens))?);
+                    }
                 }
             }
         }

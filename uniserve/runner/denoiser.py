@@ -628,6 +628,11 @@ class DenoiserRunner:
         return list(_denoiser(loaded, component).tasks)
 
     @staticmethod
+    def text_only(loaded, component: str) -> bool:
+        """Whether the denoiser serves requests without conditions."""
+        return bool(_denoiser(loaded, component).text_only)
+
+    @staticmethod
     def num_steps(loaded, component: str) -> int:
         """Solver steps of one trajectory."""
         return int(_denoiser(loaded, component).num_steps)
@@ -674,6 +679,26 @@ class DenoiserRunner:
     def legal_frame_count(loaded, component: str, frames: int) -> int:
         """The smallest frame count the denoiser generates for ``frames``."""
         return int(_denoiser(loaded, component).legal_frame_count(int(frames)))
+
+    @staticmethod
+    def max_condition_rows(
+        loaded, component: str, frames: int, width: int, height: int
+    ) -> int:
+        """Packed rows of the largest condition set a request may bring.
+
+        The set is ``VideoDenoiser.max_conditions`` of a request generating
+        ``frames`` frames on the ``width`` x ``height`` canvas, counted as
+        ``make_size`` packs them; zero when the denoiser admits none.
+        """
+        network = _denoiser(loaded, component)
+        canvas = image.Config(int(height), int(width))
+        conditions = network.max_conditions(int(frames), canvas)
+        if not conditions:
+            return 0
+        size = network.make_size(
+            int(frames), 1, canvas=canvas, conditions=conditions
+        )
+        return int(size.condition_rows)
 
     @staticmethod
     def layout_size(loaded, component: str, size, conditions, spans):

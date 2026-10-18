@@ -188,8 +188,9 @@ pub struct WorkerProcessArgs {
     /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
     /// Most denoiser rows a video request's conditions may take, which bounds
-    /// the condition products a video worker provisions.
-    pub max_condition_rows: u32,
+    /// the condition products a video worker provisions; `None` provisions
+    /// the largest condition set the worker's denoiser admits.
+    pub max_condition_rows: Option<u32>,
     /// Image features each rank's encoder cache keeps resident, which bounds
     /// the context images one request may pin.
     pub encoder_cache_entries: u32,

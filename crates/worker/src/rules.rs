@@ -109,6 +109,30 @@ fn video_buckets() -> Result<Array<Any>> {
     Ok(integer_list(values))
 }
 
+/// `video_reference_bounds(frames) -> [images, video_frames, audio_samples,
+/// video_canvases]`: the largest references a request generating `frames`
+/// frames may bring (`plan::reference_bounds`); `images`, the two largest
+/// image rasters, and `video_canvases` are flat `[width, height, ...]`.
+fn video_reference_bounds(frames: i64) -> Result<Array<Any>> {
+    let frames = u32::try_from(frames).map_err(|_| value_error("frames is out of range"))?;
+    let bounds = plan::reference_bounds(frames);
+    let rasters = |canvases: &[Canvas]| {
+        integer_list(
+            canvases
+                .iter()
+                .flat_map(|canvas| [i64::from(canvas.width), i64::from(canvas.height)]),
+        )
+    };
+    let samples = i64::try_from(bounds.audio_samples)
+        .map_err(|_| value_error("audio samples are out of range"))?;
+    Ok(list([
+        Any::from(rasters(&bounds.images)),
+        Any::from(i64::from(bounds.video_frames)),
+        Any::from(samples),
+        Any::from(rasters(&bounds.video_canvases)),
+    ]))
+}
+
 fn task(name: &str) -> Result<VideoTask> {
     VideoTask::from_name(name).ok_or_else(|| value_error(&format!("unknown video task {name:?}")))
 }
@@ -568,6 +592,7 @@ tvm_ffi::tvm_ffi_dll_export_typed_func!(video_canvas, video_canvas);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_frame_count, video_frame_count);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_aspect_ratios, video_aspect_ratios);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_buckets, video_buckets);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(video_reference_bounds, video_reference_bounds);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_named_canvas, video_named_canvas);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_vision_config, video_vision_config);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_plan, video_plan);

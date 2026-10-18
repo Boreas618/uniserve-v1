@@ -524,7 +524,7 @@ pub(crate) mod tests {
             max_batch_tokens: 8192,
             max_model_len: 16384,
             max_video_seconds: 15.0,
-            max_condition_rows: 0,
+            max_condition_rows: None,
             ffmpeg: "ffmpeg".into(),
             min_video_seconds: None,
             video_text_capacities: Vec::new(),

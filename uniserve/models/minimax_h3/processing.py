@@ -41,6 +41,7 @@ __all__ = [
     "KeyframeFit",
     "PlanError",
     "Presentation",
+    "ReferenceBounds",
     "RequestPlan",
     "Role",
     "Target",
@@ -59,6 +60,7 @@ __all__ = [
     "plan_request",
     "present",
     "presentation_segments",
+    "reference_bounds",
 ]
 
 
@@ -441,6 +443,48 @@ def buckets() -> tuple[image.Config, ...]:
     edge, then at the 480-pixel one, each in ``NAMED_ASPECT_RATIOS`` order.
     """
     return _canvases(library()["video_buckets"]())
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceBounds:
+    """The largest references a request generating some frames may bring.
+
+    Attributes:
+        images: The two largest rasters an image reference is encoded at,
+            the encoding short edge at 4:1 and at 1:4.
+        video_frames: Encoded frames of the longest reference video.
+        video_canvases: Every raster a reference video is encoded at, the
+            canvas rule's canvases.
+        audio_samples: The most 32 kHz samples of a soundtrack or audio
+            reference.
+    """
+
+    images: tuple[image.Config, image.Config]
+    video_frames: int
+    video_canvases: tuple[image.Config, ...]
+    audio_samples: int
+
+
+def reference_bounds(num_frames: int) -> ReferenceBounds:
+    """Bound every reference of a request that generates ``num_frames``.
+
+    An image's rows grow with how far its aspect lies from 1:1 at the
+    encoding short edge; a video keeps at most the generated frames, of
+    which the VAE encodes the leading whole windows on the canvas of its
+    aspect; a track is truncated to the generated duration. A denoiser
+    sizes these shapes with its own packing to state the largest condition
+    set it admits.
+    """
+    images, frames, samples, canvases = library()["video_reference_bounds"](
+        int(num_frames)
+    )
+    widest, tallest = _canvases(images)
+    return ReferenceBounds(
+        images=(widest, tallest),
+        video_frames=int(frames),
+        video_canvases=_canvases(canvases),
+        audio_samples=int(samples),
+    )
 
 
 def frame_count(seconds: float, max_seconds: float | None = None) -> int:

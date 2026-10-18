@@ -88,7 +88,9 @@ pub struct EngineSettings {
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
     /// products for it, and the video service rejects requests above it.
-    pub max_condition_rows: u32,
+    /// `None` provisions the largest condition set the deployment's
+    /// denoiser admits, so no request is refused for its conditions.
+    pub max_condition_rows: Option<u32>,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
@@ -124,7 +126,7 @@ impl Default for EngineSettings {
             video_aspect_ratios: crate::profile::video::VideoRasters::default()
                 .aspect_ratios()
                 .to_vec(),
-            max_condition_rows: EngineSettings::DEFAULT_MAX_CONDITION_ROWS,
+            max_condition_rows: None,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a
             // placement built from their own arguments.
@@ -323,15 +325,6 @@ impl EngineSettings {
     /// Final fallback context length used when neither the CLI nor the loaded
     /// model exposes a `max_model_len`.
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
-
-    /// Default condition capacity in denoiser rows: two keyframes on the
-    /// largest named canvas, 1008 rows each, so every `fl2va` request fits.
-    /// The capacity sizes each request slot's retained conditioning and the
-    /// denoiser's largest layout, so a deployment that also serves `ref2va`
-    /// states the capacity its references need (a five-second reference
-    /// video with its soundtrack takes about 38,000 rows). A checkpoint's own
-    /// sequence capacity bounds requests independently.
-    pub const DEFAULT_MAX_CONDITION_ROWS: u32 = 2048;
 
     /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`

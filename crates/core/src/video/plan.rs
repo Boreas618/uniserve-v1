@@ -520,6 +520,60 @@ fn nearest_multiple(value: f64) -> u32 {
     ((value / multiple).round_ties_even() * multiple).max(multiple) as u32
 }
 
+/// Every canvas the canvas rule resolves a display aspect to, each once,
+/// from the narrowest aspect to the widest.
+///
+/// [`canvas`] is piecewise constant in the ratio: a side changes only where
+/// its unrounded length crosses an odd multiple of half
+/// [`CANVAS_MULTIPLE`]. Below the area cap the long side is the short edge
+/// times the ratio (its reciprocal for a portrait aspect); above it the long
+/// side is `sqrt(cap * ratio)` and the short side `sqrt(cap / ratio)`.
+/// Those crossings, the ends of the range and the ratio the cap starts at
+/// cut 1:4 to 4:1 into intervals of one canvas each, so the canvases at the
+/// cuts and at the midpoints between them are all of them.
+pub fn rule_canvases() -> Vec<Canvas> {
+    let short_edge = f64::from(CANVAS_SHORT_EDGE);
+    let max_pixels = f64::from(CANVAS_MAX_PIXELS);
+    let multiple = f64::from(CANVAS_MULTIPLE);
+    let cap = max_pixels / (short_edge * short_edge);
+    let mut cuts = vec![MIN_ASPECT_RATIO, MAX_ASPECT_RATIO, 1.0, cap, 1.0 / cap];
+    // No side of the range is longer than the long side at 4:1 under the cap.
+    let longest = (max_pixels * MAX_ASPECT_RATIO).sqrt();
+    let mut crossing = multiple / 2.0;
+    while crossing <= longest + multiple {
+        for ratio in [
+            crossing / short_edge,
+            crossing * crossing / max_pixels,
+            max_pixels / (crossing * crossing),
+        ] {
+            cuts.extend([ratio, 1.0 / ratio]);
+        }
+        crossing += multiple;
+    }
+    cuts.retain(|ratio| (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO).contains(ratio));
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+
+    let midpoints: Vec<f64> = cuts
+        .windows(2)
+        .map(|pair| f64::midpoint(pair[0], pair[1]))
+        .collect();
+    let mut probes = cuts;
+    probes.extend(midpoints);
+    probes.sort_by(f64::total_cmp);
+    let mut canvases = Vec::new();
+    // Every probe lies within 1:4 to 4:1, which the rule accepts.
+    for size in probes
+        .into_iter()
+        .filter_map(|ratio| canvas(ratio, 1.0).ok())
+    {
+        if !canvases.contains(&size) {
+            canvases.push(size);
+        }
+    }
+    canvases
+}
+
 /// The training bucket of a short edge and a named ratio; `None` when no
 /// bucket has them.
 pub fn bucket(short_edge: u32, ratio: (u32, u32)) -> Option<Canvas> {
@@ -1386,8 +1440,7 @@ pub fn video_reference(
         return Err(RuleError::ReferenceFrames { available });
     }
     let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
-    // The VAE encodes the leading complete `17n + 5` frames.
-    let vae_frames = ((kept - CLIP_LATENTS) / CLIP_FRAMES).max(1) * CLIP_FRAMES + CLIP_LATENTS;
+    let vae_frames = encoded_frames(kept);
     let soundtrack = media
         .soundtrack
         .as_ref()
@@ -1413,6 +1466,61 @@ pub fn video_reference(
         block_timestamps,
     };
     Ok((clip, seen))
+}
+
+/// Frames the VAE encodes of a reference video that keeps `kept` frames: the
+/// leading complete `17n + 5`, at least one window.
+fn encoded_frames(kept: u32) -> u32 {
+    (kept.saturating_sub(CLIP_LATENTS) / CLIP_FRAMES).max(1) * CLIP_FRAMES + CLIP_LATENTS
+}
+
+/// The largest references a request generating a given frame count may
+/// bring, as [`reference_bounds`] states them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceBounds {
+    /// The two largest rasters an image reference is encoded at: the
+    /// encoding short edge at the widest (4:1) and the tallest (1:4)
+    /// accepted aspect.
+    pub images: [Canvas; 2],
+    /// Encoded frames of the longest reference video.
+    pub video_frames: u32,
+    /// Every raster a reference video is encoded at: the canvas rule's
+    /// canvases ([`rule_canvases`]).
+    pub video_canvases: Vec<Canvas>,
+    /// The most model-rate samples of a soundtrack or audio reference.
+    pub audio_samples: u64,
+}
+
+/// Bounds every reference of a request that generates `frames` frames.
+///
+/// [`reference_image_size`] scales an image's short edge to the encoding
+/// edge, so its sides, and the rows any packing gives it, grow with how far
+/// its aspect lies from 1:1: the widest and the tallest accepted aspect
+/// bound every image. [`video_reference`] keeps at most `frames` frames of a
+/// video, whose leading whole VAE windows it encodes on the canvas of the
+/// video's aspect, and [`audio_clip`] truncates a track to the generated
+/// duration and resamples it to 32 kHz, so it returns at most
+/// `ceil(frames * 32000 / 24)` samples whatever the source rate. A model
+/// sizes these shapes with its own packing to provision the largest
+/// condition set it admits.
+pub fn reference_bounds(frames: u32) -> ReferenceBounds {
+    let edge = REFERENCE_IMAGE_SHORT_EDGE;
+    ReferenceBounds {
+        images: [
+            Canvas {
+                width: 4 * edge,
+                height: edge,
+            },
+            Canvas {
+                width: edge,
+                height: 4 * edge,
+            },
+        ],
+        video_frames: encoded_frames(frames),
+        video_canvases: rule_canvases(),
+        audio_samples: (u64::from(frames) * u64::from(AUDIO_SAMPLE_RATE))
+            .div_ceil(u64::from(VIDEO_FPS)),
+    }
 }
 
 /// Parses `W:H` into positive integers written in canonical decimal form;
@@ -1987,6 +2095,8 @@ pub fn plan_request(
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::collections::HashSet;
+
     use serde::Deserialize;
     use serde_json::{Value, json};
 
@@ -1994,10 +2104,11 @@ pub(super) mod tests {
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
         AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
-        ConditionType, FrameRate, ImageFacts, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits,
-        Prepared, RequestField, RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask,
-        Vision, VisionConfig, audio_clip, bucket, bucket_short_edge, canvas, check_request,
-        cover_crop, plan_request, reference_image_size, requested_frames, rows_per_frame,
+        ConditionType, FrameRate, ImageFacts, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO, MediaFacts,
+        NAMED_ASPECT_RATIOS, PlanLimits, Prepared, REFERENCE_IMAGE_SHORT_EDGE, RequestField,
+        RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask, Vision, VisionConfig,
+        audio_clip, bucket, bucket_short_edge, canvas, check_request, cover_crop, plan_request,
+        reference_bounds, reference_image_size, requested_frames, rows_per_frame, rule_canvases,
         video_frame_count, video_reference,
     };
     use crate::MediaLocator;
@@ -2204,6 +2315,25 @@ pub(super) mod tests {
                 assert_eq!(resolved.unwrap(), size(&case["canvas"]), "{case}");
             }
         }
+    }
+
+    /// The rule's canvases are exactly those a dense sweep of 1:4 to 4:1
+    /// resolves to, each listed once.
+    #[test]
+    fn rule_canvases_are_every_canvas_of_the_range() {
+        let listed = rule_canvases();
+        let unique: HashSet<Canvas> = listed.iter().copied().collect();
+        assert_eq!(unique.len(), listed.len());
+
+        let steps = 1_000_000;
+        let swept: HashSet<Canvas> = (0..=steps)
+            .map(|step| {
+                let ratio = MIN_ASPECT_RATIO
+                    + (MAX_ASPECT_RATIO - MIN_ASPECT_RATIO) * f64::from(step) / f64::from(steps);
+                canvas(ratio, 1.0).unwrap()
+            })
+            .collect();
+        assert_eq!(swept, unique);
     }
 
     /// The 768-pixel training buckets are the canvas rule's canvases of the
@@ -2555,6 +2685,70 @@ pub(super) mod tests {
             assert_eq!(u64::from(seen.block_tokens), case["block_tokens"], "{case}");
             let rows = clip.latent_frames * rows_per_frame(clip.canvas);
             assert_eq!(u64::from(rows), case["rows"], "{case}");
+        }
+    }
+
+    /// Every reference the planner prepares for a five-second request fits
+    /// the bounds of its 124 frames: an image of any accepted aspect, and a
+    /// video of any aspect and frame rate with a soundtrack of any rate.
+    #[test]
+    fn prepared_references_fit_their_bounds() {
+        let fixture = fixture();
+        let vision = vision(&fixture);
+        let frames = video_frame_count(5.0, 15.0).unwrap();
+        let bounds = reference_bounds(frames);
+        let edge = REFERENCE_IMAGE_SHORT_EDGE;
+        assert_eq!(
+            bounds.images,
+            [
+                Canvas {
+                    width: 4 * edge,
+                    height: edge
+                },
+                Canvas {
+                    width: edge,
+                    height: 4 * edge
+                },
+            ]
+        );
+        assert_eq!((bounds.video_frames, bounds.audio_samples), (124, 165_334));
+        assert_eq!(bounds.video_canvases, rule_canvases());
+
+        for width in (250..=4000).step_by(7) {
+            let size = reference_image_size(width, 1000).unwrap();
+            assert!(
+                bounds
+                    .images
+                    .iter()
+                    .any(|bound| size.width <= bound.width && size.height <= bound.height),
+                "{width}"
+            );
+        }
+        for ((display_width, display_height), (numerator, denominator), sample_rate) in [
+            ((16, 9), (24, 1), 32_000),
+            ((9, 16), (30_000, 1001), 44_100),
+            ((4, 1), (60, 1), 48_000),
+            ((1, 4), (25, 1), 22_050),
+            ((21, 9), (24_000, 1001), 16_000),
+        ] {
+            let facts = VideoFacts {
+                display_width,
+                display_height,
+                frame_rate: FrameRate {
+                    numerator,
+                    denominator,
+                },
+                frames: 10_000,
+                soundtrack: Some(AudioFacts {
+                    sample_rate,
+                    samples: 10_000_000,
+                }),
+            };
+            let (clip, _) = video_reference(&facts, 0.0, frames, &vision).unwrap();
+            assert!(clip.vae_frames <= bounds.video_frames, "{facts:?}");
+            assert!(bounds.video_canvases.contains(&clip.canvas), "{facts:?}");
+            let track = clip.soundtrack.unwrap();
+            assert!(track.samples <= bounds.audio_samples, "{facts:?}");
         }
     }
 

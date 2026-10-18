@@ -193,15 +193,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// Most denoiser rows the conditions of one video request may take: a
     /// capacity video workers provision their condition products, request
     /// slots and largest denoiser layout for, advertised as
-    /// `max_condition_rows`. The default holds two keyframes on the largest
-    /// canvas, every `fl2va` request; a `ref2va` deployment raises it to the
-    /// rows its references take, about 38,000 for a five-second reference
-    /// video with its soundtrack.
-    #[arg(
-        long = "max-condition-rows",
-        default_value_t = uniserve_server::EngineSettings::DEFAULT_MAX_CONDITION_ROWS
-    )]
-    pub max_condition_rows: u32,
+    /// `max_condition_rows`. Without it the workers provision the largest
+    /// condition set their denoiser admits (two keyframes for `fl2va`; nine
+    /// images and three videos with their soundtracks for `ref2va`, beside
+    /// two keyframes where the denoiser packs them), so no request is
+    /// refused for its conditions and a machine that cannot hold that set
+    /// fails at startup; state a smaller capacity to serve less.
+    #[arg(long = "max-condition-rows")]
+    pub max_condition_rows: Option<u32>,
     /// Directory that `file://` condition media of video requests resolves
     /// under. Without it, `file://` media is refused.
     #[arg(long = "media-directory", value_name = "DIR")]

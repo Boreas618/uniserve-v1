@@ -156,12 +156,6 @@ pub(crate) fn plan(
     denoising: bool,
     decoding: bool,
 ) -> Result<VideoCapacity> {
-    let rows = if model.conditions() {
-        u32::try_from(config.max_condition_rows)
-            .map_err(|_| Error::Invalid("condition capacity exceeds its range".into()))?
-    } else {
-        0
-    };
     let tokens = u32::try_from(config.max_model_len)
         .map_err(|_| Error::Invalid("prompt capacity exceeds its range".into()))?;
     let requested: Vec<u32> = config
@@ -175,7 +169,7 @@ pub(crate) fn plan(
         config.min_video_seconds,
         tokens,
         &requested,
-        rows,
+        config.max_condition_rows,
         &config.video_canvases,
     )?;
     let pages = SamplePages::plan(model, &media.largest)?;
@@ -244,7 +238,7 @@ impl VideoCapacity {
             _ => 0,
         };
         Ok(MediaFacts {
-            video_denoiser: Some(model.denoiser_info(&self.media.admitted)?),
+            video_denoiser: Some(model.denoiser_info(&self.media.admitted)),
             state_bytes: self.envelope.as_ref().map_or(0, StateEnvelope::slot_bytes)
                 + self.overlap_bytes,
             local_product_bytes,

@@ -338,7 +338,7 @@ fn execution(
         max_batch_tokens: descriptor.max_batch_tokens as usize,
         max_model_len: descriptor.max_model_len as usize,
         max_video_seconds: descriptor.max_video_seconds,
-        max_condition_rows: descriptor.max_condition_rows as usize,
+        max_condition_rows: descriptor.max_condition_rows,
         ffmpeg: descriptor.ffmpeg.clone(),
         min_video_seconds: descriptor.min_video_seconds,
         video_text_capacities: Vec::new(),

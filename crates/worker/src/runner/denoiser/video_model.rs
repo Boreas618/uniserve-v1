@@ -25,6 +25,9 @@ pub(crate) struct VideoFacts {
     pub(crate) modalities: Vec<String>,
     pub(crate) num_steps: u32,
     pub(crate) tasks: Vec<String>,
+    /// Whether the denoiser serves requests without conditions; without
+    /// it every request evaluates in a layout of its own.
+    pub(crate) text_only: bool,
     pub(crate) video_shift: f64,
     pub(crate) audio_shift: f64,
     /// Canvases the denoiser offers: a deployment prepares a selection of
@@ -111,6 +114,7 @@ struct LayoutAnswers {
 /// The sizing methods, each called with the loaded model first.
 struct SizingMethods {
     legal_frame_count: Function,
+    max_condition_rows: Function,
     layout_size: Function,
     holds: Function,
     condition_layout: Function,
@@ -215,6 +219,7 @@ impl VideoModel {
         let of_decoder = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let methods = SizingMethods {
             legal_frame_count: of_denoiser("legal_frame_count")?,
+            max_condition_rows: of_denoiser("max_condition_rows")?,
             layout_size: of_denoiser("layout_size")?,
             holds: of_denoiser("holds")?,
             condition_layout: of_denoiser("condition_layout")?,
@@ -270,6 +275,10 @@ impl VideoModel {
         let names = |name: &str| -> Result<Vec<String>> {
             let (function, value) = fact(name)?;
             strings(&function, value)
+        };
+        let flag = |name: &str| -> Result<bool> {
+            let (function, value) = fact(name)?;
+            bool::try_from(value).map_err(|error| Error::numerical(function.name(), &error))
         };
         // A fact of the decoders, which the model holds one of each.
         let rate = |name: &str| -> Result<u32> {
@@ -333,6 +342,7 @@ impl VideoModel {
             modalities: names("modalities")?,
             num_steps: narrow(integer("num_steps")?, "step count")?,
             tasks: names("tasks")?,
+            text_only: flag("text_only")?,
             video_shift,
             audio_shift,
             canvases,
@@ -373,40 +383,32 @@ impl VideoModel {
         i64::try_from(value).map_err(|error| Error::numerical(method.name(), &error))
     }
 
-    /// The tasks of the denoiser this worker executes, in its order.
-    pub(crate) fn executed_tasks(&self) -> Vec<String> {
-        self.facts
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.as_str(), "t2va" | "fl2va" | "ref2va"))
-            .cloned()
-            .collect()
-    }
-
-    /// Whether any executed task takes conditions.
-    pub(crate) fn conditions(&self) -> bool {
-        self.executed_tasks().iter().any(|task| task != "t2va")
-    }
-
     /// The handshake's description of the denoiser on a deployment that
-    /// prepares and admits `canvases`.
-    pub(crate) fn denoiser_info(&self, canvases: &[Canvas]) -> Result<VideoDenoiserInfo> {
-        let tasks = self.executed_tasks();
-        if tasks.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "the placed video denoiser serves {}, none of which this worker executes",
-                self.facts.tasks.join(", ")
-            )));
-        }
-        Ok(VideoDenoiserInfo {
-            tasks,
+    /// prepares and admits `canvases`: its tasks as it states them.
+    pub(crate) fn denoiser_info(&self, canvases: &[Canvas]) -> VideoDenoiserInfo {
+        VideoDenoiserInfo {
+            tasks: self.facts.tasks.clone(),
             schedule_points: self.facts.num_steps + 1,
             video_shift: self.facts.video_shift,
             audio_shift: self.facts.audio_shift,
             canvases: canvases.to_vec(),
             max_sequence_rows: self.facts.max_sequence_rows,
             condition_tiles: self.facts.condition_tiles,
-        })
+        }
+    }
+
+    /// Packed rows of the largest condition set a request generating
+    /// `frames` frames on `canvas` may bring, as the denoiser packs them
+    /// (`VideoDenoiser.max_conditions`); zero when it admits none.
+    pub(crate) fn max_condition_rows(&self, frames: u32, canvas: Canvas) -> Result<u32> {
+        let method = &self.methods.max_condition_rows;
+        let value = self.denoiser(
+            method,
+            [frames, canvas.width, canvas.height]
+                .map(|value| Any::from(i64::from(value)))
+                .to_vec(),
+        )?;
+        narrow(self.integer(method, value)?, "condition capacity")
     }
 
     pub(crate) fn legal_frame_count(&self, frames: u32) -> Result<u32> {

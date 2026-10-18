@@ -462,7 +462,9 @@ pub struct LaunchDescriptor {
     pub max_request_pool_size: u32,
     pub max_model_len: u32,
     pub max_video_seconds: f64,
-    pub max_condition_rows: u32,
+    /// Condition rows one video request may occupy; `None` provisions the
+    /// largest condition set the rank's denoiser admits.
+    pub max_condition_rows: Option<u32>,
     /// Image features the rank's encoder cache keeps resident.
     pub encoder_cache_entries: u32,
     pub ffmpeg: String,

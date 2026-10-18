@@ -100,6 +100,29 @@ class Condition:
             raise ValueError("a keyframe is one encoded frame without audio")
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceLimits:
+    """Most references of each kind one request may carry.
+
+    A network that takes no references states none. ``total`` bounds the
+    references of every kind together, keyframes not counted; a video's
+    soundtrack counts with the video, and ``audios`` bounds the audio
+    references that are not a video's soundtrack.
+    """
+
+    images: int = 0
+    videos: int = 0
+    audios: int = 0
+    total: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            type(limit) is not int or limit < 0
+            for limit in (self.images, self.videos, self.audios, self.total)
+        ):
+            raise ValueError("reference limits must be nonnegative integers")
+
+
 class VideoSize(Protocol):
     """A video request's output timeline, raster and conditioning lengths.
 
@@ -267,6 +290,39 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     def tasks(self) -> tuple[str, ...]:
         """Task names this network serves, in canonical order."""
         raise NotImplementedError
+
+    @property
+    def text_only(self) -> bool:
+        """Whether the network serves requests that bring no conditions.
+
+        Every other request brings at least one condition and evaluates in a
+        layout of its own, so a serving owner prepares the layouts of
+        requests without conditions only when this holds.
+        """
+        raise NotImplementedError
+
+    @property
+    def max_references(self) -> ReferenceLimits:
+        """Most references of each kind one request may carry.
+
+        ``max_conditions`` provisions for them; a network that takes no
+        references states none.
+        """
+        return ReferenceLimits()
+
+    def max_conditions(
+        self, num_frames: int, canvas: image.Config
+    ) -> tuple[Condition, ...]:
+        """The largest condition set a request of this network may carry.
+
+        Returns the conditions, among those a request generating
+        ``num_frames`` frames on ``canvas`` may bring under the network's
+        tasks, whose packed rows (``make_size``) are the most. A serving
+        owner that states no smaller condition capacity provisions for
+        them, so it refuses no request for its conditions. Empty for a
+        network without a conditioned task.
+        """
+        return ()
 
     @property
     def schedule_shifts(self) -> Mapping[str, float]:
