@@ -219,16 +219,6 @@ fn mirrors(metadata: &AttentionMetadata) -> [Argument; 4] {
 }
 
 impl DiffusionLMRunner {
-    /// The warmup and capture plan every source of an expert union must
-    /// share: the runner's row and length buckets and whether it denoises.
-    pub(crate) fn capture_plan(&self) -> serde_json::Value {
-        serde_json::json!({
-            "rows": self.shapes.rows(),
-            "lengths": self.shapes.lengths(),
-            "steps": self.sampling.is_some(),
-        })
-    }
-
     /// The runner's owner name and kernel records.
     pub(crate) fn kernels(&self) -> Result<(String, Vec<KernelRecord>)> {
         let records = self
