@@ -9254,7 +9254,6 @@ dependencies = [
  "nvtx",
  "png",
  "rustix 1.1.4",
- "serde",
  "serde_json",
  "signal-hook-registry",
  "tempfile",

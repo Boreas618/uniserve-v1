@@ -154,28 +154,6 @@ impl CausalLMRunners {
             .ok_or_else(|| Error::Invariant("a text runner belongs to no group".into()))
     }
 
-    /// The warmup and capture plan every source of an expert union must
-    /// share: each group's microbatches and graph shapes.
-    pub(crate) fn capture_plan(&self) -> serde_json::Value {
-        let groups: Vec<serde_json::Value> = self
-            .groups
-            .iter()
-            .map(|group| {
-                let shapes = self.runners[group[0]].shapes();
-                serde_json::json!({
-                    "microbatches": group.len(),
-                    "decode": shapes.decode(),
-                    "prefill": shapes
-                        .prefill()
-                        .iter()
-                        .map(|shape| (shape.row_bucket, shape.token_bucket, shape.outputs))
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        serde_json::Value::Array(groups)
-    }
-
     /// Record one invocation per microbatch runner of `group` (`None` for
     /// an empty microbatch) in `job` as one numerical step.
     ///
