@@ -2,8 +2,8 @@
 
 ``tile_extent`` sizes the ``[text | audio | tiled video | padding]`` rows of
 a layout from its prompt length, frame count, canvas and alignment;
-``tile_packing`` fills the tables of the same rows. ``region_extent`` and
-``region_packing`` do the same for a multi-region layout. A denoiser
+``tile_packing`` fills the tables of the same rows. ``segment_extent`` and
+``segment_packing`` do the same for a multi-segment layout. A denoiser
 evaluates a layout from the extent alone, including which audio and video
 rows fall below a rank's shard boundary, so both must describe the same
 rows.
@@ -16,10 +16,10 @@ import torch
 
 from uniserve.media import image
 from uniserve.models.minimax_h3.packing import (
-    RegionExtent,
+    SegmentExtent,
     TileExtent,
-    region_extent,
-    region_packing,
+    segment_extent,
+    segment_packing,
     tile_extent,
     tile_packing,
 )
@@ -69,14 +69,14 @@ def test_an_extent_sizes_its_packing(
     assert int(packing.video_indices.max()) < video_end <= extent.padded_tokens
 
 
-def test_a_larger_text_region_keeps_the_valid_tokens():
+def test_a_larger_text_segment_keeps_the_valid_tokens():
     own = tile_extent(num_text_tokens=100, num_frames=124, canvas=WIDE)
     wide = tile_extent(
         num_text_tokens=100, num_frames=124, canvas=WIDE, text_rows=1024
     )
     assert wide.num_tokens == own.num_tokens
     assert wide.video_tiles == own.video_tiles
-    # The region's 1024 rows replace the prompt's own 128.
+    # The segment's 1024 rows replace the prompt's own 128.
     assert wide.prefix_tiles - own.prefix_tiles == (1024 - 128) // 64
 
 
@@ -98,7 +98,7 @@ def test_an_extent_refuses_what_its_packing_refuses(layout):
             size(**arguments)
 
 
-REGION_LAYOUTS = [
+SEGMENT_LAYOUTS = [
     # Text and condition capacities, tile and alignment of OmniRef layouts,
     # including a canvas whose token grid ends inside the 4x4x8 tiles.
     {
@@ -128,12 +128,12 @@ REGION_LAYOUTS = [
 ]
 
 
-@pytest.mark.parametrize("layout", REGION_LAYOUTS)
-def test_a_region_extent_sizes_its_packing(layout):
-    extent = region_extent(**layout)
-    packing = region_packing(**layout)
+@pytest.mark.parametrize("layout", SEGMENT_LAYOUTS)
+def test_a_segment_extent_sizes_its_packing(layout):
+    extent = segment_extent(**layout)
+    packing = segment_packing(**layout)
 
-    for field in dataclasses.fields(RegionExtent):
+    for field in dataclasses.fields(SegmentExtent):
         assert getattr(packing, field.name) == getattr(extent, field.name)
     assert extent.padded_tokens % layout["token_multiple"] == 0
     assert packing.video_valid_sizes.shape == (extent.video_tiles,)
@@ -163,11 +163,11 @@ def _counted_below(extent, packing, tile):
     return counted, tabled
 
 
-@pytest.mark.parametrize("layout", REGION_LAYOUTS)
-def test_a_region_extent_counts_the_rows_below_each_tile_boundary(layout):
-    extent = region_extent(**layout)
+@pytest.mark.parametrize("layout", SEGMENT_LAYOUTS)
+def test_a_segment_extent_counts_the_rows_below_each_tile_boundary(layout):
+    extent = segment_extent(**layout)
     counted, tabled = _counted_below(
-        extent, region_packing(**layout), extent.tile
+        extent, segment_packing(**layout), extent.tile
     )
     assert counted == tabled
     with pytest.raises(ValueError):

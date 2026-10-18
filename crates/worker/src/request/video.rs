@@ -518,7 +518,7 @@ fn condition_rows(conditions: &[VideoCondition], tiles: Option<ConditionTiles>) 
         .sum::<Option<u64>>()
         .ok_or_else(|| {
             Error::Invalid(
-                "this denoiser packs conditions in region tiles and holds no keyframes".into(),
+                "this denoiser packs conditions in segment tiles and holds no keyframes".into(),
             )
         })?;
     u32::try_from(rows)

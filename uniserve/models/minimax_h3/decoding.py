@@ -94,7 +94,7 @@ class VideoDecoder(BaseVideoDecoder):
         if isinstance(self.attention, DenseAttention):
             # Dense packing keeps the raster order.
             return torch.arange(start, stop)
-        # Tile and region packing order the rows tile-major, which depends
+        # Tile and segment packing order the rows tile-major, which depends
         # on the frame count; the argsort maps each raster row to its
         # position among the packed rows.
         return torch.argsort(
