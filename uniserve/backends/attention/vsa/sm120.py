@@ -276,13 +276,15 @@ def _launch(q, k, v, indices, counts, sizes, *, scale, out, lse):
 
 
 class _Operator(BaseOperator):
-    def kernel(self, q, k, v, out, indices, counts, valid_sizes, *, scale):
+    def kernel(
+        self, q, k, v, out, indices, counts, variable_block_sizes, *, scale
+    ):
         """Attend one complete call; ``indices`` and ``counts`` are the
         ``[heads, query tiles, ...]`` selection in the pattern's tiles and
-        ``valid_sizes`` the valid rows of every key tile.
+        ``variable_block_sizes`` the valid rows of every key tile.
         """  # noqa: D205
         heads, query_tiles, width = (int(size) for size in indices.shape)
-        key_tiles = int(valid_sizes.numel())
+        key_tiles = int(variable_block_sizes.numel())
         split = self.pattern.tile != _KERNEL_TILE
 
         # The kernel writes the log-sum-exp of every row; a 128-row selection
@@ -317,9 +319,13 @@ class _Operator(BaseOperator):
                 num_stages=1,
             )
             _split_sizes_kernel[(triton.cdiv(key_tiles, _SPLIT_BLOCK),)](
-                valid_sizes, work["sizes"], key_tiles, _SPLIT_BLOCK, num_warps=4
+                variable_block_sizes,
+                work["sizes"],
+                key_tiles,
+                _SPLIT_BLOCK,
+                num_warps=4,
             )
-            indices, counts, valid_sizes = (
+            indices, counts, variable_block_sizes = (
                 work["indices"],
                 work["counts"],
                 work["sizes"],
@@ -331,7 +337,7 @@ class _Operator(BaseOperator):
             v,
             indices,
             counts,
-            valid_sizes,
+            variable_block_sizes,
             scale=scale,
             out=out,
             lse=work["lse"],
