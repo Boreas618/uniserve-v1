@@ -21,7 +21,6 @@ from types import MappingProxyType
 from typing import Any, TypeAlias, TypeGuard
 
 from uniserve.media import image
-from uniserve.nn.functional import Rounding
 
 from . import audio_vae, output, video_vae
 from .checkpoint import (
@@ -70,12 +69,7 @@ class TransformerConfig:
 
     ``output_heads`` is 1 for an ordinary DiT and the fine-grid interval
     count for a parallel-decoding (PDD) student, whose output projections
-    hold one head-major prediction per interval. ``rounding`` is the
-    checkpoint's elementwise recipe for the block epilogues (modulation,
-    gated residuals, Q/K rotation and SwiGLU gating): the released base and
-    component checkpoints are defined by references that round after every
-    eager BF16 operation; FastH3 exports keep UniServe's single-rounding
-    kernels, whose served results their release fixed.
+    hold one head-major prediction per interval.
     """
 
     hidden_size: int = 5376
@@ -95,7 +89,6 @@ class TransformerConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     output_heads: int = 1
-    rounding: Rounding = Rounding.STEPWISE
 
     def __post_init__(self) -> None:
         for name in (
@@ -129,8 +122,6 @@ class TransformerConfig:
                 raise ValueError(
                     f"H3 transformer {name} must be finite and positive"
                 )
-        if not isinstance(self.rounding, Rounding):
-            raise ValueError("H3 transformer rounding must be a Rounding")
         # Each of the three rotary axes (time, height, width) rotates
         # 2 * rope_frequency_dim channels of a head; the rest stay unrotated.
         if (
@@ -258,12 +249,9 @@ class SparseAttention:
     """Video sparse attention over ``tile``-row spatiotemporal tiles.
 
     Each video query tile keeps ``ceil((1 - sparsity) n)`` of the ``n`` key
-    tiles of the generated video. Without ``reference_keep`` the generated
-    video is the only segment, packed in 64-row tiles (``packing.TilePacking``,
-    the FastH3 DMD students). With it, every reference video is a segment of
-    its own, of which a query keeps the fraction ``reference_keep``
-    (``packing.SegmentPacking``, the ``p2_multi_region`` policy of
-    reference-conditioned students).
+    tiles of the generated video. Every reference video is a segment of its
+    own, of which a query keeps the fraction ``reference_keep``; a network
+    without reference videos states none (``packing.SegmentPacking``).
     """
 
     tile: int
@@ -287,8 +275,6 @@ class SparseAttention:
             raise ValueError("H3 VSA sparsity must lie in [0, 1)")
         if self.reference_keep is not None and not 0 < self.reference_keep <= 1:
             raise ValueError("H3 reference keep rate must lie in (0, 1]")
-        if self.reference_keep is None and self.tile != 64:
-            raise ValueError("single-segment H3 sparse attention tiles 64 rows")
 
 
 Attention: TypeAlias = DenseAttention | SparseAttention
@@ -392,8 +378,7 @@ class Config:
         # Packing, attention and native reconstruction
         # implement this architecture; typed configs do not imply arbitrary
         # variants. The latent statistics come from each checkpoint and are
-        # exempt, as are the PDD output heads and the checkpoint family's
-        # rounding recipe.
+        # exempt, as are the PDD output heads.
         expected_networks: tuple[tuple[str, object, object], ...] = (
             ("text_encoder", self.text_encoder, TextEncoderConfig()),
             ("video_vae", self.video_vae, video_vae.Config()),
@@ -410,7 +395,6 @@ class Config:
                     "latents_mean",
                     "latents_std",
                     "output_heads",
-                    "rounding",
                 }:
                     continue
                 value = getattr(actual, field.name)
@@ -657,9 +641,7 @@ def _pdd_denoiser(
     )
 
 
-def _transformer(
-    values: Mapping[str, Any], *, heads: int, rounding: Rounding
-) -> TransformerConfig:
+def _transformer(values: Mapping[str, Any], *, heads: int) -> TransformerConfig:
     missing = set(TRANSFORMER_FIELDS) - values.keys()
     if missing:
         raise ValueError(
@@ -674,7 +656,6 @@ def _transformer(
         )
     return TransformerConfig(
         output_heads=heads,
-        rounding=rounding,
         **{
             target: values[source]
             for source, target in TRANSFORMER_FIELDS.items()
@@ -811,13 +792,7 @@ def normalize(
                 "unsupported MiniMax-H3 checkpoint: transformer pdd_steps "
                 f"must be a positive integer, got {heads!r}"
             )
-        transformer = _transformer(
-            values,
-            heads=heads,
-            rounding=Rounding.ONCE
-            if layout.kind is Kind.FASTVIDEO_EXPORT
-            else Rounding.STEPWISE,
-        )
+        transformer = _transformer(values, heads=heads)
         if layout.kind is Kind.FASTVIDEO_EXPORT:
             assert layout.contract is not None
             denoisers[component] = _dmd_denoiser(

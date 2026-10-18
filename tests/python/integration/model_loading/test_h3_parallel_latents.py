@@ -30,7 +30,7 @@ from uniserve.models.minimax_h3 import (
 )
 from uniserve.models.minimax_h3.packing import (
     audio_latent_frames,
-    tile_packing,
+    segment_packing,
     unpatchify_video,
     video_latent_frames,
 )
@@ -376,13 +376,20 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp, precision):
             )
             for name in ("video", "audio")
         }
-        packing = tile_packing(
-            num_text_tokens=len(token_ids), num_frames=frames, canvas=WIDE
+        # The tile-major order of the generated video rows depends on the
+        # frame count and canvas alone.
+        packing = segment_packing(
+            num_frames=frames,
+            canvas=WIDE,
+            text_rows=64,
+            condition_rows=0,
+            tile=64,
+            token_multiple=64,
         )
         raster = torch.empty_like(joined["video"])
         raster[packing.video_raster_indices] = joined["video"]
         video = unpatchify_video(
-            raster, frames=packing.video_frames, height=48, width=84
+            raster, frames=video_latent_frames(frames), height=48, width=84
         )
         audio = (
             joined["audio"]

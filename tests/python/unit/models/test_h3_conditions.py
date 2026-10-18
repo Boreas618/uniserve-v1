@@ -61,7 +61,7 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
     # 64 x 36 patches and the keyframe's 1008.
     assert size.condition_rows == 4032 + 120 + 2304 + 1008
 
-    with pytest.raises(ValueError, match="sparse"):
+    with pytest.raises(ValueError, match="no keyframes"):
         _meta(dmd_denoiser()).make_size(
             124, 64, canvas=WIDE, conditions=(FIRST,)
         )
@@ -253,8 +253,8 @@ def test_a_condition_layout_holds_its_condition_rows():
     assert model.condition_layout(widened, 64) == widened
 
 
-def test_a_condition_layout_respects_the_attention_and_sequence_bound():
-    with pytest.raises(ValueError, match="single-segment sparse"):
+def test_a_condition_layout_respects_the_tasks_and_sequence_bound():
+    with pytest.raises(ValueError, match="takes no conditions"):
         model = _meta(dmd_denoiser())
         model.condition_layout(
             model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64

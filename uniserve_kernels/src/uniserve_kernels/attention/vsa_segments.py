@@ -15,7 +15,8 @@ temporaries and reproduce the eager results bit for bit:
   scores in one pass, the result of the stable sorts, cumulative sums and
   scatters of ``uniserve.nn.attention.vsa.segments.select``: each segment's
   kept tiles come from a bisection for its threshold score rather than a
-  sort.
+  sort. The query tiles may be a window of the sequence's tiles, as a
+  context partition holds.
 
 Tensors are ``[rows, heads, width]`` with any row and head strides and a unit
 column stride; compressed tiles are ``[heads, tiles, width]``.
@@ -138,7 +139,7 @@ if triton is not None:
             total.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
         )
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["query_offset"])
     def _select_tiles_kernel(
         scores,
         tile_segments,
@@ -146,7 +147,9 @@ if triton is not None:
         segment_keep,
         indices,
         counts,
+        query_tiles,
         tiles,
+        query_offset,
         block: tl.constexpr,
     ):
         """Choose one query tile's key tiles for one head.
@@ -156,6 +159,8 @@ if triton is not None:
         ``segment_keep`` tiles besides every live dense tile; a dense query
         tile keeps every live tile and an empty one none. The kept tiles are
         stored first in ascending order, then the others in ascending order.
+        Query ``q`` of the program grid is tile ``query_offset + q`` of the
+        sequence; the tables hold every tile.
 
         A segment's ``keep``-th highest score key is the largest threshold
         that ``keep`` of its keys reach; bisection over the 32-bit key range
@@ -165,13 +170,13 @@ if triton is not None:
         """
         query = tl.program_id(0)
         head = tl.program_id(1)
-        row = (head * tiles + query).to(tl.int64)
+        row = (head * query_tiles + query).to(tl.int64)
         keys = tl.arange(0, block)
         present = keys < tiles
         segments = tl.load(tile_segments + keys, mask=present, other=-1)
         live = tl.load(valid_sizes + keys, mask=present, other=0) > 0
-        query_segment = tl.load(tile_segments + query)
-        query_live = tl.load(valid_sizes + query) > 0
+        query_segment = tl.load(tile_segments + query_offset + query)
+        query_live = tl.load(valid_sizes + query_offset + query) > 0
 
         mask = live & query_live
         if query_live & (query_segment >= 0):
@@ -339,24 +344,29 @@ def select_tiles(
     tile_segments: torch.Tensor,
     valid_sizes: torch.Tensor,
     segment_keep: torch.Tensor,
+    *,
+    query_tile_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Choose every query tile's key tiles from its pooled scores.
 
-    ``scores`` is the contiguous FP32 ``[heads, tiles, tiles]`` (query tile,
-    key tile) matrix and the tables are the int32 per-tile vectors of
-    ``uniserve.nn.attention.vsa.Segments``. A dense query tile keeps every
-    live key tile; a video query tile keeps every live dense tile and, of
-    each segment ``r``, the ``segment_keep[r]`` tiles of that segment with
-    the highest scores, equal scores in ascending tile order, NaN above
-    every number and -0 equal to +0; an empty query tile keeps none.
+    ``scores`` is the contiguous FP32 ``[heads, query tiles, tiles]`` (query
+    tile, key tile) matrix and the tables are the int32 per-tile vectors of
+    ``uniserve.nn.attention.vsa.Segments``, one entry per tile of the
+    sequence. Query tile ``q`` of the scores is tile ``query_tile_offset + q``
+    of the sequence. A dense query tile keeps every live key tile; a video
+    query tile keeps every live dense tile and, of each segment ``r``, the
+    ``segment_keep[r]`` tiles of that segment with the highest scores, equal
+    scores in ascending tile order, NaN above every number and -0 equal to
+    +0; an empty query tile keeps none.
 
-    Returns ``[heads, tiles, tiles]`` int32 key-tile indices, each query
+    Returns ``[heads, query tiles, tiles]`` int32 key-tile indices, each query
     tile's kept tiles first in ascending order followed by the unkept tiles
-    in ascending order, and ``[heads, tiles]`` int32 counts.
+    in ascending order, and ``[heads, query tiles]`` int32 counts.
 
     Raises:
         RuntimeError: Triton cannot launch on the scores' device.
-        ValueError: The scores or tables do not describe one tile set.
+        ValueError: The scores or tables do not describe one tile set, or the
+            query tiles leave the sequence.
     """
     if not launchable(scores.device):
         raise RuntimeError("tile selection requires Triton")
@@ -366,35 +376,38 @@ def select_tiles(
         scores.ndim != 3
         or scores.dtype != torch.float32
         or not scores.is_contiguous()
-        or query_tiles != tiles
         or any(
             table.shape != (tiles,)
             or table.dtype != torch.int32
             or table.device != scores.device
             for table in tables
         )
+        or not 0 <= query_tile_offset <= tiles - query_tiles
     ):
         raise ValueError(
-            "tile selection needs [heads, tiles, tiles] FP32 scores and "
-            "int32 tables of the same tiles"
+            "tile selection needs [heads, query tiles, tiles] FP32 scores "
+            "over a window of the tables' tiles and int32 tables of the same "
+            "tiles"
         )
     indices = torch.empty(
-        (heads, tiles, tiles), dtype=torch.int32, device=scores.device
+        (heads, query_tiles, tiles), dtype=torch.int32, device=scores.device
     )
     counts = torch.empty(
-        (heads, tiles), dtype=torch.int32, device=scores.device
+        (heads, query_tiles), dtype=torch.int32, device=scores.device
     )
-    if heads == 0 or tiles == 0:
+    if heads == 0 or query_tiles == 0:
         return indices, counts
     block = triton.next_power_of_2(tiles)
-    _select_tiles_kernel[(tiles, heads)](
+    _select_tiles_kernel[(query_tiles, heads)](
         scores,
         tile_segments,
         valid_sizes,
         segment_keep,
         indices,
         counts,
+        query_tiles,
         tiles,
+        query_tile_offset,
         block,
         # Each bisection step reduces the whole row; four warps reduce rows
         # of up to 2048 lanes fastest, eight the longer rows.

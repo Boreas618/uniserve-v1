@@ -20,7 +20,6 @@ from uniserve.models.minimax_h3 import (
     video_vae,
 )
 from uniserve.models.minimax_h3.encoder import TextEncoderConfig
-from uniserve.nn.functional import Rounding
 
 # The 16:9 canvas FastH3 DMD exports generate.
 WIDE = image.Config(768, 1344)
@@ -49,12 +48,9 @@ def dmd_denoiser(
     video_shift: float = 12.0,
     sparsity: float = 0.9,
 ) -> DenoiserConfig:
-    """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9.
-
-    Its transformer rounds once, as normalization assigns FastH3 exports.
-    """
+    """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9."""
     return DenoiserConfig(
-        transformer=replace(transformer, rounding=Rounding.ONCE),
+        transformer=transformer,
         schedule=DmdLadder(
             rungs=rungs, video_shift=video_shift, audio_shift=3.0
         ),
