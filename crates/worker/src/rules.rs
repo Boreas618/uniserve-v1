@@ -2,10 +2,10 @@
 //!
 //! The server plans and presents every request with these rules. The model
 //! package (`uniserve.models.minimax_h3.processing`) reads the parts of them
-//! its computation and tools use, the canvas rule, the training buckets, the
-//! largest references a request may bring, the canvas a target names, the
-//! frame count of a duration and the named aspect ratios: it loads this
-//! library and calls the functions below by name. Each
+//! its computation and tools use, the tasks, the canvas rule, the training
+//! buckets, the largest references a request may bring, the canvas a target
+//! names, the frame count of a duration and the named aspect ratios: it
+//! loads this library and calls the functions below by name. Each
 //! one passes scalars and strings and returns flat lists; the documentation
 //! of each states their order. A target the rules reject comes back as a
 //! `[field, message]` rejection, the field being the request path the
@@ -111,6 +111,12 @@ fn video_frame_count(
         .map_err(|error| value_error(&error.to_string()))
 }
 
+/// `video_tasks() -> [name, ...]`: the request names of the tasks
+/// ([`VideoTask`]), in canonical order.
+fn video_tasks() -> Result<Array<Any>> {
+    Ok(list(VideoTask::ALL.map(|task| text(task.as_str()))))
+}
+
 /// `video_aspect_ratios() -> [width, height, ...]`: the named aspect ratios
 /// `t2va` and `ref2va` accept besides `auto`, in canonical order.
 fn video_aspect_ratios() -> Result<Array<Any>> {
@@ -195,6 +201,7 @@ fn video_named_canvas(
     )
 }
 
+tvm_ffi::tvm_ffi_dll_export_typed_func!(video_tasks, video_tasks);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_canvas, video_canvas);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_frame_count, video_frame_count);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_aspect_ratios, video_aspect_ratios);
