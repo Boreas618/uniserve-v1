@@ -135,10 +135,10 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | 4 x GB200 | Latency and throughput | `fasth3-ulysses4.json` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Latency | `fasth3-ulysses8-two-node.json` | `--max-running-requests 2 --graph-policy off` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-node.json` | `--max-running-requests 4` |
-| 8 x RTX PRO 6000 | Latency | `fasth3-ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240,16384` |
-| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.json` | `--max-running-requests 4 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240,16384` |
-| 4 x H200 | Latency and throughput | `fasth3-ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --video-text-capacities 1024,16384` |
-| 8 x H200 | Latency, up to 10240 prompt tokens | `fasth3-ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024,10240` |
+| 8 x RTX PRO 6000 | Latency | `fasth3-ulysses8.json` | `--max-running-requests 2 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
+| 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.json` | `--max-running-requests 4 --graph-policy off --mem-fraction-static 0.92 --video-text-capacities 1024,10240` |
+| 4 x H200 | Latency and throughput | `fasth3-ulysses4.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --video-text-capacities 1024` |
+| 8 x H200 | Latency, up to 10240 prompt tokens | `fasth3-ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
 
 The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`.
@@ -158,7 +158,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | `--max-video-seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. |
 | `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. FastH3 serves `768p` and `480p`, the others `768p`. A request for any other canvas is refused. |
 | `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default. The text encoder itself accepts up to 262144 positions; the default bounds the prompt capacities startup prepares layouts and storage for (`--video-text-capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
-| `--video-text-capacities` | Prompt capacities startup prepares; each prompt runs in the smallest that holds it. By default 1024, then steps of 2048 up to `--max-model-len`. |
+| `--video-text-capacities` | Prompt capacities below `--max-model-len` that startup prepares; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |
 | `--max-condition-rows` | Denoiser rows one request's conditions may occupy. Without it the deployment provisions the largest condition set its denoiser admits at `--max-video-seconds`, so no request is refused for its conditions: two keyframes for keyframe generation, and for references nine images at 4:1 and three videos of the generated length with their soundtracks, beside two keyframes where the denoiser packs them. A machine that cannot hold that set fails at startup, as does an OmniRef deployment, whose 131,072-row sequence bound the set exceeds; a deployment that serves less states the rows, as below. |
 | `--media-directory` | Directory under which `file://` condition URIs resolve; `file://` is refused without it. |
@@ -168,7 +168,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | `--mem-fraction-static` | Device memory each worker process may hold for weights and KV cache; 0.70 by default. |
 | `--graph-policy` | `auto` (default) captures CUDA graphs at startup; `off` runs eagerly. |
 
-Startup prepares, and with graphs captures, every layout a request without conditions reaches: each frame count up to `--max-video-seconds` at each canvas and text capacity. A request with conditions evaluates in a layout of its own, prepared when it arrives, so a reference denoiser, whose every request brings a reference, prepares only each canvas's largest layout at startup. Fewer canvases, capacities and seconds start faster and hold less storage. Until then the log reports `worker still busy during Worker startup`. On four GB200 with `ulysses4.json` and the defaults, FastH3 is ready in about 17 minutes from warm kernel caches and holds about 105 GiB per model worker; the first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--video-text-capacities 1024,10240,16384`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.
+Startup prepares, and with graphs captures, every layout a request without conditions reaches: each frame count up to `--max-video-seconds` at each canvas and text capacity. A request with conditions evaluates in a layout of its own, prepared when it arrives, so a reference denoiser, whose every request brings a reference, prepares only each canvas's largest layout at startup. Fewer canvases, capacities and seconds start faster and hold less storage. Until then the log reports `worker still busy during Worker startup`. On four GB200 with `ulysses4.json` and the defaults, FastH3 is ready in about 17 minutes from warm kernel caches and holds about 105 GiB per model worker; the first startup also compiles kernels. Serving all 12 FastH3 canvases needs fewer text capacities, such as `--video-text-capacities 1024,10240`. 768p 21:9 needs more request storage than the other canvases. A deployment that does not fit fails before it reports ready and logs what each component holds.
 
 A base denoiser counts one condition row per token: a five-second reference video with its soundtrack occupies about 38,000 rows, a 16:9 reference image at a 2048-pixel short edge about 7,300 and one at its own 2560×1440 size 3,600. OmniRef packs each condition into whole 128-row tiles: an image or audio track takes `ceil(rows / 128)` tiles, and a video's token grid of latent frames × height/32 × width/32 takes `ceil(frames / 4) × ceil(height / 32 / 4) × ceil(width / 32 / 8)`. The official video-plus-audio request therefore occupies 38,124 rows on the base reference denoiser and 47,104 on OmniRef. OmniRef also bounds a request's packed sequence (prompt, conditions and generated rows) at 131,072 rows.
 
@@ -267,7 +267,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
 | Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
 | `invalid_request` naming the condition rows and `--max-condition-rows` | Serve with a larger `--max-condition-rows`, or without it to provision the largest condition set. |
-| `invalid_request` naming the prompt length | Raise `--max-model-len` together with `--video-text-capacities`. |
+| `invalid_request` naming the prompt length | Raise `--max-model-len`. |
 | A refused `file://` condition | Set `--media-directory` to a directory that holds the path. |
 | `server_error` naming `cannot run ffprobe` | Put FFmpeg on `PATH` or name it with `--ffprobe`. |
 | An OmniRef start refusing a base file by name | Download the base at the revision the export pins. |
