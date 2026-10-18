@@ -243,6 +243,18 @@ class EncoderRunner:
         ]
 
     @staticmethod
+    def load_condition_kernels(loaded) -> None:
+        """Load the video encoder's natively built kernels, before serving.
+
+        Condition encoders are constructed for each input shape while
+        serving; loading their kernels once beforehand keeps compilation
+        out of every encoding.
+        """
+        encoder = capability(loaded.module, VideoEncoder)
+        if encoder is not None:
+            encoder.load_kernels()
+
+    @staticmethod
     def sample_rate(loaded) -> int:
         """The sample rate condition audio is resampled to for the encoder."""
         encoder = capability(loaded.module, AudioEncoder)
