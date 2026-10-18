@@ -249,7 +249,7 @@ fn call(consumers: Vec<u32>) -> Call {
         call_id: CallId::new(1, 0),
         coordinates: Default::default(),
         component: "image".into(),
-        code: CallKind::Media(MediaCall::ImageDecoding),
+        kind: CallKind::Media(MediaCall::ImageDecoding),
         bounds: Default::default(),
         inputs: Vec::new(),
         outputs: Vec::new(),

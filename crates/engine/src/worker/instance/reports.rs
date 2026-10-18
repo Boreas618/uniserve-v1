@@ -211,7 +211,7 @@ pub(super) fn validate_and_order_rank_report(
                 }),
             "predicated call published a tensor"
         );
-        if planned.code == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::CacheExport)
+        if planned.kind == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::CacheExport)
             && completion.output.status == uniserve_ipc::CallStatus::Ok
         {
             let export = completion

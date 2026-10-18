@@ -93,10 +93,10 @@ pub(super) fn latent_hazards(
                 call.request_key == params.request_key && call.call_id == params.call_id
             })?;
             matches!(
-                call.code,
+                call.kind,
                 CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
             )
-            .then_some((params, call.code == CallKind::Media(MediaCall::Denoising)))
+            .then_some((params, call.kind == CallKind::Media(MediaCall::Denoising)))
         })
         .map(|(params, denoising)| {
             let slot = backend
@@ -148,7 +148,7 @@ pub(super) fn latent_hazards(
 pub(super) fn installs(plan: &BatchPlan) -> impl Iterator<Item = &Call> {
     plan.calls
         .iter()
-        .filter(|call| call.code == CallKind::Transfer(TransferMode::CacheInstall))
+        .filter(|call| call.kind == CallKind::Transfer(TransferMode::CacheInstall))
 }
 
 /// Every cache span the batch writes: whole newly assigned units (a recycled

@@ -1032,7 +1032,7 @@ mod tests {
             call_id: CallId::new(2, request as u32),
             coordinates: Default::default(),
             component: "text".into(),
-            code: CallKind::Forward(ForwardMode::Prefill),
+            kind: CallKind::Forward(ForwardMode::Prefill),
             bounds: Default::default(),
             inputs: Vec::new(),
             outputs: Vec::new(),

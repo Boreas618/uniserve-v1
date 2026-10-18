@@ -11,7 +11,7 @@ use uniserve_ipc::{ForwardMode, MediaCall};
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
         "{error} (call {}.{}, {:?})",
-        call.call_id.batch_id, call.call_id.request_index, call.code
+        call.call_id.batch_id, call.call_id.request_index, call.kind
     )
 }
 
@@ -114,7 +114,7 @@ impl Scheduler {
 
         // Only the final muxing call, the one that carries no media units,
         // returns the artifact; every other call returns none.
-        let media_output_valid = if call.code == CallKind::Media(MediaCall::Muxing) {
+        let media_output_valid = if call.kind == CallKind::Media(MediaCall::Muxing) {
             media.is_some() == call.inputs.is_empty()
         } else {
             media.is_none()
@@ -122,7 +122,7 @@ impl Scheduler {
         // The worker reports the steps it has completed; a denoising result
         // that does not advance the trajectory would be scheduled again
         // without end.
-        let step_valid = call.code != CallKind::Media(MediaCall::Denoising)
+        let step_valid = call.kind != CallKind::Media(MediaCall::Denoising)
             || record.step_index > state.denoising.completed();
         let valid = record.status == CallStatus::Ok
             && record.request_key == call.request_key
@@ -149,7 +149,7 @@ impl Scheduler {
                 // vision features with the text encoding, the pixels with the
                 // last visual latent round, the PCM with the audio latent
                 // encoding, and the condition rows with latent preparation.
-                match call.code {
+                match call.kind {
                     CallKind::Media(MediaCall::VisionEncoding) => {
                         consumed_products
                             .extend(state.condition_media.remove(product::VISION_PIXELS));
@@ -218,7 +218,7 @@ impl Scheduler {
                     _ => {}
                 }
 
-                let phase = match call.code {
+                let phase = match call.kind {
                     CallKind::Media(
                         MediaCall::MediaReading
                         | MediaCall::VisionEncoding
@@ -368,7 +368,7 @@ impl Scheduler {
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
-        self.reclaim_domain_credit(inflight.call.code, false);
+        self.reclaim_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }
 
@@ -468,7 +468,7 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             else {
                 invalid_result = true;
                 continue;
@@ -512,7 +512,7 @@ impl Scheduler {
                         .iter()
                         .find(|inflight| inflight.call.call_id == record.call_id)
                 })
-                .map(|inflight| inflight.call.code)
+                .map(|inflight| inflight.call.kind)
             {
                 self.record_domain_completion(computation, record.status);
             }
@@ -625,7 +625,7 @@ impl Scheduler {
                     continue;
                 };
 
-                let call_variant = call.code;
+                let call_variant = call.kind;
 
                 // Media calls update their independent call progress immediately;
                 // generation calls continue through semantic validation.
@@ -732,7 +732,7 @@ impl Scheduler {
                     .is_some_and(|state| state.terminal_intent.is_terminal())
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
-                    if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                    if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                         self.free_request_latent(id);
                     }
                     self.finish_pending_if_idle(id);
@@ -753,7 +753,7 @@ impl Scheduler {
                 // An accepted forward extends the request's prefix cache: publish the
                 // prompt pages it completed, then retire sliding-window pages
                 // no later reader needs.
-                if progress_result.is_some() && matches!(call.code, CallKind::Forward(_)) {
+                if progress_result.is_some() && matches!(call.kind, CallKind::Forward(_)) {
                     self.advance_request_cache(id);
                 }
 
@@ -797,7 +797,7 @@ impl Scheduler {
                 {
                     prefix.diffusion_finalized = true;
                 }
-                if call.code == CallKind::Media(MediaCall::ImageDecoding) {
+                if call.kind == CallKind::Media(MediaCall::ImageDecoding) {
                     self.free_request_latent(id);
                 }
                 if free_guidance_prefix {
@@ -866,7 +866,7 @@ impl Scheduler {
             for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
             {
                 let token_call = matches!(
-                    call.code,
+                    call.kind,
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)

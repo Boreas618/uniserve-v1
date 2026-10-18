@@ -268,7 +268,7 @@ mod tests {
             call_id: CallId::new(1, 0),
             coordinates: Default::default(),
             component: "diffusion_gemma".into(),
-            code: CallKind::Forward(ForwardMode::TokenDenoising),
+            kind: CallKind::Forward(ForwardMode::TokenDenoising),
             bounds: uniserve_ipc::Bounds {
                 max_tokens: tokens as u32,
                 ..Default::default()

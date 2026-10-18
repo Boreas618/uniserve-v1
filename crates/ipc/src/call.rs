@@ -352,7 +352,7 @@ pub struct Call {
     /// Component bound within the selected Worker.
     pub component: String,
     /// Kind performed by this call.
-    pub code: CallKind,
+    pub kind: CallKind,
     /// Scheduler-declared limits for the computation and its outputs.
     pub bounds: Bounds,
     /// Data dependencies consumed in input order.
@@ -445,11 +445,11 @@ impl Call {
 
     /// Create a computation with no inputs or outputs and zero resource bounds.
     /// The caller fills its numerical coordinates and limits before submission.
-    pub fn new(request_key: RequestKey, call_id: CallId, code: CallKind) -> Self {
+    pub fn new(request_key: RequestKey, call_id: CallId, kind: CallKind) -> Self {
         Self {
             request_key,
             call_id,
-            code,
+            kind,
             component: DEFAULT_COMPONENT.into(),
             coordinates: CallCoordinates::default(),
             bounds: Bounds::default(),
@@ -490,7 +490,7 @@ impl Call {
 
     /// A context prefill interleaves prompt tokens and input-image blocks.
     pub fn writes_context(&self) -> bool {
-        self.code == CallKind::Forward(ForwardMode::Prefill)
+        self.kind == CallKind::Forward(ForwardMode::Prefill)
             && !self.vision_inputs.is_empty()
             && self.completion_output.is_none()
     }
@@ -581,7 +581,7 @@ impl Call {
 
     /// Returns whether successful execution advances request state.
     pub const fn advances_state(&self) -> bool {
-        self.code.advances_state()
+        self.kind.advances_state()
     }
 
     /// Validates the invariants one call carries on its own.
@@ -626,7 +626,7 @@ impl Call {
             ensure_valid!(
                 !image.is_empty()
                     && matches!(
-                        self.code,
+                        self.kind,
                         CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding)
                     )
                     && self.image_input.is_none(),
@@ -638,7 +638,7 @@ impl Call {
         // slots of the canvas rows it carries, or runs one step of its
         // request's resident generation canvas of `max_tokens` tokens. Either
         // way it produces no sampled token output.
-        let denoises = self.code == CallKind::Forward(ForwardMode::TokenDenoising);
+        let denoises = self.kind == CallKind::Forward(ForwardMode::TokenDenoising);
         ensure_valid!(
             u8::from(self.readout.is_some()) + u8::from(self.canvas.is_some())
                 == u8::from(denoises),
@@ -667,7 +667,7 @@ impl Call {
         // output-index space with the tensor outputs.
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         let publishes_cache = matches!(
-            self.code,
+            self.kind,
             CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
         );
         ensure_valid!(
@@ -683,7 +683,7 @@ impl Call {
             output_indices.insert(output.output_index);
         }
         let consumes_cache = matches!(
-            self.code,
+            self.kind,
             CallKind::Transfer(TransferMode::CacheInstall)
                 | CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         );
@@ -695,7 +695,7 @@ impl Call {
             );
         }
         ensure_valid!(
-            self.code != CallKind::Transfer(TransferMode::CacheInstall)
+            self.kind != CallKind::Transfer(TransferMode::CacheInstall)
                 || self.cache_input.is_some(),
             "cache installation requires a source export"
         );
@@ -718,7 +718,7 @@ impl Call {
 
         if let Some(input) = &self.token_input {
             ensure_valid!(
-                self.code == CallKind::Transfer(TransferMode::Tensor),
+                self.kind == CallKind::Transfer(TransferMode::Tensor),
                 "token transfer input requires a tensor-transfer computation"
             );
             ensure_valid!(
@@ -773,7 +773,7 @@ impl Call {
         // An image trajectory's latent preparation names the image whose
         // noise it draws; image indices count from one. A video latent
         // preparation, which writes no latent product, names none.
-        let prepares_image = self.code == CallKind::Media(MediaCall::LatentPreparation)
+        let prepares_image = self.kind == CallKind::Media(MediaCall::LatentPreparation)
             && self.latent_output.is_some();
         ensure_valid!(
             self.image_index.is_some() == prepares_image && self.image_index != Some(0),

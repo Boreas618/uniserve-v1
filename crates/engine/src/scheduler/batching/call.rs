@@ -41,7 +41,7 @@ impl Scheduler {
             return None;
         };
         if self.inflight.has_pending_calls(request_id)
-            && !self.can_queue_successor(request_id, call.code)
+            && !self.can_queue_successor(request_id, call.kind)
         {
             tracing::error!(
                 request_id = request_id.0,
@@ -89,9 +89,9 @@ impl Scheduler {
                 self.fatal = true;
                 return None;
             };
-            if call.code == CallKind::Forward(ForwardMode::Decode) {
+            if call.kind == CallKind::Forward(ForwardMode::Decode) {
                 predecessor.token_output.clone()
-            } else if self.follows_unconditionally(request_id, call.code) {
+            } else if self.follows_unconditionally(request_id, call.kind) {
                 None
             } else {
                 predecessor.completion_output.clone()
@@ -114,7 +114,7 @@ impl Scheduler {
         // counts the tokens this call appends. Export, latent preparation,
         // and denoising only read the request's prefix cache.
         let (_, visible) = self.scheduled_token_lengths(request_id)?;
-        let cache_lengths = match call.code {
+        let cache_lengths = match call.kind {
             // A context prefill's bound counts its prompt tokens and its
             // vision blocks' exact cache lengths.
             CallKind::Forward(ForwardMode::Prefill) => Some(CacheLengths {
@@ -361,7 +361,7 @@ impl Scheduler {
         // finalizes the prefix, the call also prefills a non-empty negative
         // prompt into it; the prefix's tables are resent until then and
         // whenever the prefix has gained pages.
-        if call.code == CallKind::Media(MediaCall::Denoising) {
+        if call.kind == CallKind::Media(MediaCall::Denoising) {
             let Some(CacheLengths {
                 visible: conditioning_tokens,
                 ..

@@ -694,8 +694,8 @@ impl WorkerBackend {
         let unsupported: BTreeSet<&str> = plan
             .calls
             .iter()
-            .filter(|call| !self.info.supported_calls.contains(&call.code))
-            .map(|call| call.code.as_str())
+            .filter(|call| !self.info.supported_calls.contains(&call.kind))
+            .map(|call| call.kind.as_str())
             .collect();
         if !unsupported.is_empty() {
             return Err(Error::Invalid(format!(

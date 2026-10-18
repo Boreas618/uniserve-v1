@@ -96,7 +96,7 @@ impl WorkerBatch {
 
     /// The batch's call kind; `None` for a lifecycle-only batch.
     pub(crate) fn route(&self) -> Option<CallKind> {
-        self.plan.calls.first().map(|call| call.code)
+        self.plan.calls.first().map(|call| call.kind)
     }
 
     pub(crate) fn predecessors(&self) -> &[Option<CallId>] {
@@ -628,7 +628,7 @@ impl WorkerBackend {
 
 impl WorkerBackend {
     fn validate_kinds(&self, batch: &WorkerBatch) -> Result<()> {
-        let kinds: BTreeSet<CallKind> = batch.plan.calls.iter().map(|call| call.code).collect();
+        let kinds: BTreeSet<CallKind> = batch.plan.calls.iter().map(|call| call.kind).collect();
         if kinds.len() > 1 {
             return Err(Error::Invalid(
                 "an execution batch carries calls of one kind".into(),
