@@ -24,7 +24,8 @@ from . import audio_vae, video_vae
 from .config import Attention, DenseAttention
 from .output import frame_slices
 from .packing import (
-    FPS,
+    CLIP_FRAMES,
+    CLIP_LATENTS,
     audio_latent_frames,
     latent_raster,
     unpatchify_video_into,
@@ -88,8 +89,8 @@ class VideoDecoder(BaseVideoDecoder):
         # Unit k decodes latent frames [5k, 5k + 7): five frames that advance
         # the timeline and two trailing frames that the next unit's window
         # also reads. Their raster rows are [start, stop).
-        unit = frames.start // 17
-        start = unit * 5 * tokens_per_frame
+        unit = frames.start // CLIP_FRAMES
+        start = unit * CLIP_LATENTS * tokens_per_frame
         stop = start + 7 * tokens_per_frame
         if isinstance(self.attention, DenseAttention):
             # Dense packing keeps the raster order.
@@ -170,9 +171,8 @@ class AudioDecoder(BaseAudioDecoder):
 
     def track_samples(self, num_frames: int, frame_rate: int) -> int:
         # The denoiser generates audio_latent_frames(num_frames) latents per
-        # channel (packing.py), and each decodes to latent_rate samples.
-        if frame_rate != FPS:
-            raise ValueError(f"H3 audio accompanies {FPS} fps video")
+        # channel on the H3 timeline (packing.py), whose frame rate the video
+        # postprocessor reports; each latent decodes to latent_rate samples.
         return audio_latent_frames(num_frames) * self.latent_rate
 
     @property
