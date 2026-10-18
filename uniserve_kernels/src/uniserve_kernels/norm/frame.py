@@ -1,4 +1,4 @@
-"""Causal convolution padding of video frames in one pass.
+"""Causal convolution padding of video frames, alone or normalized.
 
 A causal 3D convolution over ``[batch, channels, frames, height, width]``
 reads its input padded on both sides of height and width (reflected or
@@ -8,17 +8,36 @@ through its own strides, so channel-first, channels-last and permuted views
 all work. The output equals the two-step ``F.pad`` result bit for bit: every
 element is a copy of one source element or zero.
 
-The kernel backs ``uniserve.nn.functional.frame_pad``, which validates the
-padding, allocates the output in its storage order and raises on CUDA
-whenever :func:`unsupported` reports a reason; the launcher does not
+A causal video convolution after a pre-activation reads
+``pad(silu(group_norm(frame)))`` for every frame. :func:`normalize_pad`
+computes the moments of every frame's channel groups straight from the
+values and writes the padded, normalized and activated input in one further
+pass, into channel-first or channels-last storage. The result equals
+PyTorch's composition (a frame-folding copy, ``F.group_norm``, ``F.silu``
+and the causal padding) bit for bit: the native extension built from
+``csrc/frame.cu`` reproduces PyTorch's CUDA moments reduction, normalization
+branches and SiLU expression.
+
+The kernels back ``uniserve.nn.functional.frame_pad`` and
+``frame_norm_pad``, which validate the padding, allocate the output in its
+storage order and raise on CUDA whenever :func:`unsupported` or
+:func:`unsupported_normalize` reports a reason; the launchers do not
 revalidate.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 
-from uniserve_kernels.triton import tl, triton, unsupported_operands
+from uniserve_kernels.triton import (
+    records_autograd,
+    tl,
+    triton,
+    unsupported_operands,
+)
 
 # Output pixels along the width and channels each program writes.
 _PAD_PIXELS = 32
@@ -188,4 +207,101 @@ def pad(
         _PAD_PIXELS,
         _PAD_CHANNELS,
         num_warps=4,
+    )
+
+
+@lru_cache(maxsize=1)
+def _extension():
+    from uniserve_kernels import jit
+
+    # The sources compile without fast math, as PyTorch's normalization and
+    # SiLU kernels do, whose arithmetic they reproduce bit for bit.
+    return jit.load(
+        "uniserve_frame_norm",
+        [Path(__file__).parent / "csrc" / "frame.cu"],
+        cuda_flags=(
+            "-O3",
+            "-std=c++20",
+            "--expt-relaxed-constexpr",
+            jit.device_architecture(),
+        ),
+    )
+
+
+def load() -> None:
+    """Compile or load the normalization extension for the current device."""
+    _extension()
+
+
+def unsupported_normalize(
+    values: torch.Tensor,
+    out: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> str | None:
+    """Return why the kernels cannot normalize ``values`` into ``out``.
+
+    The values are CUDA float32 whose frames store each channel's
+    ``height * width`` pixels contiguously, such as channel-first or
+    frame-major storage; the output is contiguous or channels-last float32
+    storage of the values' batch and channels; ``weight`` and ``bias``, when
+    present, are contiguous float32 per-channel vectors. Returns ``None``
+    when every condition holds.
+    """
+    operands = (values, out, weight, bias)
+    present = tuple(tensor for tensor in operands if tensor is not None)
+    if any(tensor.device != values.device for tensor in present):
+        return "operands reside on different devices"
+    if values.device.type != "cuda":
+        return f"operands reside on {values.device}, not a CUDA device"
+    if records_autograd(*present):
+        return (
+            "autograd is recording operands that require grad, and the "
+            "kernel defines no backward; call under torch.inference_mode()"
+        )
+    if any(tensor.dtype != torch.float32 for tensor in present):
+        return "the kernels normalize float32 values"
+    if values.ndim != 5 or out.ndim != 5:
+        return "values and output are not [batch, channels, frames, h, w]"
+    if values.stride(4) != 1 or values.stride(3) != values.shape[4]:
+        return "a frame's pixels of one channel are not contiguous"
+    if not (
+        out.is_contiguous()
+        or out.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        return "the output is neither contiguous nor channels-last"
+    if out.shape[:2] != values.shape[:2]:
+        return "the output's batch and channels differ from the input's"
+    for parameter in (weight, bias):
+        if parameter is not None and (
+            parameter.shape != (values.shape[1],)
+            or not parameter.is_contiguous()
+        ):
+            return "normalization parameters are not per-channel vectors"
+    return None
+
+
+def normalize_pad(
+    values: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    groups: int,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+    padding: tuple[int, int, int],
+    reflect: bool,
+) -> None:
+    """Write ``values`` normalized, activated and padded into ``out``.
+
+    ``padding`` is ``(top, left, front)``: the rows above, columns left of
+    and zero frames before the source within ``out``; the remaining rows and
+    columns of ``out`` pad the bottom and right, reflected or replicated.
+    The moments occupy a ``[batch * frames, groups]`` FP32 intermediate.
+    """
+    extension = _extension()
+    mean, rstd = extension.frame_moments(values, groups, eps)
+    top, left, front = padding
+    extension.frame_norm_pad(
+        values, mean, rstd, weight, bias, out, groups, top, left, front, reflect
     )

@@ -19,6 +19,7 @@ from uniserve.diffusion import normal_noise
 from uniserve.media import image, video
 from uniserve.models import AudioEncoder as BaseAudioEncoder
 from uniserve.models import VideoEncoder as BaseVideoEncoder
+from uniserve.nn import functional
 from uniserve.nn.vae import DiagonalGaussian, LatentEncoder
 from uniserve.tensors import OutputLayout
 
@@ -147,6 +148,12 @@ class VideoEncoder(BaseVideoEncoder):
                 variable_axes=(0,),
             )
         }
+
+    def load_kernels(self) -> None:
+        # The encoder's pre-activated convolutions read frame_norm_pad, whose
+        # native kernels serve CUDA residents only.
+        if self.pixel_mean.is_cuda:
+            functional.load_frame_kernels()
 
     def posterior_noise(self, size: video.Config) -> torch.Tensor:
         # One standard normal FP32 draw of the complete latent from a fresh

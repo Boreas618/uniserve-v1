@@ -82,6 +82,11 @@ pub(crate) enum ConditionSetup {
 
 impl Conditions {
     fn new(video: RunnerSetup<'_>, audio: RunnerSetup<'_>) -> Result<Self> {
+        // Condition encoders are constructed per input shape while serving;
+        // the natively built kernels they launch load now, so no encoding
+        // compiles one.
+        Interpreter::import(&format!("{ENCODER}.load_condition_kernels"))?
+            .call(&[video.loaded.view()])?;
         Ok(Self {
             unit_frames: Interpreter::import(&format!("{ENCODER}.unit_frames"))?,
             loaded: video.loaded.clone(),

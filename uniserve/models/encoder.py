@@ -679,6 +679,15 @@ class VideoEncoder(nn.Module):
         """Describe the complete latent rows of one video under ``video``."""
         raise NotImplementedError
 
+    def load_kernels(self) -> None:
+        """Build or load the native kernels ``encode`` launches.
+
+        The kernels compile for the current CUDA device on first use; the
+        rank calls this once before serving so no encoding compiles one. An
+        encoder whose forward launches no natively built kernel does
+        nothing.
+        """
+
     def posterior_noise(self, size: video.Config) -> torch.Tensor | None:
         """Return one video's complete NCTHW posterior draw, or None.
 

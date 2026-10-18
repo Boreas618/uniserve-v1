@@ -873,6 +873,11 @@ class CausalConv3d(nn.Conv3d):
     reads its input: a channels-last input reaches convolution kernels that
     compute channels-last without a transposition, and the result follows
     that order.
+
+    ``forward(values, norm=norm)`` convolves the pre-activation
+    ``silu(norm(values))`` of a ``FrameGroupNorm``, which
+    ``functional.frame_norm_pad`` normalizes, activates and pads together,
+    bit for bit as the three operations compute it.
     """
 
     def __init__(
@@ -911,7 +916,22 @@ class CausalConv3d(nn.Conv3d):
         """Convolve input that already carries this convolution's padding."""
         return F.conv3d(padded, self.weight, self.bias, stride=self.stride)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, values: torch.Tensor, norm: FrameGroupNorm | None = None
+    ) -> torch.Tensor:
+        if norm is not None:
+            return self.convolve(
+                functional.frame_norm_pad(
+                    values,
+                    self.padding_extents,
+                    groups=norm.num_groups,
+                    weight=norm.weight,
+                    bias=norm.bias,
+                    eps=norm.eps,
+                    mode=self.spatial_padding_mode,
+                    memory_format=self.memory_format,
+                )
+            )
         if self.spatial_padding or self.temporal_padding:
             values = functional.frame_pad(
                 values,
@@ -983,7 +1003,8 @@ class CausalBlock(nn.Module):
         for norm, convolution in zip(
             self.norms, self.convolutions, strict=True
         ):
-            hidden = convolution(F.silu(norm(hidden)))
+            # The convolution reads silu(norm(hidden)), padded with it.
+            hidden = convolution(hidden, norm=norm)
         return self.shortcut(values) + hidden
 
 
@@ -1118,7 +1139,7 @@ class CausalCNN(nn.Module):
         hidden = self.input(pixels)
         for stage in self.stages:
             hidden = stage(hidden)
-        return self.output(F.silu(self.norm(hidden)))
+        return self.output(hidden, norm=self.norm)
 
 
 class Encoder(SpatialEncoder):
