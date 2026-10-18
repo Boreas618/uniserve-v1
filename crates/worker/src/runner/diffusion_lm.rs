@@ -220,6 +220,17 @@ fn mirrors(metadata: &AttentionMetadata) -> [Argument; 4] {
 }
 
 impl DiffusionLMRunner {
+    /// Blocks one sampler chunk of the runner's denoising step covers, every
+    /// row count of which the engine warms through its scheduler; zero on a
+    /// rank that generates no blocks.
+    pub(crate) fn step_rows(&self) -> u32 {
+        if self.sampling.is_some() {
+            self.chunk_rows as u32
+        } else {
+            0
+        }
+    }
+
     /// The runner's owner name and kernel records.
     pub(crate) fn kernels(&self) -> Result<(String, Vec<KernelRecord>)> {
         let records = self

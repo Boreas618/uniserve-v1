@@ -345,6 +345,45 @@ impl VideoDenoiserInfo {
     }
 }
 
+/// An image shape a rank's image denoiser was prepared for: a raster and
+/// the guidance branches its captured step evaluates.
+///
+/// The engine runs one image request of this shape through its scheduler
+/// before it serves (`warmup`), at guidance scales that realize the branch
+/// count (`ImageParams::guidance_scales`), so the serving path of every
+/// captured branch count has run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageWarmup {
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Guidance branches one image evaluates per step, one to three.
+    pub branches: u8,
+    /// The model's framing of an empty negative prompt, which the warmup
+    /// request carries as its negative conditioning tokens, as the server
+    /// renders a client's; empty for one branch, which has no alternative
+    /// prefix, and for a model without prompt framing.
+    pub negative_token_ids: Vec<u32>,
+}
+
+impl ImageWarmup {
+    /// Checks that the shape names a raster and one to three branches, and
+    /// carries an alternative prefix only for guided generation.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.height > 0 && self.width > 0,
+            "an image warmup shape is empty"
+        );
+        ensure_valid!(
+            (1..=3).contains(&self.branches)
+                && (self.branches > 1 || self.negative_token_ids.is_empty()),
+            "an image warmup shape has no valid guidance branches"
+        );
+        Ok(())
+    }
+}
+
 /// Post-load worker geometry, limits, supported work, and model identity.
 ///
 /// [`WorkerInfo::validate`] checks only internal consistency. The engine's
@@ -361,6 +400,14 @@ pub struct WorkerInfo {
     pub num_inference_steps: u32,
     /// What the deployment's video denoiser serves, when the model has one.
     pub video_denoiser: Option<VideoDenoiserInfo>,
+    /// Image shapes this rank's image denoiser was prepared for, one per
+    /// captured guidance-branch count, each of which the engine warms with a
+    /// real request before serving.
+    pub image_warmups: Vec<ImageWarmup>,
+    /// Blocks one sampler chunk of this rank's diffusion LM denoising step
+    /// covers, every row count of which the engine warms; zero when the rank
+    /// generates no blocks.
+    pub diffusion_lm_step_rows: u32,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -527,6 +574,9 @@ impl WorkerInfo {
             }),
             "a media call names no component this worker serves"
         );
+        for shape in &self.image_warmups {
+            shape.validate()?;
+        }
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
             ensure_valid!(
@@ -580,6 +630,8 @@ impl Default for WorkerInfo {
             media_components: Default::default(),
             num_inference_steps: 0,
             video_denoiser: None,
+            image_warmups: Vec::new(),
+            diffusion_lm_step_rows: 0,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),

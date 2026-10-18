@@ -19,16 +19,10 @@
 //! of the lane: one installs them before the bucket's steps, one clears
 //! them and resets the scratch units after.
 //!
-//! The scenario then admits one request, prefills one token with a token
-//! relay output, decodes from that relay and finishes, through the serving
-//! executor.
+//! The serving path of these graphs is warmed by the engine, with a real
+//! request through its scheduler once the rank reported.
 
-use uniserve_core::{CallId, SamplingParams, UnitId};
-use uniserve_ipc::{
-    ArRequestParams, Batch as BatchPlan, BatchCommand, BlockTable, Bounds, CacheUnitAllocation,
-    Call, CallCoordinates, CallKind, CallStatus, DType, ForwardBatch, ForwardMode, NewRequest,
-    ShapeBound, TensorRef,
-};
+use uniserve_ipc::{CallKind, ForwardMode};
 
 use std::sync::Arc;
 
@@ -47,7 +41,7 @@ use crate::sampling::RowSampling;
 use crate::storage::PrefixCache;
 use crate::storage::memory::{Memory, StorageView};
 use crate::stream::Issue;
-use crate::warmup::{Scenarios, WarmupHooks};
+use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 
 /// The causal LM runners' warmup work.
@@ -83,13 +77,6 @@ impl WarmupHooks for CausalLMWarmup {
             .map_err(|error| {
                 WorkerError::classify(error, Some("text context warmup")).with_phase("warmup")
             })
-    }
-
-    fn scenarios(&mut self, scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError> {
-        if scenarios.backend().text_mut().is_none() {
-            return Ok(());
-        }
-        tokens(scenarios)
     }
 }
 
@@ -525,168 +512,4 @@ impl CausalLMRunners {
             None => Ok(()),
         }
     }
-}
-
-/// One prefill and one relayed decode of a fresh request.
-fn tokens(scenarios: &mut Scenarios<'_>) -> std::result::Result<(), WorkerError> {
-    let slot = scenarios.slot()?;
-    let key = scenarios.request_key();
-    let admission = NewRequest::new(
-        key,
-        slot,
-        Some(ArRequestParams {
-            sampling: SamplingParams {
-                temperature: 0.0,
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            negative_token_ids: Vec::new(),
-            finish_token_ids: Vec::new(),
-            initial_position: 0,
-            canvas: None,
-        }),
-        None,
-        0,
-    )
-    .map_err(|error| Error::Invalid(error.to_string()))?;
-    let shapes = scenarios
-        .backend()
-        .rank_storage()
-        .and_then(|storage| storage.prefix_cache.as_ref())
-        .ok_or(Error::State("text warmup requires a prefix cache"))?
-        .plan()
-        .group_shapes()?;
-
-    let (id, sequence) = scenarios.batch_id();
-    let prompt_id = CallId::new(id, 0);
-    let token = relay(key, prompt_id);
-    let mut prompt = token_call(key, prompt_id, ForwardMode::Prefill, vec![0], 0);
-    prompt.token_output = Some(token.clone());
-    let mut first = token_batch(id, vec![admission], prompt, slot, &shapes, 0, 1);
-    first.collective_seq = sequence;
-    require_ok(
-        scenarios
-            .run(first)?
-            .output
-            .completions
-            .iter()
-            .map(|output| output.status),
-    )?;
-
-    let (id, sequence) = scenarios.batch_id();
-    let decode_id = CallId::new(id, 0);
-    let mut decode = token_call(key, decode_id, ForwardMode::Decode, Vec::new(), 1);
-    decode.token_output = Some(relay(key, decode_id));
-    decode.predicate = Some(token.clone());
-    let mut second = token_batch(id, Vec::new(), decode, slot, &shapes, 1, 1);
-    second.collective_seq = sequence;
-    require_ok(
-        scenarios
-            .run(second)?
-            .output
-            .completions
-            .iter()
-            .map(|output| output.status),
-    )?;
-
-    let (id, sequence) = scenarios.batch_id();
-    let mut finish = BatchPlan::new(id, Vec::new(), Vec::new()).with_commands(vec![
-        BatchCommand::Free {
-            buffer: token.buffer_id(),
-        },
-        BatchCommand::Finish {
-            request_key: key,
-            retained_buffers: Vec::new(),
-        },
-    ]);
-    finish.collective_seq = sequence;
-    scenarios.run(finish)?;
-    scenarios.release(key);
-    tracing::info!("completed causal LM warmup");
-    Ok(())
-}
-
-fn require_ok(statuses: impl Iterator<Item = CallStatus>) -> Result<()> {
-    for status in statuses {
-        if status != CallStatus::Ok {
-            return Err(Error::Invariant(format!(
-                "text warmup call completed with {status:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn relay(key: uniserve_ipc::RequestKey, call: CallId) -> TensorRef {
-    TensorRef {
-        request_key: key,
-        producer_call_id: call,
-        output_index: 0,
-        generation: 1,
-        dtype: DType::I64,
-        shape_bound: ShapeBound::default(),
-    }
-}
-
-fn token_call(
-    key: uniserve_ipc::RequestKey,
-    id: CallId,
-    mode: ForwardMode,
-    tokens: Vec<u32>,
-    prefix: u32,
-) -> Call {
-    let mut call = Call::new(key, id, CallKind::Forward(mode));
-    call.coordinates = CallCoordinates {
-        logical_position: prefix,
-        cache_visible_len: prefix,
-        cache_computed_len: prefix,
-        flow_step: 0,
-    };
-    call.bounds = Bounds {
-        max_tokens: 1,
-        ..Bounds::default()
-    };
-    call.input_token_ids = tokens;
-    call
-}
-
-/// A one-call batch on `slot`, whose tables hold one page per group from
-/// unit 1 (allocated by the first call).
-fn token_batch(
-    id: u64,
-    admissions: Vec<NewRequest>,
-    call: Call,
-    slot: u32,
-    shapes: &[crate::storage::GroupShape],
-    prefix: u32,
-    query: u32,
-) -> BatchPlan {
-    let mut batch = BatchPlan::new(id, admissions, vec![call]);
-    let mut unit = 1;
-    for (group, shape) in shapes.iter().enumerate() {
-        let units: Vec<UnitId> = (unit..unit + shape.units_per_page).map(UnitId).collect();
-        unit += shape.units_per_page;
-        batch.block_tables.push(BlockTable {
-            request_pool_idx: slot,
-            group_id: group as u32,
-            start_page: 0,
-            unit_ids: units.clone(),
-            allocated_tokens: shape.page_tokens,
-        });
-        if prefix == 0 {
-            batch.new_cache_units.push(CacheUnitAllocation {
-                request_pool_idx: slot,
-                group_id: group as u32,
-                unit_ids: units,
-            });
-        }
-    }
-    batch.forward = ForwardBatch {
-        call_indices: vec![0],
-        request_pool_indices: vec![slot],
-        seq_lens: vec![prefix + query],
-        query_lens: vec![query],
-        write_cache: vec![true],
-    };
-    batch
 }

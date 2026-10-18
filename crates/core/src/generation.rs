@@ -899,7 +899,12 @@ pub struct GenerationRequest {
     pub request_id: RequestId,
     /// Final positive model prompt, including template and image-marker tokens.
     pub prompt_token_ids: Vec<u32>,
-    /// Final negative conditioning tokens used by image generation.
+    /// Final negative conditioning tokens of image generation: the whole
+    /// prefix its text-unconditional guidance branch attends to. The engine
+    /// sizes that prefix's cache and prefill from them and the worker
+    /// conditions the branch on exactly them, so an empty list conditions
+    /// it on no prefix; a model's framing of the negative prompt belongs in
+    /// them.
     pub negative_prompt_token_ids: Vec<u32>,
     /// Media positions refer directly to `prompt_token_ids`.
     pub multimodal_inputs: MultimodalInputs,

@@ -372,24 +372,38 @@ impl ImagePolicy {
     }
 
     /// Record the call asking the prefix a guidance branch of `source`
-    /// conditions on: the job's completion carries `[reuses, *tokens]`,
-    /// which [`Self::prefix`] reads.
-    pub(crate) fn ask_prefix(
-        &self,
-        source: BranchSource,
-        image_prompt: &str,
-        negative_prompt: &str,
-        job: &Job,
-    ) {
+    /// conditions on for the image prompt `image_prompt`: the job's
+    /// completion carries `[reuses, *tokens]`, which [`Self::prefix`] reads.
+    ///
+    /// The negative prompt the model is given is empty: the negative
+    /// source's prefix is the admitted negative tokens
+    /// ([`BranchSource::admitted`]), and no other source reads it.
+    pub(crate) fn ask_prefix(&self, source: BranchSource, image_prompt: &str, job: &Job) {
         job.call_returning(MethodCall::new(
             &self.guidance_prefix,
             vec![
                 Argument::Handle(self.loaded.clone()),
                 Argument::Text(source.name().to_owned()),
                 Argument::Text(image_prompt.to_owned()),
-                Argument::Text(negative_prompt.to_owned()),
+                Argument::Text(String::new()),
             ],
         ));
+    }
+
+    /// The prefix the model frames for a guidance branch of `source` of a
+    /// request without an image prompt or a negative prompt, asked now on
+    /// the Python thread (startup work).
+    pub(crate) fn prefix_of(&self, source: BranchSource) -> Result<Prefix> {
+        let text = |value: &str| tvm_ffi::Any::from(tvm_ffi::String::from(value));
+        let values = self.guidance_prefix.call_values(&[
+            self.loaded.to_any(),
+            text(source.name()),
+            text(""),
+            text(""),
+        ])?;
+        let values = integers(values)
+            .map_err(|error| Error::numerical(self.guidance_prefix.name(), &error))?;
+        self.prefix(&values)
     }
 
     /// The prefix a prefix call returned as `[reuses, *tokens]`.

@@ -79,7 +79,7 @@ use crate::scheduler::generation::{
     is_prompt_extend,
 };
 
-use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx};
+use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
 use crate::prefix_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crate::storage::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
