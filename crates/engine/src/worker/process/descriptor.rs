@@ -195,7 +195,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
             max_video_seconds: 15.0,
-            max_condition_rows: 0,
+            max_condition_rows: None,
             encoder_cache_entries: 256,
             ffmpeg: Self::DEFAULT_FFMPEG.into(),
             min_video_seconds: None,

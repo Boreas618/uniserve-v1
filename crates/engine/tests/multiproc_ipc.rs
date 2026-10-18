@@ -2062,7 +2062,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         max_request_pool_size: 129,
         max_model_len: 8192,
         max_video_seconds: 15.0,
-        max_condition_rows: 0,
+        max_condition_rows: None,
         // The stub rank encodes many small images, so it keeps a larger
         // encoder cache than a served model's default.
         encoder_cache_entries: 1024,

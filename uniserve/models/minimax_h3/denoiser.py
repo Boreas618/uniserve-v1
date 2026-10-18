@@ -39,11 +39,13 @@ from uniserve.diffusion import (
     ladder,
     uniform_grid,
 )
-from uniserve.media import image
+from uniserve.media import image, video
 from uniserve.models import (
     Condition,
+    ConditionRole,
     ConditionTiles,
     LatentInput,
+    ReferenceLimits,
     VideoDenoiser,
 )
 from uniserve.nn import ColumnParallelLinear, RotaryEmbedding
@@ -83,8 +85,14 @@ from .packing import (
     segment_tiles,
     video_latent_frames,
 )
-from .processing import NAMED_ASPECT_RATIOS, canvas
+from .processing import NAMED_ASPECT_RATIOS, canvas, reference_bounds
 from .transformer import Transformer, TransformerLayer
+
+# The references one ref2va request may carry, as documented for the
+# released checkpoint: nine images, three videos with or without their
+# soundtracks, three audio tracks, and twelve references in all; keyframes
+# are not counted.
+REFERENCE_LIMITS = ReferenceLimits(images=9, videos=3, audios=3, total=12)
 
 # A visual condition is held at this clean time for every step whose
 # generated video is noisier, as the released model was trained.
@@ -237,6 +245,79 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     @property
     def tasks(self) -> tuple[str, ...]:
         return self.config.tasks
+
+    @property
+    def text_only(self) -> bool:
+        # Only ``t2va`` generates from the prompt alone.
+        return "t2va" in self.config.tasks
+
+    @property
+    def max_references(self) -> ReferenceLimits:
+        """The reference counts the checkpoint documents for ``ref2va``."""
+        if "ref2va" not in self.config.tasks:
+            return ReferenceLimits()
+        return REFERENCE_LIMITS
+
+    def max_conditions(
+        self, num_frames: int, canvas: image.Config
+    ) -> tuple[Condition, ...]:
+        """The largest condition set the checkpoint documents for a request.
+
+        A ``ref2va`` request carries up to ``max_references``: images of the
+        largest reference raster and videos of the generated length with
+        their soundtracks, on the canvas of the canvas rule where a video
+        packs the most rows (``processing.reference_bounds``). Its nine
+        images and three videos are its twelve references, and each packs
+        more rows than an audio reference's track alone. A network whose
+        packing holds keyframes also holds the two keyframes of ``canvas``,
+        which are all an ``fl2va`` request carries; the segment packing of
+        sparse attention holds no keyframes.
+        """
+        tasks = set(self.config.tasks)
+        if not tasks & {"fl2va", "ref2va"}:
+            return ()
+
+        keyframes: tuple[Condition, ...] = ()
+        if self.dense:
+            frame = video.Config(1, canvas)
+            keyframes = (
+                Condition(ConditionRole.FIRST_FRAME, frame),
+                Condition(ConditionRole.LAST_FRAME, frame),
+            )
+        if "ref2va" not in tasks:
+            return keyframes
+
+        def rows(condition: Condition) -> int:
+            size = self.make_size(
+                num_frames, 1, canvas=canvas, conditions=(condition,)
+            )
+            return size.condition_rows
+
+        bounds = reference_bounds(num_frames)
+        still = max(
+            (
+                Condition(ConditionRole.REFERENCE, video.Config(1, raster))
+                for raster in bounds.images
+            ),
+            key=rows,
+        )
+        clip = max(
+            (
+                Condition(
+                    ConditionRole.REFERENCE,
+                    video.Config(bounds.video_frames, raster),
+                    bounds.audio_samples,
+                )
+                for raster in bounds.video_canvases
+            ),
+            key=rows,
+        )
+        limits = self.max_references
+        return (
+            *keyframes,
+            *(still,) * limits.images,
+            *(clip,) * limits.videos,
+        )
 
     @property
     def schedule_shifts(self) -> Mapping[str, float]:

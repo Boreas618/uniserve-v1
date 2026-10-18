@@ -19,10 +19,11 @@ from tests.python.fixtures.h3 import (
     transformer_config,
 )
 from uniserve.media import image, video
-from uniserve.models import Condition, ConditionRole
+from uniserve.models import Condition, ConditionRole, ReferenceLimits
 from uniserve.models.minimax_h3.denoiser import Denoiser
 from uniserve.models.minimax_h3.inputs import DenoiserSize
 from uniserve.models.minimax_h3.packing import patchify_video
+from uniserve.models.minimax_h3.processing import canvas
 
 pytestmark = pytest.mark.unit
 
@@ -279,3 +280,77 @@ def test_a_condition_layout_respects_the_tasks_and_sequence_bound():
     assert model.condition_layout(layout, 1024).condition_rows == 1024
     with pytest.raises(ValueError, match="38798 sequence rows"):
         model.condition_layout(layout, 1025)
+
+
+def _reference_image(width: int, height: int) -> image.Config:
+    """The raster an image reference is encoded at, as the guide states it.
+
+    The short edge scales to 2048 pixels and each side rounds half to even
+    to a multiple of 32.
+    """
+    scale = 2048 / min(width, height)
+    return image.Config(
+        round(height * scale / 32) * 32, round(width * scale / 32) * 32
+    )
+
+
+def test_the_largest_condition_set_follows_the_served_tasks():
+    """A denoiser states the largest condition set its tasks admit.
+
+    Text-to-video takes none and keyframe generation the two keyframes of
+    the target canvas. A reference request carries up to nine images and
+    three videos: images of the widest reference raster, 4:1 at the
+    2048-pixel short edge, and videos of the generated 124 frames with
+    their 124 / 24 seconds of 32 kHz sound. A dense network packs the
+    keyframes beside them; the segment packing holds none.
+    """
+    keyframes = (
+        Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE)),
+        Condition(ConditionRole.LAST_FRAME, video.Config(1, WIDE)),
+    )
+    text_only = _meta(dmd_denoiser())
+    assert text_only.text_only
+    assert text_only.max_conditions(124, WIDE) == ()
+    keyframed = _meta(base_denoiser())
+    assert keyframed.text_only
+    assert keyframed.max_references == ReferenceLimits()
+    assert keyframed.max_conditions(124, WIDE) == keyframes
+
+    for denoiser, leading in (
+        (_meta(base_denoiser(tasks=("ref2va",))), keyframes),
+        (_meta(omniref_denoiser()), ()),
+    ):
+        assert not denoiser.text_only
+        assert denoiser.max_references == ReferenceLimits(
+            images=9, videos=3, audios=3, total=12
+        )
+        conditions = denoiser.max_conditions(124, WIDE)
+        assert conditions[: len(leading)] == leading
+        references = conditions[len(leading) :]
+        stills = [item for item in references if item.video.num_frames == 1]
+        clips = [item for item in references if item.video.num_frames > 1]
+        assert (len(stills), len(clips)) == (9, 3)
+        assert {
+            (item.video.num_frames, item.audio_samples) for item in clips
+        } == {(124, 165_334)}
+
+        def rows(condition, denoiser=denoiser):
+            size = denoiser.make_size(
+                124, 100, canvas=WIDE, conditions=(condition,)
+            )
+            return size.condition_rows
+
+        # No reference a request may bring packs more rows than the
+        # declared one of its kind, at any aspect from 1:4 to 4:1.
+        for width in range(250, 4001, 7):
+            still = Condition(
+                ConditionRole.REFERENCE,
+                video.Config(1, _reference_image(width, 1000)),
+            )
+            clip = Condition(
+                ConditionRole.REFERENCE,
+                video.Config(124, canvas(width, 1000)),
+                165_334,
+            )
+            assert rows(still) <= rows(stills[0]), width
+            assert rows(clip) <= rows(clips[0]), width
