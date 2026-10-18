@@ -282,7 +282,7 @@ pub(crate) fn encode_units(
         .and_then(|host| host.components.get(&call.component))
         .cloned()
         .ok_or_else(|| Error::Invalid("video encoding has no codec component".into()))?;
-    let run = units(&config, parts.rank, 0, range.max_units)?;
+    let run = units(&config, &range.ranks, parts.rank, 0, range.max_units)?;
     if run.is_empty() {
         return Ok(());
     }

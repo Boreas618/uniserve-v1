@@ -191,6 +191,13 @@ impl ExecutorInfo {
     /// of a distributed serving component times its `units_per_rank`, or one
     /// for any other component, on the narrowest worker serving the call.
     ///
+    /// A latent encoding round is dealt to the latent encoder's ranks that a
+    /// request's prompt does not take (`Scheduler::latent_round`), so while
+    /// the prompt is encoded a round covers only the ranks the latent
+    /// encoder does not share with the text encoder of its worker. Those
+    /// ranks count; a latent encoder that shares every rank encodes after
+    /// the prompt, on all of them.
+    ///
     /// Returns `None` when no worker serves `call`, or the width does not
     /// fit in `u32`.
     pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
@@ -199,12 +206,26 @@ impl ExecutorInfo {
             .filter_map(|(worker, info)| {
                 let component = info.media_components.get(&call)?;
                 let config = self.component_config(worker, component)?;
-                let units = if config.distribution.is_some() {
-                    config.ranks.len() * config.units_per_rank.max(1)
+                if config.distribution.is_none() {
+                    return Some(1);
+                }
+
+                let prompt = info
+                    .media_components
+                    .get(&MediaCall::TextEncoding)
+                    .filter(|_| call == MediaCall::LatentEncoding)
+                    .and_then(|name| self.component_config(worker, name));
+                let unshared = config
+                    .ranks
+                    .iter()
+                    .filter(|rank| prompt.is_none_or(|prompt| !prompt.ranks.contains(rank)))
+                    .count();
+                let ranks = if unshared == 0 {
+                    config.ranks.len()
                 } else {
-                    1
+                    unshared
                 };
-                u32::try_from(units).ok()
+                u32::try_from(ranks * config.units_per_rank.max(1)).ok()
             })
             .min()
     }
@@ -1509,7 +1530,8 @@ mod tests {
 
     /// A distributed component's lane is its ranks times its units per rank,
     /// an undistributed one's a single unit, and the narrowest replica binds;
-    /// a call no worker serves has no lane.
+    /// a call no worker serves has no lane. A latent encoder's lane leaves
+    /// out the ranks its worker's text encoder takes.
     #[test]
     fn media_lanes_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
@@ -1569,6 +1591,25 @@ mod tests {
             Some(1)
         );
 
+        // A latent encoding round covers the ranks the prompt's encoding
+        // leaves free: those the latent encoder does not share with its
+        // worker's text encoder, or all of them when it shares every one.
+        let beside = |text: Vec<usize>| {
+            lanes(vec![pool(
+                "a",
+                &[
+                    (MediaCall::LatentEncoding, "latent_encoder"),
+                    (MediaCall::TextEncoding, "text_encoder"),
+                ],
+                vec![
+                    ("latent_encoder", temporal(vec![4, 5, 6, 7, 0, 1, 2, 3], 1)),
+                    ("text_encoder", parallel(text)),
+                ],
+            )])
+        };
+        assert_eq!(beside(vec![0, 1, 2, 3]), Some(4));
+        assert_eq!(beside(vec![0]), Some(7));
+        assert_eq!(beside((0..8).collect()), Some(8));
         assert_eq!(
             lanes(vec![pool(
                 "a",

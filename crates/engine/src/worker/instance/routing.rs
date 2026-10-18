@@ -1,7 +1,8 @@
 //! Where a group's calls run: the refusal of placements that put host-shared
 //! storage off the head's host, the ranks that read each media product
-//! (`media_consumer_slots`), and the projection of a batch onto the calls each
-//! rank's components execute (`rank_projection`).
+//! (`media_consumer_slots`), the projection of a batch onto the calls each
+//! rank's components execute (`rank_projection`), and the rank a call's
+//! results join on (`output_owner`).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -63,6 +64,19 @@ pub(crate) fn refuse_shared_storage_off_head(
     Ok(())
 }
 
+/// Returns the rank a call's results join on: the first of its component's
+/// ranks, in configured order, among the `members` the call is planned on.
+///
+/// That is the component's first rank, which publishes its host products,
+/// unless the call's units were dealt to other ranks. `None` when the call
+/// is planned on none of the component's ranks.
+pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Option<usize> {
+    component_ranks
+        .iter()
+        .copied()
+        .find(|rank| members.contains(rank))
+}
+
 /// Acknowledgment slots of the ranks reading a media product produced on
 /// `rank` of `worker`, where `members` are the ranks executing the call.
 ///
@@ -111,16 +125,16 @@ pub(crate) fn media_consumer_slots(
             owners.retain(|(id, _)| *id == reader.0);
         }
         for (owner, component) in owners {
-            // A round deals its media units to each distributed component's
-            // ranks in order, `units_per_rank` each, so a distributed consumer
-            // reads only the positions this producer rank wrote.
+            // A round deals its media units to the producing ranks in
+            // `members` order and to a distributed consumer's ranks in
+            // configured order, `units_per_rank` each, so a distributed
+            // consumer reads only the positions this producer rank wrote.
             let dealt = producer
                 .filter(|producer| {
                     producer.distribution.is_some() && component.distribution.is_some()
                 })
                 .and_then(|producer| {
-                    producer
-                        .ranks
+                    members
                         .iter()
                         .position(|&member| member == rank)
                         .map(|index| (producer, index))
@@ -265,25 +279,37 @@ pub(super) fn rank_projection(
             let entry = components
                 .get(&call.component)
                 .with_context(|| format!("unknown component {}", call.component))?;
-            // A distributed component deals a call's decoder units to its ranks
-            // `units_per_rank` at a time, so only the ranks the call's
-            // `max_units` reach take part. `WorkerConfig::validate_members`,
-            // which `spawn_ranks` calls, rejects a zero `units_per_rank`.
-            let count = if entry.distribution.is_some() {
-                let range = batch
-                    .decode_ranges
-                    .iter()
-                    .find(|range| {
-                        range.request_key == call.request_key && range.call_id == call.call_id
-                    })
-                    .context("temporally distributed component requires a decode range")?;
-                (range.max_units as usize)
-                    .div_ceil(entry.units_per_rank)
-                    .min(entry.ranks.len())
-            } else {
-                entry.ranks.len()
-            };
-            Ok(&entry.ranks[..count])
+            // A distributed component deals a call's units `units_per_rank`
+            // at a time to the ranks the call names, or to its ranks in
+            // configured order when the call names none, so only the ranks
+            // the call's `max_units` reach take part.
+            // `WorkerConfig::validate_members`, which `spawn_ranks` calls,
+            // rejects a zero `units_per_rank`.
+            if entry.distribution.is_none() {
+                return Ok(entry.ranks.clone());
+            }
+            let range = batch
+                .decode_ranges
+                .iter()
+                .find(|range| {
+                    range.request_key == call.request_key && range.call_id == call.call_id
+                })
+                .context("temporally distributed component requires a decode range")?;
+            let holders = (range.max_units as usize).div_ceil(entry.units_per_rank);
+            if range.ranks.is_empty() {
+                return Ok(entry.ranks[..holders.min(entry.ranks.len())].to_vec());
+            }
+            let named = range
+                .ranks
+                .iter()
+                .map(|rank| *rank as usize)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                named.len() == holders && named.iter().all(|rank| entry.ranks.contains(rank)),
+                "a call's ranks hold its units within component {}",
+                call.component
+            );
+            Ok(named)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -306,7 +332,7 @@ pub(super) fn rank_projection(
             .iter()
             .map(|index| {
                 let mut call = batch.calls[*index].clone();
-                call.consumer_slots = consumer_slots(&call, members[*index], rank);
+                call.consumer_slots = consumer_slots(&call, &members[*index], rank);
                 call
             })
             .collect();
@@ -390,11 +416,24 @@ pub(super) fn rank_projection(
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_shared_storage_off_head;
+    use super::{output_owner, refuse_shared_storage_off_head};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use std::collections::BTreeMap;
     use uniserve_ipc::MediaCall;
+
+    #[test]
+    fn a_call_joins_on_the_first_component_rank_it_is_planned_on() {
+        // The component deals its units to rank 4 first.
+        let ranks = [4, 5, 6, 7, 0, 1, 2, 3];
+
+        assert_eq!(output_owner(&ranks, &[0, 1, 2, 3, 4, 5, 6, 7]), Some(4));
+        assert_eq!(output_owner(&ranks, &[5, 6]), Some(5));
+        // A round dealt to the ranks the component lists last has no member
+        // on its first rank.
+        assert_eq!(output_owner(&ranks, &[0, 1, 2, 3]), Some(0));
+        assert_eq!(output_owner(&ranks, &[]), None);
+    }
 
     fn placement(nodes: &[&str]) -> Vec<WorkerRank> {
         nodes

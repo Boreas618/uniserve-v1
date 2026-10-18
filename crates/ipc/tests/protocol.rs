@@ -470,6 +470,7 @@ fn batch_with_calls(batch_id: u64, admissions: Vec<NewRequest>, calls: Vec<Call>
                 call_id: call.call_id,
                 cursor: 0,
                 max_units: 1,
+                ranks: Vec::new(),
             });
         }
     }
@@ -2210,4 +2211,24 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
         matches!(received, Err(IpcError::Encoding(_))),
         "{received:?}"
     );
+}
+
+/// A decode range that names the ranks holding its units names each once,
+/// in unit order, and crosses the channel as stated.
+#[test]
+fn a_decode_range_names_each_holding_rank_once() {
+    let range = DecodeRange {
+        request_key: request_key(),
+        call_id: CallId::new(11, 0),
+        cursor: 4,
+        max_units: 2,
+        ranks: vec![5, 1],
+    };
+    assert!(range.validate().is_ok());
+    assert_eq!(round_trip(&range), range);
+    let repeated = DecodeRange {
+        ranks: vec![5, 5],
+        ..range
+    };
+    assert!(repeated.validate().is_err());
 }

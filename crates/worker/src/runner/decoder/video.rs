@@ -463,7 +463,7 @@ pub(crate) fn decode_video(
         .video
         .as_ref()
         .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
-    let run = decoder.units(rank, range.cursor, range.max_units)?;
+    let run = decoder.units(&range.ranks, rank, range.cursor, range.max_units)?;
     if run.is_empty() {
         // This rank holds no unit of the round and joins no exchange.
         return Ok(());
