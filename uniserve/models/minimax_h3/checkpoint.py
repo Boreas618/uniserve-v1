@@ -10,9 +10,12 @@ A MiniMax-H3 checkpoint is one of:
   ``transformer`` and ``transformer_ref``, use the full-step uniform
   schedule;
 * a FastVideo component export (FastH3-OmniRef): the root holds one DiT and
-  its schedulers, ``fastvideo_inference.json`` carries a PDD contract
-  (``pdd_steps``) and ``base_model_revision`` pins the diffusers root that
-  supplies every other component.
+  its schedulers, and ``fastvideo_inference.json`` carries a PDD contract
+  (``pdd_steps``).
+
+An export whose contract pins a base revision in ``base_model_revision``
+(``hf://<repository>@<revision>``) reads every directory it omits from that
+revision (``base_checkpoint``).
 
 The loader's catalog selects this package by the pipeline class the root
 index names (``MiniMaxH3ModularPipeline``), so the layouts are told apart by
@@ -34,8 +37,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from uniserve.models.registry import Base
-
 # Inference contract schema every FastVideo MiniMax-H3 export publishes.
 INFERENCE_SCHEMA = "fasth3-inference-contract-v1"
 
@@ -47,12 +48,6 @@ DENOISER_DIRECTORIES: Mapping[str, str] = MappingProxyType(
 # Tasks each denoising component serves; the DiT partition fixes them.
 DENOISER_TASKS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {"denoiser": ("t2va", "fl2va"), "reference_denoiser": ("ref2va",)}
-)
-
-# Components a component export draws from its pinned base: everything but
-# its own DiT partition and schedulers.
-BASE_DIRECTORIES = frozenset(
-    {"text_encoder", "tokenizer", "processor", "vae", "audio_vae"}
 )
 
 
@@ -201,13 +196,13 @@ def detect(root: Path) -> Layout:
     return Layout(Kind.DIFFUSERS_ROOT, MappingProxyType(denoisers), None, None)
 
 
-def base_checkpoint(root: Path) -> Base | None:
-    """Name the base checkpoint a component export draws components from.
+def base_checkpoint(root: Path) -> tuple[str, str] | None:
+    """Return the ``(repository, revision)`` an export pins, if any.
 
-    A component export pins its base with ``base_model_revision``; the base
-    supplies ``BASE_DIRECTORIES``. Returns ``None`` for the layouts that
-    hold every component. Only the pin is read: ``read_config`` classifies
-    the layout, once per load.
+    The loader reads every top-level directory the export omits from that
+    revision. The base release and an export that pins nothing return
+    ``None``. Only the pin is read: ``read_config`` classifies the layout,
+    once per load.
 
     Raises:
         ValueError: The contract is not a JSON object, or the pin is not of
@@ -217,4 +212,4 @@ def base_checkpoint(root: Path) -> Base | None:
     if contract is None or contract.get("base_model_revision") is None:
         return None
     pinned = BaseRevision.parse(contract["base_model_revision"])
-    return Base(pinned.repository, pinned.revision, BASE_DIRECTORIES)
+    return pinned.repository, pinned.revision
