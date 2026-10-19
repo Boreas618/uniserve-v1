@@ -99,9 +99,8 @@ def target_canvas(
     _named_ratio(task, aspect_ratio)
     size = processing.named_canvas(
         processing.Task(task),
-        processing.Target(
-            aspect_ratio=aspect_ratio, short_edge=TARGET_SHORT_EDGE
-        ),
+        short_edge=TARGET_SHORT_EDGE,
+        aspect_ratio=aspect_ratio,
     )
     if size is None:
         if keyframe is None:
