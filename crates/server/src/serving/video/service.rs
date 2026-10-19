@@ -142,7 +142,7 @@ impl VideoService {
     /// short edges and named aspect ratios the deployment serves and the
     /// canvas each pair resolves to, the output frame rate, audio sample rate
     /// and frame rule, the duration range, the fixed schedule (its sigma
-    /// points and shifts), the prompt and sequence capacities, the stated
+    /// points and shifts), the prompt capacity, the stated
     /// condition capacity (null when the workers provision the largest
     /// condition set their denoiser admits), and the media sources and size
     /// caps.
@@ -211,7 +211,6 @@ impl VideoService {
                 "audio_flow_shift": self.denoiser.audio_shift,
             },
             "max_prompt_tokens": max_prompt_tokens,
-            "max_sequence_rows": self.denoiser.max_sequence_rows,
             "media": {
                 "data": true,
                 "http": self.media.remote_media,
@@ -346,18 +345,13 @@ mod tests {
     /// A base denoiser serving every task, on a latent encoder of one rank,
     /// in a deployment that sizes references as the released pipeline does.
     fn service() -> VideoService {
-        encoding_service(None, 1, ReferenceConfig::RELEASED)
+        encoding_service(1, ReferenceConfig::RELEASED)
     }
 
-    /// A denoiser serving every task, with an optional checkpoint sequence
-    /// capacity, whose latent encoder covers `latent_encoding_lane`
-    /// condition units in one round, on a deployment that sizes references
-    /// as `references` states.
-    fn encoding_service(
-        max_sequence_rows: Option<u32>,
-        latent_encoding_lane: u32,
-        references: ReferenceConfig,
-    ) -> VideoService {
+    /// A denoiser serving every task, whose latent encoder covers
+    /// `latent_encoding_lane` condition units in one round, on a deployment
+    /// that sizes references as `references` states.
+    fn encoding_service(latent_encoding_lane: u32, references: ReferenceConfig) -> VideoService {
         VideoService::new(
             VideoDenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
@@ -373,7 +367,6 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: served_canvases(),
-                max_sequence_rows,
             },
             vision(),
             15.0,
@@ -442,7 +435,7 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         });
-        let unenlarged = encoding_service(None, 4, ReferenceConfig::default())
+        let unenlarged = encoding_service(4, ReferenceConfig::default())
             .process(
                 &ServeRequestId::new("reference"),
                 &request(body.clone()),
@@ -465,7 +458,7 @@ mod tests {
             })
         );
 
-        let processed = encoding_service(None, 4, ReferenceConfig::RELEASED)
+        let processed = encoding_service(4, ReferenceConfig::RELEASED)
             .process(&ServeRequestId::new("reference"), &request(body), 1 << 16)
             .await
             .unwrap();
@@ -528,7 +521,7 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let processed = encoding_service(None, 4, ReferenceConfig::RELEASED)
+            let processed = encoding_service(4, ReferenceConfig::RELEASED)
             .process(
                 &ServeRequestId::new("images"),
                 &request(serde_json::json!({
@@ -562,7 +555,7 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let processed = encoding_service(None, 4, ReferenceConfig::default())
+        let processed = encoding_service(4, ReferenceConfig::default())
             .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({

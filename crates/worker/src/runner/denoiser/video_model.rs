@@ -33,7 +33,6 @@ pub(crate) struct VideoFacts {
     /// Canvases the denoiser offers: a deployment prepares a selection of
     /// them, or all of them without one, and admits only those.
     pub(crate) canvases: Vec<Canvas>,
-    pub(crate) max_sequence_rows: Option<u32>,
     pub(crate) sample_dtype: DType,
     pub(crate) text_condition_width: u32,
     /// Output video frames per second.
@@ -326,7 +325,6 @@ impl VideoModel {
                 .map_err(|error| Error::numerical(function.name(), &error))?;
             DType::parse(name.as_str())?
         };
-        let rows = integer("max_sequence_rows")?;
         let frames = match list("frame_clips")?[..] {
             [
                 min_frames,
@@ -355,7 +353,6 @@ impl VideoModel {
             video_shift,
             audio_shift,
             canvases,
-            max_sequence_rows: (rows > 0).then_some(rows as u32),
             sample_dtype,
             text_condition_width: narrow(integer("text_condition_width")?, "width")?,
             frame_rate: rate("frame_rate")?,
@@ -404,7 +401,6 @@ impl VideoModel {
             audio_sample_rate: self.facts.sample_rate,
             frames: self.facts.frames,
             canvases: canvases.to_vec(),
-            max_sequence_rows: self.facts.max_sequence_rows,
         }
     }
 

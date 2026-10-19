@@ -126,7 +126,6 @@ def test_export_reads_the_directories_it_omits_at_the_pinned_revision(
     assert denoiser.attention == SparseAttention(
         tile=128, sparsity=0.9, reference_keep=0.1
     )
-    assert denoiser.max_sequence_rows == 131_072
     assert config.tokenizer == hub / "tokenizer"
     assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
 

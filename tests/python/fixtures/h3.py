@@ -94,7 +94,6 @@ def dmd_denoiser(
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va",),
         canvases=(WIDE,),
-        max_sequence_rows=None,
     )
 
 
@@ -111,7 +110,6 @@ def base_denoiser(
         attention=DenseAttention(),
         tasks=tasks,
         canvases=None,
-        max_sequence_rows=None,
     )
 
 
@@ -133,7 +131,6 @@ def omniref_denoiser(
         attention=SparseAttention(tile=128, sparsity=0.9, reference_keep=0.1),
         tasks=("ref2va",),
         canvases=None,
-        max_sequence_rows=131_072,
     )
 
 
