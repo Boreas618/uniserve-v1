@@ -312,7 +312,7 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     ):
         assert not denoiser.text_only
         assert denoiser.max_references == ReferenceLimits(
-            images=9, videos=3, audios=3, total=12
+            images=9, videos=3, audios=3, total=12, image_short_edge=2048
         )
         conditions = denoiser.max_conditions(124, WIDE)
         assert conditions[: len(leading)] == leading

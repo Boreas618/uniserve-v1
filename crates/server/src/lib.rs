@@ -205,9 +205,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             let latent_encoding_lane = engine
                 .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
                 .unwrap_or(1);
-            // The video processor's options are its reference sizing.
+            // The video processor's options are its reference sizing, within
+            // what the denoiser declares.
             let references = uniserve_core::video::plan::ReferenceConfig::from_kwargs(
                 &config.mm_processor_kwargs,
+                &denoiser.references,
             )
             .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
             RequestRenderer::Video(

@@ -1419,6 +1419,7 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: Vec::new(),
+                references: uniserve_core::ReferenceLimits::default(),
             }),
             ..WorkerInfo::default()
         }
@@ -1655,6 +1656,7 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: Vec::new(),
+                references: uniserve_core::ReferenceLimits::default(),
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

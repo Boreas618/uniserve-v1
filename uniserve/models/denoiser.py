@@ -74,20 +74,34 @@ class ReferenceLimits:
     A network that takes no references states none. ``total`` bounds the
     references of every kind together, keyframes not counted; a video's
     soundtrack counts with the video, and ``audios`` bounds the audio
-    references that are not a video's soundtrack.
+    references that are not a video's soundtrack. ``image_short_edge`` is
+    the largest short edge, in pixels, the network encodes an image
+    reference at; a serving deployment may encode them smaller.
     """
 
     images: int = 0
     videos: int = 0
     audios: int = 0
     total: int = 0
+    image_short_edge: int = 0
 
     def __post_init__(self) -> None:
-        if any(
-            type(limit) is not int or limit < 0
-            for limit in (self.images, self.videos, self.audios, self.total)
-        ):
+        limits = (
+            self.images,
+            self.videos,
+            self.audios,
+            self.total,
+            self.image_short_edge,
+        )
+        if any(type(limit) is not int or limit < 0 for limit in limits):
             raise ValueError("reference limits must be nonnegative integers")
+        if max(self.images, self.videos, self.audios) > self.total or (
+            self.images and not self.image_short_edge
+        ):
+            raise ValueError(
+                "reference limits must lie within their total, and image "
+                "references need an image short edge"
+            )
 
 
 class VideoSize(Protocol):

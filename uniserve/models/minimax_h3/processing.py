@@ -118,18 +118,21 @@ class ReferenceBounds:
     audio_samples: int
 
 
-def reference_bounds(num_frames: int) -> ReferenceBounds:
+def reference_bounds(
+    num_frames: int, *, image_short_edge: int
+) -> ReferenceBounds:
     """Bound every reference of a request that generates ``num_frames``.
 
     An image's rows grow with how far its aspect lies from 1:1 at the
-    encoding short edge; a video keeps at most the generated frames, of
-    which the VAE encodes the leading frames forming a count H3 generates on
-    the canvas of its aspect; a track is truncated to the generated
-    duration. A denoiser sizes these shapes with its own packing to state the
-    largest condition set it admits.
+    encoding short edge, at most ``image_short_edge`` (the denoiser's
+    ``ReferenceLimits.image_short_edge``); a video keeps at most the
+    generated frames, of which the VAE encodes the leading frames forming a
+    count H3 generates on the canvas of its aspect; a track is truncated to
+    the generated duration. A denoiser sizes these shapes with its own
+    packing to state the largest condition set it admits.
     """
     images, frames, samples, canvases = library()["video_reference_bounds"](
-        int(num_frames), FPS, _frame_clips()
+        int(num_frames), FPS, _frame_clips(), int(image_short_edge)
     )
     widest, tallest = _canvases(images)
     return ReferenceBounds(

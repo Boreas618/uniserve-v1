@@ -212,6 +212,28 @@ pub struct ServedCanvas {
     pub canvas: Canvas,
 }
 
+/// The references one `ref2va` request may carry, and the largest short
+/// edge an image reference is encoded at, as a video denoiser declares them.
+///
+/// `total` bounds the references of every kind together, keyframes not
+/// counted; a video's soundtrack counts with the video, and `audios` bounds
+/// the audio references that are not one. A denoiser that takes no
+/// references declares zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReferenceLimits {
+    /// Image references.
+    pub images: u32,
+    /// Video references, with or without soundtrack.
+    pub videos: u32,
+    /// Audio references that are not a video's soundtrack.
+    pub audios: u32,
+    /// References of every kind.
+    pub total: u32,
+    /// Short edge, in pixels, the denoiser encodes an image reference at, at
+    /// most; a deployment may encode them smaller.
+    pub image_short_edge: u32,
+}
+
 /// A vision patch grid: `t` temporal patches of `h` by `w` spatial patches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VisionGrid {

@@ -161,6 +161,7 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
             tail_latent_frames: 2,
         },
         canvases: Vec::new(),
+        references: uniserve_core::ReferenceLimits::default(),
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.

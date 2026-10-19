@@ -229,6 +229,17 @@ pub(super) mod tests {
         serde_json::from_value(fixture()["vision"].clone()).unwrap()
     }
 
+    /// The released checkpoint's documented references: nine images, three
+    /// videos, three audio tracks and twelve in all, images at a short edge
+    /// of at most 2048 pixels.
+    const REFERENCE_LIMITS: uniserve_core::ReferenceLimits = uniserve_core::ReferenceLimits {
+        images: 9,
+        videos: 3,
+        audios: 3,
+        total: 12,
+        image_short_edge: 2048,
+    };
+
     /// The canvases of the vectors' accepted requests, as a deployment that
     /// prepares them all declares them. A `t2va` or `ref2va` request's ratio
     /// names its canvas (`auto` naming 16:9); an `fl2va` canvas, which the
@@ -282,8 +293,9 @@ pub(super) mod tests {
                 tail_latent_frames: 2,
             },
             canvases: served_canvases(),
+            reference_limits: REFERENCE_LIMITS,
             // The fixture's requests follow the released pipeline.
-            references: uniserve_core::video::plan::ReferenceConfig::RELEASED,
+            references: uniserve_core::video::plan::ReferenceConfig::released(&REFERENCE_LIMITS),
         }
     }
 

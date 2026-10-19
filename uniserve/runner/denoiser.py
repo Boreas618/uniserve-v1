@@ -633,6 +633,20 @@ class DenoiserRunner:
         return bool(_denoiser(loaded, component).text_only)
 
     @staticmethod
+    def max_references(loaded, component: str) -> list[int]:
+        """``[images, videos, audios, total, image_short_edge]``: the
+        references one request may carry (``VideoDenoiser.max_references``).
+        """  # noqa: D205
+        limits = _denoiser(loaded, component).max_references
+        return [
+            limits.images,
+            limits.videos,
+            limits.audios,
+            limits.total,
+            limits.image_short_edge,
+        ]
+
+    @staticmethod
     def num_steps(loaded, component: str) -> int:
         """Solver steps of one trajectory."""
         return int(_denoiser(loaded, component).num_steps)

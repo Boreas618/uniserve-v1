@@ -76,6 +76,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
                 canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
             })
             .to_vec(),
+        references: uniserve_core::ReferenceLimits::default(),
     }
 }
 
@@ -101,7 +102,8 @@ fn video_service(
         max_video_seconds,
         1,
         &VideoMediaSettings::default(),
-        Default::default(),
+        // A text-to-video denoiser takes no references to size.
+        uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
         Arc::clone(tokenizer),
     )
     .unwrap()
@@ -751,6 +753,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             served(480, "21:9", 992, 416),
             served(480, "16:9", 832, 480),
         ],
+        references: uniserve_core::ReferenceLimits::default(),
     };
     let model = InputProcessor::new(
         loaded.config().clone(),
