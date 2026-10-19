@@ -194,7 +194,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             max_model_len: 8192,
-            max_video_seconds: 15.0,
+            max_video_seconds: uniserve_core::video::plan::MAX_VIDEO_SECONDS,
             max_condition_rows: None,
             encoder_cache_entries: 256,
             ffmpeg: Self::DEFAULT_FFMPEG.into(),

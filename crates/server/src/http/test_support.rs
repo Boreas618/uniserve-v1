@@ -24,8 +24,8 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::{InputProcessor, ServingRuntime, WorkerCapabilities};
-use uniserve_core::video::plan::VisionConfig;
+use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, VisionConfig};
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -41,8 +41,10 @@ pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
 ///
 /// The tokenizer is `serving::test_support::configured_tokenizer`, whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
-/// renders only the first message's content. A DiffusionGemma model runs
-/// readouts under its own generation limits, as `build_state` starts it.
+/// renders only the first message's content. A MiniMax H3 model serves the
+/// API's longest duration capacity, as a default video deployment does, and a
+/// DiffusionGemma model runs readouts under its own generation limits, as
+/// `build_state` starts it.
 pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     let model = ModelConfig {
         served_name: SERVED_MODEL.to_string(),
@@ -60,26 +62,24 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
             .unwrap(),
     );
-    let renderer = HfChatRenderer::new(
-        Some("{{ messages[0].content }}".to_string()),
-        HashMap::new(),
-        ChatTemplateContentFormatOption::String,
-    )
-    .unwrap();
-    let video = match &model.parameters {
-        ModelParameters::MiniMaxH3 { max_video_seconds } => {
-            Some(sim_video_service(*max_video_seconds))
-        }
-        _ => None,
+    let renderer = match &model.parameters {
+        ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
+        _ => RequestRenderer::Chat(
+            HfChatRenderer::new(
+                Some("{{ messages[0].content }}".to_string()),
+                HashMap::new(),
+                ChatTemplateContentFormatOption::String,
+            )
+            .unwrap(),
+        ),
     };
     let processor = InputProcessor::new(
         model,
         configured_tokenizer(),
-        Some(renderer),
+        renderer,
         WorkerCapabilities {
             limits: client.generation_limits(),
         },
-        video,
         false,
     )
     .unwrap();
