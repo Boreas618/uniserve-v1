@@ -38,4 +38,4 @@ where = ["src"]
 include = ["uniserve_kernels*"]
 
 [tool.setuptools.package-data]
-uniserve_kernels = ["py.typed", "csrc/*.cu", "norm/csrc/*.cu", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "megamoe/LICENSE", "diffusion/*.json", "diffusion/csrc/*.cu", "diffusion/csrc/*.cpp", "host_memory/csrc/*.cpp", "deepgemm/csrc/**/*", "deepgemm/NOTICE", "deepep/csrc/**/*", "deepep/NOTICE"]
+uniserve_kernels = ["py.typed", "csrc/*.cu", "norm/csrc/*.cu", "attention/vsa_native/csrc/*.cu", "attention/vsa_native/csrc/*.cuh", "attention/vsa_native/LICENSE", "attention/vsa_sm90/csrc/*.cu", "attention/vsa_sm90/csrc/*.cuh", "megamoe/LICENSE", "diffusion/*.json", "diffusion/csrc/*.cu", "diffusion/csrc/*.cpp", "host_memory/csrc/*.cpp", "deepgemm/csrc/**/*", "deepgemm/NOTICE", "deepep/csrc/**/*", "deepep/NOTICE"]

@@ -171,7 +171,7 @@ class Backend:
 
 
 # Provider modules in the order ``"auto"`` probes them.
-_PROVIDERS = ("sm100", "sm120", "flashinfer", "triton")
+_PROVIDERS = ("sm100", "sm90", "sm120", "flashinfer", "triton")
 
 
 def resolve(backend, *, device, tile):
@@ -188,7 +188,8 @@ def resolve(backend, *, device, tile):
     Raises:
         SetupError: No installed provider (or not the named one) serves
             ``tile``-row tiles on ``device``. Only SM100 (data-center
-            Blackwell) and SM120 devices serve 128-row tiles.
+            Blackwell), SM90 (Hopper) and SM120 devices serve 128-row
+            tiles.
         ValueError: An unknown backend name.
     """
     if isinstance(backend, Backend):
@@ -203,8 +204,8 @@ def resolve(backend, *, device, tile):
         raise SetupError(
             f"no installed VSA backend serves {tile}-row tiles on {device}"
             + (
-                "; 128-row tiles require an SM100 (data-center Blackwell) "
-                "or SM120 device"
+                "; 128-row tiles require an SM100 (data-center Blackwell), "
+                "SM90 (Hopper) or SM120 device"
                 if tile == 128
                 else ""
             )
