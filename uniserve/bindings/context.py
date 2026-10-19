@@ -691,7 +691,7 @@ class ExecutionContext:
         if not requirements:
             return None
         tensors = {
-            key: self.workspace.storage(requirement)[0]
+            key: self.workspace.storage(requirement)
             for key, requirement in requirements.items()
         }
         return bind_context_storage(requirements, tensors)[parallel]

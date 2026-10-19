@@ -1,10 +1,8 @@
 """Workspace backing of execution contexts.
 
 A :class:`Workspace` backs the bindings of one execution context: it
-allocates persistent fields with ``torch.empty``, borrows the shared scratch
-of its stream from a :class:`Scratch`, and maps the peer-mapped storage of a
-symmetric field over its communicator's torch process group
-(:func:`uniserve.distributed.symmetric.allocate_symmetric_storage`).
+allocates persistent fields with ``torch.empty`` and borrows the shared
+scratch of its stream from a :class:`Scratch`.
 :class:`TensorBuffers` names tensor backing, allocated or borrowed, and
 lends compact views into it; a :class:`GatherPool` lends reusable gather
 buffers on a stream. :func:`close_resources` attempts every release of an
@@ -16,7 +14,6 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable, Iterator, Mapping
 from types import MappingProxyType
-from typing import Any
 
 import torch
 
@@ -209,27 +206,11 @@ class Scratch:
         self._backings.clear()
 
 
-def _split(requirement) -> tuple[dict, dict]:
-    """Local and symmetric fields of an attention storage requirement."""
-    local = {
-        name: config
-        for name, config in requirement.fields.items()
-        if name not in requirement.symmetric
-    }
-    symmetric = {
-        name: requirement.fields[name] for name in requirement.symmetric
-    }
-    return local, symmetric
-
-
 class Workspace:
     """The workspace of an execution context, in torch memory.
 
     Shared scratch is grown and kept by a :class:`Scratch`; persistent
-    fields are tensors of their own. A symmetric field, which every member
-    of a group maps, is memory torch cannot allocate: the workspace maps it
-    over the torch process group of the field's communicator, a collective
-    call every member makes at the same point.
+    fields are tensors of their own.
 
     Args:
         scratch: The shared :class:`Scratch` contexts serialized on one
@@ -240,8 +221,6 @@ class Workspace:
         self._owns_scratch = scratch is None
         self._scratch = Scratch() if scratch is None else scratch
         self._allocations: list[TensorBuffers] = []
-        # Peer-mapped allocations, retained until release.
-        self._symmetric: list[Any] = []
 
     def scratch(self, role, requirements, device):
         return self._scratch.view(role, requirements, device)
@@ -254,24 +233,9 @@ class Workspace:
     def storage(self, requirement):
         """Back one attention storage requirement on its group's device.
 
-        Returns the local tensor of every field and, for each symmetric
-        field, every member's peer-mapped view in member order.
+        Returns the tensor of every declared field.
         """
-        local, symmetric = _split(requirement)
-        tensors = dict(self.allocate(local, requirement.group.device))
-        peers = {}
-        if symmetric:
-            from uniserve.distributed.symmetric import (
-                allocate_symmetric_storage,
-            )
-        for name, config in symmetric.items():
-            shared = allocate_symmetric_storage(
-                requirement.group, config.shape, config.dtype
-            )
-            self._symmetric.append(shared)
-            tensors[name] = shared.local
-            peers[name] = tuple(shared.peers)
-        return tensors, peers
+        return dict(self.allocate(requirement.fields, requirement.group.device))
 
     def release(self) -> None:
         """Release persistent allocations; shared scratch survives sizes."""
@@ -279,7 +243,6 @@ class Workspace:
             allocation.close for allocation in reversed(self._allocations)
         ]
         self._allocations.clear()
-        self._symmetric.clear()
         close_resources(*actions)
 
     def close(self) -> None:

@@ -20,12 +20,37 @@ from uniserve.backends.experts import create as create_transport
 from uniserve.backends.experts.split import symmetric_bytes
 from uniserve.bindings.context import ExecutionContext
 from uniserve.distributed import Communicator, partition_experts
-from uniserve.distributed.symmetric import allocate_symmetric_storage
 from uniserve.models import TextSize
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+def _peer_storage(nbytes: int, device: torch.device):
+    """Map ``nbytes`` on every rank of the world and every rank's address.
+
+    The split transport takes its peer-mapped storage from its caller; in
+    serving the rank runtime maps it (``PeerStorage``). Here torch's NCCL
+    symmetric memory maps it over the world group, whose ranks are the
+    union's members in order. Collective: every rank calls it at the same
+    point. Returns this rank's allocation, every rank's address of its
+    allocation, and the rendezvous handle that keeps the mappings alive.
+    """
+    import torch.distributed._symmetric_memory as symmetric_memory
+
+    if symmetric_memory.get_backend(device) != "NCCL":
+        symmetric_memory.set_backend("NCCL")
+    # The NCCL rendezvous uses the group's communicator, which torch
+    # creates at its first collective.
+    dist.all_reduce(torch.zeros(1, device=device))
+    local = symmetric_memory.empty((nbytes,), dtype=torch.int8, device=device)
+    handle = symmetric_memory.rendezvous(local, dist.group.WORLD)
+    pointers = [
+        handle.get_buffer(member, (nbytes,), torch.int8).data_ptr()
+        for member in range(dist.get_world_size())
+    ]
+    return local, pointers, handle
 
 
 @torch.inference_mode()
@@ -109,21 +134,18 @@ def _exercise(
                     Quantizer(format).quantize(value), requires_grad=False
                 )
 
-        storage = allocate_symmetric_storage(
-            union,
-            (
-                symmetric_bytes(
-                    size=world_size,
-                    attention_ranks=attention_ranks,
-                    max_tokens=capacity,
-                    num_experts=experts,
-                    top_k=top_k,
-                    hidden=width,
-                    intermediate=intermediate,
-                    format=format,
-                ),
+        storage, pointers, _mapping = _peer_storage(
+            symmetric_bytes(
+                size=world_size,
+                attention_ranks=attention_ranks,
+                max_tokens=capacity,
+                num_experts=experts,
+                top_k=top_k,
+                hidden=width,
+                intermediate=intermediate,
+                format=format,
             ),
-            torch.int8,
+            device,
         )
         exchange = create_transport(
             "megamoe",
@@ -139,8 +161,8 @@ def _exercise(
             device=device,
             encoding=format,
             symmetric={
-                "storage": storage.local,
-                "pointers": [peer.data_ptr() for peer in storage.peers],
+                "storage": storage,
+                "pointers": pointers,
             },
         )
         stream = torch.cuda.Stream(device=device)
