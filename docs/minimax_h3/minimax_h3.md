@@ -4,7 +4,7 @@ UniServe serves the MiniMax-H3 video-and-audio models: the FastH3 DMD students f
 
 ## Requirements
 
-- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef needs a data-center Blackwell (SM100) GPU, and the server refuses it elsewhere at startup.
+- Linux, CUDA 13, Python 3.12, a stable Rust toolchain, and NVIDIA Hopper or Blackwell GPUs. Four local GPUs are the standard setup. FastH3 is validated on H200, GB200 and RTX PRO 6000 Blackwell Server Edition; the base checkpoint and OmniRef on four GB200. OmniRef's 128-row sparse-attention tiles have kernels on data-center Blackwell (SM100), Hopper (SM90) and SM120 GPUs, and the server refuses OmniRef on any other GPU at startup.
 - FFmpeg for keyframe and reference requests: the server probes condition media with `ffprobe` and the worker decodes reference videos with `ffmpeg`, both from `PATH` unless `--ffprobe` and `--ffmpeg` name them.
 - Shared storage and pinned-storage access for worker IPC, as the container command below provisions.
 
