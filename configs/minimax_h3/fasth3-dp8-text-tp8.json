@@ -27,7 +27,7 @@
       { "node": "localhost", "device": "cuda:0" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -50,7 +50,7 @@
       { "node": "localhost", "device": "cuda:1" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -73,7 +73,7 @@
       { "node": "localhost", "device": "cuda:2" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -96,7 +96,7 @@
       { "node": "localhost", "device": "cuda:3" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -119,7 +119,7 @@
       { "node": "localhost", "device": "cuda:4" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -142,7 +142,7 @@
       { "node": "localhost", "device": "cuda:5" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -165,7 +165,7 @@
       { "node": "localhost", "device": "cuda:6" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },
@@ -188,7 +188,7 @@
       { "node": "localhost", "device": "cuda:7" }
     ],
     "components": {
-      "denoiser": {
+      "transformer": {
         "ranks": [0],
         "parallel_config": {}
       },

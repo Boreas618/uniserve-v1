@@ -1,8 +1,7 @@
 """Normalize MiniMax-H3 checkpoints into one typed configuration.
 
-``read_config`` recognizes the checkpoint layout (``checkpoint.detect``),
-reads the JSON sidecars of every component, validates the FastVideo
-inference contract where one exists, and returns one immutable ``Config``
+``read_config`` recognizes the checkpoint (``checkpoint.detect``), reads the
+JSON sidecars of every component, and returns one immutable ``Config``
 before any module is constructed. The checkpoint's own configuration
 defines each network's dimensions; the modules are parameterised by it. The
 reader refuses only what the packing and reconstruction code hard-codes:
@@ -28,13 +27,7 @@ from uniserve.media import image
 from uniserve.models import qwen3_vl
 
 from . import audio_vae, video_vae
-from .checkpoint import (
-    DENOISER_DIRECTORIES,
-    DENOISER_TASKS,
-    Kind,
-    Layout,
-    detect,
-)
+from .checkpoint import TASK_PARTITIONS, Layout, detect
 from .encoder import RETAINED_LAYERS, TextEncoderConfig
 from .packing import (
     AUDIO_HOP,
@@ -48,11 +41,11 @@ from .processing import buckets
 # DMD rungs are unshifted noise levels on the 1000-step training schedule.
 NUM_TRAIN_TIMESTEPS = 1000.0
 
-# A diffusers root evaluates the released sigma grid of 50 points: 49 network
-# evaluations and the clean endpoint.
+# The base release evaluates the released sigma grid of 50 points: 49
+# network evaluations and the clean endpoint.
 UNIFORM_GRID_POINTS = 50
 
-# FastH3 DMD exports are trained on, and generate only, the 12 training
+# FastH3 DMD students are trained on, and generate only, the 12 training
 # buckets of the request rules: the named aspect ratios at the 768p and 480p
 # resolutions. A deployment prepares a subset of them.
 DMD_CANVASES = buckets()
@@ -318,10 +311,7 @@ class DenoiserConfig:
         if (
             not isinstance(self.tasks, tuple)
             or not self.tasks
-            or any(
-                not any(task in served for served in DENOISER_TASKS.values())
-                for task in self.tasks
-            )
+            or any(task not in TASK_PARTITIONS for task in self.tasks)
             or len(set(self.tasks)) != len(self.tasks)
         ):
             raise ValueError("H3 denoiser tasks must name distinct H3 tasks")
@@ -348,9 +338,9 @@ class DenoiserConfig:
 class Config:
     """Compose the checkpoint's encoders, denoisers and VAEs.
 
-    ``denoisers`` maps each denoising component the checkpoint holds
-    (``denoiser`` for the ``transformer`` partition, ``reference_denoiser``
-    for ``transformer_ref``) to its configuration; a deployment places one.
+    ``denoisers`` maps each DiT partition the checkpoint holds
+    (``transformer`` or ``transformer_ref``) to its configuration; a
+    deployment places one.
     """
 
     text_encoder: TextEncoderConfig
@@ -361,9 +351,9 @@ class Config:
     def __post_init__(self) -> None:
         if not isinstance(self.denoisers, Mapping) or not self.denoisers:
             raise ValueError("H3 checkpoints hold at least one denoiser")
-        if set(self.denoisers) - set(DENOISER_DIRECTORIES):
+        if set(self.denoisers) - set(TASK_PARTITIONS.values()):
             raise ValueError(
-                "H3 denoisers must be named denoiser or reference_denoiser"
+                "H3 denoisers must be named transformer or transformer_ref"
             )
         object.__setattr__(
             self, "denoisers", MappingProxyType(dict(self.denoisers))
@@ -418,200 +408,75 @@ TEXT_FIELDS = {
 }
 
 
-def _reject(field: str, expected: object, value: object) -> ValueError:
-    return ValueError(
-        f"unsupported MiniMax-H3 checkpoint: {field} must be {expected!r}, "
-        f"got {value!r}"
+def _contract_field(contract: Mapping[str, Any], name: str) -> Any:
+    """Return a field a FastH3 contract must state.
+
+    Raises:
+        ValueError: The contract omits the field.
+    """
+    if name not in contract:
+        raise ValueError(
+            "unsupported FastH3 checkpoint: fastvideo_inference.json "
+            f"states no {name}"
+        )
+    return contract[name]
+
+
+def _fasth3_attention(contract: Mapping[str, Any]) -> SparseAttention:
+    """Describe a FastH3 student's sparse attention from its contract.
+
+    A ref2va student states the keep rate of its reference videos
+    (``vsa_ref_keep_rate``); a t2va student attends the generated video
+    alone. ``SparseAttention`` refuses a tile no packing serves and a
+    sparsity or keep rate outside its range.
+    """
+    return SparseAttention(
+        tile=_contract_field(contract, "vsa_tile_size"),
+        sparsity=_contract_field(contract, "vsa_sparsity"),
+        reference_keep=contract.get("vsa_ref_keep_rate"),
     )
 
 
-def _check_contract_fields(
-    contract: Mapping[str, Any], required: Mapping[str, object]
-) -> None:
-    for name, expected in required.items():
-        if contract.get(name) != expected:
-            raise _reject(name, expected, contract.get(name))
-
-
-def _contract_shifts(
-    contract: Mapping[str, Any], shifts: Mapping[str, float]
-) -> None:
-    """Require a contract that restates a scheduler shift to agree with it."""
-    for modality in ("video", "audio"):
-        name = f"{modality}_scheduler_shift"
-        if name in contract and contract[name] != shifts[modality]:
-            raise ValueError(
-                f"unsupported MiniMax-H3 checkpoint: {name}="
-                f"{contract[name]!r} disagrees with the {modality} scheduler "
-                f"shift {shifts[modality]!r}"
-            )
-
-
-def _sparsity(contract: Mapping[str, Any]) -> float:
-    value = contract.get("vsa_sparsity")
-    if (
-        not isinstance(value, int | float)
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or not 0 <= value < 1
-    ):
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: vsa_sparsity must lie in "
-            f"[0, 1), got {value!r}"
-        )
-    return float(value)
-
-
-def _dmd_denoiser(
+def _fasth3_schedule(
     contract: Mapping[str, Any],
     transformer: TransformerConfig,
     shifts: Mapping[str, float],
-) -> DenoiserConfig:
-    """Validate a FastH3 DMD contract and describe its denoiser.
+) -> Schedule:
+    """Build a FastH3 student's schedule from its contract.
 
-    The export's trained DMD rungs are the denoising ladder: a uniform grid
-    over the same number of points is not a substitute for them.
-
-    Raises:
-        ValueError: The contract is not a text-to-video-and-audio DMD export
-            this implementation serves, naming the offending field.
-    """
-    _check_contract_fields(
-        contract, {"task": "t2av", "attention_backend": "VIDEO_SPARSE_ATTN_H3"}
-    )
-    # The model has no unconditional branch and the sparse-attention kernel
-    # tiles 64 rows.
-    for name, expected in (("guidance_scale", 1.0), ("vsa_tile_size", 64)):
-        value = contract.get(name)
-        if not _is_positive_number(value) or value != expected:
-            raise _reject(name, expected, value)
-
-    rungs = contract.get("dmd_denoising_steps")
-    if (
-        not isinstance(rungs, list)
-        or not rungs
-        or any(
-            not _is_integer(rung) or not 0 < rung <= NUM_TRAIN_TIMESTEPS
-            for rung in rungs
-        )
-        or any(left <= right for left, right in zip(rungs, rungs[1:]))
-    ):
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: dmd_denoising_steps must be "
-            "strictly decreasing integers in (0, 1000], got "
-            f"{rungs!r}"
-        )
-    # `num_inference_steps` counts sigma-grid points, including the clean
-    # endpoint the solver reaches after the last rung.
-    for name, expected in (
-        ("transformer_forwards", len(rungs)),
-        ("num_inference_steps", len(rungs) + 1),
-    ):
-        value = contract.get(name)
-        if not _is_integer(value) or value != expected:
-            raise ValueError(
-                f"unsupported MiniMax-H3 checkpoint: {name} must be "
-                f"{expected} for {len(rungs)} DMD rungs, got {value!r}"
-            )
-    sparsity = _sparsity(contract)
-    _contract_shifts(contract, shifts)
-    return DenoiserConfig(
-        transformer=transformer,
-        schedule=DmdLadder(
-            rungs=tuple(rungs),
-            video_shift=shifts["video"],
-            audio_shift=shifts["audio"],
-        ),
-        attention=SparseAttention(tile=64, sparsity=sparsity),
-        tasks=("t2va",),
-        canvases=DMD_CANVASES,
-    )
-
-
-def _pdd_denoiser(
-    contract: Mapping[str, Any],
-    transformer: TransformerConfig,
-    shifts: Mapping[str, float],
-    component: str,
-) -> DenoiserConfig:
-    """Validate a FastVideo PDD contract and describe its denoiser.
+    A DMD student evaluates its trained rungs (``dmd_denoising_steps``) on
+    the 1000-step training schedule. A parallel-decoding student has one
+    output head per interval of its fine grid over ``grid_max_t`` and
+    advances one block of it per evaluation, the blocks bounded by
+    ``pdd_step_indices``. Each schedule refuses values outside its own
+    domain.
 
     Raises:
-        ValueError: The contract is not a reference-conditioned PDD student
-            this implementation serves, naming the offending field.
+        ValueError: The contract states neither schedule.
     """
-    _check_contract_fields(
-        contract,
-        {
-            "model_type": "ref2va",
-            "attention_backend": "VIDEO_SPARSE_ATTN_H3",
-            "conditioning": "fixed_ordered_references_target_only_flow",
-            "vsa_ref_policy": "p2_multi_region",
-        },
-    )
-    if component != "reference_denoiser":
-        raise _reject(
-            "transformer_component",
-            "transformer_ref",
-            contract.get("transformer_component"),
-        )
-    for name, expected in (("guidance_scale", 1.0), ("vsa_tile_size", 128)):
-        value = contract.get(name)
-        if not _is_positive_number(value) or value != expected:
-            raise _reject(name, expected, value)
 
-    intervals = contract.get("pdd_steps")
-    if not _is_integer(intervals) or intervals < 2:
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: pdd_steps must be an integer "
-            f">= 2, got {intervals!r}"
-        )
-    if transformer.output_heads != intervals:
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: the transformer's pdd_steps "
-            f"{transformer.output_heads} disagrees with the contract's "
-            f"{intervals}"
-        )
-    nodes = contract.get("pdd_step_indices")
-    if not isinstance(nodes, list) or any(
-        not _is_integer(node) for node in nodes
-    ):
-        raise ValueError(
-            "unsupported MiniMax-H3 checkpoint: pdd_step_indices must list "
-            f"integers, got {nodes!r}"
-        )
-    # FastVideo's `num_inference_steps` counts network evaluations, one per
-    # block of the fine grid.
-    for name in ("transformer_forwards", "num_inference_steps"):
-        value = contract.get(name)
-        if not _is_integer(value) or value != len(nodes) - 1:
-            raise ValueError(
-                f"unsupported MiniMax-H3 checkpoint: {name} must be "
-                f"{len(nodes) - 1} for {len(nodes) - 1} PDD blocks, "
-                f"got {value!r}"
-            )
-    max_t = contract.get("grid_max_t")
-    if not _is_positive_number(max_t) or max_t > 1:
-        raise _reject("grid_max_t", "a value in (0, 1]", max_t)
-    keep = contract.get("vsa_ref_keep_rate")
-    if not _is_positive_number(keep) or keep > 1:
-        raise _reject("vsa_ref_keep_rate", "a value in (0, 1]", keep)
-    sparsity = _sparsity(contract)
-    _contract_shifts(contract, shifts)
-    return DenoiserConfig(
-        transformer=transformer,
-        schedule=PddGrid(
-            intervals=intervals,
-            nodes=tuple(nodes),
+    # A JSON list becomes the tuple a schedule holds; any other value
+    # reaches the schedule as it is, which refuses it.
+    def listed(value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
+    if "dmd_denoising_steps" in contract:
+        return DmdLadder(
+            rungs=listed(contract["dmd_denoising_steps"]),
             video_shift=shifts["video"],
             audio_shift=shifts["audio"],
-            max_t=float(max_t),
-        ),
-        attention=SparseAttention(
-            tile=128, sparsity=sparsity, reference_keep=float(keep)
-        ),
-        tasks=DENOISER_TASKS[component],
-        canvases=None,
+        )
+    if "pdd_step_indices" in contract:
+        return PddGrid(
+            intervals=transformer.output_heads,
+            nodes=listed(contract["pdd_step_indices"]),
+            video_shift=shifts["video"],
+            audio_shift=shifts["audio"],
+            max_t=_contract_field(contract, "grid_max_t"),
+        )
+    raise ValueError(
+        "unsupported FastH3 checkpoint: fastvideo_inference.json states "
+        "neither dmd_denoising_steps nor pdd_step_indices"
     )
 
 
@@ -803,8 +668,8 @@ def normalize(
 
     ``metadata`` holds the parsed JSON of ``text_encoder``, ``processor``
     (the image processor's ``preprocessor_config.json``), ``video_vae``,
-    ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per
-    denoising component the layout holds (its ``config.json``).
+    ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per DiT
+    partition the layout holds (its ``config.json``).
     """
     for name in (
         "text_encoder",
@@ -813,7 +678,7 @@ def normalize(
         "audio_vae",
         "scheduler",
         "audio_scheduler",
-        *layout.denoisers,
+        *layout.partitions,
     ):
         if not isinstance(metadata.get(name), Mapping):
             raise ValueError(f"MiniMax-H3 requires {name} metadata")
@@ -825,9 +690,10 @@ def normalize(
             "sampling clock"
         )
     shifts = _shifts(metadata)
+    contract = layout.contract
     denoisers: dict[str, DenoiserConfig] = {}
-    for component in layout.denoisers:
-        values = metadata[component]
+    for partition, tasks in layout.partitions.items():
+        values = metadata[partition]
         heads = values.get("pdd_steps", 1)
         if not _is_integer(heads) or heads < 1:
             raise ValueError(
@@ -835,33 +701,26 @@ def normalize(
                 f"must be a positive integer, got {heads!r}"
             )
         transformer = _transformer(values, heads=heads)
-        if layout.kind is Kind.FASTVIDEO_EXPORT:
-            assert layout.contract is not None
-            denoisers[component] = _dmd_denoiser(
-                layout.contract, transformer, shifts
+        schedule: Schedule
+        attention: Attention
+        if contract is None:
+            # The base release: the uniform grid and dense attention.
+            schedule = UniformGrid(
+                points=UNIFORM_GRID_POINTS,
+                video_shift=shifts["video"],
+                audio_shift=shifts["audio"],
             )
-        elif layout.kind is Kind.COMPONENT_EXPORT:
-            assert layout.contract is not None
-            denoisers[component] = _pdd_denoiser(
-                layout.contract, transformer, shifts, component
-            )
+            attention = DenseAttention()
         else:
-            if heads != 1:
-                raise ValueError(
-                    "unsupported MiniMax-H3 checkpoint: a diffusers root DiT "
-                    "has one output head"
-                )
-            denoisers[component] = DenoiserConfig(
-                transformer=transformer,
-                schedule=UniformGrid(
-                    points=UNIFORM_GRID_POINTS,
-                    video_shift=shifts["video"],
-                    audio_shift=shifts["audio"],
-                ),
-                attention=DenseAttention(),
-                tasks=DENOISER_TASKS[component],
-                canvases=None,
-            )
+            schedule = _fasth3_schedule(contract, transformer, shifts)
+            attention = _fasth3_attention(contract)
+        denoisers[partition] = DenoiserConfig(
+            transformer=transformer,
+            schedule=schedule,
+            attention=attention,
+            tasks=tasks,
+            canvases=DMD_CANVASES if isinstance(schedule, DmdLadder) else None,
+        )
     return Config(
         text_encoder=_text_encoder(
             metadata["text_encoder"], metadata["processor"]
@@ -901,8 +760,8 @@ def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
     for name, relative in (
         *_SIDECARS.items(),
         *(
-            (component, f"{subdirectory}/config.json")
-            for component, subdirectory in layout.denoisers.items()
+            (partition, f"{partition}/config.json")
+            for partition in layout.partitions
         ),
     ):
         directory = (

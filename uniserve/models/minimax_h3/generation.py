@@ -306,7 +306,7 @@ def generate(
     num_frames: int,
     canvas: image.Config,
     seed: int,
-    component: str = "denoiser",
+    component: str = "transformer",
     layout: Sequence[int] | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Generation:

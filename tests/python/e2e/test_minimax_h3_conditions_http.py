@@ -2,10 +2,10 @@
 
 Serves the published Ulysses-4 deployments and sends the seed-42 requests
 of the packaged conditioned workloads (``uniserve_eval/workloads/minimax_h3``):
-the official first-frame request (W3) on the diffusers root's ``denoiser``
+the official first-frame request (W3) on the base release's ``transformer``
 deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
-reference requests on the ``reference_denoiser`` deployment, with the
-diffusers root's reference DiT and with a FastH3 OmniRef component export.
+reference requests on the ``transformer_ref`` deployment, with the base
+release's reference DiT and with a FastH3 OmniRef export.
 An OmniRef deployment that states a smaller condition capacity than the
 image-plus-audio request takes refuses it, naming its rows, and then serves
 the image-only request that fits. Condition media are read from ``file://``
