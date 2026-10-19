@@ -220,7 +220,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
-crates/bin/uniserve/          `serve` and `engine` CLI entrypoints
+crates/bin/uniserve/          `serve` CLI entrypoint
 crates/bin/uniserve-host/     Per-host launcher for multi-host deployments
 crates/bin/dynamo-worker/     NVIDIA Dynamo worker backend
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog

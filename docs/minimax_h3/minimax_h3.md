@@ -96,7 +96,7 @@ uniserve serve "$OMNIREF_EXPORT" \
   --max-condition-rows 49152 --media-directory /srv/media
 ```
 
-A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding and one video and audio decoding unit per rank in a `model` worker, and a CPU `host` worker that holds the H.264 encoders and the muxer, plus the media reader that decodes condition media in the `minimax_h3` files. The media reader runs on a rank of the head's host. On a CPU rank its decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the head's host. Check a running server with:
+A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and a CPU `host` worker that holds the H.264 encoders, the muxer and the media reader, which decodes condition media. The media reader runs on a rank of the head's host. On a CPU rank its decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the head's host. Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health
@@ -119,6 +119,7 @@ The deployment files are in `configs/minimax_h3/`. Each places the condition enc
 | `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
 | `fasth3-dp8-text-tp8-host-weights.json` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
+| `ulysses4-reference.json` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
 
 A component placed with `"weights": "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.json` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--graph-policy off`.
 
