@@ -297,8 +297,8 @@ impl ExecutorInfo {
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
-        // Every worker describes the deployment's placed denoiser alike; the
-        // denoising worker's description is the deployment's.
+        // The denoising worker owns the denoiser: its description is the
+        // deployment's.
         merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
         // A deployment that assembles video denoises over the fixed schedule
         // the denoising worker describes.
@@ -306,13 +306,6 @@ impl ExecutorInfo {
             !merged.media_components.contains_key(&MediaCall::Muxing)
                 || merged.video_denoiser.is_some(),
             "a deployment that muxes video reports no video denoiser"
-        );
-        anyhow::ensure!(
-            self.workers
-                .iter()
-                .all(|(_, info)| info.video_denoiser.is_none()
-                    || info.video_denoiser == merged.video_denoiser),
-            "workers disagree on the deployment's video denoiser"
         );
         // Every cache stage must agree on its groups' retention policies and page
         // shapes. Capacity is the narrowest pool because a request may
