@@ -4,9 +4,8 @@ Context-parallel attention gathers every owner's K/V into fixed storage that
 must exist before graph capture. This module declares that storage per
 sharing key (``context_requirements``) and builds the views layers borrow
 over tensors the caller allocated for those declarations
-(``bind_context_storage``). It allocates nothing: the serving worker
-allocates every declared field as a bind-time workspace, and symmetric
-fields as peer-mapped storage.
+(``bind_context_storage``). It allocates nothing: the execution context
+allocates every declared field as a bind-time workspace.
 """
 
 from __future__ import annotations
@@ -35,14 +34,11 @@ __all__ = [
 class StorageRequirement:
     """One shared storage allocation and the layers borrowing it.
 
-    ``fields`` declares each tensor; ``symmetric`` names the fields that
-    must be peer-mapped across ``group`` (every member's allocation of the
-    field visible to every other member, in member order).
+    ``fields`` declares each tensor ``group``'s members hold.
     """
 
     group: Communicator
     fields: Mapping[str, BufferConfig]
-    symmetric: tuple[str, ...]
     layers: tuple[ParallelAttention, ...]
 
 
@@ -81,7 +77,6 @@ def context_requirements(
                 "key": BufferConfig((domain, heads, head_dim), dtype),
                 "value": BufferConfig((domain, heads, head_dim), dtype),
             },
-            (),
             tuple(owners),
         )
     return result
