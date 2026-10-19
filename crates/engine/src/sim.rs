@@ -22,7 +22,7 @@ use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
     BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    PoolPlacement, WorkerId, logical_result,
+    PoolPlacement, WorkerFailure, WorkerId, logical_result,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -75,6 +75,9 @@ pub struct SimExecutor {
     /// Products declared by submitted calls that no acknowledged `Free` or
     /// `Finish` has released yet.
     products: HashSet<TensorRef>,
+    /// A result holding failed calls, handed back by the poll after the one
+    /// that reports their failure.
+    held: Option<(BatchResult, Vec<uniserve_ipc::BatchCommand>)>,
 }
 
 /// What the simulated executor observed at its boundary, in the order it
@@ -159,6 +162,7 @@ impl SimExecutor {
             handle: Some(handle),
             admissions: HashSet::new(),
             products: HashSet::new(),
+            held: None,
         }
     }
 
@@ -220,6 +224,51 @@ impl SimExecutor {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
         Ok(result)
+    }
+
+    /// The failure a result's failed calls amount to, as `WorkerExecutor`
+    /// reports it: their requests, the buffers those calls would have
+    /// produced, and the reason of each request the simulated model refused.
+    /// `None` when every call of the result succeeded.
+    fn call_failure(&self, result: &BatchResult) -> Option<WorkerFailure> {
+        let failed = || {
+            result
+                .results
+                .iter()
+                .map(|completion| &completion.output)
+                .filter(|output| output.status == CallStatus::Error)
+        };
+        let calls = failed()
+            .map(|output| (output.request_key, output.call_id))
+            .collect::<HashSet<_>>();
+        if calls.is_empty() {
+            return None;
+        }
+
+        let requests = calls
+            .iter()
+            .map(|(request, _)| *request)
+            .collect::<HashSet<_>>();
+        let refusals = failed()
+            .filter(|output| output.error_code == Some(ErrorCode::InputError))
+            .filter_map(|output| Some((output.request_key, output.error_message.clone()?)))
+            .collect();
+        let buffers = self
+            .products
+            .iter()
+            .map(TensorRef::buffer_id)
+            .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
+            .collect::<HashSet<_>>();
+        Some(WorkerFailure {
+            worker_id: WorkerId("sim".to_owned()),
+            endpoints: Vec::new(),
+            requests: requests.into_iter().collect(),
+            refusals,
+            retired: Vec::new(),
+            buffers: buffers.into_iter().collect(),
+            execution: None,
+            message: "call failed before its dependent work could complete".into(),
+        })
     }
 
     /// Closes the simulated physical worker.
@@ -315,8 +364,18 @@ impl Executor for SimExecutor {
     /// Returns the next batch result and applies its acknowledged `Free` and
     /// `Finish` commands to the ownership sets `command_has_capacity` reads.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        let Some((result, commands)) = self.poll_batch(timeout)? else {
-            return Ok(None);
+        let (result, commands) = match self.held.take() {
+            Some(held) => held,
+            None => {
+                let Some((result, commands)) = self.poll_batch(timeout)? else {
+                    return Ok(None);
+                };
+                if let Some(failure) = self.call_failure(&result) {
+                    self.held = Some((result, commands));
+                    return Err(failure.into());
+                }
+                (result, commands)
+            }
         };
         for receipt in &result.command_results {
             // A failed command keeps its physical ownership.
@@ -666,6 +725,10 @@ pub struct SimEngine {
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
+    /// Requests the simulated model refuses, with the reason it states: each
+    /// of their media calls completes with `ErrorCode::InputError`, as a
+    /// rank reports a request whose size its model does not serve.
+    refused: HashMap<RequestId, String>,
 }
 
 impl SimEngine {
@@ -736,6 +799,7 @@ impl SimEngine {
             canvas_sampling: None,
             predicated_release: None,
             requests: HashMap::new(),
+            refused: HashMap::new(),
         }
     }
 
@@ -898,6 +962,7 @@ impl SimEngine {
             call_id: call.call_id,
             status: CallStatus::Ok,
             error_code: None,
+            error_message: None,
             timing_counters: TimingCounters::default(),
             cache_visible_len: 0,
             cache_computed_len: 0,
@@ -1193,6 +1258,7 @@ impl SimEngine {
             call_id: call.call_id,
             status: CallStatus::Predicated,
             error_code: None,
+            error_message: None,
             timing_counters: TimingCounters::default(),
             cache_visible_len: request.cache_visible_len,
             cache_computed_len: request.cache_visible_len,
@@ -1313,6 +1379,11 @@ impl SimEngine {
         let (release, held) = crossbeam_channel::unbounded();
         self.predicated_release = Some(held);
         release
+    }
+
+    /// Refuses request `id` for `reason` at each of its media calls.
+    pub fn refuse_request(&mut self, id: RequestId, reason: &str) {
+        self.refused.insert(id, reason.to_owned());
     }
 
     /// Returns mutable access to the simulator's advertised capabilities.
@@ -1462,6 +1533,7 @@ impl SimEngine {
         let fake_eos = self.fake_eos;
         let non_finite_candidate = self.non_finite_candidate;
         let canvas_sampling = self.canvas_sampling;
+        let refused = &self.refused;
         let mut completions = Vec::with_capacity(batch.requests.len());
         for (call, _) in batch.requests {
             let request = self
@@ -1517,7 +1589,7 @@ impl SimEngine {
                 continue;
             }
 
-            let completion = Self::execute_call(
+            let mut completion = Self::execute_call(
                 vocab,
                 text_len,
                 fake_eos,
@@ -1526,6 +1598,14 @@ impl SimEngine {
                 &call,
                 request,
             )?;
+            if let (CallKind::Media(_), Some(reason)) =
+                (call.kind, refused.get(&call.request_key.request_id))
+            {
+                completion.status = CallStatus::Error;
+                completion.media_output = None;
+                completion.error_code = Some(ErrorCode::InputError);
+                completion.error_message = Some(reason.clone());
+            }
             if completion.status == CallStatus::Ok && call.advances_state() {
                 request.state_call_id = call.call_id;
             }

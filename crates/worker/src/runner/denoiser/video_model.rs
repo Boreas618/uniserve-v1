@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, ConditionTiles};
+use uniserve_core::Canvas;
 use uniserve_ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
 
 use super::{DECODER, DENOISER, OUTPUTS};
@@ -34,7 +34,6 @@ pub(crate) struct VideoFacts {
     /// them, or all of them without one, and admits only those.
     pub(crate) canvases: Vec<Canvas>,
     pub(crate) max_sequence_rows: Option<u32>,
-    pub(crate) condition_tiles: Option<ConditionTiles>,
     pub(crate) sample_dtype: DType,
     pub(crate) text_condition_width: u32,
     /// Output video frames per second.
@@ -115,6 +114,8 @@ struct LayoutAnswers {
 struct SizingMethods {
     legal_frame_count: Function,
     max_condition_rows: Function,
+    refusal: Function,
+    condition_rows: Function,
     layout_size: Function,
     holds: Function,
     condition_layout: Function,
@@ -220,6 +221,8 @@ impl VideoModel {
         let methods = SizingMethods {
             legal_frame_count: of_denoiser("legal_frame_count")?,
             max_condition_rows: of_denoiser("max_condition_rows")?,
+            refusal: of_denoiser("refusal")?,
+            condition_rows: of_denoiser("condition_rows")?,
             layout_size: of_denoiser("layout_size")?,
             holds: of_denoiser("holds")?,
             condition_layout: of_denoiser("condition_layout")?,
@@ -298,22 +301,6 @@ impl VideoModel {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let condition_tiles = match list("condition_tiles")?[..] {
-            [] => None,
-            [rows, frames, height, width] => Some(ConditionTiles {
-                rows: narrow(rows, "tile")?,
-                video: [
-                    narrow(frames, "tile")?,
-                    narrow(height, "tile")?,
-                    narrow(width, "tile")?,
-                ],
-            }),
-            _ => {
-                return Err(Error::Interface(
-                    "condition tiles are [rows, t, h, w]".into(),
-                ));
-            }
-        };
         let shifts = {
             let (function, value) = fact("schedule_shifts")?;
             let values: tvm_ffi::Array<Any> = value
@@ -347,7 +334,6 @@ impl VideoModel {
             audio_shift,
             canvases,
             max_sequence_rows: (rows > 0).then_some(rows as u32),
-            condition_tiles,
             sample_dtype,
             text_condition_width: narrow(integer("text_condition_width")?, "width")?,
             frame_rate: rate("frame_rate")?,
@@ -393,7 +379,6 @@ impl VideoModel {
             audio_shift: self.facts.audio_shift,
             canvases: canvases.to_vec(),
             max_sequence_rows: self.facts.max_sequence_rows,
-            condition_tiles: self.facts.condition_tiles,
         }
     }
 
@@ -434,6 +419,23 @@ impl VideoModel {
         ];
         all.extend(arguments);
         MethodCall::new(method, all)
+    }
+
+    /// Record the call asking why the denoiser does not serve `size`: the
+    /// job's completion carries the denoiser's reason, empty for a size it
+    /// serves. A size it does not serve is the request's refusal, so the
+    /// call answers rather than fails the job.
+    pub(crate) fn ask_refusal(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_texts(self.asked(&self.methods.refusal, arguments));
+    }
+
+    /// Record the call asking the denoiser rows the conditions of `size`
+    /// take, as the denoiser packs them: the job's completion carries the
+    /// count. Asked only for a size the denoiser serves.
+    pub(crate) fn ask_condition_rows(&self, size: &VideoSize, job: &Job) {
+        let arguments = size_values(size).into();
+        job.call_returning(self.asked(&self.methods.condition_rows, arguments));
     }
 
     /// Record the call asking the smallest layout holding `size`

@@ -787,6 +787,11 @@ fn record_forwards(
         slots: &slots,
     };
     for (index, call) in plan.calls.iter().enumerate() {
+        // A call of a request the rank refused records nothing; its output
+        // reports the refusal.
+        if media.batch.calls[index].refused() {
+            continue;
+        }
         let slot = media.batch.calls[index].slot;
         match call.kind {
             CallKind::Media(MediaCall::MediaReading) => {

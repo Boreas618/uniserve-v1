@@ -670,7 +670,13 @@ impl WorkerBackend {
         started?;
         if let Some(video) = &mut self.runtimes.video {
             for request in installed {
-                video.admit(request, self.runtimes.denoisers.video.is_some())?;
+                // A request whose size the rank does not serve is refused
+                // alone: its calls report the refusal.
+                if let Some(reason) =
+                    video.admit(request, self.runtimes.denoisers.video.is_some())?
+                {
+                    self.requests.refuse(request.request_key, &reason)?;
+                }
             }
         }
 

@@ -409,6 +409,7 @@ pub(crate) fn request_output(
         call_id: id,
         status: CallStatus::Ok,
         error_code: None,
+        error_message: None,
         timing_counters: Default::default(),
         cache_visible_len: 0,
         cache_computed_len: 0,

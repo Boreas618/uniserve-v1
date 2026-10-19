@@ -178,6 +178,7 @@ fn completion_record() -> CallOutput {
         status: CallStatus::Ok,
 
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters::default(),
         cache_visible_len: 5,
         cache_computed_len: 5,
@@ -1155,6 +1156,29 @@ fn error_completion_round_trips_with_its_error_code() {
     );
 }
 
+/// A refusal carries its reason across the channel, and only an input-error
+/// completion carries one.
+#[test]
+fn a_refused_completion_round_trips_with_its_reason() {
+    let mut record = completion_record();
+    record.status = CallStatus::Error;
+    record.error_code = Some(ErrorCode::InputError);
+    record.error_message = Some("the conditions take 7808 denoiser rows".to_owned());
+    let report = lane_report(6, vec![record.clone()], Vec::new(), None, None);
+    let decoded = round_trip(&WorkerResponse::result(report));
+    assert_eq!(
+        decoded.output().unwrap().completions().next().unwrap(),
+        &record
+    );
+
+    let mut silent = record.clone();
+    silent.error_message = None;
+    assert!(silent.validate().is_ok());
+    let mut explained = record;
+    explained.error_code = Some(ErrorCode::ComputeError);
+    assert!(explained.validate().is_err());
+}
+
 #[test]
 fn request_retirement_requires_unique_buffers_from_its_request() {
     let product = tensor_for(
@@ -2018,6 +2042,7 @@ fn full_run_result() -> BatchOutput {
         status: CallStatus::Ok,
 
         error_code: None,
+        error_message: None,
         timing_counters: TimingCounters {
             queued_us: 41,
             device_us: 42,

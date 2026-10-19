@@ -858,6 +858,7 @@ impl WorkerExecutor {
             worker_id: self.workers[worker_index].0.clone(),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
+            refusals: HashMap::new(),
             retired: Vec::new(),
             buffers: Vec::new(),
             execution: None,

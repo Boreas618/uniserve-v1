@@ -658,14 +658,6 @@ class DenoiserRunner:
         return int(_denoiser(loaded, component).max_sequence_rows or 0)
 
     @staticmethod
-    def condition_tiles(loaded, component: str) -> list[int]:
-        """``[rows, frames, height, width]`` of a condition tile, or empty."""
-        tiles = _denoiser(loaded, component).condition_tiles
-        if tiles is None:
-            return []
-        return [int(tiles.rows), *(int(side) for side in tiles.video)]
-
-    @staticmethod
     def sample_dtype(loaded, component: str) -> str:
         """The dtype of the predicted samples."""
         return _dtype(_denoiser(loaded, component).prediction_dtype)
@@ -699,6 +691,27 @@ class DenoiserRunner:
             int(frames), 1, canvas=canvas, conditions=conditions
         )
         return int(size.condition_rows)
+
+    @staticmethod
+    def refusal(loaded, component: str, size, conditions, spans) -> str:
+        """Why the denoiser does not serve a request size; empty when it does.
+
+        The denoiser's size rule (``make_size``) is the authority on what it
+        serves: conditions it takes no rows for, or a size outside its
+        canvases, frame counts or prompt length, are its refusal, which the
+        rank reports for the request instead of failing the batch.
+        """
+        try:
+            _size(_denoiser(loaded, component), size, conditions, spans)
+        except ValueError as error:
+            return str(error)
+        return ""
+
+    @staticmethod
+    def condition_rows(loaded, component: str, size, conditions, spans) -> int:
+        """The rows a request size's conditions take, packed by the denoiser."""
+        network = _denoiser(loaded, component)
+        return int(_size(network, size, conditions, spans).condition_rows)
 
     @staticmethod
     def layout_size(loaded, component: str, size, conditions, spans):

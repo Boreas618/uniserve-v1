@@ -186,10 +186,11 @@ pub(crate) struct SharedRuntimeArgs {
         default_value = "16:9,9:16"
     )]
     pub video_aspect_ratios: Vec<ResolutionName>,
-    /// Most denoiser rows the conditions of one video request may take: a
-    /// capacity video workers provision their condition products, request
-    /// slots and largest denoiser layout for, advertised as
-    /// `max_condition_rows`. Without it the workers provision the largest
+    /// Most denoiser rows the conditions of one video request may take,
+    /// counted as the placed denoiser packs them: a capacity video workers
+    /// provision their condition products, request slots and largest
+    /// denoiser layout for, and the worker that denoises a request refuses
+    /// conditions beyond it. Without it the workers provision the largest
     /// condition set their denoiser admits (two keyframes for `fl2va`; nine
     /// images and three videos with their soundtracks for `ref2va`, beside
     /// two keyframes where the denoiser packs them), so no request is

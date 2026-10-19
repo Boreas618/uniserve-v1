@@ -4491,6 +4491,7 @@ fn media_rank() -> anyhow::Result<()> {
                             call_id: call.call_id,
                             status: CallStatus::Ok,
                             error_code: None,
+                            error_message: None,
                             timing_counters: Default::default(),
                             cache_visible_len: call.coordinates.cache_visible_len + length,
                             cache_computed_len: call.coordinates.cache_computed_len + length,

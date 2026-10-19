@@ -154,7 +154,6 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         audio_shift: 3.0,
         canvases: Vec::new(),
         max_sequence_rows: None,
-        condition_tiles: None,
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.
@@ -1155,6 +1154,27 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
             && message.contains(&(3 * MAX_CONDITION_ROWS + 2).to_string()),
         "{message}"
     );
+}
+
+/// A rank that refuses a request's size states why: the request is rejected
+/// as invalid with that reason, and a request admitted beside it still
+/// completes.
+#[test]
+fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
+    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
+    let mut sim = video_worker(2, 2);
+    let reason = "the conditions take 46848 rows, more than the 40960 this worker provisions";
+    sim.refuse_request(RequestId(1), reason);
+    let served = serve(sim, vec![reference_request(1, &media), video_request(2, 2)]);
+
+    let refused = served.outcomes[&RequestId(1)]
+        .iter()
+        .find_map(|event| match event {
+            EngineCoreOutput::Rejected { kind, message } => Some((*kind, message.clone())),
+            _ => None,
+        });
+    assert_eq!(refused, Some((RejectionKind::Invalid, reason.to_owned())));
+    served.assert_completed(RequestId(2));
 }
 
 /// A `t2va` request of two media units at `canvas`.
