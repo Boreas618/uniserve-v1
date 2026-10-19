@@ -155,11 +155,16 @@ pub struct WorkerProcessArgs {
     /// Optional text capacities, in prompt tokens, of a video denoiser's
     /// layouts, as a comma-separated increasing list.
     pub video_text_capacities: Option<String>,
-    /// Canvases a video deployment prepares, in the order the deployment
-    /// names them. Its workers prepare exactly these and report them back as
-    /// the only canvases requests may target; empty prepares every canvas
-    /// the denoiser offers.
-    pub video_canvases: Vec<uniserve_core::Canvas>,
+    /// Resolution classes (`768p`) a video deployment prepares, crossed with
+    /// `video_aspect_ratios` resolution-major in the order the deployment
+    /// names them. Its workers' video denoiser names the canvas of each pair;
+    /// the workers prepare exactly those and report them back, with their
+    /// names, as the only canvases requests may target. Empty takes every
+    /// class the denoiser offers.
+    pub video_resolutions: Vec<String>,
+    /// Display aspect ratios (`16:9`) a video deployment prepares; empty
+    /// takes every ratio the denoiser offers.
+    pub video_aspect_ratios: Vec<String>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the server resolves it; `None` when the served model generates no
     /// canvases. The worker keeps the argmax history its stability

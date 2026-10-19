@@ -25,7 +25,7 @@ use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, ProcessorConfig, canvas};
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -106,10 +106,14 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
                 clip_latent_frames: 5,
                 tail_latent_frames: 2,
             },
-            canvases: NAMED_ASPECT_RATIOS
-                .iter()
-                .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
-                .collect(),
+            // The base checkpoint's canvas of each named ratio at 768p.
+            canvases: [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)]
+                .map(|(width, height): (u32, u32)| uniserve_core::ServedCanvas {
+                    short_edge: 768,
+                    aspect_ratio: format!("{width}:{height}"),
+                    canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
+                })
+                .to_vec(),
         },
         ProcessorConfig {
             patch_size: 16,

@@ -644,12 +644,16 @@ class DenoiserRunner:
         return [float(shifts["video"]), float(shifts["audio"])]
 
     @staticmethod
-    def canvases(loaded, component: str) -> list[int]:
-        """``[width, height]`` of each canvas the denoiser offers."""
+    def canvases(loaded, component: str) -> list[list[int | str]]:
+        """``[short_edge, aspect_ratio, width, height]`` of each canvas the
+        denoiser offers, in its own order: the name a request selects it by
+        and its raster.
+        """  # noqa: D205
         return [
-            int(extent)
-            for canvas in _denoiser(loaded, component).canvases
-            for extent in (canvas.width, canvas.height)
+            [int(short_edge), str(aspect_ratio), canvas.width, canvas.height]
+            for (short_edge, aspect_ratio), canvas in _denoiser(
+                loaded, component
+            ).canvases.items()
         ]
 
     @staticmethod

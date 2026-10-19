@@ -36,7 +36,7 @@ from .packing import (
     CLIP_LATENTS,
     VIDEO_TILE_SHAPES,
 )
-from .processing import buckets
+from .processing import canvas
 
 # DMD rungs are unshifted noise levels on the 1000-step training schedule.
 NUM_TRAIN_TIMESTEPS = 1000.0
@@ -45,10 +45,40 @@ NUM_TRAIN_TIMESTEPS = 1000.0
 # network evaluations and the clean endpoint.
 UNIFORM_GRID_POINTS = 50
 
-# FastH3 DMD students are trained on, and generate only, the 12 training
-# buckets of the request rules: the named aspect ratios at the 768p and 480p
-# resolutions. A deployment prepares a subset of them.
-DMD_CANVASES = buckets()
+# The aspect ratios a request names a canvas by besides ``auto``, as
+# ``(width, height)``, landscape first.
+NAMED_ASPECT_RATIOS = ((21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16))
+
+# The 768p resolution class: the canvas rule's short edge, at which the
+# released checkpoint generates the rule's canvas of every named ratio.
+_CLASS_768P = 768
+
+# The canvas of every named aspect ratio at the 768p class, keyed as a
+# request selects it: ``(short_edge, "W:H")``. The base release generates
+# these by the canvas rule (``processing.canvas``).
+NAMED_CANVASES: Mapping[tuple[int, str], image.Config] = MappingProxyType(
+    {
+        (_CLASS_768P, f"{width}:{height}"): canvas(width, height)
+        for width, height in NAMED_ASPECT_RATIOS
+    }
+)
+
+# FastH3 DMD students are trained on, and generate only, 12 buckets: the
+# named aspect ratios at the 768p and 480p classes. The 768p buckets are the
+# canvas rule's canvases; the 480p buckets, (height, width) below in the same
+# ratio order, are the training table's own rather than a rescaled rule
+# (21:9 is 992x416, not 960x416). A deployment prepares a subset of them.
+DMD_CANVASES: Mapping[tuple[int, str], image.Config] = MappingProxyType(
+    {
+        **NAMED_CANVASES,
+        (480, "21:9"): image.Config(416, 992),
+        (480, "16:9"): image.Config(480, 832),
+        (480, "4:3"): image.Config(480, 640),
+        (480, "1:1"): image.Config(480, 480),
+        (480, "3:4"): image.Config(640, 480),
+        (480, "9:16"): image.Config(832, 480),
+    }
+)
 
 
 def _is_integer(value: object) -> TypeGuard[int]:
@@ -297,15 +327,16 @@ class DenoiserConfig:
         schedule: The checkpoint's fixed schedule; requests cannot change it.
         attention: Dense or sparse attention.
         tasks: The tasks this DiT serves, in canonical order.
-        canvases: The only canvases the checkpoint generates, or None when it
-            generates every canvas of the canvas rules.
+        canvases: The only canvases the checkpoint generates, keyed by the
+            ``(short_edge, "W:H")`` a request selects them with, or None
+            when it generates the canvas rule's canvases.
     """
 
     transformer: TransformerConfig
     schedule: Schedule
     attention: Attention
     tasks: tuple[str, ...]
-    canvases: tuple[image.Config, ...] | None
+    canvases: Mapping[tuple[int, str], image.Config] | None
 
     def __post_init__(self) -> None:
         if (
@@ -316,13 +347,18 @@ class DenoiserConfig:
         ):
             raise ValueError("H3 denoiser tasks must name distinct H3 tasks")
         if self.canvases is not None and (
-            not isinstance(self.canvases, tuple)
+            not isinstance(self.canvases, Mapping)
             or not self.canvases
             or any(
-                not isinstance(value, image.Config) for value in self.canvases
+                not isinstance(value, image.Config)
+                for value in self.canvases.values()
             )
+            # A canvas is named once, so a raster's name is its own.
+            or len(set(self.canvases.values())) != len(self.canvases)
         ):
-            raise ValueError("H3 denoiser canvases must be image.Config values")
+            raise ValueError(
+                "H3 denoiser canvases must name distinct image.Config values"
+            )
         heads = self.transformer.output_heads
         if isinstance(self.schedule, PddGrid) != (heads > 1) or (
             isinstance(self.schedule, PddGrid)
