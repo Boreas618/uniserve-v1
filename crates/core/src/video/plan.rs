@@ -9,9 +9,9 @@
 //! media, so a malformed request is rejected before its media are fetched.
 //!
 //! These are the only implementation of the rules: the server plans every
-//! request with them, the worker counts condition rows with them, and the
-//! Python library (`uniserve.models.minimax_h3.processing`) calls them
-//! through the rank runtime library. They are tested against
+//! request with them, and the model package
+//! (`uniserve.models.minimax_h3.processing`) reads the canvas rule and the
+//! frame counts from them through the rank runtime library. They are tested against
 //! `tests/python/fixtures/minimax_h3_plan.json`, vectors generated from the
 //! reference pipeline.
 //!

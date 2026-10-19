@@ -2,9 +2,10 @@
 //! and the conditioner presentation.
 //!
 //! A MiniMax-H3 request must be sized before admission: the engine reserves
-//! the conditioner's token count and the denoiser's condition rows, so both
-//! are known exactly before any pixel is decoded. One request flows through
-//! four stages, which [`VideoProcessor::process`] runs in order:
+//! the conditioner's token count and the worker encodes each condition in
+//! the units the plan states, so both are known exactly before any pixel is
+//! decoded. One request flows through four stages, which
+//! [`VideoProcessor::process`] runs in order:
 //!
 //! 1. [`plan::check_request`] applies every rule that needs no media
 //!    (task, roles, counts, target), so a malformed request is rejected
@@ -17,13 +18,14 @@
 //!    aspect, frame rate, decoded frame count and soundtrack, and an audio
 //!    file's sample rate and decoded sample count, through `ffprobe`.
 //! 4. [`plan::plan_request`] resolves the canvas, the frame counts, how each
-//!    condition is prepared, the Qwen3-VL vision grids and the condition rows;
+//!    condition is prepared, the Qwen3-VL vision grids and the encoder units;
 //!    [`presentation::present`] tokenizes the conditioner's presentation with
 //!    the checkpoint's tokenizer and tags every token for the denoiser's AdaLN
 //!    modulation.
 //!
-//! The request rules are `uniserve-core`'s ([`plan`], [`presentation`]),
-//! which the Python library calls through the rank runtime library.
+//! The request rules are `uniserve-core`'s ([`plan`], [`presentation`]); the
+//! model package reads the canvas rule and the frame counts from them through
+//! the rank runtime library, and plans no request.
 //!
 //! Every rejection is a [`VideoInputError::Invalid`] naming the request field
 //! at fault, `conditions[i]` for a condition; it converts into an OpenAI

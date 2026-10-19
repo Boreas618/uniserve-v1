@@ -1,12 +1,12 @@
 # MiniMax-H3 computation library
 
-The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule and output heads. Component exports resolve their missing text encoder, processor and VAE components from the caller's local base directory, or from the Hub revision declared by the export when no local base is supplied.
+The model package loads base MiniMax-H3, FastH3 DMD and FastH3 OmniRef checkpoints through the public model catalog. Each checkpoint determines its denoising components, attention layout, schedule and output heads. A component export reads the components it omits, such as the text encoder, processor and VAEs, from the Hugging Face cache's snapshot of the base revision it records, downloading what the cache lacks.
 
 Models are ordinary PyTorch modules. Text and latent encoders, denoisers, video and audio decoders compose the shared numerical capabilities. Execution contexts own kernel workspaces and communication backing; callers own request state and advance the solver. Serving workers use these same modules and numerical calls.
 
 ## Generate from Python
 
-The eager library entry accepts a model loaded as a serving rank loads it and a presented text prompt. It runs the request through the runners serving uses (`uniserve.runner`): the text encoder and the denoiser's conditioner, every solver step of the denoiser, and the video and audio decoders, on a CUDA stream of its own. This example uses a local base checkpoint, generates a portrait video and returns RGB frames, stereo PCM and final latents. The checkpoint and its active components must fit on the selected GPU.
+The eager library entry accepts a model loaded as a serving rank loads it and a tokenized text prompt. It runs the request through the runners serving uses (`uniserve.runner`): the text encoder and the denoiser's conditioner, every solver step of the denoiser, and the video and audio decoders, on a CUDA stream of its own. This example uses a local base checkpoint, generates a portrait video and returns RGB frames, stereo PCM and final latents. The checkpoint and its active components must fit on the selected GPU.
 
 ```python
 import json
@@ -82,31 +82,25 @@ loaded = rank.load_model(
     prefill_split_tile_size=None,
     use_tensor_core=None,
 )
-plan = processing.plan_request(
-    processing.Task.T2VA,
-    processing.Target(aspect_ratio="9:16", duration_seconds=4.0),
-    [],
-    processing.VisionConfig.from_processor(root / "processor"),
-)
-prompt = processing.present(
-    AutoTokenizer.from_pretrained(root / "tokenizer"),
-    plan,
+tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer")
+prompt = tokenizer.encode(
     "A lighthouse keeper climbs a spiral staircase while waves crash below.",
+    add_special_tokens=False,
 )
 result = generate(
     loaded,
-    prompt_token_ids=prompt.token_ids,
-    num_frames=plan.num_frames,
-    canvas=plan.canvas,
+    prompt_token_ids=prompt,
+    num_frames=processing.frame_count(4.0),
+    canvas=processing.canvas(9, 16),
     seed=7,
 )
 ```
 
-`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. Frame counts follow the video VAE's 17-frame clips, so this four-second request produces 107 frames. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
+`result.frames` contains `[frames, height, width, 3]` uint8 RGB; `result.audio` contains stereo int16 PCM at 32 kHz. A text-to-video prompt is presented to the conditioner as its own tokens, without special tokens or a chat template. `processing.frame_count` and `processing.canvas` apply the request rules the server plans with: frame counts follow the video VAE's 17-frame clips, so this four-second request produces 107 frames, and the 9:16 canvas is 768 x 1344. `generate` supports text conditioning; keyframe and reference computation uses the encoders and denoiser's public calls directly.
 
 ## Layouts and conditions
 
-`processing.plan_request` sizes every condition of a request: a `ref2va` reference keeps its own size on the 32-pixel grid unless it exceeds its encoding size, an image's 2048-pixel short edge or a video's canvas, and `references=processing.ReferenceConfig(enlarge=True)` enlarges smaller ones to those sizes as the released pipeline does. A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
+The serving path plans every condition of a request and presents it to the conditioner before the request reaches the denoiser (`crates/server/src/serving/video`): a `ref2va` reference keeps its own size on the 32-pixel grid unless it exceeds its encoding size, an image's 2048-pixel short edge or a video's canvas, and `--mm-processor-kwargs '{"enlarge_references":true}'` enlarges smaller ones to those sizes as the released pipeline does. A Python caller states each condition's size and tokenizes its presentation itself. A denoiser's `make_size` describes the request's frame count, canvas, prompt and ordered conditions. `layout_size` derives the numerical layout; `holds` checks whether a capacity layout can evaluate a request. Dense layouts pack keyframes and references into their declared prefix. Segment-sparse layouts retain each reference segment's independent selection domain. Layout indices and latent buffers are borrowed tensors, without request identities or pool ownership.
 
 Visual conditions are encoded in independent temporal units and assembled in the declared latent order. A still image may also be encoded in bands of whole latent row groups (`VideoEncoder.row_group` rows each): `VideoEncoder.encode(..., rows=...)` encodes one band from the tiles it depends on, and the bands assemble the whole encoding exactly. An `ExecutionContext` created with `tiles={encoder: operator}` encodes that `TiledEncoder`'s tiles through a borrowed operator equal to its one-tile encoding, such as the replay of a graph captured at `VideoEncoder.still_tile`. Audio conditions supply whole stereo tracks. The denoiser's `encode_conditions`, `prepare_latents`, `prepare_state` and solver calls preserve the checkpoint's condition-noise order, modality schedules and output-head mathematics. Encoded conditions remain fixed while generated video and audio evolve.
 

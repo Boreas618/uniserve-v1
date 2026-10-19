@@ -4,8 +4,8 @@
 //! condition is prepared, what the conditioner reads of it and the denoiser
 //! rows it adds. [`presentation`] lists and tokenizes what the conditioner
 //! reads. The rules exist once, here: the server plans requests with them
-//! before admission, the worker counts a request's condition rows with them,
-//! and the Python library calls them through the rank runtime library.
+//! before admission, and the model package reads the canvas rule and the
+//! frame counts from them through the rank runtime library.
 //!
 //! The server plans every condition before admission. A [`VideoCondition`]
 //! carries that plan to the engine and on to the workers: the shared-memory

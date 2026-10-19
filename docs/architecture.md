@@ -71,7 +71,7 @@ Each capability has one runner in two halves with the same class and file name: 
 | Image and video denoisers | `DenoiserRunner` | `draw_noise`, `prepare_latents`, `encode_conditions`, `denoise`, and for images `plan`, `plan_denoise` and `step` | prefix cache units, latent pages, per-slot state rows |
 | Image, video and audio decoders | `DecoderRunner` | `decode`, `quantize` | latent pages, products |
 
-Host media on CPU ranks has no model: the Rust `MediaRunner` calls the functions of `uniserve.media` directly. Video request rules (rasters, frame counts, condition placement and rows) are implemented once, in `uniserve-core`: the head uses them before admission, the rank sizes requests from them, and Python reaches them through functions the rank runtime library exports.
+Host media on CPU ranks has no model: the Rust `MediaRunner` calls the functions of `uniserve.media` directly. Video request rules (canvases, frame counts, how each condition is prepared and the conditioner's presentation) are implemented once, in `uniserve-core`: the head plans and presents every request with them before admission, and the rank derives the frame counts it admits from them. Python reaches the canvas rule, the training buckets, the canvas a target names and the frame count of a duration through functions the rank runtime library exports (`rules.rs`); it does not plan or present requests.
 
 A method that can be captured meets four conditions: its shapes are fixed by its scalar arguments; every value that changes between forwards enters as tensor contents; it performs no host planning or synchronization; it draws no random numbers, because draws and noise are inputs the control plane generates (for example a latent encoder's posterior noise, drawn by `draw_noise` from the request's seed).
 
@@ -197,7 +197,7 @@ Dependency direction: `core <- ipc <- {engine, worker, uniserve-host}`, `cuda <-
 | `storage`, `transfer` | as described above |
 | `parallel` | host groups, process-group topology, expert parallelism |
 | `host`, `capacity`, `profiling` | host lanes, capacity planning, NVTX ranges, kernel records and profiler windows |
-| `rules.rs` | the video request rules exported to Python |
+| `rules.rs` | the video canvas and frame-count rules exported to Python |
 
 | Python package (`uniserve`) | Content |
 | --- | --- |

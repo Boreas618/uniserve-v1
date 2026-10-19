@@ -2,10 +2,10 @@
 
 Loads the base checkpoint's text encoder, denoiser, decoders and
 post-processor on one GPU as a rank loads them
-(``uniserve.loading.rank``), plans and presents a four-second 9:16 t2va
-request with the model package's planner, and runs ``generation.generate``,
-which drives the runners serving uses. The clip has the planned frames at
-the planned canvas and a stereo track covering them.
+(``uniserve.loading.rank``), tokenizes a t2va prompt, takes the frame count
+of four seconds and the 9:16 canvas from the model package's rules, and runs
+``generation.generate``, which drives the runners serving uses. The clip has
+those frames at that canvas and a stereo track covering them.
 """
 
 from __future__ import annotations
@@ -58,29 +58,29 @@ def test_library_generates_a_portrait_clip() -> None:
         workspace_size=512 << 20,
     )
 
-    plan = processing.plan_request(
-        processing.Task.T2VA,
-        processing.Target(aspect_ratio="9:16", duration_seconds=4.0),
-        [],
-        processing.VisionConfig.from_processor(Path(root) / "processor"),
+    # A t2va presentation is the prompt alone, tokenized without special
+    # tokens.
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        Path(root) / "tokenizer"
     )
-    presentation = processing.present(
-        transformers.AutoTokenizer.from_pretrained(Path(root) / "tokenizer"),
-        plan,
+    prompt = tokenizer.encode(
         "A lighthouse keeper climbs a spiral staircase at dusk while waves "
         "crash against the rocks below.",
+        add_special_tokens=False,
     )
+    num_frames = processing.frame_count(4.0)
+    canvas = processing.canvas(9, 16)
     generation = generate(
         loaded,
-        prompt_token_ids=presentation.token_ids,
-        num_frames=plan.num_frames,
-        canvas=plan.canvas,
+        prompt_token_ids=prompt,
+        num_frames=num_frames,
+        canvas=canvas,
         seed=7,
     )
 
     # Four seconds at 24 fps align up to 107 frames of the 768x1344 canvas.
-    assert (plan.canvas.width, plan.canvas.height) == (768, 1344)
-    assert plan.num_frames == 107
+    assert (canvas.width, canvas.height) == (768, 1344)
+    assert num_frames == 107
     assert generation.frames.shape == (107, 1344, 768, 3)
     assert generation.frames.dtype == torch.uint8
     # The stereo track spans the clip at the audio decoder's 32 kHz.

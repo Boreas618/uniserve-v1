@@ -71,9 +71,9 @@ def import_path(path: str) -> Callable[..., Any]:
 def library() -> tvm_ffi.Module:
     """The rank runtime library ``uniserve._worker``, loaded once.
 
-    Besides the rank entry ``main`` it exports the video request rules
-    (``video_plan`` and the functions beside it), which any process may
-    call: loading the library starts nothing.
+    Besides the rank entry ``main`` it exports the video canvas and
+    frame-count rules (``video_canvas`` and the functions beside it), which
+    any process may call: loading the library starts nothing.
 
     Raises:
         ImportError: The library is not installed.
