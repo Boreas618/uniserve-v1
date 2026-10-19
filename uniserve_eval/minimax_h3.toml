@@ -30,10 +30,9 @@
 #   conditions too, and its audio reference, auto canvas (16:9), 5 s.
 # The base checkpoint's schedule is 50 sigma points (49 denoiser
 # evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
-# its 8 fused-block forwards, with the same shifts. Every base and OmniRef
-# point states its schedule: UniServe refuses one other than its
-# checkpoint's, and the baselines run the schedule they are sent. FastH3
-# points state none and run the checkpoint's own.
+# its 8 fused-block forwards, with the same shifts. A UniServe point states
+# no schedule and runs its checkpoint's own; a baseline point states the
+# schedule it measures, which the baseline runs as sent.
 #
 # A point first sends its one warmup row (seed 42), which is not measured,
 # then its measured rows one at a time, each with its own seed from 0: four
@@ -217,7 +216,7 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # FastH3 OmniRef on the same deployment file: the export's reference DiT
-# with the other components of its pinned base. Its region-sparse attention
+# with the other components of its pinned base. Its segment-sparse attention
 # packs each condition into whole 128-row tiles, so W5 takes 47,104
 # condition rows there; the capacity is 49,152.
 [servers.gb200-4-omniref]
