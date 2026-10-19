@@ -115,21 +115,24 @@ fn video_tasks() -> Result<Array<Any>> {
     Ok(list(VideoTask::ALL.map(|task| text(task.as_str()))))
 }
 
-/// `video_reference_bounds(frames, frame_rate, frame_rule) -> [images,
-/// video_frames, audio_samples, video_canvases]`: the largest references a
-/// request generating `frames` frames at the model's output `frame_rate`
-/// under its frame rule ([`frame_rule`]) may bring
+/// `video_reference_bounds(frames, frame_rate, frame_rule, image_short_edge)
+/// -> [images, video_frames, audio_samples, video_canvases]`: the largest
+/// references a request generating `frames` frames at the model's output
+/// `frame_rate` under its frame rule ([`frame_rule`]) may bring, its image
+/// references encoded at a short edge of at most `image_short_edge`
 /// (`plan::reference_bounds`); `images`, the two largest image rasters, and
 /// `video_canvases` are flat `[width, height, ...]`.
 fn video_reference_bounds(
     frames: i64,
     frame_rate: i64,
     frame_rule_values: Array<Any>,
+    image_short_edge: i64,
 ) -> Result<Array<Any>> {
     let frames = u32::try_from(frames).map_err(|_| value_error("frames is out of range"))?;
     let frame_rate = positive(frame_rate, "frame_rate")?;
     let clips = frame_rule(frame_rule_values)?;
-    let bounds = plan::reference_bounds(frames, frame_rate, &clips);
+    let image_short_edge = positive(image_short_edge, "image_short_edge")?;
+    let bounds = plan::reference_bounds(frames, frame_rate, &clips, image_short_edge);
     let rasters = |canvases: &[Canvas]| {
         integer_list(
             canvases

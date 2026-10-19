@@ -114,6 +114,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
                     canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
                 })
                 .to_vec(),
+            references: uniserve_core::ReferenceLimits::default(),
         },
         ProcessorConfig {
             patch_size: 16,
@@ -127,7 +128,8 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         max_video_seconds,
         1,
         &crate::VideoMediaSettings::default(),
-        Default::default(),
+        // A text-to-video denoiser takes no references to size.
+        uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
         configured_tokenizer(),
     )
     .unwrap()

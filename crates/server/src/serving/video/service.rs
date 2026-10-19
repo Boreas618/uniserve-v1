@@ -17,9 +17,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use uniserve_core::video::plan::{
-    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
-    MAX_REFERENCES, MAX_VIDEO_REFERENCES, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, PlanLimits,
-    ProcessorConfig, ReferenceConfig, Target,
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS,
+    PlanLimits, ProcessorConfig, ReferenceConfig, Target,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -93,7 +92,9 @@ impl VideoService {
             !denoiser.canvases.is_empty(),
             "invalid video denoiser handshake: the worker prepared no canvas"
         );
-        references.validate().map_err(anyhow::Error::msg)?;
+        references
+            .validate(&denoiser.references)
+            .map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
             .iter()
@@ -117,6 +118,7 @@ impl VideoService {
             frame_rate: denoiser.frame_rate,
             frames: denoiser.frames,
             canvases: denoiser.canvases.clone(),
+            reference_limits: denoiser.references,
             references,
         };
         Ok(Self {
@@ -180,10 +182,10 @@ impl VideoService {
                         "aspect_ratio": "auto or W:H",
                     }),
                     VideoTask::Ref2va => json!({
-                        "max_images": MAX_IMAGE_REFERENCES,
-                        "max_videos": MAX_VIDEO_REFERENCES,
-                        "max_audios": MAX_AUDIO_REFERENCES,
-                        "max_references": MAX_REFERENCES,
+                        "max_images": self.denoiser.references.images,
+                        "max_videos": self.denoiser.references.videos,
+                        "max_audios": self.denoiser.references.audios,
+                        "max_references": self.denoiser.references.total,
                         "keyframe_frame_indices": [[], [0], [-1], [0, -1]],
                         "reference_image_short_edge": references.image_short_edge,
                         "enlarge_references": references.enlarge,
@@ -334,7 +336,19 @@ mod tests {
 
     use base64::Engine as _;
     use image::ImageEncoder as _;
+    use uniserve_core::ReferenceLimits;
     use uniserve_core::video::plan::ReferenceConfig;
+
+    /// The released checkpoint's documented references: nine images, three
+    /// videos, three audio tracks and twelve in all, images at a short edge
+    /// of at most 2048 pixels.
+    const REFERENCE_LIMITS: ReferenceLimits = ReferenceLimits {
+        images: 9,
+        videos: 3,
+        audios: 3,
+        total: 12,
+        image_short_edge: 2048,
+    };
     use uniserve_core::{
         Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoTask, VisionGrid,
     };
@@ -349,7 +363,7 @@ mod tests {
     /// A base denoiser serving every task, on a latent encoder of one rank,
     /// in a deployment that sizes references as the released pipeline does.
     fn service() -> VideoService {
-        encoding_service(1, ReferenceConfig::RELEASED)
+        encoding_service(1, ReferenceConfig::released(&REFERENCE_LIMITS))
     }
 
     /// A denoiser serving every task, whose latent encoder covers
@@ -371,6 +385,7 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: served_canvases(),
+                references: REFERENCE_LIMITS,
             },
             vision(),
             15.0,
@@ -439,7 +454,7 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         });
-        let unenlarged = encoding_service(4, ReferenceConfig::default())
+        let unenlarged = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("reference"),
                 &request(body.clone()),
@@ -462,7 +477,7 @@ mod tests {
             })
         );
 
-        let processed = encoding_service(4, ReferenceConfig::RELEASED)
+        let processed = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
             .process(&ServeRequestId::new("reference"), &request(body), 1 << 16)
             .await
             .unwrap();
@@ -525,7 +540,7 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let processed = encoding_service(4, ReferenceConfig::RELEASED)
+            let processed = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("images"),
                 &request(serde_json::json!({
@@ -559,7 +574,7 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let processed = encoding_service(4, ReferenceConfig::default())
+        let processed = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({

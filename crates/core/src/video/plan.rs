@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{ConditionMedia, ConditionVision, FrameClips, ImageFit, MediaLocator};
-use super::{ServedCanvas, VideoCondition, VisionGrid};
+use super::{ReferenceLimits, ServedCanvas, VideoCondition, VisionGrid};
 use crate::{Canvas, VideoTask};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
@@ -62,10 +62,6 @@ pub const MAX_ASPECT_RATIO: f64 = 4.0;
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
 
-/// Short edge the released checkpoint encodes an image reference at, and the
-/// longest a deployment encodes one at ([`ReferenceConfig`]).
-pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
-
 /// Shortest explicit video duration, in seconds, the MiniMax-H3 API admits.
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;
 /// Longest explicit video duration, in seconds, the MiniMax-H3 API admits. A
@@ -81,16 +77,6 @@ const AUDIO_CHANNELS: u32 = 2;
 
 /// The rate the conditioner samples a reference video at.
 const VIDEO_SAMPLE_FPS: f64 = 2.0;
-
-/// Image references one `ref2va` request may carry, as documented for the
-/// released checkpoint.
-pub const MAX_IMAGE_REFERENCES: usize = 9;
-/// Video references, with or without soundtrack, one request may carry.
-pub const MAX_VIDEO_REFERENCES: usize = 3;
-/// Audio references one request may carry, not counting video soundtracks.
-pub const MAX_AUDIO_REFERENCES: usize = 3;
-/// References of all types one request may carry; keyframes not counted.
-pub const MAX_REFERENCES: usize = 12;
 
 /// The request field a rejection names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,7 +593,8 @@ pub struct ConditionSpec {
 }
 
 /// How a deployment sizes the references of a `ref2va` request: the options
-/// of the MiniMax-H3 video processor (`--mm-processor-kwargs`).
+/// of the MiniMax-H3 video processor (`--mm-processor-kwargs`), resolved
+/// against what the video denoiser declares ([`ReferenceLimits`]).
 ///
 /// A reference is only ever reduced by default: an image whose short edge
 /// exceeds `image_short_edge` scales down to it, and a video with more
@@ -615,41 +602,50 @@ pub struct ConditionSpec {
 /// smaller references keep their own size on the 32-pixel grid. The released
 /// pipeline also enlarges smaller ones to those sizes, which `enlarge`
 /// selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReferenceConfig {
     /// Short edge, in pixels, an image reference is encoded at, at most: a
-    /// multiple of 32 up to [`REFERENCE_IMAGE_SHORT_EDGE`].
-    #[serde(rename = "reference_image_short_edge")]
+    /// multiple of 32 up to the edge the denoiser declares.
     pub image_short_edge: u32,
     /// Whether a reference smaller than its encoding size is enlarged to it:
     /// an image to `image_short_edge` and a video to the canvas of its
     /// aspect.
-    #[serde(rename = "enlarge_references")]
     pub enlarge: bool,
 }
 
-impl Default for ReferenceConfig {
-    /// The released checkpoint's short edge, without enlarging.
-    fn default() -> Self {
-        Self {
-            image_short_edge: REFERENCE_IMAGE_SHORT_EDGE,
-            enlarge: false,
-        }
-    }
+/// The video processor's options as a deployment states them, each absent
+/// one taking its default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceOptions {
+    reference_image_short_edge: Option<u32>,
+    #[serde(default)]
+    enlarge_references: bool,
 }
 
 impl ReferenceConfig {
-    /// The released pipeline's sizing: every reference at its encoding size,
-    /// enlarged when smaller.
-    pub const RELEASED: Self = Self {
-        image_short_edge: REFERENCE_IMAGE_SHORT_EDGE,
-        enlarge: true,
-    };
+    /// The default sizing of a deployment whose denoiser declares `limits`:
+    /// images reduced to the declared edge, nothing enlarged.
+    pub fn new(limits: &ReferenceLimits) -> Self {
+        Self {
+            image_short_edge: limits.image_short_edge,
+            enlarge: false,
+        }
+    }
+
+    /// The released pipeline's sizing: every reference at its encoding size
+    /// (images at the declared edge), enlarged when smaller.
+    pub fn released(limits: &ReferenceLimits) -> Self {
+        Self {
+            enlarge: true,
+            ..Self::new(limits)
+        }
+    }
 
     /// Reads the config from the processor options a deployment states
-    /// (`--mm-processor-kwargs`): `reference_image_short_edge` and
-    /// `enlarge_references`, each keeping its default when absent.
+    /// (`--mm-processor-kwargs`): `reference_image_short_edge`, by default
+    /// the edge the denoiser declares, and `enlarge_references`, by default
+    /// false.
     ///
     /// # Errors
     ///
@@ -658,27 +654,37 @@ impl ReferenceConfig {
     /// refuses.
     pub fn from_kwargs(
         kwargs: &serde_json::Map<String, serde_json::Value>,
+        limits: &ReferenceLimits,
     ) -> Result<Self, String> {
-        let config = Self::deserialize(serde_json::Value::Object(kwargs.clone()))
+        let options = ReferenceOptions::deserialize(serde_json::Value::Object(kwargs.clone()))
             .map_err(|error| error.to_string())?;
-        config.validate()?;
+        let config = Self {
+            image_short_edge: options
+                .reference_image_short_edge
+                .unwrap_or(limits.image_short_edge),
+            enlarge: options.enlarge_references,
+        };
+        config.validate(limits)?;
         Ok(config)
     }
 
     /// Checks that the short edge is a multiple of 32 from 32 pixels to the
-    /// released checkpoint's.
+    /// edge the denoiser declares; a denoiser that takes no image reference
+    /// sizes none.
     ///
     /// # Errors
     ///
     /// Returns a message naming the short edge.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self, limits: &ReferenceLimits) -> Result<(), String> {
+        if limits.images == 0 {
+            return Ok(());
+        }
         let edge = self.image_short_edge;
-        if !edge.is_multiple_of(CANVAS_MULTIPLE)
-            || !(CANVAS_MULTIPLE..=REFERENCE_IMAGE_SHORT_EDGE).contains(&edge)
-        {
+        let largest = limits.image_short_edge;
+        if !edge.is_multiple_of(CANVAS_MULTIPLE) || !(CANVAS_MULTIPLE..=largest).contains(&edge) {
             return Err(format!(
                 "a reference image short edge must be a multiple of {CANVAS_MULTIPLE} from \
-                 {CANVAS_MULTIPLE} to {REFERENCE_IMAGE_SHORT_EDGE} pixels, got {edge}"
+                 {CANVAS_MULTIPLE} to {largest} pixels, got {edge}"
             ));
         }
         Ok(())
@@ -705,6 +711,9 @@ pub struct PlanLimits {
     /// `target.aspect_ratio` that select it, in the order the deployment
     /// names them.
     pub canvases: Vec<ServedCanvas>,
+    /// The references one `ref2va` request may carry, as the denoiser
+    /// declares them in its handshake.
+    pub reference_limits: ReferenceLimits,
     /// How the deployment sizes references.
     pub references: ReferenceConfig,
 }
@@ -1505,9 +1514,9 @@ pub struct ReferenceBounds {
 ///
 /// However a deployment sizes references ([`ReferenceConfig`]),
 /// [`reference_image_size`] encodes an image's short edge at most at
-/// [`REFERENCE_IMAGE_SHORT_EDGE`], so its sides, and the rows any packing
-/// gives it, are at most those of that edge at the widest or the tallest
-/// accepted aspect. [`video_reference`] keeps at most `frames` frames of a
+/// `image_short_edge`, the edge the denoiser declares, so its sides, and the
+/// rows any packing gives it, are at most those of that edge at the widest or
+/// the tallest accepted aspect. [`video_reference`] keeps at most `frames` frames of a
 /// video, whose leading frames forming a count of the frame rule `clips` it
 /// encodes on the canvas of the video's aspect or, for a video with fewer
 /// pixels than that canvas, at its own size, whose sides on the 32-pixel
@@ -1517,8 +1526,13 @@ pub struct ReferenceBounds {
 /// samples whatever the source rate, `frame_rate` being the output frame
 /// rate the frames are counted at. A model sizes these shapes with its own
 /// packing to provision the largest condition set it admits.
-pub fn reference_bounds(frames: u32, frame_rate: u32, clips: &FrameClips) -> ReferenceBounds {
-    let edge = REFERENCE_IMAGE_SHORT_EDGE;
+pub fn reference_bounds(
+    frames: u32,
+    frame_rate: u32,
+    clips: &FrameClips,
+    image_short_edge: u32,
+) -> ReferenceBounds {
+    let edge = image_short_edge;
     ReferenceBounds {
         images: [
             Canvas {
@@ -1675,7 +1689,7 @@ pub fn check_request(
         check_served(size, limits)?;
     }
 
-    check_conditions(task, conditions)?;
+    check_conditions(task, conditions, &limits.reference_limits)?;
 
     match target.duration_seconds {
         Some(seconds) => {
@@ -1707,7 +1721,11 @@ pub fn check_request(
 
 /// Checks each condition's fields, then the task's counts and keyframe
 /// order.
-fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(), VideoInputError> {
+fn check_conditions(
+    task: VideoTask,
+    conditions: &[ConditionSpec],
+    limits: &ReferenceLimits,
+) -> Result<(), VideoInputError> {
     if task == VideoTask::T2va {
         if !conditions.is_empty() {
             return Err(VideoInputError::invalid(
@@ -1785,12 +1803,12 @@ fn check_conditions(task: VideoTask, conditions: &[ConditionSpec]) -> Result<(),
         let videos = count(|kind| matches!(kind, ConditionType::Video | ConditionType::VideoAudio));
         // Each limit names what it bounds; the last bounds every kind.
         for (bounded, found, limit) in [
-            ("image references", images, MAX_IMAGE_REFERENCES),
-            ("video references", videos, MAX_VIDEO_REFERENCES),
-            ("audio references", audios, MAX_AUDIO_REFERENCES),
-            ("references", references().count(), MAX_REFERENCES),
+            ("image references", images, limits.images),
+            ("video references", videos, limits.videos),
+            ("audio references", audios, limits.audios),
+            ("references", references().count(), limits.total),
         ] {
-            if found > limit {
+            if found > limit as usize {
                 return Err(VideoInputError::invalid(
                     RequestField::Conditions,
                     format!("at most {limit} {bounded}, got {found}"),
@@ -2108,13 +2126,13 @@ pub(super) mod tests {
     use super::{
         AudioClip, AudioFacts, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
         FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
-        MediaFacts, PlanLimits, Prepared, ProcessorConfig, REFERENCE_IMAGE_SHORT_EDGE,
-        ReferenceConfig, RequestField, RequestPlan, Role, Target, VideoFacts, VideoInputError,
-        VideoTask, Vision, audio_clip, canvas, check_request, cover_crop, gcd, plan_request,
-        reference_bounds, reference_image_size, requested_frames, rows_per_frame, rule_canvases,
-        video_frame_count, video_reference,
+        MediaFacts, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField,
+        RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask, Vision, audio_clip,
+        canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
+        reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
+        video_reference,
     };
-    use crate::{MediaLocator, ServedCanvas};
+    use crate::{MediaLocator, ReferenceLimits, ServedCanvas};
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {
@@ -2139,6 +2157,17 @@ pub(super) mod tests {
         clip_frames: 17,
         clip_latent_frames: 5,
         tail_latent_frames: 2,
+    };
+
+    /// The released checkpoint's documented references: nine images, three
+    /// videos, three audio tracks and twelve in all, images encoded at a
+    /// short edge of at most 2048 pixels.
+    pub(in crate::video) const REFERENCE_LIMITS: ReferenceLimits = ReferenceLimits {
+        images: 9,
+        videos: 3,
+        audios: 3,
+        total: 12,
+        image_short_edge: 2048,
     };
 
     /// The canvases of the vectors' accepted requests, as a deployment that
@@ -2192,8 +2221,9 @@ pub(super) mod tests {
             frame_rate: FRAME_RATE,
             frames: FRAMES,
             canvases: vector_canvases(),
+            reference_limits: REFERENCE_LIMITS,
             // The fixture's cases follow the released pipeline.
-            references: ReferenceConfig::RELEASED,
+            references: ReferenceConfig::released(&REFERENCE_LIMITS),
         }
     }
 
@@ -2461,7 +2491,8 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         for case in fixture["reference_image_cases"].as_array().unwrap() {
             let (width, height) = pair(&case["size"]);
-            let resized = reference_image_size(width, height, &ReferenceConfig::RELEASED);
+            let resized =
+                reference_image_size(width, height, &ReferenceConfig::released(&REFERENCE_LIMITS));
             if case.get("error").is_some() {
                 assert!(resized.is_err(), "{case}");
                 continue;
@@ -2685,7 +2716,7 @@ pub(super) mod tests {
                 FRAME_RATE,
                 &FRAMES,
                 &vision,
-                &ReferenceConfig::RELEASED,
+                &ReferenceConfig::released(&REFERENCE_LIMITS),
             );
             if case.get("error").is_some() {
                 assert!(planned.is_err(), "{case}");
@@ -2723,8 +2754,8 @@ pub(super) mod tests {
         let fixture = fixture();
         let vision = vision(&fixture);
         let frames = video_frame_count(5.0, 15.0, FRAME_RATE, &FRAMES).unwrap();
-        let bounds = reference_bounds(frames, FRAME_RATE, &FRAMES);
-        let edge = REFERENCE_IMAGE_SHORT_EDGE;
+        let edge = REFERENCE_LIMITS.image_short_edge;
+        let bounds = reference_bounds(frames, FRAME_RATE, &FRAMES, edge);
         assert_eq!(
             bounds.images,
             [
@@ -2746,7 +2777,10 @@ pub(super) mod tests {
                 .any(|bound| size.width <= bound.width && size.height <= bound.height)
         };
 
-        for config in [ReferenceConfig::default(), ReferenceConfig::RELEASED] {
+        for config in [
+            ReferenceConfig::new(&REFERENCE_LIMITS),
+            ReferenceConfig::released(&REFERENCE_LIMITS),
+        ] {
             for scale in [1, 3] {
                 for width in (250..=4000).step_by(7) {
                     let size = reference_image_size(scale * width, scale * 1000, &config).unwrap();
@@ -2794,7 +2828,7 @@ pub(super) mod tests {
     #[test]
     fn references_are_enlarged_only_on_request() {
         let sized = |width, height| Canvas { width, height };
-        let unenlarged = ReferenceConfig::default();
+        let unenlarged = ReferenceConfig::new(&REFERENCE_LIMITS);
         let image = |width, height, config: &ReferenceConfig| {
             reference_image_size(width, height, config).unwrap()
         };
@@ -2802,11 +2836,11 @@ pub(super) mod tests {
         assert_eq!(image(1920, 1080, &unenlarged), sized(1920, 1088));
         assert_eq!(image(768, 768, &unenlarged), sized(768, 768));
         assert_eq!(
-            image(768, 768, &ReferenceConfig::RELEASED),
+            image(768, 768, &ReferenceConfig::released(&REFERENCE_LIMITS)),
             sized(2048, 2048)
         );
         // A 2304-pixel short edge exceeds 2048 and is reduced either way.
-        for config in [&unenlarged, &ReferenceConfig::RELEASED] {
+        for config in [&unenlarged, &ReferenceConfig::released(&REFERENCE_LIMITS)] {
             assert_eq!(image(4096, 2304, config), sized(3648, 2048));
         }
         // A smaller short edge reduces further and still never enlarges.
@@ -2845,22 +2879,24 @@ pub(super) mod tests {
         assert_eq!(video(1280, 720, &unenlarged), sized(1280, 704));
         assert_eq!(video(1920, 1080, &unenlarged), sized(1344, 768));
         assert_eq!(
-            video(1280, 720, &ReferenceConfig::RELEASED),
+            video(1280, 720, &ReferenceConfig::released(&REFERENCE_LIMITS)),
             sized(1344, 768)
         );
     }
 
     /// A reference config reads the processor options a deployment states,
-    /// absent ones keeping their defaults, and refuses an option the
-    /// processor does not take; its short edge lies on the 32-pixel grid up
-    /// to the released checkpoint's.
+    /// absent ones keeping their defaults (the image edge the denoiser
+    /// declares), and refuses an option the processor does not take; its
+    /// short edge lies on the 32-pixel grid up to the declared edge.
     #[test]
     fn a_reference_config_reads_processor_options() {
-        let read = |options: Value| ReferenceConfig::from_kwargs(options.as_object().unwrap());
-        assert_eq!(read(json!({})), Ok(ReferenceConfig::default()));
+        let read = |options: Value| {
+            ReferenceConfig::from_kwargs(options.as_object().unwrap(), &REFERENCE_LIMITS)
+        };
+        assert_eq!(read(json!({})), Ok(ReferenceConfig::new(&REFERENCE_LIMITS)));
         assert_eq!(
             read(json!({"enlarge_references": true})),
-            Ok(ReferenceConfig::RELEASED)
+            Ok(ReferenceConfig::released(&REFERENCE_LIMITS))
         );
         assert_eq!(
             read(json!({"reference_image_short_edge": 1024})),
@@ -2884,8 +2920,24 @@ pub(super) mod tests {
                 image_short_edge: edge,
                 enlarge: false,
             };
-            assert_eq!(config.validate().is_ok(), valid, "{edge}");
+            assert_eq!(config.validate(&REFERENCE_LIMITS).is_ok(), valid, "{edge}");
         }
+
+        // A denoiser that declares a smaller edge bounds the deployment's.
+        let smaller = ReferenceLimits {
+            image_short_edge: 1024,
+            ..REFERENCE_LIMITS
+        };
+        let read =
+            |options: Value| ReferenceConfig::from_kwargs(options.as_object().unwrap(), &smaller);
+        assert_eq!(
+            read(json!({})).map(|config| config.image_short_edge),
+            Ok(1024)
+        );
+        assert!(read(json!({"reference_image_short_edge": 2048})).is_err());
+        // A denoiser that takes no image reference sizes none.
+        let none = ReferenceLimits::default();
+        assert!(ReferenceConfig::from_kwargs(&serde_json::Map::new(), &none).is_ok());
     }
 
     /// Soundtracks truncate at their native rate, resample to 32 kHz and pad
@@ -3153,6 +3205,55 @@ pub(super) mod tests {
         every_kind.extend(vec![reference(ConditionType::Video); 3]);
         every_kind.push(reference(ConditionType::Audio));
         assert_eq!(refusal(&every_kind), "at most 12 references, got 13");
+    }
+
+    /// A `ref2va` request carries at most the references its denoiser
+    /// declares, of each kind and in all.
+    #[test]
+    fn reference_counts_are_bounded_by_the_declared_limits() {
+        let limits = PlanLimits {
+            reference_limits: ReferenceLimits {
+                images: 2,
+                videos: 1,
+                audios: 1,
+                total: 3,
+                ..REFERENCE_LIMITS
+            },
+            ..limits()
+        };
+        let reference = |condition_type| ConditionSpec {
+            condition_type,
+            role: Role::Reference,
+            frame_index: None,
+            start_seconds: None,
+        };
+        let image = reference(ConditionType::Image);
+        let video = reference(ConditionType::Video);
+        let audio = reference(ConditionType::Audio);
+        let check = |conditions: &[ConditionSpec]| {
+            check_request(VideoTask::Ref2va, &FIVE_SECONDS, conditions, &limits)
+        };
+
+        assert!(check(&[image.clone(), image.clone(), video.clone()]).is_ok());
+        for (conditions, bound) in [
+            (vec![image.clone(); 3], "at most 2 image references"),
+            (
+                vec![image.clone(), video.clone(), video.clone()],
+                "at most 1 video references",
+            ),
+            (
+                vec![image.clone(), audio.clone(), audio.clone()],
+                "at most 1 audio references",
+            ),
+            (
+                vec![image.clone(), image.clone(), video.clone(), audio.clone()],
+                "at most 3 references",
+            ),
+        ] {
+            let error = check(&conditions).unwrap_err();
+            assert_eq!(error.field(), Some(RequestField::Conditions));
+            assert!(error.to_string().contains(bound), "{bound}: {error}");
+        }
     }
 
     /// A task outside the placed denoiser's set is rejected first.

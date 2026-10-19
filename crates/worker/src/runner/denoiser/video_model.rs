@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, FrameClips, ServedCanvas};
+use uniserve_core::{Canvas, FrameClips, ReferenceLimits, ServedCanvas};
 use uniserve_ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
 
 use super::{DECODER, DENOISER, OUTPUTS};
@@ -28,6 +28,8 @@ pub(crate) struct VideoFacts {
     /// Whether the denoiser serves requests without conditions; without
     /// it every request evaluates in a layout of its own.
     pub(crate) text_only: bool,
+    /// The references one request may carry, as the denoiser states them.
+    pub(crate) references: ReferenceLimits,
     pub(crate) video_shift: f64,
     pub(crate) audio_shift: f64,
     /// Canvases the denoiser offers, each named by the `(short_edge,
@@ -365,11 +367,27 @@ impl VideoModel {
                 ));
             }
         };
+        let references = match list("max_references")?[..] {
+            [images, videos, audios, total, image_short_edge] => ReferenceLimits {
+                images: narrow(images, "reference limit")?,
+                videos: narrow(videos, "reference limit")?,
+                audios: narrow(audios, "reference limit")?,
+                total: narrow(total, "reference limit")?,
+                image_short_edge: narrow(image_short_edge, "reference limit")?,
+            },
+            _ => {
+                return Err(Error::Interface(
+                    "the reference limits are [images, videos, audios, total, image_short_edge]"
+                        .into(),
+                ));
+            }
+        };
         let facts = VideoFacts {
             modalities: names("modalities")?,
             num_steps: narrow(integer("num_steps")?, "step count")?,
             tasks: names("tasks")?,
             text_only: flag("text_only")?,
+            references,
             video_shift,
             audio_shift,
             canvases,
@@ -421,6 +439,7 @@ impl VideoModel {
             audio_sample_rate: self.facts.sample_rate,
             frames: self.facts.frames,
             canvases: canvases.to_vec(),
+            references: self.facts.references,
         }
     }
 

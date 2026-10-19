@@ -90,8 +90,11 @@ from .transformer import Transformer, TransformerLayer
 # The references one ref2va request may carry, as documented for the
 # released checkpoint: nine images, three videos with or without their
 # soundtracks, three audio tracks, and twelve references in all; keyframes
-# are not counted.
-REFERENCE_LIMITS = ReferenceLimits(images=9, videos=3, audios=3, total=12)
+# are not counted. The released pipeline encodes an image reference at a
+# 2048-pixel short edge.
+REFERENCE_LIMITS = ReferenceLimits(
+    images=9, videos=3, audios=3, total=12, image_short_edge=2048
+)
 
 # A visual condition is held at this clean time for every step whose
 # generated video is noisier, as the released model was trained.
@@ -290,7 +293,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             )
             return size.condition_rows
 
-        bounds = reference_bounds(num_frames)
+        limits = self.max_references
+        bounds = reference_bounds(
+            num_frames, image_short_edge=limits.image_short_edge
+        )
         still = max(
             (
                 Condition(ConditionRole.REFERENCE, video.Config(1, raster))
@@ -309,7 +315,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ),
             key=rows,
         )
-        limits = self.max_references
         return (
             *keyframes,
             *(still,) * limits.images,
