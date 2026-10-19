@@ -6,9 +6,9 @@ independently placeable components (see ``entry_points``): the Qwen text
 encoder, one denoiser per DiT partition the checkpoint holds (each with its
 token refiner), the video decoder with its RGB post-processor, and the audio
 decoder. ``read_config`` recognizes the checkpoint layout and normalizes its
-JSON sidecars, ``base_checkpoint`` names the pinned base a component export
-draws its other components from, and ``checkpoint_mappings`` maps its
-tensors onto the modules.
+JSON sidecars, ``base_checkpoint`` names the base revision an export reads
+the directories it omits from, and ``checkpoint_mappings`` maps its tensors
+onto the modules.
 """
 
 from .attention import Dense, Sparse

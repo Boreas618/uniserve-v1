@@ -887,8 +887,7 @@ def normalize(
     )
 
 
-# Component sidecars, relative to the directory that holds the component. A
-# component export holds its schedulers and draws the others from its base.
+# Component sidecars, relative to the checkpoint root.
 _SIDECARS = {
     "text_encoder": "text_encoder/config.json",
     "processor": "processor/preprocessor_config.json",
@@ -897,7 +896,6 @@ _SIDECARS = {
     "scheduler": "scheduler/scheduler_config.json",
     "audio_scheduler": "audio_scheduler/scheduler_config.json",
 }
-_EXPORT_SIDECARS = frozenset({"scheduler", "audio_scheduler"})
 
 
 def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
@@ -906,30 +904,27 @@ def read_config(root: Path, io, *, sources, base: Path | None = None) -> Config:
     ``root`` is the checkpoint directory, whose sidecars the loader has
     already fetched; ``io`` and ``sources`` (the resolved ``config_sources``,
     of which H3 declares none) are part of the package interface. ``base``
-    supplies the base components of a component export, resolved by the loader;
-    the export's text encoder and VAE sidecars are read from it, and its
-    schedulers and DiT partition from ``root``. Every other layout has no
-    base.
+    is the snapshot of the base revision the checkpoint pins
+    (``checkpoint.base_checkpoint``), resolved by the loader; a sidecar the
+    checkpoint omits is read from it.
 
-    An unreadable sidecar raises ``OSError``; invalid JSON, an unsupported
-    checkpoint, or a base that does not match the layout raises
-    ``ValueError``.
+    An unreadable or missing sidecar raises ``OSError``; invalid JSON or an
+    unsupported checkpoint raises ``ValueError``.
     """
     layout = detect(root)
-    if (layout.kind is Kind.COMPONENT_EXPORT) != (base is not None):
-        raise ValueError(
-            "a MiniMax-H3 component export, and only one, reads its other "
-            "components from its pinned base checkpoint"
-        )
     metadata: dict[str, Any] = {}
-    for name, relative in _SIDECARS.items():
-        directory = root if base is None or name in _EXPORT_SIDECARS else base
+    for name, relative in (
+        *_SIDECARS.items(),
+        *(
+            (component, f"{subdirectory}/config.json")
+            for component, subdirectory in layout.denoisers.items()
+        ),
+    ):
+        directory = (
+            root if base is None or (root / relative).is_file() else base
+        )
         metadata[name] = json.loads(
             (directory / relative).read_text(encoding="utf-8")
-        )
-    for component, subdirectory in layout.denoisers.items():
-        metadata[component] = json.loads(
-            (root / subdirectory / "config.json").read_text(encoding="utf-8")
         )
     return normalize(layout, metadata)
 

@@ -1,4 +1,11 @@
-"""Component exports read the components they omit from their pinned base."""
+"""A FastH3 export reads the directories it omits at its pinned base revision.
+
+FastH3 OmniRef ships its DiT partition and schedulers and pins, in
+``base_model_revision``, the MiniMax-H3 revision that supplies the text
+encoder, tokenizer, processor and VAEs. The loader reads every top-level
+directory the export omits from the Hub snapshot of that revision, and every
+directory it holds from the export.
+"""
 
 import json
 import shutil
@@ -72,12 +79,12 @@ def checkpoints(tmp_path):
     return export, base
 
 
-def test_export_reads_the_pinned_hub_revision(
-    checkpoints, tmp_path, monkeypatch
-):
+@pytest.fixture
+def hub(checkpoints, tmp_path, monkeypatch):
+    """The Hub serving the base revision's files; returns its snapshot."""
     from huggingface_hub.errors import EntryNotFoundError
 
-    export, base = checkpoints
+    _, base = checkpoints
     snapshot = tmp_path / "hub" / REVISION
     published = sorted(
         path.relative_to(base).as_posix()
@@ -102,6 +109,13 @@ def test_export_reads_the_pinned_hub_revision(
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
     monkeypatch.setattr("huggingface_hub.HfApi.list_repo_files", files)
+    return snapshot
+
+
+def test_export_reads_the_directories_it_omits_at_the_pinned_revision(
+    checkpoints, hub
+):
+    export, _ = checkpoints
     config = models.read_config(
         export, io=IOConfig(mode="dummy"), modules=frozenset()
     )
@@ -113,8 +127,24 @@ def test_export_reads_the_pinned_hub_revision(
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.max_sequence_rows == 131_072
-    assert config.tokenizer == snapshot / "tokenizer"
+    assert config.tokenizer == hub / "tokenizer"
     assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
+
+
+def test_export_reads_a_directory_it_holds_from_itself(checkpoints, hub):
+    """A component directory the export ships is the export's, whichever."""
+    export, base = checkpoints
+    shutil.copytree(base / "vae", export / "vae")
+    sidecar = export / "vae/config.json"
+    values = json.loads(sidecar.read_text())
+    sidecar.write_text(json.dumps({**values, "decoder_num_layers": 35}))
+
+    config = models.read_config(
+        export, io=IOConfig(mode="dummy"), modules=frozenset()
+    )
+
+    assert config.model.video_vae.decoder_num_layers == 35
+    assert config.tokenizer == hub / "tokenizer"
 
 
 def test_offline_export_reads_its_base_from_the_cached_snapshot(

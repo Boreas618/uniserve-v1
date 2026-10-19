@@ -1,15 +1,12 @@
 //! Component files of a diffusers pipeline checkpoint.
 //!
 //! A pipeline checkpoint holds its components in the folders its root index
-//! names ([`PipelineIndex`]). A FastVideo component export (FastH3 OmniRef)
-//! holds only one DiT partition and its schedulers: its
-//! `fastvideo_inference.json` marks it with `pdd_steps` and pins, in
-//! `base_model_revision` (`hf://<repository>@<revision>`), the diffusers root
-//! whose folders supply its other components, [`BASE_COMPONENTS`].
-//! [`PipelineCheckpoint`] reads each component file from the checkpoint or
-//! from that base, as the worker's loader (`uniserve.loading`) reads them:
-//! the base is the Hub cache's snapshot of the pinned commit, and a file the
-//! snapshot lacks is downloaded into it at that commit.
+//! names ([`PipelineIndex`]). A FastH3 export may omit some of them; its
+//! `fastvideo_inference.json` then pins, in `base_model_revision`
+//! (`hf://<repository>@<revision>`), the base revision whose folders supply
+//! them. [`PipelineCheckpoint`] reads each component file from the
+//! checkpoint, or from the Hub snapshot of that revision when the checkpoint
+//! lacks it, as the rank's loader (`uniserve.models.registry`) reads them.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -20,11 +17,6 @@ use serde_json::Value;
 use crate::profile::assets::error::{Error, Result};
 use crate::profile::assets::model_files::{HubClient, ModelSource, fetch_file};
 use crate::profile::assets::pipeline_index::{PipelineIndex, pipeline_index};
-
-/// Checkpoint folders a component export draws from its pinned base: every
-/// component but its own DiT partition and schedulers.
-pub const BASE_COMPONENTS: [&str; 5] =
-    ["audio_vae", "processor", "text_encoder", "tokenizer", "vae"];
 
 /// Inference contract a FastVideo export publishes at its root.
 const INFERENCE_CONTRACT: &str = "fastvideo_inference.json";
@@ -48,7 +40,7 @@ impl BaseRevision {
     pub fn parse(value: &str) -> Result<Self> {
         let malformed = || {
             Error::invalid(format!(
-                "a component export's base_model_revision must be \
+                "a FastH3 export's base_model_revision must be \
                  hf://<repository>@<revision>, got {value:?}"
             ))
         };
@@ -102,10 +94,8 @@ async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> 
     fetch_file(&client.api.repo(repo), &pin.to_string(), filename).await
 }
 
-/// Reads the base a component export pins.
-///
-/// Returns `None` for a checkpoint that publishes no inference contract or
-/// whose contract is not a component export's (it declares no `pdd_steps`).
+/// Reads the base revision a FastH3 export pins, or `None` for a checkpoint
+/// that publishes no inference contract or pins no base.
 async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
     let path = match root.file(INFERENCE_CONTRACT).await {
         Ok(path) => path,
@@ -118,19 +108,19 @@ async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {
     })?;
     let contract: Value =
         serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
-    if contract.get("pdd_steps").is_none() {
-        return Ok(None);
+    match contract.get("base_model_revision") {
+        None => Ok(None),
+        Some(pin) => pin
+            .as_str()
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "{} states a base_model_revision that is not a string",
+                    root.id()
+                ))
+            })
+            .and_then(BaseRevision::parse)
+            .map(Some),
     }
-    let pin = contract
-        .get("base_model_revision")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            Error::invalid(format!(
-                "component export {} declares no base_model_revision in {INFERENCE_CONTRACT}",
-                root.id()
-            ))
-        })?;
-    BaseRevision::parse(pin).map(Some)
 }
 
 /// A diffusers pipeline checkpoint with the source of each component's files.
@@ -139,9 +129,9 @@ pub struct PipelineCheckpoint {
     index: PipelineIndex,
     /// The checkpoint itself.
     root: ModelSource,
-    /// The pinned base a component export draws [`BASE_COMPONENTS`] from,
-    /// with the client its snapshot is read and filled through; `None` for a
-    /// checkpoint that holds every component.
+    /// The base revision that supplies the folders a FastH3 export omits,
+    /// with the client its snapshot is read through; `None` for a
+    /// checkpoint that pins none.
     base: Option<(HubClient, BaseRevision)>,
 }
 
@@ -163,7 +153,7 @@ impl PipelineCheckpoint {
     }
 
     /// Resolves the checkpoint `root` holds; `hub` builds the client its
-    /// pinned base is read through.
+    /// base revision is read through.
     async fn locate(
         root: ModelSource,
         hub: impl FnOnce() -> Result<HubClient>,
@@ -183,24 +173,22 @@ impl PipelineCheckpoint {
         &self.index.class_name
     }
 
-    /// Returns `filename` inside `component`'s folder, read from the base
-    /// when the checkpoint is a component export and the folder is one of
-    /// [`BASE_COMPONENTS`], and from the checkpoint otherwise.
+    /// Returns `filename` inside `component`'s folder, read from the
+    /// checkpoint, or from its base revision when the checkpoint lacks it.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Invalid`] for a component the index does not declare,
     /// and the errors of [`resolve_model_file`](super::resolve_model_file)
-    /// for the file, including [`Error::MissingFile`] when its source does
-    /// not hold it.
+    /// for the file, including [`Error::MissingFile`] when neither source
+    /// holds it.
     pub async fn component_file(&self, component: &str, filename: &str) -> Result<PathBuf> {
         let path = self.index.component_file(component, filename)?;
-        let folder = path.split('/').next().unwrap_or_default();
-        match &self.base {
-            Some((client, pin)) if BASE_COMPONENTS.contains(&folder) => {
+        match (self.root.file(&path).await, &self.base) {
+            (Err(Error::MissingFile { .. }), Some((client, pin))) => {
                 pinned_file(client, pin, &path).await
             }
-            _ => self.root.file(&path).await,
+            (file, _) => file,
         }
     }
 }
@@ -218,7 +206,7 @@ mod tests {
     const BASE: &str = "org/base";
     const PIN: &str = "9bfb6693f2cf6de171db46d1aa586f67d773a1da";
 
-    /// Index of a component export: every MiniMax-H3 component, of which the
+    /// Index of a FastH3 export: every MiniMax-H3 component, of which the
     /// export holds only `transformer_ref`.
     const INDEX: &str = r#"{
         "_class_name": "MiniMaxH3ModularPipeline",
@@ -235,13 +223,13 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    /// A FastH3 OmniRef-style component export pinning `BASE` at `PIN`.
+    /// A FastH3 OmniRef-style export pinning `BASE` at `PIN`.
     fn export() -> TempDir {
         let root = tempdir().unwrap();
         write(&root.path().join("modular_model_index.json"), INDEX);
         write(
             &root.path().join(INFERENCE_CONTRACT),
-            &format!(r#"{{"pdd_steps": 32, "base_model_revision": "hf://{BASE}@{PIN}"}}"#),
+            &format!(r#"{{"model_type": "ref2va", "base_model_revision": "hf://{BASE}@{PIN}"}}"#),
         );
         write(
             &root.path().join("transformer_ref/config.json"),
@@ -254,11 +242,12 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
-    /// The base components come from the Hub cache's snapshot of the pinned
-    /// commit: a cached file is read without a Hub request (the stub does not
-    /// publish it), and an uncached one is downloaded into that snapshot.
+    /// The folders the export omits come from the Hub cache's snapshot of
+    /// the pinned commit: a cached file is read without a Hub request (the
+    /// stub does not publish it), and an uncached one is downloaded into
+    /// that snapshot. The export's own DiT is read from the export.
     #[tokio::test]
-    async fn a_component_export_reads_its_base_from_the_hub_cache_at_the_pinned_revision() {
+    async fn an_export_reads_the_folders_it_omits_at_the_pinned_revision() {
         let (export, cache) = (export(), tempdir().unwrap());
         let repository = seed_snapshot(
             cache.path(),
@@ -281,6 +270,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(checkpoint.class_name(), "MiniMaxH3ModularPipeline");
         let snapshot = repository.join("snapshots").join(PIN);
         let tokenizer = checkpoint
             .component_file("tokenizer", "tokenizer.json")
@@ -292,6 +282,7 @@ mod tests {
             .component_file("processor", "config.json")
             .await
             .unwrap();
+        assert!(processor.starts_with(&snapshot), "{}", processor.display());
         assert_eq!(read(processor), "downloaded");
         assert_eq!(
             read(
