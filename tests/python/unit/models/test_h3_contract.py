@@ -94,7 +94,6 @@ def test_diffusers_root_serves_both_task_families(base):
             points=50, video_shift=12.0, audio_shift=3.0
         )
         assert denoiser.canvases is None
-        assert denoiser.max_sequence_rows is None
     points = entry_points(config)
     assert {"denoiser", "reference_denoiser"} <= set(points)
     with torch.device("meta"):
@@ -161,7 +160,6 @@ def test_component_export_states_its_parallel_decoding_contract(checkpoint):
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert denoiser.tasks == ("ref2va",)
-    assert denoiser.max_sequence_rows == 131_072
     # A student whose heads disagree with its contract is rejected.
     metadata["reference_denoiser"] = {**transformer, "pdd_steps": 16}
     with pytest.raises(ValueError, match="pdd_steps"):

@@ -72,7 +72,6 @@ fn base_denoiser() -> VideoDenoiserInfo {
             .iter()
             .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
             .collect(),
-        max_sequence_rows: None,
     }
 }
 
@@ -738,7 +737,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             tail_latent_frames: 2,
         },
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
-        max_sequence_rows: None,
     };
     let model = InputProcessor::new(
         loaded.config().clone(),
