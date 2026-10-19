@@ -280,6 +280,12 @@ def test_component_bindings_release_cancelled_requests(
         worker_config = _eight_rank_worker_config(parallel_kind)
     else:
         raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
+    # A FastH3 student also serves fl2va, so every deployment places the
+    # latent encoder that encodes its keyframes, here on the first video
+    # decoder rank; the requests below are text-to-video and never use it.
+    worker_config["latent_encoder"] = {
+        "ranks": worker_config["video_decoder"]["ranks"][:1],
+    }
     devices = worker_config.pop("devices")
     visible_devices = max(devices) + 1
     # Mapping a product into a consumer's device needs peer access between the
@@ -301,7 +307,7 @@ def test_component_bindings_release_cancelled_requests(
         "split": [(name,) for name in worker_config],
         "mixed": [
             ("transformer", "text_encoder"),
-            ("video_decoder", "audio_decoder"),
+            ("video_decoder", "audio_decoder", "latent_encoder"),
         ],
     }[grouping]
     workers = []
@@ -334,27 +340,34 @@ def test_component_bindings_release_cancelled_requests(
         owners.update(dict.fromkeys(names, worker_id))
     # Media units are encoded and the artifact assembled on a host worker, as
     # in the shipped deployments: each host rank is one codec slot encoding
-    # one unit of a round, and a further rank muxes.
+    # one unit of a round, a further rank muxes and the last reads condition
+    # media.
     decoder_units = len(worker_config["video_decoder"]["ranks"])
     workers.append(
         {
             "id": "host",
             "ranks": [{"node": "localhost", "device": "cpu"}]
-            * (decoder_units + 1),
+            * (decoder_units + 2),
             "components": {
                 "video_codec": {
                     "ranks": list(range(decoder_units)),
                 },
                 "muxer": {"ranks": [decoder_units]},
+                "media_reader": {"ranks": [decoder_units + 1]},
             },
             "queue_depth": 6,
         }
     )
-    owners.update({"video_codec": "host", "muxer": "host"})
+    owners.update(
+        dict.fromkeys(("video_codec", "muxer", "media_reader"), "host")
+    )
     edges = {
         (owners[source], owners[destination])
         for source, destination in (
+            ("media_reader", "text_encoder"),
+            ("media_reader", "latent_encoder"),
             ("text_encoder", "transformer"),
+            ("latent_encoder", "transformer"),
             ("transformer", "video_decoder"),
             ("transformer", "audio_decoder"),
             ("video_decoder", "video_codec"),
