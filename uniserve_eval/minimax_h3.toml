@@ -304,7 +304,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/fasth3-ulysses4.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--workers", "configs/minimax_h3/ulysses4.json", "--max-running-requests", "2", "--max-model-len", "16384", "--max-video-seconds", "15", "--mem-fraction-static", "0.70", "--dtype", "bfloat16", "--quantization-config", "{\"mode\":\"quality\"}"]
 
 [servers.fast-h3-gb200-4.environment]
 NCCL_NVLS_ENABLE = "0"

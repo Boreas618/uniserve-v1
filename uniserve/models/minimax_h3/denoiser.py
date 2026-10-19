@@ -3,7 +3,8 @@
 ``Denoiser`` implements the ``VideoDenoiser`` capability for H3's joint
 video/audio transformer under one ``DenoiserConfig``: the released dense
 DiTs with their full-step uniform schedule, a DMD student with sparse
-attention, or a parallel-decoding (PDD) student. One sample's text, audio and
+attention, which serves its partition's keyframe requests as well as text to
+video, or a parallel-decoding (PDD) student. One sample's text, audio and
 video rows share one packed sequence, split into equal row shards across the
 sequence-parallel group. A modality's canonical sample on a rank is that
 rank's rows of the modality, in packed order.
@@ -268,22 +269,20 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         their soundtracks, on the canvas of the canvas rule where a video
         packs the most rows (``processing.reference_bounds``). Its nine
         images and three videos are its twelve references, and each packs
-        more rows than an audio reference's track alone. A network whose
-        packing holds keyframes also holds the two keyframes of ``canvas``,
-        which are all an ``fl2va`` request carries; the segment packing of
-        sparse attention holds no keyframes.
+        more rows than an audio reference's track alone. Every conditioned
+        network also holds the two keyframes of ``canvas``, which are all an
+        ``fl2va`` request carries: the dense packing places them with the
+        conditions, and the segment packing gives each tiles of its own.
         """
         tasks = set(self.config.tasks)
         if not tasks & {"fl2va", "ref2va"}:
             return ()
 
-        keyframes: tuple[Condition, ...] = ()
-        if self.dense:
-            frame = video.Config(1, canvas)
-            keyframes = (
-                Condition(ConditionRole.FIRST_FRAME, frame),
-                Condition(ConditionRole.LAST_FRAME, frame),
-            )
+        frame = video.Config(1, canvas)
+        keyframes = (
+            Condition(ConditionRole.FIRST_FRAME, frame),
+            Condition(ConditionRole.LAST_FRAME, frame),
+        )
         if "ref2va" not in tasks:
             return keyframes
 
@@ -363,9 +362,7 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             ValueError: A canvas the checkpoint does not generate, an invalid
                 frame count, prompt length or vision span, or conditions this
                 network does not take: keyframes without an ``fl2va`` or
-                ``ref2va`` task, references without ``ref2va``, or a keyframe
-                under sparse attention, whose segment packing has no keyframe
-                rows.
+                ``ref2va`` task, or references without ``ref2va``.
         """
         canvases = self.config.canvases
         if canvases is not None and canvas not in canvases.values():
