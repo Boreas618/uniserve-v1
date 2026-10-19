@@ -29,8 +29,8 @@ pub mod video;
 pub use media::{MediaSource, SharedMedia, SharedMediaError};
 pub use shared_memory::SharedMemory;
 pub use video::{
-    AudioClip, ConditionMedia, ConditionRole, ConditionTiles, ConditionVision, ImageFit,
-    MediaLocator, VideoClip, VideoCondition, VisionGrid,
+    AudioClip, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator, VideoClip,
+    VideoCondition, VisionGrid,
 };
 /// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;

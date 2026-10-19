@@ -143,6 +143,11 @@ pub struct CallOutput {
     pub status: CallStatus,
     /// Error classification when `status` is [`CallStatus::Error`].
     pub error_code: Option<ErrorCode>,
+    /// Why the rank refused the call's request, on an
+    /// [`ErrorCode::InputError`] completion whose rank states it; the engine
+    /// rejects the request with it.
+    #[serde(default)]
+    pub error_message: Option<String>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,
     /// Accepted cache prefix available to a successor.
@@ -209,6 +214,10 @@ impl CallOutput {
                 "a non-error completion must not carry an error code"
             ),
         }
+        ensure_valid!(
+            self.error_message.is_none() || self.error_code == Some(ErrorCode::InputError),
+            "only an input-error completion states why the rank refused its request"
+        );
         ensure_valid!(
             self.candidate_logprobs.is_empty() || self.status == CallStatus::Ok,
             "candidate log-probabilities belong to a successful completion"

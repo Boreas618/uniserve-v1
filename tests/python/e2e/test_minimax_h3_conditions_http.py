@@ -6,11 +6,11 @@ the official first-frame request (W3) on the diffusers root's ``denoiser``
 deployment, and the image-plus-audio (W4) and official video-plus-audio (W5)
 reference requests on the ``reference_denoiser`` deployment, with the
 diffusers root's reference DiT and with a FastH3 OmniRef component export.
-The OmniRef export also serves a request just under its 131,072-row
-sequence bound and refuses one just over it before admission. Condition
-media are read from ``file://`` URIs under ``--media-directory``. Every
-response is a complete MP4 at the canvas and frame count the request
-resolves to.
+An OmniRef deployment that states a smaller condition capacity than the
+image-plus-audio request takes refuses it, naming its rows, and then serves
+the image-only request that fits. Condition media are read from ``file://``
+URIs under ``--media-directory``. Every served response is a complete MP4 at
+the canvas and frame count the request resolves to.
 """
 
 from __future__ import annotations
@@ -251,79 +251,31 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     )
 
 
-# The OmniRef checkpoint packs at most 131,072 rows. Five seconds, 49,536
-# text tokens and 43,776 condition rows make the largest layout its workers
-# prepare 131,022 rows: 37,296 + 414 generated rows, the text capacity and
-# six 16:9 reference images of 7,296 condition rows each (57 whole tiles),
-# enlarged to their 2048-pixel short edge as the released pipeline enlarges
-# them.
-BOUND_OPTIONS = [
+# The image-plus-audio request (W4) packs 7,808 condition rows on OmniRef when
+# references are enlarged to the released pipeline's encoding size: its
+# 2560x1440 reference image, enlarged to a 2048-pixel short edge, fills 57
+# whole 128-row tiles (7,296 rows of video latents) and the five-second voice
+# four (two tracks of 207 rows, 414 rows of audio latents). This deployment
+# states a 7,680-row condition capacity: each of W4's condition products fits
+# it and their packed rows do not. W4's image without its voice fits.
+SMALL_CAPACITY_OPTIONS = [
     "--mm-processor-kwargs",
     '{"enlarge_references": true}',
     "--max-video-seconds",
     "5",
     "--max-model-len",
-    "49536",
+    "8192",
     "--video-text-capacities",
-    "49536",
+    "8192",
     "--max-condition-rows",
-    "43776",
+    "7680",
 ]
-BOUND_IMAGES = (
-    "official_fl2va_0_image.png",
-    "hf_character_action_reference.png",
-)
-BOUND_VOICE = "official_ref2va_1_audio.mp3"
-BOUND_LEAD = (
-    "Six reference pictures show one sunlit kitchen from slightly different "
-    "angles; keep its layout, colors and light. "
-)
-BOUND_FILLER = (
-    "The camera holds steady while warm light falls across the counter. "
-)
-# The lead, 470 fillers of 12 tokens each and the six images' 43,776
-# vision tokens present 49,486 prompt tokens, so the request packs 49,486 +
-# 43,776 + 37,710 = 130,972 rows.
-BOUND_REPEATS = 470
 
 
-def _bound_request(inputs: Path, *, audio: bool) -> dict:
-    """The six-image request near the bound, optionally with a voice."""
-    conditions = [
-        {
-            "type": "image",
-            "uri": f"file://{inputs / 'media' / BOUND_IMAGES[index % 2]}",
-            "role": "reference",
-        }
-        for index in range(6)
-    ]
-    if audio:
-        # The 5 s clip of the official voice takes 2 x 207 rows, four more
-        # tiles: 44,288 condition rows and 131,484 rows in all.
-        conditions.append(
-            {
-                "type": "audio",
-                "uri": f"file://{inputs / 'media' / BOUND_VOICE}",
-                "role": "reference",
-            }
-        )
-    return {
-        "model": "MiniMax-H3",
-        "task": "ref2va",
-        "prompt": BOUND_LEAD + BOUND_FILLER * BOUND_REPEATS,
-        "conditions": conditions,
-        "target": {
-            "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 5.0,
-        },
-        "seed": 42,
-    }
-
-
-def test_omniref_sequence_bound(tmp_path: Path) -> None:
-    # A request just under the 131,072-row bound is served; one just over
-    # it is refused before admission, naming its rows.
+def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
+    # Admission passes W4, whose every condition product fits its bound; the
+    # denoising ranks count its conditions in the denoiser's tiles and refuse
+    # it, and the deployment then serves its image-only form.
     inputs = _inputs()
     export = _omniref()
     port = find_free_port()
@@ -333,22 +285,22 @@ def test_omniref_sequence_bound(tmp_path: Path) -> None:
         "ulysses4-reference.json",
         port,
         inputs,
-        BOUND_OPTIONS,
+        SMALL_CAPACITY_OPTIONS,
     )
+    packed = _request("w4", inputs)
+    image_only = {**packed, "conditions": packed["conditions"][:1]}
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
         httpx.Client(base_url=base, timeout=3600) as client,
     ):
-        response = client.post(
-            "/v1/videos/sync", json=_bound_request(inputs, audio=False)
-        )
-        (tmp_path / "near_bound.mp4").write_bytes(response.content)
-        _check_media(response, width=1344, height=768, frames=124)
-
-        refused = client.post(
-            "/v1/videos/sync", json=_bound_request(inputs, audio=True)
-        )
+        refused = client.post("/v1/videos/sync", json=packed)
         assert refused.status_code == 400, refused.text
-        message = refused.json()["error"]["message"]
-        assert "44288" in message and "43776" in message, message
+        error = refused.json()["error"]
+        assert error["type"] == "invalid_request_error", error
+        message = error["message"]
+        assert "7808" in message and "7680" in message, message
         assert "--max-condition-rows" in message, message
+
+        served = client.post("/v1/videos/sync", json=image_only)
+        (tmp_path / "image_only.mp4").write_bytes(served.content)
+        _check_media(served, width=1344, height=768, frames=124)

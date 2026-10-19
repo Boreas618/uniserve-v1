@@ -41,6 +41,11 @@ struct RequestState {
     posterior_draws: u64,
     closed: bool,
     retired: bool,
+    // Why this rank refuses the request, decided from its size when it was
+    // started or sized. A refused request is closed, and each of its calls,
+    // those submitted before the refusal included, reports the refusal
+    // instead of running.
+    refusal: Option<Arc<str>>,
 }
 
 /// One admitted epoch of a request slot.
@@ -104,6 +109,11 @@ impl Request {
 
     pub(crate) fn retired(&self) -> Result<bool> {
         Ok(self.state()?.retired)
+    }
+
+    /// Why this rank refuses the request, when it does.
+    pub(crate) fn refusal(&self) -> Result<Option<Arc<str>>> {
+        Ok(self.state()?.refusal.clone())
     }
 
     fn state(&self) -> Result<MutexGuard<'_, RequestState>> {
@@ -219,7 +229,9 @@ impl RequestPool {
                 )));
             }
             let state = request.state()?;
-            if state.closed {
+            // A refused request's calls bind so that each reports the
+            // refusal; a call of a request closed otherwise is stale.
+            if state.closed && state.refusal.is_none() {
                 return Err(Error::Invalid(format!(
                     "call {id:?} targets a closed request"
                 )));
@@ -360,6 +372,21 @@ impl RequestPool {
                 state.pending.shift_remove(&id);
                 state.closed = true;
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse the current epoch of `key` for `reason`: it is closed, and
+    /// every call of it reports the refusal instead of running. A key that
+    /// no longer names the slot's epoch is left alone.
+    pub(crate) fn refuse(&mut self, key: RequestKey, reason: &str) -> Result<()> {
+        if let Some(request) = self
+            .peek(key.request_id.0)
+            .filter(|request| request.key() == key)
+        {
+            let mut state = request.state()?;
+            state.closed = true;
+            state.refusal = Some(Arc::from(reason));
         }
         Ok(())
     }

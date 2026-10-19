@@ -34,7 +34,6 @@ from .decoder import (
 from .denoiser import (
     Condition,
     ConditionRole,
-    ConditionTiles,
     Denoiser,
     ImageDenoiser,
     ReferenceLimits,
@@ -95,7 +94,6 @@ __all__ = [
     "VideoSize",
     "Condition",
     "ConditionRole",
-    "ConditionTiles",
     "ReferenceLimits",
     "ImageDecoder",
     "AudioDecoder",

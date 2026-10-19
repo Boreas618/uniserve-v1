@@ -43,7 +43,6 @@ from uniserve.media import image, video
 from uniserve.models import (
     Condition,
     ConditionRole,
-    ConditionTiles,
     LatentInput,
     ReferenceLimits,
     VideoDenoiser,
@@ -68,7 +67,6 @@ from .inputs import (
     SequenceInput,
 )
 from .packing import (
-    VIDEO_TILE_SHAPES,
     DensePacking,
     SegmentExtent,
     SegmentPacking,
@@ -327,18 +325,6 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
     @property
     def max_sequence_rows(self) -> int | None:
         return self.config.max_sequence_rows
-
-    @property
-    def condition_tiles(self) -> ConditionTiles | None:
-        """The segment packing's tiles under sparse attention.
-
-        ``make_size`` counts a condition's rows as ``segment_tiles`` of
-        ``VIDEO_TILE_SHAPES[tile]`` video tiles; dense attention counts
-        densely.
-        """
-        if self.dense:
-            return None
-        return ConditionTiles(self._tile, VIDEO_TILE_SHAPES[self._tile])
 
     @property
     def dense(self) -> bool:

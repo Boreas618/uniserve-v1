@@ -11,7 +11,6 @@
 //! descriptions of all workers (`ExecutorInfo::runtime_info`).
 
 use super::*;
-use uniserve_core::ConditionTiles;
 
 /// Physical cache unit pool exposed by a worker that executes AR work.
 ///
@@ -266,8 +265,9 @@ impl WorkerEndpoint {
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule, and with it every request's step count;
-/// the tasks, canvases, condition packing and sequence capacity bound what
-/// admission accepts.
+/// the tasks, canvases and sequence capacity bound what admission accepts.
+/// The worker that denoises a request admits its conditions into the
+/// condition capacity it provisioned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Task names the denoiser serves, in canonical order.
@@ -285,10 +285,6 @@ pub struct VideoDenoiserInfo {
     pub canvases: Vec<uniserve_core::Canvas>,
     /// The checkpoint's packed sequence capacity in rows, when it has one.
     pub max_sequence_rows: Option<u32>,
-    /// How the denoiser packs condition rows: in whole tiles for a
-    /// multi-segment denoiser, or densely, one row per condition token, when
-    /// absent.
-    pub condition_tiles: Option<ConditionTiles>,
 }
 
 impl VideoDenoiserInfo {
@@ -299,8 +295,8 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, every canvas and the capacity are
-    /// positive, and condition tiles are video tiles of their row count.
+    /// and positive finite shifts, and every canvas and the capacity are
+    /// positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -321,19 +317,6 @@ impl VideoDenoiserInfo {
                 .all(|canvas| canvas.width > 0 && canvas.height > 0)
                 && self.max_sequence_rows != Some(0),
             "a video denoiser declares an empty canvas or sequence capacity"
-        );
-        ensure_valid!(
-            self.condition_tiles.is_none_or(|tiles| {
-                tiles.rows > 0
-                    && tiles.video.iter().all(|&size| size > 0)
-                    && tiles
-                        .video
-                        .iter()
-                        .map(|&size| u64::from(size))
-                        .product::<u64>()
-                        == u64::from(tiles.rows)
-            }),
-            "a video denoiser's condition tiles are not video tiles of their rows"
         );
         Ok(())
     }
