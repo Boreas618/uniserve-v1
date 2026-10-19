@@ -28,12 +28,12 @@ use crate::engine_client::EngineClient;
 pub use crate::profile::ModelDescription;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::{ModelConfig, ModelParameters};
-use crate::serving::LoadedModel;
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
 pub use crate::serving::media::ImageFetchPolicy;
 use crate::serving::media::ImageFetcher;
 use crate::serving::systemone::ReadoutEncoder;
-use crate::serving::{InputProcessor, ServingRuntime};
+use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
+use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineSettings, HttpListenerMode, VideoMediaSettings};
 use tracing::info;
@@ -90,7 +90,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         config: mut model_config,
         tokenizer,
         renderer,
-        vision,
     } = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
@@ -139,7 +138,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         // resolutions and aspect ratios, and report them back as the only
         // canvases requests may target.
         video_canvases: match &model_config.parameters {
-            ModelParameters::MiniMaxH3 { .. } => crate::profile::video::VideoRasters::new(
+            ModelParameters::MiniMaxH3 => crate::profile::video::VideoRasters::new(
                 &config.engine.video_resolutions,
                 &config.engine.video_aspect_ratios,
             )
@@ -184,12 +183,20 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let engine = Arc::new(client);
     // A video checkpoint serves what its placed denoiser declares in the
     // worker handshake, planned against the conditioner's vision processor.
-    let video = match &model_config.parameters {
-        crate::profile::ModelParameters::MiniMaxH3 { max_video_seconds } => {
+    let renderer = match renderer {
+        LoadedRenderer::Chat(renderer) => {
+            // No other served model's processor takes options.
+            anyhow::ensure!(
+                config.mm_processor_kwargs.is_empty(),
+                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
+                config.model
+            );
+            RequestRenderer::Chat(*renderer)
+        }
+        LoadedRenderer::Video(vision) => {
             let denoiser = engine
                 .video_denoiser()
                 .context("the video worker reported no video denoiser")?;
-            let vision = vision.context("the video checkpoint has no vision processor")?;
             // Reference images are banded to the units one latent encoding
             // round covers on the deployment's latent encoder while a
             // request's prompt is encoded.
@@ -201,11 +208,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 &config.mm_processor_kwargs,
             )
             .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
-            Some(
+            RequestRenderer::Video(
                 crate::serving::video::VideoService::new(
                     denoiser,
                     vision,
-                    *max_video_seconds,
+                    config.engine.max_video_seconds,
                     config.engine.max_condition_rows,
                     latent_encoding_lane,
                     &config.video_media,
@@ -214,15 +221,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 )
                 .context("failed to bind the video denoiser")?,
             )
-        }
-        _ => {
-            // No other served model's processor takes options.
-            anyhow::ensure!(
-                config.mm_processor_kwargs.is_empty(),
-                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
-                config.model
-            );
-            None
         }
     };
 
@@ -258,7 +256,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         crate::serving::WorkerCapabilities {
             limits: engine.generation_limits(),
         },
-        video,
         config.reasoning_parsing,
     )
     .context("failed to bind the configured model description")?;

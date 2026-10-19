@@ -75,7 +75,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
-use uniserve_core::video::plan::{VIDEO_FPS, video_frame_count};
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, VIDEO_FPS, video_frame_count};
 use uniserve_core::{MediaKind, VideoTask};
 use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -86,7 +86,7 @@ use uniserve_server::{
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     profile::omni::resolution::ResolutionName,
     profile::video::{VideoRasters, VideoResolution},
-    serving::{FinishStatus, RequestOutput, ServeRequestId, validate_video_capacity},
+    serving::{FinishStatus, RequestOutput, ServeRequestId},
 };
 
 // The served canvases come from `--video-resolutions` and
@@ -132,7 +132,7 @@ struct Args {
     #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
     max_model_len: u32,
 
-    #[arg(long, default_value_t = 15.0)]
+    #[arg(long, default_value_t = MAX_VIDEO_SECONDS)]
     max_video_seconds: f64,
 
     #[arg(long, value_delimiter = ',', default_value = "768p")]
@@ -196,7 +196,6 @@ impl DynamoFastH3Engine {
         if args.common.enable_rl {
             return Err(invalid_argument("RL engine routes are not supported"));
         }
-        validate_video_capacity(args.max_video_seconds).map_err(invalid_argument)?;
         if args.max_running_requests == 0 {
             return Err(invalid_argument("max-running-requests must be positive"));
         }

@@ -16,7 +16,7 @@ use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
 use uniserve_server::serving::{
-    FinishStatus, InputProcessor, RequestOutput, ServingRuntime, StopCause,
+    FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime, StopCause,
 };
 
 /// Builds a serving runtime over a default `SimEngine`.
@@ -71,7 +71,7 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
             eos_token_ids: BTreeSet::from([128]),
         },
         tokenizer,
-        Some(
+        RequestRenderer::Chat(
             HfChatRenderer::new(
                 Some("{{ messages[0].content }}".to_string()),
                 HashMap::new(),
@@ -82,7 +82,6 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
         uniserve_server::serving::WorkerCapabilities {
             limits: client.generation_limits(),
         },
-        None,
         false,
     )
     .unwrap();

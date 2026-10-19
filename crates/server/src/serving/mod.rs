@@ -59,8 +59,8 @@ pub use input::{
     PromptInput, ResponseOptions, SamplingConfig, StopConfig,
 };
 pub use media::ImageInput;
-pub(crate) use model::LoadedModel;
-pub use model::{InputProcessor, WorkerCapabilities, validate_video_capacity};
+pub use model::{InputProcessor, RequestRenderer, WorkerCapabilities};
+pub(crate) use model::{LoadedModel, LoadedRenderer};
 pub use preprocessing::chat_image_urls;
 
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
