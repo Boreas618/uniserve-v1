@@ -120,6 +120,7 @@ The deployment files are in `configs/minimax_h3/`. Each places the condition enc
 | `fasth3-dp8-text-tp8-host-weights.json` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference.json` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
+| `ulysses8-reference.json` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
 | `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
 A component placed with `"weights": "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.json` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--graph-policy off`.
@@ -143,7 +144,7 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | 8 x H200 | Latency, up to 10240 prompt tokens | `ulysses8.json` | `--max-running-requests 2 --mem-fraction-static 0.92 --max-model-len 10240 --video-text-capacities 1024` |
 | 8 x H200 | Throughput, up to 5 s and 1024 prompt tokens | `fasth3-dp8-text-tp8.json` | `--max-running-requests 8 --max-video-seconds 5 --max-model-len 1024` |
 
-The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`.
+The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves reference requests as one Ulysses8 replica on one eight-GPU host (`ulysses8-reference.json`) with `--mem-fraction-static 0.92`, with the capacities of [OmniRef on H200](evaluation.md#omniref-on-h200).
 
 ### Two hosts
 
