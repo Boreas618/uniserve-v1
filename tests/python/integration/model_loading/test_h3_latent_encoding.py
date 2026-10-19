@@ -252,16 +252,24 @@ def test_reference_image_bands_match_the_whole_encoding(video_encoders):
     encoder, _ = video_encoders
     frame = image.Config(2048, 3648)
     pixels = _frames(1, frame.height, frame.width, seed=2048)
+    # The whole call and every band take the image's one posterior draw.
+    size = video.Config(1, frame)
+    noise = torch.empty(encoder.posterior_shape(size))
+    encoder.draw_noise(size, noise)
     with torch.inference_mode():
         (whole,) = encoder.encode(
-            (pixels,), frames=(slice(0, 1),), num_frames=(1,)
+            (pixels,), clips=(slice(0, 1),), num_frames=(1,), noise=(noise,)
         )
         assembled = torch.full_like(whole.tensor, torch.nan)
         group = encoder.row_group
         for band in range(4):
             rows = slice(band * 16 * group, (band + 1) * 16 * group)
             (result,) = encoder.encode(
-                (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+                (pixels,),
+                clips=(slice(0, 1),),
+                num_frames=(1,),
+                noise=(noise,),
+                rows=(rows,),
             )
             assembled[result.layout.local_slice] = result.tensor
     assert torch.equal(assembled, whole.tensor)
@@ -288,9 +296,17 @@ def test_still_frame_tiles_replay_their_eager_encoding(
     encoder, _ = video_encoders
     spatial, static = encoder.still_tile(torch.device("cuda"))
     pixels = _frames(1, height, width, seed=height + width)
+    # Both encodings take the frame's one posterior draw.
+    size = video.Config(1, image.Config(height, width))
+    noise = torch.empty(encoder.posterior_shape(size))
+    encoder.draw_noise(size, noise)
     with torch.inference_mode():
         (eager,) = encoder.encode(
-            (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+            (pixels,),
+            clips=(slice(0, 1),),
+            num_frames=(1,),
+            noise=(noise,),
+            rows=(rows,),
         )
         output = torch.empty_like(spatial(static))
         torch.cuda.synchronize()
@@ -308,7 +324,11 @@ def test_still_frame_tiles_replay_their_eager_encoding(
         context = ExecutionContext(encoder, tiles={spatial: replay})
         with context.activate():
             (replayed,) = encoder.encode(
-                (pixels,), frames=(slice(0, 1),), num_frames=(1,), rows=(rows,)
+                (pixels,),
+                clips=(slice(0, 1),),
+                num_frames=(1,),
+                noise=(noise,),
+                rows=(rows,),
             )
         context.close()
     assert torch.equal(replayed.tensor, eager.tensor)
