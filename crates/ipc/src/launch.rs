@@ -23,7 +23,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{Canvas, CanvasSampling, ComponentConfig};
+use uniserve_core::{CanvasSampling, ComponentConfig};
 
 use crate::LaneConfig;
 
@@ -481,10 +481,14 @@ pub struct LaunchDescriptor {
     /// Comma-separated `HEIGHTxWIDTH` image capture sizes.
     pub flow_graph_shapes: Option<String>,
     pub video_text_capacities: Option<String>,
-    /// Canvases a video deployment prepares and admits, in the order the
-    /// deployment names them; empty prepares every canvas the denoiser
-    /// offers.
-    pub video_canvases: Vec<Canvas>,
+    /// Resolution classes (`768p`) a video deployment prepares, crossed
+    /// with `video_aspect_ratios` resolution-major, in the order the
+    /// deployment names them. The video denoiser names the canvas of each
+    /// pair; empty takes every class it offers.
+    pub video_resolutions: Vec<String>,
+    /// Display aspect ratios (`16:9`) a video deployment prepares; empty
+    /// takes every ratio the video denoiser offers.
+    pub video_aspect_ratios: Vec<String>,
     pub canvas_sampling: Option<CanvasSampling>,
 
     /// FlashInfer attention options, in bytes and backend names.

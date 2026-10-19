@@ -776,16 +776,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["video"]["tasks"], serde_json::json!(["t2va"]));
         assert_eq!(body["video"]["schedule"]["num_inference_steps"], 5);
-        // The deployment prepared the named aspect ratios' canvases.
+        // The deployment prepared the named aspect ratios' canvases at 768p,
+        // each reported with the pair that selects it.
+        let canvas = |aspect_ratio: &str, width: u32, height: u32| {
+            serde_json::json!({
+                "short_edge": 768,
+                "aspect_ratio": aspect_ratio,
+                "width": width,
+                "height": height,
+            })
+        };
         assert_eq!(
             body["video"]["canvas"]["canvases"],
             serde_json::json!([
-                {"width": 1536, "height": 672},
-                {"width": 1344, "height": 768},
-                {"width": 1024, "height": 768},
-                {"width": 768, "height": 768},
-                {"width": 768, "height": 1024},
-                {"width": 768, "height": 1344},
+                canvas("21:9", 1536, 672),
+                canvas("16:9", 1344, 768),
+                canvas("4:3", 1024, 768),
+                canvas("1:1", 768, 768),
+                canvas("3:4", 768, 1024),
+                canvas("9:16", 768, 1344),
             ])
         );
         assert_eq!(

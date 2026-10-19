@@ -23,8 +23,6 @@ use uniserve_engine::{
     TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::profile::diffusion_gemma::DenoisingOverrides;
-use uniserve_server::profile::omni::resolution::ResolutionName;
-use uniserve_server::profile::video::VideoResolution;
 use uniserve_server::serving::systemone::{
     CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions,
 };
@@ -167,25 +165,28 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
     /// Comma-separated video resolution classes (`768p`, `480p`) a video
-    /// deployment prepares, each at every `--video-aspect-ratios` entry. A
-    /// request's `target.short_edge` selects one: 768 or 480. Only a FastH3
-    /// export generates the 480p buckets.
+    /// deployment prepares, each at every `--video-aspect-ratios` entry. The
+    /// served denoiser names the canvas of each pair, and the workers refuse
+    /// at startup a pair it does not generate: the base checkpoint generates
+    /// 768p, a FastH3 DMD export 768p and 480p. A request's
+    /// `target.short_edge` selects a class: 768 for 768p.
     #[arg(
         long = "video-resolutions",
         value_delimiter = ',',
         default_value = "768p"
     )]
-    pub video_resolutions: Vec<VideoResolution>,
-    /// Comma-separated video aspect ratios, from the trained buckets `21:9`,
-    /// `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, a video deployment prepares. A
-    /// request's `target.aspect_ratio` selects one; requests are refused at
-    /// any canvas the deployment did not prepare.
+    pub video_resolutions: Vec<String>,
+    /// Comma-separated display aspect ratios (`21:9`, `16:9`, `4:3`, `1:1`,
+    /// `3:4`, `9:16`) a video deployment prepares at every
+    /// `--video-resolutions` class. A request's `target.aspect_ratio` selects
+    /// one; requests are refused at any canvas the deployment did not
+    /// prepare.
     #[arg(
         long = "video-aspect-ratios",
         value_delimiter = ',',
         default_value = "16:9,9:16"
     )]
-    pub video_aspect_ratios: Vec<ResolutionName>,
+    pub video_aspect_ratios: Vec<String>,
     /// Most denoiser rows the conditions of one video request may take,
     /// counted as the placed denoiser packs them: a capacity video workers
     /// provision their condition products, request slots and largest

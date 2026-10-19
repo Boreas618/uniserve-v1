@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use uniserve_core::video::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES,
-    MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES, MAX_VIDEO_SECONDS,
-    MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits, ProcessorConfig, ReferenceConfig, Target,
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
+    MAX_REFERENCES, MAX_VIDEO_REFERENCES, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS, PlanLimits,
+    ProcessorConfig, ReferenceConfig, Target,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -138,30 +138,34 @@ impl VideoService {
     /// Describes the served video contract for `GET /v1/capabilities`.
     ///
     /// Reports the tasks and their condition rules, with how the deployment
-    /// sizes `ref2va` references, the canvas rule, the
-    /// short edges and named aspect ratios the deployment serves and the
-    /// canvas each pair resolves to, the output frame rate, audio sample rate
-    /// and frame rule, the duration range, the fixed schedule (its sigma
-    /// points and shifts), the prompt capacity, the stated
-    /// condition capacity (null when the workers provision the largest
-    /// condition set their denoiser admits), and the media sources and size
-    /// caps.
+    /// sizes `ref2va` references, the canvas rule, the canvases the
+    /// deployment serves with the short edge and aspect ratio that select
+    /// each, in the order the deployment names them, the output frame rate,
+    /// audio sample rate and frame rule, the duration range, the fixed
+    /// schedule (its sigma points and shifts), the prompt capacity, and the
+    /// media sources and size caps.
     pub fn capabilities(&self, max_prompt_tokens: u32) -> Value {
-        // The named ratios served at any short edge, in their canonical
-        // order, and each served pair's canvas; `auto` is 16:9 for t2va and
-        // ref2va.
-        let served = plan::served_canvases(self.processor.limits());
-        let named: Vec<String> = NAMED_ASPECT_RATIOS
-            .iter()
-            .map(|(width, height)| format!("{width}:{height}"))
-            .filter(|ratio| served.iter().any(|(_, served, _)| served == ratio))
-            .collect();
+        // Each served canvas with the pair that selects it, and the aspect
+        // ratios served at any short edge, in the order the deployment names
+        // them; `auto` is 16:9 for t2va and ref2va.
+        let mut aspect_ratios: Vec<&str> = Vec::new();
         let mut sizes = serde_json::Map::new();
-        for (short_edge, aspect_ratio, size) in served {
+        let mut canvases = Vec::with_capacity(self.denoiser.canvases.len());
+        for served in &self.denoiser.canvases {
+            if !aspect_ratios.contains(&served.aspect_ratio.as_str()) {
+                aspect_ratios.push(&served.aspect_ratio);
+            }
+            let size = json!({"width": served.canvas.width, "height": served.canvas.height});
             let entry = sizes
-                .entry(short_edge.to_string())
+                .entry(served.short_edge.to_string())
                 .or_insert_with(|| json!({}));
-            entry[aspect_ratio] = json!({"width": size.width, "height": size.height});
+            entry[served.aspect_ratio.as_str()] = size;
+            canvases.push(json!({
+                "short_edge": served.short_edge,
+                "aspect_ratio": served.aspect_ratio,
+                "width": served.canvas.width,
+                "height": served.canvas.height,
+            }));
         }
         let limits = MediaLimits::new(self.media.max_request_bytes);
         let references = self.processor.limits().references;
@@ -195,9 +199,9 @@ impl VideoService {
                 "short_edges": self.processor.limits().short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
-                "aspect_ratios": named,
+                "aspect_ratios": aspect_ratios,
                 "sizes": sizes,
-                "canvases": self.denoiser.canvases,
+                "canvases": canvases,
             },
             "fps": self.denoiser.frame_rate,
             "audio_sample_rate": self.denoiser.audio_sample_rate,

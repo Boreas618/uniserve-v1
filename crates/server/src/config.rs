@@ -85,12 +85,13 @@ pub struct EngineSettings {
     /// serve, between `MIN_VIDEO_SECONDS` and `MAX_VIDEO_SECONDS`, the range the
     /// video API admits. The video service rejects longer video requests.
     pub max_video_seconds: f64,
-    /// Video resolution classes a video deployment prepares. Crossed with
-    /// `video_aspect_ratios`, they name the canvases its workers prepare and
-    /// report as the only canvases requests may target.
-    pub video_resolutions: Vec<crate::profile::video::VideoResolution>,
-    /// Video aspect ratios a video deployment prepares.
-    pub video_aspect_ratios: Vec<crate::profile::omni::resolution::ResolutionName>,
+    /// Video resolution classes (`768p`) a video deployment prepares. Crossed
+    /// with `video_aspect_ratios`, they name the canvases its workers
+    /// prepare: the video denoiser names the canvas of each pair, and the
+    /// workers report them back as the only canvases requests may target.
+    pub video_resolutions: Vec<String>,
+    /// Display aspect ratios (`16:9`) a video deployment prepares.
+    pub video_aspect_ratios: Vec<String>,
     /// Most denoiser rows a video request's conditions may take
     /// (`--max-condition-rows`). Video workers provision their condition
     /// products for it, and the worker that denoises a request refuses
@@ -127,12 +128,10 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: MAX_VIDEO_SECONDS,
-            video_resolutions: crate::profile::video::VideoRasters::default()
-                .resolutions()
-                .to_vec(),
-            video_aspect_ratios: crate::profile::video::VideoRasters::default()
-                .aspect_ratios()
-                .to_vec(),
+            // 768p landscape and portrait, the canvases every graph-captured
+            // deployment can hold.
+            video_resolutions: vec!["768p".to_owned()],
+            video_aspect_ratios: vec!["16:9".to_owned(), "9:16".to_owned()],
             max_condition_rows: None,
             // One local CUDA rank running `DEFAULT_COMPONENT`. The `uniserve`
             // CLI and the Dynamo worker binary both replace this with a

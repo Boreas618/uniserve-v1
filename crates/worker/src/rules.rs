@@ -2,24 +2,22 @@
 //!
 //! The server plans and presents every request with these rules. The model
 //! package (`uniserve.models.minimax_h3.processing`) reads the parts of them
-//! its computation and tools use, the tasks, the canvas rule, the training
-//! buckets, the largest references a request may bring, the canvas a target
-//! names, the frame count of a duration and the named aspect ratios: it
-//! loads this library and calls the functions below by name. Each
-//! one passes scalars and strings and returns flat lists; the documentation
-//! of each states their order. A target the rules reject comes back as a
-//! `[field, message]` rejection, the field being the request path the
-//! rejection names (`target.aspect_ratio`); a rule that rejects its
-//! arguments outside a request raises `ValueError`.
+//! its computation and tools use, the tasks, the canvas rule, the largest
+//! references a request may bring, the canvas a target names among the
+//! canvases the model generates and the frame count of a duration: it loads
+//! this library and calls the functions below by name. Each one passes
+//! scalars and lists and returns lists; the documentation of each states
+//! their order. A target the rules reject comes back as a `[field, message]`
+//! rejection, the field being the request path the rejection names
+//! (`target.aspect_ratio`); a rule that rejects its arguments outside a
+//! request raises `ValueError`.
 //!
 //! These calls run on the caller's thread and touch no rank state: they are
 //! the rules' arithmetic and nothing else.
 
 use tvm_ffi::{Any, Array};
-use uniserve_core::video::plan::{
-    self, BUCKET_SHORT_EDGES, MAX_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, Target, VideoInputError,
-};
-use uniserve_core::{Canvas, FrameClips, VideoTask};
+use uniserve_core::video::plan::{self, MAX_VIDEO_SECONDS, Target, VideoInputError};
+use uniserve_core::{Canvas, FrameClips, ServedCanvas, VideoTask};
 
 use crate::ffi::{integer_list, integers, list};
 
@@ -117,29 +115,6 @@ fn video_tasks() -> Result<Array<Any>> {
     Ok(list(VideoTask::ALL.map(|task| text(task.as_str()))))
 }
 
-/// `video_aspect_ratios() -> [width, height, ...]`: the named aspect ratios
-/// `t2va` and `ref2va` accept besides `auto`, in canonical order.
-fn video_aspect_ratios() -> Result<Array<Any>> {
-    Ok(integer_list(NAMED_ASPECT_RATIOS.iter().flat_map(
-        |&(width, height)| [i64::from(width), i64::from(height)],
-    )))
-}
-
-/// `video_buckets() -> [width, height, ...]`: the FastH3 training buckets,
-/// the named aspect ratios' canvases at the 768-pixel short edge, then at
-/// the 480-pixel one.
-fn video_buckets() -> Result<Array<Any>> {
-    let mut values = Vec::new();
-    for short_edge in BUCKET_SHORT_EDGES {
-        for ratio in NAMED_ASPECT_RATIOS {
-            let canvas = plan::bucket(short_edge, ratio)
-                .ok_or_else(|| runtime_error("a named ratio has no training bucket"))?;
-            values.extend([i64::from(canvas.width), i64::from(canvas.height)]);
-        }
-    }
-    Ok(integer_list(values))
-}
-
 /// `video_reference_bounds(frames, frame_rate, frame_rule) -> [images,
 /// video_frames, audio_samples, video_canvases]`: the largest references a
 /// request generating `frames` frames at the model's output `frame_rate`
@@ -176,13 +151,40 @@ fn task(name: &str) -> Result<VideoTask> {
     VideoTask::from_name(name).ok_or_else(|| value_error(&format!("unknown video task {name:?}")))
 }
 
-/// `video_named_canvas(task, short_edge, aspect_ratio) -> [rejection,
-/// canvas]`: the canvas a target names without media, `[width, height]`, or
-/// `None` for `fl2va` with `auto`, whose canvas follows the first keyframe.
+/// Served canvases from `[[short_edge, aspect_ratio, width, height], ...]`.
+fn served_canvases(entries: Array<Any>) -> Result<Vec<ServedCanvas>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let fields: Array<Any> = Array::try_from(entry)?;
+            let fields: Vec<Any> = fields.iter().collect();
+            let [short_edge, aspect_ratio, width, height] =
+                <[Any; 4]>::try_from(fields).map_err(|_| {
+                    value_error("a canvas is [short_edge, aspect_ratio, width, height]")
+                })?;
+            let side = |value: Any| positive(i64::try_from(value)?, "a canvas side");
+            Ok(ServedCanvas {
+                short_edge: side(short_edge)?,
+                aspect_ratio: tvm_ffi::String::try_from(aspect_ratio)?.as_str().to_owned(),
+                canvas: Canvas {
+                    width: side(width)?,
+                    height: side(height)?,
+                },
+            })
+        })
+        .collect()
+}
+
+/// `video_named_canvas(task, short_edge, aspect_ratio, canvases) ->
+/// [rejection, canvas]`: the canvas a target names without media,
+/// `[width, height]`, or `None` for `fl2va` with `auto`, whose canvas follows
+/// the first keyframe. `canvases` are the canvases served, each
+/// `[short_edge, aspect_ratio, width, height]`.
 fn video_named_canvas(
     task_name: tvm_ffi::String,
     short_edge: i64,
     aspect_ratio: tvm_ffi::String,
+    canvases: Array<Any>,
 ) -> Result<Array<Any>> {
     let target = Target {
         short_edge: u32::try_from(short_edge)
@@ -190,8 +192,9 @@ fn video_named_canvas(
         aspect_ratio: aspect_ratio.as_str(),
         duration_seconds: None,
     };
+    let canvases = served_canvases(canvases)?;
     Ok(
-        match plan::named_canvas(task(task_name.as_str())?, &target) {
+        match plan::named_canvas(task(task_name.as_str())?, &target, &canvases) {
             Ok(canvas) => list([
                 Any::default(),
                 canvas.map_or_else(Any::default, |canvas| Any::from(canvas_values(canvas))),
@@ -204,7 +207,5 @@ fn video_named_canvas(
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_tasks, video_tasks);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_canvas, video_canvas);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_frame_count, video_frame_count);
-tvm_ffi::tvm_ffi_dll_export_typed_func!(video_aspect_ratios, video_aspect_ratios);
-tvm_ffi::tvm_ffi_dll_export_typed_func!(video_buckets, video_buckets);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_reference_bounds, video_reference_bounds);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_named_canvas, video_named_canvas);

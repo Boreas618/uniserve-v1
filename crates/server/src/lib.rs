@@ -136,16 +136,16 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_condition_rows: config.engine.max_condition_rows,
         // Video workers provision only the frame counts the API admits.
         min_video_seconds: Some(uniserve_core::video::plan::MIN_VIDEO_SECONDS),
-        // Video workers prepare exactly the canvases of the configured
-        // resolutions and aspect ratios, and report them back as the only
-        // canvases requests may target.
-        video_canvases: match &model_config.parameters {
-            ModelParameters::MiniMaxH3 => crate::profile::video::VideoRasters::new(
-                &config.engine.video_resolutions,
-                &config.engine.video_aspect_ratios,
-            )
-            .map_err(|error| anyhow::anyhow!("invalid video deployment: {error}"))?
-            .canvases(),
+        // Video workers prepare exactly the canvases their denoiser names
+        // for the configured resolutions and aspect ratios, refusing a pair
+        // it does not generate, and report them back as the only canvases
+        // requests may target.
+        video_resolutions: match &model_config.parameters {
+            ModelParameters::MiniMaxH3 => config.engine.video_resolutions.clone(),
+            _ => Vec::new(),
+        },
+        video_aspect_ratios: match &model_config.parameters {
+            ModelParameters::MiniMaxH3 => config.engine.video_aspect_ratios.clone(),
             _ => Vec::new(),
         },
         // Every generated canvas uses the served sampling, which the worker
