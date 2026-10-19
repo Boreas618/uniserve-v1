@@ -1,11 +1,10 @@
 """The media reader decodes MiniMax-H3 still and audio conditions exactly.
 
-Each case plans a recorded diffusers reference request from its media's
-probed facts (``processing.plan_request``, the planner the server's rules
-are checked against) and reads every image and soundtrack through
-``uniserve.media.reader`` with the plan's values, as the serving
-worker's host reader does. The reader applies the reference conditioning's
-own operations in its order, so every result is compared bit for bit:
+Each case reads the media of a recorded diffusers reference request through
+``uniserve.media.reader`` with the sizes the reference conditioned it at, as
+the serving worker's host reader does with the sizes the server plans. The
+reader applies the reference conditioning's own operations in its order, so
+every result is compared bit for bit:
 
 - an image with the diffusers pipeline's prepared image: PIL decoding and a
   LANCZOS resize (and, for a later keyframe, the cover crop);
@@ -21,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +28,6 @@ import pytest
 import torch
 
 from uniserve.media.reader import read_audio, read_image
-from uniserve.models.minimax_h3 import processing
 
 pytestmark = [
     pytest.mark.integration,
@@ -40,13 +39,54 @@ pytestmark = [
 SAMPLE_RATE = 32_000
 FPS = 24
 
-_VISION = processing.VisionConfig(
-    **json.loads(
+
+@dataclass(frozen=True, slots=True)
+class ImageRead:
+    """An image resized to ``resized`` and read in ``window``.
+
+    Sizes are ``(width, height)``; the window is ``(left, top, width,
+    height)`` within the resized image.
+    """
+
+    resized: tuple[int, int]
+    window: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class AudioRead:
+    """A soundtrack's native-rate span and the samples it resamples to."""
+
+    native_rate: int
+    start_sample: int
+    source_samples: int
+    samples: int
+
+
+# The 1344 x 768 canvas every recorded case generates.
+_CANVAS = ImageRead((1344, 768), (0, 0, 1344, 768))
+
+# What each recorded run conditioned on, as its metadata.json records: the
+# frame count and, in request order, how every condition was prepared. A
+# first keyframe is stretched onto the canvas; the later clay-fox keyframe
+# covers it at 1376 x 768 and its centre 1344 columns are read. The image
+# reference is encoded at its 2048-pixel short edge (3648 x 2048, 7296
+# condition rows). The official voice is 44.1 kHz: the 124 frames of five
+# seconds keep its first 227,850 native samples, which resample to 165,334
+# samples at 32 kHz (two tracks of 207 audio latents).
+_CASES = {
+    "fl2va_first_8s": (192, (_CANVAS,)),
+    "fl2va_first_last_8s": (
+        192,
+        (_CANVAS, ImageRead((1376, 768), (16, 0, 1344, 768))),
+    ),
+    "ref2va_image_audio_5s": (
+        124,
         (
-            Path(__file__).parents[2] / "fixtures" / "minimax_h3_plan.json"
-        ).read_text()
-    )["vision"]
-)
+            ImageRead((3648, 2048), (0, 0, 3648, 2048)),
+            AudioRead(44_100, 0, 227_850, 165_334),
+        ),
+    ),
+}
 
 
 @pytest.fixture(scope="module")
@@ -57,82 +97,17 @@ def root() -> Path:
     return Path(value)
 
 
-def _media(root: Path, uri: str) -> Path:
-    return root / "inputs" / "media" / Path(uri).name
-
-
-def _facts(path: Path, kind: processing.ConditionType):
-    from diffusers.modular_pipelines.minimax_h3 import references
-    from PIL import Image, ImageOps
-
-    if kind is processing.ConditionType.IMAGE:
-        with Image.open(path) as value:
-            width, height = ImageOps.exif_transpose(value).size
-        return processing.ImageFacts(width, height)
-    if kind is processing.ConditionType.AUDIO:
-        waveform, rate = references._decode_audio_file(path)
-        return processing.AudioFacts(rate, int(waveform.shape[1]))
-    raise AssertionError("the cases condition on images and audio only")
-
-
-def _plan(root: Path, case: str):
-    """The recorded request's plan and each condition's media file."""
+def _paths(root: Path, case: str) -> list[Path]:
+    """The media file of each condition of the recorded request."""
     run = root / "reference" / "diffusers" / case / "seed42"
     request = json.loads((run / "request.json").read_text())
-    conditions, paths = [], []
-    for item in request["conditions"]:
-        kind = processing.ConditionType(item["type"])
-        path = _media(root, item["uri"])
-        paths.append(path)
-        conditions.append(
-            processing.Condition(
-                type=kind,
-                role=processing.Role(item["role"]),
-                media=_facts(path, kind),
-                frame_index=item.get("frame_index"),
-            )
-        )
-    # The recorded runs come from the reference pipeline, which enlarges
-    # small references.
-    planned = processing.plan_request(
-        processing.Task(request["task"]),
-        processing.Target(**request["target"]),
-        conditions,
-        _VISION,
-        references=processing.ReferenceConfig(enlarge=True),
-    )
-    return planned, paths
+    return [
+        root / "inputs" / "media" / Path(item["uri"]).name
+        for item in request["conditions"]
+    ]
 
 
-def _fit(prepared, canvas) -> tuple[tuple[int, int], tuple[int, ...]]:
-    """The reader's ``resized`` and ``window`` of a planned image."""
-    if isinstance(prepared, processing.KeyframeFit):
-        crop = prepared.cover_crop
-        if crop is None:
-            return (canvas.width, canvas.height), (
-                0,
-                0,
-                canvas.width,
-                canvas.height,
-            )
-        return (crop.width, crop.height), (
-            crop.left,
-            crop.top,
-            canvas.width,
-            canvas.height,
-        )
-    return (prepared.width, prepared.height), (
-        0,
-        0,
-        prepared.width,
-        prepared.height,
-    )
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["fl2va_first_8s", "fl2va_first_last_8s", "ref2va_image_audio_5s"],
-)
+@pytest.mark.parametrize("case", list(_CASES))
 def test_conditions_read_as_the_reference_conditioning(case, root):
     from diffusers.image_processor import VaeImageProcessor
     from diffusers.modular_pipelines.minimax_h3 import references
@@ -141,18 +116,17 @@ def test_conditions_read_as_the_reference_conditioning(case, root):
     )
     from diffusers.utils import load_image
 
-    planned, paths = _plan(root, case)
+    num_frames, reads = _CASES[case]
+    paths = _paths(root, case)
     resize = VaeImageProcessor(vae_scale_factor=16).resize
-    checked = 0
-    for condition, path in zip(planned.conditions, paths, strict=True):
-        prepared = condition.prepared
-        if isinstance(prepared, processing.AudioClip):
+    for read, path in zip(reads, paths, strict=True):
+        if isinstance(read, AudioRead):
             samples = read_audio(
                 path.read_bytes(),
-                native_rate=prepared.sample_rate,
-                start=prepared.start_sample,
-                source_samples=prepared.source_samples,
-                samples=prepared.samples,
+                native_rate=read.native_rate,
+                start=read.start_sample,
+                source_samples=read.source_samples,
+                samples=read.samples,
                 rate=SAMPLE_RATE,
             )
             # The diffusers setup step normalizes the decoded track,
@@ -162,34 +136,35 @@ def test_conditions_read_as_the_reference_conditioning(case, root):
                 waveform,
                 rate,
                 SAMPLE_RATE,
-                max_duration=planned.num_frames / FPS,
+                max_duration=num_frames / FPS,
             )
             assert torch.equal(samples, expected.T)
-        else:
-            resized, window = _fit(prepared, planned.canvas)
-            pixels = read_image(
-                path.read_bytes(), resized=resized, window=window
+            continue
+
+        pixels = read_image(
+            path.read_bytes(), resized=read.resized, window=read.window
+        )
+        # The pipeline resizes the decoded file with PIL's LANCZOS filter,
+        # then crops a later keyframe onto the canvas.
+        left, top, width, height = read.window
+        expected = np.array(
+            resize(
+                load_image(str(path)),
+                height=read.resized[1],
+                width=read.resized[0],
             )
-            # The pipeline resizes the decoded file with PIL's LANCZOS
-            # filter, then crops a later keyframe onto the canvas.
-            left, top, width, height = window
-            expected = np.array(
-                resize(
-                    load_image(str(path)), height=resized[1], width=resized[0]
-                )
-            )[top : top + height, left : left + width]
-            assert np.array_equal(pixels[0], expected)
-        checked += 1
-    assert checked == len(paths)
+        )[top : top + height, left : left + width]
+        assert np.array_equal(pixels[0], expected)
 
 
 def test_tracks_that_decode_to_another_extent_are_refused(root):
-    planned, paths = _plan(root, "ref2va_image_audio_5s")
-    clip = planned.conditions[1].prepared
+    _, reads = _CASES["ref2va_image_audio_5s"]
+    clip = reads[1]
+    path = _paths(root, "ref2va_image_audio_5s")[1]
     with pytest.raises(ValueError, match="Hz"):
         read_audio(
-            paths[1].read_bytes(),
-            native_rate=clip.sample_rate + 1,
+            path.read_bytes(),
+            native_rate=clip.native_rate + 1,
             start=clip.start_sample,
             source_samples=clip.source_samples,
             samples=clip.samples,
@@ -197,8 +172,8 @@ def test_tracks_that_decode_to_another_extent_are_refused(root):
         )
     with pytest.raises(ValueError, match="planned"):
         read_audio(
-            paths[1].read_bytes(),
-            native_rate=clip.sample_rate,
+            path.read_bytes(),
+            native_rate=clip.native_rate,
             start=clip.start_sample,
             source_samples=clip.source_samples,
             samples=clip.samples + 1,
