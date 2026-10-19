@@ -4,9 +4,10 @@
 //! decoded: the generated canvas and frame counts, how every condition is
 //! prepared (keyframe fit, reference image size, 24 fps reference clip,
 //! 32 kHz soundtrack), what the Qwen3-VL conditioner sees of it (vision
-//! grids, 2 fps samples and block timestamps), and the denoiser condition
-//! rows it adds. [`check_request`] applies the subset of rules that needs no
-//! media, so a malformed request is rejected before its media are fetched.
+//! grids, 2 fps samples and block timestamps), and the denoiser rows of each
+//! condition's encoder units. [`check_request`] applies the request-only
+//! rules, which need no media, so a malformed request is rejected before its
+//! media are fetched; [`plan_request`] then plans from the probed media.
 //!
 //! These are the only implementation of the rules: the server plans every
 //! request with them, and the model package
@@ -116,8 +117,6 @@ pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
 pub const AUDIO_HOP: u32 = 800;
 /// Stereo channels, packed channel-major.
 const AUDIO_CHANNELS: u32 = 2;
-/// Audio latents per second of video.
-const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
 
 /// The rate the conditioner samples a reference video at.
 const VIDEO_SAMPLE_FPS: f64 = 2.0;
@@ -1036,8 +1035,6 @@ pub struct VideoClip {
     pub frames: u32,
     /// The leading `17n + 5` frames the VAE encodes.
     pub vae_frames: u32,
-    /// Latent frames of the VAE encoding.
-    pub latent_frames: u32,
     /// The video's soundtrack, when it has one.
     pub soundtrack: Option<AudioClip>,
 }
@@ -1093,14 +1090,10 @@ pub enum Prepared {
 pub struct ConditionPlan {
     /// Position of the condition in the request.
     pub index: usize,
-    /// The condition's media type.
-    pub condition_type: ConditionType,
     /// The preparation of its media.
     pub prepared: Prepared,
     /// The conditioner's view, for conditions it reads.
     pub vision: Option<Vision>,
-    /// Denoiser video condition rows.
-    pub video_rows: u32,
     /// Denoiser audio condition rows.
     pub audio_rows: u32,
 }
@@ -1166,21 +1159,22 @@ impl ConditionPlan {
     }
 
     /// Denoiser video rows of each unit the video encoder encodes, in unit
-    /// order.
+    /// order. `canvas` is the generated canvas.
     ///
-    /// A keyframe is one unit. A reference image is `image_bands` units:
-    /// bands of its rows of 32x32-pixel patches dealt as evenly as possible
-    /// in order, so with `g` patch rows band `b` holds rows `b * g / bands`
-    /// to `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one
+    /// A keyframe is one unit, one latent frame of the canvas it is fitted
+    /// to. A reference image is `image_bands` units: bands of its rows of
+    /// 32x32-pixel patches dealt as evenly as possible in order, so with `g`
+    /// patch rows band `b` holds rows `b * g / bands` to
+    /// `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one
     /// through `g`. Each band is encoded on its own and the bands assemble
     /// the whole image's encoding; a rank finds a band's patch rows from the
     /// rows of the bands before it. A video's `17n + 5` encoded frames are
     /// `n + 1` units of up to 17 frames: each complete one yields 5 latent
     /// frames and the last 2, the video encoder dropping the leading 3 of
     /// its padded final clip. An audio reference has none.
-    pub fn latent_units(&self, image_bands: u32) -> Vec<u32> {
+    pub fn latent_units(&self, canvas: Canvas, image_bands: u32) -> Vec<u32> {
         match &self.prepared {
-            Prepared::Keyframe(_) => vec![self.video_rows],
+            Prepared::Keyframe(_) => vec![rows_per_frame(canvas)],
             Prepared::Image(size) => {
                 let patch_rows = size.height / CANVAS_MULTIPLE;
                 let patches_per_row = size.width / CANVAS_MULTIPLE;
@@ -1235,7 +1229,7 @@ impl ConditionPlan {
             source,
             media,
             vision,
-            latent_units: self.latent_units(image_bands),
+            latent_units: self.latent_units(canvas, image_bands),
             audio_rows: self.audio_rows,
         }
     }
@@ -1253,35 +1247,11 @@ pub struct RequestPlan {
     pub duration_seconds: f64,
     /// Generated frames, of the form `17n + 5`.
     pub num_frames: u32,
-    /// Generated video latent frames.
-    pub latent_frames: u32,
-    /// Generated audio latents per stereo channel.
-    pub audio_latents: u32,
     /// One plan per condition, in request order.
     pub conditions: Vec<ConditionPlan>,
 }
 
 impl RequestPlan {
-    /// Denoiser rows of the generated video.
-    pub fn target_video_rows(&self) -> u32 {
-        self.latent_frames * rows_per_frame(self.canvas)
-    }
-
-    /// Denoiser rows of the generated stereo audio.
-    pub fn target_audio_rows(&self) -> u32 {
-        AUDIO_CHANNELS * self.audio_latents
-    }
-
-    /// Denoiser video rows of all conditions.
-    pub fn condition_video_rows(&self) -> u32 {
-        self.conditions.iter().map(|plan| plan.video_rows).sum()
-    }
-
-    /// Denoiser audio rows of all conditions.
-    pub fn condition_audio_rows(&self) -> u32 {
-        self.conditions.iter().map(|plan| plan.audio_rows).sum()
-    }
-
     /// The units each condition's reference image is encoded in when one
     /// latent encoding round covers `lane` units, one entry per condition
     /// (other conditions' entries are unread).
@@ -1325,12 +1295,6 @@ impl RequestPlan {
 /// 17-frame clip and two for the trailing 5-frame overlap.
 pub const fn latent_frames(frames: u32) -> u32 {
     (frames - CLIP_LATENTS) / CLIP_FRAMES * CLIP_LATENTS + 2
-}
-
-/// The audio latents of a frame count: its duration at 40 latents per
-/// second, rounded half to even (never a tie at 24 fps).
-fn audio_latents(frames: u32) -> u32 {
-    (f64::from(frames) / f64::from(VIDEO_FPS) * AUDIO_LATENTS_PER_SECOND).round_ties_even() as u32
 }
 
 /// Returns the size an image reference is encoded at.
@@ -1538,7 +1502,6 @@ pub fn video_reference(
         start_frame: u32::try_from(start_frame).unwrap_or(u32::MAX),
         frames: kept,
         vae_frames,
-        latent_frames: latent_frames(vae_frames),
         soundtrack,
     };
     let seen = VideoVision {
@@ -2049,13 +2012,11 @@ fn plan_keyframe(
     };
     Ok(ConditionPlan {
         index,
-        condition_type: condition.condition_type,
         prepared: Prepared::Keyframe(KeyframeFit {
             position,
             cover_crop: crop,
         }),
         vision: seen,
-        video_rows: rows_per_frame(size),
         audio_rows: 0,
     })
 }
@@ -2069,12 +2030,10 @@ fn plan_reference(
     config: &ReferenceConfig,
 ) -> Result<ConditionPlan, VideoInputError> {
     let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
-    let plan = |prepared, seen, video_rows, audio_rows| ConditionPlan {
+    let plan = |prepared, seen, audio_rows| ConditionPlan {
         index,
-        condition_type: condition.condition_type,
         prepared,
         vision: seen,
-        video_rows,
         audio_rows,
     };
     match media {
@@ -2085,42 +2044,35 @@ fn plan_reference(
                 grid,
                 tokens: vision.block_tokens(grid),
             });
-            // One latent frame at the reference's own size.
-            Ok(plan(
-                Prepared::Image(size),
-                Some(seen),
-                rows_per_frame(size),
-                0,
-            ))
+            Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
         MediaFacts::Audio(audio) => {
             let clip = audio_clip(audio, 0.0, frames).map_err(reject)?;
-            Ok(plan(Prepared::Audio(clip), None, 0, clip.rows()))
+            Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaFacts::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
             let (clip, seen) =
                 video_reference(video, start, frames, vision, config).map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
-            let video_rows = clip.latent_frames * rows_per_frame(clip.canvas);
             Ok(plan(
                 Prepared::Video(clip),
                 Some(Vision::Video(seen)),
-                video_rows,
                 audio_rows,
             ))
         }
     }
 }
 
-/// Validates a request and resolves every size it implies.
+/// Resolves every size a request implies from the probed media.
 ///
-/// `media` holds the probed facts of each condition, in request order.
+/// `media` holds the probed facts of each condition, in request order. The
+/// caller applies the request-only rules of [`check_request`] first, which
+/// need no media and so run before it is fetched.
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] naming the first field at fault,
-/// with the request-only rules of [`check_request`] applied first, and
+/// Returns [`VideoInputError::Invalid`] naming the first field at fault, and
 /// [`VideoInputError::Internal`] when `media` and `conditions` differ in
 /// length.
 pub fn plan_request(
@@ -2131,7 +2083,6 @@ pub fn plan_request(
     vision: &VisionConfig,
     limits: &PlanLimits,
 ) -> Result<RequestPlan, VideoInputError> {
-    check_request(task, target, conditions, limits)?;
     if media.len() != conditions.len() {
         return Err(VideoInputError::internal(format!(
             "{} conditions were planned with {} probed media",
@@ -2177,8 +2128,6 @@ pub fn plan_request(
         canvas: size,
         duration_seconds,
         num_frames: frames,
-        latent_frames: latent_frames(frames),
-        audio_latents: audio_latents(frames),
         conditions: plans,
     })
 }
@@ -2194,12 +2143,13 @@ pub(super) mod tests {
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
         AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
-        ConditionType, FrameRate, ImageFacts, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO, MediaFacts,
-        NAMED_ASPECT_RATIOS, PlanLimits, Prepared, REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig,
-        RequestField, RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask, Vision,
-        VisionConfig, audio_clip, bucket, bucket_short_edge, canvas, check_request, cover_crop,
-        gcd, plan_request, reference_bounds, reference_image_size, requested_frames,
-        rows_per_frame, rule_canvases, video_frame_count, video_reference,
+        ConditionType, FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO,
+        MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared,
+        REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig, RequestField, RequestPlan, Role, Target,
+        VideoFacts, VideoInputError, VideoTask, Vision, VisionConfig, audio_clip, bucket,
+        bucket_short_edge, canvas, check_request, cover_crop, gcd, latent_frames, plan_request,
+        reference_bounds, reference_image_size, requested_frames, rows_per_frame, rule_canvases,
+        video_frame_count, video_reference,
     };
     use crate::MediaLocator;
 
@@ -2323,10 +2273,13 @@ pub(super) mod tests {
             }
         }
 
+        /// The request's plan, its request-only rules applied first as the
+        /// server applies them before fetching media.
         pub(in crate::video) fn plan(
             &self,
             vision: &VisionConfig,
         ) -> Result<RequestPlan, VideoInputError> {
+            check_request(self.task, &self.target(), &self.conditions, &limits())?;
             plan_request(
                 self.task,
                 &self.target(),
@@ -2347,8 +2300,9 @@ pub(super) mod tests {
         })
     }
 
-    /// A condition plan in the vectors' layout.
-    fn condition_json(plan: &ConditionPlan) -> Value {
+    /// A condition plan in the vectors' layout; `canvas` is the generated
+    /// canvas. A condition's video rows are its encoder units' rows.
+    fn condition_json(plan: &ConditionPlan, canvas: Canvas) -> Value {
         let vision = match &plan.vision {
             None => Value::Null,
             Some(Vision::Image(seen)) => json!({
@@ -2364,7 +2318,7 @@ pub(super) mod tests {
         };
         let mut entry = json!({
             "index": plan.index,
-            "video_rows": plan.video_rows,
+            "video_rows": plan.latent_units(canvas, 1).iter().sum::<u32>(),
             "audio_rows": plan.audio_rows,
             "vision": vision,
         });
@@ -2385,7 +2339,7 @@ pub(super) mod tests {
                 "start_frame": clip.start_frame,
                 "clip_frames": clip.frames,
                 "vae_frames": clip.vae_frames,
-                "latent_frames": clip.latent_frames,
+                "latent_frames": latent_frames(clip.vae_frames),
                 "soundtrack": clip.soundtrack.as_ref().map(audio_json),
             }),
         };
@@ -2479,7 +2433,7 @@ pub(super) mod tests {
     }
 
     /// Durations align up to `17n + 5` frames within the served range, with
-    /// the latent counts the reference derives from them.
+    /// the video latent count the reference derives from them.
     #[test]
     fn durations_match_the_reference() {
         let fixture = fixture();
@@ -2506,13 +2460,8 @@ pub(super) mod tests {
                 "{case}"
             );
             assert_eq!(
-                u64::from(plan.latent_frames),
+                u64::from(latent_frames(plan.num_frames)),
                 case["latent_frames"],
-                "{case}"
-            );
-            assert_eq!(
-                u64::from(plan.audio_latents),
-                case["audio_latents"],
                 "{case}"
             );
         }
@@ -2572,32 +2521,41 @@ pub(super) mod tests {
         };
         let video = ConditionPlan {
             index: 0,
-            condition_type: ConditionType::Video,
             prepared: Prepared::Video(super::VideoClip {
                 canvas,
                 start_frame: 0,
                 frames: 124,
                 vae_frames: 124,
-                latent_frames: 37,
                 soundtrack: None,
             }),
             vision: None,
-            video_rows: 37 * 1008,
             audio_rows: 0,
         };
         // A video's units are its encoder windows, however many bands an
         // image would take.
-        let units = video.latent_units(4);
+        let units = video.latent_units(canvas, 4);
         assert_eq!(units, [vec![5 * 1008; 7], vec![2 * 1008]].concat());
-        assert_eq!(units.iter().sum::<u32>(), video.video_rows);
+        assert_eq!(units.iter().sum::<u32>(), latent_frames(124) * 1008);
 
+        // A reference image is one latent frame at its own size, a keyframe
+        // one at the generated canvas.
+        let size = Canvas {
+            width: 3648,
+            height: 2048,
+        };
         let image = ConditionPlan {
-            prepared: Prepared::Image(canvas),
-            condition_type: ConditionType::Image,
-            video_rows: 1008,
+            prepared: Prepared::Image(size),
+            ..video.clone()
+        };
+        assert_eq!(image.latent_units(canvas, 1), [7296]);
+        let keyframe = ConditionPlan {
+            prepared: Prepared::Keyframe(KeyframeFit {
+                position: FramePosition::First,
+                cover_crop: None,
+            }),
             ..video
         };
-        assert_eq!(image.latent_units(1), [1008]);
+        assert_eq!(keyframe.latent_units(canvas, 1), [1008]);
     }
 
     /// A reference image's bands are runs of whole 32-pixel patch rows dealt
@@ -2612,25 +2570,23 @@ pub(super) mod tests {
         };
         let image = ConditionPlan {
             index: 0,
-            condition_type: ConditionType::Image,
             prepared: Prepared::Image(size),
             vision: None,
-            video_rows: rows_per_frame(size),
             audio_rows: 0,
         };
-        assert_eq!(image.latent_units(4), [16 * 114; 4]);
-        assert_eq!(image.latent_units(3), [21 * 114, 21 * 114, 22 * 114]);
-        assert_eq!(image.latent_units(0), [64 * 114]);
-        assert_eq!(image.latent_units(100), [114; 64]);
+        assert_eq!(image.latent_units(size, 4), [16 * 114; 4]);
+        assert_eq!(image.latent_units(size, 3), [21 * 114, 21 * 114, 22 * 114]);
+        assert_eq!(image.latent_units(size, 0), [64 * 114]);
+        assert_eq!(image.latent_units(size, 100), [114; 64]);
 
         let keyframe = ConditionPlan {
-            prepared: Prepared::Keyframe(super::KeyframeFit {
-                position: super::FramePosition::First,
+            prepared: Prepared::Keyframe(KeyframeFit {
+                position: FramePosition::First,
                 cover_crop: None,
             }),
             ..image.clone()
         };
-        assert_eq!(keyframe.latent_units(4), [image.video_rows]);
+        assert_eq!(keyframe.latent_units(size, 4), [rows_per_frame(size)]);
     }
 
     /// The lane is divided evenly among a request's reference images, at
@@ -2639,17 +2595,14 @@ pub(super) mod tests {
     fn reference_images_share_the_latent_lane() {
         let image = ConditionPlan {
             index: 0,
-            condition_type: ConditionType::Image,
             prepared: Prepared::Image(Canvas {
                 width: 2048,
                 height: 2048,
             }),
             vision: None,
-            video_rows: 4096,
             audio_rows: 0,
         };
         let audio = ConditionPlan {
-            condition_type: ConditionType::Audio,
             prepared: Prepared::Audio(AudioClip {
                 sample_rate: 32_000,
                 start_sample: 0,
@@ -2657,7 +2610,6 @@ pub(super) mod tests {
                 samples: 32_000,
                 latents: 40,
             }),
-            video_rows: 0,
             audio_rows: 80,
             ..image.clone()
         };
@@ -2669,8 +2621,6 @@ pub(super) mod tests {
             },
             duration_seconds: 5.0,
             num_frames: 124,
-            latent_frames: 37,
-            audio_latents: 200,
             conditions,
         };
         assert_eq!(
@@ -2716,8 +2666,8 @@ pub(super) mod tests {
                 // Bands split an image's rows without changing them.
                 let described = condition.describe(plan.canvas, source.clone(), 4);
                 assert_eq!(
-                    described.video_rows(),
-                    u64::from(condition.video_rows),
+                    described.latent_units,
+                    condition.latent_units(plan.canvas, 4),
                     "{}",
                     case["name"]
                 );
@@ -2751,11 +2701,8 @@ pub(super) mod tests {
             assert_eq!(u64::from(clip.start_frame), case["start_frame"], "{case}");
             assert_eq!(u64::from(clip.frames), case["clip_frames"], "{case}");
             assert_eq!(u64::from(clip.vae_frames), case["vae_frames"], "{case}");
-            assert_eq!(
-                u64::from(clip.latent_frames),
-                case["latent_frames"],
-                "{case}"
-            );
+            let latents = latent_frames(clip.vae_frames);
+            assert_eq!(u64::from(latents), case["latent_frames"], "{case}");
             assert_eq!(json!(seen.frame_indices), case["frame_indices"], "{case}");
             assert_eq!(
                 json!(seen.block_timestamps),
@@ -2767,7 +2714,7 @@ pub(super) mod tests {
                 case["vision_grid"]
             );
             assert_eq!(u64::from(seen.block_tokens), case["block_tokens"], "{case}");
-            let rows = clip.latent_frames * rows_per_frame(clip.canvas);
+            let rows = latents * rows_per_frame(clip.canvas);
             assert_eq!(u64::from(rows), case["rows"], "{case}");
         }
     }
@@ -2974,34 +2921,29 @@ pub(super) mod tests {
             let plan = Request::parse(case).plan(&vision).unwrap();
             assert_eq!(plan.canvas, size(&expected["canvas"]), "{name}");
             assert_eq!(u64::from(plan.num_frames), expected["num_frames"], "{name}");
+            // The conditions' encoder units and audio rows are the
+            // reference's condition rows.
+            let video_rows: u32 = plan
+                .conditions
+                .iter()
+                .flat_map(|condition| condition.latent_units(plan.canvas, 1))
+                .sum();
+            let audio_rows: u32 = plan.conditions.iter().map(|plan| plan.audio_rows).sum();
             assert_eq!(
-                u64::from(plan.latent_frames),
-                expected["latent_frames"],
+                u64::from(video_rows),
+                expected["condition_video_rows"],
                 "{name}"
             );
             assert_eq!(
-                u64::from(plan.audio_latents),
-                expected["audio_latents"],
+                u64::from(audio_rows),
+                expected["condition_audio_rows"],
                 "{name}"
             );
-            let rows = [
-                ("target_video_rows", plan.target_video_rows()),
-                ("target_audio_rows", plan.target_audio_rows()),
-                ("condition_video_rows", plan.condition_video_rows()),
-                ("condition_audio_rows", plan.condition_audio_rows()),
-            ];
-            for (key, value) in rows {
-                assert_eq!(u64::from(value), expected[key], "{name} {key}");
-            }
-            // Together with the presentation's rows, the planned rows fill
-            // the reference's packed sequence exactly.
-            let planned = rows.iter().map(|&(_, value)| u64::from(value)).sum::<u64>();
-            assert_eq!(
-                planned + expected["text_rows"].as_u64().unwrap(),
-                expected["sequence_rows"],
-                "{name}"
-            );
-            let conditions: Vec<Value> = plan.conditions.iter().map(condition_json).collect();
+            let conditions: Vec<Value> = plan
+                .conditions
+                .iter()
+                .map(|condition| condition_json(condition, plan.canvas))
+                .collect();
             assert_eq!(Value::from(conditions), expected["conditions"], "{name}");
         }
     }
