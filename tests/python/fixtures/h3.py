@@ -85,14 +85,17 @@ def dmd_denoiser(
     video_shift: float = 12.0,
     sparsity: float = 0.9,
 ) -> DenoiserConfig:
-    """A FastH3 DMD student: sparse tile-64 attention, text-only, 16:9."""
+    """A FastH3 DMD student: sparse tile-64 attention, t2va and fl2va, 16:9.
+
+    It serves the tasks of the ``transformer`` partition it replaces.
+    """
     return DenoiserConfig(
         transformer=transformer or transformer_config(),
         schedule=DmdLadder(
             rungs=rungs, video_shift=video_shift, audio_shift=3.0
         ),
         attention=SparseAttention(tile=64, sparsity=sparsity),
-        tasks=("t2va",),
+        tasks=("t2va", "fl2va"),
         canvases={(768, "16:9"): WIDE},
     )
 
@@ -135,7 +138,7 @@ def omniref_denoiser(
 
 
 def fasth3_config() -> Config:
-    """A FastH3 t2va export: one DMD denoiser."""
+    """A FastH3 DMD export: one denoiser serving t2va and fl2va."""
     return Config(
         text_encoder=text_encoder_config(),
         denoisers={"transformer": dmd_denoiser()},

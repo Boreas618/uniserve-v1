@@ -26,6 +26,7 @@ from uniserve.models.minimax_h3.processing import canvas
 pytestmark = pytest.mark.unit
 
 FIRST = Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE))
+LAST = Condition(ConditionRole.LAST_FRAME, video.Config(1, WIDE))
 IMAGE = Condition(
     ConditionRole.REFERENCE, video.Config(1, image.Config(2048, 1152))
 )
@@ -60,8 +61,20 @@ def test_each_denoiser_takes_the_conditions_of_its_tasks():
     # 64 x 36 patches and the keyframe's 1008.
     assert size.condition_rows == 4032 + 120 + 2304 + 1008
 
+    # Sparse students pack each keyframe in whole tiles of their own: 1008
+    # rows fill 16 tiles of 64 or 8 of 128.
+    students = _meta(dmd_denoiser())
+    size = students.make_size(124, 64, canvas=WIDE, conditions=(FIRST, LAST))
+    assert size.condition_rows == 2 * 1024
+    with pytest.raises(ValueError, match="no references"):
+        students.make_size(124, 64, canvas=WIDE, conditions=(IMAGE,))
+    size = _meta(omniref_denoiser()).make_size(
+        124, 64, canvas=WIDE, conditions=(IMAGE, FIRST)
+    )
+    assert size.condition_rows == 2304 + 1024
+
     with pytest.raises(ValueError, match="no keyframes"):
-        _meta(dmd_denoiser()).make_size(
+        _meta(base_denoiser(tasks=("t2va",))).make_size(
             124, 64, canvas=WIDE, conditions=(FIRST,)
         )
 
@@ -184,9 +197,9 @@ def test_reference_segments_take_whole_tiles():
     # The retained conditioning holds the prompt capacity, the conditions'
     # rows and one zero row.
     assert model.text_condition_rows(layout) == 384 + 7168 + 1
-    # Segment packing holds no keyframe rows.
-    with pytest.raises(ValueError, match="keyframe"):
-        model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, FIRST))
+    # A keyframe's 1008 rows take eight tiles of their own.
+    size = model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, FIRST))
+    assert size.condition_rows == 128 * (1 + 36 + 8)
 
 
 def test_reference_segment_state_follows_its_layout():
@@ -257,10 +270,18 @@ def test_a_condition_layout_holds_its_condition_rows():
 
 def test_a_condition_layout_respects_the_tasks():
     with pytest.raises(ValueError, match="takes no conditions"):
-        model = _meta(dmd_denoiser())
+        model = _meta(base_denoiser(tasks=("t2va",)))
         model.condition_layout(
             model.layout_size(model.make_size(124, 64, canvas=WIDE)), 64
         )
+
+    # A DMD student takes keyframes in its 64-row tiles.
+    model = _meta(dmd_denoiser())
+    layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
+    size = model.make_size(124, 64, canvas=WIDE, conditions=(FIRST, LAST))
+    widened = model.condition_layout(layout, size.condition_rows)
+    assert widened.condition_rows == 32 * 64
+    assert model.holds(widened, size)
 
     # Segment packing takes conditions in its own 128-row tiles.
     model = _meta(omniref_denoiser())
@@ -288,28 +309,26 @@ def test_the_largest_condition_set_follows_the_served_tasks():
     """A denoiser states the largest condition set its tasks admit.
 
     Text-to-video takes none and keyframe generation the two keyframes of
-    the target canvas. A reference request carries up to nine images and
-    three videos: images of the widest reference raster, 4:1 at the
-    2048-pixel short edge, and videos of the generated 124 frames with
-    their 124 / 24 seconds of 32 kHz sound. A dense network packs the
-    keyframes beside them; the segment packing holds none.
+    the target canvas, under dense and sparse attention alike. A reference
+    request carries up to nine images and three videos: images of the widest
+    reference raster, 4:1 at the 2048-pixel short edge, and videos of the
+    generated 124 frames with their 124 / 24 seconds of 32 kHz sound, beside
+    the two keyframes.
     """
-    keyframes = (
-        Condition(ConditionRole.FIRST_FRAME, video.Config(1, WIDE)),
-        Condition(ConditionRole.LAST_FRAME, video.Config(1, WIDE)),
-    )
-    text_only = _meta(dmd_denoiser())
+    keyframes = (FIRST, LAST)
+    text_only = _meta(base_denoiser(tasks=("t2va",)))
     assert text_only.text_only
     assert text_only.max_conditions(124, WIDE) == ()
-    keyframed = _meta(base_denoiser())
-    assert keyframed.text_only
-    assert keyframed.max_references == ReferenceLimits()
-    assert keyframed.max_conditions(124, WIDE) == keyframes
+    for keyframed in (_meta(base_denoiser()), _meta(dmd_denoiser())):
+        assert keyframed.text_only
+        assert keyframed.max_references == ReferenceLimits()
+        assert keyframed.max_conditions(124, WIDE) == keyframes
 
-    for denoiser, leading in (
-        (_meta(base_denoiser(tasks=("ref2va",))), keyframes),
-        (_meta(omniref_denoiser()), ()),
+    for denoiser in (
+        _meta(base_denoiser(tasks=("ref2va",))),
+        _meta(omniref_denoiser()),
     ):
+        leading = keyframes
         assert not denoiser.text_only
         assert denoiser.max_references == ReferenceLimits(
             images=9, videos=3, audios=3, total=12, image_short_edge=2048
