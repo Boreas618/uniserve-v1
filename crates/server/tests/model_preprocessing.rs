@@ -62,7 +62,6 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         canvases: Vec::new(),
         max_sequence_rows: None,
-        condition_tiles: None,
     }
 }
 
@@ -86,7 +85,6 @@ fn video_service(
             video_max_pixels: 25_165_824,
         },
         max_video_seconds,
-        None,
         1,
         &VideoMediaSettings::default(),
         Default::default(),
@@ -722,7 +720,6 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
         max_sequence_rows: None,
-        condition_tiles: None,
     };
     let model = InputProcessor::new(
         loaded.config().clone(),

@@ -311,6 +311,12 @@ impl WorkerBackend {
             .and_then(|mut completion| {
                 video.answer(&mut sizing, &mut completion, &mut self.runtimes.denoisers)
             });
+        // The requests the denoiser or the plan does not serve are refused
+        // alone; the others go on being sized.
+        for (key, reason) in sizing.take_refused() {
+            tracing::info!(request = ?key, "refused video request: {reason}");
+            self.requests.refuse(key, &reason)?;
+        }
         match answered {
             Ok(true) => Ok(()),
             Ok(false) => {

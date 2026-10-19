@@ -115,10 +115,19 @@ pub(crate) struct CallState<F = ()> {
     pub(crate) output: PendingOutput,
     /// The request slot of the call's request.
     pub(crate) slot: usize,
-    /// False when the call's host-gated predicate skipped it.
+    /// False when the call's host-gated predicate skipped it, or when the
+    /// rank refused its request (its output then reports the refusal).
     pub(crate) active: bool,
     pub(crate) completion_write: Option<ProductBuffer>,
     pub(crate) forward: F,
+}
+
+impl<F> CallState<F> {
+    /// Whether the rank refused the call's request, so the call reports the
+    /// refusal and runs nothing, host work included.
+    pub(crate) fn refused(&self) -> bool {
+        self.output.output.error_message.is_some()
+    }
 }
 
 /// A batch whose outputs are bound, before its output storage is leased:
@@ -136,7 +145,9 @@ pub(crate) struct Opening<F = ()> {
 impl<F: Default> Opening<F> {
     /// Bind the outputs of `plan`'s calls to their requests' live epochs and
     /// slots, and record in `job` the read of every host-gated predicate of
-    /// a call `gated` selects. Each predicate is read after its producer's
+    /// a call `gated` selects. A call of a request this rank refused is
+    /// inactive and reports [`ErrorCode::InputError`] with the refusal's
+    /// reason; it reads no predicate. Each predicate is read after its producer's
     /// fence; its read lease ends behind the read, and the job's completion
     /// carries one byte per predicate.
     #[expect(clippy::too_many_arguments, reason = "the owners a batch opens on")]
@@ -165,10 +176,17 @@ impl<F: Default> Opening<F> {
         let bound = requests.bind_calls(&calls)?;
         let mut calls = Vec::with_capacity(plan.calls.len());
         for (index, (call, request)) in plan.calls.iter().zip(&bound).enumerate() {
+            let mut output = PendingOutput::new(call, request.progress()?, index)?;
+            let refusal = request.refusal()?;
+            if let Some(reason) = &refusal {
+                output.output.status = CallStatus::Error;
+                output.output.error_code = Some(ErrorCode::InputError);
+                output.output.error_message = Some(reason.to_string());
+            }
             calls.push(CallState {
-                output: PendingOutput::new(call, request.progress()?, index)?,
+                output,
                 slot: request.slot(),
-                active: true,
+                active: refusal.is_none(),
                 completion_write: None,
                 forward: F::default(),
             });
@@ -176,6 +194,9 @@ impl<F: Default> Opening<F> {
 
         let mut predicated = Vec::new();
         for (index, call) in plan.calls.iter().enumerate() {
+            if !calls[index].active {
+                continue;
+            }
             let Some(predicate) = call
                 .predicate
                 .as_ref()

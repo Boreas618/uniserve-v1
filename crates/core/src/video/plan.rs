@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ConditionMedia, ConditionTiles, ConditionVision, ImageFit, MediaLocator};
+use super::{ConditionMedia, ConditionVision, ImageFit, MediaLocator};
 use super::{VideoCondition, VisionGrid};
 use crate::{Canvas, VideoTask};
 
@@ -1165,22 +1165,6 @@ impl ConditionPlan {
         }
     }
 
-    /// Denoiser rows the condition takes, packed as `tiles` prescribes: its
-    /// video and audio rows without tiles, or the rows of the whole tiles
-    /// they fill, a video's in tiles of its `(latent frames, height / 32,
-    /// width / 32)` token grid. `None` for a keyframe under tiles, which a
-    /// segment packing does not hold. `canvas` is the generated canvas.
-    pub fn packed_rows(&self, canvas: Canvas, tiles: Option<ConditionTiles>) -> Option<u64> {
-        let (role, media) = self.media(canvas);
-        super::packed_rows(
-            tiles,
-            role,
-            &media,
-            u64::from(self.video_rows),
-            self.audio_rows,
-        )
-    }
-
     /// Denoiser video rows of each unit the video encoder encodes, in unit
     /// order.
     ///
@@ -1296,15 +1280,6 @@ impl RequestPlan {
     /// Denoiser audio rows of all conditions.
     pub fn condition_audio_rows(&self) -> u32 {
         self.conditions.iter().map(|plan| plan.audio_rows).sum()
-    }
-
-    /// Denoiser rows of all conditions, packed as `tiles` prescribes (see
-    /// [`ConditionPlan::packed_rows`]); `None` when a keyframe meets tiles.
-    pub fn condition_rows(&self, tiles: Option<ConditionTiles>) -> Option<u64> {
-        self.conditions
-            .iter()
-            .map(|plan| plan.packed_rows(self.canvas, tiles))
-            .sum()
     }
 
     /// The units each condition's reference image is encoded in when one
@@ -2227,7 +2202,6 @@ pub(super) mod tests {
         rows_per_frame, rule_canvases, video_frame_count, video_reference,
     };
     use crate::MediaLocator;
-    use crate::video::ConditionTiles;
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {
@@ -2722,29 +2696,17 @@ pub(super) mod tests {
         assert_eq!(plan(five).image_bands(4), [1, 1, 1, 1, 1, 4]);
     }
 
-    /// The worker counts an admitted condition's rows from its description:
-    /// for every planned condition of the vectors, densely and in the segment
-    /// tiles of both tile sizes, the described condition packs into exactly
-    /// the rows its plan does, and a keyframe under tiles into none.
+    /// Every planned condition of the vectors is described with the rows its
+    /// plan counts: a described condition carries the plan's video rows, in
+    /// its encoder units however its image is banded, and its audio rows.
     #[test]
-    fn described_conditions_pack_like_their_plans() {
+    fn described_conditions_carry_their_plans_rows() {
         let fixture = fixture();
         let vision = vision(&fixture);
         let source = MediaLocator {
             name: "uniserve-media-0".to_owned(),
             bytes: 1,
         };
-        let tilings = [
-            None,
-            Some(ConditionTiles {
-                rows: 64,
-                video: [4, 4, 4],
-            }),
-            Some(ConditionTiles {
-                rows: 128,
-                video: [4, 4, 8],
-            }),
-        ];
         for case in fixture["requests"].as_array().unwrap() {
             if case.get("expected").is_none() {
                 continue;
@@ -2753,16 +2715,16 @@ pub(super) mod tests {
             for condition in &plan.conditions {
                 // Bands split an image's rows without changing them.
                 let described = condition.describe(plan.canvas, source.clone(), 4);
-                for tiles in tilings {
-                    let planned = condition.packed_rows(plan.canvas, tiles);
-                    assert_eq!(described.packed_rows(tiles), planned, "{}", case["name"]);
-                    let keyframe = matches!(condition.prepared, Prepared::Keyframe(_));
-                    assert_eq!(planned.is_none(), keyframe && tiles.is_some());
-                }
-                // Densely, the rows are the condition's own.
                 assert_eq!(
-                    described.packed_rows(None),
-                    Some(u64::from(condition.video_rows + condition.audio_rows))
+                    described.video_rows(),
+                    u64::from(condition.video_rows),
+                    "{}",
+                    case["name"]
+                );
+                assert_eq!(
+                    described.audio_rows, condition.audio_rows,
+                    "{}",
+                    case["name"]
                 );
             }
         }

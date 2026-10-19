@@ -18,7 +18,7 @@
 
 pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1350,6 +1350,11 @@ pub struct WorkerFailure {
     pub endpoints: Vec<uniserve_ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
+    /// The requests among `requests` that a worker refused, each with the
+    /// reason its input-error completion states (`CallOutput::error_message`).
+    /// The scheduler rejects these with their reason and fails the others
+    /// with `message`.
+    pub refusals: HashMap<RequestKey, String>,
     /// Accepted logical calls that will no longer produce a device completion.
     pub retired: Vec<(u64, RequestKey, CallId)>,
     /// Buffers whose published locations no longer cover their complete logical value.
@@ -1407,7 +1412,6 @@ mod tests {
                 audio_shift: 3.0,
                 canvases: Vec::new(),
                 max_sequence_rows: None,
-                condition_tiles: None,
             }),
             ..WorkerInfo::default()
         }
@@ -1637,7 +1641,6 @@ mod tests {
                 audio_shift: 3.0,
                 canvases: Vec::new(),
                 max_sequence_rows: None,
-                condition_tiles: None,
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

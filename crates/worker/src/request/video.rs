@@ -10,17 +10,19 @@
 //! admits it in the layout of the smallest prepared prompt capacity that
 //! holds it.
 //!
-//! A request's condition rows are the request rules' count
-//! ([`VideoCondition::packed_rows`] under the denoiser's declared condition
-//! tiles), computed at admission without the Python thread; only the
-//! layout questions, which are the model's arithmetic, are asked.
+//! The denoiser is the authority on the sizes it serves and on the rows a
+//! request's conditions take (its `make_size`): both are asked of the model.
+//! A request whose size the denoiser or the plan does not serve is refused
+//! alone, for the reason the refusal states: its calls report the refusal
+//! (`RequestPool::refuse`), and the requests sized beside it are admitted as
+//! usual.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::video::plan::requested_frames;
-use uniserve_core::{Canvas, ConditionRole, ConditionTiles, VideoCondition};
+use uniserve_core::{Canvas, ConditionRole, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -210,6 +212,10 @@ pub(crate) fn vision_spans(tags: &[u8]) -> Vec<(u32, u32)> {
     }
     spans
 }
+
+/// The refusal of a request whose frame count, canvas or prompt lies outside
+/// what the rank admits.
+const OUTSIDE_PLAN: &str = "media input exceeds the worker frame, canvas or conditioning capacity";
 
 /// What a rank admits and the layouts it prepares, fixed at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,19 +499,13 @@ impl MediaPlan {
         self.frame_counts.last().copied().unwrap_or(0)
     }
 
-    /// Refuse a size outside the plan's frame counts, canvases or prompt
-    /// capacity, as an invalid descriptor.
-    fn check(&self, size: &VideoSize) -> Result<()> {
-        if !self.frame_counts.contains(&size.frames)
+    /// The refusal of a size outside the plan's frame counts, canvases or
+    /// prompt capacity; `None` for a size the plan admits.
+    fn refusal(&self, size: &VideoSize) -> Option<String> {
+        (!self.frame_counts.contains(&size.frames)
             || !self.canvases.contains(&size.canvas)
-            || size.tokens > self.max_text_tokens
-        {
-            return Err(Error::Invalid(
-                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
-                    .into(),
-            ));
-        }
-        Ok(())
+            || size.tokens > self.max_text_tokens)
+            .then(|| OUTSIDE_PLAN.to_owned())
     }
 
     /// The layout of a size without conditions at prompt capacity
@@ -527,19 +527,21 @@ impl MediaPlan {
     /// `holds` whether each holds the request. The request evaluates in
     /// the layout of the smallest capacity that holds it.
     ///
-    /// Fails, as an invalid descriptor, when the conditions exceed their
-    /// capacity or no capacity's layout holds the request.
+    /// Returns the request's refusal when its conditions take more rows
+    /// than the deployment provisioned, naming both and the option that
+    /// raises the capacity, or when no capacity's layout holds it.
     fn select(
         &self,
         size: VideoSize,
         condition_rows: u32,
         layouts: &[VideoLayout],
         holds: &[bool],
-    ) -> Result<Admission> {
+    ) -> std::result::Result<Admission, String> {
         if condition_rows > self.condition_rows {
-            return Err(Error::Invalid(
-                "media input exceeds the worker frame, canvas, conditioning or condition capacity"
-                    .into(),
+            return Err(format!(
+                "conditions: the conditions take {condition_rows} denoiser rows, more than the \
+                 {} this deployment serves; serve with a larger --max-condition-rows",
+                self.condition_rows
             ));
         }
         self.text_capacities
@@ -553,32 +555,13 @@ impl MediaPlan {
                 layout,
                 text_capacity,
             })
-            .ok_or_else(|| Error::Invalid("media input has no admitted capacity layout".into()))
+            .ok_or_else(|| "media input has no admitted capacity layout".to_owned())
     }
 }
 
 /// The request-order conditions of an admission, as the denoiser sizes them.
 pub(crate) fn condition_shapes(conditions: &[VideoCondition]) -> Arc<[ConditionShape]> {
     conditions.iter().map(ConditionShape::of).collect()
-}
-
-/// The denoiser rows a request's conditions occupy, as the denoiser packs
-/// them (densely, or in its declared condition `tiles`).
-///
-/// Fails, as an invalid request, for a keyframe a tile-packing denoiser
-/// holds no rows for, or rows beyond a 32-bit count.
-fn condition_rows(conditions: &[VideoCondition], tiles: Option<ConditionTiles>) -> Result<u32> {
-    let rows = conditions
-        .iter()
-        .map(|condition| condition.packed_rows(tiles))
-        .sum::<Option<u64>>()
-        .ok_or_else(|| {
-            Error::Invalid(
-                "this denoiser packs conditions in segment tiles and holds no keyframes".into(),
-            )
-        })?;
-    u32::try_from(rows)
-        .map_err(|_| Error::Invalid(format!("{rows} condition rows exceed any capacity")))
 }
 
 /// One admitted video request on this rank.
@@ -616,8 +599,13 @@ struct Unsized {
     slot: usize,
     key: RequestKey,
     size: VideoSize,
-    /// The request's condition rows ([`condition_rows`]).
-    condition_rows: u32,
+    /// The rows the request's conditions take, as the denoiser packs them:
+    /// zero without conditions, otherwise asked of the model once it serves
+    /// the size.
+    condition_rows: Option<u32>,
+    /// Whether the model was asked whether it serves the size: a size
+    /// without conditions is one the plan's startup layouts were sized for.
+    screened: bool,
     /// The layout of each prompt capacity of the plan, in its order: a
     /// startup layout for a size without conditions, otherwise asked for.
     layouts: Vec<Option<VideoLayout>>,
@@ -628,7 +616,9 @@ struct Unsized {
 
 /// What the job a sizing submitted last was asked.
 enum Asked {
-    /// The layouts of sizes with conditions.
+    /// Whether the denoiser serves the sizes with conditions.
+    Refusals,
+    /// The layouts and condition rows of sizes with conditions.
     Layouts,
     /// Which of each request's layouts hold it.
     Holds,
@@ -648,12 +638,23 @@ enum Asked {
 /// startup or for an earlier request) takes a further job, on the
 /// denoiser's lane, that prepares the layout.
 ///
-/// The requests a batch started are sized together: a size the model
-/// rejects fails the batch, and with it every request of the sizing that
-/// was not admitted yet.
+/// The requests a batch started are sized together. A request whose size
+/// the denoiser or the plan does not serve leaves the sizing refused, with
+/// the reason [`Sizing::take_refused`] hands the rank; a failure of the
+/// sizing itself fails the batch, and with it every request of the sizing
+/// that was not admitted yet.
 pub(crate) struct Sizing {
     requests: Vec<Unsized>,
     asked: Asked,
+    /// Requests refused since the rank last took them, with their reasons.
+    refused: Vec<(RequestKey, String)>,
+}
+
+impl Sizing {
+    /// The requests refused since the last call, with their reasons.
+    pub(crate) fn take_refused(&mut self) -> Vec<(RequestKey, String)> {
+        std::mem::take(&mut self.refused)
+    }
 }
 
 /// What the model answers about a video of one admitted frame count.
@@ -707,9 +708,19 @@ impl VideoRequests {
     /// rank the layout it evaluates in is the model's answer, which the
     /// batch that started it asks for next ([`Self::begin_sizing`]); until
     /// then the request has no layout.
-    pub(crate) fn admit(&mut self, admission: &NewRequest, denoising: bool) -> Result<()> {
+    ///
+    /// Returns the request's refusal when its frame count, canvas or prompt
+    /// lies outside what the rank's plan admits; the caller refuses the
+    /// request ([`RequestPool::refuse`](crate::request::RequestPool::refuse)).
+    /// Fails, as an invalid descriptor, for a request whose task and
+    /// conditions, or computation bounds, contradict each other.
+    pub(crate) fn admit(
+        &mut self,
+        admission: &NewRequest,
+        denoising: bool,
+    ) -> Result<Option<String>> {
         let (Some(media), Some(video)) = (&admission.diffusion, &admission.video) else {
-            return Ok(());
+            return Ok(None);
         };
         let slot = admission.request_pool_idx as usize;
         let canvas = Canvas {
@@ -721,16 +732,13 @@ impl VideoRequests {
                 "a video request's task disagrees with its conditions".into(),
             ));
         }
-        let duration = self
+        let Some(duration) = self
             .durations
             .get(&media.num_frames)
             .filter(|_| self.plan.canvases.contains(&canvas))
-            .ok_or_else(|| {
-                Error::Invalid(
-                    "media input exceeds the worker frame, canvas, conditioning or condition capacity"
-                        .into(),
-                )
-            })?;
+        else {
+            return Ok(Some(OUTSIDE_PLAN.to_owned()));
+        };
         let units = Arc::clone(&duration.units);
         if media.video_units as usize != units.len() {
             return Err(Error::Invalid(
@@ -763,8 +771,10 @@ impl VideoRequests {
             mux: None,
         };
         if denoising {
-            self.plan.check(&size)?;
-            let rows = condition_rows(&video.conditions, self.model.facts.condition_tiles)?;
+            if let Some(refusal) = self.plan.refusal(&size) {
+                return Ok(Some(refusal));
+            }
+            let conditioned = !size.conditions.is_empty();
             // A request restarted in the slot replaces the one waiting.
             self.waiting.retain(|waiting| waiting.slot != slot);
             self.waiting.push(Unsized {
@@ -782,12 +792,13 @@ impl VideoRequests {
                     })
                     .collect(),
                 size,
-                condition_rows: rows,
+                condition_rows: (!conditioned).then_some(0),
+                screened: !conditioned,
                 admitted: None,
             });
         }
         self.requests.insert(slot, request);
-        Ok(())
+        Ok(None)
     }
 
     /// The requests started since the last call, for the batch that
@@ -796,22 +807,39 @@ impl VideoRequests {
         let requests = std::mem::take(&mut self.waiting);
         (!requests.is_empty()).then_some(Sizing {
             requests,
+            refused: Vec::new(),
             asked: Asked::Holds,
         })
     }
 
-    /// Record into `job` the next step of `sizing`: the layouts not yet
-    /// known; once every layout is known, whether each of a request's
-    /// layouts holds it; and for requests whose selected layout `denoisers`
-    /// does not hold, that layout's preparation. Returns whether the job belongs on the denoiser's lane
-    /// (a preparation works on its stream) rather than on the Python thread
-    /// alone.
+    /// Record into `job` the next step of `sizing`: whether the denoiser
+    /// serves each size with conditions; then the layouts and condition rows
+    /// not yet known; once every layout is known, whether each of a
+    /// request's layouts holds it; and for requests whose selected layout
+    /// `denoisers` does not hold, that layout's preparation. Returns whether
+    /// the job belongs on the denoiser's lane (a preparation works on its
+    /// stream) rather than on the Python thread alone.
     pub(crate) fn ask(
         &self,
         sizing: &mut Sizing,
         denoisers: &mut DenoiserRunners,
         job: &Job,
     ) -> Result<bool> {
+        // A size the denoiser does not serve is refused before anything else
+        // about it is asked, since every other question would fail on it.
+        let unscreened: Vec<&Unsized> = sizing
+            .requests
+            .iter()
+            .filter(|request| !request.screened)
+            .collect();
+        if !unscreened.is_empty() {
+            for request in unscreened {
+                self.model.ask_refusal(&request.size, job);
+            }
+            sizing.asked = Asked::Refusals;
+            return Ok(false);
+        }
+
         // Selected requests wait for layouts the denoiser lacks.
         let mut lacking: Vec<VideoLayout> = Vec::new();
         for admitted in sizing
@@ -853,6 +881,9 @@ impl VideoRequests {
                     };
                     self.model.ask_layout_size(&candidate, job);
                 }
+                if request.condition_rows.is_none() {
+                    self.model.ask_condition_rows(&request.size, job);
+                }
                 continue;
             }
             for layout in request.layouts.iter().flatten() {
@@ -873,42 +904,79 @@ impl VideoRequests {
     /// whether every request has (otherwise `sizing` has more to ask).
     ///
     /// A request that ended or was restarted while it was sized is left
-    /// out.
+    /// out. A request whose size the denoiser or the plan does not serve
+    /// leaves the sizing refused ([`Sizing::take_refused`]).
     pub(crate) fn answer(
         &mut self,
         sizing: &mut Sizing,
         completion: &mut Completion,
         denoisers: &mut DenoiserRunners,
     ) -> Result<bool> {
+        let integer = |values: Vec<i64>| {
+            values
+                .first()
+                .copied()
+                .ok_or_else(|| Error::Interface("a sizing function returned no value".into()))
+        };
         match std::mem::replace(&mut sizing.asked, Asked::Holds) {
+            Asked::Refusals => {
+                let mut served = Vec::with_capacity(sizing.requests.len());
+                for mut request in std::mem::take(&mut sizing.requests) {
+                    if request.screened {
+                        served.push(request);
+                        continue;
+                    }
+                    let reason = completion.texts()?.concat();
+                    if reason.is_empty() {
+                        request.screened = true;
+                        served.push(request);
+                    } else {
+                        sizing.refused.push((request.key, reason));
+                    }
+                }
+                sizing.requests = served;
+                return Ok(sizing.requests.is_empty());
+            }
             Asked::Layouts => {
                 for request in &mut sizing.requests {
                     for layout in request.layouts.iter_mut().filter(|layout| layout.is_none()) {
                         *layout = Some(VideoLayout::from_values(&completion.returned()?)?);
                     }
+                    if request.condition_rows.is_none() {
+                        let rows = integer(completion.returned()?)?;
+                        request.condition_rows = Some(u32::try_from(rows).map_err(|_| {
+                            Error::Interface(format!(
+                                "the denoiser counts {rows} condition rows for a request"
+                            ))
+                        })?);
+                    }
                 }
                 return Ok(false);
             }
             Asked::Holds => {
-                let integer = |values: Vec<i64>| {
-                    values.first().copied().ok_or_else(|| {
-                        Error::Interface("a sizing function returned no value".into())
-                    })
-                };
-                for waiting in &mut sizing.requests {
+                let mut selected = Vec::with_capacity(sizing.requests.len());
+                for mut waiting in std::mem::take(&mut sizing.requests) {
                     let layouts: Vec<VideoLayout> =
                         waiting.layouts.iter().flatten().copied().collect();
                     let holds = layouts
                         .iter()
                         .map(|_| Ok(integer(completion.returned()?)? != 0))
                         .collect::<Result<Vec<bool>>>()?;
-                    waiting.admitted = Some(self.plan.select(
-                        waiting.size.clone(),
-                        waiting.condition_rows,
-                        &layouts,
-                        &holds,
-                    )?);
+                    let rows = waiting.condition_rows.ok_or_else(|| {
+                        Error::Invariant("a sized request's condition rows are known".into())
+                    })?;
+                    match self
+                        .plan
+                        .select(waiting.size.clone(), rows, &layouts, &holds)
+                    {
+                        Ok(admission) => {
+                            waiting.admitted = Some(admission);
+                            selected.push(waiting);
+                        }
+                        Err(reason) => sizing.refused.push((waiting.key, reason)),
+                    }
                 }
+                sizing.requests = selected;
             }
             Asked::Preparation(layouts, evicted) => {
                 for layout in layouts {
@@ -1250,14 +1318,14 @@ mod tests {
             (1024, layouts[0])
         );
 
-        // No layout holds the request, or its conditions exceed the plan's.
-        let refused = |result: Result<Admission>| matches!(result, Err(Error::Invalid(_)));
-        assert!(refused(plan.select(
-            size.clone(),
-            0,
-            &layouts,
-            &[false, false]
-        )));
-        assert!(refused(plan.select(size, 513, &layouts, &[true, true])));
+        // No layout holds the request, or its conditions exceed the plan's:
+        // either is the request's refusal, the second naming the capacity
+        // the deployment states.
+        assert!(
+            plan.select(size.clone(), 0, &layouts, &[false, false])
+                .is_err()
+        );
+        let refusal = plan.select(size, 513, &layouts, &[true, true]).unwrap_err();
+        assert!(refusal.contains("513") && refusal.contains("--max-condition-rows"));
     }
 }

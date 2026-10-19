@@ -215,7 +215,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                     denoiser,
                     vision,
                     config.engine.max_video_seconds,
-                    config.engine.max_condition_rows,
                     latent_encoding_lane,
                     &config.video_media,
                     references,
