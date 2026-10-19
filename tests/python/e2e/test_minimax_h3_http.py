@@ -23,18 +23,16 @@ from tests.python.e2e.http_helpers import (
     server_process,
     t2va_request,
 )
+from uniserve.models.minimax_h3.config import NAMED_CANVASES
 from uniserve_eval.transport.video import inspect_video_bytes
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
-# The canvas rule's named aspect ratios and the canvases they resolve to.
+# The base checkpoint's canvas of each named aspect ratio at 768p, as the
+# model package names them.
 CANVASES = {
-    "21:9": (1536, 672),
-    "16:9": (1344, 768),
-    "4:3": (1024, 768),
-    "1:1": (768, 768),
-    "3:4": (768, 1024),
-    "9:16": (768, 1344),
+    ratio: (canvas.width, canvas.height)
+    for (_, ratio), canvas in NAMED_CANVASES.items()
 }
 
 
@@ -90,8 +88,13 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
             "audio_flow_shift": 3.0,
         }
         assert video["canvas"]["canvases"] == [
-            {"width": width, "height": height}
-            for width, height in CANVASES.values()
+            {
+                "short_edge": 768,
+                "aspect_ratio": ratio,
+                "width": width,
+                "height": height,
+            }
+            for ratio, (width, height) in CANVASES.items()
         ]
         assert video["canvas"]["short_edges"] == [768]
         assert video["canvas"]["aspect_ratios"] == list(CANVASES)

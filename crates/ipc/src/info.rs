@@ -288,9 +288,10 @@ pub struct VideoDenoiserInfo {
     /// How the VAE divides a video's frames into clips, which counts the
     /// frames the deployment generates and their decode units.
     pub frames: uniserve_core::FrameClips,
-    /// The only canvases the deployment serves: those it prepares, in the
-    /// order it names them.
-    pub canvases: Vec<uniserve_core::Canvas>,
+    /// The only canvases the deployment serves: those it prepares, each
+    /// with the `(short_edge, aspect_ratio)` its model names it by, in the
+    /// order the deployment names them.
+    pub canvases: Vec<uniserve_core::ServedCanvas>,
 }
 
 impl VideoDenoiserInfo {
@@ -302,7 +303,8 @@ impl VideoDenoiserInfo {
 
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, and every canvas is positive.
+    /// frame rule are declared, and every canvas is a positive raster named
+    /// by its own `(short_edge, aspect_ratio)` pair.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -330,10 +332,22 @@ impl VideoDenoiserInfo {
             "a video denoiser declares an empty frame rule"
         );
         ensure_valid!(
+            self.canvases.iter().all(|served| {
+                served.short_edge > 0
+                    && !served.aspect_ratio.is_empty()
+                    && served.canvas.width > 0
+                    && served.canvas.height > 0
+            }),
+            "a video denoiser declares an empty canvas"
+        );
+        ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0),
-            "a video denoiser declares an empty canvas"
+                .map(|served| (served.short_edge, served.aspect_ratio.as_str()))
+                .collect::<HashSet<_>>()
+                .len()
+                == self.canvases.len(),
+            "a video denoiser declares a canvas name twice"
         );
         Ok(())
     }

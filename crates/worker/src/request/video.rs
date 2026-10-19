@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use tvm_ffi::Any;
 use uniserve_core::video::plan::requested_frames;
-use uniserve_core::{Canvas, ConditionRole, VideoCondition};
+use uniserve_core::{Canvas, ConditionRole, ServedCanvas, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
 use crate::executor::lifecycle::{LaneJobs, RequestStorage};
@@ -222,9 +222,9 @@ const OUTSIDE_PLAN: &str = "media input exceeds the worker frame, canvas or cond
 pub(crate) struct MediaPlan {
     /// Admitted frame counts, ascending.
     pub(crate) frame_counts: Vec<u32>,
-    /// Admitted canvases in the order the deployment names them, which the
-    /// handshake reports.
-    pub(crate) admitted: Vec<Canvas>,
+    /// Admitted canvases in the order the deployment names them, with the
+    /// names the denoiser gives them, which the handshake reports.
+    pub(crate) admitted: Vec<ServedCanvas>,
     /// The admitted canvases in preparation order (see
     /// [`preparation_order`]).
     pub(crate) canvases: Vec<Canvas>,
@@ -272,35 +272,92 @@ struct CanvasExtent {
     generated: u64,
 }
 
-/// The canvases a deployment prepares and admits: `configured`, or every
-/// canvas the denoiser offers without a selection.
+/// The canvases a deployment prepares and admits, in the order it names
+/// them.
 ///
-/// Fails, as an unsupported setup, when the denoiser offers no canvas or
-/// does not offer a configured one.
-fn admitted_canvases(offered: &[Canvas], configured: &[Canvas]) -> Result<Vec<Canvas>> {
+/// `offered` are the canvases the denoiser generates, each named by the
+/// `(short_edge, aspect_ratio)` a request selects it with. Every resolution
+/// class of `resolutions` (`768p`) is crossed with every ratio of
+/// `aspect_ratios` (`16:9`), resolution-major, and each pair admits the
+/// canvas the denoiser names by it. Without resolutions, or without aspect
+/// ratios, every one the denoiser offers takes their place, in its own
+/// order; without either, every offered canvas is admitted.
+///
+/// Fails, as an invalid setup, for a resolution that is not a class or a
+/// repeated name, and, as an unsupported setup, when the denoiser offers no
+/// canvas or names none by a selected pair.
+pub(crate) fn admitted_canvases(
+    offered: &[ServedCanvas],
+    resolutions: &[String],
+    aspect_ratios: &[String],
+) -> Result<Vec<ServedCanvas>> {
     if offered.is_empty() {
         return Err(Error::Unsupported(
             "the video denoiser prepares no canvas".into(),
         ));
     }
-    if configured.is_empty() {
+    if resolutions.is_empty() && aspect_ratios.is_empty() {
         return Ok(offered.to_vec());
     }
-    if configured.iter().any(|canvas| !offered.contains(canvas)) {
-        let names = |canvases: &[Canvas]| {
-            canvases
-                .iter()
-                .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        return Err(Error::Unsupported(format!(
-            "the denoiser offers only the canvases {}, not every canvas of {}",
-            names(offered),
-            names(configured)
-        )));
+
+    let mut edges = Vec::with_capacity(resolutions.len());
+    for name in resolutions {
+        let edge = name
+            .strip_suffix('p')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a video resolution is a class such as 768p, got {name:?}"
+                ))
+            })?;
+        edges.push(edge);
     }
-    Ok(configured.to_vec())
+    // Without names, every one the denoiser offers, in its own order.
+    if edges.is_empty() {
+        for served in offered {
+            if !edges.contains(&served.short_edge) {
+                edges.push(served.short_edge);
+            }
+        }
+    }
+    let mut ratios: Vec<&str> = aspect_ratios.iter().map(String::as_str).collect();
+    if ratios.is_empty() {
+        for served in offered {
+            if !ratios.contains(&served.aspect_ratio.as_str()) {
+                ratios.push(&served.aspect_ratio);
+            }
+        }
+    }
+    let distinct = |count: usize, unique: usize| count == unique;
+    if !distinct(edges.len(), edges.iter().collect::<HashSet<_>>().len())
+        || !distinct(ratios.len(), ratios.iter().collect::<HashSet<_>>().len())
+    {
+        return Err(Error::Invalid(
+            "a video resolution or aspect ratio repeats".into(),
+        ));
+    }
+
+    let mut admitted = Vec::with_capacity(edges.len() * ratios.len());
+    for &edge in &edges {
+        for &ratio in &ratios {
+            let served = offered
+                .iter()
+                .find(|served| served.short_edge == edge && served.aspect_ratio == ratio)
+                .ok_or_else(|| {
+                    let generated: Vec<String> = offered
+                        .iter()
+                        .map(|served| format!("{}p {}", served.short_edge, served.aspect_ratio))
+                        .collect();
+                    Error::Unsupported(format!(
+                        "the video denoiser generates only {}, not {edge}p {ratio}",
+                        generated.join(", ")
+                    ))
+                })?;
+            admitted.push(served.clone());
+        }
+    }
+    Ok(admitted)
 }
 
 /// The first default text capacity, in prompt tokens: a short prompt pads to
@@ -390,9 +447,8 @@ impl MediaPlan {
     /// the largest condition set the denoiser admits at the longest frame
     /// count, on the admitted canvas where it packs the most, so no request
     /// is refused for its conditions. A denoiser that admits no condition
-    /// gets none either way. `canvases` are the canvases the deployment
-    /// names, each one the denoiser offers; without any the deployment
-    /// prepares every offered canvas.
+    /// gets none either way. `admitted` are the canvases the deployment
+    /// prepares ([`admitted_canvases`]), in the order it names them.
     pub(crate) fn new(
         model: &VideoModel,
         max_seconds: f64,
@@ -400,7 +456,7 @@ impl MediaPlan {
         max_text_tokens: u32,
         requested: &[u32],
         stated_rows: Option<u32>,
-        canvases: &[Canvas],
+        admitted: Vec<ServedCanvas>,
     ) -> Result<Self> {
         let facts = &model.facts;
         let longest = model.legal_frame_count(requested_frames(max_seconds, facts.frame_rate))?;
@@ -419,10 +475,9 @@ impl MediaPlan {
                 "the video denoiser admits no frame count of the duration capacity".into(),
             ));
         }
-        let admitted = admitted_canvases(&facts.canvases, canvases)?;
         let mut admitted_rows = 0;
-        for &canvas in &admitted {
-            admitted_rows = admitted_rows.max(model.max_condition_rows(longest, canvas)?);
+        for served in &admitted {
+            admitted_rows = admitted_rows.max(model.max_condition_rows(longest, served.canvas)?);
         }
         let condition_rows = if admitted_rows == 0 {
             0
@@ -441,7 +496,7 @@ impl MediaPlan {
         // the condition capacity, bounds every layout of the canvas.
         let mut largest = Vec::with_capacity(admitted.len());
         let mut extents = Vec::with_capacity(admitted.len());
-        for &canvas in &admitted {
+        for canvas in admitted.iter().map(|served| served.canvas) {
             let plain = model.layout_size(&VideoSize::plain(longest, canvas, max_text_tokens))?;
             let layout = widen(plain)?;
             extents.push(CanvasExtent {
@@ -1168,20 +1223,56 @@ mod tests {
         Canvas { width, height }
     }
 
+    fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+        ServedCanvas {
+            short_edge,
+            aspect_ratio: aspect_ratio.to_owned(),
+            canvas: canvas(width, height),
+        }
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|&value| value.to_owned()).collect()
+    }
+
     #[test]
     fn a_deployment_admits_the_offered_canvases_it_names() {
-        let offered = [canvas(1536, 672), canvas(1344, 768), canvas(768, 1344)];
+        let offered = [
+            served(768, "21:9", 1536, 672),
+            served(768, "16:9", 1344, 768),
+            served(768, "9:16", 768, 1344),
+            served(480, "16:9", 832, 480),
+        ];
         // Without a selection every offered canvas is prepared.
-        assert_eq!(admitted_canvases(&offered, &[]).unwrap(), offered);
-        // A selection keeps the order the deployment names.
-        let named = [canvas(768, 1344), canvas(1344, 768)];
-        assert_eq!(admitted_canvases(&offered, &named).unwrap(), named);
-        // A canvas the denoiser does not offer refuses the deployment,
-        // naming what it offers.
-        let error = admitted_canvases(&offered, &[canvas(832, 480)]).unwrap_err();
+        assert_eq!(admitted_canvases(&offered, &[], &[]).unwrap(), offered);
+        // Resolutions cross aspect ratios resolution-major, in the order the
+        // deployment names them.
+        let admitted =
+            admitted_canvases(&offered, &names(&["480p", "768p"]), &names(&["16:9"])).unwrap();
+        assert_eq!(admitted, [offered[3].clone(), offered[1].clone()]);
+        let admitted =
+            admitted_canvases(&offered, &names(&["768p"]), &names(&["9:16", "16:9"])).unwrap();
+        assert_eq!(admitted, [offered[2].clone(), offered[1].clone()]);
+        // Without resolutions, every offered class takes their place.
+        let admitted = admitted_canvases(&offered, &[], &names(&["16:9"])).unwrap();
+        assert_eq!(admitted, [offered[1].clone(), offered[3].clone()]);
+        // A pair the denoiser does not name refuses the deployment, naming
+        // what it generates.
+        let error = admitted_canvases(&offered, &names(&["480p"]), &names(&["21:9"])).unwrap_err();
         assert!(matches!(&error, Error::Unsupported(message)
-            if message.contains("1536x672, 1344x768, 768x1344") && message.contains("832x480")));
-        assert!(admitted_canvases(&[], &[]).is_err());
+            if message.contains("768p 21:9, 768p 16:9") && message.contains("not 480p 21:9")));
+        // A name that is not a class, and a repeated name, are invalid.
+        for (resolutions, ratios) in [
+            (names(&["768"]), names(&[])),
+            (names(&["768p", "768p"]), names(&[])),
+            (names(&[]), names(&["16:9", "16:9"])),
+        ] {
+            assert!(matches!(
+                admitted_canvases(&offered, &resolutions, &ratios),
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert!(admitted_canvases(&[], &[], &[]).is_err());
     }
 
     #[test]
@@ -1234,7 +1325,10 @@ mod tests {
         }
         MediaPlan {
             frame_counts: vec![49, 121],
-            admitted: canvases.clone(),
+            admitted: vec![
+                served(768, "16:9", 1344, 768),
+                served(768, "9:16", 768, 1344),
+            ],
             canvases: canvases.clone(),
             text_capacities: vec![1024, 2048],
             max_text_tokens: 2048,

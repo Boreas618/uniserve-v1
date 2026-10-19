@@ -103,7 +103,7 @@ curl --fail-with-body http://127.0.0.1:8000/health
 curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.tool
 ```
 
-`/v1/capabilities` reports the served tasks and condition rules, canvases, durations, the output frame rate (`fps`) and audio sample rate, the frame rule of the video VAE (`frames`), schedule, prompt capacity, and media policy.
+`/v1/capabilities` reports the served tasks and condition rules, the canvases with the `short_edge` and `aspect_ratio` that select each, in the order the deployment names them, durations, the output frame rate (`fps`) and audio sample rate, the frame rule of the video VAE (`frames`), schedule, prompt capacity, and media policy.
 
 ### Deployments
 
@@ -156,7 +156,7 @@ NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity 
 | Option | Meaning |
 | --- | --- |
 | `--max-video-seconds` | Longest admitted duration, 4 to 15 seconds; 15 by default. |
-| `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. FastH3 serves `768p` and `480p`, the others `768p`. A request for any other canvas is refused. |
+| `--video-resolutions`, `--video-aspect-ratios` | The canvases startup prepares: each resolution with each aspect ratio, `768p` and `16:9,9:16` by default. The served checkpoint names the canvas of each pair, and the workers refuse at startup a pair it does not generate: FastH3 DMD exports generate `21:9`, `16:9`, `4:3`, `1:1`, `3:4` and `9:16` at `768p` and `480p`, the base checkpoint and OmniRef those ratios at `768p`. A request for any other canvas is refused. |
 | `--max-model-len` | Longest prompt presentation in tokens, vision tokens included; 16384 by default. The text encoder itself accepts up to 262144 positions; the default bounds the prompt capacities startup prepares layouts and storage for (`--video-text-capacities`). The official keyframe request presents 1935 tokens and the official video-plus-audio request 6913. |
 | `--video-text-capacities` | Prompt capacities below `--max-model-len` that startup prepares; `--max-model-len` itself is always the largest, and each prompt runs in the smallest capacity that holds it. By default 1024, then steps of 2048. |
 | `--max-running-requests` | Concurrently resident requests, up to the workers' request slots. |

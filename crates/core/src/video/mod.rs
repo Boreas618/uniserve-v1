@@ -196,6 +196,22 @@ impl FrameClips {
     }
 }
 
+/// A canvas a deployment serves, with the request fields that select it.
+///
+/// The model names each canvas it generates by the pair a request selects it
+/// with; the rank declares the canvases its deployment prepares in its
+/// handshake, in the order the operator named them, and the request rules
+/// resolve a target against exactly those.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServedCanvas {
+    /// `target.short_edge`: the resolution class, in pixels, such as 768.
+    pub short_edge: u32,
+    /// `target.aspect_ratio`: the display ratio as `W:H`, such as `16:9`.
+    pub aspect_ratio: String,
+    /// The raster this pair selects.
+    pub canvas: Canvas,
+}
+
 /// A vision patch grid: `t` temporal patches of `h` by `w` spatial patches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VisionGrid {

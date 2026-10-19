@@ -206,7 +206,7 @@ pub(super) mod tests {
         Target, VideoInputError,
     };
     use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
-    use uniserve_core::{Canvas, FrameClips, VideoTask};
+    use uniserve_core::{Canvas, FrameClips, ServedCanvas, VideoTask};
 
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -229,23 +229,43 @@ pub(super) mod tests {
         serde_json::from_value(fixture()["vision"].clone()).unwrap()
     }
 
-    /// The canvases of the vectors' accepted requests: what a deployment that
-    /// prepares them all serves.
-    pub(in crate::serving::video) fn served_canvases() -> Vec<Canvas> {
-        let mut canvases = Vec::new();
+    /// The canvases of the vectors' accepted requests, as a deployment that
+    /// prepares them all declares them. A `t2va` or `ref2va` request's ratio
+    /// names its canvas (`auto` naming 16:9); an `fl2va` canvas, which the
+    /// canvas rule resolves from a free ratio or the first keyframe, is
+    /// declared under its own size.
+    pub(in crate::serving::video) fn served_canvases() -> Vec<ServedCanvas> {
+        let mut declared: Vec<ServedCanvas> = Vec::new();
         for case in fixture()["requests"].as_array().unwrap() {
-            if let Some(expected) = case.get("expected") {
-                let pair = &expected["canvas"];
-                let canvas = Canvas {
-                    width: pair[0].as_u64().unwrap() as u32,
-                    height: pair[1].as_u64().unwrap() as u32,
-                };
-                if !canvases.contains(&canvas) {
-                    canvases.push(canvas);
-                }
+            let Some(expected) = case.get("expected") else {
+                continue;
+            };
+            let pair = &expected["canvas"];
+            let canvas = Canvas {
+                width: pair[0].as_u64().unwrap() as u32,
+                height: pair[1].as_u64().unwrap() as u32,
+            };
+            let target = &case["target"];
+            let short_edge = target["short_edge"].as_u64().unwrap() as u32;
+            let aspect_ratio = match (
+                case["task"].as_str().unwrap(),
+                target["aspect_ratio"].as_str().unwrap(),
+            ) {
+                ("fl2va", _) => format!("{}:{}", canvas.width, canvas.height),
+                (_, "auto") => "16:9".to_owned(),
+                (_, named) => named.to_owned(),
+            };
+            if !declared.iter().any(|served| {
+                served.short_edge == short_edge && served.aspect_ratio == aspect_ratio
+            }) {
+                declared.push(ServedCanvas {
+                    short_edge,
+                    aspect_ratio,
+                    canvas,
+                });
             }
         }
-        canvases
+        declared
     }
 
     /// Limits that serve every task and duration the model does, at the

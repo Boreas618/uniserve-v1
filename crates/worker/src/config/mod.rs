@@ -70,10 +70,13 @@ pub struct WorkerConfig {
     pub min_video_seconds: Option<f64>,
     /// Prompt-token capacities admitted by standalone denoiser layouts.
     pub video_text_capacities: Vec<usize>,
-    /// Canvases a video deployment prepares and admits, in the order the
-    /// deployment names them; empty prepares every canvas the denoiser
-    /// offers.
-    pub video_canvases: Vec<uniserve_core::Canvas>,
+    /// Resolution classes (`768p`) a video deployment prepares, crossed with
+    /// `video_aspect_ratios` resolution-major in the order the deployment
+    /// names them; empty takes every class the denoiser offers.
+    pub video_resolutions: Vec<String>,
+    /// Display aspect ratios (`16:9`) a video deployment prepares; empty
+    /// takes every ratio the denoiser offers.
+    pub video_aspect_ratios: Vec<String>,
     pub deployment_components: Vec<String>,
 
     /// Sampling shared by all generating canvases of this deployment.

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, FrameClips};
+use uniserve_core::{Canvas, FrameClips, ServedCanvas};
 use uniserve_ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
 
 use super::{DECODER, DENOISER, OUTPUTS};
@@ -30,9 +30,11 @@ pub(crate) struct VideoFacts {
     pub(crate) text_only: bool,
     pub(crate) video_shift: f64,
     pub(crate) audio_shift: f64,
-    /// Canvases the denoiser offers: a deployment prepares a selection of
-    /// them, or all of them without one, and admits only those.
-    pub(crate) canvases: Vec<Canvas>,
+    /// Canvases the denoiser offers, each named by the `(short_edge,
+    /// aspect_ratio)` a request selects it with: a deployment prepares a
+    /// selection of them by name, or all of them without one, and admits
+    /// only those.
+    pub(crate) canvases: Vec<ServedCanvas>,
     pub(crate) sample_dtype: DType,
     pub(crate) text_condition_width: u32,
     /// Output video frames per second.
@@ -291,17 +293,35 @@ impl VideoModel {
             narrow(value, name)
         };
 
-        let canvases = list("canvases")?
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[width, height]| {
-                Ok(Canvas {
-                    width: narrow(width, "canvas")?,
-                    height: narrow(height, "canvas")?,
+        // Each offered canvas is `[short_edge, aspect_ratio, width, height]`.
+        let canvases = {
+            let (function, value) = fact("canvases")?;
+            let failed = |error: tvm_ffi::Error| Error::numerical(function.name(), &error);
+            let entries: tvm_ffi::Array<Any> = value.try_into().map_err(failed)?;
+            entries
+                .iter()
+                .map(|entry| {
+                    let fields: tvm_ffi::Array<Any> = entry.try_into().map_err(failed)?;
+                    let fields: Vec<Any> = fields.iter().collect();
+                    let [short_edge, aspect_ratio, width, height] = <[Any; 4]>::try_from(fields)
+                        .map_err(|_| {
+                            Error::Interface(
+                                "a canvas is [short_edge, aspect_ratio, width, height]".into(),
+                            )
+                        })?;
+                    let integer = |value: Any| i64::try_from(value).map_err(failed);
+                    let aspect_ratio = tvm_ffi::String::try_from(aspect_ratio).map_err(failed)?;
+                    Ok(ServedCanvas {
+                        short_edge: narrow(integer(short_edge)?, "canvas")?,
+                        aspect_ratio: aspect_ratio.as_str().to_owned(),
+                        canvas: Canvas {
+                            width: narrow(integer(width)?, "canvas")?,
+                            height: narrow(integer(height)?, "canvas")?,
+                        },
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?
+        };
         let shifts = {
             let (function, value) = fact("schedule_shifts")?;
             let values: tvm_ffi::Array<Any> = value
@@ -391,7 +411,7 @@ impl VideoModel {
 
     /// The handshake's description of the denoiser on a deployment that
     /// prepares and admits `canvases`: its tasks as it states them.
-    pub(crate) fn denoiser_info(&self, canvases: &[Canvas]) -> VideoDenoiserInfo {
+    pub(crate) fn denoiser_info(&self, canvases: &[ServedCanvas]) -> VideoDenoiserInfo {
         VideoDenoiserInfo {
             tasks: self.facts.tasks.clone(),
             schedule_points: self.facts.num_steps + 1,

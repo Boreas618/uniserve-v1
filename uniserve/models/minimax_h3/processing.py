@@ -9,15 +9,17 @@ generated from the diffusers reference pipeline.
 
 This module calls the parts of the same rules that the model package and its
 tools use, through the rank runtime library (``uniserve._worker``): the
-tasks, the canvas rule, the FastH3 training buckets, the largest references
-a request may bring, which a denoiser provisions its condition capacity for,
-the canvas a target names without media, the frame count of a duration and
-the named aspect ratios.
+tasks, the canvas rule, the largest references a request may bring, which a
+denoiser provisions its condition capacity for, the canvas a target names
+among the canvases a deployment serves, and the frame count of a duration.
+The canvases the model generates, keyed by the names a request selects them
+with, are the model's own (``config.NAMED_CANVASES`` and
+``config.DMD_CANVASES``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -28,11 +30,9 @@ from uniserve.worker import library
 from .packing import FPS, align_num_frames, video_latent_frames
 
 __all__ = [
-    "NAMED_ASPECT_RATIOS",
     "PlanError",
     "ReferenceBounds",
     "Task",
-    "buckets",
     "canvas",
     "frame_count",
     "named_canvas",
@@ -46,19 +46,6 @@ def _canvases(values: Sequence[int]) -> tuple[image.Config, ...]:
         image.Config(height=int(height), width=int(width))
         for width, height in zip(values[::2], values[1::2], strict=True)
     )
-
-
-def _ratios(values: Sequence[int]) -> tuple[tuple[int, int], ...]:
-    """Aspect ratios from the rules' flat ``[width, height, ...]``."""
-    return tuple(
-        (int(width), int(height))
-        for width, height in zip(values[::2], values[1::2], strict=True)
-    )
-
-
-# The aspect ratios t2va and ref2va accept besides ``auto``, as
-# ``(width, height)`` in canonical order.
-NAMED_ASPECT_RATIOS = _ratios(library()["video_aspect_ratios"]())
 
 
 class Task(StrEnum):
@@ -109,15 +96,6 @@ def canvas(aspect_width: float, aspect_height: float) -> image.Config:
         float(aspect_width), float(aspect_height)
     )
     return _canvases(values)[0]
-
-
-def buckets() -> tuple[image.Config, ...]:
-    """Return the FastH3 training buckets, which DMD exports generate.
-
-    The named aspect ratios' canvases at the canvas rule's 768-pixel short
-    edge, then at the 480-pixel one, each in ``NAMED_ASPECT_RATIOS`` order.
-    """
-    return _canvases(library()["video_buckets"]())
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,20 +179,31 @@ def _frame_clips() -> list[int]:
 
 
 def named_canvas(
-    task: Task, *, short_edge: int, aspect_ratio: str
+    task: Task,
+    *,
+    short_edge: int,
+    aspect_ratio: str,
+    canvases: Mapping[tuple[int, str], image.Config],
 ) -> image.Config | None:
     """Return the canvas a target names without media.
 
-    ``None`` for ``fl2va`` with ``auto``, whose canvas follows the first
-    keyframe. At the canvas rule's 768-pixel short edge a ratio resolves
-    through ``canvas``; another short edge names its training bucket.
+    ``canvases`` are the canvases a deployment serves, keyed by the
+    ``(short_edge, "W:H")`` a request selects them with, such as the model's
+    ``config.NAMED_CANVASES``. ``auto`` is 16:9 for ``t2va`` and ``ref2va``;
+    ``None`` is ``fl2va`` with ``auto``, whose canvas follows the first
+    keyframe. ``fl2va`` also takes any ratio from 1:4 to 4:1, which the canvas
+    rule resolves at its 768-pixel short edge.
 
     Raises:
-        PlanError: The task does not accept the aspect ratio, or the short
-            edge has no canvas for it.
+        PlanError: No served canvas the ratio names at the short edge, and
+            the canvas rule does not apply to it.
     """
+    served = [
+        [int(edge), str(ratio), raster.width, raster.height]
+        for (edge, ratio), raster in canvases.items()
+    ]
     rejection, values = library()["video_named_canvas"](
-        task.value, int(short_edge), aspect_ratio
+        task.value, int(short_edge), aspect_ratio, served
     )
     _raise(rejection)
     return None if values is None else _canvases(values)[0]

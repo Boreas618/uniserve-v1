@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{ConditionMedia, ConditionVision, FrameClips, ImageFit, MediaLocator};
-use super::{VideoCondition, VisionGrid};
+use super::{ServedCanvas, VideoCondition, VisionGrid};
 use crate::{Canvas, VideoTask};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
@@ -59,43 +59,8 @@ pub const CANVAS_MULTIPLE: u32 = 32;
 pub const MIN_ASPECT_RATIO: f64 = 0.25;
 /// Widest accepted width-to-height ratio, 4:1.
 pub const MAX_ASPECT_RATIO: f64 = 4.0;
-/// The aspect ratios `t2va` and `ref2va` accept besides `auto`.
-pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
-    [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)];
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
-
-/// Short edges of the FastH3 training buckets, in pixels: the canvas rule's
-/// 768 and 480.
-pub const BUCKET_SHORT_EDGES: [u32; 2] = [768, 480];
-
-const fn bucket_canvas(width: u32, height: u32) -> Canvas {
-    Canvas { width, height }
-}
-
-/// The FastH3 training buckets: for each short edge of
-/// [`BUCKET_SHORT_EDGES`], the canvas of each ratio of
-/// [`NAMED_ASPECT_RATIOS`]. The 768-pixel buckets are the canvas rule's
-/// canvases; the 480-pixel ones are the training table's own rather than a
-/// rescaled rule (21:9 is 992x416, not 960x416).
-const BUCKETS: [[Canvas; 6]; 2] = [
-    [
-        bucket_canvas(1536, 672),
-        bucket_canvas(1344, 768),
-        bucket_canvas(1024, 768),
-        bucket_canvas(768, 768),
-        bucket_canvas(768, 1024),
-        bucket_canvas(768, 1344),
-    ],
-    [
-        bucket_canvas(992, 416),
-        bucket_canvas(832, 480),
-        bucket_canvas(640, 480),
-        bucket_canvas(480, 480),
-        bucket_canvas(480, 640),
-        bucket_canvas(480, 832),
-    ],
-];
 
 /// Short edge the released checkpoint encodes an image reference at, and the
 /// longest a deployment encodes one at ([`ReferenceConfig`]).
@@ -581,28 +546,6 @@ pub fn rule_canvases() -> Vec<Canvas> {
     canvases
 }
 
-/// The training bucket of a short edge and a named ratio; `None` when no
-/// bucket has them.
-pub fn bucket(short_edge: u32, ratio: (u32, u32)) -> Option<Canvas> {
-    let edge = BUCKET_SHORT_EDGES
-        .iter()
-        .position(|&edge| edge == short_edge)?;
-    let named = NAMED_ASPECT_RATIOS
-        .iter()
-        .position(|&named| named == ratio)?;
-    Some(BUCKETS[edge][named])
-}
-
-/// The short edge of the training bucket with exactly this canvas; `None`
-/// when no bucket has it.
-pub fn bucket_short_edge(canvas: Canvas) -> Option<u32> {
-    BUCKET_SHORT_EDGES
-        .into_iter()
-        .zip(BUCKETS)
-        .find(|(_, buckets)| buckets.contains(&canvas))
-        .map(|(edge, _)| edge)
-}
-
 /// Frames of `seconds` of video at `fps`: the product rounded half to even,
 /// as the reference implementations round with Python's `round`.
 pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
@@ -641,8 +584,8 @@ pub fn video_frame_count(
 /// The requested output, as the request states it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Target<'a> {
-    /// `target.short_edge`: 768, the canvas rule's, or 480 where the
-    /// deployment serves a FastH3 export's 480p buckets.
+    /// `target.short_edge`: the resolution class, in pixels, of a canvas the
+    /// deployment serves; 768 is the canvas rule's.
     pub short_edge: u32,
     /// `target.aspect_ratio`: `auto` or `W:H`.
     pub aspect_ratio: &'a str,
@@ -757,23 +700,23 @@ pub struct PlanLimits {
     /// declares it: the frame counts it generates and a reference video's
     /// encoded frames and latent units follow from it.
     pub frames: FrameClips,
-    /// The only canvases the deployment serves: those its workers prepare
-    /// and declare in their handshake.
-    pub canvases: Vec<Canvas>,
+    /// The only canvases the deployment serves, as its workers declare them
+    /// in their handshake: each with the `target.short_edge` and
+    /// `target.aspect_ratio` that select it, in the order the deployment
+    /// names them.
+    pub canvases: Vec<ServedCanvas>,
     /// How the deployment sizes references.
     pub references: ReferenceConfig,
 }
 
 impl PlanLimits {
     /// The `target.short_edge` values the deployment serves, in the order of
-    /// its canvases: each served canvas's training-bucket short edge, or the
-    /// canvas rule's 768 for a canvas no bucket has.
+    /// its canvases.
     pub fn short_edges(&self) -> Vec<u32> {
         let mut edges = Vec::new();
-        for &canvas in &self.canvases {
-            let edge = bucket_short_edge(canvas).unwrap_or(CANVAS_SHORT_EDGE);
-            if !edges.contains(&edge) {
-                edges.push(edge);
+        for served in &self.canvases {
+            if !edges.contains(&served.short_edge) {
+                edges.push(served.short_edge);
             }
         }
         edges
@@ -1607,110 +1550,80 @@ fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
     Some((side(width)?, side(height)?))
 }
 
-/// The aspect ratio a target asks for: a named ratio for `t2va` and
-/// `ref2va` (`auto` being 16:9), any ratio within 1:4 to 4:1 for `fl2va`,
-/// and `None` for `fl2va` with `auto`, whose canvas follows the first
-/// keyframe.
-fn requested_ratio(
-    task: VideoTask,
-    aspect_ratio: &str,
-) -> Result<Option<(u32, u32)>, VideoInputError> {
-    if aspect_ratio == "auto" {
-        return Ok((task != VideoTask::Fl2va).then_some(DEFAULT_ASPECT_RATIO));
-    }
-    let ratio = parse_aspect_ratio(aspect_ratio);
-    let (accepted, allowed) = match task {
-        VideoTask::Fl2va => (
-            ratio.is_some_and(|(width, height)| {
-                (MIN_ASPECT_RATIO..=MAX_ASPECT_RATIO)
-                    .contains(&(f64::from(width) / f64::from(height)))
-            }),
-            "auto or W:H within 1:4 to 4:1".to_owned(),
-        ),
-        VideoTask::T2va | VideoTask::Ref2va => {
-            let named: Vec<String> = NAMED_ASPECT_RATIOS
-                .iter()
-                .map(|(width, height)| format!("{width}:{height}"))
-                .collect();
-            (
-                ratio.is_some_and(|ratio| NAMED_ASPECT_RATIOS.contains(&ratio)),
-                format!("auto or one of {}", named.join(", ")),
-            )
-        }
-    };
-    match ratio {
-        Some(ratio) if accepted => Ok(Some(ratio)),
-        _ => Err(VideoInputError::invalid(
-            RequestField::TargetAspectRatio,
-            format!("must be {allowed}, got {aspect_ratio:?}"),
-        )),
-    }
-}
-
 /// The canvas a target names without consulting media; `None` for `fl2va`
 /// with `auto`, whose canvas follows the first keyframe.
 ///
-/// At the canvas rule's 768-pixel short edge a ratio resolves through
-/// [`canvas`]. Another short edge names the FastH3 training bucket of that
-/// short edge ([`bucket`]), whose sides the rule does not produce: 480p 21:9
-/// is 992x416.
+/// `canvases` are the canvases a deployment serves, each with the
+/// `(short_edge, aspect_ratio)` that selects it. `auto` is 16:9 for `t2va`
+/// and `ref2va`. A `W:H` ratio named at the target's short edge selects that
+/// canvas. `fl2va` also takes any ratio from 1:4 to 4:1, which the canvas
+/// rule ([`canvas`]) resolves at its 768-pixel short edge; a deployment
+/// serves such a canvas only when it is one of `canvases`.
 ///
 /// # Errors
 ///
-/// Returns [`VideoInputError::Invalid`] for `target.aspect_ratio` when the
-/// task does not accept the ratio or the short edge has no canvas for it.
+/// Returns [`VideoInputError::Invalid`] for `target.aspect_ratio` when no
+/// canvas the ratio names is served at the target's short edge and the
+/// canvas rule does not apply to it.
 pub fn named_canvas(
     task: VideoTask,
     target: &Target<'_>,
+    canvases: &[ServedCanvas],
 ) -> Result<Option<Canvas>, VideoInputError> {
-    let Some((width, height)) = requested_ratio(task, target.aspect_ratio)? else {
+    let name = if target.aspect_ratio != "auto" {
+        target.aspect_ratio.to_owned()
+    } else if task == VideoTask::Fl2va {
         return Ok(None);
+    } else {
+        format!("{}:{}", DEFAULT_ASPECT_RATIO.0, DEFAULT_ASPECT_RATIO.1)
     };
-    if target.short_edge == CANVAS_SHORT_EDGE {
+    let at_edge = || {
+        canvases
+            .iter()
+            .filter(|served| served.short_edge == target.short_edge)
+    };
+    if let Some(served) = at_edge().find(|served| served.aspect_ratio == name) {
+        return Ok(Some(served.canvas));
+    }
+
+    let by_rule = task == VideoTask::Fl2va && target.short_edge == CANVAS_SHORT_EDGE;
+    if by_rule && let Some((width, height)) = parse_aspect_ratio(&name) {
         return canvas(f64::from(width), f64::from(height))
             .map(Some)
             .map_err(|error| {
                 VideoInputError::invalid(RequestField::TargetAspectRatio, error.to_string())
             });
     }
-    bucket(target.short_edge, (width, height))
-        .map(Some)
-        .ok_or_else(|| {
-            VideoInputError::invalid(
-                RequestField::TargetAspectRatio,
-                format!(
-                    "{width}:{height} has no canvas at a {}-pixel short edge",
-                    target.short_edge
-                ),
-            )
-        })
-}
 
-/// Every named aspect ratio the deployment serves at each of its short edges,
-/// with the canvas it resolves to, short edge by short edge in
-/// [`NAMED_ASPECT_RATIOS`] order.
-pub fn served_canvases(limits: &PlanLimits) -> Vec<(u32, String, Canvas)> {
-    let mut served = Vec::new();
-    for short_edge in limits.short_edges() {
-        for (width, height) in NAMED_ASPECT_RATIOS {
-            let aspect_ratio = format!("{width}:{height}");
-            let target = Target {
-                short_edge,
-                aspect_ratio: &aspect_ratio,
-                duration_seconds: None,
-            };
-            if let Ok(Some(size)) = named_canvas(VideoTask::T2va, &target)
-                && check_served(size, limits).is_ok()
-            {
-                served.push((short_edge, aspect_ratio, size));
-            }
-        }
+    let served: Vec<&str> = at_edge()
+        .map(|served| served.aspect_ratio.as_str())
+        .collect();
+    if served.is_empty() && !by_rule {
+        return Err(VideoInputError::invalid(
+            RequestField::TargetAspectRatio,
+            format!(
+                "names no canvas: no canvas is served at a {}-pixel short edge, got {:?}",
+                target.short_edge, target.aspect_ratio
+            ),
+        ));
     }
-    served
+    let allowed = match (task, by_rule) {
+        (VideoTask::Fl2va, true) => "auto or W:H within 1:4 to 4:1".to_owned(),
+        (VideoTask::Fl2va, false) => format!("one of {}", served.join(", ")),
+        _ => format!("auto or one of {}", served.join(", ")),
+    };
+    Err(VideoInputError::invalid(
+        RequestField::TargetAspectRatio,
+        format!(
+            "must be {allowed} at a {}-pixel short edge, got {:?}",
+            target.short_edge, target.aspect_ratio
+        ),
+    ))
 }
 
+/// Checks that a canvas is one the deployment's workers prepared.
 fn check_served(size: Canvas, limits: &PlanLimits) -> Result<(), VideoInputError> {
-    if limits.canvases.contains(&size) {
+    if limits.canvases.iter().any(|served| served.canvas == size) {
         return Ok(());
     }
     Err(VideoInputError::invalid(
@@ -1758,7 +1671,7 @@ pub fn check_request(
         ));
     }
 
-    if let Some(size) = named_canvas(task, target)? {
+    if let Some(size) = named_canvas(task, target, &limits.canvases)? {
         check_served(size, limits)?;
     }
 
@@ -1994,8 +1907,9 @@ fn target_canvas(
     task: VideoTask,
     target: &Target<'_>,
     media: &[MediaFacts],
+    limits: &PlanLimits,
 ) -> Result<Canvas, VideoInputError> {
-    if let Some(size) = named_canvas(task, target)? {
+    if let Some(size) = named_canvas(task, target, &limits.canvases)? {
         return Ok(size);
     }
     // fl2va with `auto`: the conditions are keyframes and the first one sets
@@ -2150,7 +2064,7 @@ pub fn plan_request(
     }
     let (duration_seconds, frames) = resolve_frames(target, &soundtracks, limits)?;
 
-    let size = target_canvas(task, target, media)?;
+    let size = target_canvas(task, target, media, limits)?;
     check_served(size, limits)?;
 
     let mut plans = Vec::with_capacity(conditions.len());
@@ -2192,16 +2106,15 @@ pub(super) mod tests {
     use super::super::presentation::present;
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
-        ConditionType, FrameClips, FramePosition, FrameRate, ImageFacts, KeyframeFit,
-        MAX_ASPECT_RATIO, MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared,
-        ProcessorConfig, REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig, RequestField, RequestPlan,
-        Role, Target, VideoFacts, VideoInputError, VideoTask, Vision, audio_clip, bucket,
-        bucket_short_edge, canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
-        reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
-        video_reference,
+        AudioClip, AudioFacts, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
+        FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
+        MediaFacts, PlanLimits, Prepared, ProcessorConfig, REFERENCE_IMAGE_SHORT_EDGE,
+        ReferenceConfig, RequestField, RequestPlan, Role, Target, VideoFacts, VideoInputError,
+        VideoTask, Vision, audio_clip, canvas, check_request, cover_crop, gcd, plan_request,
+        reference_bounds, reference_image_size, requested_frames, rows_per_frame, rule_canvases,
+        video_frame_count, video_reference,
     };
-    use crate::MediaLocator;
+    use crate::{MediaLocator, ServedCanvas};
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {
@@ -2228,19 +2141,46 @@ pub(super) mod tests {
         tail_latent_frames: 2,
     };
 
-    /// The canvases of the vectors' accepted requests: what a deployment that
-    /// prepares them all serves.
-    pub(in crate::video) fn vector_canvases() -> Vec<Canvas> {
-        let mut canvases = Vec::new();
+    /// The canvases of the vectors' accepted requests, as a deployment that
+    /// prepares them all declares them. A `t2va` or `ref2va` request's ratio
+    /// names its canvas (`auto` naming 16:9); an `fl2va` canvas, which the
+    /// canvas rule resolves from a free ratio or the first keyframe, is
+    /// declared under its own size.
+    pub(in crate::video) fn vector_canvases() -> Vec<ServedCanvas> {
+        let mut declared: Vec<ServedCanvas> = Vec::new();
         for case in fixture()["requests"].as_array().unwrap() {
-            if let Some(expected) = case.get("expected") {
-                let canvas = size(&expected["canvas"]);
-                if !canvases.contains(&canvas) {
-                    canvases.push(canvas);
-                }
+            let Some(expected) = case.get("expected") else {
+                continue;
+            };
+            let canvas = size(&expected["canvas"]);
+            let target = &case["target"];
+            let short_edge = target["short_edge"].as_u64().unwrap() as u32;
+            let named = target["aspect_ratio"].as_str().unwrap();
+            let aspect_ratio = match (case["task"].as_str().unwrap(), named) {
+                ("fl2va", _) => format!("{}:{}", canvas.width, canvas.height),
+                (_, "auto") => "16:9".to_owned(),
+                (_, named) => named.to_owned(),
+            };
+            if !declared.iter().any(|served| {
+                served.short_edge == short_edge && served.aspect_ratio == aspect_ratio
+            }) {
+                declared.push(ServedCanvas {
+                    short_edge,
+                    aspect_ratio,
+                    canvas,
+                });
             }
         }
-        canvases
+        declared
+    }
+
+    /// The canvas a deployment declares for a short edge and aspect ratio.
+    fn served(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+        ServedCanvas {
+            short_edge,
+            aspect_ratio: aspect_ratio.to_owned(),
+            canvas: Canvas { width, height },
+        }
     }
 
     /// Limits that serve every task and duration the model does, at the
@@ -2464,44 +2404,6 @@ pub(super) mod tests {
             })
             .collect();
         assert_eq!(swept, unique);
-    }
-
-    /// The 768-pixel training buckets are the canvas rule's canvases of the
-    /// named ratios; the 480-pixel ones are the training table's own, and a
-    /// canvas names its bucket's short edge.
-    #[test]
-    fn buckets_name_the_training_canvases() {
-        for ratio in NAMED_ASPECT_RATIOS {
-            let rule = canvas(f64::from(ratio.0), f64::from(ratio.1)).unwrap();
-            assert_eq!(bucket(768, ratio), Some(rule), "{ratio:?}");
-            for short_edge in BUCKET_SHORT_EDGES {
-                let canvas = bucket(short_edge, ratio).unwrap();
-                assert_eq!((canvas.width % 32, canvas.height % 32), (0, 0));
-                assert_eq!(bucket_short_edge(canvas), Some(short_edge));
-                // A mirrored ratio has the transposed bucket.
-                let mirrored = bucket(short_edge, (ratio.1, ratio.0));
-                if let Some(mirrored) = mirrored {
-                    assert_eq!(
-                        (mirrored.width, mirrored.height),
-                        (canvas.height, canvas.width)
-                    );
-                }
-            }
-        }
-        let narrow = Canvas {
-            width: 992,
-            height: 416,
-        };
-        assert_eq!(bucket(480, (21, 9)), Some(narrow));
-        assert_eq!(
-            bucket_short_edge(Canvas {
-                width: 960,
-                height: 416
-            }),
-            None
-        );
-        assert_eq!(bucket(720, (16, 9)), None);
-        assert_eq!(bucket(768, (3, 2)), None);
     }
 
     /// A duration's frames round half to even, as Python's `round` does:
@@ -3081,10 +2983,7 @@ pub(super) mod tests {
         let fixture = fixture();
         let vision = vision(&fixture);
         let limits = PlanLimits {
-            canvases: vec![Canvas {
-                width: 1344,
-                height: 768,
-            }],
+            canvases: vec![served(768, "16:9", 1344, 768)],
             ..limits()
         };
         let plan =
@@ -3099,17 +2998,21 @@ pub(super) mod tests {
         assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
     }
 
-    /// A deployment serving 480p buckets accepts their short edge: a named
-    /// ratio resolves to the training bucket rather than a rescaled canvas
-    /// rule, and a short edge or bucket the deployment did not prepare is
-    /// refused before any media is needed.
+    /// A deployment that declares 480p canvases accepts their short edge: a
+    /// ratio names the canvas the deployment declares for it rather than a
+    /// rescaled canvas rule, and a short edge or ratio the deployment did not
+    /// prepare is refused before any media is needed.
     #[test]
-    fn served_buckets_resolve_each_short_edge() {
+    fn declared_canvases_resolve_each_short_edge() {
         let fixture = fixture();
         let vision = vision(&fixture);
         let canvas = |width, height| Canvas { width, height };
         let served = PlanLimits {
-            canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+            canvases: vec![
+                served(768, "16:9", 1344, 768),
+                served(480, "21:9", 992, 416),
+                served(480, "16:9", 832, 480),
+            ],
             ..limits()
         };
         assert_eq!(served.short_edges(), vec![768, 480]);
@@ -3150,6 +3053,60 @@ pub(super) mod tests {
         };
         let error = check_request(VideoTask::T2va, &target, &[], &limits()).unwrap_err();
         assert_eq!(error.field(), Some(RequestField::TargetShortEdge));
+    }
+
+    /// `fl2va` takes any ratio from 1:4 to 4:1, which the canvas rule
+    /// resolves at its 768-pixel short edge, but only onto a canvas the
+    /// deployment declares; `t2va` takes only a declared ratio.
+    #[test]
+    fn free_keyframe_ratios_land_on_a_declared_canvas() {
+        let limits = PlanLimits {
+            canvases: vec![served(768, "16:9", 1344, 768)],
+            ..limits()
+        };
+        let keyframe = ConditionSpec {
+            condition_type: ConditionType::Image,
+            role: Role::Keyframe,
+            frame_index: Some(0),
+            start_seconds: None,
+        };
+        let target = |aspect_ratio| Target {
+            aspect_ratio,
+            ..FIVE_SECONDS
+        };
+        // 7:4 at a 768-pixel short edge is 1344x768, the declared canvas.
+        let fl2va = |aspect_ratio| {
+            check_request(
+                VideoTask::Fl2va,
+                &target(aspect_ratio),
+                std::slice::from_ref(&keyframe),
+                &limits,
+            )
+        };
+        assert!(fl2va("7:4").is_ok());
+        assert!(fl2va("16:9").is_ok());
+        // 4:3 is 1024x768, which the deployment does not serve.
+        let error = fl2va("4:3").unwrap_err();
+        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
+        // t2va names only the declared ratios, and auto names 16:9.
+        assert!(check_request(VideoTask::T2va, &target("auto"), &[], &limits).is_ok());
+        let error = check_request(VideoTask::T2va, &target("7:4"), &[], &limits).unwrap_err();
+        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
+        assert!(error.to_string().contains("auto or one of 16:9"), "{error}");
+
+        // A short edge that serves no canvas names none, for any ratio.
+        let narrow = Target {
+            short_edge: 480,
+            ..target("16:9")
+        };
+        let error = super::named_canvas(VideoTask::T2va, &narrow, &limits.canvases).unwrap_err();
+        assert_eq!(error.field(), Some(RequestField::TargetAspectRatio));
+        assert!(
+            error
+                .to_string()
+                .contains("no canvas is served at a 480-pixel short edge"),
+            "{error}"
+        );
     }
 
     /// The served maximum duration narrows the model's own range.

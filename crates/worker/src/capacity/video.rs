@@ -17,7 +17,7 @@ use uniserve_ipc::{DType, DimBound, MediaCall, OutputInfo, ShapeBound};
 use super::plan::{MediaFacts, product_bytes};
 use crate::config::WorkerConfig;
 use crate::host::mux::encoded_unit_bytes;
-use crate::request::video::MediaPlan;
+use crate::request::video::{MediaPlan, admitted_canvases};
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::{SamplePages, StateEnvelope};
 use crate::storage::LatentPlan;
@@ -163,6 +163,11 @@ pub(crate) fn plan(
         .iter()
         .map(|&capacity| u32::try_from(capacity).unwrap_or(u32::MAX))
         .collect();
+    let admitted = admitted_canvases(
+        &model.facts.canvases,
+        &config.video_resolutions,
+        &config.video_aspect_ratios,
+    )?;
     let media = MediaPlan::new(
         model,
         config.max_video_seconds,
@@ -170,7 +175,7 @@ pub(crate) fn plan(
         tokens,
         &requested,
         config.max_condition_rows,
-        &config.video_canvases,
+        admitted,
     )?;
     let pages = SamplePages::plan(model, &media.largest)?;
     let envelope = if denoising {

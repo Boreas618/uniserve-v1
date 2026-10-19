@@ -10,9 +10,10 @@
 //! The Dynamo frontend forwards each `/v1/videos` request to
 //! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
 //! The worker serves FastH3 text-to-video-and-audio at the canvases its
-//! `--video-resolutions` and `--video-aspect-ratios` prepare, and refuses at
-//! startup a deployment that serves any other task or canvas, such as a
-//! MiniMax-H3 base checkpoint: `prepare_request` maps the Dynamo request onto
+//! `--video-resolutions` and `--video-aspect-ratios` prepare, as the started
+//! deployment declares them, and refuses at startup a deployment that serves
+//! any other task, such as a MiniMax-H3 base checkpoint, or a canvas name its
+//! model does not generate: `prepare_request` maps the Dynamo request onto
 //! a `t2va` request of UniServe's video API and refuses any control FastH3
 //! does not implement rather than ignoring it. The request then enters
 //! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
@@ -82,8 +83,6 @@ use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerP
 use uniserve_server::{
     AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
-    profile::omni::resolution::ResolutionName,
-    profile::video::{VideoRasters, VideoResolution},
     serving::{
         ServeRequestId,
         video::artifact::{ArtifactCollector, VideoStreamError},
@@ -138,10 +137,10 @@ struct Args {
     max_video_seconds: f64,
 
     #[arg(long, value_delimiter = ',', default_value = "768p")]
-    video_resolutions: Vec<VideoResolution>,
+    video_resolutions: Vec<String>,
 
     #[arg(long, value_delimiter = ',', default_value = "16:9,9:16")]
-    video_aspect_ratios: Vec<ResolutionName>,
+    video_aspect_ratios: Vec<String>,
 
     #[arg(long, default_value_t = 2)]
     max_running_requests: usize,
@@ -161,11 +160,8 @@ struct Args {
 /// UniServe engine.
 pub struct DynamoFastH3Engine {
     args: Args,
-    /// The validated product of `--video-resolutions` and
-    /// `--video-aspect-ratios`.
-    rasters: VideoRasters,
-    /// What the started deployment generates, set once by `start` with
-    /// `state`.
+    /// What the started deployment generates, and at which rasters, set once
+    /// by `start` with `state`.
     outputs: OnceCell<Outputs>,
     /// The UniServe serving state, set once by `start`. Every other trait
     /// method reads it and treats an unset state as not started.
@@ -182,9 +178,10 @@ impl DynamoFastH3Engine {
     /// Clap exits the process on a malformed command line, including an
     /// unreadable or invalid `--workers` deployment file. Settings this
     /// worker cannot honor (disaggregation, encoder routing, RL routes, a
-    /// non-finite or non-positive video length, a zero request limit, an
-    /// empty, repeated or untrained video raster selection) return
-    /// an invalid-argument error. No rank starts until `RawEngine::start`.
+    /// non-finite or non-positive video length, a zero request limit) return
+    /// an invalid-argument error. No rank starts until `RawEngine::start`,
+    /// whose workers refuse a video canvas selection the model does not
+    /// generate.
     pub fn from_args() -> Result<(Self, DynamoWorkerConfig), DynamoError> {
         Self::try_from_args(<Args as Parser>::parse())
     }
@@ -204,8 +201,6 @@ impl DynamoFastH3Engine {
         if args.max_running_requests == 0 {
             return Err(invalid_argument("max-running-requests must be positive"));
         }
-        let rasters = VideoRasters::new(&args.video_resolutions, &args.video_aspect_ratios)
-            .map_err(|error| invalid_argument(error.to_string()))?;
 
         let config = DynamoWorkerConfig {
             namespace: args.common.namespace.clone(),
@@ -229,7 +224,6 @@ impl DynamoFastH3Engine {
         Ok((
             Self {
                 args,
-                rasters,
                 outputs: OnceCell::new(),
                 state: OnceCell::new(),
                 cancel: CancellationToken::new(),
@@ -245,8 +239,9 @@ impl DynamoFastH3Engine {
     /// cannot be resolved or does not name MiniMax H3, when the configuration
     /// does not validate, or when the started model reports no video
     /// capabilities or not FastH3's. It fails with an engine error when
-    /// UniServe cannot start. A refusal after startup shuts the engine down
-    /// before returning.
+    /// UniServe cannot start, including a canvas selection its workers
+    /// refuse. A refusal after startup shuts the engine down before
+    /// returning.
     async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
@@ -318,7 +313,7 @@ impl DynamoFastH3Engine {
             let _ = state.engine().shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
-        let outputs = match check_fasth3(&capabilities, &self.rasters) {
+        let outputs = match check_fasth3(&capabilities) {
             Ok(outputs) => outputs,
             Err(mismatch) => {
                 let _ = state.engine().shutdown().await;
@@ -338,7 +333,7 @@ impl RawEngine for DynamoFastH3Engine {
             return Err(engine_error("UniServe engine already started"));
         }
         let (state, outputs) = self.build_state().await?;
-        let runtime_data = runtime_data(self.args.max_video_seconds, &self.rasters, &outputs);
+        let runtime_data = runtime_data(self.args.max_video_seconds, &outputs);
         self.state
             .set(state)
             .map_err(|_| engine_error("UniServe engine already started"))?;
@@ -372,7 +367,7 @@ impl RawEngine for DynamoFastH3Engine {
             request,
             &self.args.served_model_name,
             self.args.max_video_seconds,
-            &self.rasters,
+            &outputs.rasters,
         )?;
         // The Dynamo context id is the UniServe request id, so `abort` can name
         // the same request from its own context.
@@ -389,7 +384,7 @@ impl RawEngine for DynamoFastH3Engine {
         let cancel = self.cancel.clone();
         let served_model_name = self.args.served_model_name.clone();
         let response_format = prepared.response_format;
-        let outputs = *outputs;
+        let outputs = outputs.clone();
 
         // Unless stopped, the stream yields exactly one item: the response
         // object, or the error that ended the request. A Dynamo stop or
@@ -549,9 +544,10 @@ struct PreparedRequest {
 /// target is the selected raster and the request's duration.
 ///
 /// The raster is selected by `size` (`WIDTHxHEIGHT`, one of the served
-/// rasters), by the passthrough `resolution` and `aspect_ratio` fields, or by
-/// both when they name the same raster; omitted, it is the deployment's
-/// default. Its resolution class names the target's short edge.
+/// rasters), by the passthrough `resolution` (`768p`) and `aspect_ratio`
+/// fields, or by both when they name the same raster; omitted, it is the
+/// deployment's default, the first it declares. Its resolution class names
+/// the target's short edge.
 /// Omitted fields default to seed 0, a `url` response, and 5 seconds, capped
 /// at `max_video_seconds`; the video service bounds the duration and derives
 /// the frame count when it plans the target.
@@ -560,7 +556,7 @@ fn prepare_request(
     value: Value,
     served_model_name: &str,
     max_video_seconds: f64,
-    rasters: &VideoRasters,
+    rasters: &Rasters,
 ) -> Result<PreparedRequest, DynamoError> {
     let request: DynamoVideoRequest = serde_json::from_value(value)
         .map_err(|error| invalid_argument(format!("invalid video request: {error}")))?;
@@ -585,7 +581,7 @@ fn prepare_request(
     {
         return Err(invalid_argument("output_format must be mp4"));
     }
-    let (mut resolution, mut aspect_ratio) = passthrough_raster(request.extra_args)?;
+    let (mut short_edge, mut aspect_ratio) = passthrough_raster(request.extra_args)?;
     if let Some(size) = request.size.as_deref() {
         let raster = size
             .split_once('x')
@@ -594,24 +590,26 @@ fn prepare_request(
             .ok_or_else(|| {
                 invalid_argument(format!(
                     "size must be one of {}",
-                    served_sizes(rasters).join(", ")
+                    rasters.sizes().join(", ")
                 ))
             })?;
-        if resolution.is_some_and(|value| value != raster.resolution)
-            || aspect_ratio.is_some_and(|value| value != raster.aspect_ratio)
+        if short_edge.is_some_and(|value| value != raster.short_edge)
+            || aspect_ratio
+                .as_deref()
+                .is_some_and(|value| value != raster.aspect_ratio)
         {
             return Err(invalid_argument(format!(
                 "size {size} conflicts with resolution or aspect_ratio"
             )));
         }
-        resolution = Some(raster.resolution);
-        aspect_ratio = Some(raster.aspect_ratio);
+        short_edge = Some(raster.short_edge);
+        aspect_ratio = Some(raster.aspect_ratio.clone());
     }
     // Refuse an unprovisioned raster here; the video service refuses it
     // again when it plans the target.
     let raster = rasters
-        .select(resolution, aspect_ratio)
-        .map_err(|error| invalid_argument(error.to_string()))?;
+        .select(short_edge, aspect_ratio.as_deref())
+        .map_err(invalid_argument)?;
 
     // `seconds` is an integer in Dynamo's API; the video service refuses one
     // outside the deployment's duration range when it plans the target.
@@ -643,8 +641,8 @@ fn prepare_request(
             task: VideoTask::T2va,
             conditions: Vec::new(),
             target: VideoTarget {
-                short_edge: raster.resolution.short_edge(),
-                aspect_ratio: raster.aspect_ratio.as_str().to_owned(),
+                short_edge: raster.short_edge,
+                aspect_ratio: raster.aspect_ratio.clone(),
                 duration_seconds: Some(seconds),
             },
             seed,
@@ -654,30 +652,155 @@ fn prepare_request(
 }
 
 /// What a started deployment generates, as its video capabilities report it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Outputs {
     /// Frames per second of every generated video (`fps`).
     frame_rate: u32,
     /// Sample rate, in Hz, of the audio muxed into each video
     /// (`audio_sample_rate`).
     audio_sample_rate: u32,
+    /// The rasters the deployment serves (`canvas.canvases`).
+    rasters: Rasters,
+}
+
+/// A raster the deployment serves and the request fields that select it.
+#[derive(Debug, Clone, PartialEq)]
+struct Raster {
+    /// The resolution class's short edge in pixels, `target.short_edge`.
+    short_edge: u32,
+    /// The display aspect ratio as `W:H`, `target.aspect_ratio`.
+    aspect_ratio: String,
+    width: u32,
+    height: u32,
+}
+
+/// The rasters a deployment serves, as its capabilities report them, in the
+/// order the deployment names them: every prepared resolution class crossed
+/// with every prepared aspect ratio. The first is the default of a request
+/// that names neither a resolution nor an aspect ratio.
+#[derive(Debug, Clone, PartialEq)]
+struct Rasters(Vec<Raster>);
+
+impl Rasters {
+    /// Reads the served rasters from `canvas.canvases` of the capabilities.
+    fn from_capabilities(capabilities: &Value) -> Result<Self, DeploymentMismatch> {
+        let canvases = &capabilities["canvas"]["canvases"];
+        let unreadable = || DeploymentMismatch::Canvases(canvases.to_string());
+        let count = |value: &Value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|&value| value > 0)
+        };
+        let rasters = canvases
+            .as_array()
+            .ok_or_else(unreadable)?
+            .iter()
+            .map(|canvas| {
+                Some(Raster {
+                    short_edge: count(&canvas["short_edge"])?,
+                    aspect_ratio: canvas["aspect_ratio"].as_str()?.to_owned(),
+                    width: count(&canvas["width"])?,
+                    height: count(&canvas["height"])?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|rasters| !rasters.is_empty())
+            .ok_or_else(unreadable)?;
+        Ok(Self(rasters))
+    }
+
+    /// Selects a served raster; an omitted field takes the default's.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the served values when the deployment does
+    /// not serve the requested resolution, aspect ratio or their pair.
+    fn select(
+        &self,
+        short_edge: Option<u32>,
+        aspect_ratio: Option<&str>,
+    ) -> Result<&Raster, String> {
+        // `from_capabilities` admits no empty set, so there is a default.
+        let default = &self.0[0];
+        let short_edge = short_edge.unwrap_or(default.short_edge);
+        let aspect_ratio = aspect_ratio.unwrap_or(&default.aspect_ratio);
+        if !self.0.iter().any(|raster| raster.short_edge == short_edge) {
+            return Err(format!(
+                "resolution must be one of {}",
+                self.resolutions().join(", ")
+            ));
+        }
+        if !self
+            .0
+            .iter()
+            .any(|raster| raster.aspect_ratio == aspect_ratio)
+        {
+            return Err(format!(
+                "aspect_ratio must be one of {}",
+                self.aspect_ratios().join(", ")
+            ));
+        }
+        self.0
+            .iter()
+            .find(|raster| raster.short_edge == short_edge && raster.aspect_ratio == aspect_ratio)
+            .ok_or_else(|| format!("no canvas is served for {short_edge}p {aspect_ratio}"))
+    }
+
+    /// Returns the served raster with exactly these pixel dimensions.
+    fn find_size(&self, width: u32, height: u32) -> Option<&Raster> {
+        self.0
+            .iter()
+            .find(|raster| raster.width == width && raster.height == height)
+    }
+
+    /// Served rasters as `WIDTHxHEIGHT`, the default first.
+    fn sizes(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|raster| format!("{}x{}", raster.width, raster.height))
+            .collect()
+    }
+
+    /// Served resolution classes, as `768p`, the default first.
+    fn resolutions(&self) -> Vec<String> {
+        let mut classes: Vec<String> = Vec::new();
+        for raster in &self.0 {
+            let class = format!("{}p", raster.short_edge);
+            if !classes.contains(&class) {
+                classes.push(class);
+            }
+        }
+        classes
+    }
+
+    /// Served aspect ratios, the default first.
+    fn aspect_ratios(&self) -> Vec<String> {
+        let mut ratios: Vec<String> = Vec::new();
+        for raster in &self.0 {
+            if !ratios.contains(&raster.aspect_ratio) {
+                ratios.push(raster.aspect_ratio.clone());
+            }
+        }
+        ratios
+    }
 }
 
 /// A deployment whose video capabilities are not the FastH3 contract.
 #[derive(Debug, thiserror::Error)]
 enum DeploymentMismatch {
-    /// Other tasks or canvases than the worker serves.
-    #[error(
-        "the Dynamo worker serves FastH3 text-to-video at {served} only; this deployment serves tasks {tasks} on canvases {canvases}"
-    )]
-    Contract {
-        /// The canvases the worker serves, `WIDTHxHEIGHT` joined by commas.
-        served: String,
+    /// Other tasks than the worker serves.
+    #[error("the Dynamo worker serves FastH3 text-to-video only; this deployment serves tasks {0}")]
+    Tasks(
         /// The deployment's `tasks` capability, as JSON.
-        tasks: String,
+        String,
+    ),
+    /// Capabilities without a readable served canvas.
+    #[error("the deployment reports no readable canvas: {0}")]
+    Canvases(
         /// The deployment's `canvas.canvases` capability, as JSON.
-        canvases: String,
-    },
+        String,
+    ),
     /// Capabilities without a rate of the generated media.
     #[error("the deployment reports no output {name}: {value}")]
     Rate {
@@ -688,28 +811,13 @@ enum DeploymentMismatch {
     },
 }
 
-/// Checks that a deployment's video capabilities are FastH3's: `t2va` alone
-/// on exactly the canvases of `rasters`, the requests `prepare_request`
-/// builds. Returns what the deployment generates.
-fn check_fasth3(
-    capabilities: &Value,
-    rasters: &VideoRasters,
-) -> Result<Outputs, DeploymentMismatch> {
+/// Checks that a deployment's video capabilities are FastH3's: `t2va` alone,
+/// the requests `prepare_request` builds. Returns what the deployment
+/// generates and the rasters it serves.
+fn check_fasth3(capabilities: &Value) -> Result<Outputs, DeploymentMismatch> {
     let tasks = &capabilities["tasks"];
-    let canvases = &capabilities["canvas"]["canvases"];
-    let expected: Vec<Value> = rasters
-        .rasters()
-        .map(|raster| json!({"width": raster.width, "height": raster.height}))
-        .collect();
-    let served = canvases.as_array().is_some_and(|served| {
-        served.len() == expected.len() && expected.iter().all(|canvas| served.contains(canvas))
-    });
-    if *tasks != json!(["t2va"]) || !served {
-        return Err(DeploymentMismatch::Contract {
-            served: served_sizes(rasters).join(", "),
-            tasks: tasks.to_string(),
-            canvases: canvases.to_string(),
-        });
+    if *tasks != json!(["t2va"]) {
+        return Err(DeploymentMismatch::Tasks(tasks.to_string()));
     }
     // A rate is a positive count of the deployment's own.
     let rate = |name: &'static str| {
@@ -726,6 +834,7 @@ fn check_fasth3(
     Ok(Outputs {
         frame_rate: rate("fps")?,
         audio_sample_rate: rate("audio_sample_rate")?,
+        rasters: Rasters::from_capabilities(capabilities)?,
     })
 }
 
@@ -801,7 +910,7 @@ fn video_response(
 /// `extra_args["media_passthrough"]`, refusing every other extra argument.
 fn passthrough_raster(
     extra_args: Option<Map<String, Value>>,
-) -> Result<(Option<VideoResolution>, Option<ResolutionName>), DynamoError> {
+) -> Result<(Option<u32>, Option<String>), DynamoError> {
     let mut extra_args = extra_args.unwrap_or_default();
     let passthrough = match extra_args.remove("media_passthrough") {
         None => Map::new(),
@@ -822,31 +931,26 @@ fn passthrough_raster(
             Some(_) => Err(invalid_argument(format!("{name} must be a string"))),
         }
     };
-    let resolution = field("resolution")?
-        .map(|value| value.parse::<VideoResolution>())
-        .transpose()
-        .map_err(|error| invalid_argument(error.to_string()))?;
-    let aspect_ratio = field("aspect_ratio")?
-        .map(|value| value.parse::<ResolutionName>())
-        .transpose()
-        .map_err(|error| invalid_argument(error.to_string()))?;
-    Ok((resolution, aspect_ratio))
-}
-
-/// Served rasters as `WIDTHxHEIGHT`, the default first.
-fn served_sizes(rasters: &VideoRasters) -> Vec<String> {
-    rasters
-        .rasters()
-        .map(|raster| format!("{}x{}", raster.width, raster.height))
-        .collect()
+    // A resolution class `768p` names the short edge 768.
+    let short_edge = field("resolution")?
+        .map(|value| {
+            value
+                .strip_suffix('p')
+                .filter(|digits| !digits.starts_with('+'))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    invalid_argument(format!(
+                        "resolution must be a class such as 768p, got {value:?}"
+                    ))
+                })
+        })
+        .transpose()?;
+    Ok((short_edge, field("aspect_ratio")?))
 }
 
 /// Registration metadata Dynamo copies into the model's runtime config.
-fn runtime_data(
-    max_video_seconds: f64,
-    rasters: &VideoRasters,
-    outputs: &Outputs,
-) -> HashMap<String, Value> {
+fn runtime_data(max_video_seconds: f64, outputs: &Outputs) -> HashMap<String, Value> {
+    let rasters = &outputs.rasters;
     let default = rasters.select(None, None).ok();
     BTreeMap::from([
         ("backend".to_string(), json!("uniserve-inprocess")),
@@ -860,7 +964,7 @@ fn runtime_data(
             "height".to_string(),
             json!(default.map(|raster| raster.height)),
         ),
-        ("sizes".to_string(), json!(served_sizes(rasters))),
+        ("sizes".to_string(), json!(rasters.sizes())),
         ("resolutions".to_string(), json!(rasters.resolutions())),
         ("aspect_ratios".to_string(), json!(rasters.aspect_ratios())),
         ("max_video_seconds".to_string(), json!(max_video_seconds)),
@@ -909,11 +1013,15 @@ mod tests {
         })
     }
 
-    /// What the default 24 fps deployment generates.
-    const OUTPUTS: Outputs = Outputs {
-        frame_rate: 24,
-        audio_sample_rate: 32_000,
-    };
+    /// A served canvas as the capabilities report it.
+    fn canvas(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> Value {
+        json!({
+            "short_edge": short_edge,
+            "aspect_ratio": aspect_ratio,
+            "width": width,
+            "height": height,
+        })
+    }
 
     fn capabilities(tasks: Value, canvases: Value) -> Value {
         json!({
@@ -924,40 +1032,44 @@ mod tests {
         })
     }
 
+    /// What the default 24 fps deployment generates: 768p 16:9 and 9:16.
+    fn outputs() -> Outputs {
+        let served = json!([
+            canvas(768, "16:9", 1344, 768),
+            canvas(768, "9:16", 768, 1344),
+        ]);
+        check_fasth3(&capabilities(json!(["t2va"]), served))
+            .unwrap_or_else(|error| panic!("the default deployment was refused: {error}"))
+    }
+
     #[test]
     fn only_fasth3_deployments_are_served() {
-        let rasters = VideoRasters::default();
-        let served = json!([
-            {"width": 768, "height": 1344},
-            {"width": 1344, "height": 768},
-        ]);
+        let outputs = outputs();
         assert_eq!(
-            check_fasth3(&capabilities(json!(["t2va"]), served.clone()), &rasters).ok(),
-            Some(OUTPUTS)
+            (outputs.frame_rate, outputs.audio_sample_rate),
+            (24, 32_000)
         );
+        // The served rasters keep the order the deployment names them.
+        assert_eq!(outputs.rasters.sizes(), ["1344x768", "768x1344"]);
+        let served = json!([canvas(768, "16:9", 1344, 768)]);
         // A deployment that reports no frame or audio rate is refused.
         for rate in ["fps", "audio_sample_rate"] {
             let mut silent = capabilities(json!(["t2va"]), served.clone());
             silent[rate] = json!(0);
-            assert!(check_fasth3(&silent, &rasters).is_err(), "{rate}");
+            assert!(check_fasth3(&silent).is_err(), "{rate}");
         }
-        // Another canvas set than the configured one is refused.
-        let landscape = json!([{"width": 1344, "height": 768}]);
-        assert!(check_fasth3(&capabilities(json!(["t2va"]), landscape), &rasters).is_err());
+        // A deployment without a readable named canvas is refused.
+        for canvases in [json!([]), json!([{"width": 1344, "height": 768}])] {
+            assert!(check_fasth3(&capabilities(json!(["t2va"]), canvases)).is_err());
+        }
         // A base checkpoint serves more tasks.
-        assert!(
-            check_fasth3(
-                &capabilities(json!(["t2va", "fl2va"]), served.clone()),
-                &rasters
-            )
-            .is_err()
-        );
-        assert!(check_fasth3(&capabilities(json!(["ref2va"]), served), &rasters).is_err());
+        assert!(check_fasth3(&capabilities(json!(["t2va", "fl2va"]), served.clone())).is_err());
+        assert!(check_fasth3(&capabilities(json!(["ref2va"]), served)).is_err());
     }
 
     #[test]
     fn request_maps_to_uniserve_contract() {
-        let prepared = match prepare_request(request(), "FastH3", 15.0, &VideoRasters::default()) {
+        let prepared = match prepare_request(request(), "FastH3", 15.0, &outputs().rasters) {
             Ok(prepared) => prepared,
             Err(error) => panic!("supported request was rejected: {error}"),
         };
@@ -972,12 +1084,16 @@ mod tests {
 
     #[test]
     fn size_or_passthrough_fields_select_the_target() {
-        let rasters = VideoRasters::new(
-            &[VideoResolution::P768, VideoResolution::P480],
-            &[ResolutionName::Landscape16x9, ResolutionName::Landscape21x9],
-        )
-        .unwrap_or_else(|error| panic!("trained rasters were rejected: {error}"));
-        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &rasters);
+        // 768p and 480p, each at 16:9 and 21:9.
+        let served = json!([
+            canvas(768, "16:9", 1344, 768),
+            canvas(768, "21:9", 1536, 672),
+            canvas(480, "16:9", 832, 480),
+            canvas(480, "21:9", 992, 416),
+        ]);
+        let outputs = check_fasth3(&capabilities(json!(["t2va"]), served))
+            .unwrap_or_else(|error| panic!("trained canvases were refused: {error}"));
+        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &outputs.rasters);
         for (size, short_edge, aspect_ratio) in
             [("1344x768", 768, "16:9"), ("992x416", 480, "21:9")]
         {
@@ -1019,7 +1135,7 @@ mod tests {
         ] {
             assert!(prepare(request).is_err());
         }
-        let runtime = runtime_data(15.0, &rasters, &OUTPUTS);
+        let runtime = runtime_data(15.0, &outputs);
         assert_eq!(runtime["fps"], 24);
         assert_eq!(runtime["width"], 1344);
         assert_eq!(runtime["height"], 768);
@@ -1035,15 +1151,11 @@ mod tests {
     fn an_omitted_duration_defaults_to_five_seconds() {
         for (max_video_seconds, expected) in [(15.0, 5.0), (4.5, 4.5)] {
             let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
-            let prepared = match prepare_request(
-                request,
-                "FastH3",
-                max_video_seconds,
-                &VideoRasters::default(),
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
-            };
+            let prepared =
+                match prepare_request(request, "FastH3", max_video_seconds, &outputs().rasters) {
+                    Ok(prepared) => prepared,
+                    Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
+                };
             assert_eq!(prepared.request.target.duration_seconds, Some(expected));
         }
     }
@@ -1061,7 +1173,7 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_inference_steps":4}}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
-            assert!(prepare_request(request, "FastH3", 15.0, &VideoRasters::default()).is_err());
+            assert!(prepare_request(request, "FastH3", 15.0, &outputs().rasters).is_err());
         }
     }
 
@@ -1072,7 +1184,7 @@ mod tests {
             "FastH3",
             ResponseFormat::B64Json,
             b"mp4",
-            &OUTPUTS,
+            &outputs(),
             Duration::from_millis(1_500),
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
@@ -1086,7 +1198,7 @@ mod tests {
             "FastH3",
             ResponseFormat::Url,
             b"mp4",
-            &OUTPUTS,
+            &outputs(),
             Duration::ZERO,
         );
         assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");

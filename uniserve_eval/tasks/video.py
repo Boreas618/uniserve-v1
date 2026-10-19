@@ -94,13 +94,14 @@ def target_canvas(
     """
     # The model package loads torch, which only video points need, so the
     # rules are imported on first use.
-    from uniserve.models.minimax_h3 import processing
+    from uniserve.models.minimax_h3 import config, processing
 
     _named_ratio(task, aspect_ratio)
     size = processing.named_canvas(
         processing.Task(task),
         short_edge=TARGET_SHORT_EDGE,
         aspect_ratio=aspect_ratio,
+        canvases=config.NAMED_CANVASES,
     )
     if size is None:
         if keyframe is None:
@@ -129,7 +130,7 @@ def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
     Raises:
         ValueError: The ratio is neither ``auto`` nor a named ratio.
     """
-    from uniserve.models.minimax_h3 import processing
+    from uniserve.models.minimax_h3 import config
 
     if aspect_ratio == "auto":
         return None
@@ -137,7 +138,7 @@ def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
     # accepted exactly as written here.
     named = {
         f"{width}:{height}": (width, height)
-        for width, height in processing.NAMED_ASPECT_RATIOS
+        for width, height in config.NAMED_ASPECT_RATIOS
     }
     if aspect_ratio not in named:
         raise ValueError(

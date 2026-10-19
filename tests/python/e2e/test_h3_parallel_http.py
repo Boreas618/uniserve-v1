@@ -566,8 +566,18 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         assert video["canvas"]["short_edges"] == [768]
         assert video["canvas"]["aspect_ratios"] == ["16:9", "9:16"]
         assert video["canvas"]["canvases"] == [
-            {"width": 1344, "height": 768},
-            {"width": 768, "height": 1344},
+            {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "width": 1344,
+                "height": 768,
+            },
+            {
+                "short_edge": 768,
+                "aspect_ratio": "9:16",
+                "width": 768,
+                "height": 1344,
+            },
         ]
         # The schedule counts sigma points: one per trained rung and the
         # clean endpoint.

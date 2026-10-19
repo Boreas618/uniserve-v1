@@ -63,7 +63,8 @@ fn defaults() -> Value {
         "flow_graph_batch_sizes": null,
         "flow_graph_shapes": null,
         "video_text_capacities": null,
-        "video_canvases": [],
+        "video_resolutions": [],
+        "video_aspect_ratios": [],
         "canvas_sampling": null,
         "flashinfer_workspace_size": 536870912,
         "flashinfer_use_tensor_core": null,
@@ -231,27 +232,18 @@ fn bucket_lists_are_positive_and_strictly_increasing() {
 }
 
 #[test]
-fn video_canvases_keep_the_order_the_deployment_names() {
-    let canvas = |width, height| uniserve_core::Canvas { width, height };
-    let launch = resolved(json!({"video_canvases": [
-        {"width": 768, "height": 1344},
-        {"width": 1344, "height": 768},
-    ]}))
+fn video_canvas_names_keep_the_order_the_deployment_names() {
+    let launch = resolved(json!({
+        "video_resolutions": ["480p", "768p"],
+        "video_aspect_ratios": ["9:16", "16:9"],
+    }))
     .unwrap();
-    assert_eq!(
-        launch.execution.video_canvases,
-        vec![canvas(768, 1344), canvas(1344, 768)]
-    );
+    assert_eq!(launch.execution.video_resolutions, ["480p", "768p"]);
+    assert_eq!(launch.execution.video_aspect_ratios, ["9:16", "16:9"]);
 
-    // Without a selection the worker prepares the canvases its denoiser
-    // offers.
-    assert!(
-        resolved(json!({}))
-            .unwrap()
-            .execution
-            .video_canvases
-            .is_empty()
-    );
+    // Without names the worker prepares the canvases its denoiser offers.
+    let execution = resolved(json!({})).unwrap().execution;
+    assert!(execution.video_resolutions.is_empty() && execution.video_aspect_ratios.is_empty());
 }
 
 #[test]

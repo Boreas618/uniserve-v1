@@ -245,11 +245,14 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
     """
 
     @property
-    def canvases(self) -> tuple[image.Config, ...]:
+    def canvases(self) -> Mapping[tuple[int, str], image.Config]:
         """Canvases a deployment may prepare layouts for before serving.
 
-        A deployment prepares a selection of them, or all of them without
-        one, and admits only the canvases it prepares.
+        Each is keyed by the pair a request selects it with: the resolution
+        class's short edge in pixels and the display aspect ratio as
+        ``W:H``, such as ``(768, "16:9")``. A deployment prepares a
+        selection of them by those names, or all of them without one, and
+        admits only the canvases it prepares.
         """
         raise NotImplementedError
 

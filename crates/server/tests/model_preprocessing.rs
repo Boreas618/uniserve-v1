@@ -13,8 +13,8 @@ use base64::Engine as _;
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::video::plan::{NAMED_ASPECT_RATIOS, ProcessorConfig, canvas};
-use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall};
+use uniserve_core::video::plan::{ProcessorConfig, canvas};
+use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall, ServedCanvas};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::VideoMediaSettings;
 use uniserve_server::openai::VideoGenerationRequest;
@@ -68,10 +68,14 @@ fn base_denoiser() -> VideoDenoiserInfo {
             clip_latent_frames: 5,
             tail_latent_frames: 2,
         },
-        canvases: NAMED_ASPECT_RATIOS
-            .iter()
-            .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
-            .collect(),
+        // The canvas rule's canvas of each named ratio, at 768p.
+        canvases: [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)]
+            .map(|(width, height): (u32, u32)| ServedCanvas {
+                short_edge: 768,
+                aspect_ratio: format!("{width}:{height}"),
+                canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
+            })
+            .to_vec(),
     }
 }
 
@@ -716,12 +720,18 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
 
 /// A FastH3 DMD deployment serves the training buckets its workers prepared,
 /// on the export's own schedule: other canvases are refused, and the
-/// capabilities report the canvases, the short edges and named ratios they
-/// serve, the schedule and the deployment's duration capacity.
+/// capabilities report the canvases with the names that select them, the
+/// short edges and ratios they serve, the schedule and the deployment's
+/// duration capacity.
 #[tokio::test]
 async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
     let canvas = |width, height| uniserve_core::Canvas { width, height };
+    let served = |short_edge, aspect_ratio: &str, width, height| ServedCanvas {
+        short_edge,
+        aspect_ratio: aspect_ratio.to_owned(),
+        canvas: canvas(width, height),
+    };
     // 768p 16:9, then 480p 21:9 and 16:9.
     let denoiser = VideoDenoiserInfo {
         tasks: vec!["t2va".to_owned()],
@@ -736,7 +746,11 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             clip_latent_frames: 5,
             tail_latent_frames: 2,
         },
-        canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
+        canvases: vec![
+            served(768, "16:9", 1344, 768),
+            served(480, "21:9", 992, 416),
+            served(480, "16:9", 832, 480),
+        ],
     };
     let model = InputProcessor::new(
         loaded.config().clone(),
@@ -757,9 +771,9 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     assert_eq!(
         capabilities["canvas"]["canvases"],
         serde_json::json!([
-            {"width": 1344, "height": 768},
-            {"width": 992, "height": 416},
-            {"width": 832, "height": 480},
+            {"short_edge": 768, "aspect_ratio": "16:9", "width": 1344, "height": 768},
+            {"short_edge": 480, "aspect_ratio": "21:9", "width": 992, "height": 416},
+            {"short_edge": 480, "aspect_ratio": "16:9", "width": 832, "height": 480},
         ])
     );
     assert_eq!(
@@ -768,7 +782,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     );
     assert_eq!(
         capabilities["canvas"]["aspect_ratios"],
-        serde_json::json!(["21:9", "16:9"])
+        serde_json::json!(["16:9", "21:9"])
     );
     assert_eq!(
         capabilities["canvas"]["sizes"],

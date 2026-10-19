@@ -32,7 +32,7 @@ from uniserve.models.minimax_h3.encoder import TextEncoderConfig
 
 CHECKPOINT = Path(__file__).parent / "models/fasth3"
 
-# The 16:9 canvas FastH3 DMD exports generate.
+# The 16:9 canvas FastH3 DMD exports generate at 768p.
 WIDE = image.Config(768, 1344)
 
 
@@ -93,7 +93,7 @@ def dmd_denoiser(
         ),
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va",),
-        canvases=(WIDE,),
+        canvases={(768, "16:9"): WIDE},
     )
 
 
