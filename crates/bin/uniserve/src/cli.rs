@@ -16,6 +16,7 @@ use educe::Educe;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
+use uniserve_core::video::plan::MAX_VIDEO_SECONDS;
 use uniserve_core::{ModelDtype, PrefixCacheDtype};
 use uniserve_engine::{
     DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
@@ -168,7 +169,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// Longest video duration, in seconds, a media deployment provisions and
     /// admits: a capacity within the video API's [4, 15] second range,
     /// advertised as `max_seconds`.
-    #[arg(long = "max-video-seconds", default_value_t = 15.0)]
+    #[arg(long = "max-video-seconds", default_value_t = MAX_VIDEO_SECONDS)]
     pub max_video_seconds: f64,
     /// Comma-separated video resolution classes (`768p`, `480p`) a video
     /// deployment prepares, each at every `--video-aspect-ratios` entry. A

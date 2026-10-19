@@ -686,9 +686,7 @@ mod tests {
     use axum::extract::FromRequest;
 
     fn video_state() -> AppState {
-        sim_state(ModelParameters::MiniMaxH3 {
-            max_video_seconds: 15.0,
-        })
+        sim_state(ModelParameters::MiniMaxH3)
     }
 
     fn video_request() -> serde_json::Value {
