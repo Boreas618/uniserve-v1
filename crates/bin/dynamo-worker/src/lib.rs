@@ -15,7 +15,11 @@
 //! no `t2va`, such as a reference denoiser, or a canvas name its model does
 //! not generate: `prepare_request` maps the Dynamo request onto
 //! a `t2va` request of UniServe's video API and refuses any control FastH3
-//! does not implement rather than ignoring it. The request then enters
+//! does not implement rather than ignoring it. A refused request's stream
+//! holds only its invalid-argument error, so the worker stays routable; a
+//! frontend at the pinned Dynamo revision answers it with a 400, while the
+//! 1.5.0 release answers every error of a video stream with a 500. The
+//! request then enters
 //! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
 //! route uses, and a successful request yields one terminal response object
 //! carrying the single MP4 artifact.
@@ -363,12 +367,22 @@ impl RawEngine for DynamoFastH3Engine {
             .outputs
             .get()
             .ok_or_else(|| engine_error("generate called before start"))?;
-        let prepared = prepare_request(
+        // A refusal of this request is the stream's only item. Dynamo's
+        // router reads an error returned before the stream as a worker that
+        // cannot serve: it answers 500 and takes the instance out of routing
+        // for its inhibited period, while an in-stream invalid argument
+        // leaves it routable and is answered by the frontend (a 400 from the
+        // pinned Dynamo revision on). Only failures of the engine itself end
+        // `generate` before the stream.
+        let prepared = match prepare_request(
             request,
             &self.args.served_model_name,
             self.args.max_video_seconds,
             &outputs.rasters,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(refusal(error)),
+        };
         // The Dynamo context id is the UniServe request id, so `abort` can name
         // the same request from its own context.
         let request_id = ServeRequestId::new(ctx.id().to_string());
@@ -376,11 +390,19 @@ impl RawEngine for DynamoFastH3Engine {
         // The serving runtime owns the request lifecycle the HTTP video route
         // uses: identity registration, prompt preprocessing, submission and
         // terminal accounting.
-        let (_, mut events) = state
+        let (_, mut events) = match state
             .runtime()
             .generate_video(request_id.clone(), prepared.request)
             .await
-            .map_err(api_error)?;
+        {
+            Ok(started) => started,
+            // The video service refused the request, for example a duration
+            // outside the deployment's range.
+            Err(error) if error.status_code().is_client_error() => {
+                return Ok(refusal(api_error(error)));
+            }
+            Err(error) => return Err(api_error(error)),
+        };
         let cancel = self.cancel.clone();
         let served_model_name = self.args.served_model_name.clone();
         let response_format = prepared.response_format;
@@ -985,6 +1007,11 @@ fn api_error(error: uniserve_server::openai::ApiError) -> DynamoError {
         BackendError::Unknown
     };
     dynamo_error(kind, error.to_error_response().error.message)
+}
+
+/// A response stream whose only item is `error`, the refusal of its request.
+fn refusal(error: DynamoError) -> BoxStream<'static, Result<Value, DynamoError>> {
+    futures::stream::once(std::future::ready(Err(error))).boxed()
 }
 
 fn invalid_argument(message: impl Into<String>) -> DynamoError {
