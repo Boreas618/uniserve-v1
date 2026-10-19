@@ -57,10 +57,6 @@ UNIFORM_GRID_POINTS = 50
 # resolutions. A deployment prepares a subset of them.
 DMD_CANVASES = buckets()
 
-# A FastVideo PDD student's packed sequence capacity in rows; the checkpoint
-# owns this bound and serving options may only tighten it.
-PDD_MAX_SEQUENCE_ROWS = 131_072
-
 
 def _is_integer(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -310,8 +306,6 @@ class DenoiserConfig:
         tasks: The tasks this DiT serves, in canonical order.
         canvases: The only canvases the checkpoint generates, or None when it
             generates every canvas of the canvas rules.
-        max_sequence_rows: The checkpoint's packed sequence capacity, or None
-            when only memory and serving options bound it.
     """
 
     transformer: TransformerConfig
@@ -319,7 +313,6 @@ class DenoiserConfig:
     attention: Attention
     tasks: tuple[str, ...]
     canvases: tuple[image.Config, ...] | None
-    max_sequence_rows: int | None
 
     def __post_init__(self) -> None:
         if (
@@ -340,11 +333,6 @@ class DenoiserConfig:
             )
         ):
             raise ValueError("H3 denoiser canvases must be image.Config values")
-        if self.max_sequence_rows is not None and (
-            not _is_integer(self.max_sequence_rows)
-            or self.max_sequence_rows < 1
-        ):
-            raise ValueError("H3 sequence capacity must be a positive integer")
         heads = self.transformer.output_heads
         if isinstance(self.schedule, PddGrid) != (heads > 1) or (
             isinstance(self.schedule, PddGrid)
@@ -537,7 +525,6 @@ def _dmd_denoiser(
         attention=SparseAttention(tile=64, sparsity=sparsity),
         tasks=("t2va",),
         canvases=DMD_CANVASES,
-        max_sequence_rows=None,
     )
 
 
@@ -625,7 +612,6 @@ def _pdd_denoiser(
         ),
         tasks=DENOISER_TASKS[component],
         canvases=None,
-        max_sequence_rows=PDD_MAX_SEQUENCE_ROWS,
     )
 
 
@@ -875,7 +861,6 @@ def normalize(
                 attention=DenseAttention(),
                 tasks=DENOISER_TASKS[component],
                 canvases=None,
-                max_sequence_rows=None,
             )
     return Config(
         text_encoder=_text_encoder(

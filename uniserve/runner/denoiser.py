@@ -653,11 +653,6 @@ class DenoiserRunner:
         ]
 
     @staticmethod
-    def max_sequence_rows(loaded, component: str) -> int:
-        """The most sequence rows of one evaluation; zero when unbounded."""
-        return int(_denoiser(loaded, component).max_sequence_rows or 0)
-
-    @staticmethod
     def sample_dtype(loaded, component: str) -> str:
         """The dtype of the predicted samples."""
         return _dtype(_denoiser(loaded, component).prediction_dtype)

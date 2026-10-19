@@ -110,7 +110,6 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
                 .iter()
                 .map(|&(width, height)| canvas(f64::from(width), f64::from(height)).unwrap())
                 .collect(),
-            max_sequence_rows: None,
         },
         ProcessorConfig {
             patch_size: 16,

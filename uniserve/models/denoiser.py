@@ -296,11 +296,6 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         """Each modality's fixed schedule shift."""
         raise NotImplementedError
 
-    @property
-    def max_sequence_rows(self) -> int | None:
-        """The checkpoint's packed sequence capacity, or None without one."""
-        raise NotImplementedError
-
     def text_condition_rows(self, layout: VideoSizeT) -> int:
         """Rows of a request's retained conditioning in ``layout``.
 
@@ -380,8 +375,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         sizes the layout that bounds its condition capacity this way.
 
         Raises:
-            ValueError: The network takes no conditions, or the widened
-                layout exceeds ``max_sequence_rows``.
+            ValueError: The network takes no conditions.
         """
         raise ValueError("this network takes no conditioning inputs")
 

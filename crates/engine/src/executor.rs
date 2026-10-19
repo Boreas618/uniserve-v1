@@ -1419,7 +1419,6 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: Vec::new(),
-                max_sequence_rows: None,
             }),
             ..WorkerInfo::default()
         }
@@ -1656,7 +1655,6 @@ mod tests {
                     tail_latent_frames: 2,
                 },
                 canvases: Vec::new(),
-                max_sequence_rows: None,
             });
             ExecutorInfo {
                 workers: vec![(WorkerId("model".to_owned()), info)],

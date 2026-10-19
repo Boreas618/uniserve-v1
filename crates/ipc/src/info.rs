@@ -265,7 +265,7 @@ impl WorkerEndpoint {
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule, and with it every request's step count;
-/// the tasks, canvases and sequence capacity bound what admission accepts.
+/// the tasks and canvases bound what admission accepts.
 /// The worker that denoises a request admits its conditions into the
 /// condition capacity it provisioned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,8 +291,6 @@ pub struct VideoDenoiserInfo {
     /// The only canvases the deployment serves: those it prepares, in the
     /// order it names them.
     pub canvases: Vec<uniserve_core::Canvas>,
-    /// The checkpoint's packed sequence capacity in rows, when it has one.
-    pub max_sequence_rows: Option<u32>,
 }
 
 impl VideoDenoiserInfo {
@@ -304,8 +302,7 @@ impl VideoDenoiserInfo {
 
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, and every canvas and the capacity are
-    /// positive.
+    /// frame rule are declared, and every canvas is positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -335,9 +332,8 @@ impl VideoDenoiserInfo {
         ensure_valid!(
             self.canvases
                 .iter()
-                .all(|canvas| canvas.width > 0 && canvas.height > 0)
-                && self.max_sequence_rows != Some(0),
-            "a video denoiser declares an empty canvas or sequence capacity"
+                .all(|canvas| canvas.width > 0 && canvas.height > 0),
+            "a video denoiser declares an empty canvas"
         );
         Ok(())
     }

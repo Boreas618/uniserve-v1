@@ -6,8 +6,6 @@ condition ahead of the generated rows, and writes each condition's projected
 rows into the request's retained conditioning past the prompt capacity.
 """
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -257,7 +255,7 @@ def test_a_condition_layout_holds_its_condition_rows():
     assert model.condition_layout(widened, 64) == widened
 
 
-def test_a_condition_layout_respects_the_tasks_and_sequence_bound():
+def test_a_condition_layout_respects_the_tasks():
     with pytest.raises(ValueError, match="takes no conditions"):
         model = _meta(dmd_denoiser())
         model.condition_layout(
@@ -272,14 +270,6 @@ def test_a_condition_layout_respects_the_tasks_and_sequence_bound():
     size = model.make_size(124, 300, canvas=WIDE, conditions=(CLIP, IMAGE))
     widened = model.condition_layout(layout, size.condition_rows)
     assert model.holds(widened, size)
-
-    # 37296 video, 414 audio and 64 text rows of a 5 s 16:9 layout leave
-    # 1024 rows below a 38798-row bound: 16 tiles fit, 17 do not.
-    model = _meta(replace(base_denoiser(), max_sequence_rows=38_798))
-    layout = model.layout_size(model.make_size(124, 64, canvas=WIDE))
-    assert model.condition_layout(layout, 1024).condition_rows == 1024
-    with pytest.raises(ValueError, match="38798 sequence rows"):
-        model.condition_layout(layout, 1025)
 
 
 def _reference_image(width: int, height: int) -> image.Config:
