@@ -21,23 +21,23 @@ from .packing import AUDIO_SAMPLE_RATE, FPS
 class Model(nn.Module):
     """Compose shared numerical capabilities without retaining execution owners.
 
-    Each DiT partition the checkpoint holds is its own denoising component:
-    ``denoiser`` (the ``transformer`` partition) and ``reference_denoiser``
-    (``transformer_ref``); a deployment places one of them. The video
+    Each DiT partition the checkpoint holds is its own denoising component,
+    named as the checkpoint names it: ``transformer`` (t2va and fl2va) and
+    ``transformer_ref`` (ref2va); a deployment places one of them. The video
     decoder reconstructs the latent order those denoisers publish, so a
     checkpoint's denoisers must share one attention kind. The video and audio
     encoders turn condition pixels and soundtracks into the latent rows the
     denoisers condition on.
     """
 
-    denoiser: Denoiser | None
-    reference_denoiser: Denoiser | None
+    transformer: Denoiser | None
+    transformer_ref: Denoiser | None
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
         self.text_encoder = TextEncoder(config.text_encoder)
-        for name in ("denoiser", "reference_denoiser"):
+        for name in ("transformer", "transformer_ref"):
             denoiser = config.denoisers.get(name)
             setattr(
                 self, name, None if denoiser is None else Denoiser(denoiser)
