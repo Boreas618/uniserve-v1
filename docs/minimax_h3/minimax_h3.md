@@ -120,6 +120,7 @@ The deployment files are in `configs/minimax_h3/`. Each places the condition enc
 | `fasth3-dp8-text-tp8-host-weights.json` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `gather8.json` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference.json` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
+| `ulysses8-reference-two-node.json` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
 A component placed with `"weights": "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.json` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--graph-policy off`.
 
@@ -129,7 +130,7 @@ A Ulysses denoiser's `sequence_parallel` object also selects how each layer's Q/
 "sequence_parallel": { "kind": "ulysses", "ulysses_degree": 8, "projection": "exchange", "projection_rows": 4096 }
 ```
 
-One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The validated FastH3 settings:
+One replica across every GPU gives the lowest latency; replicas serve more requests at once when the offered concurrency keeps them busy. The two-host reference file spreads a request's condition encoding over both hosts: its media reader runs in a one-GPU `reader` worker on `rank-0`, so the latent encoder's ranks on both hosts read the decoded references from that GPU's storage, and while the text encoder encodes the prompt on `rank-0`'s four GPUs, the latent encoder, whose ranks list `rank-1`'s GPUs first, deals the request's condition units to the ranks the prompt leaves free. One eight-way reference replica serves both latency and throughput across two hosts. The validated FastH3 settings:
 
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
