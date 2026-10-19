@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use tvm_ffi::Any;
-use uniserve_core::Canvas;
+use uniserve_core::{Canvas, FrameClips};
 use uniserve_ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
 
 use super::{DECODER, DENOISER, OUTPUTS};
@@ -40,6 +40,8 @@ pub(crate) struct VideoFacts {
     pub(crate) frame_rate: u32,
     /// Output audio samples per second.
     pub(crate) sample_rate: u32,
+    /// How the video VAE divides the generated frames into clips.
+    pub(crate) frames: FrameClips,
 }
 
 /// One state field of a layout.
@@ -325,6 +327,26 @@ impl VideoModel {
             DType::parse(name.as_str())?
         };
         let rows = integer("max_sequence_rows")?;
+        let frames = match list("frame_clips")?[..] {
+            [
+                min_frames,
+                clip_frames,
+                clip_latent_frames,
+                tail_latent_frames,
+            ] => FrameClips {
+                min_frames: narrow(min_frames, "frame rule")?,
+                clip_frames: narrow(clip_frames, "frame rule")?,
+                clip_latent_frames: narrow(clip_latent_frames, "frame rule")?,
+                tail_latent_frames: narrow(tail_latent_frames, "frame rule")?,
+            },
+            _ => {
+                return Err(Error::Interface(
+                    "the frame rule is [min_frames, clip_frames, clip_latent_frames, \
+                     tail_latent_frames]"
+                        .into(),
+                ));
+            }
+        };
         let facts = VideoFacts {
             modalities: names("modalities")?,
             num_steps: narrow(integer("num_steps")?, "step count")?,
@@ -338,6 +360,7 @@ impl VideoModel {
             text_condition_width: narrow(integer("text_condition_width")?, "width")?,
             frame_rate: rate("frame_rate")?,
             sample_rate: rate("sample_rate")?,
+            frames,
         };
         Ok(Self {
             denoiser,
@@ -379,6 +402,7 @@ impl VideoModel {
             audio_shift: self.facts.audio_shift,
             frame_rate: self.facts.frame_rate,
             audio_sample_rate: self.facts.sample_rate,
+            frames: self.facts.frames,
             canvases: canvases.to_vec(),
             max_sequence_rows: self.facts.max_sequence_rows,
         }

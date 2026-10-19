@@ -285,6 +285,9 @@ pub struct VideoDenoiserInfo {
     pub frame_rate: u32,
     /// Sample rate, in Hz, of the audio track generated with each video.
     pub audio_sample_rate: u32,
+    /// How the VAE divides a video's frames into clips, which counts the
+    /// frames the deployment generates and their decode units.
+    pub frames: uniserve_core::FrameClips,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order it names them. Empty declares every canvas of the model's
     /// canvas rule.
@@ -301,8 +304,9 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, the frame and audio sample rates are
-    /// declared, and every canvas and the capacity are positive.
+    /// and positive finite shifts, the frame and audio sample rates and the
+    /// frame rule are declared, and every canvas and the capacity are
+    /// positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -324,6 +328,10 @@ impl VideoDenoiserInfo {
         ensure_valid!(
             self.audio_sample_rate > 0,
             "a video denoiser declares no audio sample rate"
+        );
+        ensure_valid!(
+            self.frames.is_valid(),
+            "a video denoiser declares an empty frame rule"
         );
         ensure_valid!(
             self.canvases

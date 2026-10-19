@@ -19,9 +19,9 @@ use tvm_ffi::{Any, Array};
 use uniserve_core::video::plan::{
     self, BUCKET_SHORT_EDGES, MAX_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, Target, VideoInputError,
 };
-use uniserve_core::{Canvas, VideoTask};
+use uniserve_core::{Canvas, FrameClips, VideoTask};
 
-use crate::ffi::{integer_list, list};
+use crate::ffi::{integer_list, integers, list};
 
 type Result<T> = tvm_ffi::Result<T>;
 
@@ -60,16 +60,53 @@ fn video_canvas(aspect_width: f64, aspect_height: f64) -> Result<Array<Any>> {
         .map_err(|error| value_error(&error.to_string()))
 }
 
-/// `video_frame_count(seconds, max_seconds, frame_rate) -> frames`: the
-/// generated frame count of a duration at the model's output `frame_rate`;
-/// `max_seconds` `None` is the model's 15 seconds.
-fn video_frame_count(seconds: f64, max_seconds: Option<f64>, frame_rate: i64) -> Result<i64> {
-    let max_seconds = max_seconds.unwrap_or(MAX_VIDEO_SECONDS);
-    let frame_rate = u32::try_from(frame_rate)
+/// A positive count of a rules argument.
+fn positive(value: i64, what: &str) -> Result<u32> {
+    u32::try_from(value)
         .ok()
-        .filter(|&rate| rate > 0)
-        .ok_or_else(|| value_error("frame_rate must be a positive count"))?;
-    plan::video_frame_count(seconds, max_seconds, frame_rate)
+        .filter(|&value| value > 0)
+        .ok_or_else(|| value_error(&format!("{what} must be a positive count")))
+}
+
+/// A model's frame rule as the rules take it: `[min_frames, clip_frames,
+/// clip_latent_frames, tail_latent_frames]` ([`FrameClips`]).
+fn frame_rule(frames: Array<Any>) -> Result<FrameClips> {
+    let rule = integers(Any::from(frames))?;
+    let [
+        min_frames,
+        clip_frames,
+        clip_latent_frames,
+        tail_latent_frames,
+    ] = rule[..]
+    else {
+        return Err(value_error("frames must hold four counts"));
+    };
+    let frames = FrameClips {
+        min_frames: positive(min_frames, "frames")?,
+        clip_frames: positive(clip_frames, "frames")?,
+        clip_latent_frames: positive(clip_latent_frames, "frames")?,
+        tail_latent_frames: positive(tail_latent_frames, "frames")?,
+    };
+    if !frames.is_valid() {
+        return Err(value_error("frames leave no tail past the first clip"));
+    }
+    Ok(frames)
+}
+
+/// `video_frame_count(seconds, max_seconds, frame_rate, frames) -> frames`:
+/// the generated frame count of a duration at the model's output
+/// `frame_rate` under its frame rule `frames` ([`frame_rule`]);
+/// `max_seconds` `None` is the model's 15 seconds.
+fn video_frame_count(
+    seconds: f64,
+    max_seconds: Option<f64>,
+    frame_rate: i64,
+    frames: Array<Any>,
+) -> Result<i64> {
+    let max_seconds = max_seconds.unwrap_or(MAX_VIDEO_SECONDS);
+    let frame_rate = positive(frame_rate, "frame_rate")?;
+    let frames = frame_rule(frames)?;
+    plan::video_frame_count(seconds, max_seconds, frame_rate, &frames)
         .map(i64::from)
         .map_err(|error| value_error(&error.to_string()))
 }
@@ -97,18 +134,21 @@ fn video_buckets() -> Result<Array<Any>> {
     Ok(integer_list(values))
 }
 
-/// `video_reference_bounds(frames, frame_rate) -> [images, video_frames,
-/// audio_samples, video_canvases]`: the largest references a request
-/// generating `frames` frames at the model's output `frame_rate` may bring
+/// `video_reference_bounds(frames, frame_rate, frame_rule) -> [images,
+/// video_frames, audio_samples, video_canvases]`: the largest references a
+/// request generating `frames` frames at the model's output `frame_rate`
+/// under its frame rule ([`frame_rule`]) may bring
 /// (`plan::reference_bounds`); `images`, the two largest image rasters, and
 /// `video_canvases` are flat `[width, height, ...]`.
-fn video_reference_bounds(frames: i64, frame_rate: i64) -> Result<Array<Any>> {
+fn video_reference_bounds(
+    frames: i64,
+    frame_rate: i64,
+    frame_rule_values: Array<Any>,
+) -> Result<Array<Any>> {
     let frames = u32::try_from(frames).map_err(|_| value_error("frames is out of range"))?;
-    let frame_rate = u32::try_from(frame_rate)
-        .ok()
-        .filter(|&rate| rate > 0)
-        .ok_or_else(|| value_error("frame_rate must be a positive count"))?;
-    let bounds = plan::reference_bounds(frames, frame_rate);
+    let frame_rate = positive(frame_rate, "frame_rate")?;
+    let clips = frame_rule(frame_rule_values)?;
+    let bounds = plan::reference_bounds(frames, frame_rate, &clips);
     let rasters = |canvases: &[Canvas]| {
         integer_list(
             canvases

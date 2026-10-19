@@ -28,7 +28,8 @@
 //!   reference video's timeline at the output frame rate `fps` (24 for the
 //!   released checkpoint) and the first `floor(s * rate + 0.5)` samples of
 //!   its soundtrack;
-//! - a reference video needs at least 22 frames (one `17n + 5` VAE clip)
+//! - a reference video needs at least the fewest frames of the denoiser's
+//!   frame rule (one VAE clip and its tail, 22 for the released checkpoint)
 //!   on that timeline after the start offset;
 //! - `ref2va` keyframes are fitted to the target canvas like `fl2va` ones
 //!   (the first stretched, a second cover-cropped) and do not enter the
@@ -43,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ConditionMedia, ConditionVision, ImageFit, MediaLocator};
+use super::{ConditionMedia, ConditionVision, FrameClips, ImageFit, MediaLocator};
 use super::{VideoCondition, VisionGrid};
 use crate::{Canvas, VideoTask};
 
@@ -99,14 +100,6 @@ const BUCKETS: [[Canvas; 6]; 2] = [
 /// Short edge the released checkpoint encodes an image reference at, and the
 /// longest a deployment encodes one at ([`ReferenceConfig`]).
 pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
-
-/// Pixel frames per video VAE clip, and the latent frames a clip encodes to
-/// (also the frames of the overlap a clip carries).
-const CLIP_FRAMES: u32 = 17;
-const CLIP_LATENTS: u32 = 5;
-/// Fewest frames at the output rate a reference video must keep: one VAE
-/// clip.
-pub const MIN_REFERENCE_FRAMES: u32 = CLIP_FRAMES + CLIP_LATENTS;
 
 /// Shortest explicit video duration, in seconds, the MiniMax-H3 API admits.
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;
@@ -257,11 +250,13 @@ pub enum RuleError {
     /// A reference video with fewer than one VAE clip of frames after its
     /// start offset.
     #[error(
-        "a reference video needs at least {MIN_REFERENCE_FRAMES} frames at {frame_rate} fps after start_time_seconds, got {available}"
+        "a reference video needs at least {min_frames} frames at {frame_rate} fps after start_time_seconds, got {available}"
     )]
     ReferenceFrames {
         /// Frames left on the output-rate timeline.
         available: u64,
+        /// The fewest frames the VAE encodes: one clip and the tail.
+        min_frames: u32,
         /// The output frame rate the timeline is counted at.
         frame_rate: u32,
     },
@@ -620,9 +615,10 @@ pub fn requested_frames(seconds: f64, fps: u32) -> u32 {
 ///
 /// The requested frame count is `seconds * frame_rate` rounded half to even
 /// ([`requested_frames`]), and the output extends it upward to the next
-/// complete VAE clip, a count of the form `17n + 5`. The output may
-/// therefore last longer than requested: at 24 fps, 4 seconds yields 107
-/// frames and 15 seconds 362.
+/// frame count of the model's frame rule `frames` ([`FrameClips::align_up`]),
+/// `17n + 5` for the released checkpoint. The output may therefore last
+/// longer than requested: at 24 fps, 4 seconds yields 107 frames and 15
+/// seconds 362.
 ///
 /// # Errors
 ///
@@ -632,16 +628,14 @@ pub fn video_frame_count(
     seconds: f64,
     max_video_seconds: f64,
     frame_rate: u32,
+    frames: &FrameClips,
 ) -> Result<u32, RuleError> {
     if !seconds.is_finite() || !(MIN_VIDEO_SECONDS..=max_video_seconds).contains(&seconds) {
         return Err(RuleError::Duration {
             max_seconds: max_video_seconds,
         });
     }
-    let requested = requested_frames(seconds, frame_rate);
-    // The frames up to the next count congruent to 5 modulo 17.
-    let clip = CLIP_FRAMES;
-    Ok(requested + (clip + CLIP_LATENTS - requested % clip) % clip)
+    Ok(frames.align_up(requested_frames(seconds, frame_rate)))
 }
 
 /// The requested output, as the request states it.
@@ -759,6 +753,10 @@ pub struct PlanLimits {
     /// denoiser declares it: durations and reference videos are counted on
     /// it.
     pub frame_rate: u32,
+    /// How the denoiser's VAE divides a video's frames into clips, as it
+    /// declares it: the frame counts it generates and a reference video's
+    /// encoded frames and latent units follow from it.
+    pub frames: FrameClips,
     /// The only canvases the deployment serves, those its workers prepare;
     /// `None` serves every canvas the rules produce.
     pub canvases: Option<Vec<Canvas>>,
@@ -1051,8 +1049,10 @@ pub struct VideoClip {
     /// Output-rate frames kept after the start offset, at most the generated
     /// frame count; the conditioner samples these.
     pub frames: u32,
-    /// The leading `17n + 5` frames the VAE encodes.
+    /// The leading frames the VAE encodes, a frame count of `vae_clips`.
     pub vae_frames: u32,
+    /// How the VAE divides those frames into clips.
+    pub vae_clips: FrameClips,
     /// The video's soundtrack, when it has one.
     pub soundtrack: Option<AudioClip>,
 }
@@ -1186,10 +1186,12 @@ impl ConditionPlan {
     /// `(b + 1) * g / bands`, rounded down, `image_bands` clamped to one
     /// through `g`. Each band is encoded on its own and the bands assemble
     /// the whole image's encoding; a rank finds a band's patch rows from the
-    /// rows of the bands before it. A video's `17n + 5` encoded frames are
-    /// `n + 1` units of up to 17 frames: each complete one yields 5 latent
-    /// frames and the last 2, the video encoder dropping the leading 3 of
-    /// its padded final clip. An audio reference has none.
+    /// rows of the bands before it. A video's encoded frames are one unit
+    /// per clip of its frame rule and one for the tail: each clip yields the
+    /// rule's clip latent frames and the tail its tail latent frames (5 and
+    /// 2 for the released checkpoint, whose video encoder drops the leading
+    /// 3 latent frames of its padded final window). An audio reference has
+    /// none.
     pub fn latent_units(&self, canvas: Canvas, image_bands: u32) -> Vec<u32> {
         match &self.prepared {
             Prepared::Keyframe(_) => vec![rows_per_frame(canvas)],
@@ -1206,12 +1208,13 @@ impl ConditionPlan {
                     .collect()
             }
             Prepared::Video(clip) => {
-                let complete = (clip.vae_frames - CLIP_LATENTS) / CLIP_FRAMES;
                 let rows_per_frame = rows_per_frame(clip.canvas);
-                let mut units = vec![CLIP_LATENTS * rows_per_frame; complete as usize];
-                units.push(
-                    (latent_frames(clip.vae_frames) - complete * CLIP_LATENTS) * rows_per_frame,
-                );
+                let clips = clip.vae_clips;
+                let mut units = vec![
+                    clips.clip_latent_frames * rows_per_frame;
+                    clips.units(clip.vae_frames) as usize
+                ];
+                units.push(clips.tail_latent_frames * rows_per_frame);
                 units
             }
             Prepared::Audio(_) => Vec::new(),
@@ -1263,7 +1266,7 @@ pub struct RequestPlan {
     /// The requested duration in seconds: `target.duration_seconds`, or the
     /// soundtrack's length after its start offset when that sets it.
     pub duration_seconds: f64,
-    /// Generated frames, of the form `17n + 5`.
+    /// Generated frames, a frame count of the denoiser's frame rule.
     pub num_frames: u32,
     /// One plan per condition, in request order.
     pub conditions: Vec<ConditionPlan>,
@@ -1307,12 +1310,6 @@ impl RequestPlan {
         }
         bands
     }
-}
-
-/// The video latent frames of a `17n + 5` frame count: five per complete
-/// 17-frame clip and two for the trailing 5-frame overlap.
-pub const fn latent_frames(frames: u32) -> u32 {
-    (frames - CLIP_LATENTS) / CLIP_FRAMES * CLIP_LATENTS + 2
 }
 
 /// Returns the size an image reference is encoded at.
@@ -1473,14 +1470,16 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// # Errors
 ///
 /// Returns [`RuleError::VideoCanvas`] when the display aspect lies outside
-/// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than 22 frames
-/// remain after the offset, and the errors of [`audio_clip`],
+/// 1:4 to 4:1, [`RuleError::ReferenceFrames`] when fewer than the frame
+/// rule's fewest frames (22 for the released checkpoint) remain after the
+/// offset, and the errors of [`audio_clip`],
 /// [`sample_video_frames`] and [`ProcessorConfig::video_grid`].
 pub fn video_reference(
     media: &VideoFacts,
     start_seconds: f64,
     frames: u32,
     frame_rate: u32,
+    clips: &FrameClips,
     vision: &ProcessorConfig,
     config: &ReferenceConfig,
 ) -> Result<(VideoClip, VideoVision), RuleError> {
@@ -1506,14 +1505,17 @@ pub fn video_reference(
     };
     let start_frame = start_offset(start_seconds, fps);
     let available = timeline.saturating_sub(start_frame);
-    if available < u64::from(MIN_REFERENCE_FRAMES) {
-        return Err(RuleError::ReferenceFrames {
-            available,
-            frame_rate,
-        });
+    let too_short = RuleError::ReferenceFrames {
+        available,
+        min_frames: clips.min_frames,
+        frame_rate,
+    };
+    if available < u64::from(clips.min_frames) {
+        return Err(too_short);
     }
     let kept = u32::try_from(available).map_or(frames, |available| available.min(frames));
-    let vae_frames = encoded_frames(kept);
+    // The VAE encodes the leading frames that form a frame count of its rule.
+    let vae_frames = clips.align_down(kept).ok_or(too_short)?;
     let soundtrack = media
         .soundtrack
         .as_ref()
@@ -1530,6 +1532,7 @@ pub fn video_reference(
         start_frame: u32::try_from(start_frame).unwrap_or(u32::MAX),
         frames: kept,
         vae_frames,
+        vae_clips: *clips,
         soundtrack,
     };
     let seen = VideoVision {
@@ -1539,12 +1542,6 @@ pub fn video_reference(
         block_timestamps,
     };
     Ok((clip, seen))
-}
-
-/// Frames the VAE encodes of a reference video that keeps `kept` frames: the
-/// leading complete `17n + 5`, at least one window.
-fn encoded_frames(kept: u32) -> u32 {
-    (kept.saturating_sub(CLIP_LATENTS) / CLIP_FRAMES).max(1) * CLIP_FRAMES + CLIP_LATENTS
 }
 
 /// The largest references a request generating a given frame count may
@@ -1572,15 +1569,16 @@ pub struct ReferenceBounds {
 /// [`REFERENCE_IMAGE_SHORT_EDGE`], so its sides, and the rows any packing
 /// gives it, are at most those of that edge at the widest or the tallest
 /// accepted aspect. [`video_reference`] keeps at most `frames` frames of a
-/// video, whose leading whole VAE windows it encodes on the canvas of the
-/// video's aspect or, for a video with fewer pixels than that canvas, at
-/// its own size, whose sides on the 32-pixel grid are at most the canvas's.
+/// video, whose leading frames forming a count of the frame rule `clips` it
+/// encodes on the canvas of the video's aspect or, for a video with fewer
+/// pixels than that canvas, at its own size, whose sides on the 32-pixel
+/// grid are at most the canvas's.
 /// [`audio_clip`] truncates a track to the generated duration and resamples
 /// it to 32 kHz, so it returns at most `ceil(frames * 32000 / frame_rate)`
 /// samples whatever the source rate, `frame_rate` being the output frame
 /// rate the frames are counted at. A model sizes these shapes with its own
 /// packing to provision the largest condition set it admits.
-pub fn reference_bounds(frames: u32, frame_rate: u32) -> ReferenceBounds {
+pub fn reference_bounds(frames: u32, frame_rate: u32, clips: &FrameClips) -> ReferenceBounds {
     let edge = REFERENCE_IMAGE_SHORT_EDGE;
     ReferenceBounds {
         images: [
@@ -1593,7 +1591,9 @@ pub fn reference_bounds(frames: u32, frame_rate: u32) -> ReferenceBounds {
                 height: 4 * edge,
             },
         ],
-        video_frames: encoded_frames(frames),
+        // No reference video fits a request shorter than the rule's fewest
+        // frames.
+        video_frames: clips.align_down(frames).unwrap_or(0),
         video_canvases: rule_canvases(),
         audio_samples: (u64::from(frames) * u64::from(AUDIO_SAMPLE_RATE))
             .div_ceil(u64::from(frame_rate)),
@@ -1770,9 +1770,15 @@ pub fn check_request(
 
     match target.duration_seconds {
         Some(seconds) => {
-            video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate).map_err(
-                |error| VideoInputError::invalid(RequestField::TargetDuration, error.to_string()),
-            )?;
+            video_frame_count(
+                seconds,
+                limits.max_video_seconds,
+                limits.frame_rate,
+                &limits.frames,
+            )
+            .map_err(|error| {
+                VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
+            })?;
         }
         None => {
             let may_follow_audio = task == VideoTask::Ref2va
@@ -1943,11 +1949,16 @@ fn resolve_frames(
     limits: &PlanLimits,
 ) -> Result<(f64, u32), VideoInputError> {
     if let Some(seconds) = target.duration_seconds {
-        return video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
-            .map(|frames| (seconds, frames))
-            .map_err(|error| {
-                VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
-            });
+        return video_frame_count(
+            seconds,
+            limits.max_video_seconds,
+            limits.frame_rate,
+            &limits.frames,
+        )
+        .map(|frames| (seconds, frames))
+        .map_err(|error| {
+            VideoInputError::invalid(RequestField::TargetDuration, error.to_string())
+        });
     }
     let [(index, track, start_seconds)] = soundtracks else {
         return Err(VideoInputError::invalid(
@@ -1967,14 +1978,19 @@ fn resolve_frames(
         ));
     }
     let seconds = (track.samples - start_sample) as f64 / rate;
-    video_frame_count(seconds, limits.max_video_seconds, limits.frame_rate)
-        .map(|frames| (seconds, frames))
-        .map_err(|error| {
-            VideoInputError::condition(
-                *index,
-                format!("the audio track sets the duration, but {error}"),
-            )
-        })
+    video_frame_count(
+        seconds,
+        limits.max_video_seconds,
+        limits.frame_rate,
+        &limits.frames,
+    )
+    .map(|frames| (seconds, frames))
+    .map_err(|error| {
+        VideoInputError::condition(
+            *index,
+            format!("the audio track sets the duration, but {error}"),
+        )
+    })
 }
 
 /// The generated canvas: from the ratio, or from the first keyframe.
@@ -2055,9 +2071,8 @@ fn plan_reference(
     condition: &ConditionSpec,
     media: &MediaFacts,
     frames: u32,
-    frame_rate: u32,
     vision: &ProcessorConfig,
-    config: &ReferenceConfig,
+    limits: &PlanLimits,
 ) -> Result<ConditionPlan, VideoInputError> {
     let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
     let plan = |prepared, seen, audio_rows| ConditionPlan {
@@ -2068,7 +2083,8 @@ fn plan_reference(
     };
     match media {
         MediaFacts::Image(image) => {
-            let size = reference_image_size(image.width, image.height, config).map_err(reject)?;
+            let size = reference_image_size(image.width, image.height, &limits.references)
+                .map_err(reject)?;
             let grid = vision.image_grid(size.height, size.width).map_err(reject)?;
             let seen = Vision::Image(ImageVision {
                 grid,
@@ -2077,13 +2093,21 @@ fn plan_reference(
             Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
         MediaFacts::Audio(audio) => {
-            let clip = audio_clip(audio, 0.0, frames, frame_rate).map_err(reject)?;
+            let clip = audio_clip(audio, 0.0, frames, limits.frame_rate).map_err(reject)?;
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
         MediaFacts::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
-            let (clip, seen) = video_reference(video, start, frames, frame_rate, vision, config)
-                .map_err(reject)?;
+            let (clip, seen) = video_reference(
+                video,
+                start,
+                frames,
+                limits.frame_rate,
+                &limits.frames,
+                vision,
+                &limits.references,
+            )
+            .map_err(reject)?;
             let audio_rows = clip.soundtrack.map_or(0, |track| track.rows());
             Ok(plan(
                 Prepared::Video(clip),
@@ -2147,15 +2171,9 @@ pub fn plan_request(
                     "a keyframe must be an image",
                 ));
             }
-            (Role::Reference, _) => plan_reference(
-                index,
-                condition,
-                facts,
-                frames,
-                limits.frame_rate,
-                vision,
-                &limits.references,
-            )?,
+            (Role::Reference, _) => {
+                plan_reference(index, condition, facts, frames, vision, limits)?
+            }
         };
         plans.push(plan);
     }
@@ -2179,11 +2197,11 @@ pub(super) mod tests {
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
         AudioClip, AudioFacts, BUCKET_SHORT_EDGES, Canvas, ConditionPlan, ConditionSpec,
-        ConditionType, FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO,
-        MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared, ProcessorConfig,
-        REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig, RequestField, RequestPlan, Role, Target,
-        VideoFacts, VideoInputError, VideoTask, Vision, audio_clip, bucket, bucket_short_edge,
-        canvas, check_request, cover_crop, gcd, latent_frames, plan_request, reference_bounds,
+        ConditionType, FrameClips, FramePosition, FrameRate, ImageFacts, KeyframeFit,
+        MAX_ASPECT_RATIO, MIN_ASPECT_RATIO, MediaFacts, NAMED_ASPECT_RATIOS, PlanLimits, Prepared,
+        ProcessorConfig, REFERENCE_IMAGE_SHORT_EDGE, ReferenceConfig, RequestField, RequestPlan,
+        Role, Target, VideoFacts, VideoInputError, VideoTask, Vision, audio_clip, bucket,
+        bucket_short_edge, canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
         reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
         video_reference,
     };
@@ -2205,12 +2223,22 @@ pub(super) mod tests {
     /// generated at.
     pub(in crate::video) const FRAME_RATE: u32 = 24;
 
+    /// The released checkpoint's frame rule: `17n + 5` frames, five latent
+    /// frames per clip and two for the tail.
+    pub(in crate::video) const FRAMES: FrameClips = FrameClips {
+        min_frames: 22,
+        clip_frames: 17,
+        clip_latent_frames: 5,
+        tail_latent_frames: 2,
+    };
+
     /// Limits that serve every task, duration and canvas the model does.
     pub(in crate::video) fn limits() -> PlanLimits {
         PlanLimits {
             tasks: vec![VideoTask::T2va, VideoTask::Fl2va, VideoTask::Ref2va],
             max_video_seconds: 15.0,
             frame_rate: FRAME_RATE,
+            frames: FRAMES,
             canvases: None,
             // The fixture's cases follow the released pipeline.
             references: ReferenceConfig::RELEASED,
@@ -2380,7 +2408,7 @@ pub(super) mod tests {
                 "start_frame": clip.start_frame,
                 "clip_frames": clip.frames,
                 "vae_frames": clip.vae_frames,
-                "latent_frames": latent_frames(clip.vae_frames),
+                "latent_frames": clip.vae_clips.latent_frames(clip.vae_frames),
                 "soundtrack": clip.soundtrack.as_ref().map(audio_json),
             }),
         };
@@ -2491,7 +2519,7 @@ pub(super) mod tests {
                 let field = plan.unwrap_err().field();
                 assert_eq!(field, Some(RequestField::TargetDuration), "{case}");
                 assert!(
-                    video_frame_count(seconds, 15.0, FRAME_RATE).is_err(),
+                    video_frame_count(seconds, 15.0, FRAME_RATE, &FRAMES).is_err(),
                     "{case}"
                 );
                 continue;
@@ -2499,12 +2527,12 @@ pub(super) mod tests {
             let plan = plan.unwrap();
             assert_eq!(u64::from(plan.num_frames), case["num_frames"], "{case}");
             assert_eq!(
-                u64::from(video_frame_count(seconds, 15.0, FRAME_RATE).unwrap()),
+                u64::from(video_frame_count(seconds, 15.0, FRAME_RATE, &FRAMES).unwrap()),
                 case["num_frames"],
                 "{case}"
             );
             assert_eq!(
-                u64::from(latent_frames(plan.num_frames)),
+                u64::from(FRAMES.latent_frames(plan.num_frames)),
                 case["latent_frames"],
                 "{case}"
             );
@@ -2570,6 +2598,7 @@ pub(super) mod tests {
                 start_frame: 0,
                 frames: 124,
                 vae_frames: 124,
+                vae_clips: FRAMES,
                 soundtrack: None,
             }),
             vision: None,
@@ -2579,7 +2608,7 @@ pub(super) mod tests {
         // image would take.
         let units = video.latent_units(canvas, 4);
         assert_eq!(units, [vec![5 * 1008; 7], vec![2 * 1008]].concat());
-        assert_eq!(units.iter().sum::<u32>(), latent_frames(124) * 1008);
+        assert_eq!(units.iter().sum::<u32>(), FRAMES.latent_frames(124) * 1008);
 
         // A reference image is one latent frame at its own size, a keyframe
         // one at the generated canvas.
@@ -2740,6 +2769,7 @@ pub(super) mod tests {
                 start,
                 frames,
                 FRAME_RATE,
+                &FRAMES,
                 &vision,
                 &ReferenceConfig::RELEASED,
             );
@@ -2752,7 +2782,7 @@ pub(super) mod tests {
             assert_eq!(u64::from(clip.start_frame), case["start_frame"], "{case}");
             assert_eq!(u64::from(clip.frames), case["clip_frames"], "{case}");
             assert_eq!(u64::from(clip.vae_frames), case["vae_frames"], "{case}");
-            let latents = latent_frames(clip.vae_frames);
+            let latents = FRAMES.latent_frames(clip.vae_frames);
             assert_eq!(u64::from(latents), case["latent_frames"], "{case}");
             assert_eq!(json!(seen.frame_indices), case["frame_indices"], "{case}");
             assert_eq!(
@@ -2778,8 +2808,8 @@ pub(super) mod tests {
     fn prepared_references_fit_their_bounds() {
         let fixture = fixture();
         let vision = vision(&fixture);
-        let frames = video_frame_count(5.0, 15.0, FRAME_RATE).unwrap();
-        let bounds = reference_bounds(frames, FRAME_RATE);
+        let frames = video_frame_count(5.0, 15.0, FRAME_RATE, &FRAMES).unwrap();
+        let bounds = reference_bounds(frames, FRAME_RATE, &FRAMES);
         let edge = REFERENCE_IMAGE_SHORT_EDGE;
         assert_eq!(
             bounds.images,
@@ -2833,7 +2863,8 @@ pub(super) mod tests {
                     }),
                 };
                 let (clip, _) =
-                    video_reference(&facts, 0.0, frames, FRAME_RATE, &vision, &config).unwrap();
+                    video_reference(&facts, 0.0, frames, FRAME_RATE, &FRAMES, &vision, &config)
+                        .unwrap();
                 assert!(clip.vae_frames <= bounds.video_frames, "{facts:?}");
                 assert!(within(clip.canvas, &bounds.video_canvases), "{facts:?}");
                 let track = clip.soundtrack.unwrap();
@@ -2890,7 +2921,7 @@ pub(super) mod tests {
                 frames: 48,
                 soundtrack: None,
             };
-            video_reference(&facts, 0.0, 124, FRAME_RATE, &vision, config)
+            video_reference(&facts, 0.0, 124, FRAME_RATE, &FRAMES, &vision, config)
                 .unwrap()
                 .0
                 .canvas

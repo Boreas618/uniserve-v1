@@ -25,7 +25,7 @@ from typing import Any
 from uniserve.media import image
 from uniserve.worker import library
 
-from .packing import FPS
+from .packing import FPS, align_num_frames, video_latent_frames
 
 __all__ = [
     "NAMED_ASPECT_RATIOS",
@@ -132,13 +132,13 @@ def reference_bounds(num_frames: int) -> ReferenceBounds:
 
     An image's rows grow with how far its aspect lies from 1:1 at the
     encoding short edge; a video keeps at most the generated frames, of
-    which the VAE encodes the leading whole windows on the canvas of its
-    aspect; a track is truncated to the generated duration. A denoiser
-    sizes these shapes with its own packing to state the largest condition
-    set it admits.
+    which the VAE encodes the leading frames forming a count H3 generates on
+    the canvas of its aspect; a track is truncated to the generated
+    duration. A denoiser sizes these shapes with its own packing to state the
+    largest condition set it admits.
     """
     images, frames, samples, canvases = library()["video_reference_bounds"](
-        int(num_frames), FPS
+        int(num_frames), FPS, _frame_clips()
     )
     widest, tallest = _canvases(images)
     return ReferenceBounds(
@@ -165,7 +165,26 @@ def frame_count(seconds: float, max_seconds: float | None = None) -> int:
         ValueError: ``seconds`` lies outside ``[4, max_seconds]``.
     """
     longest = None if max_seconds is None else float(max_seconds)
-    return int(library()["video_frame_count"](float(seconds), longest, FPS))
+    return int(
+        library()["video_frame_count"](
+            float(seconds), longest, FPS, _frame_clips()
+        )
+    )
+
+
+def _frame_clips() -> list[int]:
+    """The H3 frame rule as the request rules take it.
+
+    ``[min_frames, clip_frames, clip_latent_frames, tail_latent_frames]``,
+    read from the counts the model generates (``packing.align_num_frames``)
+    and the latent frames it encodes each to
+    (``packing.video_latent_frames``), as the denoiser runner declares them
+    in the worker's handshake.
+    """
+    fewest = align_num_frames(1)
+    clip = align_num_frames(fewest + 1) - fewest
+    per_clip = video_latent_frames(fewest + clip) - video_latent_frames(fewest)
+    return [fewest, clip, per_clip, video_latent_frames(fewest) - per_clip]
 
 
 def named_canvas(

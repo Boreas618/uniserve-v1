@@ -739,12 +739,10 @@ impl VideoRequests {
         else {
             return Ok(Some(OUTSIDE_PLAN.to_owned()));
         };
+        // The request's decode units (`media.video_units`) derive from the
+        // frame rule this rank declared, so they need no comparison with the
+        // units of its own decoder's slicing.
         let units = Arc::clone(&duration.units);
-        if media.video_units as usize != units.len() {
-            return Err(Error::Invalid(
-                "video request has invalid computation bounds".into(),
-            ));
-        }
         let conditions: Arc<[VideoCondition]> = video.conditions.clone().into();
         let size = VideoSize {
             frames: media.num_frames,
