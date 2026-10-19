@@ -40,7 +40,7 @@ description = rank.read_config(
     generation_device=None,
     components=json.dumps(
         dict.fromkeys(
-            ("text_encoder", "denoiser", "video_decoder", "audio_decoder"),
+            ("text_encoder", "transformer", "video_decoder", "audio_decoder"),
             local,
         )
     ),
@@ -52,7 +52,7 @@ loaded = rank.load_model(
     description,
     modules=[
         "text_encoder",
-        "denoiser",
+        "transformer",
         "video_decoder",
         "video_postprocessor",
         "audio_decoder",

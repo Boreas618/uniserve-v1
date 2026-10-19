@@ -25,10 +25,10 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 # The components generation runs, each on this rank alone, and the module
 # paths they hold.
-_COMPONENTS = ("text_encoder", "denoiser", "video_decoder", "audio_decoder")
+_COMPONENTS = ("text_encoder", "transformer", "video_decoder", "audio_decoder")
 _MODULES = [
     "text_encoder",
-    "denoiser",
+    "transformer",
     "video_decoder",
     "video_postprocessor",
     "audio_decoder",

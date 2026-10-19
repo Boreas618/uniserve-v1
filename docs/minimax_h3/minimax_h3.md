@@ -1,6 +1,6 @@
 # FastH3 and MiniMax-H3 guide
 
-UniServe serves the MiniMax-H3 video-and-audio models: the FastH3 DMD students for text-to-video (`t2va`), FastH3 OmniRef students for reference-conditioned video (`ref2va`), and the base MiniMax-H3 checkpoint for `t2va`, keyframe-conditioned video (`fl2va`) and `ref2va`. Every response is an H.264/AAC MP4 at 24 fps with stereo 32-kHz audio.
+UniServe serves the MiniMax-H3 video-and-audio models: the base MiniMax-H3 checkpoint for text-to-video (`t2va`), keyframe-conditioned video (`fl2va`) and reference-conditioned video (`ref2va`), and FastH3, its fast variant: a distilled student of one of the base checkpoint's DiT partitions. The FastH3 DMD students serve `t2va` and the FastH3 OmniRef students `ref2va`. Every response is an H.264/AAC MP4 at 24 fps with stereo 32-kHz audio.
 
 ## Requirements
 
@@ -35,13 +35,13 @@ The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the Cu
 | --- | --- | --- | --- |
 | [`FastVideo/FastVideo-FastH3-8-Step-V2`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4) | `t2va` | 768p, 480p | 8 |
 | [`FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree), [`-NVFP4`](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4) | `t2va` | 768p, 480p | 4 |
-| FastH3 OmniRef component exports | `ref2va` | 768p | The export's schedule |
-| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `denoiser` | `t2va`, `fl2va` | 768p | 49 |
-| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `reference_denoiser` | `ref2va` | 768p | 49 |
+| FastH3 OmniRef exports | `ref2va` | 768p | The export's schedule |
+| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer` | `t2va`, `fl2va` | 768p | 49 |
+| [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) `transformer_ref` | `ref2va` | 768p | 49 |
 
-The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A checkpoint's schedule comes from its `fastvideo_inference.json` and schedulers, or for the base checkpoint 50 sigma points with video shift 12 and audio shift 3. A server places one denoiser, so a base deployment serves either `t2va` and `fl2va` or `ref2va`.
+The NVFP4 repositories are ModelOpt PTQ checkpoints and need Blackwell. A FastH3 export's `fastvideo_inference.json` states its task, which selects the base partition it replaces (`transformer` for `t2va`, `transformer_ref` for `ref2va`), its schedule (DMD rungs or parallel-decoding blocks) and its sparse attention; the base checkpoint evaluates 50 sigma points with video shift 12 and audio shift 3. Each checkpoint's schedulers state its shifts. A server places one DiT partition, so a base deployment serves either `t2va` and `fl2va` or `ref2va`.
 
-An OmniRef export holds only its reference denoiser and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read them from the Hugging Face cache at that revision, downloading what the cache lacks.
+An OmniRef export holds only its DiT partition and schedulers. Its `fastvideo_inference.json` pins the base revision (`base_model_revision`) whose text encoder, tokenizer, processor and VAEs it uses, and the server and workers read every directory the export omits from the Hugging Face cache at that revision, downloading what the cache lacks.
 
 ```bash
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
@@ -258,7 +258,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | --- | --- |
 | `uniserve._worker` load or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
 | CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible. |
-| `unsupported FastH3 checkpoint` | Use a complete checkpoint from the table above; the message names the expected model and revision. |
+| `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `--quantization-config` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |

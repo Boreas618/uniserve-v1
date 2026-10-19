@@ -43,7 +43,7 @@ def _released() -> Config:
 
 def transformer_config(**overrides) -> TransformerConfig:
     """The released DiT dimensions, with ``overrides`` applied."""
-    transformer = _released().denoisers["denoiser"].transformer
+    transformer = _released().denoisers["transformer"].transformer
     return replace(transformer, **overrides)
 
 
@@ -135,22 +135,22 @@ def omniref_denoiser(
 
 
 def fasth3_config() -> Config:
-    """A FastH3 export: one DMD denoiser."""
+    """A FastH3 t2va export: one DMD denoiser."""
     return Config(
         text_encoder=text_encoder_config(),
-        denoisers={"denoiser": dmd_denoiser()},
+        denoisers={"transformer": dmd_denoiser()},
         video_vae=video_vae_config(),
         audio_vae=audio_vae_config(),
     )
 
 
 def base_config() -> Config:
-    """A diffusers root: both released DiTs."""
+    """The base release: both DiT partitions."""
     return Config(
         text_encoder=text_encoder_config(),
         denoisers={
-            "denoiser": base_denoiser(),
-            "reference_denoiser": base_denoiser(tasks=("ref2va",)),
+            "transformer": base_denoiser(),
+            "transformer_ref": base_denoiser(tasks=("ref2va",)),
         },
         video_vae=video_vae_config(),
         audio_vae=audio_vae_config(),

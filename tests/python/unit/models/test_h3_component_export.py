@@ -55,21 +55,10 @@ def checkpoints(tmp_path):
     (export / "fastvideo_inference.json").write_text(
         json.dumps(
             {
-                "schema_version": "fasth3-inference-contract-v1",
                 "model_type": "ref2va",
-                "attention_backend": "VIDEO_SPARSE_ATTN_H3",
-                "conditioning": "fixed_ordered_references_target_only_flow",
                 "base_model_revision": f"hf://MiniMaxAI/MiniMax-H3@{REVISION}",
-                "transformer_component": "transformer_ref",
-                "guidance_scale": 1.0,
-                "pdd_steps": 32,
                 "pdd_step_indices": [0, 4, 8, 12, 16, 20, 24, 28, 32],
-                "transformer_forwards": 8,
-                "num_inference_steps": 8,
                 "grid_max_t": 0.999,
-                "video_scheduler_shift": 12.0,
-                "audio_scheduler_shift": 3.0,
-                "vsa_ref_policy": "p2_multi_region",
                 "vsa_ref_keep_rate": 0.1,
                 "vsa_sparsity": 0.9,
                 "vsa_tile_size": 128,
@@ -120,14 +109,14 @@ def test_export_reads_the_directories_it_omits_at_the_pinned_revision(
         export, io=IOConfig(mode="dummy"), modules=frozenset()
     )
 
-    assert set(config.model.denoisers) == {"reference_denoiser"}
-    denoiser = config.model.denoisers["reference_denoiser"]
+    assert set(config.model.denoisers) == {"transformer_ref"}
+    denoiser = config.model.denoisers["transformer_ref"]
     assert isinstance(denoiser.schedule, PddGrid)
     assert denoiser.attention == SparseAttention(
         tile=128, sparsity=0.9, reference_keep=0.1
     )
     assert config.tokenizer == hub / "tokenizer"
-    assert set(config.entry_points) >= {"text_encoder", "reference_denoiser"}
+    assert set(config.entry_points) >= {"text_encoder", "transformer_ref"}
 
 
 def test_export_reads_a_directory_it_holds_from_itself(checkpoints, hub):
@@ -176,5 +165,5 @@ def test_offline_export_reads_its_base_from_the_cached_snapshot(
         export, io=IOConfig(mode="dummy"), modules=frozenset()
     )
 
-    assert set(config.model.denoisers) == {"reference_denoiser"}
+    assert set(config.model.denoisers) == {"transformer_ref"}
     assert config.tokenizer == snapshot / "tokenizer"

@@ -59,7 +59,7 @@ artifact_root = "artifacts/minimax_h3/measurements"
 # and W2; 1935 text rows for W3; up to 6913 for W5), the duration bound the
 # longest target, and the condition capacity the rows the references pack.
 
-# Base FL2VA (the diffusers root's denoiser) for t2va: the full 15-second
+# Base FL2VA (the base release's transformer partition) for t2va: the full 15-second
 # range and one 1024-token text capacity.
 [servers.gb200-4]
 host = "127.0.0.1"
@@ -161,7 +161,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# Base Ref2VA (the base release's transformer_ref partition): 5 seconds, an
 # 8192-token text capacity and 40,960 condition rows, which hold W5's
 # reference video, its soundtrack and the audio reference (about 38,000
 # rows packed densely).
@@ -981,7 +981,7 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base Ref2VA (the diffusers root's reference_denoiser): 5 seconds, an
+# Base Ref2VA (the base release's transformer_ref partition): 5 seconds, an
 # 8192-token text capacity and 40,960 condition rows, which hold W5's
 # reference video, its soundtrack and the audio reference (about 38,000
 # rows packed densely).
