@@ -12,10 +12,11 @@ same two calls.
 A model package provides ``config_sources``, ``read_config``, ``Model``,
 ``checkpoint_sources``, ``checkpoint_mappings``, ``entry_points``,
 ``image_processor``, ``flow_prompt``, ``precisions`` and
-``checkpoint_precision``. A package whose checkpoints may be component
-exports, which hold some components and pin a base checkpoint for the rest,
-also provides ``base_checkpoint`` (see ``Base``). This module also recognizes
-calibrated ModelOpt NVFP4 exports.
+``checkpoint_precision``. A package whose checkpoints may omit components
+that a base revision supplies also provides ``base_checkpoint(root)``, which
+returns that revision's ``(repository, revision)`` or ``None``; a top-level
+directory the checkpoint omits is then read from the base revision. This
+module also recognizes calibrated ModelOpt NVFP4 exports.
 """
 
 from __future__ import annotations
@@ -69,28 +70,6 @@ _metadata_files = (
     "model_index.json",
     "modular_model_index.json",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class Base:
-    """The pinned checkpoint a component export draws components from.
-
-    A package's ``base_checkpoint(root)`` returns one for a checkpoint
-    directory that holds only some of its components, else ``None``.
-    ``read_config`` then resolves the base from the Hub cache at
-    ``revision``, fetching what the cache lacks, and reads every source and
-    sidecar under ``directories`` from it; the package's own ``read_config``
-    receives the base directory as ``base``.
-
-    Attributes:
-        repository: Hub repository id of the base.
-        revision: The commit the export pins.
-        directories: Top-level component directories the base supplies.
-    """
-
-    repository: str
-    revision: str
-    directories: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,25 +669,20 @@ def _calibrated_quantization(
     }
 
 
-def _base_snapshot(base: Base, io) -> _Snapshot:
-    """Resolve a component export's base checkpoint.
+def _base_snapshot(repository: str, revision: str, io) -> _Snapshot:
+    """Resolve the Hub snapshot of the base revision a checkpoint pins.
 
-    The base is the Hub snapshot of the revision the export pins, read from
-    the Hub cache and fetched into it when absent. Only files under
-    ``base.directories`` are listed.
+    The snapshot is read from the Hub cache and fetched into it when absent.
 
     Raises:
         FileNotFoundError: The pinned revision publishes no model metadata.
     """
     root, repository, revision = _root(
-        base.repository, replace(io, revision=base.revision)
+        repository, replace(io, revision=revision)
     )
-    inventory = frozenset(
-        name
-        for name in _inventory(root, repository, revision, io)
-        if PurePosixPath(name).parts[0] in base.directories
+    return _Snapshot(
+        root, repository, revision, _inventory(root, repository, revision, io)
     )
-    return _Snapshot(root, repository, revision, inventory)
 
 
 def _root_metadata(root: Path) -> dict:
@@ -771,8 +745,8 @@ def read_config(
             aliases. Their architecture metadata remains available.
 
     Raises:
-        FileNotFoundError: The checkpoint, its metadata, its base, or a
-            declared source's files cannot be found.
+        FileNotFoundError: The checkpoint, its metadata, its base revision,
+            or a declared source's files cannot be found.
         ValueError: The checkpoint metadata or selection is invalid or
             unsupported, including an architecture outside the catalog, a
             selected path that is not a module, and malformed architecture,
@@ -801,12 +775,16 @@ def read_config(
     }
     _fetch(root, sidecars, repository, revision, io)
 
-    # A component export reads the directories its base supplies from the
-    # base checkpoint, whose sidecars are fetched like the export's own.
+    # A checkpoint that pins a base revision reads the top-level directories
+    # it omits from that revision, whose sidecars are fetched like the
+    # checkpoint's own.
     export = _Snapshot(root, repository, revision, inventory)
     declares_base = hasattr(package, "base_checkpoint")
     pinned = package.base_checkpoint(root) if declares_base else None
-    supplier = None if pinned is None else _base_snapshot(pinned, io)
+    supplier = None
+    if pinned is not None:
+        base_repository, base_revision = pinned
+        supplier = _base_snapshot(base_repository, base_revision, io)
     if supplier is not None:
         _fetch(
             supplier.root,
@@ -820,10 +798,11 @@ def read_config(
             io,
         )
 
+    held = {PurePosixPath(name).parts[0] for name in inventory}
+
     def located(directory: str) -> _Snapshot:
         parts = PurePosixPath(directory).parts
-        if pinned is not None and parts and parts[0] in pinned.directories:
-            assert supplier is not None
+        if supplier is not None and parts and parts[0] not in held:
             return supplier
         return export
 
