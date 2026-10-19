@@ -20,7 +20,7 @@ use uniserve_core::video::plan::{
     self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_ASPECT_RATIO,
     MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES, MAX_REFERENCES, MAX_VIDEO_REFERENCES,
     MAX_VIDEO_SECONDS, MIN_ASPECT_RATIO, MIN_VIDEO_SECONDS, NAMED_ASPECT_RATIOS, PlanLimits,
-    ProcessorConfig, ReferenceConfig, Target, VIDEO_FPS,
+    ProcessorConfig, ReferenceConfig, Target,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -47,6 +47,9 @@ pub struct ProcessedVideo {
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
+    /// The duration of the generated frames, in seconds: the frame count at
+    /// the deployment's frame rate.
+    pub actual_seconds: f64,
     /// The generated canvas.
     pub canvas: Canvas,
 }
@@ -108,6 +111,7 @@ impl VideoService {
         let limits = PlanLimits {
             tasks: tasks.clone(),
             max_video_seconds,
+            frame_rate: denoiser.frame_rate,
             // An empty list means the denoiser generates every canvas of the
             // canvas rule.
             canvases: (!denoiser.canvases.is_empty()).then(|| denoiser.canvases.clone()),
@@ -193,7 +197,7 @@ impl VideoService {
                 "sizes": sizes,
                 "canvases": (!self.denoiser.canvases.is_empty()).then_some(&self.denoiser.canvases),
             },
-            "fps": VIDEO_FPS,
+            "fps": self.denoiser.frame_rate,
             "min_seconds": MIN_VIDEO_SECONDS,
             "max_seconds": self.max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
@@ -299,6 +303,7 @@ impl VideoService {
                 },
             },
             duration_seconds: plan.duration_seconds,
+            actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
             canvas: plan.canvas,
         })
     }
@@ -356,6 +361,7 @@ mod tests {
                 schedule_points: 50,
                 video_shift: 12.0,
                 audio_shift: 3.0,
+                frame_rate: 24,
                 canvases: Vec::new(),
                 max_sequence_rows,
             },

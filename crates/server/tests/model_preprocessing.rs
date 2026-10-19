@@ -60,6 +60,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         schedule_points: 50,
         video_shift: 12.0,
         audio_shift: 3.0,
+        frame_rate: 24,
         canvases: Vec::new(),
         max_sequence_rows: None,
     }
@@ -718,6 +719,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         schedule_points: 9,
         video_shift: 10.0,
         audio_shift: 3.0,
+        frame_rate: 24,
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
         max_sequence_rows: None,
     };

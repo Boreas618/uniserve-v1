@@ -76,7 +76,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, VIDEO_FPS};
+use uniserve_core::video::plan::MAX_VIDEO_SECONDS;
 use uniserve_core::{MediaKind, VideoTask};
 use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
 use uniserve_server::{
@@ -165,6 +165,9 @@ pub struct DynamoFastH3Engine {
     /// The validated product of `--video-resolutions` and
     /// `--video-aspect-ratios`.
     rasters: VideoRasters,
+    /// What the started deployment generates, set once by `start` with
+    /// `state`.
+    outputs: OnceCell<Outputs>,
     /// The UniServe serving state, set once by `start`. Every other trait
     /// method reads it and treats an unset state as not started.
     state: OnceCell<Arc<AppState>>,
@@ -228,6 +231,7 @@ impl DynamoFastH3Engine {
             Self {
                 args,
                 rasters,
+                outputs: OnceCell::new(),
                 state: OnceCell::new(),
                 cancel: CancellationToken::new(),
             },
@@ -236,14 +240,15 @@ impl DynamoFastH3Engine {
     }
 
     /// Starts UniServe's engine and worker ranks for the configured FastH3
-    /// checkpoint and returns the serving state.
+    /// checkpoint and returns the serving state with what it generates.
     ///
     /// Fails with an invalid argument when the checkpoint's pipeline index
     /// cannot be resolved or does not name MiniMax H3, when the configuration
     /// does not validate, or when the started model reports no video
-    /// capabilities. It fails with an engine error when UniServe cannot
-    /// start. A refusal after startup shuts the engine down before returning.
-    async fn build_state(&self) -> Result<Arc<AppState>, DynamoError> {
+    /// capabilities or not FastH3's. It fails with an engine error when
+    /// UniServe cannot start. A refusal after startup shuts the engine down
+    /// before returning.
+    async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
         let pipeline =
@@ -314,11 +319,14 @@ impl DynamoFastH3Engine {
             let _ = state.engine().shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
-        if let Err(mismatch) = check_fasth3(&capabilities, &self.rasters) {
-            let _ = state.engine().shutdown().await;
-            return Err(invalid_argument(mismatch.to_string()));
-        }
-        Ok(state)
+        let outputs = match check_fasth3(&capabilities, &self.rasters) {
+            Ok(outputs) => outputs,
+            Err(mismatch) => {
+                let _ = state.engine().shutdown().await;
+                return Err(invalid_argument(mismatch.to_string()));
+            }
+        };
+        Ok((state, outputs))
     }
 }
 
@@ -330,14 +338,18 @@ impl RawEngine for DynamoFastH3Engine {
         if self.state.initialized() {
             return Err(engine_error("UniServe engine already started"));
         }
-        let state = self.build_state().await?;
+        let (state, outputs) = self.build_state().await?;
+        let runtime_data = runtime_data(self.args.max_video_seconds, &self.rasters, &outputs);
         self.state
             .set(state)
+            .map_err(|_| engine_error("UniServe engine already started"))?;
+        self.outputs
+            .set(outputs)
             .map_err(|_| engine_error("UniServe engine already started"))?;
         Ok(EngineConfig {
             model: self.args.served_model_name.clone(),
             served_model_name: Some(self.args.served_model_name.clone()),
-            runtime_data: runtime_data(self.args.max_video_seconds, &self.rasters),
+            runtime_data,
             llm: None,
             ..Default::default()
         })
@@ -353,6 +365,10 @@ impl RawEngine for DynamoFastH3Engine {
                 .get()
                 .ok_or_else(|| engine_error("generate called before start"))?,
         );
+        let outputs = self
+            .outputs
+            .get()
+            .ok_or_else(|| engine_error("generate called before start"))?;
         let prepared = prepare_request(
             request,
             &self.args.served_model_name,
@@ -374,6 +390,7 @@ impl RawEngine for DynamoFastH3Engine {
         let cancel = self.cancel.clone();
         let served_model_name = self.args.served_model_name.clone();
         let response_format = prepared.response_format;
+        let outputs = *outputs;
 
         // Unless stopped, the stream yields exactly one item: the response
         // object, or the error that ended the request. A Dynamo stop or
@@ -427,6 +444,7 @@ impl RawEngine for DynamoFastH3Engine {
                 &served_model_name,
                 response_format,
                 artifact.media.as_bytes(),
+                &outputs,
                 started_at.elapsed(),
             ));
         }))
@@ -636,24 +654,40 @@ fn prepare_request(
     })
 }
 
+/// What a started deployment generates, as its video capabilities report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Outputs {
+    /// Frames per second of every generated video (`fps`).
+    frame_rate: u32,
+}
+
 /// A deployment whose video capabilities are not the FastH3 contract.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "the Dynamo worker serves FastH3 text-to-video at {served} only; this deployment serves tasks {tasks} on canvases {canvases}"
-)]
-struct DeploymentMismatch {
-    /// The canvases the worker serves, `WIDTHxHEIGHT` joined by commas.
-    served: String,
-    /// The deployment's `tasks` capability, as JSON.
-    tasks: String,
-    /// The deployment's `canvas.canvases` capability, as JSON.
-    canvases: String,
+enum DeploymentMismatch {
+    /// Other tasks or canvases than the worker serves.
+    #[error(
+        "the Dynamo worker serves FastH3 text-to-video at {served} only; this deployment serves tasks {tasks} on canvases {canvases}"
+    )]
+    Contract {
+        /// The canvases the worker serves, `WIDTHxHEIGHT` joined by commas.
+        served: String,
+        /// The deployment's `tasks` capability, as JSON.
+        tasks: String,
+        /// The deployment's `canvas.canvases` capability, as JSON.
+        canvases: String,
+    },
+    /// Capabilities without the output frame rate.
+    #[error("the deployment reports no output frame rate: fps is {0}")]
+    FrameRate(String),
 }
 
 /// Checks that a deployment's video capabilities are FastH3's: `t2va` alone
 /// on exactly the canvases of `rasters`, the requests `prepare_request`
-/// builds.
-fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), DeploymentMismatch> {
+/// builds. Returns what the deployment generates.
+fn check_fasth3(
+    capabilities: &Value,
+    rasters: &VideoRasters,
+) -> Result<Outputs, DeploymentMismatch> {
     let tasks = &capabilities["tasks"];
     let canvases = &capabilities["canvas"]["canvases"];
     let expected: Vec<Value> = rasters
@@ -663,14 +697,20 @@ fn check_fasth3(capabilities: &Value, rasters: &VideoRasters) -> Result<(), Depl
     let served = canvases.as_array().is_some_and(|served| {
         served.len() == expected.len() && expected.iter().all(|canvas| served.contains(canvas))
     });
-    if *tasks == json!(["t2va"]) && served {
-        return Ok(());
+    if *tasks != json!(["t2va"]) || !served {
+        return Err(DeploymentMismatch::Contract {
+            served: served_sizes(rasters).join(", "),
+            tasks: tasks.to_string(),
+            canvases: canvases.to_string(),
+        });
     }
-    Err(DeploymentMismatch {
-        served: served_sizes(rasters).join(", "),
-        tasks: tasks.to_string(),
-        canvases: canvases.to_string(),
-    })
+    let fps = &capabilities["fps"];
+    let frame_rate = fps
+        .as_u64()
+        .and_then(|rate| u32::try_from(rate).ok())
+        .filter(|&rate| rate > 0)
+        .ok_or_else(|| DeploymentMismatch::FrameRate(fps.to_string()))?;
+    Ok(Outputs { frame_rate })
 }
 
 /// Maps a video stream that ended without an artifact to Dynamo's error type.
@@ -707,13 +747,15 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
 /// `NvVideosResponse`.
 ///
 /// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
-/// `B64Json` as bare base64. `fps` and `audio_sample_rate` report the fixed
-/// FastH3 contract, not values read from the artifact.
+/// `B64Json` as bare base64. `fps` reports the deployment's output frame rate
+/// and `audio_sample_rate` the fixed FastH3 contract, not values read from
+/// the artifact.
 fn video_response(
     id: &str,
     model: &str,
     response_format: ResponseFormat,
     media: &[u8],
+    outputs: &Outputs,
     elapsed: Duration,
 ) -> Value {
     let encoded = base64::engine::general_purpose::STANDARD.encode(media);
@@ -732,7 +774,7 @@ fn video_response(
             "output_format": "mp4",
             "url": url,
             "b64_json": b64_json,
-            "fps": VIDEO_FPS,
+            "fps": outputs.frame_rate,
             "audio_sample_rate": H3_AUDIO_SAMPLE_RATE,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
@@ -784,12 +826,16 @@ fn served_sizes(rasters: &VideoRasters) -> Vec<String> {
 }
 
 /// Registration metadata Dynamo copies into the model's runtime config.
-fn runtime_data(max_video_seconds: f64, rasters: &VideoRasters) -> HashMap<String, Value> {
+fn runtime_data(
+    max_video_seconds: f64,
+    rasters: &VideoRasters,
+    outputs: &Outputs,
+) -> HashMap<String, Value> {
     let default = rasters.select(None, None).ok();
     BTreeMap::from([
         ("backend".to_string(), json!("uniserve-inprocess")),
         ("task".to_string(), json!("t2va")),
-        ("fps".to_string(), json!(VIDEO_FPS)),
+        ("fps".to_string(), json!(outputs.frame_rate)),
         (
             "width".to_string(),
             json!(default.map(|raster| raster.width)),
@@ -847,8 +893,11 @@ mod tests {
         })
     }
 
+    /// What the default 24 fps deployment generates.
+    const OUTPUTS: Outputs = Outputs { frame_rate: 24 };
+
     fn capabilities(tasks: Value, canvases: Value) -> Value {
-        json!({"tasks": tasks, "canvas": {"canvases": canvases}})
+        json!({"tasks": tasks, "canvas": {"canvases": canvases}, "fps": 24})
     }
 
     #[test]
@@ -858,7 +907,14 @@ mod tests {
             {"width": 768, "height": 1344},
             {"width": 1344, "height": 768},
         ]);
-        assert!(check_fasth3(&capabilities(json!(["t2va"]), served.clone()), &rasters).is_ok());
+        assert_eq!(
+            check_fasth3(&capabilities(json!(["t2va"]), served.clone()), &rasters).ok(),
+            Some(OUTPUTS)
+        );
+        // A deployment that reports no frame rate is refused.
+        let mut silent = capabilities(json!(["t2va"]), served.clone());
+        silent["fps"] = Value::Null;
+        assert!(check_fasth3(&silent, &rasters).is_err());
         // Another canvas set than the configured one is refused.
         let landscape = json!([{"width": 1344, "height": 768}]);
         assert!(check_fasth3(&capabilities(json!(["t2va"]), landscape), &rasters).is_err());
@@ -937,7 +993,8 @@ mod tests {
         ] {
             assert!(prepare(request).is_err());
         }
-        let runtime = runtime_data(15.0, &rasters);
+        let runtime = runtime_data(15.0, &rasters, &OUTPUTS);
+        assert_eq!(runtime["fps"], 24);
         assert_eq!(runtime["width"], 1344);
         assert_eq!(runtime["height"], 768);
         assert_eq!(
@@ -989,13 +1046,22 @@ mod tests {
             "FastH3",
             ResponseFormat::B64Json,
             b"mp4",
+            &OUTPUTS,
             Duration::from_millis(1_500),
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
+        assert_eq!(response["data"][0]["fps"], 24);
         assert!(response["data"][0]["url"].is_null());
         assert_eq!(response["inference_time_s"], 1.5);
 
-        let response = video_response("id", "FastH3", ResponseFormat::Url, b"mp4", Duration::ZERO);
+        let response = video_response(
+            "id",
+            "FastH3",
+            ResponseFormat::Url,
+            b"mp4",
+            &OUTPUTS,
+            Duration::ZERO,
+        );
         assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");
     }
 }

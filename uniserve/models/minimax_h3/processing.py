@@ -25,6 +25,8 @@ from typing import Any
 from uniserve.media import image
 from uniserve.worker import library
 
+from .packing import FPS
+
 __all__ = [
     "NAMED_ASPECT_RATIOS",
     "PlanError",
@@ -136,7 +138,7 @@ def reference_bounds(num_frames: int) -> ReferenceBounds:
     set it admits.
     """
     images, frames, samples, canvases = library()["video_reference_bounds"](
-        int(num_frames)
+        int(num_frames), FPS
     )
     widest, tallest = _canvases(images)
     return ReferenceBounds(
@@ -150,8 +152,9 @@ def reference_bounds(num_frames: int) -> ReferenceBounds:
 def frame_count(seconds: float, max_seconds: float | None = None) -> int:
     """Return the generated frame count of a duration.
 
-    The duration times 24 rounds half to even and aligns up to the next
-    ``17 * n + 5``: 4 seconds give 107 frames, 15 seconds 362.
+    The duration times the model's output frame rate (``packing.FPS``, 24)
+    rounds half to even and aligns up to the next ``17 * n + 5``: 4 seconds
+    give 107 frames, 15 seconds 362.
 
     Args:
         seconds: The requested duration.
@@ -162,7 +165,7 @@ def frame_count(seconds: float, max_seconds: float | None = None) -> int:
         ValueError: ``seconds`` lies outside ``[4, max_seconds]``.
     """
     longest = None if max_seconds is None else float(max_seconds)
-    return int(library()["video_frame_count"](float(seconds), longest))
+    return int(library()["video_frame_count"](float(seconds), longest, FPS))
 
 
 def named_canvas(

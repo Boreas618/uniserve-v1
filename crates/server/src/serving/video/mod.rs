@@ -234,6 +234,7 @@ pub(super) mod tests {
         PlanLimits {
             tasks: VideoTask::ALL.to_vec(),
             max_video_seconds: 15.0,
+            frame_rate: 24,
             canvases: None,
             // The fixture's requests follow the released pipeline.
             references: uniserve_core::video::plan::ReferenceConfig::RELEASED,
