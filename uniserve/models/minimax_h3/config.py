@@ -50,15 +50,16 @@ UNIFORM_GRID_POINTS = 50
 NAMED_ASPECT_RATIOS = ((21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16))
 
 # The 768p resolution class: the canvas rule's short edge, at which the
-# released checkpoint generates the rule's canvas of every named ratio.
-_CLASS_768P = 768
+# released checkpoint generates the rule's canvas of every named ratio. A
+# request selects these canvases by stating it as its target short edge.
+CANVAS_SHORT_EDGE = 768
 
 # The canvas of every named aspect ratio at the 768p class, keyed as a
 # request selects it: ``(short_edge, "W:H")``. The base release generates
 # these by the canvas rule (``processing.canvas``).
 NAMED_CANVASES: Mapping[tuple[int, str], image.Config] = MappingProxyType(
     {
-        (_CLASS_768P, f"{width}:{height}"): canvas(width, height)
+        (CANVAS_SHORT_EDGE, f"{width}:{height}"): canvas(width, height)
         for width, height in NAMED_ASPECT_RATIOS
     }
 )

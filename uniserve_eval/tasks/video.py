@@ -38,11 +38,6 @@ from ..types import (
 )
 from .base import BenchmarkTask
 
-# Every MiniMax-H3 output runs at 24 frames per second.
-VIDEO_FPS = 24
-# The only target short edge the canvas rule serves, in pixels.
-TARGET_SHORT_EDGE = 768
-
 # Media types of the condition files the request API accepts, by suffix:
 # JPEG, PNG and WEBP images, MP4 and QuickTime videos, MP3 and WAV audio.
 MEDIA_TYPES = {
@@ -99,7 +94,7 @@ def target_canvas(
     _named_ratio(task, aspect_ratio)
     size = processing.named_canvas(
         processing.Task(task),
-        short_edge=TARGET_SHORT_EDGE,
+        short_edge=config.CANVAS_SHORT_EDGE,
         aspect_ratio=aspect_ratio,
         canvases=config.NAMED_CANVASES,
     )
@@ -113,8 +108,8 @@ def target_canvas(
 def target_frames(seconds: float) -> int:
     """Return the frames a target duration generates.
 
-    The duration times 24 rounds half to even and aligns up to the next
-    ``17 n + 5`` frames.
+    The duration times the model's frame rate (24) rounds half to even
+    and aligns up to the next ``17 n + 5`` frames.
 
     Raises:
         ValueError: The duration lies outside 4 to 15 seconds.
@@ -198,6 +193,8 @@ class VideoTask(BenchmarkTask):
                 cannot be sent them as the same work.
             OSError: A condition media file cannot be read.
         """
+        from uniserve.models.minimax_h3 import config
+
         video = self.point.video
         seconds = float(
             example.seconds if example.seconds is not None else video.seconds
@@ -219,7 +216,8 @@ class VideoTask(BenchmarkTask):
             "task": video.task,
             "conditions": conditions,
             "target": {
-                "short_edge": TARGET_SHORT_EDGE,
+                # The short edge the model names its canvases at.
+                "short_edge": config.CANVAS_SHORT_EDGE,
                 "aspect_ratio": video.aspect_ratio,
                 "duration_seconds": seconds,
             },
@@ -333,8 +331,13 @@ class VideoTask(BenchmarkTask):
 
         Each output is held to the canvas and frame count its own request
         resolved to (``RequestRecord.video_shape``); a record without one
-        fails every shape check.
+        fails every shape check. The frame rate, sample rate and channel
+        count are the model's own (``packing``), the facts the serving
+        workers declare in their handshake.
         """
+        from uniserve.models.minimax_h3 import packing
+
+        fps = packing.FPS
         outputs = [record.decoded_video for record in records]
         shapes = [record.video_shape for record in records]
         present = (
@@ -355,7 +358,7 @@ class VideoTask(BenchmarkTask):
         # one frame period. A one-frame-short video with full-length audio is
         # therefore valid, while a missing or truncated stream is not.
         frame_tolerance = 1
-        duration_tolerance_s = 1.0 / VIDEO_FPS
+        duration_tolerance_s = 1.0 / fps
         return ValidationResult(
             checks={
                 "decoded_video": present,
@@ -366,10 +369,11 @@ class VideoTask(BenchmarkTask):
                     (video.width, video.height) == (shape.width, shape.height)
                     for video, shape in pairs
                 ),
-                # The container frame rate is a rational; require exactly 24.
+                # The container frame rate is a rational; require exactly
+                # the model's.
                 "24fps_video": present
                 and all(
-                    video.fps_numerator == VIDEO_FPS * video.fps_denominator
+                    video.fps_numerator == fps * video.fps_denominator
                     for video in videos
                 ),
                 "aligned_frame_count": present
@@ -380,13 +384,13 @@ class VideoTask(BenchmarkTask):
                 "aac_stereo_32khz_audio": present
                 and all(
                     video.audio_codec == "aac"
-                    and video.audio_channels == 2
-                    and video.audio_sample_rate == 32_000
+                    and video.audio_channels == packing.AUDIO_CHANNELS
+                    and video.audio_sample_rate == packing.AUDIO_SAMPLE_RATE
                     for video in videos
                 ),
                 "aligned_audio_duration": present
                 and all(
-                    abs(video.audio_duration_s - shape.frames / VIDEO_FPS)
+                    abs(video.audio_duration_s - shape.frames / fps)
                     <= duration_tolerance_s
                     for video, shape in pairs
                 ),
