@@ -62,6 +62,12 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        frames: uniserve_core::FrameClips {
+            min_frames: 22,
+            clip_frames: 17,
+            clip_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: Vec::new(),
         max_sequence_rows: None,
     }
@@ -722,6 +728,12 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
+        frames: uniserve_core::FrameClips {
+            min_frames: 22,
+            clip_frames: 17,
+            clip_latent_frames: 5,
+            tail_latent_frames: 2,
+        },
         canvases: vec![canvas(1344, 768), canvas(992, 416), canvas(832, 480)],
         max_sequence_rows: None,
     };

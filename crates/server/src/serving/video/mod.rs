@@ -201,12 +201,12 @@ pub(super) mod tests {
     use serde_json::Value;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::VideoTask;
     use uniserve_core::video::plan::{
         ConditionSpec, ConditionType, PlanLimits, Prepared, ProcessorConfig, RequestField, Role,
         Target, VideoInputError,
     };
     use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
+    use uniserve_core::{FrameClips, VideoTask};
 
     use super::probe::{MediaProber, ProbeConfig};
     use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
@@ -235,6 +235,12 @@ pub(super) mod tests {
             tasks: VideoTask::ALL.to_vec(),
             max_video_seconds: 15.0,
             frame_rate: 24,
+            frames: FrameClips {
+                min_frames: 22,
+                clip_frames: 17,
+                clip_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
             canvases: None,
             // The fixture's requests follow the released pipeline.
             references: uniserve_core::video::plan::ReferenceConfig::RELEASED,

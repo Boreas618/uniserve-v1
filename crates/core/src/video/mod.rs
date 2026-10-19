@@ -142,6 +142,60 @@ impl ConditionMedia {
     }
 }
 
+/// How a model's video VAE divides a video's frames into clips.
+///
+/// A video has `min_frames + n * clip_frames` frames: one decode unit per
+/// clip, so `n + 1` units. The VAE encodes each clip to `clip_latent_frames`
+/// latent frames and the tail past the whole clips to `tail_latent_frames`.
+/// The model states the rule and the worker declares it in its handshake;
+/// every count a request derives from it, the generated frames, the decode
+/// units and a reference video's encoded frames and latent units, follows
+/// from these four values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FrameClips {
+    /// Fewest frames of a video: one clip and the tail.
+    pub min_frames: u32,
+    /// Frames each further clip adds.
+    pub clip_frames: u32,
+    /// Latent frames one clip encodes to.
+    pub clip_latent_frames: u32,
+    /// Latent frames of the tail past the clips.
+    pub tail_latent_frames: u32,
+}
+
+impl FrameClips {
+    /// The decode units of a video of `frames` legal frames: one per clip.
+    pub fn units(&self, frames: u32) -> u32 {
+        frames.saturating_sub(self.min_frames) / self.clip_frames + 1
+    }
+
+    /// The fewest legal frame count that is at least `requested`.
+    pub fn align_up(&self, requested: u32) -> u32 {
+        let beyond = requested.saturating_sub(self.min_frames);
+        self.min_frames + beyond.div_ceil(self.clip_frames) * self.clip_frames
+    }
+
+    /// The most legal frames of at most `available`, or `None` below the
+    /// fewest.
+    pub fn align_down(&self, available: u32) -> Option<u32> {
+        let beyond = available.checked_sub(self.min_frames)?;
+        Some(self.min_frames + beyond / self.clip_frames * self.clip_frames)
+    }
+
+    /// The latent frames the VAE encodes `frames` legal frames to.
+    pub fn latent_frames(&self, frames: u32) -> u32 {
+        self.units(frames) * self.clip_latent_frames + self.tail_latent_frames
+    }
+
+    /// Whether the rule is positive and leaves a tail past the first clip.
+    pub fn is_valid(&self) -> bool {
+        self.clip_frames > 0
+            && self.min_frames > self.clip_frames
+            && self.clip_latent_frames > 0
+            && self.tail_latent_frames > 0
+    }
+}
+
 /// A vision patch grid: `t` temporal patches of `h` by `w` spatial patches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VisionGrid {

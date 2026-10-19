@@ -668,6 +668,22 @@ class DenoiserRunner:
         return int(_denoiser(loaded, component).text_condition_width)
 
     @staticmethod
+    def frame_clips(loaded, component: str) -> list[int]:
+        """How the video VAE divides the frames the denoiser generates.
+
+        ``[min_frames, clip_frames, clip_latent_frames, tail_latent_frames]``:
+        the denoiser's legal frame counts form ``min_frames + n *
+        clip_frames``, and the video encoder's latent slices of the fewest
+        frames are one whole clip followed by the tail past it.
+        """
+        network = _denoiser(loaded, component)
+        fewest = int(network.legal_frame_count(1))
+        clip = int(network.legal_frame_count(fewest + 1)) - fewest
+        encoder = _require(loaded, VideoEncoder)
+        whole, *_, tail = encoder.latent_slices(fewest)
+        return [fewest, clip, whole.stop - whole.start, tail.stop - tail.start]
+
+    @staticmethod
     def legal_frame_count(loaded, component: str, frames: int) -> int:
         """The smallest frame count the denoiser generates for ``frames``."""
         return int(_denoiser(loaded, component).legal_frame_count(int(frames)))

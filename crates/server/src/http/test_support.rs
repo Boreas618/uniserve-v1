@@ -100,6 +100,12 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
+            frames: uniserve_core::FrameClips {
+                min_frames: 22,
+                clip_frames: 17,
+                clip_latent_frames: 5,
+                tail_latent_frames: 2,
+            },
             canvases: Vec::new(),
             max_sequence_rows: None,
         },
