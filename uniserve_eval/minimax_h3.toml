@@ -552,10 +552,9 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
-# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
-# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
-# (--attention-backend fa; exploratory, two requests each).
+# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va),
+# including its platform attention (cuDNN SDPA); FlashAttention-4
+# (--attention-backend fa) is no faster on W4 and W5.
 [servers.sglang-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -742,10 +741,9 @@ videos_per_second = "higher"
 "video_latency_ms.p95" = "lower"
 
 # vLLM-Omni's Ref2VA partition directory; it serves ref2va only. The recipe
-# with the text encoder sharded over the four ranks (--text-encoder-tp-size 4)
-# measured lowest on 4xGB200: 52.48 s for W4 and 138.55 s for W5 against the
-# recipe's 52.65 s and 138.95 s (exploratory, two requests each; the
-# difference is within the run-to-run spread on W5).
+# runs with the text encoder sharded over the four ranks
+# (--text-encoder-tp-size 4), which is at least as fast on W4 and W5 as the
+# recipe's own text encoder placement.
 [servers.vllm-omni-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083
@@ -933,11 +931,6 @@ videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-# Base Ref2VA (the base release's transformer_ref partition): 5 seconds, an
-# 8192-token text capacity and 40,960 condition rows, which hold W5's
-# reference video, its soundtrack and the audio reference (about 38,000
-# rows packed densely).
-
 # SGLang across rank-0 and rank-1: its cookbook's GB200 2x4 recipe, Ulysses 4
 # within a host and ring attention of degree 2 across the hosts, resident
 # components, the text encoder replicated across the nodes; ring attention
@@ -1062,11 +1055,6 @@ warmup_manifest = "uniserve_eval/workloads/minimax_h3/w3-warmup.jsonl"
 videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
-
-# SGLang's Ref2VA partition with the same recipe (--model-variant ref2va).
-# The recipe's platform attention (cuDNN SDPA) measured 65.12 s for W4 and
-# 132.41 s for W5 against 65.49 s and 132.79 s with FlashAttention-4
-# (--attention-backend fa; exploratory, two requests each).
 
 [suites.gb200-4]
 points = ["gb200-4-w1", "gb200-4-w2", "gb200-4-w3"]
