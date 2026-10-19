@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from uniserve.media.reader import read_audio, read_image
+from uniserve.models.minimax_h3.packing import FPS
 
 pytestmark = [
     pytest.mark.integration,
@@ -35,9 +36,8 @@ pytestmark = [
     pytest.mark.slow,
 ]
 
-# The model's audio rate and frame rate.
+# The model's audio rate, the rate every soundtrack is resampled to.
 SAMPLE_RATE = 32_000
-FPS = 24
 
 
 @dataclass(frozen=True, slots=True)

@@ -98,6 +98,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             schedule_points: 5,
             video_shift: 12.0,
             audio_shift: 3.0,
+            frame_rate: 24,
             canvases: Vec::new(),
             max_sequence_rows: None,
         },

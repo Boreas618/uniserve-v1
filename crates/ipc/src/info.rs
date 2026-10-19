@@ -279,6 +279,10 @@ pub struct VideoDenoiserInfo {
     pub video_shift: f64,
     /// Shift of the audio schedule.
     pub audio_shift: f64,
+    /// Frame rate, in frames per second, of every video the deployment
+    /// generates: the output clock durations and reference videos are
+    /// counted on.
+    pub frame_rate: u32,
     /// The only canvases the deployment serves: those it prepares, in the
     /// order it names them. Empty declares every canvas of the model's
     /// canvas rule.
@@ -295,8 +299,8 @@ impl VideoDenoiserInfo {
     }
 
     /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, and every canvas and the capacity are
-    /// positive.
+    /// and positive finite shifts, the frame rate is declared, and every
+    /// canvas and the capacity are positive.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -310,6 +314,10 @@ impl VideoDenoiserInfo {
                     .iter()
                     .all(|shift| shift.is_finite() && *shift > 0.0),
             "a video denoiser schedule needs points and positive shifts"
+        );
+        ensure_valid!(
+            self.frame_rate > 0,
+            "a video denoiser declares no frame rate"
         );
         ensure_valid!(
             self.canvases

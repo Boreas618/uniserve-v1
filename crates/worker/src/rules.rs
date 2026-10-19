@@ -60,11 +60,16 @@ fn video_canvas(aspect_width: f64, aspect_height: f64) -> Result<Array<Any>> {
         .map_err(|error| value_error(&error.to_string()))
 }
 
-/// `video_frame_count(seconds, max_seconds) -> frames`: the generated frame
-/// count of a duration; `max_seconds` `None` is the model's 15 seconds.
-fn video_frame_count(seconds: f64, max_seconds: Option<f64>) -> Result<i64> {
+/// `video_frame_count(seconds, max_seconds, frame_rate) -> frames`: the
+/// generated frame count of a duration at the model's output `frame_rate`;
+/// `max_seconds` `None` is the model's 15 seconds.
+fn video_frame_count(seconds: f64, max_seconds: Option<f64>, frame_rate: i64) -> Result<i64> {
     let max_seconds = max_seconds.unwrap_or(MAX_VIDEO_SECONDS);
-    plan::video_frame_count(seconds, max_seconds)
+    let frame_rate = u32::try_from(frame_rate)
+        .ok()
+        .filter(|&rate| rate > 0)
+        .ok_or_else(|| value_error("frame_rate must be a positive count"))?;
+    plan::video_frame_count(seconds, max_seconds, frame_rate)
         .map(i64::from)
         .map_err(|error| value_error(&error.to_string()))
 }
@@ -92,13 +97,18 @@ fn video_buckets() -> Result<Array<Any>> {
     Ok(integer_list(values))
 }
 
-/// `video_reference_bounds(frames) -> [images, video_frames, audio_samples,
-/// video_canvases]`: the largest references a request generating `frames`
-/// frames may bring (`plan::reference_bounds`); `images`, the two largest
-/// image rasters, and `video_canvases` are flat `[width, height, ...]`.
-fn video_reference_bounds(frames: i64) -> Result<Array<Any>> {
+/// `video_reference_bounds(frames, frame_rate) -> [images, video_frames,
+/// audio_samples, video_canvases]`: the largest references a request
+/// generating `frames` frames at the model's output `frame_rate` may bring
+/// (`plan::reference_bounds`); `images`, the two largest image rasters, and
+/// `video_canvases` are flat `[width, height, ...]`.
+fn video_reference_bounds(frames: i64, frame_rate: i64) -> Result<Array<Any>> {
     let frames = u32::try_from(frames).map_err(|_| value_error("frames is out of range"))?;
-    let bounds = plan::reference_bounds(frames);
+    let frame_rate = u32::try_from(frame_rate)
+        .ok()
+        .filter(|&rate| rate > 0)
+        .ok_or_else(|| value_error("frame_rate must be a positive count"))?;
+    let bounds = plan::reference_bounds(frames, frame_rate);
     let rasters = |canvases: &[Canvas]| {
         integer_list(
             canvases
