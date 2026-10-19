@@ -52,6 +52,19 @@ The `h200-ulysses8`, `h200-ulysses4` and `h200-fp8` suites and the `h200-gather8
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3_h200.toml run h200-ulysses8 --reuse-deployment
 ```
 
+## RTX PRO 6000
+
+The `rtx-pro-6000-8-dp8-nvfp4`, `rtx-pro-6000-8-dp8-tp4x2-nvfp4` and `rtx-pro-6000-8-dp8-bf16` suites of `uniserve_eval/fast_h3.toml` run the throughput points of the [FastH3 post](#fasth3-post) on one host with eight RTX PRO 6000 Blackwell Server Edition GPUs: six unmeasured warmups, the priming requests of the concurrency, then the 32 throughput requests, at concurrency 8, and 16 on the TP8 text encoders. Each serves eight one-GPU denoiser replicas, which keep every denoiser collective off PCIe: the NVFP4 checkpoint beside one TP8 text encoder (`fasth3-dp8-text-tp8.json`) or two TP4 text encoders, one per four-GPU half (`fasth3-dp8-text-tp4x2.json`), and the BF16 checkpoint with each replica's layer projections in host memory (`fasth3-dp8-text-tp8-host-weights.json`). A one-GPU replica holds a whole 15-second sequence, so the DP8 servers bound prompts at 10240 tokens (the workload's longest is 10000) and prepare only the 16:9 canvas. Collectives use NCCL's default transport: on a host whose GPUs share no PCIe switch, `NCCL_P2P_LEVEL=SYS` makes NCCL use PCIe peer-to-peer between them where its default connects them through host memory, which lowers its all-to-all and all-reduce bandwidth.
+
+The `rtx-pro-6000-8-omniref-refs` suite of `uniserve_eval/minimax_h3.toml` runs twelve cells of the OmniRef reference matrix, the `image`, `image-voice`, `video` and `mixed` compositions at 5, 10 and 15 seconds, as one Ulysses8 reference replica (`ulysses8-reference.json`) with the capacities, sizing and seeds of the `h200-8-omniref-refs` suite and graphs off; SM120 evaluates each 128-row sparse-attention tile as two tiles of its 64-row kernel. `rtx-pro-6000-8-omniref-smoke` runs five of those cells.
+
+No measurement of these suites is recorded.
+
+```bash
+.venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run rtx-pro-6000-8-dp8-nvfp4 --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run rtx-pro-6000-8-omniref-refs --reuse-deployment --keep-going
+```
+
 ## MiniMax-H3 workloads
 
 `uniserve_eval/minimax_h3.toml` runs these workloads on UniServe, SGLang, vLLM-Omni and FastVideo:
