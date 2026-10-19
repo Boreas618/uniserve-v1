@@ -265,7 +265,8 @@ impl WorkerEndpoint {
 /// What the video denoiser a deployment places serves.
 ///
 /// The denoiser fixes its schedule, and with it every request's step count;
-/// the tasks and canvases bound what admission accepts.
+/// the tasks, canvases and reference limits bound what a request may ask
+/// for.
 /// The worker that denoises a request admits its conditions into the
 /// condition capacity it provisioned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,6 +293,9 @@ pub struct VideoDenoiserInfo {
     /// with the `(short_edge, aspect_ratio)` its model names it by, in the
     /// order the deployment names them.
     pub canvases: Vec<uniserve_core::ServedCanvas>,
+    /// The references one request may carry and the largest short edge an
+    /// image reference is encoded at; zeros for a denoiser that takes none.
+    pub references: uniserve_core::ReferenceLimits,
 }
 
 impl VideoDenoiserInfo {
@@ -303,8 +307,10 @@ impl VideoDenoiserInfo {
 
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, and every canvas is a positive raster named
-    /// by its own `(short_edge, aspect_ratio)` pair.
+    /// frame rule are declared, every canvas is a positive raster named by
+    /// its own `(short_edge, aspect_ratio)` pair, and the reference limits
+    /// bound each kind within the total, with an image edge where images
+    /// are taken.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
@@ -330,6 +336,16 @@ impl VideoDenoiserInfo {
         ensure_valid!(
             self.frames.is_valid(),
             "a video denoiser declares an empty frame rule"
+        );
+        let references = &self.references;
+        ensure_valid!(
+            references
+                .images
+                .max(references.videos)
+                .max(references.audios)
+                <= references.total
+                && (references.images == 0 || references.image_short_edge > 0),
+            "a video denoiser declares reference limits beyond their total or images without an edge"
         );
         ensure_valid!(
             self.canvases.iter().all(|served| {

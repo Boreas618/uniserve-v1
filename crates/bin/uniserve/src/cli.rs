@@ -225,8 +225,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Options of the served model's multimodal processor, as a JSON object.
     /// The processor refuses an option it does not take. MiniMax-H3's video
     /// processor sizes `ref2va` references by two: an image whose short
-    /// edge exceeds `reference_image_short_edge` (a multiple of 32 up to
-    /// 2048, the default) scales down to it and a video larger than the
+    /// edge exceeds `reference_image_short_edge` (a multiple of 32 up to the
+    /// edge the checkpoint declares, 2048 for MiniMax-H3, which is the
+    /// default) scales down to it and a video larger than the
     /// canvas of its aspect scales down to that canvas, while smaller
     /// references keep their own size unless `enlarge_references` (false by
     /// default) enlarges them to those sizes, as the released pipeline does.
