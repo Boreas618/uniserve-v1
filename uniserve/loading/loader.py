@@ -21,7 +21,7 @@ from . import checkpoint as checkpoint_module
 from . import weights as weight_options
 from .config import Config
 from .layout import ExpertKernels, finalize
-from .retained import Retained
+from .retained import Retained, tensors
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -29,11 +29,64 @@ ModelT = TypeVar("ModelT", bound=nn.Module)
 
 @dataclass(frozen=True, slots=True)
 class Result(Generic[ModelT]):
-    """A materialized model, its resolved sources and completeness reports."""
+    """A materialized model, its resolved sources and completeness reports.
+
+    ``origins`` names the checkpoint source of each tensor a declared
+    mapping loads, by tensor object identity.
+    """
 
     model: ModelT
     sources: tuple[checkpoint_module.Source, ...]
     reports: tuple[weight_options.Report, ...]
+    origins: dict[int, str]
+
+
+def _origins(
+    declared: tuple[weight_options.ModuleMapping, ...],
+) -> dict[int, str]:
+    """The checkpoint source of every tensor under each mapping's module.
+
+    A module under two mappings takes the first's source.
+    """
+    origins: dict[int, str] = {}
+    for component in declared:
+        for _, tensor in tensors(component.module):
+            origins.setdefault(id(tensor), component.source)
+    return origins
+
+
+def _reads(
+    model: nn.Module,
+    declared: tuple[weight_options.ModuleMapping, ...],
+    load: frozenset[str],
+) -> frozenset[str]:
+    """The tensors to read so that ``load`` (tensor identities) is read.
+
+    A mapping that derives constants after loading (``post_load``) reads
+    its whole module once any of its tensors is read, and a merged
+    projection reads all of its branches, which loading lays out in one
+    backing. Every rank computes the same set from the same ``load``.
+    """
+    from uniserve.nn.linear import MergedColumnParallelLinear
+
+    names = {id(tensor): name for name, tensor in tensors(model)}
+    reads = set(load)
+
+    def within(module: nn.Module) -> set[str]:
+        return {names[id(tensor)] for _, tensor in tensors(module)}
+
+    for module in model.modules():
+        if isinstance(module, MergedColumnParallelLinear):
+            members = within(module)
+            if members & reads:
+                reads |= members
+    for component in declared:
+        if component.post_load is None:
+            continue
+        members = within(component.module)
+        if members & reads:
+            reads |= members
+    return frozenset(reads)
 
 
 def select_modules(
@@ -154,6 +207,7 @@ def load_model(
     experts: Communicator | None = None,
     expert_kernels: ExpertKernels = "local",
     retained: Retained | None = None,
+    load: frozenset[str] = frozenset(),
 ) -> Result[ModelT]:
     """Construct on meta, bind partitions, then materialize selected modules.
 
@@ -173,7 +227,11 @@ def load_model(
     With ``retained``, the selected modules take the tensors a worker
     published when it last loaded this model on this placement
     (``uniserve.loading.retained``) instead of reading the checkpoint; they
-    are already in their final layout, and the reports are empty.
+    are already in their final layout. ``load`` names the tensors
+    (``uniserve.loading.retained`` identities) the worker reads from the
+    checkpoint instead, which ``retained`` lacks: those, and what reading
+    them takes (``_reads``), load as without ``retained``, and the reports
+    cover them alone.
     """
     with torch.device("meta"):
         model = model_class(config)
@@ -233,7 +291,7 @@ def load_model(
     # Declaring the mappings may also prune the model to the modules a
     # pipeline stage holds, so it precedes installing retained tensors too.
     declared = mapping(model)
-    if retained is not None:
+    if retained is not None and not load:
         # Indexing the weight settings applies their module-level choices,
         # such as each projection's activation quantizer, as loading does.
         weight_options._Loader(
@@ -249,7 +307,7 @@ def load_model(
         ).close()
         retained.install(model, selected)
         model.eval()
-        return Result(model, checkpoint, ())
+        return Result(model, checkpoint, (), _origins(declared))
 
     parameters = {
         id(parameter)
@@ -257,6 +315,15 @@ def load_model(
         if id(child) in selected
         for parameter in child.parameters(recurse=False)
     }
+    if retained is not None:
+        # The retained tensors install first; loading reads the rest.
+        reads = _reads(model, declared, load)
+        retained.install(model, selected, skip=reads)
+        parameters = {
+            id(tensor)
+            for name, tensor in tensors(model)
+            if name in reads and id(tensor) in parameters
+        }
 
     # Narrow each declared mapping to the selected modules: unselected
     # parameters keep their meta placeholders and their assignments drop out.
@@ -269,8 +336,10 @@ def load_model(
             )
             if id(parameter) in parameters
         }
-        retained = names.intersection(component.required | component.optional)
-        if not retained and id(component.module) not in selected:
+        resident = names.intersection(component.required | component.optional)
+        if not resident and (
+            retained is not None or id(component.module) not in selected
+        ):
             continue
         if component.post_load is not None and not component.required.issubset(
             names
@@ -310,4 +379,4 @@ def load_model(
     )
     finalize(model, experts=expert_kernels)
     model.eval()
-    return Result(model, checkpoint, reports)
+    return Result(model, checkpoint, reports, _origins(declared))

@@ -4,12 +4,16 @@ A worker keeps its loaded parameters and buffers at the Storage Server, so a
 restarted worker binds them instead of reading the checkpoint. The server
 stores bytes; this module defines what they are:
 
-- :func:`fingerprint` digests everything that determines a model's loaded
-  bytes besides the worker's placement and GPUs: the checkpoint's files,
+- :func:`fingerprints` digests what determines a model's loaded bytes
+  besides the worker's placement and GPUs. The structure fingerprint covers
   the normalized configuration, the module selection, the weight choices,
   the load mode, which kernels read the routed experts, and the numerics
-  digest (:func:`numerics`) of the code that loads and converts weights.
-  The worker adds its placement and GPUs to form the keys.
+  digest (:func:`numerics`) of the code that loads and converts weights;
+  each checkpoint source's fingerprint adds that source's files. A tensor
+  loaded from a source is keyed by its source's fingerprint, so a change to
+  one source's files reloads only its tensors; the manifest and the tensors
+  no source loads are keyed by the structure. The worker adds its
+  placement and GPUs to form the keys.
 - :class:`Layout` describes a loaded model's device tensors for publishing:
   each parameter and buffer as its fields (a dense tensor's data, or a
   quantized tensor's encoded fields), grouped by the torch storage they
@@ -23,7 +27,9 @@ stores bytes; this module defines what they are:
 
 A tensor is named by its first path in ``named_modules(remove_duplicate=
 False)`` order, which the model a worker constructs before loading repeats
-exactly: ``p:<path>`` for a parameter and ``b:<path>`` for a buffer.
+exactly: ``p:<path>`` for a parameter and ``b:<path>`` for a buffer. A
+worker that finds only some of its tensors binds those and loads the rest
+(``uniserve.loading.loader.load_model``'s ``load``).
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.quantization.tensor import RowOrder, ScaleLayout
 
 # The manifest's format; a manifest of another version is not bound.
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 # The field name of a dense tensor's data.
 _DATA = "data"
@@ -173,8 +179,10 @@ def _header(path: Path) -> str:
         return file.read(length).decode("utf-8", errors="replace")
 
 
-def fingerprint(source, io, model_dtype: str, expert_kernels: str) -> str:
-    """The digest of what determines a model's loaded bytes.
+def fingerprints(
+    source, io, model_dtype: str, expert_kernels: str
+) -> dict[str, Any]:
+    """The digests of what determines a model's loaded bytes.
 
     The worker's placement and GPUs aside, which the worker adds.
 
@@ -187,19 +195,13 @@ def fingerprint(source, io, model_dtype: str, expert_kernels: str) -> str:
             (``uniserve.loading.layout.ExpertKernels``).
 
     Returns:
-        A lowercase hexadecimal SHA-256 digest.
+        ``{"structure": digest, "sources": {name: digest}}``: the structure
+        fingerprint, and each checkpoint source's, as lowercase
+        hexadecimal SHA-256 digests.
     """
-    digest = hashlib.sha256()
-    _hash(digest, "uniserve-model-fingerprint")
-    _hash(digest, numerics())
-    for checkpoint in source.checkpoint:
-        _hash(digest, checkpoint.name)
-        _hash(digest, checkpoint.prefix)
-        for path in sorted(checkpoint.files):
-            _hash(digest, path.relative_to(checkpoint.root).as_posix())
-            _hash(digest, str(path.stat().st_size))
-            _hash(digest, _header(path))
-        _hash(digest, json.dumps(_canonical(checkpoint.headers)))
+    structure = hashlib.sha256()
+    _hash(structure, "uniserve-model-structure")
+    _hash(structure, numerics())
     for part in (
         source.model_class,
         source.model,
@@ -211,17 +213,41 @@ def fingerprint(source, io, model_dtype: str, expert_kernels: str) -> str:
         str(model_dtype),
         str(expert_kernels),
     ):
-        _hash(digest, json.dumps(_canonical(part)))
-    return digest.hexdigest()
+        _hash(structure, json.dumps(_canonical(part)))
+    for checkpoint in source.checkpoint:
+        _hash(structure, checkpoint.name)
+        _hash(structure, checkpoint.prefix)
+    structure_digest = structure.hexdigest()
+
+    sources = {}
+    for checkpoint in source.checkpoint:
+        digest = hashlib.sha256()
+        _hash(digest, "uniserve-checkpoint-source")
+        _hash(digest, structure_digest)
+        _hash(digest, checkpoint.name)
+        for path in sorted(checkpoint.files):
+            _hash(digest, path.relative_to(checkpoint.root).as_posix())
+            _hash(digest, str(path.stat().st_size))
+            _hash(digest, _header(path))
+        _hash(digest, json.dumps(_canonical(checkpoint.headers)))
+        sources[checkpoint.name] = digest.hexdigest()
+    return {"structure": structure_digest, "sources": sources}
 
 
 @dataclass
 class _Entry:
-    """One parameter or buffer of a loaded model, as its fields."""
+    """One parameter or buffer of a loaded model, as its fields.
+
+    ``source`` names the checkpoint source the tensor is loaded from, empty
+    for a tensor no source loads; ``host`` marks a matrix streamed from
+    host memory.
+    """
 
     id: str
     representation: dict[str, Any]
     fields: dict[str, torch.Tensor]
+    source: str = ""
+    host: bool = False
 
 
 def _entry(identity: str, tensor: torch.Tensor) -> _Entry:
@@ -241,7 +267,7 @@ def _entry(identity: str, tensor: torch.Tensor) -> _Entry:
     return _Entry(identity, {"kind": "dense"}, {_DATA: tensor})
 
 
-def _tensors(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+def tensors(module: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
     """Every parameter and buffer of ``module`` with its identity, once each.
 
     In ``named_modules(remove_duplicate=False)`` order; an alias is named by
@@ -281,6 +307,10 @@ class Layout:
     (``uniserve.loading.host_weights``) are manifest entries whose data
     lies in the stack's host region instead of a device storage:
     :meth:`host_fields` lists them for each stack.
+
+    The manifest names every tensor; the storages and fields cover only the
+    tensors to publish, which a worker that bound the others narrows to the
+    tensors it read.
     """
 
     entries: list[_Entry]
@@ -298,21 +328,29 @@ class Layout:
 
     @classmethod
     def describe(
-        cls, module: nn.Module, host: frozenset[int] = frozenset()
+        cls,
+        module: nn.Module,
+        host: frozenset[int] = frozenset(),
+        origins: Mapping[int, str] | None = None,
+        only: frozenset[str] | None = None,
     ) -> Layout:
         """The layout of ``module``'s parameters and buffers.
 
         Meta tensors (modules this rank does not hold) are left out.
         ``host`` names the parameters (by object identity) a stack streams
-        from host memory, which no device storage holds.
+        from host memory, which no device storage holds. ``origins`` names
+        each loaded tensor's checkpoint source by object identity
+        (``uniserve.loading.loader.Result.origins``). ``only`` narrows the
+        tensors to publish to those identities; ``None`` publishes all.
 
         Raises:
             ValueError: A tensor lies outside CUDA memory, which retention
                 does not hold.
         """
+        origins = {} if origins is None else origins
         layout = cls([])
         index: dict[tuple[str, int], int] = {}
-        for identity, tensor in _tensors(module):
+        for identity, tensor in tensors(module):
             if tensor.is_meta:
                 continue
             if tensor.device.type != "cuda":
@@ -321,8 +359,12 @@ class Layout:
                     "only CUDA weights are retained"
                 )
             entry = _entry(identity, tensor)
+            entry.source = origins.get(id(tensor), "")
+            entry.host = id(tensor) in host
             layout.entries.append(entry)
-            if id(tensor) in host:
+            if only is not None and identity not in only:
+                continue
+            if entry.host:
                 layout._host[id(tensor)] = entry
                 continue
             for name, value in entry.fields.items():
@@ -344,6 +386,8 @@ class Layout:
                 "tensors": [
                     {
                         "id": entry.id,
+                        "source": entry.source,
+                        "host": entry.host,
                         "representation": entry.representation,
                         "fields": list(entry.fields),
                     }
@@ -369,6 +413,10 @@ class Layout:
     def field_ids(self) -> list[str]:
         """Each field's identity, ``<tensor id>/<field>``."""
         return [f"{entry.id}/{name}" for _, entry, name, _ in self._fields()]
+
+    def field_sources(self) -> list[str]:
+        """The checkpoint source of each field's tensor; empty for none."""
+        return [entry.source for _, entry, _, _ in self._fields()]
 
     def field_storages(self) -> list[int]:
         """The storage each field views."""
@@ -448,10 +496,10 @@ class Layout:
     def host_fields(self, loaded, path: str) -> list[Any]:
         """The fields of the stack under ``path`` in its host region.
 
-        Returns ``[ids, offsets, dtypes, ranks, shapes, strides]``, each a
-        flat list as the ``field_*`` methods return them, with byte offsets
-        in the region (``host_weights.placements``). Call before the stack
-        is bound to its slots.
+        Returns ``[ids, offsets, dtypes, ranks, shapes, strides, sources]``,
+        each a flat list as the ``field_*`` methods return them, with byte
+        offsets in the region (``host_weights.placements``). Call before the
+        stack is bound to its slots.
 
         Raises:
             ValueError: A streamed matrix is not a dense host-streamed entry
@@ -459,7 +507,13 @@ class Layout:
         """
         from uniserve.loading import host_weights
 
-        ids, offsets, dtypes, ranks, shapes, strides = [], [], [], [], [], []
+        ids: list[str] = []
+        offsets: list[int] = []
+        dtypes: list[str] = []
+        ranks: list[int] = []
+        shapes: list[int] = []
+        strides: list[int] = []
+        sources: list[str] = []
         for parameter, offset in host_weights.placements(loaded, str(path)):
             entry = self._host.get(id(parameter))
             if entry is None or entry.representation["kind"] != "dense":
@@ -467,19 +521,24 @@ class Layout:
                     "a streamed matrix is not a dense host entry of the layout"
                 )
             ids.append(f"{entry.id}/{_DATA}")
+            sources.append(entry.source)
             offsets.append(offset)
             dtypes.append(str(parameter.dtype).removeprefix("torch."))
             ranks.append(parameter.dim())
             shapes.extend(parameter.shape)
             strides.extend(parameter.stride())
-        return [ids, offsets, dtypes, ranks, shapes, strides]
+        return [ids, offsets, dtypes, ranks, shapes, strides, sources]
 
 
-def describe(loaded, host_paths: Sequence[str] = ()) -> Layout:
+def describe(
+    loaded, host_paths: Sequence[str] = (), only: Sequence[str] | None = None
+) -> Layout:
     """The publish layout of a rank's loaded model (``rank.Loaded``).
 
     ``host_paths`` are the module paths whose layer stacks stream from host
-    memory (``uniserve.loading.host_weights``).
+    memory (``uniserve.loading.host_weights``). ``only`` names the tensors
+    to publish, those the rank read while it bound the others; ``None``
+    publishes all.
     """
     from uniserve.loading import host_weights
 
@@ -488,7 +547,12 @@ def describe(loaded, host_paths: Sequence[str] = ()) -> Layout:
         for path in host_paths
         for parameter in host_weights.streamed(loaded, str(path))
     }
-    return Layout.describe(loaded.root, frozenset(host))
+    return Layout.describe(
+        loaded.root,
+        frozenset(host),
+        loaded.origins,
+        None if only is None else frozenset(str(name) for name in only),
+    )
 
 
 @dataclass
@@ -503,6 +567,7 @@ class Retained:
         manifest: str,
         storages: Sequence[torch.Tensor],
         field_ids: Sequence[str],
+        load: Sequence[str],
         field_storages: Sequence[int],
         field_offsets: Sequence[int],
         field_dtypes: Sequence[str],
@@ -510,13 +575,15 @@ class Retained:
         field_shapes: Sequence[int],
         field_strides: Sequence[int],
     ) -> Retained:
-        """Rebuild every tensor the manifest names.
+        """Rebuild every tensor the manifest names but those in ``load``.
 
         Args:
             manifest: The JSON :meth:`Layout.manifest` wrote.
             storages: Each retained storage as a one-dimensional ``uint8``
                 tensor over the whole allocation.
             field_ids: Each field's identity, ``<tensor id>/<field>``.
+            load: The tensors the worker reads from the checkpoint instead,
+                whose fields are not among ``field_ids``.
             field_storages: The storage each field views.
             field_offsets: Each field's byte offset in its storage.
             field_dtypes: Each field's element type name.
@@ -551,8 +618,11 @@ class Retained:
             fields[str(identity)] = view
 
         tensors: dict[str, torch.Tensor] = {}
+        loaded = frozenset(str(name) for name in load)
         for entry in described["tensors"]:
             identity = entry["id"]
+            if identity in loaded:
+                continue
             names = entry["fields"]
             missing = [f"{identity}/{name}" for name in names]
             missing = [name for name in missing if name not in fields]
@@ -578,18 +648,23 @@ class Retained:
             tensors[identity] = value
         return cls(tensors)
 
-    def install(self, model: nn.Module, selected: set[int]) -> None:
+    def install(
+        self,
+        model: nn.Module,
+        selected: set[int],
+        skip: frozenset[str] = frozenset(),
+    ) -> None:
         """Install the retained tensors on ``model``.
 
         Every parameter and buffer of a module in ``selected`` (module object
-        identities) takes its retained tensor; an alias takes the same one,
-        so shared parameters stay shared. A buffer registered as ``None``
-        takes the tensor retained at its path, if any. A tensor without a
-        retained one keeps its placeholder, as it stayed on meta when the
-        model was published. Parameters keep their placeholder's
-        ``requires_grad``.
+        identities) takes its retained tensor, but those ``skip`` names
+        (identities), which loading reads; an alias takes the same one, so
+        shared parameters stay shared. A buffer registered as ``None`` takes
+        the tensor retained at its path, if any. A tensor without a retained
+        one keeps its placeholder, as it stayed on meta when the model was
+        published. Parameters keep their placeholder's ``requires_grad``.
         """
-        identities = {id(tensor): name for name, tensor in _tensors(model)}
+        identities = {id(tensor): name for name, tensor in tensors(model)}
         resident: dict[int, torch.Tensor] = {}
         # A module under several paths is visited again holding the tensors
         # already installed on it.
@@ -603,6 +678,8 @@ class Retained:
                     continue
                 key = id(parameter)
                 if key not in resident:
+                    if identities[key] in skip:
+                        continue
                     value = self.tensors.get(identities[key])
                     if value is None:
                         continue
@@ -613,6 +690,8 @@ class Retained:
                 module._parameters[name] = resident[key]
             for name, buffer in list(module._buffers.items()):
                 if buffer is None:
+                    if f"b:{prefix}{name}" in skip:
+                        continue
                     value = self.tensors.get(f"b:{prefix}{name}")
                     if value is not None:
                         module._buffers[name] = value
@@ -622,6 +701,8 @@ class Retained:
                 if key in installed:
                     continue
                 if key not in resident:
+                    if identities[key] in skip:
+                        continue
                     value = self.tensors.get(identities[key])
                     if value is None:
                         continue

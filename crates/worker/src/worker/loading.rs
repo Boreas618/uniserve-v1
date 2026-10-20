@@ -15,10 +15,13 @@
 //! fact: the loaded model's own (its attention backend and numerical
 //! formats) here, a capability's from that capability's runner.
 
+use std::collections::BTreeSet;
+
 use tvm_ffi::Any;
 
 use crate::config::WorkerLaunch;
 use crate::ffi::{Handle, Interpreter, integer_list, list, strings, texts};
+use crate::storage::weights::Fingerprints;
 
 /// The library module that reads and loads a rank's model.
 const LOADING: &str = "uniserve.loading.rank";
@@ -159,10 +162,13 @@ fn quantization(launch: &WorkerLaunch) -> &str {
 }
 
 impl LoadedModel {
-    /// The digest of what determines this rank's loaded weights besides
-    /// its placement and GPUs (`fingerprint`); empty for the stub model,
+    /// The digests of what determines this rank's loaded weights besides
+    /// its placement and GPUs (`fingerprint`); `None` for the stub model,
     /// whose weights are not retained.
-    pub(crate) fn fingerprint(description: &Description, launch: &WorkerLaunch) -> Result<String> {
+    pub(crate) fn fingerprint(
+        description: &Description,
+        launch: &WorkerLaunch,
+    ) -> Result<Option<Fingerprints>> {
         let (modules, excluded) = selection(description, launch);
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
         let union = launch.expert_parallel.as_ref();
@@ -178,13 +184,19 @@ impl LoadedModel {
             ])?
             .try_into()
             .map_err(|error| Error::numerical("fingerprint", &error))?;
-        Ok(fingerprint.as_str().to_owned())
+        if fingerprint.as_str().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(fingerprint.as_str())
+            .map(Some)
+            .map_err(|error| Error::Interface(format!("the model's fingerprints: {error}")))
     }
 
     /// Materialize this rank's modules (`load_model`), or bind `retained`,
     /// the library's tensors this rank retained when it last loaded the
-    /// same model on the same placement. The checkpoint is narrowed to the
-    /// rank's resident modules (`selection`).
+    /// same model on the same placement, and read the tensors `load` names
+    /// from the checkpoint. The checkpoint is narrowed to the rank's
+    /// resident modules (`selection`).
     pub(crate) fn load(
         description: Description,
         launch: &WorkerLaunch,
@@ -192,6 +204,7 @@ impl LoadedModel {
         experts: Option<ExpertPartition>,
         host_only: bool,
         retained: Option<&Handle>,
+        load: &BTreeSet<String>,
     ) -> Result<Self> {
         let execution = &launch.execution;
         let (modules, excluded) = selection(&description, launch);
@@ -245,6 +258,7 @@ impl LoadedModel {
                     .map(|union| text(&union.exchange))
                     .unwrap_or_default(),
                 retained.map(Handle::to_any).unwrap_or_default(),
+                Any::from(strings(load)),
                 text(execution.attention_backend.as_str()),
                 Any::from(attention.workspace_size as i64),
                 text(&attention.decode_backend),

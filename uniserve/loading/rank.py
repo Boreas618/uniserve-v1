@@ -172,6 +172,9 @@ class Loaded:
     description: Description
     root: nn.Module
     calls: dict[str, tuple[Call, ...]] = field(default_factory=dict)
+    # The checkpoint source of each loaded tensor, by tensor object identity
+    # (``uniserve.loading.loader.Result.origins``).
+    origins: dict[int, str] = field(default_factory=dict)
     attention: Any = None
     attention_backend: str = "auto"
     image_processor: Any = None
@@ -354,11 +357,11 @@ def fingerprint(
     expert_exchange: str | None,
     attention_ranks: int,
 ) -> str:
-    """The digest of what determines this rank's loaded weights.
+    """The digests of what determines this rank's loaded weights.
 
-    Placement and GPUs aside (``uniserve.loading.retained.fingerprint``);
-    the arguments are those of :func:`load_model`. Empty for the stub
-    model, whose weights are not retained.
+    Placement and GPUs aside (``uniserve.loading.retained.fingerprints``),
+    as JSON text; the arguments are those of :func:`load_model`. Empty for
+    the stub model, whose weights are not retained.
     """
     resolved = _resolve(
         description, modules, exclude_modules, quantization, model_dtype
@@ -366,8 +369,11 @@ def fingerprint(
     if isinstance(resolved, Description):
         return ""
     kernels = _expert_kernels(_text(expert_exchange), int(attention_ranks))
-    return retention.fingerprint(
-        resolved.source, description.io, str(model_dtype), kernels
+    return json.dumps(
+        retention.fingerprints(
+            resolved.source, description.io, str(model_dtype), kernels
+        ),
+        sort_keys=True,
     )
 
 
@@ -394,6 +400,7 @@ def load_model(
     expert_dedicated: bool,
     expert_exchange: str | None,
     retained: retention.Retained | None,
+    load: Sequence[str],
     attention_backend: str,
     workspace_size: int,
     decode_backend: str,
@@ -438,6 +445,9 @@ def load_model(
         retained: The tensors this rank retained when it last loaded this
             model on this placement, which it binds instead of reading the
             checkpoint; ``None`` loads.
+        load: With ``retained``, the tensors to read from the checkpoint
+            instead, which the rank's loading peers agreed on
+            (``uniserve.loading.loader.load_model``).
         attention_backend: The attention backend's name.
         workspace_size, decode_backend, prefill_backend, disable_split_kv,
         decode_split_tile_size, prefill_split_tile_size, use_tensor_core:
@@ -536,6 +546,7 @@ def load_model(
                 _text(expert_exchange), int(attention_ranks)
             ),
             retained=retained,
+            load=frozenset(str(name) for name in load),
         )
         module = result.model
         if dedicated:
@@ -546,9 +557,15 @@ def load_model(
                 for child in module.modules()
                 if isinstance(child, FusedMoE)
             )
+        if retained is None:
+            action = "loaded"
+        elif load:
+            action = f"bound retained tensors and read {len(load)} of"
+        else:
+            action = "bound retained"
         logger.info(
             "%s numerical model %s in %.1f s",
-            "loaded" if retained is None else "bound retained",
+            action,
             type(module).__qualname__,
             time.perf_counter() - started,
         )
@@ -560,6 +577,7 @@ def load_model(
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
             tokenizer=None if dedicated else source.tokenizer,
+            origins=result.origins,
         )
 
     if not dedicated and not host_only:

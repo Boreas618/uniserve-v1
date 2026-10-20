@@ -221,28 +221,29 @@ impl Worker {
             });
         let loading = range(c"uniserve.worker.load", None);
         // The weights the rank retained when it last loaded this model on
-        // this placement bind instead of loading, when every rank that
-        // loads with it found its own.
-        let fingerprint =
-            model_fingerprint(&launch, &description, host_only).map_err(phase("load"))?;
-        let keys =
-            weight_keys(&launch, fingerprint.as_deref(), &retained).map_err(phase("load"))?;
+        // this placement bind instead of loading. Loading is collective, so
+        // the ranks that load together read what any of them misses
+        // (`weights::Load`), and bind the rest.
+        let fingerprints =
+            model_fingerprints(&launch, &description, host_only).map_err(phase("load"))?;
+        let keys = weight_keys(&launch, fingerprints.as_ref(), &retained).map_err(phase("load"))?;
         let found = match &keys {
             Some(keys) => keys.find(&retained).map_err(phase("load"))?,
             None => None,
         };
         let agreement = world.union.as_ref().unwrap_or(&world.host);
-        let everywhere = agreement
-            .all_reduce_min(&[i64::from(found.is_some())])
-            .map_err(phase("load"))?[0]
-            == 1;
-        let found = found.filter(|_| everywhere);
+        let load =
+            agree_load(agreement, weights::Load::of(found.as_ref())).map_err(phase("load"))?;
+        let (found, load) = match load {
+            weights::Load::Tensors(names) => (found, names),
+            weights::Load::All => (None, Default::default()),
+        };
         if found.is_none() && keys.is_some() {
             retained.release_read_only().map_err(phase("load"))?;
         }
         let binding = found
             .as_ref()
-            .map(weights::Found::bind)
+            .map(|found| found.bind(&load))
             .transpose()
             .map_err(phase("load"))?;
         let model = LoadedModel::load(
@@ -252,6 +253,7 @@ impl Worker {
             experts,
             host_only,
             binding.as_ref(),
+            &load,
         )
         .map_err(phase("load"))?;
         drop(binding);
@@ -263,11 +265,20 @@ impl Worker {
             .filter(|placed| placed.config.weights == ComponentWeights::Host)
             .flat_map(|placed| model.declarations.roots(&placed.name))
             .collect();
+        // A rank publishes what it read: everything, or the tensors it
+        // read beside those it bound.
         let (mut published, bound) = match (found, &keys) {
+            (Some(found), Some(keys)) if !load.is_empty() => (
+                Some(
+                    keys.publish(model.handle(), &host_paths, Some(&load))
+                        .map_err(phase("load"))?,
+                ),
+                found.into_storages(),
+            ),
             (Some(found), _) => (None, found.into_storages()),
             (None, Some(keys)) => (
                 Some(
-                    keys.publish(model.handle(), &host_paths)
+                    keys.publish(model.handle(), &host_paths, None)
                         .map_err(phase("load"))?,
                 ),
                 Vec::new(),
@@ -317,15 +328,21 @@ impl Worker {
             .map_err(phase("experts"))?;
         // Host-resident layer weights release their device storage before
         // capacity planning measures free memory.
+        // A stack's host region is published with a whole load and bound
+        // otherwise: a rank that misses any of it loads whole (`Load::of`).
         let mut retention = match &mut published {
-            Some(published) => HostRetention::Publish(published),
-            None if !bound.is_empty() => HostRetention::Bound(&bound),
-            None => HostRetention::None,
+            Some(published) if bound.is_empty() => HostRetention::Publish(published),
+            _ if !bound.is_empty() => HostRetention::Bound(&bound),
+            _ => HostRetention::None,
         };
         let host_weights =
             HostWeights::start(&model, &components, &mut retention).map_err(phase("load"))?;
         let weight_storages = match published {
-            Some(published) => published.put(&retained).map_err(phase("load"))?,
+            Some(published) => {
+                let mut storages = published.put(&retained).map_err(phase("load"))?;
+                storages.extend(bound);
+                storages
+            }
             None => bound,
         };
         let budget = match device {
@@ -380,10 +397,11 @@ impl Worker {
         let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
         // The head copies the cache's pages through the host page tier when
-        // it says so; pages are keyed by the model fingerprint.
+        // it says so; pages are keyed by the whole model's fingerprint.
+        let model_fingerprint = fingerprints.as_ref().map(weights::Fingerprints::model);
         if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
             launch.storage.page_tier,
-            fingerprint.as_deref(),
+            model_fingerprint.as_deref(),
             storage.prefix_cache.as_mut(),
             device.cuda(),
             info.prefix_cache.as_mut(),
@@ -968,25 +986,44 @@ impl Worker {
     }
 }
 
-/// The model fingerprint of a rank that holds CUDA weights
-/// (`uniserve.loading.retained.fingerprint`), which keys its retained
+/// The model fingerprints of a rank that holds CUDA weights
+/// (`uniserve.loading.retained.fingerprints`), which key its retained
 /// weights and its cache pages; `None` for the stub model and a rank
 /// without CUDA weights.
-fn model_fingerprint(
+fn model_fingerprints(
     launch: &WorkerLaunch,
     description: &crate::worker::loading::Description,
     host_only: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<weights::Fingerprints>> {
     if host_only || launch.device().cuda().is_none() {
         return Ok(None);
     }
     let started = std::time::Instant::now();
-    let fingerprint = LoadedModel::fingerprint(description, launch)?;
+    let fingerprints = LoadedModel::fingerprint(description, launch)?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "fingerprinted the model's weights"
     );
-    Ok(Some(fingerprint).filter(|fingerprint| !fingerprint.is_empty()))
+    Ok(fingerprints)
+}
+
+/// What every rank in `agreement` reads from the checkpoint, from each
+/// rank's own `need` (`weights::Load`).
+fn agree_load(
+    agreement: &crate::parallel::host::HostGroup,
+    need: weights::Load,
+) -> Result<weights::Load> {
+    let encoded = serde_json::to_vec(&need)
+        .map_err(|error| Error::Invalid(format!("encoding a weight load: {error}")))?;
+    let needs = agreement
+        .all_gather_bytes(&encoded)?
+        .iter()
+        .map(|bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|error| Error::Interface(format!("a rank's weight load: {error}")))
+        })
+        .collect::<Result<Vec<weights::Load>>>()?;
+    Ok(weights::Load::union(needs))
 }
 
 /// The keys of the rank's retained weights, or `None` when its weights are
@@ -995,14 +1032,14 @@ fn model_fingerprint(
 /// (`dwdp`).
 fn weight_keys(
     launch: &WorkerLaunch,
-    fingerprint: Option<&str>,
+    fingerprints: Option<&weights::Fingerprints>,
     retained: &Retained,
 ) -> Result<Option<WeightKeys>> {
     let moved = launch
         .expert_parallel
         .as_ref()
         .is_some_and(|union| union.exchange == "dwdp");
-    let Some(fingerprint) = fingerprint.filter(|_| !moved) else {
+    let Some(fingerprints) = fingerprints.filter(|_| !moved) else {
         return Ok(None);
     };
     let devices: Vec<DeviceId> = launch
@@ -1012,7 +1049,7 @@ fn weight_keys(
         .collect();
     Ok(Some(WeightKeys::new(
         retained,
-        fingerprint,
+        fingerprints,
         &weights::placement(launch)?,
         &devices,
     )?))
