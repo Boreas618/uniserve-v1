@@ -27,7 +27,7 @@ use uniserve_cuda::{CopyBatch, SourceOrder};
 use uniserve_ipc::{BufferId, LatentParams, RequestKey};
 
 use crate::executor::batch::StreamOrder;
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -152,7 +152,7 @@ impl LatentCache {
 }
 
 impl RequestStorage for LatentCache {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 

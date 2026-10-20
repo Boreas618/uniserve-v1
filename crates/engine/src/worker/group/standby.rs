@@ -15,6 +15,11 @@
 //! that is its own failure domain: a group of a shared expert world is
 //! replaced with its domain, and a launcher stops every rank of a group on
 //! its host when the group fails.
+//!
+//! A control-plane handover (`crate::handover`) stands the successor's
+//! workers by for the same groups: the predecessor's groups stop their
+//! standbys for it (`prepare_handover`), and each successor group promotes
+//! its own workers, which started standing by (`promote_workers`).
 
 use super::WorkerGroup;
 use super::validate_replacement_info;
@@ -31,13 +36,61 @@ impl WorkerGroup {
     /// Whether the group keeps a standby: `worker_config.standby`, for a
     /// group that is its own failure domain on the head's host.
     fn keeps_standby(&self) -> bool {
-        self.process_args.keep_standby
-            && self.failure_domain.is_none()
+        self.process_args.keep_standby && !self.handing_over && self.stands_by()
+    }
+
+    /// Whether ranks can stand by for the group: it is its own failure
+    /// domain on the head's host.
+    fn stands_by(&self) -> bool {
+        self.failure_domain.is_none()
             && self
                 .process_args
                 .ranks
                 .iter()
                 .all(|rank| rank.host == self.process_args.host)
+    }
+
+    /// Predecessor of a handover: stop the standby and keep none, and
+    /// return the group's prefix cache units, which the successor's workers
+    /// adopt, and the claim they stand by under. Fails for a group no rank
+    /// can stand by for.
+    pub(crate) fn prepare_handover(&mut self) -> anyhow::Result<(Option<u32>, [u8; 16])> {
+        anyhow::ensure!(
+            self.stands_by(),
+            "worker group {} cannot be handed over: its ranks run on another host or share \
+             an expert world",
+            self.process_args.worker_id
+        );
+        let claim = self.claims.launch(&self.process_args.host)?.claim;
+        self.handing_over = true;
+        self.drop_standby();
+        Ok((
+            self.info.prefix_cache.as_ref().map(|cache| cache.num_units),
+            claim,
+        ))
+    }
+
+    /// Predecessor of a handover that did not happen: keep a standby again.
+    pub(crate) fn abandon_handover(&mut self) {
+        self.handing_over = false;
+        self.start_standby();
+    }
+
+    /// Successor of a handover, once the predecessor's workers closed: take
+    /// the deployment's claim over and promote the group's workers, which
+    /// started standing by. The group then serves, and relaunches and
+    /// standbys start as at any start.
+    pub(crate) fn promote_workers(&mut self) -> anyhow::Result<()> {
+        self.claims.take_over()?;
+        let timeout = self.process_args.watchdog_timeout;
+        for worker in &mut self.workers {
+            worker.promote(timeout)?;
+        }
+        // A relaunch serves at once, over the planes of the adopted units.
+        self.process_args.standby = false;
+        self.last_progress = std::time::Instant::now();
+        self.start_standby();
+        Ok(())
     }
 
     /// Start a standby when the group keeps one and has none. Its ranks

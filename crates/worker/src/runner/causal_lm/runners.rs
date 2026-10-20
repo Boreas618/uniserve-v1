@@ -44,7 +44,7 @@ use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::batch::{Failure, Stage, StreamOrder, fail, unsupported};
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelCalls;
@@ -517,7 +517,7 @@ impl CausalLMRunners {
 }
 
 impl RequestStorage for CausalLMRunners {
-    fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, admitted: &[AdmittedSlot<'_>], jobs: &LaneJobs) -> Result<()> {
         // Reset on the first runner's stream, by the lane that owns it;
         // other streams order after it before their next batch.
         let stream = self.runners.first().and_then(CausalLMRunner::stream);
@@ -528,7 +528,19 @@ impl RequestStorage for CausalLMRunners {
             .ok_or_else(|| Error::Invariant("the first text runner is in no group".into()))?;
         let issue = jobs.job(self.kind(group)?)?.on(stream);
         self.order.wait(issue)?;
-        self.state.reset(slots, issue)?;
+        let slots: Vec<usize> = admitted.iter().map(|admitted| admitted.slot).collect();
+        self.state.reset(&slots, issue)?;
+        // A request resumed from a predecessor engine counts the tokens it
+        // generated there.
+        for admitted in admitted {
+            if let Some(generation) = &admitted.request.generation {
+                self.state.count_generated(
+                    admitted.slot,
+                    &generation.generated_token_ids,
+                    issue,
+                )?;
+            }
+        }
         self.order.record(issue)
     }
 

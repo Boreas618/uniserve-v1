@@ -25,7 +25,7 @@ use uniserve_core::video::plan::requested_frames;
 use uniserve_core::{Canvas, ConditionRole, ServedCanvas, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::ffi::integer_list;
 use crate::host::mux::{MuxConfig, MuxSession};
 use crate::lane::{Completion, Job};
@@ -1142,7 +1142,7 @@ impl VideoRequests {
 }
 
 impl RequestStorage for VideoRequests {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         // A request's state is created when its admission is installed.
         Ok(())
     }

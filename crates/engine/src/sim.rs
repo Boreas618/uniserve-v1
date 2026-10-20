@@ -452,6 +452,10 @@ struct SimRequestState {
     cache_visible_len: u32,
     /// Index of the next synthetic text token, as `synth_logits` takes it.
     emitted: usize,
+    /// Tokens the request generated on a predecessor engine
+    /// (`GenerationParams::generated_token_ids`): its synthetic tokens
+    /// continue after them.
+    history: usize,
     /// The step index of the request's trajectory: the solver steps it has
     /// completed. Image decoding resets it to zero, as it does on a worker
     /// rank.
@@ -491,15 +495,27 @@ impl SimRequestState {
             .generation
             .as_ref()
             .map_or(0, |branch| branch.initial_position);
+        // A resumed request continues its synthetic tokens and penalties
+        // after the ones it generated before.
+        let generated = admission
+            .generation
+            .as_ref()
+            .map_or(&[][..], |branch| branch.generated_token_ids.as_slice());
+        let mut penalty_counts = BTreeMap::new();
+        for token in generated {
+            *penalty_counts.entry(*token).or_insert(0_u32) += 1;
+        }
+        let history = generated.len();
         Self {
             admission,
             logical_position: prefix_len,
             positions_from_model: false,
             cache_visible_len: prefix_len,
-            emitted: 0,
+            emitted: history,
+            history,
             step_index: 0,
             predicate_values: HashMap::new(),
-            penalty_counts: BTreeMap::new(),
+            penalty_counts,
             state_call_id: uniserve_ipc::CallId::new(0, 0),
             canvas: uniserve_ipc::CanvasStep::default(),
         }
@@ -1078,7 +1094,7 @@ impl SimEngine {
                     }
                     match work {
                         CallKind::Forward(ForwardMode::Prefill) => {
-                            request.emitted = request.emitted.max(1)
+                            request.emitted = request.emitted.max(request.history + 1)
                         }
                         CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify) => {
@@ -1670,6 +1686,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                generated_token_ids: Vec::new(),
             }),
             None,
             0,

@@ -332,6 +332,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                generated_token_ids: Vec::new(),
             }),
             None,
             0,

@@ -17,7 +17,7 @@ use super::cache_width;
 use crate::Result;
 use crate::capacity::plan::Plan;
 use crate::config::{WorkerConfig, WorkerLaunch};
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::storage::{BufferPool, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
@@ -76,7 +76,7 @@ impl WorkerStorage {
 }
 
 impl RequestStorage for WorkerStorage {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         // Block tables are installed per batch; a new slot has no state.
         Ok(())
     }

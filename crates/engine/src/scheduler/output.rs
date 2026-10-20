@@ -38,7 +38,7 @@ fn terminal_event(
     EngineCoreOutput::Finished {
         reason,
         stop_reason,
-        prompt_tokens: state.req.prompt_token_ids.len(),
+        prompt_tokens: state.prompt_tokens(),
         completion_tokens: state.num_generated_tokens,
         images: state.num_generated_images,
     }
@@ -130,6 +130,11 @@ impl EventJournal {
         self.event_tx
             .capacity()
             .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(self.journal.len()))
+    }
+
+    /// The event channel and the events journaled behind it, in order.
+    pub(super) fn into_parts(self) -> (EventTx, VecDeque<EngineCoreOutput>) {
+        (self.event_tx, self.journal)
     }
 
     /// Flushes pending journal entries; returns `true` when the receiver closed.

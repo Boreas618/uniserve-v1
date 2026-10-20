@@ -170,6 +170,16 @@ impl EventTx {
         })
     }
 
+    /// Publishes an event once the channel has room, as a relay that
+    /// forwards another engine's events does (`crate::handover`). Fails
+    /// with `Closed` once the receiver has closed.
+    pub async fn deliver(&self, event: EngineCoreOutput) -> Result<(), EventSendError> {
+        self.inner
+            .send(event)
+            .await
+            .map_err(|error| EventSendError::Closed(Box::new(error.0)))
+    }
+
     /// Returns the channel's currently available event slots.
     pub fn capacity(&self) -> usize {
         self.inner.capacity()
@@ -427,6 +437,22 @@ pub enum Command {
     Abort(RequestId),
     /// Requests orderly engine shutdown.
     Shutdown,
+    /// Prepares a control-plane handover (`crate::handover`): the executor
+    /// stops its standbys and replies with what the successor's workers
+    /// adopt, `None` for an executor whose workers keep no storage.
+    PrepareHandover(crossbeam_channel::Sender<anyhow::Result<Option<crate::handover::Adoption>>>),
+    /// Keeps standbys again after a handover that did not happen.
+    AbandonHandover,
+    /// Quiesces the engine core and replies with its handover once it is at
+    /// a quiescent step boundary; the scheduler then stops.
+    Quiesce(crossbeam_channel::Sender<anyhow::Result<crate::handover::Quiesced>>),
+    /// Resumes a predecessor's requests, each publishing through its event
+    /// channel, in the snapshot's order, and replies once they are queued.
+    Resume {
+        snapshot: Box<crate::handover::CoreSnapshot>,
+        events: Vec<EventTx>,
+        reply: crossbeam_channel::Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Cloneable front door over the scheduler. `submit` enqueues to the scheduler;
@@ -464,7 +490,7 @@ impl EngineHandle {
     }
 
     /// Enqueues a command, then wakes the scheduler after a successful send.
-    fn send(&self, cmd: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
+    pub(crate) fn send(&self, cmd: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
         let r = self.tx.send(cmd);
         // Wake only on a successful enqueue: if the channel is closed there is
         // no scheduler to wake, and the error is propagated to the caller.
@@ -531,6 +557,26 @@ impl EngineHandle {
             event_tx,
         };
         (submission, event_rx)
+    }
+
+    /// The event channel of a request that resumes on this engine
+    /// (`crate::handover`). The receiver cancels the request when dropped
+    /// before its terminal event; `awaits_decoder` states whether its tokens
+    /// await the frontend decoder's stop-string decisions, as `bind` derives
+    /// it.
+    pub(crate) fn bind_resumed(
+        &self,
+        request_id: RequestId,
+        awaits_decoder: bool,
+    ) -> (EventTx, EventRx) {
+        event_channel_with_waker(
+            self.waker.clone(),
+            Some(EventCancellation {
+                handle: self.clone(),
+                request_id,
+                awaits_decoder,
+            }),
+        )
     }
 
     /// Cancels a request.

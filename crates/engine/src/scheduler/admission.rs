@@ -85,105 +85,17 @@ pub(super) enum MediaOutputError {
 impl Scheduler {
     /// Validates and queues one token-generation request or rejects it synchronously.
     ///
-    /// Rejects with `RejectionKind::Invalid` when the runtime has no prefix cache,
-    /// the request fails validation, a unit the scheduler never splits (a
-    /// readout row, a generation canvas, an input image's vision block)
-    /// exceeds the step token budget, the worker lacks a required generation
-    /// feature, or `validate_resources` or `max_cache_tokens` fails against
-    /// `generation_limits`; rejects with `RejectionKind::Overloaded` when the
+    /// Rejects with `RejectionKind::Invalid` when `validate_submission`
+    /// refuses the request, and with `RejectionKind::Overloaded` when the
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
     /// send result is ignored.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
-        if self.storage.cache.is_none() {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: "generation request requires worker KV resources".into(),
-            });
-            return;
-        }
-        if let Err(error) = req.validate() {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!("invalid generation request: {error:?}"),
-            });
-            return;
-        }
-        // A canvas pass holds whole rows, so every readout row must fit one
-        // scheduling step's token budget.
-        if let Some(row) = req
-            .readout
-            .iter()
-            .find(|row| row.token_ids.len() > self.config.max_num_batched_tokens)
-        {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "a {}-token readout canvas exceeds the {}-token step budget",
-                    row.token_ids.len(),
-                    self.config.max_num_batched_tokens
-                ),
-            });
-            return;
-        }
-        // A request the deployment generates in canvases generates text only
-        // and names the seed its draws follow.
-        if self.config.canvas.is_some() && !req.is_readout() {
-            let error = if req.generates_images() {
-                Some(GenerationRequestError::CanvasGeneratesTextOnly)
-            } else if req.sampling.seed.is_none() {
-                Some(GenerationRequestError::UnseededCanvas)
-            } else {
-                None
-            };
-            if let Some(error) = error {
+        let max_cache_tokens = match self.validate_submission(&req) {
+            Ok(tokens) => tokens,
+            Err(message) => {
                 let _ = event_tx.send(EngineCoreOutput::Rejected {
                     kind: RejectionKind::Invalid,
-                    message: format!("invalid generation request: {error:?}"),
-                });
-                return;
-            }
-        }
-        // A context prefill writes an input image's vision block whole, as
-        // one attention block of one call, so the block's exact cache length
-        // must fit one scheduling step's token budget.
-        if let Some(tokens) = req
-            .multimodal_inputs
-            .images
-            .iter()
-            .flat_map(|image| &image.encoders)
-            .filter(|input| input.encoder == MediaCall::VisionEncoding)
-            .filter_map(|input| input.num_cache_tokens)
-            .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
-        {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "a {}-token input image vision block exceeds the {}-token step budget",
-                    tokens, self.config.max_num_batched_tokens
-                ),
-            });
-            return;
-        }
-        if let Some(feature) = self.missing_required_feature(&req) {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
-                kind: RejectionKind::Invalid,
-                message: format!(
-                    "generation request requires worker feature `{feature}`, but the worker does not support it"
-                ),
-            });
-            return;
-        }
-        // Resource validation includes the cache bound, so a request that passes
-        // it has a worst-case cache token count.
-        let max_cache_tokens = match req
-            .validate_resources(&self.generation_limits)
-            .and_then(|()| req.max_cache_tokens(&self.generation_limits))
-        {
-            Ok(tokens) => tokens.saturating_add(self.image_unconditional_tokens(&req)),
-            Err(error) => {
-                let _ = event_tx.send(EngineCoreOutput::Rejected {
-                    kind: RejectionKind::Invalid,
-                    message: format!("invalid generation resource requirements: {error}"),
+                    message,
                 });
                 return;
             }
@@ -205,6 +117,103 @@ impl Scheduler {
             });
             return;
         }
+        let st = self.request_state(req, event_tx, max_cache_tokens);
+
+        // Admission examines only the queue head, so the insertion position
+        // fixes the admission order. Under `Priority` a request goes after
+        // every queued request with a lower priority value, or an equal one
+        // and an earlier or equal arrival, so ties stay FIFO.
+        let position = match self.config.policy {
+            SchedulingPolicy::Fcfs => self.waiting.len(),
+            SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
+                (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
+            }),
+        };
+        self.waiting.insert(position, st);
+    }
+
+    /// Checks a token-generation request against the loaded workers and
+    /// returns its worst-case cache token count.
+    ///
+    /// Refuses, with the client's message, a request when the runtime has no
+    /// prefix cache, the request fails validation, a unit the scheduler never
+    /// splits (a readout row, a generation canvas, an input image's vision
+    /// block) exceeds the step token budget, the worker lacks a required
+    /// generation feature, or `validate_resources` or `max_cache_tokens`
+    /// fails against `generation_limits`.
+    pub(super) fn validate_submission(&self, req: &GenerationRequest) -> Result<usize, String> {
+        if self.storage.cache.is_none() {
+            return Err("generation request requires worker KV resources".into());
+        }
+        if let Err(error) = req.validate() {
+            return Err(format!("invalid generation request: {error:?}"));
+        }
+        // A canvas pass holds whole rows, so every readout row must fit one
+        // scheduling step's token budget.
+        if let Some(row) = req
+            .readout
+            .iter()
+            .find(|row| row.token_ids.len() > self.config.max_num_batched_tokens)
+        {
+            return Err(format!(
+                "a {}-token readout canvas exceeds the {}-token step budget",
+                row.token_ids.len(),
+                self.config.max_num_batched_tokens
+            ));
+        }
+        // A request the deployment generates in canvases generates text only
+        // and names the seed its draws follow.
+        if self.config.canvas.is_some() && !req.is_readout() {
+            let error = if req.generates_images() {
+                Some(GenerationRequestError::CanvasGeneratesTextOnly)
+            } else if req.sampling.seed.is_none() {
+                Some(GenerationRequestError::UnseededCanvas)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                return Err(format!("invalid generation request: {error:?}"));
+            }
+        }
+        // A context prefill writes an input image's vision block whole, as
+        // one attention block of one call, so the block's exact cache length
+        // must fit one scheduling step's token budget.
+        if let Some(tokens) = req
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| &image.encoders)
+            .filter(|input| input.encoder == MediaCall::VisionEncoding)
+            .filter_map(|input| input.num_cache_tokens)
+            .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
+        {
+            return Err(format!(
+                "a {}-token input image vision block exceeds the {}-token step budget",
+                tokens, self.config.max_num_batched_tokens
+            ));
+        }
+        if let Some(feature) = self.missing_required_feature(req) {
+            return Err(format!(
+                "generation request requires worker feature `{feature}`, but the worker does not support it"
+            ));
+        }
+        // Resource validation includes the cache bound, so a request that passes
+        // it has a worst-case cache token count.
+        req.validate_resources(&self.generation_limits)
+            .and_then(|()| req.max_cache_tokens(&self.generation_limits))
+            .map(|tokens| tokens.saturating_add(self.image_unconditional_tokens(req)))
+            .map_err(|error| format!("invalid generation resource requirements: {error}"))
+    }
+
+    /// The state of a validated request, at the next request epoch, which
+    /// publishes through `event_tx`. `max_cache_tokens` is its worst-case
+    /// cache token count (`validate_submission`).
+    pub(super) fn request_state(
+        &mut self,
+        req: GenerationRequest,
+        event_tx: EventTx,
+        max_cache_tokens: usize,
+    ) -> RequestState {
         // Multimodal requests reserve their configured bounded cache envelope at
         // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
@@ -263,23 +272,14 @@ impl Scheduler {
             canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
+            resumed_tokens: 0,
+            scheduled_sent: false,
             terminal_intent: super::TerminalIntent::None,
             failure: None,
             req,
         };
         self.next_request_epoch = self.next_request_epoch.saturating_add(1);
-
-        // Admission examines only the queue head, so the insertion position
-        // fixes the admission order. Under `Priority` a request goes after
-        // every queued request with a lower priority value, or an equal one
-        // and an earlier or equal arrival, so ties stay FIFO.
-        let position = match self.config.policy {
-            SchedulingPolicy::Fcfs => self.waiting.len(),
-            SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
-                (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
-            }),
-        };
-        self.waiting.insert(position, st);
+        st
     }
 
     /// Resolves the products a video request reserves at admission.
@@ -1027,6 +1027,10 @@ impl Scheduler {
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
+        // A quiescing scheduler hands its waiting token requests over.
+        if self.quiescing() {
+            return;
+        }
         loop {
             if self.running_request_count() >= self.config.max_running_requests
                 || self.storage.request_pool.is_empty()
@@ -1320,12 +1324,15 @@ impl Scheduler {
         self.record_queue_wait(q, scheduled_at);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
-        if !st.output.events.enqueue(EngineCoreOutput::Scheduled {
-            queued_at: q,
-            scheduled_at,
-        }) {
+        if !st.scheduled_sent
+            && !st.output.events.enqueue(EngineCoreOutput::Scheduled {
+                queued_at: q,
+                scheduled_at,
+            })
+        {
             st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
         }
+        st.scheduled_sent = true;
 
         // Running order, resource reservations, and runtime ownership advance
         // together so the next scheduling pass observes one coherent admission.

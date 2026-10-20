@@ -1025,6 +1025,7 @@ mod tests {
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
+                generated_token_ids: Vec::new(),
             }),
             image: None,
             diffusion: None,

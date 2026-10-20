@@ -1396,6 +1396,30 @@ pub trait Executor: Send {
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
     /// Closes the executor and its physical workers.
     fn close(&mut self) -> Result<(), ExecutorError>;
+    /// The executor's part in a control-plane handover (`crate::handover`);
+    /// `None` for an executor whose workers keep no storage beyond it, which
+    /// a handover closes and a successor starts afresh.
+    fn handover(&mut self) -> Option<&mut dyn ExecutorHandover> {
+        None
+    }
+}
+
+/// What an executor whose workers retain their storage does in a
+/// control-plane handover, besides serving and closing.
+pub trait ExecutorHandover {
+    /// Predecessor: stop every worker group's standby, whose memory the
+    /// successor's workers take, and keep none until [`Self::abandon`].
+    /// Returns what the successor's workers adopt. Fails for a group a
+    /// successor cannot stand by for: one with a rank on another host or in
+    /// a shared expert world.
+    fn prepare(&mut self) -> anyhow::Result<crate::handover::Adoption>;
+    /// Predecessor: the successor did not take over; groups keep standbys
+    /// again.
+    fn abandon(&mut self);
+    /// Successor: take the deployment's claim over from the predecessor,
+    /// whose workers have closed, and promote every group's workers, which
+    /// started as its standbys.
+    fn promote(&mut self) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

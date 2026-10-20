@@ -9,7 +9,8 @@
 //! requests, assigns cache pages (`prefix_cache`) and other worker storage (`storage`),
 //! and submits calls through the `Executor` trait (`executor`);
 //! `WorkerExecutor` (`worker`) splits each batch into per-worker submissions
-//! to the worker processes.
+//! to the worker processes. An engine core hands its requests to an engine
+//! core of a new build without failing them (`handover`).
 //!
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
@@ -18,6 +19,9 @@ mod core;
 mod deployment;
 mod executor;
 mod handle;
+/// Control-plane hot update: the snapshot an engine core hands its
+/// successor.
+pub mod handover;
 mod prefix_cache;
 mod scheduler;
 #[cfg(feature = "testing")]
@@ -32,14 +36,16 @@ pub use crate::core::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerGroupRo
 pub use crate::deployment::Deployment;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
-    ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
-    PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
-    TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure, WorkerGroupId, WorkerResult,
+    ExecutionBatch, Executor, ExecutorError, ExecutorHandover, ExecutorInfo, ExecutorSubmitError,
+    ParallelConfig, PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend,
+    TransferConfig, TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure,
+    WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
     StreamCancelCause, Submission, SubmitError,
 };
+pub use crate::prefix_cache::IndexedPage;
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
