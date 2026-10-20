@@ -9252,6 +9252,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "crossbeam-channel",
  "expect-test",
  "fastokens",
  "futures",

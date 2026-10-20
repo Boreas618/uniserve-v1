@@ -8,6 +8,8 @@
 
 /// The serving engine over the in-process engine cores.
 pub mod engine;
+/// Control-plane hot update between two heads of one deployment.
+mod handover;
 /// The HTTP server: router assembly, the listener, and graceful shutdown.
 pub mod http;
 /// The OpenAI-compatible API: wire schemas, errors, and the route handlers.
