@@ -588,6 +588,7 @@ pub(crate) fn forward(
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,
     };
+    let page_reads = batch.page_reads().cloned();
     let (plan, pending, _) = batch.token_parts();
 
     let parts = backend.parts();
@@ -604,7 +605,13 @@ pub(crate) fn forward(
     };
     let job = Job::new();
     let (job, next) = match state {
-        None => match Opening::open(&mut owners, parts.placement, parts.rank, &job) {
+        None => match Opening::open(
+            &mut owners,
+            parts.placement,
+            parts.rank,
+            &job,
+            page_reads.as_ref(),
+        ) {
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
             Ok(opening) => grids(owners, opening, job),
             // The fences the opening recorded are still due.

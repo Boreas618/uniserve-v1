@@ -313,8 +313,12 @@ pub(super) fn plan(
                 &cache,
             )?,
         );
-        // Every unit column holds one index per unit, charged with each unit.
-        let columns = PrefixCache::import_workers(import_capacity) + unit_columns;
+        // Every unit column holds one index per unit, charged with each unit:
+        // the import workers', the lanes' and the copy lane's of a rank that
+        // copies pages through the host page tier.
+        let columns = PrefixCache::import_workers(import_capacity)
+            + unit_columns
+            + usize::from(launch.storage.page_tier);
         let unit_overhead = columns as u64 * UnitColumn::bytes(1);
         layout.fit_cache(&cache, unit_overhead, config, total, &world.host)?;
         Some(Arc::new(cache))
