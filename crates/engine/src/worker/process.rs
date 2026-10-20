@@ -22,7 +22,7 @@
 //! tensors, cache pages, and latent storage remain worker-resident.
 //!
 //! The launch settings `WorkerProcessArgs` carries (`LaneConfig`,
-//! `FlashInferBackend`), that type's defaults, and the launch descriptor
+//! `FlashInferBackend`, `GraphPolicy`, `LoadFormat`), that type's defaults, and the launch descriptor
 //! built from it are defined in `descriptor`.
 
 mod descriptor;
@@ -41,7 +41,7 @@ use uniserve_ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerRes
 use crate::worker::WorkerProcessArgs;
 
 use descriptor::worker_environment;
-pub use descriptor::{FlashInferBackend, FlashInferBackendParseError};
+pub use descriptor::{FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LoadFormat};
 
 /// Maximum time `request_close` spends draining in-flight responses from a
 /// still-alive worker before it sends the shutdown request. A hung (alive but
@@ -63,7 +63,7 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use uniserve_ipc::LaneConfig;
+pub use uniserve_ipc::{LaneConfig, LaneSpec};
 
 /// One adopted rank: its channel, its process when this engine started it,
 /// and the requests outstanding on it.

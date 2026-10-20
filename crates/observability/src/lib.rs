@@ -6,14 +6,11 @@
 //!
 //! - `api_server`: the HTTP metrics middleware (`track_http_metrics`), when
 //!   each response body finishes or is dropped.
-//! - `scheduler`: the engine client's scheduler-stats export task
+//! - `scheduler`: the server engine's scheduler-stats export tasks
 //!   (`record_scheduler_stats`), from periodic `SchedulerStats` snapshots.
-//! - `serving`: the `/metrics` scrape handler, which calls
-//!   `ServingMetrics::set_request_states` just before rendering.
-//! - `request`: the engine client's request registry
-//!   (`RequestRegistry::complete`), once for each request the engine accepted,
-//!   when the request completes; the server's `StatsLogger` reads its prompt
-//!   and generation token counters.
+//! - `request`: the server engine's `RequestStats`, once for each request an
+//!   engine core accepted, when the request ends; the server's `StatsLogger`
+//!   reads its prompt and generation token counters.
 //!
 //! Every metric field is a `prometheus-client` handle whose clones share their
 //! underlying state, so updates through a field reach the clone held by the
@@ -34,15 +31,13 @@ use prometheus_client::registry::Registry;
 mod api_server;
 mod request;
 mod scheduler;
-mod serving;
 
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
-pub use request::{FinishedReasonLabels, PromptTokenSourceLabels, RequestMetrics};
+pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics, WaitingReasonLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics,
 };
-pub use serving::{ServingMetrics, ServingRequestLabels};
 
 /// Unsigned Prometheus counter used by metric families.
 pub type U64Counter = Counter<u64, AtomicU64>;
@@ -66,8 +61,6 @@ pub struct Metrics {
     pub request: RequestMetrics,
     /// HTTP transport metric families.
     pub api_server: ApiServerMetrics,
-    /// Serving-runtime lifecycle metric families.
-    pub serving: ServingMetrics,
 }
 
 impl Metrics {
@@ -77,14 +70,12 @@ impl Metrics {
         let scheduler = SchedulerMetrics::register(&mut registry);
         let request = RequestMetrics::register(&mut registry);
         let api_server = ApiServerMetrics::register(&mut registry);
-        let serving = ServingMetrics::register(&mut registry);
 
         Self {
             registry,
             scheduler,
             request,
             api_server,
-            serving,
         }
     }
 
@@ -97,11 +88,6 @@ impl Metrics {
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
         Ok(output)
-    }
-
-    /// Returns the registry owned by this metrics object.
-    pub fn registry(&self) -> &Registry {
-        &self.registry
     }
 }
 

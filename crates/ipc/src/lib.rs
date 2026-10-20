@@ -106,7 +106,7 @@ mod transfer;
 pub use batch::*;
 pub use call::*;
 pub use command::*;
-pub use config::{LaneConfig, LaneConfigError};
+pub use config::{LaneConfig, LaneConfigError, LaneSpec};
 pub use info::*;
 pub use output::*;
 pub use request::*;

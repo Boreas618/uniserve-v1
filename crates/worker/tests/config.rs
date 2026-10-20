@@ -112,7 +112,7 @@ fn the_tower_placement_resolves_the_generation_device() {
     for (mesh, message) in [
         ("tower=text:cuda:0;gen:cuda:1", "tower=gen:<device>"),
         ("tower=gen:cuda", "other than the rank's"),
-        ("tower=gen:bogus", "--worker-mesh tower gen"),
+        ("tower=gen:bogus", "worker_config.mesh tower gen"),
     ] {
         let error = launch_error(json!({"device": "cuda:0", "mesh": mesh}));
         assert!(error.contains(message), "{mesh}: {error}");
@@ -123,7 +123,7 @@ fn the_tower_placement_resolves_the_generation_device() {
 fn a_malformed_device_names_its_option() {
     for device in ["gpu0", "cuda:x"] {
         let error = launch_error(json!({"device": device}));
-        assert!(error.contains("--device"), "{error}");
+        assert!(error.contains("rank device"), "{error}");
     }
 }
 
@@ -202,33 +202,32 @@ fn execution_lanes_bind_disjoint_calls() {
     assert!(launch_error(duplicate).contains("one execution lane"));
 }
 
+/// A stated capture catalog or capacity list replaces the rank's own, and an
+/// unstated one keeps it. The launching side validates the lists it states.
 #[test]
-fn bucket_lists_are_positive_and_strictly_increasing() {
-    let launch =
-        resolved(json!({"video_text_capacities": "1024,4096,8192", "min_video_seconds": 4.0}))
-            .unwrap();
+fn stated_catalogs_replace_the_rank_defaults() {
+    let launch = resolved(json!({
+        "video_text_capacities": [1024, 4096, 8192],
+        "min_video_seconds": 4.0,
+        "flow_graph_shapes": [[1024, 512], [512, 1024]],
+    }))
+    .unwrap();
     assert_eq!(
         launch.execution.video_text_capacities,
         vec![1024, 4096, 8192]
     );
     assert_eq!(launch.execution.min_video_seconds, Some(4.0));
+    assert_eq!(
+        launch.execution.flow_graph_shapes,
+        vec![(1024, 512), (512, 1024)]
+    );
 
-    // Without settings the worker derives its video capacities itself.
+    // Without settings the worker derives its video capacities itself and
+    // captures its own image shapes.
     let unset = resolved(json!({})).unwrap();
     assert!(unset.execution.video_text_capacities.is_empty());
     assert_eq!(unset.execution.min_video_seconds, None);
-
-    for capacities in ["0,1024", "4096,1024", "1024,1024"] {
-        assert!(resolved(json!({"video_text_capacities": capacities})).is_err());
-    }
-    assert_eq!(
-        resolved(json!({"flow_graph_shapes": "1024x512, 512X1024"}))
-            .unwrap()
-            .execution
-            .flow_graph_shapes,
-        vec![(1024, 512), (512, 1024)]
-    );
-    assert!(resolved(json!({"flow_graph_shapes": "1024x512,1024x512"})).is_err());
+    assert!(!unset.execution.flow_graph_shapes.is_empty());
 }
 
 #[test]
@@ -247,9 +246,9 @@ fn video_canvas_names_keep_the_order_the_deployment_names() {
 }
 
 #[test]
-fn attention_options_are_checked() {
+fn attention_options_reach_the_backend() {
     let launch = resolved(
-        json!({"flashinfer_workspace_size": 64 << 20, "flashinfer_use_tensor_core": "True"}),
+        json!({"flashinfer_workspace_size": 64 << 20, "flashinfer_use_tensor_core": true}),
     )
     .unwrap();
     assert_eq!(launch.attention.workspace_size, 64 << 20);

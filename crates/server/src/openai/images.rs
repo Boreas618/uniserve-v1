@@ -1,31 +1,152 @@
-//! Collection of image-generation output into OpenAI responses.
+//! `POST /v1/images/generations`: OpenAI-compatible image generation.
 //!
-//! The `/v1/images/generations` route submits an `ImageGenerationRequest`
-//! through the serving runtime and hands the resulting `RequestOutput` stream
-//! to [`collect_image_generation`], which buffers completed images until the
-//! request finishes and returns one non-streaming response.
+//! The handler lowers an `ImageGenerationRequest` ([`lower_image_request`]),
+//! submits it through the engine, and hands the resulting `RequestOutput`
+//! stream to [`collect_image_generation`],
+//! which buffers completed images until the request finishes and returns one
+//! non-streaming response.
 
-use crate::serving::RequestOutput;
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _};
 
-use crate::openai::error::{ApiError, serve_error_to_api};
-use crate::openai::types::{GeneratedImageData, ImageGenerationResponse};
+use crate::engine::Engine;
+use crate::http::RequestId;
+use uniserve_core::GenerationConstraint;
 
-/// Collects image events into one OpenAI-compatible response.
-///
-/// Consumes `stream` until its `Finished` event. Each `ImageDone` event
-/// contributes one entry to the response `data`, in arrival order; `created`
-/// is the response timestamp in Unix seconds. Lifecycle, text, reasoning,
-/// output-block, tool-call, image-progress, and usage events are ignored.
+use crate::openai::{
+    ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,
+    check_model_served,
+};
+use crate::serving::{
+    FinishReason, GenerateRequest, ImageSamplingParams, Prompt, RequestOutput, SamplingParams,
+};
+
+/// The image generation route.
+pub(crate) fn router(engine: Arc<Engine>) -> Router {
+    Router::new()
+        .route("/v1/images/generations", post(images_generations))
+        .with_state(engine)
+}
+
+/// Validates, submits, and collects one image-generation request.
+async fn images_generations(
+    State(engine): State<Arc<Engine>>,
+    Extension(RequestId(base_id)): Extension<RequestId>,
+    ValidatedJson(body): ValidatedJson<ImageGenerationRequest>,
+) -> Response {
+    let request =
+        match lower_image_request(format!("img-{base_id}"), engine.served_model_name(), body) {
+            Ok(request) => request,
+            Err(error) => return error.into_response(),
+        };
+    let stream = match engine.generate(request).await {
+        Ok(stream) => stream,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    match collect_image_generation(stream, uniserve_core::now_unix_secs_u64()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Validates and lowers one image-generation request into the serving
+/// layer's generate request: an image-only generation of exactly one image
+/// with the default shared cache policy and default text sampling.
 ///
 /// # Errors
 ///
-/// Returns a stream error mapped by [`serve_error_to_api`], the category
-/// chosen by [`ApiError::rejected`] for an admission rejection, and a server
-/// error when the request fails, is cancelled or aborted, finishes with an
-/// error status, emits a video event, reports an image without its
-/// dimensions, byte count, or PNG payload, or ends without a `Finished` event
-/// or without any image.
+/// Rejects an empty or whitespace-only prompt, a model name other than the
+/// served one, and a malformed `size`.
+pub fn lower_image_request(
+    request_id: String,
+    served_model_name: &str,
+    request: ImageGenerationRequest,
+) -> Result<GenerateRequest, ApiError> {
+    if request.prompt.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "prompt must not be empty".to_string(),
+            Some("prompt"),
+        ));
+    }
+    if let Some(model) = request.model.as_deref() {
+        check_model_served(model, served_model_name)?;
+    }
+    // An absent size leaves both dimensions to the profile's resolution
+    // policy.
+    let (width, height) = request
+        .size
+        .as_deref()
+        .map(parse_size)
+        .transpose()?
+        .map_or((None, None), |(width, height)| (Some(width), Some(height)));
+    Ok(GenerateRequest {
+        request_id,
+        prompt: Prompt::Text {
+            prompt: request.prompt,
+            negative_prompt: request.negative_prompt,
+        },
+        constraint: GenerationConstraint::GenOnly,
+        sampling_params: SamplingParams::default(),
+        image_params: Some(ImageSamplingParams {
+            width,
+            height,
+            steps: request.steps,
+            cfg_text_scale: request.guidance_scale,
+            cfg_img_scale: request.image_guidance_scale,
+            cfg_interval: request.cfg_interval,
+            cfg_renorm_type: request.cfg_norm,
+            timestep_shift: request.timestep_shift,
+            seed: request.seed,
+            max_images: Some(1),
+            ..ImageSamplingParams::default()
+        }),
+        priority: 0,
+        cache_salt: None,
+    })
+}
+
+/// Parses a positive `WIDTHxHEIGHT` image-size string.
+fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
+    let Some((width, height)) = size.split_once('x') else {
+        return Err(ApiError::invalid_request(
+            "size must use WIDTHxHEIGHT syntax".to_string(),
+            Some("size"),
+        ));
+    };
+    if height.contains('x') {
+        return Err(ApiError::invalid_request(
+            "size must use WIDTHxHEIGHT syntax".to_string(),
+            Some("size"),
+        ));
+    }
+    let width = width.parse::<u32>().ok().filter(|value| *value > 0);
+    let height = height.parse::<u32>().ok().filter(|value| *value > 0);
+    width.zip(height).ok_or_else(|| {
+        ApiError::invalid_request(
+            "size dimensions must be positive integers".to_string(),
+            Some("size"),
+        )
+    })
+}
+
+/// Collects image events into one OpenAI-compatible response.
+///
+/// Consumes `stream` until its terminal event. Each `ImageDone` event
+/// contributes one entry to the response `data`, in arrival order; `created`
+/// is the response timestamp in Unix seconds. Lifecycle, text, reasoning,
+/// output-block, tool-call, token, and image-step events are ignored.
+///
+/// # Errors
+///
+/// Returns a stream error mapped by `From<ServeError>`, the category chosen
+/// by [`ApiError::rejected`] for an admission rejection, and a server error
+/// when the request fails or is aborted, emits a video event, or ends
+/// without a `Finished` event or without any image.
 pub async fn collect_image_generation(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     created: u64,
@@ -35,65 +156,46 @@ pub async fn collect_image_generation(
     let mut data = Vec::new();
     let mut finished = false;
     while let Some(event) = stream.next().await {
-        match event.map_err(serve_error_to_api)? {
-            // `ImageDone` metadata is optional in the serving protocol; an
-            // image response cannot be built without all four fields.
-            RequestOutput::ImageDone {
-                height,
-                width,
-                bytes,
-                pixels_png_b64,
-                ..
-            } => data.push(GeneratedImageData {
-                b64_json: required_image_field(pixels_png_b64, "PNG artifact")?,
-                revised_prompt: None,
-                height: required_image_field(height, "height")?,
-                width: required_image_field(width, "width")?,
-                bytes: required_image_field(bytes, "byte count")?,
+        match event? {
+            RequestOutput::ImageDone(image) => data.push(GeneratedImageData {
+                b64_json: image.png_base64,
+                height: image.height,
+                width: image.width,
+                bytes: image.bytes,
             }),
-            RequestOutput::Finished { reason, .. } => {
-                if matches!(reason, crate::serving::FinishStatus::Error) {
-                    return Err(ApiError::server_error(
-                        "image generation terminated with an execution error".to_string(),
-                    ));
-                }
-                finished = true;
-                break;
-            }
-            RequestOutput::Rejected { kind, message, .. } => {
-                return Err(ApiError::rejected(kind, message));
-            }
-            RequestOutput::Failed { message, .. } => return Err(ApiError::server_error(message)),
-            RequestOutput::Cancelled { .. } => {
-                return Err(ApiError::server_error(
-                    "image generation request was cancelled".to_string(),
-                ));
-            }
-            RequestOutput::Aborted { .. } => {
+            RequestOutput::Finished {
+                reason: FinishReason::Abort,
+                ..
+            } => {
                 return Err(ApiError::server_error(
                     "image generation request was aborted".to_string(),
                 ));
             }
+            RequestOutput::Finished { .. } => {
+                finished = true;
+                break;
+            }
+            RequestOutput::Rejected { kind, message } => {
+                return Err(ApiError::rejected(kind, message));
+            }
+            RequestOutput::Failed { message } => return Err(ApiError::server_error(message)),
             // Artifact and media-progress events belong to video generation.
             RequestOutput::Artifact(_) | RequestOutput::MediaProgress { .. } => {
                 return Err(ApiError::server_error(
                     "image request received a video event".to_owned(),
                 ));
             }
-            RequestOutput::Accepted { .. }
+            RequestOutput::Accepted(_)
             | RequestOutput::Scheduled { .. }
             | RequestOutput::TextDelta { .. }
-            | RequestOutput::InternalTextDelta { .. }
             | RequestOutput::ReasoningDelta { .. }
+            | RequestOutput::TokenDelta { .. }
             | RequestOutput::OutputBlockStart { .. }
             | RequestOutput::OutputBlockEnd { .. }
             | RequestOutput::ToolCallStart { .. }
             | RequestOutput::ToolCallArgumentsDelta { .. }
             | RequestOutput::ToolCallEnd { .. }
-            | RequestOutput::ImageBegin { .. }
-            | RequestOutput::ImageStep { .. }
-            | RequestOutput::ImageCommit { .. }
-            | RequestOutput::Usage { .. } => {}
+            | RequestOutput::ImageStep { .. } => {}
         }
     }
 
@@ -103,14 +205,4 @@ pub async fn collect_image_generation(
         ));
     }
     Ok(ImageGenerationResponse { created, data })
-}
-
-/// Returns a required `ImageDone` field, or a server error naming the missing
-/// metadata.
-fn required_image_field<T>(value: Option<T>, field: &str) -> Result<T, ApiError> {
-    value.ok_or_else(|| {
-        ApiError::server_error(format!(
-            "image generation completed without required {field} metadata"
-        ))
-    })
 }

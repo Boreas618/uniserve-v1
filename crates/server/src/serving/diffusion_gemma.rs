@@ -6,9 +6,10 @@
 //! the image's vision features where that run stands ([`engine_images`]).
 //! The reply is generated in canvases of the checkpoint's `canvas_length`
 //! tokens under the deployment's block-diffusion sampling
-//! ([`canvas_sampling`]), which the engine and its ranks are launched with,
+//! (`DiffusionGemmaProfile::sampling`), which the engine and its ranks are
+//! launched with,
 //! and Gemma-4 parsers split its thought channel and tool calls
-//! ([`Gemma4ChatOutputProcessor`]). Token-sampling controls have no meaning
+//! (`ChatOutputProcessor::gemma4`). Token-sampling controls have no meaning
 //! for a denoised canvas, so a request that sets one is refused
 //! ([`refuse_token_sampling_controls`]).
 //!
@@ -18,16 +19,13 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
+    GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
-use crate::serving::chat::{ChatOutputProcessor, ChatRequest, Gemma4ChatOutputProcessor};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
 use crate::serving::text::TextDecodeOptions;
-use crate::serving::{
-    InputProcessor, OutputProcessorPolicy, SamplingConfig, ServeError, ServeRequestId, StopConfig,
-    TokenizeError, media,
-};
+use crate::serving::{InputProcessor, SamplingParams, ServeError, TokenizeError, media};
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
 /// prompt tokens and image inputs.
@@ -66,23 +64,6 @@ pub(crate) fn engine_images(
     (prompt, inputs)
 }
 
-/// Returns the block-diffusion sampling of every canvas the deployment
-/// generates: the checkpoint's canvas length under its sampler defaults, as
-/// the server's configuration overrides them. The engine and the ranks are
-/// launched with it; requests do not carry it.
-pub(crate) fn canvas_sampling(profile: &DiffusionGemmaProfile) -> CanvasSampling {
-    let denoising = &profile.denoising;
-    CanvasSampling {
-        canvas_length: profile.canvas_length,
-        max_steps: denoising.max_denoising_steps,
-        entropy_bound: denoising.entropy_bound,
-        t_min: denoising.t_min,
-        t_max: denoising.t_max,
-        confidence_threshold: denoising.confidence_threshold,
-        stability_threshold: denoising.stability_threshold,
-    }
-}
-
 /// Why block diffusion defines no temperature or truncation control.
 const SCHEDULED_SAMPLING: &str = "block diffusion samples every canvas position from the full \
      vocabulary at the temperature schedule the server configures";
@@ -107,9 +88,8 @@ const FIRST_EOS: &str = "a canvas ends the reply at its first end-of-sequence to
 /// Returns [`ServeError::UnsupportedSamplingControl`] for the first control
 /// the request sets.
 pub(crate) fn refuse_token_sampling_controls(
-    request_id: &ServeRequestId,
-    sampling: &SamplingConfig,
-    stop: &StopConfig,
+    request_id: &str,
+    sampling: &SamplingParams,
 ) -> Result<(), ServeError> {
     let controls = [
         (
@@ -135,17 +115,17 @@ pub(crate) fn refuse_token_sampling_controls(
             sampling.repetition_penalty.is_some(),
             NO_PENALTIES,
         ),
-        ("logit_bias", stop.logit_bias.is_some(), UNCONSTRAINED),
+        ("logit_bias", sampling.logit_bias.is_some(), UNCONSTRAINED),
         (
             "allowed_token_ids",
-            stop.allowed_token_ids.is_some(),
+            sampling.allowed_token_ids.is_some(),
             UNCONSTRAINED,
         ),
-        ("bad_words", !stop.bad_words.is_empty(), UNCONSTRAINED),
-        ("logprobs", stop.logprobs.is_some(), NO_LOGPROBS),
+        ("bad_words", !sampling.bad_words.is_empty(), UNCONSTRAINED),
+        ("logprobs", sampling.logprobs.is_some(), NO_LOGPROBS),
         (
             "prompt_logprobs",
-            stop.prompt_logprobs.is_some(),
+            sampling.prompt_logprobs.is_some(),
             NO_LOGPROBS,
         ),
         ("min_tokens", sampling.min_tokens.is_some(), FIRST_EOS),
@@ -153,7 +133,7 @@ pub(crate) fn refuse_token_sampling_controls(
     ];
     match controls.into_iter().find(|(_, set, _)| *set) {
         Some((control, _, reason)) => Err(ServeError::UnsupportedSamplingControl {
-            request_id: request_id.clone(),
+            request_id: request_id.to_owned(),
             control,
             reason,
         }),
@@ -179,16 +159,16 @@ impl InputProcessor {
     pub(super) fn preprocess_diffusion_gemma_input(
         &self,
         profile: &DiffusionGemmaProfile,
-        mut chat: ChatRequest,
+        chat: ChatRequest,
         images: &[media::ImageInput],
-        sampling: &SamplingConfig,
+        sampling: &SamplingParams,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
-    ) -> Result<OutputProcessorPolicy, TokenizeError> {
-        chat.decode_options = decode.clone();
+    ) -> Result<ChatOutputProcessor, TokenizeError> {
         chat.validate()?;
-        let processor = Gemma4ChatOutputProcessor::new(
-            &mut chat,
+        let processor = ChatOutputProcessor::gemma4(
+            &chat,
+            decode,
             Arc::clone(&self.tokenizer),
             self.parse_reasoning,
         )?;
@@ -213,7 +193,7 @@ impl InputProcessor {
         // reply may use only the whole canvases that fit the context.
         let prompt_len = u32::try_from(expanded.len()).unwrap_or(u32::MAX);
         let max_model_len = self.config.max_model_len;
-        let canvas = profile.canvas_length;
+        let canvas = profile.sampling.canvas_length;
         let room = max_model_len.saturating_sub(prompt_len) / canvas * canvas;
         if room == 0 {
             return Err(TokenizeError::Invalid(format!(
@@ -221,7 +201,7 @@ impl InputProcessor {
                  {prompt_len} tokens leave no room for one {canvas}-token canvas"
             )));
         }
-        let max_tokens = crate::serving::text::resolve_max_tokens(
+        let max_tokens = crate::serving::sampling::resolve_max_tokens(
             sampling.max_tokens,
             self.config.sampling_defaults.max_output_tokens,
             Some(prompt_len + room),
@@ -239,10 +219,7 @@ impl InputProcessor {
                 .seed
                 .unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0),
         );
-        decode.skip_special_tokens = chat.decode_options.skip_special_tokens;
-        Ok(OutputProcessorPolicy::Chat(ChatOutputProcessor::Gemma4(
-            processor,
-        )))
+        Ok(processor)
     }
 }
 
@@ -256,37 +233,33 @@ mod tests {
     //! `TEXT_LEN` tokens. The tokenizer decodes every synthetic token to its own
     //! word, so each delta's text follows from its token ids.
 
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use crate::engine_client::EngineClient;
-    use crate::profile::diffusion_gemma::{
-        ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
-    };
-    use crate::profile::tokenizer::HuggingFaceTokenizer;
-    use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
-    use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-    use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
-    use crate::serving::{
-        FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
-    };
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
-    use uniserve_core::ModelDtype;
-    use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
+    use uniserve_core::{CanvasSampling, ModelDtype};
+    use uniserve_engine::{EngineConfig, SimEngine};
+
+    use crate::engine::Engine;
+    use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
+    use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
+    use crate::serving::{FinishReason, RequestOutput};
+    use crate::test_support::{SERVED_MODEL, engine_over, load_tokenizer, sim_core};
 
     /// Tokens of one canvas.
     const CANVAS: u32 = 16;
     /// Synthetic reply tokens before the simulator's EOS.
     const TEXT_LEN: usize = 40;
 
-    /// Builds a DiffusionGemma serving runtime over the simulator.
+    /// Builds a DiffusionGemma engine over the simulator.
     ///
     /// The tokenizer maps ASCII code points to themselves and every larger id
     /// below 6000 to the word `w<id>`, followed by the control tokens. The chat
     /// template renders the first message's content.
-    fn runtime() -> (ServingRuntime, Arc<HuggingFaceTokenizer>) {
+    fn runtime() -> (Engine, Arc<HuggingFaceTokenizer>) {
         let vocabulary = (0_u32..6_000)
             .map(|id| {
                 let token = if id < 128 {
@@ -306,14 +279,10 @@ mod tests {
         tokenizer.add_special_tokens(
             &["<|image>", "<|image|>", "<image|>"].map(|token| AddedToken::from(token, true)),
         );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("tokenizer.json");
-        tokenizer.save(&path, false).unwrap();
-        let tokenizer = Arc::new(HuggingFaceTokenizer::new(&path).unwrap());
+        let tokenizer = Arc::new(load_tokenizer(&tokenizer));
         let id = |token: &str| tokenizer.token_to_id(token).unwrap();
 
         let profile = DiffusionGemmaProfile {
-            canvas_length: CANVAS,
             tokens: ControlTokens {
                 mask: 4,
                 pad: 0,
@@ -327,8 +296,9 @@ mod tests {
                 pooling_kernel_size: 3,
                 max_soft_tokens: 280,
             },
-            denoising: DenoisingDefaults {
-                max_denoising_steps: 4,
+            sampling: CanvasSampling {
+                canvas_length: CANVAS,
+                max_steps: 4,
                 entropy_bound: 0.1,
                 t_min: 0.4,
                 t_max: 0.8,
@@ -337,9 +307,8 @@ mod tests {
             },
             quantized: false,
         };
-        let sampling = super::canvas_sampling(&profile);
+        let sampling = profile.sampling;
         let model = ModelConfig {
-            served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
             sampling_defaults: SamplingDefaults::default(),
             max_model_len: 4096,
@@ -350,36 +319,12 @@ mod tests {
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
         worker.set_canvas_sampling(sampling);
-        let mut config = EngineConfig::sim("sim-model");
+        let mut config = EngineConfig::sim(SERVED_MODEL);
         config.worker_process.canvas_sampling = Some(sampling);
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-        let client = Arc::new(
-            EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))
-                .unwrap(),
-        );
-        let processor = InputProcessor::new(
-            model,
-            Arc::clone(&tokenizer),
-            RequestRenderer::Chat(
-                HfChatRenderer::new(
-                    Some("{{ messages[0].content }}".to_string()),
-                    HashMap::new(),
-                    ChatTemplateContentFormatOption::String,
-                )
-                .unwrap(),
-            ),
-            crate::serving::WorkerCapabilities {
-                limits: client.generation_limits(),
-            },
-            false,
-        )
-        .unwrap();
-
-        let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
-        (
-            ServingRuntime::new(processor, client, images, false),
-            tokenizer,
-        )
+        let core = sim_core(config, worker);
+        let engine = engine_over(model, Arc::clone(&tokenizer) as _, vec![core], None);
+        (engine, tokenizer)
     }
 
     /// One chat reply as the chat stream published it.
@@ -388,14 +333,14 @@ mod tests {
         texts: Vec<String>,
         /// Token-id deltas, in order.
         token_ids: Vec<Vec<u32>>,
-        finish: FinishStatus,
-        /// Visible output tokens the usage reports.
+        finish: FinishReason,
+        /// Generated tokens the usage reports.
         tokens: u32,
     }
 
     /// Runs one chat request with its token ids returned. The chat stream
     /// publishes parsed text and token ids as separate deltas.
-    async fn chat(runtime: &ServingRuntime, id: &str, max_completion_tokens: u32) -> Reply {
+    async fn chat(runtime: &Engine, id: &str, max_completion_tokens: u32) -> Reply {
         let request = serde_json::from_value(serde_json::json!({
             "model": "sim-model",
             "messages": [{"role": "user", "content": "hi"}],
@@ -403,28 +348,25 @@ mod tests {
             "return_token_ids": true,
         }))
         .unwrap();
-        let mut stream = runtime.generate_chat(id.into(), request).await.unwrap();
+        let (request, _) =
+            crate::openai::chat_completions::lower_chat_request(id.into(), "sim-model", request)
+                .unwrap();
+        let mut stream = runtime.generate(request).await.unwrap();
         let (mut texts, mut token_ids, mut usage, mut finish) =
             (Vec::new(), Vec::new(), None, None);
         while let Some(event) = stream.next().await {
             match event.unwrap() {
-                RequestOutput::TextDelta {
-                    text,
-                    token_ids: ids,
-                    ..
-                } => {
-                    if !text.is_empty() {
-                        texts.push(text);
-                    }
-                    if !ids.is_empty() {
-                        token_ids.push(ids);
-                    }
+                RequestOutput::TextDelta { text } if !text.is_empty() => texts.push(text),
+                RequestOutput::TokenDelta { token_ids: ids, .. } if !ids.is_empty() => {
+                    token_ids.push(ids);
                 }
-                RequestOutput::Usage {
-                    visible_output_tokens,
-                    ..
-                } => usage = Some(visible_output_tokens),
-                RequestOutput::Finished { reason, .. } => finish = Some(reason),
+                RequestOutput::Finished {
+                    reason,
+                    usage: used,
+                } => {
+                    finish = Some(reason);
+                    usage = Some(used.output_tokens);
+                }
                 _ => {}
             }
         }
@@ -465,11 +407,13 @@ mod tests {
 
         assert_eq!(token_counts(&tokenizer, &reply), [16, 16, 8]);
         assert!(
-            matches!(reply.finish, FinishStatus::Stop { .. }),
+            matches!(reply.finish, FinishReason::Stop(_)),
             "{:?}",
             reply.finish
         );
-        assert_eq!(reply.tokens, TEXT_LEN as u32);
+        // The engine counts the EOS that ends the reply among its generated
+        // tokens, as OpenAI usage reports them.
+        assert_eq!(reply.tokens, TEXT_LEN as u32 + 1);
         runtime.shutdown().await.unwrap();
     }
 
@@ -480,7 +424,7 @@ mod tests {
         let reply = chat(&runtime, "truncated", 20).await;
 
         assert_eq!(token_counts(&tokenizer, &reply), [16, 4]);
-        assert_eq!(reply.finish, FinishStatus::Length);
+        assert_eq!(reply.finish, FinishReason::Length);
         assert_eq!(reply.tokens, 20);
         runtime.shutdown().await.unwrap();
     }

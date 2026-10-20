@@ -1,0 +1,35 @@
+# FastH3 on eight GPUs of one host: an eight-way all-gather sequence-parallel
+# denoiser and a TP8 text encoder.
+
+[[workers]]
+id = "model"
+ranks = ["cuda:0-7"]
+queue_depth = 6
+
+[workers.components.transformer]
+sequence_parallel = { kind = "allgather", allgather_degree = 8 }
+
+[workers.components.text_encoder]
+tensor_parallel_size = 8
+
+[workers.components.video_decoder]
+
+[workers.components.audio_decoder]
+distribution = "temporal_units"
+
+[workers.components.latent_encoder]
+distribution = "temporal_units"
+
+[[workers]]
+id = "host"
+ranks = ["cpu*10"]
+queue_depth = 6
+
+[workers.components.video_codec]
+ranks = [0, 1, 2, 3, 4, 5, 6, 7]
+
+[workers.components.muxer]
+ranks = [8]
+
+[workers.components.media_reader]
+ranks = [9]

@@ -105,7 +105,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         Path(__file__).resolve().parents[3]
         / "configs"
         / "minimax_h3"
-        / "ulysses4.json"
+        / "ulysses4.toml"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -125,12 +125,12 @@ def test_every_admitted_duration_and_prompt_length_replays(
         "2",
         "--max-model-len",
         "16384",
-        "--max-video-seconds",
-        "15",
-        "--video-text-capacities",
-        TEXT_CAPACITIES,
-        "--graph-policy",
-        "full",
+        "--set",
+        "video_config.max_seconds=15",
+        "--set",
+        f"video_config.text_capacities={TEXT_CAPACITIES}",
+        "--set",
+        "cuda_graph_config.policy=full",
     ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model) / "tokenizer")
 

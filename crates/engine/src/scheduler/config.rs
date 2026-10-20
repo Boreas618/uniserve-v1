@@ -9,11 +9,11 @@ pub const DEFAULT_MAX_BATCH: usize = 128;
 /// Default token budget for one generation scheduling pass.
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 /// Default maximum number of concurrently running requests.
-pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
+pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
-pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// Policy used to order requests waiting for admission.
 ///
@@ -40,13 +40,13 @@ pub struct SchedulerConfig {
     /// units and guidance branches.
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently running requests, token and media together.
-    pub max_num_seqs: usize,
+    pub max_running_requests: usize,
     /// Per-request token ceiling for one prefill chunk.
-    pub long_prefill_threshold: usize,
+    pub chunked_prefill_size: usize,
     /// Admission limit on waiting requests, or `None` to queue without
     /// bound. Submission counts waiting token and media requests together
     /// with finished requests whose output events are still retained.
-    pub max_num_waiting: Option<usize>,
+    pub max_queued_requests: Option<usize>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the ranks are launched with. A block-diffusion runtime has no
     /// autoregressive decode, so each request it does not read out runs
@@ -60,9 +60,9 @@ impl Default for SchedulerConfig {
             policy: SchedulingPolicy::Fcfs,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
-            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
-            max_num_waiting: None,
+            max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
+            chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
+            max_queued_requests: None,
             canvas: None,
         }
     }

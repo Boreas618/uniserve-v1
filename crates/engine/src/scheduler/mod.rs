@@ -38,8 +38,8 @@ mod stats;
 pub(crate) mod stats_report;
 
 pub use config::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, SchedulerConfig, SchedulingPolicy,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
