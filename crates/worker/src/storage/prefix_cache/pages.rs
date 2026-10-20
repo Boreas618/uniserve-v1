@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder};
+use uniserve_cuda::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder};
 use uniserve_ipc::{PageCopy, PagePoolInfo};
 use uniserve_storage::Key;
 use uniserve_storage::protocol::{PageShape, Reply, Request};
@@ -110,6 +110,12 @@ impl PageTier {
                 continue;
             }
             let content = content(fingerprint, plan, index);
+            // The pool lies on the host NUMA node closest to the device, so
+            // the copies between them cross no inter-node link.
+            let numa_node = device
+                .attribute(DeviceAttribute::HostNumaId)
+                .ok()
+                .and_then(|node| u32::try_from(node).ok());
             let shape = PageShape {
                 content: Key(content),
                 kv_head_offset: group.kv_head_offset,
@@ -117,13 +123,7 @@ impl PageTier {
                 page_bytes: page_bytes(plan, group),
             };
             let answer = retained.call("mapping a page pool", |client| {
-                client.call(
-                    &Request::PagePool {
-                        shape,
-                        numa_node: None,
-                    },
-                    &[],
-                )
+                client.call(&Request::PagePool { shape, numa_node }, &[])
             })?;
             let Reply::PagePool {
                 pool,
@@ -147,6 +147,7 @@ impl PageTier {
                 pool,
                 slots,
                 page_bytes,
+                numa_node,
                 "mapped the host page pool"
             );
             pools.insert(

@@ -28,6 +28,9 @@ pub enum DeviceAttribute {
     VirtualMemoryManagementSupported = 102,
     HandleTypePosixFileDescriptorSupported = 103,
     HandleTypeFabricSupported = 128,
+    /// The host NUMA node closest to the device, or -1 when the host has no
+    /// NUMA affinity for it.
+    HostNumaId = 134,
 }
 
 /// Device memory reported by `cuMemGetInfo`, in bytes.
