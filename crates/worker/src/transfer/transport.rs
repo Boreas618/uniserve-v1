@@ -31,7 +31,7 @@ use super::{
     ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::memory::Memory;
+use crate::storage::memory::Storage;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 
@@ -173,7 +173,7 @@ pub(crate) enum Staged {
     Channel {
         /// The location without its payload.
         locator: Locator,
-        staging: Arc<Memory>,
+        staging: Arc<Storage>,
         bytes: usize,
     },
     /// A CUDA VMM export fenced by a readiness event. A same-host reader
@@ -286,9 +286,9 @@ impl Transport {
     }
 
     /// Whether this mechanism reads `locator`, a location of its kind: a
-    /// POSIX segment only on this rank's node.
+    /// POSIX segment only on this rank's host.
     pub(crate) fn reads(&self, locator: &Locator) -> bool {
-        self.kind() != TransportKind::PosixShm || locator.source.node == self.source.node
+        self.kind() != TransportKind::PosixShm || locator.source.host == self.source.host
     }
 
     /// Whether this mechanism reaches any of `consumers` (every mechanism
@@ -760,7 +760,7 @@ mod tests {
     fn locator(shape: Vec<u64>, offset: Vec<u64>) -> Locator {
         Locator {
             source: WorkerEndpoint {
-                node: "n".into(),
+                host: "n".into(),
                 address_space: "a".into(),
                 incarnation: "i".into(),
             },

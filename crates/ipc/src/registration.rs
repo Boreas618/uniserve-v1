@@ -1,9 +1,9 @@
 //! The first frame on a connection to the head.
 //!
-//! A rank is started with the head's address, its own identity and the
+//! A worker is started with the head's address, its own identity and the
 //! launch it belongs to, and a host's launcher with the head's address and
 //! its host identity. Each connects, and the first frame it sends is its
-//! [`Registration`]. The head answers a rank with its
+//! [`Registration`]. The head answers a worker with its
 //! [`LaunchDescriptor`](crate::LaunchDescriptor), which carries every other
 //! launch value, and the connection then carries requests and responses
 //! until it closes. A launcher's connection carries the messages of
@@ -20,37 +20,37 @@ use serde::{Deserialize, Serialize};
 /// encoding is positional, so the two ends of a connection must be the same
 /// build: a message type reordered or retyped between two builds would fail
 /// to decode or, worse, decode into other fields. The head, a launcher and a
-/// rank are installed as separate artifacts, two binaries and a library, so
-/// the head refuses a registration that states another version. The digest
-/// tells apart two builds of one package version, such as a head and a rank
-/// library compiled from different trees.
+/// worker are installed as separate artifacts, so the head refuses a
+/// registration that states another version. The digest tells apart two
+/// builds of one package version, such as a head and a worker library
+/// compiled from different trees.
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "+",
     env!("UNISERVE_SOURCE_DIGEST")
 );
 
-/// The first frame a rank or a launcher sends: who it is and what it was
+/// The first frame a worker or a launcher sends: who it is and what it was
 /// built as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Registration {
-    /// One rank of a worker group.
-    Rank {
-        /// Worker group the rank was started for.
+    /// One worker of a worker group.
+    Worker {
+        /// Worker group the worker was started for.
         worker_id: String,
-        /// Rank within that group's process world.
+        /// The worker's rank within that group.
         rank: u32,
-        /// The launch of the worker group the rank was started for. The head
-        /// numbers each group's launches from 1, and a relaunch after the
-        /// group lost a rank takes the next number, so a registration of
-        /// another launch than the group's current one is a rank of an
+        /// The launch of the worker group the worker was started for. The
+        /// head numbers each group's launches from 1, and a relaunch after
+        /// the group lost a worker takes the next number, so a registration
+        /// of another launch than the group's current one is a worker of an
         /// earlier launch, which the head refuses.
         generation: u64,
-        /// [`VERSION`] of the build the rank runs.
+        /// [`VERSION`] of the build the worker runs.
         version: String,
     },
-    /// The launcher of one host, which starts the ranks placed there.
+    /// The launcher of one host, which starts the workers placed there.
     Launcher {
         /// The host identity the launcher owns, as the placement names it.
         host: String,
@@ -63,7 +63,7 @@ impl Registration {
     /// Returns the build version the registration states.
     pub fn version(&self) -> &str {
         match self {
-            Self::Rank { version, .. } | Self::Launcher { version, .. } => version,
+            Self::Worker { version, .. } | Self::Launcher { version, .. } => version,
         }
     }
 }

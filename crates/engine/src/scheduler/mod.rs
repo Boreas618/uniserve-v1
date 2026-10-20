@@ -365,7 +365,7 @@ pub struct Scheduler {
     /// Aggregate capacity view of the loaded workers.
     info: WorkerInfo,
     generation_limits: uniserve_core::GenerationLimits,
-    ctrl: SpecialTokenIds,
+    special_tokens: SpecialTokenIds,
     /// Token requests awaiting admission, in admission order: arrival order,
     /// or priority then arrival under the priority policy.
     waiting: VecDeque<RequestState>,

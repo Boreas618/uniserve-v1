@@ -27,7 +27,7 @@ use crate::config::placement::Components;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result, lock};
@@ -346,7 +346,7 @@ pub(crate) struct ShardField {
 pub(crate) struct WeightStorage {
     published: Vec<crate::transfer::PeerStorage>,
     slots: Vec<uniserve_cuda::DeviceAllocation>,
-    composites: Vec<std::sync::Arc<crate::storage::memory::Memory>>,
+    composites: Vec<std::sync::Arc<crate::storage::memory::Storage>>,
 }
 
 /// Distributed expert weights: every rank keeps its expert shard resident
@@ -383,7 +383,7 @@ impl ExpertWeights {
     pub(crate) fn build(
         group: &super::host::HostGroup,
         device: DeviceId,
-        node: &str,
+        host: &str,
         layers: &[Vec<ShardField>],
         stream: &Stream,
     ) -> Result<(Self, Vec<Vec<crate::storage::memory::StorageView>>)> {
@@ -392,7 +392,7 @@ impl ExpertWeights {
             slots: Vec::new(),
             composites: Vec::new(),
         };
-        let built = Self::map(group, device, node, layers, stream, &mut storage);
+        let built = Self::map(group, device, host, layers, stream, &mut storage);
         match built {
             Ok((copies, views, (resident_bytes, buffer_bytes, transfer_bytes))) => {
                 let prefetch =
@@ -419,7 +419,7 @@ impl ExpertWeights {
     fn map(
         group: &super::host::HostGroup,
         device: DeviceId,
-        node: &str,
+        host: &str,
         layers: &[Vec<ShardField>],
         stream: &Stream,
         storage: &mut WeightStorage,
@@ -434,7 +434,7 @@ impl ExpertWeights {
         use uniserve_cuda::{DeviceAllocation, PeerMapping, memcpy_async};
 
         use crate::ffi::{Backing, DType};
-        use crate::storage::memory::{Memory, StorageView};
+        use crate::storage::memory::{Storage, StorageView};
 
         let (rank, size) = (group.rank(), group.size());
         let page = DeviceAllocation::granularity(device)?;
@@ -459,7 +459,7 @@ impl ExpertWeights {
                     .unwrap_or(page);
                 let last = first + capacity;
                 let published =
-                    crate::transfer::PeerStorage::allocate(device, capacity, node, group)?;
+                    crate::transfer::PeerStorage::allocate(device, capacity, host, group)?;
                 if published.bytes_each() != capacity {
                     return Err(Error::Invariant(
                         "published expert pages disagree with their capacity".into(),
@@ -518,7 +518,7 @@ impl ExpertWeights {
                 if let Some(&slot) = part.next() {
                     pieces.push(&storage.slots[slot]);
                 }
-                let composite = Memory::mapped(PeerMapping::alias(&pieces)?);
+                let composite = Storage::mapped(PeerMapping::alias(&pieces)?);
                 let whole = composite.address();
                 let peers = published.peers().address();
 
@@ -685,7 +685,7 @@ impl DwdpManager {
         world: &World,
         model: &LoadedModel,
         streams: &Streams,
-        node: &str,
+        host: &str,
     ) -> Result<Option<Self>> {
         let Some(union) = &launch.expert_parallel else {
             return Ok(None);
@@ -735,7 +735,7 @@ impl DwdpManager {
             .iter()
             .map(|&count| fields.by_ref().take(count as usize).collect())
             .collect();
-        let (weights, views) = ExpertWeights::build(union_group, device, node, &layers, &stream)?;
+        let (weights, views) = ExpertWeights::build(union_group, device, host, &layers, &stream)?;
         drop(shards);
         let bind = Interpreter::import(&format!("{MODULE}.bind_weights"))?;
         for (layer, (fields, views)) in layers.iter().zip(views).enumerate() {
@@ -965,8 +965,8 @@ impl Ring {
 /// What the copies of a host-weight stack address: its page-locked host
 /// copy of every layer and the device slots.
 struct HostStorage {
-    _host: Arc<Memory>,
-    _slots: Vec<Arc<Memory>>,
+    _host: Arc<Storage>,
+    _slots: Vec<Arc<Storage>>,
 }
 
 /// The dense projection weights of one repeated layer stack, kept in
@@ -1074,11 +1074,11 @@ impl HostWeights {
 
         // One page-locked region of exactly every layer's bytes, and one
         // device slot per ring position.
-        let host = Memory::pinned(device, layers * layer_bytes)?;
+        let host = Storage::pinned(device, layers * layer_bytes)?;
         let slots = (0..ring.slots)
-            .map(|_| Memory::device(device, layer_bytes))
+            .map(|_| Storage::device(device, layer_bytes))
             .collect::<Result<Vec<_>>>()?;
-        let view = |memory: &Arc<Memory>| {
+        let view = |memory: &Arc<Storage>| {
             StorageView::whole(Arc::clone(memory) as Arc<dyn Backing>, DType::U8)
         };
         let host_view = view(&host)?;

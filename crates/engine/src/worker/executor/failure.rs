@@ -117,7 +117,7 @@ impl WorkerExecutor {
 
         // Propagate to a fixed point. A call reading an invalid buffer taints
         // its request. Abandoning an unstarted producer also invalidates its
-        // future buffers. Already running work on another instance keeps its
+        // future buffers. Already running work on another group keeps its
         // real completion path, so an in-flight call only taints its request.
         loop {
             let before = (requests.len(), buffers.len());

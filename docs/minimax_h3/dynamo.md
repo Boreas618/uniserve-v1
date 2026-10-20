@@ -13,7 +13,7 @@ The Rust worker additionally needs Clang's library and builtin headers, a C++ co
 ```bash
 apt-get install -y build-essential cmake pkg-config protobuf-compiler libclang-dev
 export LIBRARY_PATH=/usr/local/cuda/lib64/stubs
-cargo build --locked --release -p uniserve-dynamo-worker
+cargo build --locked --release -p uniserve-dynamo
 
 uv venv --python /usr/bin/python3.12 artifacts/dynamo/frontend-env
 uv pip install --python artifacts/dynamo/frontend-env/bin/python ai-dynamo==1.5.0
@@ -47,10 +47,10 @@ In another terminal, from the same repository and on the same host, start the wo
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 export DYN_DISCOVERY_BACKEND=file
 
-target/release/uniserve-dynamo-worker "$H3_MODEL" \
+target/release/uniserve-dynamo "$H3_MODEL" \
   --namespace uniserve-fasth3 --served-model-name FastH3 \
   --worker-python "$PWD/.venv/bin/python" \
-  --workers configs/minimax_h3/ulysses4.toml \
+  --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-model-len 16384 --max-running-requests 2 \
   --set video_config.max_seconds=15 --set quantization_config.mode=quality
 ```

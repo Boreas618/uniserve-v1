@@ -6,7 +6,7 @@ use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use super::{BlockTableUpdate, GroupShape};
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
@@ -27,7 +27,7 @@ const ALIGNMENT: usize = 256;
 /// zero after allocation except the constant `table_shapes`. Writes are
 /// stream-ordered and never issued on a capturing stream.
 pub struct BlockTableStorage {
-    memory: Arc<Memory>,
+    memory: Arc<Storage>,
     device: Option<DeviceId>,
     rows: u32,
     tables: u32,
@@ -96,8 +96,8 @@ impl BlockTableStorage {
         let tables: u32 = groups.iter().map(|group| group.units_per_page).sum();
         let (offsets, bytes) = layout(rows as usize, tables as usize, groups.len(), width as usize);
         let memory = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
+            Some(device) => Storage::device(device, bytes)?,
+            None => Storage::host(bytes),
         };
         let backing = || Arc::clone(&memory) as Arc<dyn Backing>;
         let view = |index: usize, shape: &[i64]| {

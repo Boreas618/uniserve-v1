@@ -234,7 +234,7 @@ impl CallId {
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum MediaCall {
-    /// Decodes a video request's condition media on a host rank into the
+    /// Decodes a video request's condition media on a CPU worker into the
     /// inputs of the vision and latent encoders.
     MediaReading,
     VisionEncoding,

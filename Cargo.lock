@@ -9113,7 +9113,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-dynamo-worker"
+name = "uniserve-dynamo"
 version = "2.0.0"
 dependencies = [
  "anyhow",
@@ -9158,19 +9158,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-host"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "uniserve-ipc",
-]
-
-[[package]]
 name = "uniserve-ipc"
 version = "2.0.0"
 dependencies = [
@@ -9183,6 +9170,19 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uniserve-core",
+]
+
+[[package]]
+name = "uniserve-launcher"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "uniserve-ipc",
 ]
 
 [[package]]

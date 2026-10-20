@@ -2,9 +2,9 @@
 //! tensors.
 //!
 //! Runtime storage (cache planes, graph inputs and outputs, workspaces, staging)
-//! is allocated here. A [`Memory`] value owns one allocation; a
-//! [`StorageView`] is a typed, strided window into it that retains the
-//! allocation. Python receives a view as one torch tensor, made once from
+//! is allocated here. A [`Storage`] owns one allocation; a [`StorageView`]
+//! is a typed, strided window into it that retains the allocation, the way a
+//! torch tensor views a torch storage. Python receives a view as one torch tensor, made once from
 //! the view's DLPack export and passed by every call that takes the view
 //! ([`StorageView::handle`]). Dropping the last Rust and Python reference
 //! releases the memory through `uniserve-cuda`'s reclaimer, which never
@@ -14,7 +14,7 @@
 //! Exportable device allocations (`cuMemCreate` with a shareable handle) are
 //! recorded in a process-wide registry by address, with how long they live,
 //! so a transport can export any view of them in place
-//! ([`Memory::exportable_containing`]).
+//! ([`Storage::exportable_containing`]).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -31,8 +31,9 @@ use crate::ffi::{
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result, lock};
 
-/// One allocation owned by the worker.
-pub struct Memory {
+/// One allocation owned by the worker: device memory, page-locked or
+/// pageable host memory, or a mapping of memory another process exported.
+pub struct Storage {
     kind: Kind,
 }
 
@@ -60,9 +61,9 @@ pub(crate) enum Residency {
 /// Exportable allocations by base address, with their residency. Entries
 /// are weak: the registry never extends an allocation's lifetime, and a
 /// dropped allocation removes its own entry.
-static EXPORTABLE: Mutex<BTreeMap<u64, (Weak<Memory>, Residency)>> = Mutex::new(BTreeMap::new());
+static EXPORTABLE: Mutex<BTreeMap<u64, (Weak<Storage>, Residency)>> = Mutex::new(BTreeMap::new());
 
-impl Memory {
+impl Storage {
     /// Device memory on `device`. Contents are uninitialized.
     pub fn device(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::linear(device, bytes)?;
@@ -83,7 +84,7 @@ impl Memory {
         Self::register_exportable(device, bytes, access, Residency::Resident)
     }
 
-    /// Exportable device memory, as [`Memory::exportable`], that holds the
+    /// Exportable device memory, as [`Storage::exportable`], that holds the
     /// payload of one export and is released when that export retires.
     pub(crate) fn export_staging(
         device: DeviceId,
@@ -180,7 +181,7 @@ impl Memory {
     }
 }
 
-impl Drop for Memory {
+impl Drop for Storage {
     fn drop(&mut self) {
         if let Kind::Device(allocation) = &self.kind
             && allocation.handle_type().is_some()
@@ -198,7 +199,7 @@ impl Drop for Memory {
     }
 }
 
-impl Backing for Memory {
+impl Backing for Storage {
     fn device(&self) -> MemoryKind {
         match &self.kind {
             Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
@@ -669,7 +670,7 @@ mod tests {
 
     #[test]
     fn views_stay_inside_their_allocation() -> Result<()> {
-        let memory: Arc<dyn Backing> = Memory::host(64);
+        let memory: Arc<dyn Backing> = Storage::host(64);
         assert!(StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[4, 4]).is_ok());
         assert!(StorageView::contiguous(Arc::clone(&memory), 4, DType::F32, &[4, 4]).is_err());
 
@@ -683,7 +684,7 @@ mod tests {
 
     #[test]
     fn regions_select_and_transposes_address_the_same_elements() -> Result<()> {
-        let memory: Arc<dyn Backing> = Memory::host(4 * 6 * 4);
+        let memory: Arc<dyn Backing> = Storage::host(4 * 6 * 4);
         let base = memory.address();
         let grid = StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[4, 6])?;
 

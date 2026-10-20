@@ -21,7 +21,7 @@ use uniserve_cuda::{DeviceId, Stream};
 
 use crate::Result;
 use crate::ffi::{Backing, DType, Handle};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 
 /// Per-sequence language output, independently of the input's cache writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +114,6 @@ impl RunnerSetup<'_> {
 
 pub(crate) fn device_buffer(device: DeviceId, dtype: DType, shape: &[i64]) -> Result<StorageView> {
     let elements: i64 = shape.iter().product();
-    let memory = Memory::device(device, (elements as usize * dtype.bytes()).max(1))?;
+    let memory = Storage::device(device, (elements as usize * dtype.bytes()).max(1))?;
     StorageView::contiguous(memory as Arc<dyn Backing>, 0, dtype, shape)
 }

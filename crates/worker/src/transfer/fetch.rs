@@ -47,7 +47,7 @@ pub(crate) fn plan(
     ordered.sort_by_key(|(_, location)| TransportKind::of(location) != TransportKind::Local);
     let mut bound = Vec::new();
     let locations = ordered.into_iter().filter_map(|(index, location)| {
-        // A POSIX segment is addressable only on its producer's node; other
+        // A POSIX segment is addressable only on its producer's host; other
         // locations of the same tensor may still cover the region.
         let transport = transports
             .get(TransportKind::of(location))

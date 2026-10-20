@@ -12,7 +12,7 @@ use uniserve_observability_derive::MetricFamily;
 
 use crate::{F64Gauge, U64Counter, U64Gauge};
 
-/// Labels identifying one model and engine instance.
+/// Labels identifying one model and engine core.
 ///
 /// The in-process engine client publishes its scheduler snapshots as engine
 /// `0`.
@@ -20,7 +20,7 @@ use crate::{F64Gauge, U64Counter, U64Gauge};
 pub struct EngineLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
 }
 
@@ -29,7 +29,7 @@ pub struct EngineLabels {
 pub struct EnginePathLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Speculative-verification resolution path reported by the worker.
     pub path: String,
@@ -40,7 +40,7 @@ pub struct EnginePathLabels {
 pub struct EngineModeLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Worker runtime mode.
     pub mode: String,
@@ -51,7 +51,7 @@ pub struct EngineModeLabels {
 pub struct EngineComponentLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Instrumented worker component.
     pub component: String,
@@ -62,7 +62,7 @@ pub struct EngineComponentLabels {
 pub struct EngineDomainLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Scheduler execution domain: `prefill`, `decode`, or `flow`.
     pub domain: String,
@@ -73,7 +73,7 @@ pub struct EngineDomainLabels {
 pub struct EngineDomainKindLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Scheduler execution domain: `prefill`, `decode`, or `flow`.
     pub domain: String,
@@ -88,7 +88,7 @@ pub struct EngineDomainKindLabels {
 pub struct EngineBackendLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Attention kernel backend family.
     pub backend: String,

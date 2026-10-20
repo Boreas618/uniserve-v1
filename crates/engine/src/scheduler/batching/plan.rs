@@ -716,7 +716,7 @@ impl Scheduler {
         let generated = &state.generated_token_ids;
         let mut suppress = Vec::new();
         if n_generated < sampling.min_tokens {
-            suppress.extend_from_slice(&self.ctrl.eos);
+            suppress.extend_from_slice(&self.special_tokens.eos);
         }
         for word in &sampling.bad_words_ids {
             let Some((&last, prefix)) = word.split_last() else {

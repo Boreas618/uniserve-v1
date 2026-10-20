@@ -22,7 +22,7 @@ pub(crate) struct Rendezvous {
 /// Reserves the address a worker group's ranks rendezvous at.
 ///
 /// The collective store is a TCP store so ranks on different hosts can reach
-/// it; an instance on one host reserves a loopback address, and one spanning
+/// it; a group on one host reserves a loopback address, and one spanning
 /// hosts reserves an address those hosts can route to (see `interface`).
 /// The head calls this when the group's first rank runs on its own host: it
 /// binds the socket here, and that rank, which it spawns, inherits the socket
@@ -48,7 +48,7 @@ pub(crate) fn reserve_rendezvous(head: Option<IpAddr>) -> anyhow::Result<Rendezv
 ///
 /// `head` is an address of this host that the other hosts route to, and none
 /// when every rank runs here. A loopback address reaches only the host that
-/// binds it, so an instance spanning hosts binds every interface and names
+/// binds it, so a group spanning hosts binds every interface and names
 /// itself by that routable address rather than by the wildcard, which names
 /// no interface, or by the placement's host identity, which need not resolve
 /// on other hosts.

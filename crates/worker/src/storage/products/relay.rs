@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -96,8 +96,8 @@ impl ProductStore {
                             let bytes = count * dtype.bytes();
                             let projected = state.arena_capacity(bytes)?;
                             let memory = match device {
-                                MemoryKind::Cuda(index) => Memory::device(index, bytes)?,
-                                MemoryKind::Host | MemoryKind::PinnedHost => Memory::host(bytes),
+                                MemoryKind::Cuda(index) => Storage::device(index, bytes)?,
+                                MemoryKind::Host | MemoryKind::PinnedHost => Storage::host(bytes),
                             };
                             let arena = StorageView::contiguous(
                                 memory as Arc<dyn crate::ffi::Backing>,

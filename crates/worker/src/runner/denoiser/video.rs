@@ -24,7 +24,7 @@ use crate::lane::{Capture, Completion, Job};
 use crate::parallel::joins::GraphFunctions;
 use crate::request::video::{VideoLayout, VideoSize};
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{LatentPlan, RequestSlots, TrajectoryVersion};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -167,7 +167,7 @@ impl DenoiserRunner {
     /// latent pool and bind them.
     pub(crate) fn video(setup: DenoiserSetup<'_>) -> Result<Self> {
         let device = setup.device;
-        let memory = |bytes: u64| Memory::device(device, bytes.max(1) as usize);
+        let memory = |bytes: u64| Storage::device(device, bytes.max(1) as usize);
         let samples = StorageView::contiguous(
             memory(setup.envelope.samples * 4)? as Arc<dyn Backing>,
             0,

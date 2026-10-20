@@ -29,7 +29,7 @@ use super::plan::CachePlan;
 use crate::ffi::{
     Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
 };
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
@@ -44,19 +44,19 @@ pub struct CachePlanes {
     plan: Arc<CachePlan>,
     device: Option<DeviceId>,
     num_units: u32,
-    values: [Arc<Memory>; 2],
-    scales: Option<[Arc<Memory>; 2]>,
-    initialized: [Arc<Memory>; 2],
+    values: [Arc<Storage>; 2],
+    scales: Option<[Arc<Storage>; 2]>,
+    initialized: [Arc<Storage>; 2],
     /// Each field's whole view, keyed as the numerical library reads it.
     /// Every binding passes these views, so each field is wrapped as a
     /// torch tensor once.
     fields: Vec<(String, StorageView)>,
 }
 
-fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Memory>> {
+fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Storage>> {
     match device {
-        Some(device) => Memory::device(device, bytes),
-        None => Ok(Memory::host(bytes)),
+        Some(device) => Storage::device(device, bytes),
+        None => Ok(Storage::host(bytes)),
     }
 }
 
@@ -65,10 +65,10 @@ fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Memory>> {
 /// pages where they lie, whatever the pool's size. Every local peer device
 /// may address them, because readers on those devices in this process copy
 /// from the pages directly.
-fn allocate_values(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Memory>> {
+fn allocate_values(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Storage>> {
     match device {
-        Some(device) => Memory::exportable(device, bytes, &Memory::peers(device)?),
-        None => Ok(Memory::host(bytes)),
+        Some(device) => Storage::exportable(device, bytes, &Storage::peers(device)?),
+        None => Ok(Storage::host(bytes)),
     }
 }
 

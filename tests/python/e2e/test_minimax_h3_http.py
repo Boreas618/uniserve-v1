@@ -54,7 +54,7 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--workers",
+        "--worker-groups",
         str(deployment),
         "--worker-python",
         sys.executable,

@@ -33,7 +33,7 @@ use super::read::{NativeRead, ReadCall};
 use super::transport::{Staged, read_destination};
 use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_planner};
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::storage::memory::{Memory, Residency, StorageView};
+use crate::storage::memory::{Residency, Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 use handle::AllocationHandle;
@@ -101,7 +101,7 @@ type ImportKey = (String, DeviceId, [u8; 64], u64);
 /// import needs a grant per export), is mapped for its read alone.
 #[derive(Default)]
 pub(crate) struct ImportedAllocations {
-    mappings: Mutex<HashMap<ImportKey, Arc<Memory>>>,
+    mappings: Mutex<HashMap<ImportKey, Arc<Storage>>>,
 }
 
 impl ImportedAllocations {
@@ -110,8 +110,8 @@ impl ImportedAllocations {
     fn mapping(
         &self,
         key: ImportKey,
-        import: impl FnOnce() -> Result<Arc<Memory>>,
-    ) -> Result<Arc<Memory>> {
+        import: impl FnOnce() -> Result<Arc<Storage>>,
+    ) -> Result<Arc<Storage>> {
         if let Some(mapping) = lock(&self.mappings).get(&key) {
             return Ok(Arc::clone(mapping));
         }
@@ -202,7 +202,7 @@ impl CudaExports {
         let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
             let (spans, handle, size, offset, residency) =
-                match Memory::exportable_containing(first) {
+                match Storage::exportable_containing(first) {
                     Some((memory, offset, residency)) => {
                         let allocation = memory.allocation().ok_or_else(|| {
                             Error::Invariant("an exportable allocation is device memory".into())
@@ -393,7 +393,7 @@ impl CudaExports {
             return Ok(Arc::clone(pool));
         }
         // Readers in this process may copy from another device.
-        let memory = Memory::exportable(device, self.pool_bytes, &Memory::peers(device)?)?;
+        let memory = Storage::exportable(device, self.pool_bytes, &Storage::peers(device)?)?;
         let allocation = memory
             .allocation()
             .ok_or_else(|| Error::Invariant("an export pool is device memory".into()))?;
@@ -523,7 +523,7 @@ impl CudaExports {
         // The engine places a CUDA VMM edge across hosts only where both
         // devices export fabric handles (`WorkerExecutor::try_new`), so a
         // read from another host imports a fabric handle.
-        let same_node = locator.source.node == source.node;
+        let same_host = locator.source.host == source.host;
         if !matches!(device, MemoryKind::Cuda(_)) {
             return Err(Error::Invalid(
                 "CUDA VMM destination must be a CUDA device".into(),
@@ -535,7 +535,7 @@ impl CudaExports {
             region: region.map(<[_]>::to_vec),
             slot: self.slot,
             local: locator.source.address_space == source.address_space,
-            same_node,
+            same_host,
             imports: Arc::clone(&self.imports),
         }))
     }
@@ -627,7 +627,7 @@ pub(crate) struct CudaRead {
     /// The export lies in this address space and is read through its
     /// registry instead of a mapping.
     pub(crate) local: bool,
-    pub(crate) same_node: bool,
+    pub(crate) same_host: bool,
     /// The reading rank's kept mappings of resident allocations.
     pub(crate) imports: Arc<ImportedAllocations>,
 }
@@ -717,7 +717,7 @@ impl CudaRead {
         };
 
         let mut import_device = device;
-        if self.same_node
+        if self.same_host
             && let MemoryKind::Cuda(source) = MemoryKind::from_locator(&self.locator.device)
             && source != device
             && !device.can_access_peer(source)?
@@ -726,11 +726,11 @@ impl CudaRead {
         }
 
         let published = AllocationHandle::decode(allocation_handle)?;
-        let map = || -> Result<Arc<Memory>> {
+        let map = || -> Result<Arc<Storage>> {
             let handle = published.import(endpoint, export_id)?;
             // The mapping retains the imported allocation; the descriptor is
             // no longer needed once it is made.
-            Ok(Memory::mapped(PeerMapping::import(
+            Ok(Storage::mapped(PeerMapping::import(
                 import_device,
                 &handle,
                 *storage_size_bytes as usize,

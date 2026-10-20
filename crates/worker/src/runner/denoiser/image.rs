@@ -55,7 +55,7 @@ use crate::runner::denoiser::{DENOISER, DenoiserRunner, Family, Methods};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::storage::AttentionRow;
 use crate::storage::PrefixCache;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -224,8 +224,8 @@ fn allocate(
 ) -> Result<StorageView> {
     let bytes = shape.iter().product::<i64>().max(1) as usize * dtype.bytes();
     let memory: Arc<dyn crate::ffi::Backing> = match device {
-        Device::Cuda(index) => Memory::device(index, bytes)?,
-        Device::Cpu => Memory::host(bytes),
+        Device::Cuda(index) => Storage::device(index, bytes)?,
+        Device::Cpu => Storage::host(bytes),
     };
     let view = StorageView::contiguous(memory, 0, dtype, shape)?;
     // SAFETY: a new allocation the denoiser keeps until it closes after

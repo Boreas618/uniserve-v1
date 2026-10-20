@@ -21,7 +21,7 @@ use uniserve_ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -42,10 +42,10 @@ fn pages(start: u64, end: u64, block_size: u64) -> Vec<(u64, u32, u32)> {
 /// Staging for frozen exports: exportable memory of the pool's device, which
 /// a CUDA VMM export names where it lies and local peer devices may address,
 /// or host memory for a CPU pool.
-fn staging(planes: &CachePlanes, bytes: usize) -> Result<Arc<Memory>> {
+fn staging(planes: &CachePlanes, bytes: usize) -> Result<Arc<Storage>> {
     match planes.device() {
-        Some(device) => Memory::export_staging(device, bytes.max(1), &Memory::peers(device)?),
-        None => Ok(Memory::host(bytes.max(1))),
+        Some(device) => Storage::export_staging(device, bytes.max(1), &Storage::peers(device)?),
+        None => Ok(Storage::host(bytes.max(1))),
     }
 }
 
@@ -56,7 +56,7 @@ fn freeze(
     planes: &CachePlanes,
     source: &Spans,
     stream: impl Issue,
-    frozen: &mut Vec<Arc<Memory>>,
+    frozen: &mut Vec<Arc<Storage>>,
 ) -> Result<Spans> {
     let shape: Vec<i64> = source.shape().iter().map(|&extent| extent as i64).collect();
     let memory = staging(planes, source.nbytes() as usize)?;
@@ -96,7 +96,7 @@ pub struct CacheExport {
     /// the rank channel), out of it; a job performs those copies later, and
     /// such an export does not retain the staging. The staging is released
     /// with this value, once that work was performed.
-    staging: Vec<Arc<Memory>>,
+    staging: Vec<Arc<Storage>>,
 }
 
 impl CacheExport {
@@ -296,7 +296,7 @@ fn export_group(
     consumers: &[usize],
     stream: impl Issue,
     exports: &mut Vec<Vec<Exports>>,
-    frozen: &mut Vec<Arc<Memory>>,
+    frozen: &mut Vec<Arc<Storage>>,
 ) -> Result<Vec<TensorTransfer>> {
     let count = export.visible - export.start;
     if count == 0 {
@@ -565,7 +565,7 @@ mod tests {
             EventPool::new(),
             &TransportOptions {
                 source: WorkerEndpoint {
-                    node: "node".into(),
+                    host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
                 },

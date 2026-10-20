@@ -21,7 +21,7 @@ use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
 /// interleaved text and images without bound, and the rest serve text.
 pub(crate) fn scheduler_with(
     executor: Box<dyn Executor>,
-    ctrl: SpecialTokenIds,
+    special_tokens: SpecialTokenIds,
     config: SchedulerConfig,
 ) -> anyhow::Result<Scheduler> {
     let info = executor.info().runtime_info()?;
@@ -56,18 +56,24 @@ pub(crate) fn scheduler_with(
             ..Default::default()
         }
     };
-    Scheduler::new(executor, ctrl, config, ModelDtype::BFloat16, limits)
+    Scheduler::new(
+        executor,
+        special_tokens,
+        config,
+        ModelDtype::BFloat16,
+        limits,
+    )
 }
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass.
 pub(crate) fn scheduler(
     executor: Box<dyn Executor>,
-    ctrl: SpecialTokenIds,
+    special_tokens: SpecialTokenIds,
     max_batch: usize,
 ) -> anyhow::Result<Scheduler> {
     scheduler_with(
         executor,
-        ctrl,
+        special_tokens,
         SchedulerConfig {
             max_batch,
             ..Default::default()
@@ -79,13 +85,13 @@ pub(crate) fn scheduler(
 /// orders waiting requests by `policy`.
 pub(crate) fn scheduler_with_policy(
     executor: Box<dyn Executor>,
-    ctrl: SpecialTokenIds,
+    special_tokens: SpecialTokenIds,
     max_batch: usize,
     policy: SchedulingPolicy,
 ) -> anyhow::Result<Scheduler> {
     scheduler_with(
         executor,
-        ctrl,
+        special_tokens,
         SchedulerConfig {
             max_batch,
             policy,

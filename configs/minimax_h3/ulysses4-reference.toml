@@ -1,35 +1,35 @@
 # OmniRef on four GPUs of one host: a Ulysses4 transformer_ref denoiser and a
 # TP4 text encoder.
 
-[[workers]]
+[[worker_groups]]
 id = "model"
 ranks = ["cuda:0-3"]
 queue_depth = 6
 
-[workers.components.transformer_ref]
+[worker_groups.components.transformer_ref]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
-[workers.components.text_encoder]
+[worker_groups.components.text_encoder]
 tensor_parallel_size = 4
 
-[workers.components.video_decoder]
+[worker_groups.components.video_decoder]
 
-[workers.components.audio_decoder]
+[worker_groups.components.audio_decoder]
 distribution = "temporal_units"
 
-[workers.components.latent_encoder]
+[worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[workers]]
-id = "host"
+[[worker_groups]]
+id = "media"
 ranks = ["cpu*6"]
 queue_depth = 6
 
-[workers.components.video_codec]
+[worker_groups.components.video_codec]
 ranks = [0, 1, 2, 3]
 
-[workers.components.muxer]
+[worker_groups.components.muxer]
 ranks = [4]
 
-[workers.components.media_reader]
+[worker_groups.components.media_reader]
 ranks = [5]

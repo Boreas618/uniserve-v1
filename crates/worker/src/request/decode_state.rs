@@ -22,7 +22,7 @@ use std::sync::Arc;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 
@@ -31,7 +31,7 @@ const ALIGNMENT: usize = 256;
 
 /// The continuation state of every request slot of a rank.
 pub(crate) struct DecodeState {
-    memory: Arc<Memory>,
+    memory: Arc<Storage>,
     rows: usize,
     vocab: usize,
     future_input_tokens: StorageView,
@@ -97,8 +97,8 @@ impl DecodeState {
         }
         let (offsets, bytes) = layout(rows, vocab, logits);
         let memory = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
+            Some(device) => Storage::device(device, bytes)?,
+            None => Storage::host(bytes),
         };
         let view = |index: usize, dtype: DType, shape: &[i64]| {
             StorageView::contiguous(
@@ -284,8 +284,12 @@ mod tests {
 
     #[test]
     fn reset_restores_a_slot_without_touching_its_neighbors() -> Result<()> {
-        let lengths =
-            StorageView::contiguous(Memory::host(4 * 4) as Arc<dyn Backing>, 0, DType::I32, &[4])?;
+        let lengths = StorageView::contiguous(
+            Storage::host(4 * 4) as Arc<dyn Backing>,
+            0,
+            DType::I32,
+            &[4],
+        )?;
         let state = DecodeState::allocate(3, 5, DType::BF16, lengths.clone(), None, None)?;
         assert_eq!(read::<i64>(&state.future_input_tokens), vec![1; 4]);
 

@@ -113,7 +113,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--workers",
+        "--worker-groups",
         str(deployment),
         "--worker-python",
         sys.executable,

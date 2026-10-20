@@ -17,7 +17,7 @@ This document describes how a deployment is organized, how a rank process divide
 | Process | Language | Role |
 | --- | --- | --- |
 | `uniserve` (head) | Rust | HTTP API, model profile, tokenization, request lowering and response assembly (`uniserve-server`); scheduling, storage assignment and the rank fleet (`uniserve-engine`) |
-| `uniserve-host` | Rust | Starts and supervises the ranks placed on a host other than the head's |
+| `uniserve-launcher` | Rust | Starts and supervises the ranks placed on a host other than the head's |
 | `dynamo-worker` | Rust | An experimental head for FastH3 that embeds the engine and the serving runtime in a Dynamo worker; Dynamo's frontend replaces the HTTP API |
 | Rank | Rust runtime hosted by a Python interpreter | One per device rank and per CPU host rank; executes the batches the engine sends |
 
@@ -32,7 +32,7 @@ The engine and each rank exchange the messages of `uniserve-ipc` (`NewRequest`, 
 - **Lifetime.** The same connection then carries requests and responses, and its close is the only death signal of a registered rank: the head treats the rank as dead and the rank exits. Before a rank registers, the head notices the exit of a process it started itself, and a launcher reports the exits of the ranks it started.
 - **Frames.** A frame is a length followed by one message in a serde binary encoding (MessagePack). Head and ranks are built from one workspace, so the message types are the protocol's only definition. A frame carries a message of any size its `u32` length states; no launch setting bounds it further.
 - **Waiting.** Each side blocks on its socket together with one local wake descriptor, which its own threads fire for work that did not arrive on the socket.
-- **Launchers.** A `uniserve-host` launcher's connection carries the same frames: its registration, the head's instructions to reserve, start and stop a group's ranks and to terminate, and its reports of reservations and rank exits.
+- **Launchers.** A `uniserve-launcher` launcher's connection carries the same frames: its registration, the head's instructions to reserve, start and stop a group's ranks and to terminate, and its reports of reservations and rank exits.
 - **Data.** Tensors, prefix cache pages, latents and products move through the transfer mechanisms. Only a host product routed between hosts travels on the channel.
 
 ## The planes of a rank
@@ -160,7 +160,7 @@ Errors cross with a stable code, whether they are fatal to the rank, and the pha
 
 A driver call that does not return stops only its lane's execution thread. The control thread keeps serving the channel and, once a job has stayed in flight for the stall bound (half the head's watchdog timeout, `worker_config.watchdog_timeout`, sent in the launch descriptor), reports to the head the lane (or the Python thread), the batch, its runner method, its calls and how long it has run (`WorkerResponse::Stalled`). The head logs the report, fails the affected requests with an error naming the lane, and replaces the group. The head's watchdog covers a rank that stops answering altogether.
 
-A rank's orderly close ends with a reset of its primary contexts before the process exits. The reset releases the driver state the process created, including the shared-memory file (`/dev/shm/cuda.shm.*`) the CUDA driver makes for a process's interprocess events and removes only when the context is destroyed. A rank that loses its head with nothing in flight takes the aborted close and then the reset; with work in flight it ends at once. A rank that ends without its orderly close first removes the driver file and the NCCL shared-memory names (`/dev/shm/nccl-*`) its mappings still link. The process that reaps a rank (the head for its local ranks, `uniserve-host` for remote ones) observes the death before reaping and removes that rank's driver files and recorded NCCL names while the zombie still holds its pid. A rank's startup failure reaches the head as the rank's own error.
+A rank's orderly close ends with a reset of its primary contexts before the process exits. The reset releases the driver state the process created, including the shared-memory file (`/dev/shm/cuda.shm.*`) the CUDA driver makes for a process's interprocess events and removes only when the context is destroyed. A rank that loses its head with nothing in flight takes the aborted close and then the reset; with work in flight it ends at once. A rank that ends without its orderly close first removes the driver file and the NCCL shared-memory names (`/dev/shm/nccl-*`) its mappings still link. The process that reaps a rank (the head for its local ranks, `uniserve-launcher` for remote ones) observes the death before reaping and removes that rank's driver files and recorded NCCL names while the zombie still holds its pid. A rank's startup failure reaches the head as the rank's own error.
 
 ## Repository layout
 
@@ -173,13 +173,13 @@ crates/server/      uniserve-server: HTTP/OpenAI API, model profiles, request lo
 crates/worker/      uniserve-worker: the rank runtime (installed as the module uniserve._worker)
 crates/observability/         metrics registry
 crates/observability-derive/  the registry's derive macro
-crates/bin/         uniserve (head), uniserve-host (launcher), dynamo-worker
+crates/bin/         uniserve (head), uniserve-launcher (launcher), dynamo-worker
 uniserve/           the numerical library, the concrete models, the Python half of each runner and the rank entry
 uniserve_kernels/   Triton, CuTe and CUDA kernels, and the vendored DeepEP and DeepGEMM sources
 uniserve_eval/      HTTP evaluation client
 ```
 
-Dependency direction: `core <- ipc <- {engine, worker, uniserve-host}`, `cuda <- worker`, `{core, engine, observability} <- server <- {uniserve, dynamo-worker}`. The worker never depends on the engine or server, and the engine never links CUDA.
+Dependency direction: `core <- ipc <- {engine, worker, uniserve-launcher}`, `cuda <- worker`, `{core, engine, observability} <- server <- {uniserve, dynamo-worker}`. The worker never depends on the engine or server, and the engine never links CUDA.
 
 | Rank runtime module (`crates/worker/src`) | Responsibility |
 | --- | --- |

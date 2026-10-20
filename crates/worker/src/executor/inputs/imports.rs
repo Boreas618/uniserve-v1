@@ -33,20 +33,20 @@ pub(super) fn consumers(plan: &BatchPlan) -> HashMap<&TensorRef, Vec<usize>> {
 }
 
 /// Whether a host media consumer reads `export` in place: a muxer always,
-/// a video encoder a segment on this node.
+/// a video encoder a segment on this host.
 pub(super) fn borrowed(
     backend: &WorkerBackend,
     plan: &BatchPlan,
     readers: &[usize],
     export: &TensorExport,
 ) -> bool {
-    let shared = backend.rank_storage().is_some_and(|storage| {
+    let shared = backend.worker_storage().is_some_and(|storage| {
         storage
             .transports
             .get(crate::transfer::TransportKind::PosixShm)
             .is_some()
     });
-    let node = &backend.info().endpoint.node;
+    let host = &backend.info().endpoint.host;
     readers.iter().any(|&index| {
         let call = &plan.calls[index];
         call.inputs.contains(&export.product)
@@ -57,7 +57,7 @@ pub(super) fn borrowed(
                     && export.value.tensors().iter().any(|tensor| {
                         tensor.locations.iter().any(|location| {
                             matches!(location.transport, TransferTransport::PosixShm { .. })
-                                && location.source.node == *node
+                                && location.source.host == *host
                         })
                     })))
     })
@@ -171,7 +171,7 @@ pub(super) fn import_products(
             .into_iter()
             .collect();
         let storage = backend
-            .rank_storage()
+            .worker_storage()
             .ok_or_else(|| Error::Unsupported("product imports require rank storage".into()))?;
         if storage.transports.is_empty() {
             return Err(Error::Unsupported(

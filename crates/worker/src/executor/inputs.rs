@@ -149,7 +149,7 @@ pub(crate) enum Input {
         device: MemoryKind,
     },
     /// A product a host media call reads in place from a location on this
-    /// node; importing it would read unused capacity.
+    /// host; importing it would read unused capacity.
     Borrowed,
 }
 
@@ -395,7 +395,7 @@ pub(crate) fn subscribe(
 
     if let Some(returns) = inputs.backpressure {
         let storage = backend
-            .rank_storage()
+            .worker_storage()
             .ok_or(Error::State("refused imports lost their rank storage"))?;
         let callback: Notify = Arc::new(wake);
         // The return sequence closes the gap between the refusal and this
@@ -625,7 +625,7 @@ fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job) -> Result<()>
     let device = component_device(backend, &call.component)?;
     let stream = backend.transfer_stream(call.kind, device)?;
     let storage = backend
-        .rank_storage()
+        .worker_storage()
         .ok_or_else(|| Error::Unsupported("predicates require rank storage".into()))?;
     request_flag(
         &storage.tensors,
@@ -694,7 +694,7 @@ fn consumer_kind(plan: &BatchPlan, product: &TensorRef) -> Result<CallKind> {
 
 fn tensors(backend: &WorkerBackend) -> Result<&ProductStore> {
     backend
-        .rank_storage()
+        .worker_storage()
         .map(|storage| &storage.tensors)
         .ok_or_else(|| Error::Unsupported("product imports require rank storage".into()))
 }
@@ -732,7 +732,7 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
             Input::Cache(import) => {
                 if !import.adopted() {
                     let abandoned = backend
-                        .rank_storage_mut()
+                        .worker_storage_mut()
                         .and_then(|storage| storage.prefix_cache.as_mut())
                         .ok_or(Error::Invariant("a cache import outlived its cache".into()))
                         .and_then(|prefix_cache| prefix_cache.abandon_import(&import));

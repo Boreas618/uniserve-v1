@@ -27,7 +27,7 @@ use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transpo
 const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
 
 /// The storage owners of a rank.
-pub(crate) struct RankStorage {
+pub(crate) struct WorkerStorage {
     pub events: Arc<EventPool>,
     pub tensors: ProductStore,
     /// Shared with the cache import copy tasks that read through them.
@@ -43,7 +43,7 @@ pub(crate) struct RankStorage {
     retired_prefixes: HashSet<RequestKey>,
 }
 
-impl RankStorage {
+impl WorkerStorage {
     pub(crate) fn new(
         events: Arc<EventPool>,
         tensors: ProductStore,
@@ -75,7 +75,7 @@ impl RankStorage {
     }
 }
 
-impl RequestStorage for RankStorage {
+impl RequestStorage for WorkerStorage {
     fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
         // Block tables are installed per batch; a new slot has no state.
         Ok(())
@@ -203,7 +203,7 @@ pub(super) fn allocate_storage(
     config: &WorkerConfig,
     plan: &Plan,
     streams: &Streams,
-) -> Result<RankStorage> {
+) -> Result<WorkerStorage> {
     let events = EventPool::new();
     let kinds = launch
         .data_plane
@@ -277,7 +277,7 @@ pub(super) fn allocate_storage(
             .transpose()?,
         None => None,
     };
-    Ok(RankStorage::new(
+    Ok(WorkerStorage::new(
         events,
         tensors,
         transports,

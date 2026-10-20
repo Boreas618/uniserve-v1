@@ -444,7 +444,7 @@ def load_model(
     elif host_only:
         # Only the stub model resolves to a bare description.
         assert source is not None
-        # A host rank holds only host components: the weight-less
+        # A CPU worker holds only host components: the weight-less
         # description carries the media geometry, rates and unit division.
         logger.info(
             "described numerical model %s for host work",

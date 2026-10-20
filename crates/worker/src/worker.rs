@@ -30,7 +30,7 @@ mod planning;
 mod storage;
 
 pub(crate) use loading::LoadedModel;
-pub(crate) use storage::RankStorage;
+pub(crate) use storage::WorkerStorage;
 
 use std::collections::BTreeMap;
 
@@ -228,7 +228,7 @@ impl Worker {
 
         let devices: Vec<Device> = config.devices().collect();
         let mut streams = Streams::create(&config, &devices).map_err(phase("streams"))?;
-        let node = host_name().map_err(phase("host"))?;
+        let host = launch.host.clone();
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
         let mut experts = ExpertUnion::start(ExpertStart {
@@ -237,10 +237,10 @@ impl Worker {
             model: &model,
             streams: &mut streams,
             max_tokens: expert_tokens(&config),
-            node: &node,
+            host: &host,
         })
         .map_err(phase("experts"))?;
-        let weights = DwdpManager::start(&launch, &world, &model, &streams, &node)
+        let weights = DwdpManager::start(&launch, &world, &model, &streams, &host)
             .map_err(phase("experts"))?;
         // Host-resident layer weights release their device storage before
         // capacity planning measures free memory.
@@ -437,7 +437,7 @@ impl Worker {
         };
         let mut backend = WorkerBackend::new(info.clone(), config.rank, placement, components)
             .map_err(phase("storage"))?;
-        backend.set_rank_storage(storage);
+        backend.set_worker_storage(storage);
         backend.set_job_queues(streams.job_queues());
         let text_warmup = text.is_some();
         let video_warmup = video_owners.is_some();
@@ -833,20 +833,6 @@ impl Worker {
     }
 }
 
-/// This host's node name, the rank's node identity in transfers.
-///
-/// Peers compare node names to decide whether a product location is on their
-/// own host, so a substituted or altered name would misroute transfers: a
-/// name that is empty or not UTF-8 is an error.
-fn host_name() -> Result<String> {
-    let system = rustix::system::uname();
-    let node = system.nodename();
-    match node.to_str() {
-        Ok(name) if !name.is_empty() => Ok(name.to_owned()),
-        _ => Err(Error::HostName(node.to_owned())),
-    }
-}
-
 /// Graph pools for an expert union member's captured joins, one per microbatch,
 /// when no text runner shares its pools on the microbatch streams.
 fn reserve_join_pools(
@@ -871,14 +857,15 @@ fn reserve_join_pools(
     Ok(())
 }
 
-/// The rank's identity for transfers: host, process and incarnation. The
-/// engine knows which worker and rank the incarnation serves.
-fn endpoint() -> Result<WorkerEndpoint> {
-    Ok(WorkerEndpoint {
-        node: host_name()?,
+/// The worker's identity for transfers: the deployment's name of its host,
+/// its process and its incarnation. The head knows which worker group and
+/// rank the incarnation serves.
+fn endpoint(host: &str) -> WorkerEndpoint {
+    WorkerEndpoint {
+        host: host.to_owned(),
         address_space: format!("{}:{}", std::process::id(), uuid::Uuid::new_v4().simple()),
         incarnation: uuid::Uuid::new_v4().simple().to_string(),
-    })
+    }
 }
 
 /// The graph policy a rank serves with.

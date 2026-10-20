@@ -15,10 +15,10 @@ use uniserve_worker::CUDAStream;
 use uniserve_worker::ffi::DType;
 use uniserve_worker::parallel::host::{HostGroup, Rendezvous};
 use uniserve_worker::parallel::{CollectiveGroup, StreamCollectives};
-use uniserve_worker::storage::{Memory, StorageView};
+use uniserve_worker::storage::{Storage, StorageView};
 
 fn upload(values: &[f32], device: DeviceId, stream: &CUDAStream) -> StorageView {
-    let memory = Memory::device(device, values.len() * 4).unwrap();
+    let memory = Storage::device(device, values.len() * 4).unwrap();
     let view = StorageView::whole(memory, DType::F32).unwrap();
     // SAFETY: the view spans the `values.len() * 4` bytes of its allocation, and
     // both it and `values` outlive the synchronization below.

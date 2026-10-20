@@ -27,7 +27,7 @@ use uniserve_core::{
 use uniserve_engine::{
     BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
     Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PoolPlacement, RequestPlacement,
-    SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerId,
+    SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerGroupId,
 };
 use uniserve_ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
@@ -343,7 +343,7 @@ struct Served {
     submissions: Vec<Submission>,
     /// Each submitted media call with the worker its placement names for
     /// every component reading its products, in submission order.
-    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerId>)>,
+    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerGroupId>)>,
     /// Every submitted media call with its placement, in submission order.
     calls: Vec<(Call, RequestPlacement)>,
     /// Every event each request's stream delivered.
@@ -632,7 +632,7 @@ fn each_media_call_names_the_workers_routed_to_read_its_products() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), WorkerId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     // The video graph: text conditioning feeds latent preparation on the
@@ -765,7 +765,7 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
 }
 
 #[test]
-fn a_host_lane_admits_no_more_tasks_than_its_rank_advertises() {
+fn a_host_lane_admits_no_more_tasks_than_its_worker_advertises() {
     for capacity in [1_usize, 2] {
         let request = RequestId(1);
         let served = serve(
@@ -1115,7 +1115,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), WorkerId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     for (owner, call, readers) in &served.readers {
@@ -1287,7 +1287,7 @@ struct PooledExecutor {
     inner: SimExecutor,
     info: ExecutorInfo,
     /// The worker the simulator itself reports.
-    simulator: WorkerId,
+    simulator: WorkerGroupId,
     /// The media call whose first batch is handed back, until it has been.
     hand_back: Option<MediaCall>,
     handed_back: Arc<AtomicBool>,
@@ -1332,11 +1332,11 @@ impl PooledExecutor {
         };
         let pools = [
             (
-                WorkerId("encoders".to_owned()),
+                WorkerGroupId("encoders".to_owned()),
                 pool(&["media_reader", "text_encoder", "latent_encoder"]),
             ),
             (
-                WorkerId("generator".to_owned()),
+                WorkerGroupId("generator".to_owned()),
                 pool(&[
                     "denoiser",
                     "video_decoder",
@@ -1376,11 +1376,11 @@ impl Executor for PooledExecutor {
         &self.info
     }
 
-    fn is_ready(&self, worker: &WorkerId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
     }
 
-    fn has_capacity(&self, worker: &WorkerId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
     }
 

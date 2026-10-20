@@ -18,7 +18,7 @@ use uniserve_core::TokenLogprob;
 use uniserve_cuda::{DeviceId, Event, SourceOrder};
 
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, EventPool, Result, lock};
@@ -32,7 +32,7 @@ pub use logprobs::LogprobLayout;
 /// storage is reused; each batch receives a distinct [`OutputBuffer`] and
 /// completion signal.
 pub struct OutputStorage {
-    memory: Arc<Memory>,
+    memory: Arc<Storage>,
     offset: usize,
     words: usize,
 }
@@ -63,11 +63,11 @@ impl OutputStorage {
 }
 
 /// Host memory for `words` 64-bit words, pinned for `device`'s copies.
-fn words_memory(device: Option<DeviceId>, words: usize) -> Result<Arc<Memory>> {
+fn words_memory(device: Option<DeviceId>, words: usize) -> Result<Arc<Storage>> {
     let bytes = words.max(1) * size_of::<i64>();
     Ok(match device {
-        Some(device) => Memory::pinned(device, bytes)?,
-        None => Memory::host(bytes),
+        Some(device) => Storage::pinned(device, bytes)?,
+        None => Storage::host(bytes),
     })
 }
 
@@ -650,7 +650,7 @@ pub(crate) type OutputLease = Arc<Mutex<OutputBuffer>>;
 /// reservation follows the request.
 pub(crate) struct OutputPool {
     /// Released by [`Self::finish_close`].
-    arena: Option<Arc<Memory>>,
+    arena: Option<Arc<Storage>>,
     /// The device the lane's copies read from; `None` for a CPU lane.
     device: Option<DeviceId>,
     blocks: usize,
@@ -852,12 +852,12 @@ mod tests {
 
     use super::{OutputBuffer, OutputPool};
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Memory, StorageView};
+    use crate::storage::memory::{Storage, StorageView};
     use crate::{EventPool, Result, lock};
 
     /// A host column holding `values`, as a CPU lane's sampler produces it.
     fn column(values: &[i64]) -> Result<StorageView> {
-        let memory = Memory::host(size_of_val(values));
+        let memory = Storage::host(size_of_val(values));
         // SAFETY: fresh host memory of exactly this size, owned by the test.
         unsafe {
             std::ptr::copy_nonoverlapping(

@@ -1,7 +1,7 @@
 //! Names the build this crate is compiled in: a digest of the workspace
 //! sources every artifact of the build is compiled from.
 //!
-//! The head (`uniserve`), a host's launcher (`uniserve-host`) and the rank
+//! The head (`uniserve`), a host's launcher (`uniserve-launcher`) and the rank
 //! runtime library are installed as separate artifacts and exchange this
 //! crate's messages in a positional encoding, so each registration states
 //! the build it runs and the head refuses any other (`registration::VERSION`).

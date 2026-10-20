@@ -5,7 +5,7 @@
 //! `rank_projection` to cut each `Batch` into per-rank projections under the
 //! same batch identifier, each holding the calls that rank's components
 //! execute and every command of the batch, and sends each projection through
-//! that rank's `RankProcess`. Returned rank results wait in per-rank buffers
+//! that rank's `WorkerProcess`. Returned rank results wait in per-rank buffers
 //! until every rank planned for a set of calls has reported them; `try_join`
 //! then merges those reports into one `WorkerResult` published by the calls'
 //! output owner, the first rank of their component they are planned on
@@ -13,7 +13,7 @@
 //! every failing rank reports identically, while no succeeding rank holds an
 //! unjoined call, retires only its batch unless it is fatal, is coded as a
 //! scheduler bug or invariant violation, or failed a batch carrying a `Free`
-//! command (`join_rank_errors`); rank loss, a lane a rank reports stalled,
+//! command (`join_worker_errors`); rank loss, a lane a rank reports stalled,
 //! protocol violations, and every other error replace the whole rank group
 //! (`recover_workers`) and invalidate every request resident on it.
 //!
@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::registry::Registry;
-use super::{BatchSubmitError, IncarnationRegistry, RankProcess};
+use super::{BatchSubmitError, IncarnationRegistry, WorkerProcess};
 use crate::executor::{RankBuffer, WorkerExecError, WorkerFailure};
 use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
@@ -45,7 +45,7 @@ use routing::{output_owner, rank_projection};
 /// Cooperative worker processes with one IPC channel per rank.
 pub struct WorkerGroup {
     /// Rank processes in rank order; empty after `close` or a failed recovery.
-    workers: Vec<RankProcess>,
+    workers: Vec<WorkerProcess>,
     /// Results each rank returned, indexed by rank. `take_rank_calls`
     /// consumes their calls as they are joined, and `finish_batch` drops what
     /// remains of a retired batch.
@@ -89,7 +89,7 @@ pub struct WorkerGroup {
     /// The first terminal loss wakes every group's ordinary progress loop.
     failure_domain: Option<Arc<FailureDomain>>,
     failure_wake: Option<crate::handle::WakeSignal>,
-    /// The deployment's launchers of the hosts this instance does not run
+    /// The deployment's launchers of the hosts this head does not run
     /// on, shared with the other groups. A launcher terminates the ranks it
     /// started when the registry's last owner closes the connection, so the
     /// group holds it for as long as it holds those ranks.
@@ -129,7 +129,7 @@ type CallIdentity = (u64, u64, u64, uniserve_ipc::CallId);
 /// The worker routed to each component reading a call's products, keyed by
 /// the call's request and call identifiers (`RequestPlacement::readers`).
 pub type CallReaders =
-    HashMap<(RequestKey, uniserve_ipc::CallId), BTreeMap<String, crate::WorkerId>>;
+    HashMap<(RequestKey, uniserve_ipc::CallId), BTreeMap<String, crate::WorkerGroupId>>;
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
@@ -138,11 +138,11 @@ struct PendingBatch {
     /// Calls not yet joined into a published result.
     remaining: BTreeSet<CallIdentity>,
     /// Every rank that received a projection, by rank.
-    ranks: BTreeMap<usize, RankResult>,
+    ranks: BTreeMap<usize, WorkerReport>,
 }
 
 /// A participating rank's received prefix, independent of transport fragmentation.
-struct RankResult {
+struct WorkerReport {
     /// The calls planned on this rank and whether the rank returned each.
     calls: BTreeMap<CallIdentity, bool>,
     /// Whether the rank returned its result for the batch.
@@ -165,8 +165,8 @@ impl WorkerGroup {
     /// Drains immediately available rank results into per-rank agreement buffers.
     ///
     /// A result that does not match the rank's plan for its batch fails the
-    /// drain. A rank error that `record_rank_error` accepts is recorded for
-    /// `join_rank_errors`; any other is kept as the group's first `failure`
+    /// drain. A rank error that `record_worker_error` accepts is recorded for
+    /// `join_worker_errors`; any other is kept as the group's first `failure`
     /// and ends that rank's drain, so results already buffered can still be
     /// joined before `poll_batch` reports the failure.
     fn pump_once(&mut self) -> anyhow::Result<()> {
@@ -220,7 +220,7 @@ impl WorkerGroup {
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        if let Err(error) = self.record_rank_error(rank, &error) {
+                        if let Err(error) = self.record_worker_error(rank, &error) {
                             self.failure.get_or_insert(error);
                             break;
                         }
@@ -237,7 +237,7 @@ impl WorkerGroup {
     /// carries no batch identifier, names a batch or rank with no pending
     /// entry, or differs from an error the rank already reported for that
     /// batch.
-    fn record_rank_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
+    fn record_worker_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
         let execution = error
             .downcast_ref::<WorkerExecError>()
             .ok_or_else(|| anyhow::anyhow!("rank {rank} failed: {error:#}"))?;
@@ -300,8 +300,10 @@ impl WorkerGroup {
         self.workers.clear();
         // The lost incarnations stop resolving at once, so a publication they
         // made is never bound as an input while the group is relaunched.
-        self.incarnations
-            .assign(&crate::WorkerId(self.process_args.worker_id.clone()), []);
+        self.incarnations.assign(
+            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
+            [],
+        );
         self.clear_execution();
 
         let recovery = (|| -> anyhow::Result<()> {
@@ -340,7 +342,7 @@ impl WorkerGroup {
             }
         };
         WorkerFailure {
-            worker_id: crate::WorkerId(self.process_args.worker_id.clone()),
+            worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
             endpoints,
             requests,
             refusals: HashMap::new(),
@@ -356,13 +358,13 @@ impl WorkerGroup {
     }
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
-    fn install_replacement(&mut self, workers: Vec<RankProcess>) {
+    fn install_replacement(&mut self, workers: Vec<WorkerProcess>) {
         // `validate_replacement_info` has required every replacement rank to
         // match its predecessor apart from the endpoint, so the group's agreed
         // info keeps everything but rank 0's new endpoint.
         self.info.endpoint = workers[0].info().endpoint.clone();
         self.incarnations.assign(
-            &crate::WorkerId(self.process_args.worker_id.clone()),
+            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
             workers.iter().map(|worker| &worker.info().endpoint),
         );
         self.workers = workers;
@@ -386,14 +388,14 @@ impl WorkerGroup {
     /// the participants into the output owner's report, which alone carries
     /// public output and forward statistics. The result is `done` once every
     /// call is joined and every rank of the batch has completed; the batch is
-    /// then retired. When nothing is joinable, `join_rank_errors` may resolve
+    /// then retired. When nothing is joinable, `join_worker_errors` may resolve
     /// a batch whose ranks reported execution errors, returning its error;
     /// otherwise the result is `None`.
     fn try_join(&mut self) -> anyhow::Result<Option<WorkerResult>> {
         let Some((batch_id, output_rank, call_ids)) = self.joinable_report_key() else {
             // Preserve successful partial results already agreed by every rank
             // before retiring the unresolved remainder of a failed batch.
-            self.join_rank_errors()?;
+            self.join_worker_errors()?;
             return Ok(None);
         };
 
@@ -457,7 +459,7 @@ impl WorkerGroup {
     pub(crate) fn progress_fds(&self) -> Vec<libc::pollfd> {
         self.workers
             .iter()
-            .flat_map(RankProcess::progress_fds)
+            .flat_map(WorkerProcess::progress_fds)
             .chain(
                 self.failure_wake
                     .iter()
@@ -490,7 +492,7 @@ impl WorkerGroup {
     /// retires the batch and returns a `WorkerFailure` naming its unjoined
     /// calls and affected requests, which `poll_batch` returns without
     /// recovery.
-    fn join_rank_errors(&mut self) -> anyhow::Result<()> {
+    fn join_worker_errors(&mut self) -> anyhow::Result<()> {
         let failing = self
             .pending_batches
             .iter()
@@ -546,7 +548,7 @@ impl WorkerGroup {
                     .any(|command| matches!(command, BatchCommand::Free { .. }))
             {
                 // A failed physical release cannot return an allocation safely.
-                // Replacing this instance proves retirement without retrying
+                // Replacing this group proves retirement without retrying
                 // the same unsuccessful release indefinitely.
                 return Err(canonical.into());
             }
@@ -565,7 +567,7 @@ impl WorkerGroup {
                 .into_iter()
                 .collect();
             let failure = WorkerFailure {
-                worker_id: crate::WorkerId(self.process_args.worker_id.clone()),
+                worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
                 endpoints: Vec::new(),
                 requests,
                 refusals: HashMap::new(),
@@ -694,7 +696,7 @@ fn validate_replacement_info(
 }
 
 impl WorkerGroup {
-    /// Reports whether this instance is open and holds its rank group.
+    /// Reports whether this group is open and holds its workers.
     ///
     /// `close` and a failed recovery make it permanently unready.
     pub fn is_ready(&self) -> bool {
@@ -720,7 +722,7 @@ impl WorkerGroup {
         &self.info
     }
 
-    /// Return the same bindings used to initialize this instance's transports.
+    /// Return the same bindings used to initialize this group's transports.
     pub(crate) fn transfer_config(&self) -> &crate::executor::TransferConfig {
         &self.process_args.transfer
     }
@@ -737,8 +739,8 @@ impl WorkerGroup {
     }
 
     /// Returns the loaded physical endpoints used for transfer binding.
-    pub(crate) fn rank_info(&self, rank: usize) -> Option<&WorkerInfo> {
-        self.workers.get(rank).map(RankProcess::info)
+    pub(crate) fn worker_info(&self, rank: usize) -> Option<&WorkerInfo> {
+        self.workers.get(rank).map(WorkerProcess::info)
     }
 
     /// Submit each call to its component members and lifetime commands to the rank group.
@@ -831,7 +833,7 @@ impl WorkerGroup {
             .map(|(rank, batch)| {
                 (
                     *rank,
-                    RankResult {
+                    WorkerReport {
                         calls: batch
                             .calls
                             .iter()
@@ -883,9 +885,9 @@ impl WorkerGroup {
     ///
     /// Returns `None` when `timeout` passes without a joinable result, and at
     /// once for a closed group. The `WorkerFailure` of an agreed execution
-    /// error that `join_rank_errors` retires with its batch is returned as is
+    /// error that `join_worker_errors` retires with its batch is returned as is
     /// and the group stays usable. Any other error, including rank loss, a
-    /// protocol violation, an agreed error `join_rank_errors` does not retire,
+    /// protocol violation, an agreed error `join_worker_errors` does not retire,
     /// a lane a rank reports stalled, and an expired
     /// `WorkerProcessArgs::watchdog_timeout` (measured from the group's last
     /// progress and enforced only while a batch is pending), replaces the
@@ -956,7 +958,7 @@ impl WorkerGroup {
 
     /// Closes every rank in the physical worker group.
     ///
-    /// The ranks are closed together (`close_ranks`): each is asked to shut
+    /// The ranks are closed together (`close_workers`): each is asked to shut
     /// down before any is waited for, since a rank's teardown retires the
     /// communicators it shares with the others and completes only once all
     /// of them take part. Ranks on other hosts are followed until their
@@ -980,7 +982,7 @@ impl WorkerGroup {
             self.release_closed_resources();
             return Ok(());
         }
-        super::process::close_ranks(
+        super::process::close_workers(
             &mut self.workers,
             self.launchers
                 .as_ref()

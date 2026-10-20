@@ -63,7 +63,7 @@ use crate::lock;
 use crate::request::RequestPool;
 use crate::storage::{OutputPool, ProductBuffer, ProductExport};
 use crate::stream::Streams;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 use latents::PendingExport;
 use prefix_cache::{Exporting, Installation, Published};
@@ -513,7 +513,7 @@ struct Located {
 /// A transfer batch recording its last job: its borrowed owners and what it
 /// reserved.
 pub(super) struct TransferBatch<'a> {
-    pub(super) storage: &'a mut RankStorage,
+    pub(super) storage: &'a mut WorkerStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     /// The job everything the batch issues is recorded into, and the
@@ -609,7 +609,7 @@ impl Recorded {
     /// validate every owner's update, then commit them together.
     fn commit(
         mut self,
-        storage: &mut RankStorage,
+        storage: &mut WorkerStorage,
         requests: &mut RequestPool,
         mut image: Option<&mut ImageParts<'_>>,
         plan: &BatchPlan,
@@ -649,7 +649,11 @@ impl Recorded {
 
     /// Retire every reservation of a batch that failed while it recorded
     /// its job, once that job completed.
-    fn discard(self, storage: &mut RankStorage, image: Option<&mut ImageParts<'_>>) -> Result<()> {
+    fn discard(
+        self,
+        storage: &mut WorkerStorage,
+        image: Option<&mut ImageParts<'_>>,
+    ) -> Result<()> {
         self.retire(storage, image, Located::default())
     }
 
@@ -657,7 +661,7 @@ impl Recorded {
     /// complete: each joins its call's completion.
     fn locate(
         &mut self,
-        storage: &mut RankStorage,
+        storage: &mut WorkerStorage,
         image: Option<&mut ImageParts<'_>>,
         located: &mut Located,
     ) -> Result<()> {
@@ -700,7 +704,7 @@ impl Recorded {
     /// transfers.
     fn validate(
         &self,
-        storage: &mut RankStorage,
+        storage: &mut WorkerStorage,
         plan: &BatchPlan,
         located: &Located,
     ) -> Result<()> {
@@ -718,7 +722,7 @@ impl Recorded {
     /// storage returns once they complete.
     fn retire(
         mut self,
-        storage: &mut RankStorage,
+        storage: &mut WorkerStorage,
         image: Option<&mut ImageParts<'_>>,
         located: Located,
     ) -> Result<()> {

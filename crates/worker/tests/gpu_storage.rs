@@ -12,7 +12,7 @@ use uniserve_ipc::BlockTable;
 use uniserve_worker::ffi::{Backing, DType, Handle};
 use uniserve_worker::storage::{
     BlockTableStorage, BlockTables, CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, GroupShape,
-    Memory, OutputBuffer, OutputStorage, StorageView,
+    OutputBuffer, OutputStorage, Storage, StorageView,
 };
 use uniserve_worker::{EventPool, Result};
 
@@ -21,7 +21,7 @@ const DEVICE: DeviceId = DeviceId(0);
 /// Copy a device view's bytes to the host (drains `stream`).
 fn download(view: &StorageView, stream: &Stream) -> Result<Vec<u8>> {
     let bytes = view.byte_len()?;
-    let host = Memory::pinned(DEVICE, bytes.max(1))?;
+    let host = Storage::pinned(DEVICE, bytes.max(1))?;
     let mut batch = CopyBatch::new(SourceOrder::Stream);
     batch.push(host.address(), view.address(), bytes);
     // SAFETY: both ranges hold `bytes`; the stream drains below.
@@ -129,7 +129,7 @@ fn block_table_installs_and_clears_write_device_tables() -> Result<()> {
 fn output_readback_waits_for_device_copies_and_widens_tokens() -> Result<()> {
     let stream = Stream::new(DEVICE)?;
     let events = EventPool::default();
-    let tokens = Memory::device(DEVICE, 12)?;
+    let tokens = Storage::device(DEVICE, 12)?;
     // SAFETY: the allocation holds three words; the stream drains before
     // the readback reads them.
     unsafe { memset_d32(tokens.address(), 0xFFFF_FFFE, 3, &stream) }?;

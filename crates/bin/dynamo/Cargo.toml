@@ -1,11 +1,11 @@
 [package]
-name = "uniserve-dynamo-worker"
+name = "uniserve-dynamo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "uniserve-dynamo-worker"
+name = "uniserve-dynamo"
 path = "src/main.rs"
 
 [dependencies]

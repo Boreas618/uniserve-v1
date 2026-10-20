@@ -62,10 +62,6 @@ pub enum Error {
     /// the import path crosses as an opaque handle instead.
     #[error("a TVM-FFI tensor cannot be held as an opaque handle")]
     TensorHandle,
-    /// The host's node name cannot identify this rank's node to transfer
-    /// peers: it is empty or not UTF-8.
-    #[error("host name {0:?} cannot identify the rank's node in transfers")]
-    HostName(std::ffi::CString),
 }
 
 impl Error {
@@ -356,7 +352,7 @@ fn kind_code(error: &Error) -> ErrorCode {
         Error::Shared(shared) => kind_code(shared),
         Error::Invalid(_) => ErrorCode::InvalidDescriptor,
         Error::Resource(_) | Error::ReadBackpressure { .. } => ErrorCode::ResourceError,
-        Error::Unsupported(_) | Error::Interface(_) | Error::TensorHandle | Error::HostName(_) => {
+        Error::Unsupported(_) | Error::Interface(_) | Error::TensorHandle => {
             ErrorCode::UnsupportedSetup
         }
         Error::Invariant(_) => ErrorCode::InvariantViolation,

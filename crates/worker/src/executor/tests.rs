@@ -25,7 +25,7 @@ use crate::error::WorkerError;
 use crate::ffi::MemoryKind;
 use crate::storage::{BufferPool, OutputPlacement, ProductRead, ProductStore};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, ErrorCode, EventPool};
 
 type Result<T> = std::result::Result<T, WorkerError>;
@@ -186,8 +186,8 @@ fn a_distributed_rank_refuses_a_collective_sequence_that_does_not_advance() -> R
     Ok(())
 }
 
-/// A host rank holding a product store and local transports.
-fn host_rank(capacity: usize) -> Result<Executor> {
+/// A CPU worker holding a product store and local transports.
+fn cpu_worker(capacity: usize) -> Result<Executor> {
     let mut executor = rank(capacity, false)?;
     let events = EventPool::new();
     let tensors = ProductStore::new(
@@ -212,20 +212,22 @@ fn host_rank(capacity: usize) -> Result<Executor> {
         Arc::clone(&events),
         &options,
     )?;
-    executor.backend_mut().set_rank_storage(RankStorage::new(
-        events,
-        tensors,
-        Arc::new(transports),
-        None,
-        None,
-    ));
+    executor
+        .backend_mut()
+        .set_worker_storage(WorkerStorage::new(
+            events,
+            tensors,
+            Arc::new(transports),
+            None,
+            None,
+        ));
     Ok(executor)
 }
 
 fn tensors(executor: &Executor) -> Result<&ProductStore> {
     let storage = executor
         .backend()
-        .rank_storage()
+        .worker_storage()
         .ok_or(Error::State("the rank has no storage owners"))?;
     Ok(&storage.tensors)
 }
@@ -297,7 +299,7 @@ fn readable(executor: &Executor, product: &TensorRef) -> Result<bool> {
 
 #[test]
 fn a_finished_request_retires_after_its_readers_and_retains_products_until_free() -> Result<()> {
-    let mut executor = host_rank(4)?;
+    let mut executor = cpu_worker(4)?;
     let first = key(1, 1);
     assert_eq!(
         run(&mut executor, lifecycle(1, vec![start(first, 1)?]))?,
@@ -346,7 +348,7 @@ fn a_finished_request_retires_after_its_readers_and_retains_products_until_free(
 
 #[test]
 fn a_remote_epoch_and_a_product_freed_with_its_finish_are_released() -> Result<()> {
-    let mut executor = host_rank(4)?;
+    let mut executor = cpu_worker(4)?;
     // Epoch 2 of request 1 never started on this rank, yet owns products
     // here (another rank's call produced them).
     let remote = key(1, 2);

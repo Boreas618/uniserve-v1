@@ -267,7 +267,7 @@ impl Scheduler {
         let burst_result = record.committed_tokens.len() > 1;
         // A completion without committed tokens resolves as the first EOS token.
         let tokens = if record.committed_tokens.is_empty() {
-            vec![self.ctrl.eos[0]]
+            vec![self.special_tokens.eos[0]]
         } else {
             std::mem::take(&mut record.committed_tokens)
         };
@@ -408,7 +408,7 @@ impl Scheduler {
                                         >= st.req.prompt_token_ids.len() as u32
                             })
                         {
-                            let bos = self.ctrl.bos;
+                            let bos = self.special_tokens.bos;
                             let generates_canvases = self.config.canvas.is_some();
                             if let Some(st) = self.running.get_mut(&id) {
                                 if st.req.is_readout() {
@@ -557,7 +557,7 @@ impl Scheduler {
                 // understanding decode starts from BOS, as after a trailing
                 // latent block.
                 if call.token_output.is_none() {
-                    let bos = self.ctrl.bos;
+                    let bos = self.special_tokens.bos;
                     if let Some(st) = self.running.get_mut(&id) {
                         st.next_token = bos;
                         st.round_token_ids.clear();
@@ -603,7 +603,7 @@ impl Scheduler {
                     .committed_tokens
                     .last()
                     .copied()
-                    .unwrap_or(self.ctrl.eos[0]);
+                    .unwrap_or(self.special_tokens.eos[0]);
                 let logprob = record.sampled_logprob;
 
                 let Some(st) = self.running.get(&id) else {
@@ -1213,7 +1213,7 @@ impl Scheduler {
                     break;
                 }
                 TokenOutcome::Finish(reason) => {
-                    if !self.ctrl.eos.contains(&token_id) {
+                    if !self.special_tokens.eos.contains(&token_id) {
                         visible.push(token_id);
                     }
                     finish = Some((reason, None));
@@ -1244,7 +1244,7 @@ impl Scheduler {
             TokenOutcome::StopToken
         } else if generated >= state.req.max_und_tokens {
             TokenOutcome::Finish(FinishReason::MaxTokens)
-        } else if self.ctrl.eos.contains(&token_id)
+        } else if self.special_tokens.eos.contains(&token_id)
             && !state.req.sampling.ignore_eos
             && !under_floor
         {
@@ -1324,7 +1324,7 @@ impl Scheduler {
                 return true;
             }
             TokenOutcome::Finish(reason) => {
-                if !self.ctrl.eos.contains(&token_id) {
+                if !self.special_tokens.eos.contains(&token_id) {
                     if sampled {
                         self.emit_sampled_text(id, token_id, logprob, top_logprobs);
                     } else {

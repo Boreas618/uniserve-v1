@@ -14,19 +14,19 @@ use uniserve_ipc::MediaCall;
 ///
 /// A component lane measured in media units carries `units`; a demand with
 /// zero `units` holds its component lane exclusively, one request at a time.
-/// `host_ranks` names the host lanes the call places tasks on.
+/// `cpu_workers` names the host lanes the call places tasks on.
 pub(in crate::scheduler) struct LaneDemand {
     /// The worker and component whose device lane the call occupies, taken
     /// from the request's placement (`Placement::affinity`). Admission places
     /// a media request on a worker for every media component, so a request's
     /// first call is checked against its lane too. `None` when no component
     /// serves the call or the request holds no placement for it.
-    component: Option<(crate::WorkerId, String)>,
+    component: Option<(crate::WorkerGroupId, String)>,
     units: u32,
     /// Host lanes this call occupies, each named by its worker and rank with
     /// the number of tasks the call places on it: one per media unit the
     /// rank encodes, one for any other host call.
-    host_ranks: Vec<(crate::WorkerId, usize, u32)>,
+    cpu_workers: Vec<(crate::WorkerGroupId, usize, u32)>,
 }
 
 /// Lane occupancy across the media calls in flight.
@@ -37,18 +37,18 @@ pub(in crate::scheduler) struct LaneDemand {
 #[derive(Default)]
 pub(in crate::scheduler) struct LaneLedger {
     /// The request holding each exclusive component lane.
-    exclusive: HashMap<(crate::WorkerId, String), RequestId>,
+    exclusive: HashMap<(crate::WorkerGroupId, String), RequestId>,
     /// Media units in flight on each unit-measured component lane.
-    units: HashMap<(crate::WorkerId, String), u32>,
-    /// A host rank owns one host lane, so occupancy is counted per rank of
+    units: HashMap<(crate::WorkerGroupId, String), u32>,
+    /// A CPU worker owns one host lane, so occupancy is counted per rank of
     /// each worker.
-    host: HashMap<(crate::WorkerId, usize), u32>,
+    host: HashMap<(crate::WorkerGroupId, usize), u32>,
 }
 
 impl LaneLedger {
     /// Returns whether one request's call fits the lanes it occupies.
     ///
-    /// Every host rank must have room for the call's tasks. An exclusive
+    /// Every CPU worker must have room for the call's tasks. An exclusive
     /// component lane admits further calls of the request already holding it.
     pub(in crate::scheduler) fn admits(
         &self,
@@ -56,7 +56,7 @@ impl LaneLedger {
         request: RequestId,
         scheduler: &Scheduler,
     ) -> bool {
-        if demand.host_ranks.iter().any(|(worker, rank, tasks)| {
+        if demand.cpu_workers.iter().any(|(worker, rank, tasks)| {
             let capacity = scheduler.host_lane_capacity(worker);
             let key = (worker.clone(), *rank);
             self.host.get(&key).copied().unwrap_or(0) + tasks > capacity
@@ -83,7 +83,7 @@ impl LaneLedger {
 
     /// Marks the lanes one request's call occupies until it completes.
     pub(in crate::scheduler) fn occupy(&mut self, demand: &LaneDemand, request: RequestId) {
-        for (worker, rank, tasks) in &demand.host_ranks {
+        for (worker, rank, tasks) in &demand.cpu_workers {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
         let Some((worker, component)) = demand.component.as_ref() else {
@@ -119,7 +119,7 @@ impl Scheduler {
     /// advance as calls are scheduled, so a unit group only becomes ready
     /// once its predecessor is submitted.
     ///
-    /// A conditioned request first reads its media on a host rank. The calls
+    /// A conditioned request first reads its media on a CPU worker. The calls
     /// reading those host products wait until the read has completed, so a
     /// model worker's queue never holds a call blocked on a host task. Then
     /// the vision encoding precedes the text encoding that splices its
@@ -266,7 +266,7 @@ impl Scheduler {
         request: RequestKey,
         work: CallKind,
         component: &'a str,
-    ) -> Option<(&'a crate::WorkerId, &'a crate::ComponentConfig)> {
+    ) -> Option<(&'a crate::WorkerGroupId, &'a crate::ComponentConfig)> {
         let owner = self
             .placement
             .affinity
@@ -402,7 +402,7 @@ impl Scheduler {
     ///
     /// Returns `None` for an exclusive lane, and when `worker` was launched
     /// without a component named `component`.
-    fn device_lane_units(&self, worker: &crate::WorkerId, component: &str) -> Option<u32> {
+    fn device_lane_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
         let config = self.executor.info().component_config(worker, component)?;
         config
             .distribution
@@ -434,17 +434,17 @@ impl Scheduler {
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
-        let host_ranks = match media_call {
+        let cpu_workers = match media_call {
             MediaCall::MediaReading
             | MediaCall::VideoEncoding
             | MediaCall::AudioEncoding
-            | MediaCall::Muxing => self.host_lane_ranks(request, component.as_deref(), units),
+            | MediaCall::Muxing => self.host_lane_workers(request, component.as_deref(), units),
             _ => Vec::new(),
         };
         LaneDemand {
             component: placed_component,
             units: device_units,
-            host_ranks,
+            cpu_workers,
         }
     }
 
@@ -460,12 +460,12 @@ impl Scheduler {
     /// loaded worker holding it before the request is placed. Returns no
     /// lanes when `component` is `None` or that worker is not loaded or does
     /// not hold the component.
-    fn host_lane_ranks(
+    fn host_lane_workers(
         &self,
         request: RequestKey,
         component: Option<&str>,
         units: u32,
-    ) -> Vec<(crate::WorkerId, usize, u32)> {
+    ) -> Vec<(crate::WorkerGroupId, usize, u32)> {
         let Some(component) = component else {
             return Vec::new();
         };
@@ -506,7 +506,7 @@ impl Scheduler {
     }
 
     /// Returns the host lane capacity of one worker's ranks.
-    fn host_lane_capacity(&self, worker: &crate::WorkerId) -> u32 {
+    fn host_lane_capacity(&self, worker: &crate::WorkerGroupId) -> u32 {
         self.executor
             .info()
             .workers
@@ -534,7 +534,7 @@ impl Scheduler {
         LaneDemand {
             component: None,
             units: 0,
-            host_ranks: self.host_lane_ranks(request, Some(&component), 1),
+            cpu_workers: self.host_lane_workers(request, Some(&component), 1),
         }
     }
 

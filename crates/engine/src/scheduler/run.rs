@@ -97,7 +97,7 @@ impl Scheduler {
     /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn new(
         executor: Box<dyn Executor>,
-        ctrl: SpecialTokenIds,
+        special_tokens: SpecialTokenIds,
         mut config: SchedulerConfig,
         model_dtype: uniserve_core::ModelDtype,
         generation_limits: uniserve_core::GenerationLimits,
@@ -215,7 +215,7 @@ impl Scheduler {
             },
             info,
             generation_limits,
-            ctrl,
+            special_tokens,
             waiting: VecDeque::new(),
             waiting_media: VecDeque::new(),
             running: HashMap::new(),

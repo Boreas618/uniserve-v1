@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` server and `uniserve-host` launcher binaries, the worker's rank runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` server and `uniserve-launcher` launcher binaries, the worker's rank runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -40,7 +40,7 @@ export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 
 uniserve serve "$H3_MODEL" \
-  --workers configs/minimax_h3/ulysses4.toml \
+  --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
@@ -58,15 +58,15 @@ curl --fail-with-body --max-time 600 \
 
 ## Deployments
 
-A deployment file passed to `--workers` places FastH3's components on devices and hosts: TOML `[[workers]]` groups, each with its ranks (`cuda:0-3`), replicas and components. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
+A deployment file passed to `--worker-groups` places FastH3's components on devices and hosts: TOML `[[worker_groups]]` groups, each with its ranks (`cuda:0-3`), replicas and components. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
 
 | File | GPUs | Layout |
 | --- | --- | --- |
 | `ulysses4.toml` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
 | `ulysses8.toml` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
-| `ulysses8-two-node.toml` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses8-two-host.toml` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
 | `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas |
-| `fasth3-ulysses4x2-two-node.toml` | Four on each of two hosts | One Ulysses4 replica per host |
+| `fasth3-ulysses4x2-two-host.toml` | Four on each of two hosts | One Ulysses4 replica per host |
 | `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
 | `gather8.toml` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
 
@@ -105,7 +105,7 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve "$H3_MODEL" --workers configs/minimax_h3/ulysses4.toml \
+uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set cuda_graph_config.policy=off \
   --set quantization_config.mode=balanced
@@ -115,7 +115,7 @@ uniserve serve "$H3_MODEL" --workers configs/minimax_h3/ulysses4.toml \
 | --- | --- |
 | `MODEL`, `--served-model-name`, `--max-model-len` | The checkpoint, its served name and context length |
 | `--host`, `--port` | The HTTP listener (`server_config`) |
-| `--workers`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Placement: a deployment file, or the tensor- and data-parallel shorthand |
+| `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Placement: a deployment file, or the tensor- and data-parallel shorthand |
 | `--max-running-requests`, `--mem-fraction-static` | Resident requests and each rank's device-memory share |
 | `--worker-python` | The interpreter of the worker ranks (`worker_config.python`) |
 | `--config`, `--set`, `--print-config` | The configuration file, assignments by path, and printing the resolved tree |
@@ -152,7 +152,7 @@ The [evaluation guide](docs/minimax_h3/evaluation.md) lists every suite and the 
 
 ## Text and expert parallelism
 
-For data-parallel serving, run one full replica per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
+For data-parallel serving, run one engine core per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
 
 ```bash
 uniserve serve /models/diffusiongemma-26B-A4B-it \
@@ -160,7 +160,7 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
   --data-parallel-size 4
 ```
 
-Adding `--set moe_config.expert_parallel=true` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
+Adding `--set moe_config.expert_parallel=true` keeps the four engine cores' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the engine cores exchange tokens at each expert layer. Every expert layer then runs in steps the engine cores take together: an engine core without work joins each step another one starts, and all of them pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 guide](docs/minimax_h3/minimax_h3.md).
 
@@ -212,8 +212,8 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
 crates/bin/uniserve/          `serve` CLI entrypoint
-crates/bin/uniserve-host/     Per-host launcher for multi-host deployments
-crates/bin/dynamo-worker/     NVIDIA Dynamo worker backend
+crates/bin/uniserve-launcher/     Per-host launcher for multi-host deployments
+crates/bin/dynamo/     NVIDIA Dynamo worker backend
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the rank runtime calls
   worker.py                   Rank process entry: loads the rank runtime and hands it the library's import function

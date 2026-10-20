@@ -4,7 +4,7 @@
 //! The ranks here are Python processes that wait to be killed after they
 //! create an interprocess event through the driver, as a rank does when it
 //! exports a device product (run with
-//! `cargo test -p uniserve-ipc --test rank_child -- --ignored`), or after
+//! `cargo test -p uniserve-ipc --test worker_child -- --ignored`), or after
 //! they map shared memory under NCCL's prefix, as a communicator's proxy
 //! does.
 
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use uniserve_ipc::launch::RankChild;
+use uniserve_ipc::launch::WorkerChild;
 
 /// A stand-in rank: creates an interprocess event on device 0, which makes
 /// the driver create its shared memory named for this process, and waits to
@@ -47,14 +47,14 @@ fn event_memory(pid: u32) -> Vec<PathBuf> {
 }
 
 /// Kills and reaps a holder when a test ends, including when it panics.
-struct Holder(RankChild);
+struct Holder(WorkerChild);
 
 impl Holder {
     /// Starts a holder and waits until its event memory exists.
     fn start() -> (Self, Vec<PathBuf>) {
         let mut command = Command::new("python3");
         command.args(["-c", EVENT_HOLDER]);
-        let holder = Self(RankChild::spawn(&mut command).unwrap());
+        let holder = Self(WorkerChild::spawn(&mut command).unwrap());
 
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -84,7 +84,7 @@ impl Drop for Holder {
 /// a live rank's stays.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn a_killed_rank_leaves_no_event_memory_once_reaped() {
+fn a_killed_worker_leaves_no_event_memory_once_reaped() {
     let (mut killed, killed_memory) = Holder::start();
     let (mut live, live_memory) = Holder::start();
 
@@ -140,7 +140,7 @@ fn hold_nccl(directory: &std::path::Path, name: &str) -> (Holder, PathBuf) {
     let path_file = directory.join(name);
     let mut command = Command::new("python3");
     command.args(["-c", NCCL_HOLDER]).arg(&path_file);
-    let holder = Holder(RankChild::spawn(&mut command).unwrap());
+    let holder = Holder(WorkerChild::spawn(&mut command).unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(path) = std::fs::read_to_string(&path_file) {
@@ -155,7 +155,7 @@ fn hold_nccl(directory: &std::path::Path, name: &str) -> (Holder, PathBuf) {
 /// process id; its parent noted the names it mapped while it ran and
 /// removes them when it reaps it, while a live rank's stay.
 #[test]
-fn a_killed_rank_leaves_none_of_its_nccl_names_once_reaped() {
+fn a_killed_worker_leaves_none_of_its_nccl_names_once_reaped() {
     let directory = tempfile::tempdir().unwrap();
     let (mut killed, killed_path) = hold_nccl(directory.path(), "killed");
     let (mut live, live_path) = hold_nccl(directory.path(), "live");

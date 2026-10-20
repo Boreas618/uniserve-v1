@@ -44,10 +44,10 @@
 //! artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
 //!   --http-host 127.0.0.1 --http-port 18090 \
 //!   --namespace uniserve-fasth3 --discovery-backend file &
-//! target/release/uniserve-dynamo-worker "$UNISERVE_FAST_H3_MODEL" \
+//! target/release/uniserve-dynamo "$UNISERVE_FAST_H3_MODEL" \
 //!   --namespace uniserve-fasth3 --served-model-name FastH3 \
 //!   --worker-python "$PWD/.venv/bin/python" \
-//!   --workers configs/minimax_h3/ulysses4.toml \
+//!   --worker-groups configs/minimax_h3/ulysses4.toml \
 //!   --max-model-len 16384 --max-running-requests 2 \
 //!   --set video_config.max_seconds=15 --set quantization_config.mode=quality &
 //! # Once `curl -fsS http://127.0.0.1:18090/v1/models` lists FastH3:
@@ -115,7 +115,7 @@ const UNSUPPORTED_PATHS: [&str; 9] = [
 
 #[derive(Clone, Parser)]
 #[command(
-    name = "uniserve-dynamo-worker",
+    name = "uniserve-dynamo",
     about = "Experimental in-process Dynamo worker for UniServe FastH3."
 )]
 struct Args {
@@ -200,9 +200,9 @@ impl DynamoFastH3Engine {
                 "`{path}` is not supported by the Dynamo worker"
             )));
         }
-        if serve.workers.is_none() {
+        if serve.worker_groups.is_none() {
             return Err(invalid_argument(
-                "`workers` is required: a deployment file places FastH3's components",
+                "`worker_groups` is required: a deployment file places FastH3's components",
             ));
         }
 
@@ -851,7 +851,7 @@ mod tests {
 
     /// Parses a worker command line as `from_args` does.
     fn parsed(flags: &[&str]) -> Result<(DynamoFastH3Engine, DynamoWorkerConfig), DynamoError> {
-        let args = Args::try_parse_from(["uniserve-dynamo-worker"].iter().chain(flags))
+        let args = Args::try_parse_from(["uniserve-dynamo"].iter().chain(flags))
             .expect("the command line parses");
         DynamoFastH3Engine::try_from_args(args)
     }
@@ -866,15 +866,15 @@ mod tests {
         ));
         std::fs::write(
             &deployment,
-            "[[workers]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 6\n\
-             [workers.components.transformer]\n",
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 6\n\
+             [worker_groups.components.transformer]\n",
         )
         .unwrap();
         let workers = deployment.to_str().unwrap();
 
         let (_engine, registration) = parsed(&[
             "/models/FastH3",
-            "--workers",
+            "--worker-groups",
             workers,
             "--served-model-name",
             "FastH3",
@@ -885,24 +885,30 @@ mod tests {
         assert_eq!(registration.model_name, "FastH3");
 
         for flags in [
-            vec!["/models/FastH3", "--workers", workers, "--port", "9000"],
             vec![
                 "/models/FastH3",
-                "--workers",
+                "--worker-groups",
+                workers,
+                "--port",
+                "9000",
+            ],
+            vec![
+                "/models/FastH3",
+                "--worker-groups",
                 workers,
                 "--data-parallel-size",
                 "2",
             ],
             vec![
                 "/models/FastH3",
-                "--workers",
+                "--worker-groups",
                 workers,
                 "--set",
                 "video_config.max_condition_rows=4",
             ],
             vec![
                 "/models/FastH3",
-                "--workers",
+                "--worker-groups",
                 workers,
                 "--set",
                 "media_config.allow_remote=false",

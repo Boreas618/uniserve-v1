@@ -32,7 +32,7 @@ use crate::sampling::{
     RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_count, logprob_words,
 };
 use crate::storage::LogprobLayout;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
 /// A prefill chunk's prompt scoring.
@@ -588,7 +588,7 @@ impl TokenBatch<'_> {
 pub(super) fn condition_latents(
     runtime: &mut CausalLMRunners,
     image: &mut Option<ImageParts<'_>>,
-    storage: &mut RankStorage,
+    storage: &mut WorkerStorage,
     rows: &[ConditionRow],
     stream: Option<&uniserve_cuda::Stream>,
     job: &Job,

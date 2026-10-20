@@ -22,7 +22,7 @@ use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::executor::{
     BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    PoolPlacement, WorkerFailure, WorkerId, logical_result,
+    PoolPlacement, WorkerFailure, WorkerGroupId, logical_result,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -144,7 +144,7 @@ impl SimExecutor {
             .expect("spawn sim executor thread");
         Self {
             executor_info: {
-                let id = WorkerId("sim".to_owned());
+                let id = WorkerGroupId("sim".to_owned());
                 ExecutorInfo {
                     workers: vec![(id.clone(), info.clone())],
                     placements: BTreeMap::from([(id, placement)]),
@@ -260,7 +260,7 @@ impl SimExecutor {
             .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
             .collect::<HashSet<_>>();
         Some(WorkerFailure {
-            worker_id: WorkerId("sim".to_owned()),
+            worker_id: WorkerGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
             refusals,
@@ -282,7 +282,7 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn has_capacity(&self, worker: &WorkerId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.is_ready(worker) && self.in_flight < self.depth
     }
 
@@ -304,7 +304,7 @@ impl Executor for SimExecutor {
         !has_owner || (self.handle.is_some() && self.in_flight < self.depth)
     }
 
-    fn is_ready(&self, worker: &WorkerId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.handle.is_some()
             && self
                 .executor_info
@@ -1734,7 +1734,7 @@ mod tests {
             vec![(
                 call,
                 crate::executor::RequestPlacement {
-                    worker: WorkerId("sim".into()),
+                    worker: WorkerGroupId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),
                     new_cache_units: Vec::new(),

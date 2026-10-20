@@ -276,7 +276,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::Backing;
-    use crate::storage::memory::Memory;
+    use crate::storage::memory::Storage;
 
     fn write_floats(memory: &Arc<dyn Backing>, values: &[f32]) {
         // SAFETY: test memory is host memory owned by the caller.
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn regions_split_across_spans_in_local_coordinates() -> Result<()> {
-        let memory: Arc<dyn Backing> = Memory::host(12 * 4);
+        let memory: Arc<dyn Backing> = Storage::host(12 * 4);
         let pages = Spans::new(vec![
             StorageView::contiguous(Arc::clone(&memory), 0, DType::F32, &[2, 3])?,
             StorageView::contiguous(Arc::clone(&memory), 24, DType::F32, &[2, 3])?,
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn destinations_reject_aliasing_but_accept_interleaved_pages() -> Result<()> {
-        let memory: Arc<dyn Backing> = Memory::host(16 * 4);
+        let memory: Arc<dyn Backing> = Storage::host(16 * 4);
         // Columns of a [4, 4] grid viewed as rows: `[columns, 4]` with
         // strides `[1, 4]`, starting at the first column's element.
         let columns = |first: usize, count: i64| {
@@ -346,8 +346,8 @@ mod tests {
 
     #[test]
     fn host_copies_walk_both_partitions() -> Result<()> {
-        let source_memory: Arc<dyn Backing> = Memory::host(12 * 4);
-        let target_memory: Arc<dyn Backing> = Memory::host(12 * 4);
+        let source_memory: Arc<dyn Backing> = Storage::host(12 * 4);
+        let target_memory: Arc<dyn Backing> = Storage::host(12 * 4);
         write_floats(
             &source_memory,
             &(0..12).map(|value| value as f32).collect::<Vec<_>>(),

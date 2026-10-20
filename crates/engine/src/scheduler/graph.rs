@@ -5,7 +5,7 @@
 //! their exact leading extents, and which calls read them. A `t2va` request
 //! is text encoding, latent preparation, denoising, both decoders,
 //! both encoders and the muxer. A conditioned request first reads its
-//! condition media on a host rank (`MediaReading`), encodes the vision blocks
+//! condition media on a CPU worker (`MediaReading`), encodes the vision blocks
 //! the presentation names (`VisionEncoding`) ahead of the text encoding that
 //! splices them in, and encodes its visual conditions by temporal units and
 //! its audio tracks separately (`LatentEncoding`); latent preparation then

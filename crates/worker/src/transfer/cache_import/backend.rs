@@ -23,7 +23,7 @@ use uniserve_ipc::{CacheTransfer, Locator, Wake};
 
 use super::{CacheImport, CacheImporter};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
@@ -33,7 +33,7 @@ use crate::{Error, Result, lock};
 /// One import thread's stream, scratch and bound numerical operations.
 pub(crate) struct ImportWorkspace {
     stream: Option<Arc<Stream>>,
-    scratch: Arc<Memory>,
+    scratch: Arc<Storage>,
     elements: u64,
     units: UnitColumn,
     /// The library's `PageConversion` over the scratch and the pool.
@@ -60,9 +60,9 @@ impl ImportWorkspace {
         let (stream, scratch) = match planes.device() {
             Some(device) => (
                 Some(Arc::new(Stream::new(device)?)),
-                Memory::device(device, bytes.max(1))?,
+                Storage::device(device, bytes.max(1))?,
             ),
-            None => (None, Memory::host(bytes.max(1))),
+            None => (None, Storage::host(bytes.max(1))),
         };
         let units = UnitColumn::bind(planes, stream.as_deref())?;
 

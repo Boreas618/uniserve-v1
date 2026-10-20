@@ -512,7 +512,7 @@ impl WorkerBackend {
         &mut self,
     ) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
-            if let Some(storage) = &self.runtimes.rank_storage {
+            if let Some(storage) = &self.runtimes.worker_storage {
                 storage.events.performed(job);
             }
             // What belongs to no batch is applied here: the event pool's
@@ -520,7 +520,7 @@ impl WorkerBackend {
             // union's step this rank joined, the kernel watch's calls.
             let events = self
                 .runtimes
-                .rank_storage
+                .worker_storage
                 .as_ref()
                 .map(|storage| &storage.events);
             if let Some(events) = events.filter(|events| events.owns(job)) {

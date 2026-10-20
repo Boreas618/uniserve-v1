@@ -22,7 +22,7 @@ use crate::lane::Job;
 use crate::lock;
 use crate::runner::ImageSetup;
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, TrajectoryVersion, ValueRange,
 };
@@ -59,8 +59,8 @@ impl ImageDecoder {
             ));
         }
         let memory: std::sync::Arc<dyn crate::ffi::Backing> = match device {
-            Device::Cuda(index) => Memory::device(index, staging_bytes.max(1))?,
-            Device::Cpu => Memory::host(staging_bytes.max(1)),
+            Device::Cuda(index) => Storage::device(index, staging_bytes.max(1))?,
+            Device::Cpu => Storage::host(staging_bytes.max(1)),
         };
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
         let method = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));

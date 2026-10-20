@@ -19,7 +19,7 @@ use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_worker::config::Device;
 use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter};
-use uniserve_worker::storage::{Memory, StorageView};
+use uniserve_worker::storage::{Storage, StorageView};
 use uniserve_worker::{
     DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool,
     ImagePreparation, ImageSetup, Result, Tower,
@@ -50,8 +50,8 @@ fn module_path(root: &str, path: &str) -> String {
 
 fn arena(device: Device) -> Result<StorageView> {
     let memory: Arc<dyn Backing> = match device {
-        Device::Cuda(cuda) => Memory::device(cuda, ARENA_BYTES)?,
-        Device::Cpu => Memory::host(ARENA_BYTES),
+        Device::Cuda(cuda) => Storage::device(cuda, ARENA_BYTES)?,
+        Device::Cpu => Storage::host(ARENA_BYTES),
     };
     StorageView::contiguous(memory, 0, DType::U8, &[ARENA_BYTES as i64])
 }
@@ -250,7 +250,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             ));
         };
         let bytes = (units * width) as usize * 2;
-        let memory = Memory::host(bytes);
+        let memory = Storage::host(bytes);
         // SAFETY: both ranges hold `bytes` bytes of BF16 latents.
         unsafe {
             std::ptr::copy_nonoverlapping(

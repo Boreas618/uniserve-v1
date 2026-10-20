@@ -105,6 +105,9 @@ pub struct DataPlane {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerLaunch {
     pub ipc: IpcConfig,
+    /// The deployment's name of this worker's host, its host identity in
+    /// transfers and peer storage.
+    pub host: String,
     /// Rank index among the worker's ranks on this host.
     pub local_rank: usize,
     /// Torch backend override for numerical process groups.
@@ -160,6 +163,10 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
         ));
     }
 
+    if descriptor.host.is_empty() {
+        return Err(DescriptorError::new("the worker's host is unnamed"));
+    }
+
     let stub = descriptor.no_model;
     let model = text(Some(&descriptor.model));
     if !stub && model.is_none() {
@@ -185,6 +192,7 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             // group's last progress.
             stall_bound: std::time::Duration::from_millis(descriptor.watchdog_timeout_ms / 2),
         },
+        host: descriptor.host.clone(),
         local_rank: descriptor.local_rank as usize,
         distributed_backend: text(descriptor.distributed_backend.as_deref()),
         rendezvous,

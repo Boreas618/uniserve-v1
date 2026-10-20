@@ -41,7 +41,7 @@ use crate::runner::media::MediaRunner;
 use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::storage::LatentCache;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, OutputPool, Result};
 
 pub(crate) use steps::WorkerBatch;
@@ -80,7 +80,7 @@ pub(crate) struct WorkerBackend {
 #[derive(Default)]
 pub(crate) struct Runtimes {
     /// The rank's storage owners (events, products, transports, prefix cache).
-    rank_storage: Option<RankStorage>,
+    worker_storage: Option<WorkerStorage>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<crate::runner::causal_lm::CausalLMRunners>,
     /// An image model's facts and host policy, on ranks holding encoders,
@@ -150,7 +150,7 @@ impl Runtimes {
         };
         let denoisers = video.then_some(&mut self.denoisers);
 
-        self.rank_storage
+        self.worker_storage
             .as_mut()
             .map(owner)
             .into_iter()
@@ -176,7 +176,7 @@ pub(crate) struct Parts<'a> {
     pub placement: &'a GroupPlacement,
     pub rank: usize,
     pub requests: &'a mut RequestPool,
-    pub storage: Option<&'a mut RankStorage>,
+    pub storage: Option<&'a mut WorkerStorage>,
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<ImageParts<'a>>,
     pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
@@ -241,13 +241,13 @@ impl WorkerBackend {
             None => self.jobs.call(job, wake),
         };
         // Work deferred later behind these records waits on their lane.
-        if let (Some(lane), Some(storage)) = (lane, &self.runtimes.rank_storage)
+        if let (Some(lane), Some(storage)) = (lane, &self.runtimes.worker_storage)
             && !records.is_empty()
         {
             storage.events.queued(submitted, lane, &records);
         }
         if !deferrals.is_empty() {
-            let storage = self.runtimes.rank_storage.as_ref().ok_or(Error::State(
+            let storage = self.runtimes.worker_storage.as_ref().ok_or(Error::State(
                 "a job defers work on a rank without an event pool",
             ))?;
             let jobs = &self.jobs;
@@ -263,7 +263,7 @@ impl WorkerBackend {
     /// Have the rank's event pool start the jobs its deferred work waits
     /// for on the rank's lanes, from this thread, the control thread.
     fn serve_events(&self) {
-        let Some(storage) = &self.runtimes.rank_storage else {
+        let Some(storage) = &self.runtimes.worker_storage else {
             return;
         };
         let jobs = self.jobs.clone();
@@ -325,17 +325,17 @@ impl WorkerBackend {
     }
 
     /// Install the rank's storage owners.
-    pub(crate) fn set_rank_storage(&mut self, storage: RankStorage) {
-        self.runtimes.rank_storage = Some(storage);
+    pub(crate) fn set_worker_storage(&mut self, storage: WorkerStorage) {
+        self.runtimes.worker_storage = Some(storage);
         self.serve_events();
     }
 
-    pub(crate) fn rank_storage(&self) -> Option<&RankStorage> {
-        self.runtimes.rank_storage.as_ref()
+    pub(crate) fn worker_storage(&self) -> Option<&WorkerStorage> {
+        self.runtimes.worker_storage.as_ref()
     }
 
-    pub(crate) fn rank_storage_mut(&mut self) -> Option<&mut RankStorage> {
-        self.runtimes.rank_storage.as_mut()
+    pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerStorage> {
+        self.runtimes.worker_storage.as_mut()
     }
 
     /// Install the text runtime.
@@ -550,7 +550,7 @@ impl WorkerBackend {
             placement: &self.placement,
             rank: self.rank,
             requests: &mut self.requests,
-            storage: self.runtimes.rank_storage.as_mut(),
+            storage: self.runtimes.worker_storage.as_mut(),
             text: self.runtimes.text.as_mut(),
             image: match (
                 &self.runtimes.image,
@@ -630,7 +630,7 @@ impl WorkerBackend {
             requests: &mut self.requests,
             storage: self
                 .runtimes
-                .rank_storage
+                .worker_storage
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
             info: &self.info,
@@ -741,7 +741,7 @@ impl WorkerBackend {
     /// owner.
     pub(crate) fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
         self.jobs.set_wake(wake.clone());
-        if let Some(storage) = &self.runtimes.rank_storage {
+        if let Some(storage) = &self.runtimes.worker_storage {
             storage.set_wake(wake.clone());
         }
         if let Some(host) = &self.runtimes.image_host {
@@ -784,7 +784,7 @@ impl WorkerBackend {
         if let Some(mut transfer) = self.runtimes.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        if let Some(mut storage) = self.runtimes.rank_storage.take() {
+        if let Some(mut storage) = self.runtimes.worker_storage.take() {
             result = result.and(storage.close(aborted));
         }
         result
@@ -813,7 +813,7 @@ impl WorkerBackend {
     /// early; once the batch executed, the predecessors it read retire too.
     /// The admission root (batch 0) has no outputs.
     fn release_predecessors(&mut self, batch: &WorkerBatch, inputs_acquired: bool) -> Result<()> {
-        let Some(storage) = self.runtimes.rank_storage.as_mut() else {
+        let Some(storage) = self.runtimes.worker_storage.as_mut() else {
             return Ok(());
         };
         let mut consumed = HashSet::new();
@@ -941,7 +941,7 @@ impl WorkerBackend {
     pub(crate) fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self
             .runtimes
-            .rank_storage
+            .worker_storage
             .as_ref()
             .is_some_and(|storage| storage.awaiting_acknowledgment())
             || self

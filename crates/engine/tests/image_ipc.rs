@@ -27,7 +27,7 @@ use uniserve_core::{
     ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaCall,
     MultimodalInputs, Request, RequestId, SamplingParams,
 };
-use uniserve_engine::{EngineConfig, EngineCore, WorkerConfig, WorkerProcessArgs};
+use uniserve_engine::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerProcessArgs};
 
 /// The stub's end-of-image marker, which its head maps to end of sequence.
 const END_OF_IMAGE: u32 = 1007;
@@ -75,7 +75,7 @@ fn engine() -> anyhow::Result<EngineCore> {
     };
     config.eos = vec![END_OF_IMAGE];
     config.end_of_image = END_OF_IMAGE;
-    config.workers = vec![WorkerConfig::placed(
+    config.worker_groups = vec![WorkerGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         1,
@@ -90,7 +90,7 @@ fn engine() -> anyhow::Result<EngineCore> {
         // encoder cache than a served model's default.
         encoder_cache_entries: 1024,
         prefill_cuda_graph: false,
-        ranks: config.workers[0].ranks.clone(),
+        ranks: config.worker_groups[0].ranks.clone(),
         components,
         queue_depth: 2,
         max_total_tokens: Some(4096),

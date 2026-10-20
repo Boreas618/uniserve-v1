@@ -94,7 +94,7 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--workers",
+        "--worker-groups",
         str(ROOT / "configs" / "minimax_h3" / deployment),
         "--worker-python",
         sys.executable,

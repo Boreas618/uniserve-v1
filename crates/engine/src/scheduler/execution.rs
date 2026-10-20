@@ -60,7 +60,10 @@ impl Scheduler {
     /// submitted goes back to the end of the queue. Returns whether any batch
     /// was submitted, or `true` after a terminal submission failure, which is
     /// handed to `on_executor_error` and stops dispatching.
-    fn dispatch_submissions(&mut self, blocked_workers: &mut HashSet<crate::WorkerId>) -> bool {
+    fn dispatch_submissions(
+        &mut self,
+        blocked_workers: &mut HashSet<crate::WorkerGroupId>,
+    ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be
         // submitted before its inputs' producers complete, since its worker
@@ -109,7 +112,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// instance: a batch carries one call kind to one component, so a media
+    /// worker group: a batch carries one call kind to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {

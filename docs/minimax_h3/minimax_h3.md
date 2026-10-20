@@ -27,7 +27,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` and `uniserve-host` binaries, the worker's rank runtime library (`uniserve._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
+The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` and `uniserve-launcher` binaries, the worker's rank runtime library (`uniserve._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
 
 ## Checkpoints
 
@@ -62,7 +62,7 @@ FastH3 text-to-video and keyframe requests:
 
 ```bash
 uniserve serve "$H3_MODEL" \
-  --workers configs/minimax_h3/ulysses4.toml \
+  --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
@@ -72,7 +72,7 @@ Base text-to-video and keyframe requests:
 
 ```bash
 uniserve serve "$H3_ROOT" \
-  --workers configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
+  --worker-groups configs/minimax_h3/ulysses4.toml --served-model-name MiniMax-H3 \
   --host 0.0.0.0 --set video_config.max_seconds=8 --max-model-len 2048 \
   --set video_config.text_capacities=2048
 ```
@@ -81,7 +81,7 @@ Reference requests, with the base reference denoiser or an OmniRef export:
 
 ```bash
 uniserve serve "$H3_ROOT" \
-  --workers configs/minimax_h3/ulysses4-reference.toml \
+  --worker-groups configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3 --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set video_config.text_capacities=8192 \
@@ -89,7 +89,7 @@ uniserve serve "$H3_ROOT" \
   --set media_config.directory=/srv/media
 
 uniserve serve "$OMNIREF_EXPORT" \
-  --workers configs/minimax_h3/ulysses4-reference.toml \
+  --worker-groups configs/minimax_h3/ulysses4-reference.toml \
   --served-model-name MiniMax-H3-OmniRef --host 0.0.0.0 \
   --set video_config.max_seconds=5 --max-model-len 8192 \
   --set video_config.text_capacities=8192 \
@@ -97,7 +97,7 @@ uniserve serve "$OMNIREF_EXPORT" \
   --set media_config.directory=/srv/media
 ```
 
-The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and a CPU `host` worker that holds the H.264 encoders, the muxer and the media reader, which decodes condition media. The media reader runs on a rank of the head's host. On a CPU rank its decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the head's host. Check a running server with:
+The options can also be kept in a TOML file passed with `--config` ([Configuration](../configuration.md#configuration-file)). A deployment file places each component on devices. These four-GPU files run four-way Ulysses denoising, TP4 text encoding, the latent encoder and one video and audio decoding unit per rank in a `model` worker, and a CPU `media` worker group that holds the H.264 encoders, the muxer and the media reader, which decodes condition media. The media reader runs on a rank of the head's host. On a CPU rank its decoded pixels are host data, which reach another host only through the head's rank channel, whose frames are bounded far below a reference video's pixels; on a GPU rank they lie in that GPU's storage, which condition encoders on every host read through the device transport, so a deployment whose condition encoders span hosts places the reader on a GPU of the head's host. Check a running server with:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/health
@@ -108,29 +108,29 @@ curl --fail-with-body http://127.0.0.1:8000/v1/capabilities | python -m json.too
 
 ### Deployments
 
-The deployment files are in `configs/minimax_h3/`, in the TOML format [Configuration](../configuration.md#deployment-files) describes: each `[[workers]]` group lists its ranks, such as `cuda:0-3` or `rank-1/cpu*4`, and the components placed on them, and `replicas` copies a group over equal blocks of its ranks. Each file places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` files split each GPU's memory between workers by FastH3's sizes.
+The deployment files are in `configs/minimax_h3/`, in the TOML format [Configuration](../configuration.md#deployment-files) describes: each `[[worker_groups]]` group lists its ranks, such as `cuda:0-3` or `rank-1/cpu*4`, and the components placed on them, and `replicas` copies a group over equal blocks of its ranks. Each file places the condition encoders and the media reader that keyframe and reference requests use; the `fasth3-` files split each GPU's memory between workers by FastH3's sizes.
 
 | File | GPUs | Denoiser | Text encoder |
 | --- | --- | --- | --- |
 | `ulysses4.toml` | Four on one host | Ulysses4 | TP4 |
 | `ulysses8.toml` | Eight on one host | Ulysses8 | TP8 |
-| `ulysses8-two-node.toml` | Four on each of two hosts | Ulysses8 | TP8 |
+| `ulysses8-two-host.toml` | Four on each of two hosts | Ulysses8 | TP8 |
 | `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas | TP4 per replica |
-| `fasth3-ulysses4x2-two-node.toml` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
+| `fasth3-ulysses4x2-two-host.toml` | Four on each of two hosts | One Ulysses4 replica per host | TP4 per replica |
 | `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas | One shared TP8 |
 | `fasth3-dp8-text-tp4x2.toml` | Eight on one host | Eight one-GPU replicas | Two TP4, one per four-GPU half |
 | `fasth3-dp8-text-tp8-host-weights.toml` | Eight on one host | Eight one-GPU replicas, layer projections in host memory | One shared TP8 |
 | `gather8.toml` | Eight on one host | Eight-way all-gather | TP8 |
 | `ulysses4-reference.toml` | Four on one host | Ulysses4 `transformer_ref` | TP4 |
 | `ulysses8-reference.toml` | Eight on one host | Ulysses8 `transformer_ref` | TP8 |
-| `ulysses8-reference-two-node.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
+| `ulysses8-reference-two-host.toml` | Four on each of two hosts | Ulysses8 `transformer_ref` | TP4 on `rank-0` |
 
 A component placed with `weights = "host"` keeps the dense projection weights of its repeated layer stack in page-locked host memory. Each rank holds a few layer-sized device slots, the fewest of at least four that divide the layer count (five for FastH3's 50 layers), and copies each layer into its slot on its own stream up to that count less two layers ahead of its use, while the layers before it compute. Biases and every other weight stay on the device, and the released device memory becomes capacity. `fasth3-dp8-text-tp8-host-weights.toml` places every replica's denoiser this way, and each replica holds its own host copy. The option requires `--set cuda_graph_config.policy=off`. On eight RTX PRO 6000 it serves the BF16 checkpoint for throughput with `--max-running-requests 8 --max-model-len 10240 --set video_config.text_capacities=1024 --set video_config.aspect_ratios=16:9 --set cuda_graph_config.policy=off --mem-fraction-static 0.92`, the options of the `rtx-pro-6000-8-dp8-bf16` evaluation server.
 
 A Ulysses denoiser's `sequence_parallel` table also selects how each layer's Q/K/V/gate projection reaches every rank's heads. With `projection = "gather"`, the default, every rank all-gathers the other ranks' input rows and projects its own heads, holding the projection weights partitioned by head. With `projection = "exchange"`, every rank projects its own rows for all heads, holding the whole weights, and sends each rank that rank's heads. For FastH3 the exchange transfers two thirds of the gather's bytes with eight ranks and more than the gather with four, and every rank holds the whole Q/K/V/gate weights of the 50 layers, 14.4 GiB in BF16, instead of its share of them. `projection_rows = <rows>` makes the exchange project and send each rank's rows in steps of that many rows, each step's transfer overlapping the next step's projection; without it the exchange sends the whole shard at once. A step holds whole attention tiles: a multiple of the checkpoint's 64- or 128-row tile, so a multiple of 128 suits every FastH3 checkpoint. Every mode produces the same values and serves every precision preset, and none applies to the `hybrid` and `allgather` kinds:
 
 ```toml
-[workers.components.transformer]
+[worker_groups.components.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange", projection_rows = 4096 }
 ```
 
@@ -139,8 +139,8 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
-| 8 x GB200, two hosts | Latency | `ulysses8-two-node.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off` |
-| 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-node.toml` | `--max-running-requests 4` |
+| 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off` |
+| 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
 | 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
 | 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
 | 4 x H200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2 --mem-fraction-static 0.92 --set video_config.text_capacities=1024` |
@@ -151,10 +151,10 @@ The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves re
 
 ### Two hosts
 
-The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the head's own). Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this instance does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build; the head refuses a launcher or rank compiled from other sources and names both builds:
+The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the head's own). Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this head does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build; the head refuses a launcher or rank compiled from other sources and names both builds:
 
 ```bash
-NCCL_NVLS_ENABLE=0 uniserve-host --head <rank-0 address>:<port> --host-identity rank-1
+NCCL_NVLS_ENABLE=0 uniserve-launcher --head <rank-0 address>:<port> --host-identity rank-1
 ```
 
 ## Startup and capacity
@@ -188,7 +188,7 @@ docker build -f docs/minimax_h3/Dockerfile -t uniserve-h3 .
 docker run --rm --gpus all --shm-size=4g --ulimit memlock=-1 -p 8000:8000 \
   -v "$H3_MODEL:/models/h3:ro" \
   uniserve-h3 serve /models/h3 \
-    --workers configs/minimax_h3/ulysses4.toml \
+    --worker-groups configs/minimax_h3/ulysses4.toml \
     --served-model-name FastH3 \
     --host 0.0.0.0 \
     --max-running-requests 2

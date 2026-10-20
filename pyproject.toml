@@ -111,10 +111,10 @@ target = "uniserve"
 path = "crates/bin/uniserve/Cargo.toml"
 debug = false
 
-# Per-host launcher for multi-host deployments, installed as `uniserve-host`.
+# Per-host launcher for multi-host deployments, installed as `uniserve-launcher`.
 [[tool.setuptools-rust.bins]]
-target = "uniserve-host"
-path = "crates/bin/uniserve-host/Cargo.toml"
+target = "uniserve-launcher"
+path = "crates/bin/uniserve-launcher/Cargo.toml"
 debug = false
 
 [tool.pytest.ini_options]

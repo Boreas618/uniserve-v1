@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uniserve_cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// Byte alignment of each carved column.
@@ -57,8 +57,8 @@ impl<D: Columns> InputBuffers<D> {
         let layout = dimensions.columns();
         let bytes = Self::bytes(&dimensions) as usize;
         let memory = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
+            Some(device) => Storage::device(device, bytes)?,
+            None => Storage::host(bytes),
         };
         let mut columns = Vec::with_capacity(layout.len());
         let mut offset = 0;

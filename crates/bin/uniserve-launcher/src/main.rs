@@ -3,18 +3,18 @@
 //! Each host of a deployment runs one of these, started by the cluster; exactly
 //! one host runs the head. The engine does not start processes on other hosts,
 //! so a launcher connects out to the head, registers its host identity, receives
-//! the launches of the ranks placed on its host, of every worker group the
+//! the launches of the workers placed on its host, of every worker group the
 //! deployment places there, spawns them, reports their exits by
-//! worker, generation and rank, stops one group's ranks on instruction ahead
+//! worker group, generation and rank, stops one group's workers on instruction ahead
 //! of that group's relaunch, and terminates them all when the head's
-//! connection closes. For a group whose first rank it runs, it also holds the
-//! bound socket that rank serves the group's collective store on, from the
-//! head's reservation until the rank inherits it at spawn.
+//! connection closes. For a group whose first worker it runs, it also holds the
+//! bound socket that worker serves the group's collective store on, from the
+//! head's reservation until the worker inherits it at spawn.
 //!
-//! Its ranks never outlive it. An orderly end of supervision terminates them,
-//! and on Linux the kernel kills each rank when the launcher dies by any other
-//! means. A rank is its child (`RankChild`), so each exit it reaps, reported
-//! or terminated, first removes the CUDA driver memory a rank that did not
+//! Its workers never outlive it. An orderly end of supervision terminates them,
+//! and on Linux the kernel kills each worker when the launcher dies by any other
+//! means. A worker is its child (`WorkerChild`), so each exit it reaps, reported
+//! or terminated, first removes the CUDA driver memory a worker that did not
 //! end in order left behind. Its log output is diagnostics only: a launcher
 //! is often started over an SSH session whose pipe closes before the
 //! deployment stops, and a failed log write must not end supervision.
@@ -34,25 +34,25 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use uniserve_ipc::launch::RankChild;
-use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::launch::WorkerChild;
+use uniserve_ipc::launcher::{Instruction, Report, Reservation, WorkerExit, WorkerSpawn};
 use uniserve_ipc::{Channel, IpcError, Registration, VERSION};
 
-/// Bounds how long a rank's exit waits to be reported: exit reporting must
+/// Bounds how long a worker's exit waits to be reported: exit reporting must
 /// not depend on another instruction arriving.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How often a running rank's NCCL names are noted
-/// (`RankChild::note_nccl_segments`). A rank reports that it is ready to the
-/// head, not to its launcher, so the launcher notes them while the rank
+/// How often a running worker's NCCL names are noted
+/// (`WorkerChild::note_nccl_segments`). A worker reports that it is ready to the
+/// head, not to its launcher, so the launcher notes them while the worker
 /// lives; its communicators exist from its startup on.
 const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Spawns and supervises the ranks an instance places on this host.
+/// Spawns and supervises the workers a head places on this host.
 #[derive(Parser, Debug)]
 #[command(
-    name = "uniserve-host",
-    about = "Launch and supervise one host's ranks"
+    name = "uniserve-launcher",
+    about = "Launch and supervise one host's workers"
 )]
 struct Args {
     /// Address of the head: the TCP address its log names for launchers.
@@ -63,15 +63,15 @@ struct Args {
     host_identity: String,
 }
 
-/// A rank's identity on this host: its worker group and its rank within it.
-type RankKey = (String, u32);
+/// A worker's identity on this host: its worker group and its rank within it.
+type WorkerKey = (String, u32);
 
-/// One rank this launcher owns.
-struct Rank {
-    child: RankChild,
-    /// The group generation the rank's spawn named.
+/// One worker this launcher owns.
+struct Worker {
+    child: WorkerChild,
+    /// The group generation the worker's spawn named.
     generation: u64,
-    /// When the rank's NCCL names were last noted.
+    /// When the worker's NCCL names were last noted.
     noted: std::time::Instant,
 }
 
@@ -97,34 +97,34 @@ fn main() -> anyhow::Result<()> {
     .context("registering this host with the head")?;
     tracing::info!(host = %args.host_identity, head = %args.head, "presented this host");
 
-    let mut ranks: HashMap<RankKey, Rank> = HashMap::new();
-    let outcome = supervise(&mut head, &args, &mut ranks);
+    let mut workers: HashMap<WorkerKey, Worker> = HashMap::new();
+    let outcome = supervise(&mut head, &args, &mut workers);
 
     // However supervision ends (the head closing the connection because the
-    // instance stopped or the head was lost, a `Terminate`, or an error), this
-    // host's ranks are terminated before the launcher exits.
-    terminate(&mut ranks);
+    // head stopped or was lost, a `Terminate`, or an error), this
+    // host's workers are terminated before the launcher exits.
+    terminate(&mut workers);
     outcome
 }
 
 /// Follows the head's instructions until it closes the connection or sends
-/// `Terminate`, reporting rank exits as they happen.
+/// `Terminate`, reporting worker exits as they happen.
 ///
-/// Fails on an undecodable instruction, a failed reservation or rank start,
-/// or a failed report to the head. The caller terminates the remaining ranks
-/// in every case.
+/// Fails on an undecodable instruction, a failed reservation or worker
+/// start, or a failed report to the head. The caller terminates the
+/// remaining workers in every case.
 fn supervise(
     head: &mut Channel,
     args: &Args,
-    ranks: &mut HashMap<RankKey, Rank>,
+    workers: &mut HashMap<WorkerKey, Worker>,
 ) -> anyhow::Result<()> {
     // Bound store sockets by worker group, each held until that group's first
-    // rank is spawned here and inherits it.
+    // worker is spawned here and inherits it.
     let mut rendezvous: HashMap<String, TcpListener> = HashMap::new();
     loop {
-        report_exits(head, ranks)?;
+        report_exits(head, workers)?;
 
-        // A closed connection is the head's instruction to stop: the instance
+        // A closed connection is the head's instruction to stop: the head
         // stopped, the head was lost, or it refused this launcher's build.
         let instruction = match head.try_recv::<Instruction>() {
             Ok(Some(instruction)) => instruction,
@@ -143,7 +143,7 @@ fn supervise(
                 let reason = anyhow::Error::new(reason);
                 tracing::info!(
                     reason = format!("{reason:#}"),
-                    "head connection closed; terminating this host's ranks"
+                    "head connection closed; terminating this host's workers"
                 );
                 return Ok(());
             }
@@ -152,7 +152,7 @@ fn supervise(
         match instruction {
             Instruction::Reserve { worker_id } => {
                 // This launcher holds the bound socket until it spawns the
-                // group's first rank, which inherits it, so no other process
+                // group's first worker, which inherits it, so no other process
                 // on this host, and no other group's reservation, can take the
                 // port meanwhile.
                 let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
@@ -160,7 +160,7 @@ fn supervise(
                 let port = listener.local_addr()?.port();
                 let reservation = Report::Reservation(Reservation {
                     port,
-                    // The first rank inherits the socket at this number.
+                    // The first worker inherits the socket at this number.
                     listen_fd: listener.as_raw_fd(),
                 });
                 rendezvous.insert(worker_id, listener);
@@ -168,7 +168,7 @@ fn supervise(
                     .context("reporting a reservation to the head")?;
             }
             Instruction::Spawn(spawn) => {
-                // The group's first rank serves its store on the reserved
+                // The group's first worker serves its store on the reserved
                 // socket; the others connect to it and bind nothing.
                 let store_listener = if spawn.rank == 0 {
                     rendezvous.remove(&spawn.worker_id)
@@ -176,28 +176,31 @@ fn supervise(
                     None
                 };
                 let key = (spawn.worker_id.clone(), spawn.rank);
-                let started = start_rank(args, *spawn, store_listener).with_context(|| {
-                    format!("starting rank {} of worker {} on this host", key.1, key.0)
+                let started = start_worker(args, *spawn, store_listener).with_context(|| {
+                    format!(
+                        "starting rank {} of worker group {} on this host",
+                        key.1, key.0
+                    )
                 })?;
-                ranks.insert(key.clone(), started);
-                tracing::info!(worker = %key.0, rank = key.1, "started a rank");
+                workers.insert(key.clone(), started);
+                tracing::info!(worker = %key.0, rank = key.1, "started a worker");
             }
             Instruction::Stop { worker_id } => {
-                // The group's ranks leave supervision before they are killed,
+                // The group's workers leave supervision before they are killed,
                 // so their exits are not reported. An unspawned reservation of
                 // the group is closed.
-                let stopped: Vec<RankKey> = ranks
+                let stopped: Vec<WorkerKey> = workers
                     .keys()
                     .filter(|(worker, _)| *worker == worker_id)
                     .cloned()
                     .collect();
-                let mut group: HashMap<RankKey, Rank> = stopped
+                let mut group: HashMap<WorkerKey, Worker> = stopped
                     .into_iter()
-                    .filter_map(|key| ranks.remove(&key).map(|rank| (key, rank)))
+                    .filter_map(|key| workers.remove(&key).map(|worker| (key, worker)))
                     .collect();
                 terminate(&mut group);
                 rendezvous.remove(&worker_id);
-                tracing::info!(worker = %worker_id, "head asked this host to stop a worker's ranks");
+                tracing::info!(worker = %worker_id, "head asked this host to stop a worker group's workers");
             }
             Instruction::Terminate => {
                 tracing::info!("head asked this host to stop");
@@ -207,20 +210,21 @@ fn supervise(
     }
 }
 
-/// Starts one rank, which connects to the head, registers as a member of
+/// Starts one worker, which connects to the head, registers as a member of
 /// the launch `spawn.generation` names and receives its launch descriptor
 /// there.
 ///
 /// `store_listener` is the group's reserved collective store socket when this
-/// rank serves the store. The rank inherits it at the descriptor number this
-/// launcher reported with the reservation, which the head names in the rank's
-/// launch descriptor. This process keeps no copy once the rank is started.
-fn start_rank(
+/// worker serves the store. The worker inherits it at the descriptor number
+/// this launcher reported with the reservation, which the head names in the
+/// worker's launch descriptor. This process keeps no copy once the worker is
+/// started.
+fn start_worker(
     args: &Args,
-    spawn: RankSpawn,
+    spawn: WorkerSpawn,
     store_listener: Option<TcpListener>,
-) -> anyhow::Result<Rank> {
-    let mut command = uniserve_ipc::launch::rank_command(
+) -> anyhow::Result<Worker> {
+    let mut command = uniserve_ipc::launch::worker_command(
         &spawn.python,
         &spawn.head,
         &spawn.worker_id,
@@ -235,22 +239,22 @@ fn start_rank(
         uniserve_ipc::launch::inherit_listener(&mut command, listener);
     }
 
-    let child = RankChild::spawn(&mut command)
+    let child = WorkerChild::spawn(&mut command)
         .with_context(|| format!("spawning rank {} with {}", spawn.rank, spawn.python))?;
     tracing::debug!(rank = spawn.rank, host = %args.host_identity, "spawned");
-    Ok(Rank {
+    Ok(Worker {
         child,
         generation: spawn.generation,
         noted: std::time::Instant::now(),
     })
 }
 
-/// Makes the rank `command` starts die with this launcher.
+/// Makes the worker `command` starts die with this launcher.
 ///
-/// The kernel sends the rank SIGKILL when the thread that spawned it exits,
+/// The kernel sends the worker SIGKILL when the thread that spawned it exits,
 /// which covers a launcher killed by a signal or aborted before `terminate`
-/// runs. Every rank is spawned from the main thread, whose exit is the
-/// process's. A rank whose launcher exited between fork and the request is
+/// runs. Every worker is spawned from the main thread, whose exit is the
+/// process's. A worker whose launcher exited between fork and the request is
 /// already orphaned, so it fails to start instead.
 #[cfg(target_os = "linux")]
 fn die_with_launcher(command: &mut Command) {
@@ -273,17 +277,20 @@ fn die_with_launcher(command: &mut Command) {
     }
 }
 
-/// Elsewhere only an orderly end of supervision terminates the ranks.
+/// Elsewhere only an orderly end of supervision terminates the workers.
 #[cfg(not(target_os = "linux"))]
 fn die_with_launcher(_command: &mut Command) {}
 
-/// Notes the NCCL names of each running rank every
-/// [`SEGMENT_NOTE_INTERVAL`], and reports every rank that has exited since
-/// the last report and stops supervising it. A rank whose exit status cannot
-/// be read is reported as exited.
-fn report_exits(head: &mut Channel, ranks: &mut HashMap<RankKey, Rank>) -> anyhow::Result<()> {
+/// Notes the NCCL names of each running worker every
+/// [`SEGMENT_NOTE_INTERVAL`], and reports every worker that has exited since
+/// the last report and stops supervising it. A worker whose exit status
+/// cannot be read is reported as exited.
+fn report_exits(
+    head: &mut Channel,
+    workers: &mut HashMap<WorkerKey, Worker>,
+) -> anyhow::Result<()> {
     let mut exited = Vec::new();
-    for (key, owned) in ranks.iter_mut() {
+    for (key, owned) in workers.iter_mut() {
         if owned.noted.elapsed() >= SEGMENT_NOTE_INTERVAL {
             owned.noted = std::time::Instant::now();
             let _ = owned.child.note_nccl_segments();
@@ -296,28 +303,29 @@ fn report_exits(head: &mut Channel, ranks: &mut HashMap<RankKey, Rank>) -> anyho
         exited.push((key.clone(), owned.generation, status));
     }
     for ((worker_id, rank), generation, status) in exited {
-        ranks.remove(&(worker_id.clone(), rank));
-        let exit = Report::Exit(RankExit {
+        workers.remove(&(worker_id.clone(), rank));
+        let exit = Report::Exit(WorkerExit {
             worker_id: worker_id.clone(),
             generation,
             rank,
             status: status.clone(),
         });
         head.send(&exit)
-            .context("reporting a rank exit to the head")?;
-        tracing::warn!(worker = %worker_id, generation, rank, status = %status, "a rank exited");
+            .context("reporting a worker exit to the head")?;
+        tracing::warn!(worker = %worker_id, generation, rank, status = %status, "a worker exited");
     }
     Ok(())
 }
 
-/// Kills every rank in `ranks`, then reaps each one, leaving `ranks` empty.
-fn terminate(ranks: &mut HashMap<RankKey, Rank>) {
-    for ((worker_id, rank), owned) in ranks.iter_mut() {
+/// Kills every worker in `workers`, then reaps each one, leaving `workers`
+/// empty.
+fn terminate(workers: &mut HashMap<WorkerKey, Worker>) {
+    for ((worker_id, rank), owned) in workers.iter_mut() {
         if let Err(error) = owned.child.kill() {
-            tracing::warn!(worker = %worker_id, rank, %error, "a rank could not be stopped");
+            tracing::warn!(worker = %worker_id, rank, %error, "a worker could not be stopped");
         }
     }
-    for (_, mut owned) in ranks.drain() {
+    for (_, mut owned) in workers.drain() {
         let _ = owned.child.wait();
     }
 }

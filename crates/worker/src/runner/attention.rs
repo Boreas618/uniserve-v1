@@ -24,7 +24,7 @@ use uniserve_cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::PrefixCache;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{AttentionRow, TablePages};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -79,8 +79,8 @@ impl AttentionMetadata {
         let words = capacity.row_words();
         let bytes = words * DType::I64.bytes();
         let memory: Arc<dyn Backing> = match device {
-            Some(device) => Memory::device(device, bytes)?,
-            None => Memory::host(bytes),
+            Some(device) => Storage::device(device, bytes)?,
+            None => Storage::host(bytes),
         };
         let row_columns = StorageView::contiguous(memory, 0, DType::I64, &[words as i64])?;
         // SAFETY: a new allocation the metadata keeps until its runner closes

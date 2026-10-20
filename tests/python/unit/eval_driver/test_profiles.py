@@ -30,14 +30,13 @@ def test_shipped_profiles_name_deployments_and_workloads_that_exist(
     config = load_config(profile)
 
     for name, server in config.servers.items():
-        if "--workers" not in server.command:
+        if "--worker-groups" not in server.command:
             continue
-        deployment = (
-            config.root / server.command[server.command.index("--workers") + 1]
-        )
+        flag = server.command.index("--worker-groups")
+        deployment = config.root / server.command[flag + 1]
         assert deployment.is_file(), f"{name} names {deployment}"
-        workers = tomllib.loads(deployment.read_text())["workers"]
-        assert workers and all(worker["components"] for worker in workers)
+        groups = tomllib.loads(deployment.read_text())["worker_groups"]
+        assert groups and all(group["components"] for group in groups)
 
     for name, point in config.benchmarks.items():
         manifests = (

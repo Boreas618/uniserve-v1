@@ -420,9 +420,9 @@ impl Transport {
         destination: Option<&Spans>,
         region: Option<&[Range<u64>]>,
     ) -> Result<ReadCall> {
-        if locator.source.node != self.source.node {
+        if locator.source.host != self.source.host {
             return Err(Error::Invalid(
-                "shared storage transport requires the source node".into(),
+                "shared storage transport requires the source host".into(),
             ));
         }
         Ok(ReadCall::Shared {
@@ -515,9 +515,9 @@ impl Transport {
                 "only shared storage supports host borrowing".into(),
             ));
         };
-        if locator.source.node != self.source.node {
+        if locator.source.host != self.source.host {
             return Err(Error::Invalid(
-                "shared storage transport requires the source node".into(),
+                "shared storage transport requires the source host".into(),
             ));
         }
         let TransferTransport::PosixShm { name, .. } = &locator.transport else {

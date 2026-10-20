@@ -244,7 +244,7 @@ impl OutputInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
     /// Host identity, independent of process-local device ordinals.
-    pub node: String,
+    pub host: String,
     /// Process lifetime identity; multiple Workers may share it.
     pub address_space: String,
     /// Lifetime identity of this loaded Worker rank.
@@ -255,7 +255,7 @@ impl WorkerEndpoint {
     /// Checks identities before accepting startup metadata or an export.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
-            !self.node.is_empty() && !self.address_space.is_empty() && !self.incarnation.is_empty(),
+            !self.host.is_empty() && !self.address_space.is_empty() && !self.incarnation.is_empty(),
             "worker endpoint identity is incomplete"
         );
         Ok(())
@@ -601,7 +601,7 @@ impl Default for WorkerInfo {
             image_unconditional_token_ids: None,
             fabric_handles: false,
             endpoint: WorkerEndpoint {
-                node: "simulation".into(),
+                host: "simulation".into(),
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
