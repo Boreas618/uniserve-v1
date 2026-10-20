@@ -273,7 +273,7 @@ impl DynamoFastH3Engine {
         // Only `uniserve_server::http` binds the configuration's listener, and
         // this worker never serves UniServe's HTTP API.
         let state = Arc::new(
-            Engine::start(&self.config, &self.stated)
+            Engine::start(&self.config, &self.stated, None)
                 .await
                 .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?,
         );
