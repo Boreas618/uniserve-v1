@@ -593,7 +593,7 @@ pub struct ConditionSpec {
 }
 
 /// How a deployment sizes the references of a `ref2va` request: the options
-/// of the MiniMax-H3 video processor (`--mm-processor-kwargs`), resolved
+/// of the MiniMax-H3 video processor (`mm_processor_kwargs`), resolved
 /// against what the video denoiser declares ([`ReferenceLimits`]).
 ///
 /// A reference is only ever reduced by default: an image whose short edge
@@ -643,7 +643,7 @@ impl ReferenceConfig {
     }
 
     /// Reads the config from the processor options a deployment states
-    /// (`--mm-processor-kwargs`): `reference_image_short_edge`, by default
+    /// (`mm_processor_kwargs`): `reference_image_short_edge`, by default
     /// the edge the denoiser declares, and `enlarge_references`, by default
     /// false.
     ///
@@ -696,7 +696,7 @@ impl ReferenceConfig {
 pub struct PlanLimits {
     /// The tasks of the placed denoiser.
     pub tasks: Vec<VideoTask>,
-    /// Longest requested duration served (`--max-video-seconds`).
+    /// Longest requested duration served (`video_config.max_seconds`).
     pub max_video_seconds: f64,
     /// Frame rate of every generated video, in frames per second, as the
     /// denoiser declares it: durations and reference videos are counted on

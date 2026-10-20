@@ -1,0 +1,52 @@
+# FastH3 on eight GPUs of one host: two Ulysses4 denoiser replicas, each with
+# its own TP4 text encoder.
+
+[[workers]]
+id = "text"
+replicas = 2
+ranks = ["cuda:0-7"]
+queue_depth = 6
+mem_fraction_static = 0.26
+
+[workers.components.text_encoder]
+tensor_parallel_size = 4
+
+[[workers]]
+id = "flow"
+replicas = 2
+ranks = ["cuda:0-7"]
+queue_depth = 6
+mem_fraction_static = 0.73
+
+[workers.components.transformer]
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
+
+[workers.components.video_decoder]
+
+[workers.components.audio_decoder]
+distribution = "temporal_units"
+
+[workers.components.latent_encoder]
+distribution = "temporal_units"
+
+[[workers]]
+id = "encoder"
+replicas = 2
+ranks = ["cpu*8"]
+queue_depth = 6
+
+[workers.components.video_codec]
+
+[[workers]]
+id = "reader"
+ranks = ["cpu"]
+queue_depth = 6
+
+[workers.components.media_reader]
+
+[[workers]]
+id = "muxer"
+ranks = ["cpu"]
+queue_depth = 12
+
+[workers.components.muxer]

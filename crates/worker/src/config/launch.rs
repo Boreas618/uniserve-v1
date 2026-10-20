@@ -134,18 +134,18 @@ impl WorkerLaunch {
 /// Resolve a launch descriptor.
 ///
 /// The command line and the engine validate the launch values they own
-/// before they write the descriptor (`--lane` validates each lane where
+/// before they write the descriptor (`lanes` validates each lane where
 /// the operator states it), so this checks only what the rank alone knows:
 /// its device, the transports it can bind, the precisions its device
-/// computes, and the text values it parses (`--worker-mesh`, the graph
-/// catalogs, the lanes taken together). Fails with the first violated
+/// computes, the generation-tower placement it parses (`worker_config.mesh`) and
+/// the lanes taken together. Fails with the first violated
 /// rule; messages name the launch option the operator sets, because the
 /// engine reports them as the rank's exit cause.
 pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorError> {
     let role = descriptor.role.trim().to_owned();
     let experts = expert_parallel(&descriptor)?;
 
-    let device = Device::parse(&descriptor.device, "--device")?;
+    let device = Device::parse(&descriptor.device, "rank device")?;
     let generation = generation_device(descriptor.mesh.as_deref().unwrap_or_default(), device)?;
     let backends = transfer_backends(&descriptor.transfer_backends)?;
     let exports = transfer_backends(&descriptor.export_backends)?;
@@ -170,7 +170,7 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
 
     let rendezvous = rendezvous(&descriptor);
     let load = load_options(&descriptor)?;
-    let attention = attention_options(&descriptor)?;
+    let attention = attention_options(&descriptor);
     let execution = execution(&descriptor, device, generation, &role, experts.as_ref())?;
 
     Ok(WorkerLaunch {
@@ -289,25 +289,16 @@ fn load_options(descriptor: &LaunchDescriptor) -> Result<LoadOptions, Descriptor
     })
 }
 
-fn attention_options(descriptor: &LaunchDescriptor) -> Result<AttentionOptions, DescriptorError> {
-    let use_tensor_core = descriptor
-        .flashinfer_use_tensor_core
-        .as_deref()
-        .map(|value| match value.trim().to_lowercase().as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            _ => Err(DescriptorError::new("expected an optional bool token")),
-        })
-        .transpose()?;
-    Ok(AttentionOptions {
+fn attention_options(descriptor: &LaunchDescriptor) -> AttentionOptions {
+    AttentionOptions {
         workspace_size: descriptor.flashinfer_workspace_size,
         decode_backend: descriptor.flashinfer_decode_backend.clone(),
         prefill_backend: descriptor.flashinfer_prefill_backend.clone(),
         disable_split_kv: descriptor.flashinfer_disable_split_kv,
         decode_split_tile_size: descriptor.flashinfer_decode_split_tile_size,
         prefill_split_tile_size: descriptor.flashinfer_prefill_split_tile_size,
-        use_tensor_core,
-    })
+        use_tensor_core: descriptor.flashinfer_use_tensor_core,
+    }
 }
 
 /// The execution settings: every launch value as the descriptor states it,
@@ -371,6 +362,10 @@ fn execution(
             .collect();
     }
 
+    // The launching side validated each catalog it states (positive,
+    // strictly increasing, distinct shapes); an unstated one keeps the
+    // rank's own.
+    let sizes = |values: &[u32]| values.iter().map(|&value| value as usize).collect();
     for (value, buckets) in [
         (
             &descriptor.decode_graph_batch_sizes,
@@ -390,24 +385,14 @@ fn execution(
         ),
     ] {
         if let Some(value) = value {
-            *buckets = positive_csv(value)?;
+            *buckets = sizes(value);
         }
     }
-    if let Some(value) = &descriptor.flow_graph_shapes {
-        config.flow_graph_shapes.clear();
-        for shape in value.split(',') {
-            let shape = shape.trim().to_lowercase();
-            let (height, width) = shape
-                .split_once('x')
-                .ok_or_else(|| DescriptorError::new("flow graph shapes must use HEIGHTxWIDTH"))?;
-            let shape = (positive_number(height)?, positive_number(width)?);
-            if config.flow_graph_shapes.contains(&shape) {
-                return Err(DescriptorError::new(
-                    "flow graph shapes must be positive and unique",
-                ));
-            }
-            config.flow_graph_shapes.push(shape);
-        }
+    if let Some(shapes) = &descriptor.flow_graph_shapes {
+        config.flow_graph_shapes = shapes
+            .iter()
+            .map(|&[height, width]| (height as usize, width as usize))
+            .collect();
     }
     if let Some(sampling) = descriptor.canvas_sampling {
         if let Some(parameter) = sampling.invalid_parameter() {
@@ -419,26 +404,4 @@ fn execution(
     }
     config.validate().map_err(DescriptorError::from)?;
     Ok(config)
-}
-
-fn positive_number(value: &str) -> Result<usize, DescriptorError> {
-    value
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|&value| value > 0)
-        .ok_or_else(|| DescriptorError::new("bucket sizes must be positive integers"))
-}
-
-fn positive_csv(value: &str) -> Result<Vec<usize>, DescriptorError> {
-    let values = value
-        .split(',')
-        .map(positive_number)
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(DescriptorError::new(
-            "integer bucket lists must be strictly increasing",
-        ));
-    }
-    Ok(values)
 }

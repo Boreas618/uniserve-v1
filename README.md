@@ -40,7 +40,7 @@ export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
 
 uniserve serve "$H3_MODEL" \
-  --workers configs/minimax_h3/ulysses4.json \
+  --workers configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
   --max-running-requests 2
@@ -58,17 +58,17 @@ curl --fail-with-body --max-time 600 \
 
 ## Deployments
 
-A deployment file passed to `--workers` places FastH3's components on devices and hosts. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
+A deployment file passed to `--workers` places FastH3's components on devices and hosts: TOML `[[workers]]` groups, each with its ranks (`cuda:0-3`), replicas and components. `configs/minimax_h3/` holds them; the FastH3 deployments with published measurements are:
 
 | File | GPUs | Layout |
 | --- | --- | --- |
-| `ulysses4.json` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
-| `ulysses8.json` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
-| `ulysses8-two-node.json` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
-| `fasth3-ulysses4x2.json` | Eight on one host | Two Ulysses4 replicas |
-| `fasth3-ulysses4x2-two-node.json` | Four on each of two hosts | One Ulysses4 replica per host |
-| `fasth3-dp8-text-tp8.json` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
-| `gather8.json` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
+| `ulysses4.toml` | Four on one host | Ulysses4 denoiser, TP4 text encoder |
+| `ulysses8.toml` | Eight on one host | Ulysses8 denoiser, TP8 text encoder |
+| `ulysses8-two-node.toml` | Four on each of two hosts | Ulysses8 denoiser, TP8 text encoder |
+| `fasth3-ulysses4x2.toml` | Eight on one host | Two Ulysses4 replicas |
+| `fasth3-ulysses4x2-two-node.toml` | Four on each of two hosts | One Ulysses4 replica per host |
+| `fasth3-dp8-text-tp8.toml` | Eight on one host | Eight one-GPU replicas, shared TP8 text encoder |
+| `gather8.toml` | Eight on one host | All-gather sequence-parallel denoiser, TP8 text encoder |
 
 One replica spanning every GPU gives the lowest latency; replicas serve more requests at once. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#deployments) lists the recommended deployment and options for each GPU type and goal, and describes two-host startup.
 
@@ -90,7 +90,7 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
 | `POST /v1/systemone` | TypeSafe System One decision readout (DiffusionGemma) |
 
-DiffusionGemma readout settings are fixed when the server starts. `--readout-canvas full` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--readout-canvas 64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `--readout-candidates variants` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
+DiffusionGemma readout settings are fixed when the server starts. `readout_config.canvas = "full"` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--set readout_config.canvas=64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `readout_config.candidates = "variants"` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
 
 See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for checkpoint setup, four-GPU serving, decision and chat examples, precision choices, and measurement contracts.
 
@@ -100,51 +100,40 @@ The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requ
 
 ## Serving options
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| Positional `MODEL` | Required | Local model directory or Hugging Face repository |
-| `--workers` | One model worker over every rank | Deployment file: worker instances, node/device ranks, and the components placed on them |
-| `--served-model-name` | Resolved model ID | Single public model ID |
-| `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
-| `--uds` | Unset | Unix-domain listener instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
-| `--host-identity` | `localhost` | This host's name in a multi-host deployment file |
-| `--device` | `cuda` | Worker device |
-| `--worker-ranks` | `1` | Tensor-parallel ranks in each replica when `--workers` is omitted |
-| `--data-parallel-size` | `1` | Independent replicas, each with its own scheduler, KV cache and ranks |
-| `--expert-parallel` | Off | Shard routed experts across data-parallel replicas or dedicated expert workers |
-| `--expert-exchange` | `alltoall` | NVLink token exchange, `deepep` elastic dispatch/combine, `megamoe` fused experts, or `dwdp` asynchronous expert-weight prefetch |
-| `--expert-microbatches` | `1` | Independent microbatches; values above one require dedicated experts, and split MegaMoE serves at most four |
-| `--max-video-seconds` | `15` | Longest admitted clip, from 4 to 15 seconds |
-| `--max-model-len` | The checkpoint's `max_position_embeddings`; 16384 prompt tokens for a MiniMax-H3 pipeline; 8192 when neither exists | Context-length ceiling |
-| `--video-text-capacities` | `1024`, then steps of 2048 | Prompt-token capacities below `--max-model-len`, the largest capacity, prepared at startup |
-| `--max-running-requests` | `128`, clamped to worker capacity | Scheduler active-request bound |
-| `--max-queued-requests` | Unbounded | Requests the scheduler holds waiting or with undelivered events before it rejects a submission as overloaded |
-| `--max-total-tokens` | Runtime sizing | KV token-capacity override |
-| `--block-size` | Chosen by the worker | Tokens per KV block of the widest cache group, supported by every cache group's attention readers |
-| `--max-num-batched-tokens` | `8192` | Per-step scheduling token budget; a request with an input image whose vision feature block holds more tokens is refused; a video pipeline refuses it |
-| `--chunked-prefill-size` | `8192` | Per-request prefill bound; a video pipeline refuses it |
-| `--mem-fraction-static` | `0.70` | Each rank's share of device memory for weights and KV cache |
-| `--graph-policy` | `auto` | CUDA graph policy: `auto` captures graphs when serving captures the attention provider's calls (every provider but `torch`) and otherwise serves every call eagerly, `full` requires those graphs, `off` serves every call eagerly |
-| `--quantization-config` | `{}`, the `quality` preset | Precision preset or per-component overrides |
-| `--attention-backend` | `auto` | Attention provider: `auto` selects a native kernel for each call from the device and the installed kernel libraries; `flashinfer`, `trtllm` (TensorRT-LLM kernels shipped with FlashInfer), `flash_attn_4` (FlashAttention-4), `torch` (portable SDPA), `prefix_block` (UniServe's SM100 prefix-block kernels), `flash_attn` (FlashAttention-2) or `sgl_kernel` (SGLang's FlashAttention-3, SM90) serves every call, and startup refuses a model with a call that provider does not compute. The ranks resolve the name when they load their model and refuse a name these are not. The `gpu` extra installs neither FlashAttention-2 nor SGLang's kernels |
-| `--api-key` | Unset | Bearer token for public routes |
-| `--request-timeout` | Unset | Seconds until response headers; streamed bodies are not bounded |
-| `--max-concurrent-requests` | Unset | In-flight bound for chat, image generation, System One and synchronous video requests |
-| `--video-job-retention` | `3600` | Seconds a completed or failed asynchronous video job stays retrievable |
-| `--max-video-job-bytes` | `1073741824` | Bytes of generated video the asynchronous jobs keep, retained artifacts and unfinished downloads together |
-| `--shutdown-timeout` | `30` | Graceful drain bound in seconds |
-| `--watchdog-timeout` | `300` | Seconds a batch may run without any rank making progress before the worker group is replaced; a rank reports a lane stalled after half of it |
-| `--image-fetch-timeout` | `20` | Seconds allowed to fetch one `http(s)` image URL, including redirects and the complete body |
-| `--image-fetch-max-bytes` | `20000000` | Largest accepted input image in bytes, for fetched URLs and `data:` URLs alike |
-| `--allow-private-image-urls` | Off | Allow image URLs that resolve to loopback, private, link-local, unique-local, or cloud metadata addresses |
-| `--readout-layout` | `joint` | System One question grouping: `joint` packs questions in request order into shared canvases; `independent` gives each question its own prompt and canvas |
-| `--readout-canvas` | `full` | System One canvas length: `full` is the checkpoint's canvas length; `compact` is the smallest multiple of 16 holding the scaffold; a positive multiple of 16 fixes the length, bounded by the checkpoint's canvas |
-| `--readout-candidates` | `variants` | Sum supported answer-token spellings, or use `primary` for only the space-prefixed spelling |
-| `--diffusion-generation-config` | Checkpoint `generation_config.json` | DiffusionGemma block-diffusion sampling for every reply, as a JSON object that replaces any of `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold`, and `stability_threshold` |
+UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
-On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `--max-num-batched-tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `--max-running-requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step that no captured graph holds runs eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `--graph-policy off` serves every call without graphs, and so does `auto` with `--attention-backend torch`, whose captured calls attend over every row's whole capacity.
+```bash
+uniserve serve "$H3_MODEL" --workers configs/minimax_h3/ulysses4.toml \
+  --served-model-name FastH3 --max-running-requests 2 \
+  --set cuda_graph_config.policy=off \
+  --set quantization_config.mode=balanced
+```
 
-Run `uniserve serve --help` for the complete option set.
+| Flags | Options |
+| --- | --- |
+| `MODEL`, `--served-model-name`, `--max-model-len` | The checkpoint, its served name and context length |
+| `--host`, `--port` | The HTTP listener (`server_config`) |
+| `--workers`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Placement: a deployment file, or the tensor- and data-parallel shorthand |
+| `--max-running-requests`, `--mem-fraction-static` | Resident requests and each rank's device-memory share |
+| `--worker-python` | The interpreter of the worker ranks (`worker_config.python`) |
+| `--config`, `--set`, `--print-config` | The configuration file, assignments by path, and printing the resolved tree |
+
+| Table | Options for |
+| --- | --- |
+| `server_config` | HTTP listener, API key, timeouts and HTTP admission |
+| `load_config`, `kv_cache_config`, `scheduler_config` | Checkpoint loading, the KV cache, and admission and batching |
+| `placement_config`, `moe_config` | Placement without a deployment file and product transport; expert parallelism |
+| `cuda_graph_config`, `flashinfer_config`, `worker_config` | CUDA graph capture, the FlashInfer provider, and the worker processes |
+| `logging_config` | Request and statistics logs |
+| `chat_config`, `image_fetch_config` | Chat models: chat template, reasoning parser and image URL fetching |
+| `video_config`, `media_config`, `video_job_config` | MiniMax-H3: canvases, durations, prompt capacities, condition media and asynchronous jobs |
+| `readout_config`, `diffusion_generation_config` | DiffusionGemma readouts and block-diffusion sampling |
+
+A model-family table is refused at startup when the served checkpoint belongs to another family. `--print-config` prints the resolved tree, defaults included, in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
+
+On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `max_num_batched_tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `max_running_requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step that no captured graph holds runs eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `cuda_graph_config.policy = "off"` serves every call without graphs, and so does `auto` with `attention_backend = "torch"`, whose captured calls attend over every row's whole capacity.
+
+Run `uniserve serve --help` for the flags and `uniserve serve --print-config` for every option.
 
 ## Reproduce the measurements
 
@@ -169,7 +158,7 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
   --data-parallel-size 4
 ```
 
-Adding `--expert-parallel` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `--expert-exchange megamoe` fuses each expert layer's exchange and expert computation into one kernel.
+Adding `--set moe_config.expert_parallel=true` keeps the four replicas' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the replicas exchange tokens at each expert layer. Every expert layer then runs in steps the replicas take together: a replica without work joins each step another replica starts, and all replicas pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 guide](docs/minimax_h3/minimax_h3.md).
 
@@ -210,7 +199,7 @@ crates/observability-derive/  Metrics proc-macro
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
 crates/engine/                Scheduler, KV allocation, executors, worker fleet and rank launch
-crates/server/                Model profiles, serving funnel, HTTP API, and engine clients
+crates/server/                Serving options, model profiles, serving funnel, HTTP API, and engine clients
 crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
   launch/, config/            Launch descriptor, rank configuration and startup
   model/                      Model description, loading and component placement
@@ -228,8 +217,9 @@ uniserve/                     Numerical layers, loading, resource binding, concr
   worker.py                   Rank process entry: loads the rank runtime and hands it the library's import function
 uniserve_kernels/             Native CUDA, Triton and CuTe kernels
 uniserve_eval/                Serving evaluator, profiles, and request workloads
-configs/minimax_h3/           H3 deployment files
+configs/                      Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md          Processes, the rank planes and the request path
+docs/configuration.md         The serving option tree, configuration files and deployment files
 docs/minimax_h3/              H3 serving, library, evaluation and Dynamo guides, container files
 ```
 

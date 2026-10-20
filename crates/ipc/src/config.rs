@@ -1,7 +1,6 @@
 //! Execution-lane settings shared by the launcher and rank runtime.
 
 use std::collections::HashSet;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +18,6 @@ pub enum LaneConfigError {
     /// The named optional limit is configured as zero.
     #[error("lane {0} must be positive when configured")]
     Limit(&'static str),
-    #[error("invalid execution lane JSON: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("unknown execution lane domain {0:?}")]
     Domain(String),
 }
@@ -65,23 +62,30 @@ impl LaneConfig {
     }
 }
 
-impl FromStr for LaneConfig {
-    type Err = LaneConfigError;
+/// An execution lane as an operator states it: the call domains it serves
+/// rather than the concrete call kinds a rank binds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneSpec {
+    pub lane_id: String,
+    /// Number of streaming multiprocessors in the lane's partition.
+    pub sm_budget: usize,
+    /// `prefill`, `decode` or `flow`.
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_calls: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight: Option<usize>,
+}
 
-    /// Resolve the public `--lane` domain selectors to concrete operations.
-    /// Rank launch descriptors carry the resolved structure directly.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Options {
-            lane_id: String,
-            sm_budget: usize,
-            domains: Vec<String>,
-            max_batch_calls: Option<usize>,
-            max_batch_tokens: Option<usize>,
-            max_inflight: Option<usize>,
-        }
-        let options: Options = serde_json::from_str(value)?;
+impl TryFrom<LaneSpec> for LaneConfig {
+    type Error = LaneConfigError;
+
+    /// Resolves the stated domains to concrete operations and validates the
+    /// lane. Rank launch descriptors carry the resolved structure directly.
+    fn try_from(options: LaneSpec) -> Result<Self, Self::Error> {
         let mut call_kinds = Vec::new();
         for domain in options.domains {
             use CallKind::{Forward, Media, Transfer};

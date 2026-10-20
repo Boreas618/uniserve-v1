@@ -8504,10 +8504,12 @@ version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
 dependencies = [
+ "indexmap 2.14.0",
  "serde_core",
  "serde_spanned 1.1.1",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 
@@ -8569,6 +8571,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"
@@ -9141,6 +9149,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml 1.1.3+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uniserve-core",
@@ -9202,12 +9211,14 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "clap",
  "criterion",
  "expect-test",
  "fastokens",
  "futures",
  "hf-hub 0.5.0",
  "http-body",
+ "humantime",
  "image",
  "indexmap 2.14.0",
  "itertools 0.14.0",
@@ -9219,6 +9230,7 @@ dependencies = [
  "serde",
  "serde-json-fmt",
  "serde_json",
+ "serde_path_to_error",
  "serde_with",
  "sha2 0.10.9",
  "socket2 0.6.4",
@@ -9228,6 +9240,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "tokio",
  "tokio-util",
+ "toml 1.1.3+spec-1.1.0",
  "tower",
  "tower-http",
  "tracing",

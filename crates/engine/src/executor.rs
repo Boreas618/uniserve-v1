@@ -768,7 +768,7 @@ impl TransferEdge {
     }
 }
 
-/// Per-edge data-plane transfer selection (`--transfer`) and the placement it
+/// Per-edge data-plane transfer selection (`placement_config.transfer`) and the placement it
 /// is resolved against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferConfig {

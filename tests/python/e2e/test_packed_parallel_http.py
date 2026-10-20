@@ -60,16 +60,17 @@ def _command(
         sys.executable,
         "--workers",
         str(written_deployment(directory, [worker_config])),
-        "--dtype",
-        "bfloat16",
-        "--max-total-tokens",
-        "65536" if description == "sensenova" else "8192",
+        "--set",
+        "dtype=bfloat16",
+        "--set",
+        "kv_cache_config.max_tokens="
+        + ("65536" if description == "sensenova" else "8192"),
         "--max-model-len",
         "32768" if description == "sensenova" else "4096",
-        "--max-num-batched-tokens",
-        step_tokens,
-        "--chunked-prefill-size",
-        "512",
+        "--set",
+        f"max_num_batched_tokens={step_tokens}",
+        "--set",
+        "scheduler_config.chunked_prefill_size=512",
         "--max-running-requests",
         "1",
     ]
@@ -219,11 +220,8 @@ def test_ordered_bindings_generate_outputs(
     )
     worker_config = {
         "id": "model",
-        "ranks": [
-            {"node": "localhost", "device": f"cuda:{device}"}
-            for device in (3, 1)
-        ],
-        "components": {"model": {"ranks": [1, 0], "parallel_config": parallel}},
+        "ranks": [f"cuda:{device}" for device in (3, 1)],
+        "components": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
     image_size = (512, 512) if description == "bagel" else (2048, 1152)

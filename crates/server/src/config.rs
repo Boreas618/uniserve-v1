@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use uniserve_engine::{
-    DEFAULT_COMPONENT, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, SchedulingPolicy, TransferConfig,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, SchedulingPolicy, TransferConfig,
     WorkerConfig, WorkerProcessArgs,
 };
 
@@ -61,20 +61,20 @@ pub struct EngineSettings {
     /// token batches and refuses a value.
     pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently running requests.
-    pub max_num_seqs: usize,
+    pub max_running_requests: usize,
     /// Most requests the scheduler holds waiting, or finished with
     /// undelivered events, before it rejects a submission as overloaded;
     /// `None` queues without bound.
-    pub max_num_waiting: Option<usize>,
+    pub max_queued_requests: Option<usize>,
     /// Per-request token ceiling for one prefill chunk; `None` is
-    /// [`DEFAULT_LONG_PREFILL_THRESHOLD`]. A video pipeline prefills no
+    /// [`DEFAULT_CHUNKED_PREFILL_SIZE`]. A video pipeline prefills no
     /// prompt chunks and refuses a value.
-    pub long_prefill_threshold: Option<usize>,
+    pub chunked_prefill_size: Option<usize>,
     /// Reuse and retain prompt cache prefixes across requests. Per-request cache
     /// policy can further restrict this deployment-wide setting.
-    pub prefix_reuse: bool,
+    pub prefix_cache: bool,
     /// Waiting queue policy used by the scheduler.
-    pub scheduler_policy: SchedulingPolicy,
+    pub schedule_policy: SchedulingPolicy,
     /// Maximum model context length override. `None` derives the limit from
     /// the loaded model: its `max_position_embeddings` for a model with a root
     /// `config.json` (falling back to
@@ -93,7 +93,7 @@ pub struct EngineSettings {
     /// Display aspect ratios (`16:9`) a video deployment prepares.
     pub video_aspect_ratios: Vec<String>,
     /// Most denoiser rows a video request's conditions may take
-    /// (`--max-condition-rows`). Video workers provision their condition
+    /// (`video_config.max_condition_rows`). Video workers provision their condition
     /// products for it, and the worker that denoises a request refuses
     /// conditions above it. `None` provisions the largest condition set the
     /// deployment's denoiser admits, so no request is refused for its
@@ -101,7 +101,7 @@ pub struct EngineSettings {
     pub max_condition_rows: Option<u32>,
     /// Static Worker configurations with ordered ranks and named computation components.
     pub workers: Vec<WorkerConfig>,
-    /// Per-edge data-plane transfer backend (`--transfer`), e.g.
+    /// Per-edge data-plane transfer backend (`placement_config.transfer`), e.g.
     /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`.
     pub transfer: TransferConfig,
     /// Number of independent replicas `workers` forms, as equal consecutive
@@ -121,11 +121,11 @@ impl Default for EngineSettings {
         Self {
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: None,
-            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
-            max_num_waiting: None,
-            long_prefill_threshold: None,
-            prefix_reuse: true,
-            scheduler_policy: SchedulingPolicy::Fcfs,
+            max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
+            max_queued_requests: None,
+            chunked_prefill_size: None,
+            prefix_cache: true,
+            schedule_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: MAX_VIDEO_SECONDS,
             // 768p landscape and portrait, the canvases every graph-captured
@@ -173,10 +173,10 @@ pub struct Config {
     /// How to serialize `message.content` for chat-template rendering.
     pub chat_template_content_format: ChatTemplateContentFormatOption,
     /// Log a summary line for each completed request.
-    pub enable_log_requests: bool,
+    pub log_requests: bool,
     /// When `true`, set `X-Request-Id` on every HTTP response that passes the
     /// API-key check, carrying the ID the request ran under.
-    pub enable_request_id_headers: bool,
+    pub request_id_headers: bool,
     /// Whether to emit periodic stats logging (throughput, queue depth, cache usage).
     pub log_stats: bool,
     /// Bearer token accepted by the public serving API. Omitted from serialized
@@ -208,10 +208,68 @@ pub struct Config {
     /// Block-diffusion sampler overrides applied to every generated reply.
     pub diffusion_generation: DenoisingOverrides,
     /// Options of the served model's multimodal processor
-    /// (`--mm-processor-kwargs`), by name. The model's processor reads the
+    /// (`mm_processor_kwargs`), by name. The model's processor reads the
     /// ones it takes and refuses any other at startup; MiniMax-H3's reads
     /// its reference sizing (`uniserve_core::video::plan::ReferenceConfig`).
     pub mm_processor_kwargs: serde_json::Map<String, serde_json::Value>,
+    /// The model-family options the operator stated, which startup refuses
+    /// for a served model outside that family.
+    pub family_options: FamilyOptions,
+}
+
+/// The model-family tables a configuration states, by configuration path.
+///
+/// Each family's tables configure behavior only that family has, so stating
+/// one for another family's checkpoint is refused rather than ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FamilyOptions {
+    /// Chat-model tables (`chat_config`, `image_fetch_config`), which a video
+    /// pipeline has no use for.
+    pub chat: Vec<String>,
+    /// MiniMax-H3 video tables (`video_config`, `media_config`,
+    /// `video_job_config`).
+    pub video: Vec<String>,
+    /// DiffusionGemma tables (`readout_config`,
+    /// `diffusion_generation_config`).
+    pub diffusion_gemma: Vec<String>,
+}
+
+impl FamilyOptions {
+    /// Refuses a stated table the served model's family does not have.
+    ///
+    /// # Errors
+    ///
+    /// Fails, naming the first such table and the served family, when a
+    /// video pipeline is configured with chat tables, any other model with
+    /// video tables, or a model other than DiffusionGemma with DiffusionGemma
+    /// tables.
+    pub fn check(&self, description: crate::ModelDescription) -> Result<()> {
+        use crate::ModelDescription::{DiffusionGemma, MiniMaxH3};
+
+        let foreign = [
+            (&self.chat, description.is_pipeline(), "chat models"),
+            (
+                &self.video,
+                description != MiniMaxH3,
+                "MiniMax-H3 video generation",
+            ),
+            (
+                &self.diffusion_gemma,
+                description != DiffusionGemma,
+                "DiffusionGemma",
+            ),
+        ];
+        for (tables, refused, family) in foreign {
+            if let Some(table) = tables.first().filter(|_| refused) {
+                anyhow::bail!(
+                    "`{table}` configures {family}, but the served checkpoint is a {} model; \
+                     remove it",
+                    description.id()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Retention and memory policy of the video job store.
@@ -302,8 +360,8 @@ impl Default for Config {
             chat_template: None,
             default_chat_template_kwargs: None,
             chat_template_content_format: ChatTemplateContentFormatOption::default(),
-            enable_log_requests: false,
-            enable_request_id_headers: false,
+            log_requests: false,
+            request_id_headers: false,
             log_stats: true,
             api_key: None,
             request_timeout: None,
@@ -316,6 +374,7 @@ impl Default for Config {
             readout: ReadoutOptions::default(),
             diffusion_generation: DenoisingOverrides::default(),
             mm_processor_kwargs: serde_json::Map::new(),
+            family_options: FamilyOptions::default(),
         }
     }
 }
@@ -361,7 +420,7 @@ impl Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TokenBudgets {
     pub(crate) max_num_batched_tokens: usize,
-    pub(crate) long_prefill_threshold: usize,
+    pub(crate) chunked_prefill_size: usize,
 }
 
 impl EngineSettings {
@@ -383,17 +442,17 @@ impl EngineSettings {
     pub(crate) fn token_budgets(&self, pipeline: bool) -> Result<TokenBudgets> {
         anyhow::ensure!(
             !pipeline
-                || (self.max_num_batched_tokens.is_none() && self.long_prefill_threshold.is_none()),
-            "--max-num-batched-tokens and --chunked-prefill-size bound token batches, \
+                || (self.max_num_batched_tokens.is_none() && self.chunked_prefill_size.is_none()),
+            "max_num_batched_tokens and scheduler_config.chunked_prefill_size bound token batches, \
              which a video pipeline does not schedule; remove them"
         );
         Ok(TokenBudgets {
             max_num_batched_tokens: self
                 .max_num_batched_tokens
                 .unwrap_or(DEFAULT_MAX_NUM_BATCHED_TOKENS),
-            long_prefill_threshold: self
-                .long_prefill_threshold
-                .unwrap_or(DEFAULT_LONG_PREFILL_THRESHOLD),
+            chunked_prefill_size: self
+                .chunked_prefill_size
+                .unwrap_or(DEFAULT_CHUNKED_PREFILL_SIZE),
         })
     }
 
@@ -418,10 +477,13 @@ impl EngineSettings {
             self.max_num_batched_tokens != Some(0),
             "max_num_batched_tokens must be greater than 0"
         );
-        anyhow::ensure!(self.max_num_seqs > 0, "max_num_seqs must be greater than 0");
         anyhow::ensure!(
-            self.max_num_waiting != Some(0),
-            "max_num_waiting must be greater than 0"
+            self.max_running_requests > 0,
+            "max_running_requests must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.max_queued_requests != Some(0),
+            "max_queued_requests must be greater than 0"
         );
         anyhow::ensure!(
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
@@ -482,7 +544,7 @@ mod tests {
                 ..EngineSettings::default()
             },
             EngineSettings {
-                long_prefill_threshold: Some(1),
+                chunked_prefill_size: Some(1),
                 ..EngineSettings::default()
             },
         ] {
@@ -498,7 +560,7 @@ mod tests {
                 EngineSettings::default().token_budgets(pipeline).unwrap(),
                 TokenBudgets {
                     max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
-                    long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+                    chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
                 }
             );
         }

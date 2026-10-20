@@ -495,10 +495,14 @@ fn serve(sim: SimEngine, requests: Vec<Request>) -> Served {
 }
 
 /// Serves the requests with an optional bound on waiting request state.
-fn serve_bounded(sim: SimEngine, requests: Vec<Request>, max_num_waiting: Option<usize>) -> Served {
+fn serve_bounded(
+    sim: SimEngine,
+    requests: Vec<Request>,
+    max_queued_requests: Option<usize>,
+) -> Served {
     let mut executor = SimExecutor::new(sim);
     let boundary = executor.observe();
-    serve_through(Box::new(executor), boundary, requests, max_num_waiting)
+    serve_through(Box::new(executor), boundary, requests, max_queued_requests)
 }
 
 /// Serves the requests through `executor`, whose accepted batches and
@@ -507,14 +511,14 @@ fn serve_through(
     executor: Box<dyn Executor>,
     boundary: Receiver<BatchEvent>,
     requests: Vec<Request>,
-    max_num_waiting: Option<usize>,
+    max_queued_requests: Option<usize>,
 ) -> Served {
     let scheduler = support::scheduler_with(
         executor,
         SimEngine::special_tokens(),
         SchedulerConfig {
             max_batch: 32,
-            max_num_waiting,
+            max_queued_requests,
             ..Default::default()
         },
     )

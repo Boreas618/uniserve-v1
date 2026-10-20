@@ -17,6 +17,8 @@ pub mod engine_client;
 pub mod http;
 /// OpenAI-compatible schemas and conversion helpers.
 pub mod openai;
+/// Serving options: the command line and the configuration file.
+pub mod options;
 pub mod profile;
 pub mod serving;
 mod state;
@@ -35,7 +37,9 @@ use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
 use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineSettings, HttpListenerMode, VideoJobSettings, VideoMediaSettings};
+pub use config::{
+    Config, EngineSettings, FamilyOptions, HttpListenerMode, VideoJobSettings, VideoMediaSettings,
+};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
 use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
@@ -80,9 +84,10 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 ///
 /// # Errors
 ///
-/// Fails when the model assets cannot be resolved, when the per-run call
-/// bound (`max_batch`) or `max_num_batched_tokens`
-/// does not fit the worker's `u32` fields, when the engine fails to start, or
+/// Fails when the model assets cannot be resolved, when the configuration
+/// states an option of another model family (`FamilyOptions::check`), when
+/// the per-run call bound (`max_batch`) or `max_num_batched_tokens` does not
+/// fit the worker's `u32` fields, when the engine fails to start, or
 /// when the model description cannot be bound to the capabilities the engine
 /// reports.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
@@ -93,25 +98,24 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     } = ModelConfig::load(config)
         .await
         .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+    // Options of another model family than the served one are refused
+    // rather than ignored.
+    config.family_options.check(model_config.description())?;
     // The server's block-diffusion sampling replaces the checkpoint's
     // defaults once, before any request is lowered.
     if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
         profile.denoising = profile
             .denoising
             .with_overrides(&config.diffusion_generation)
-            .map_err(|message| {
-                anyhow::anyhow!("invalid --diffusion-generation-config: {message}")
-            })?;
+            .map_err(|message| anyhow::anyhow!("invalid diffusion_generation_config: {message}"))?;
     }
     let max_model_len = model_config.max_model_len;
     let control_tokens = special_token_ids(&model_config);
-    let generation_limits =
-        model_config.generation_limits(config.engine.worker_process.model_dtype);
+    let generation_limits = model_config.generation_limits(config.engine.worker_process.dtype);
 
     info!(
         workers = ?config.engine.workers,
         block_size = ?config.engine.worker_process.block_size,
-        queue_depth = config.engine.worker_process.queue_depth,
         "starting UniServe Rust engine"
     );
 
@@ -165,11 +169,11 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         generation_limits,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: budgets.max_num_batched_tokens,
-        max_num_seqs: config.engine.max_num_seqs,
-        max_num_waiting: config.engine.max_num_waiting,
-        long_prefill_threshold: budgets.long_prefill_threshold,
-        prefix_reuse: config.engine.prefix_reuse,
-        scheduler_policy: config.engine.scheduler_policy,
+        max_running_requests: config.engine.max_running_requests,
+        max_queued_requests: config.engine.max_queued_requests,
+        chunked_prefill_size: budgets.chunked_prefill_size,
+        prefix_cache: config.engine.prefix_cache,
+        schedule_policy: config.engine.schedule_policy,
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
         data_parallel_size: config.engine.data_parallel_size,
@@ -190,7 +194,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             // No other served model's processor takes options.
             anyhow::ensure!(
                 config.mm_processor_kwargs.is_empty(),
-                "invalid --mm-processor-kwargs: the processor of `{}` takes no options",
+                "invalid mm_processor_kwargs: the processor of `{}` takes no options",
                 config.model
             );
             RequestRenderer::Chat(*renderer)
@@ -211,7 +215,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 &config.mm_processor_kwargs,
                 &denoiser.references,
             )
-            .map_err(|message| anyhow::anyhow!("invalid --mm-processor-kwargs: {message}"))?;
+            .map_err(|message| anyhow::anyhow!("invalid mm_processor_kwargs: {message}"))?;
             RequestRenderer::Video(
                 crate::serving::video::VideoService::new(
                     denoiser,
@@ -271,8 +275,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
 
     Ok(Arc::new(
         AppState::new(runtime)
-            .with_log_requests(config.enable_log_requests)
-            .with_request_id_headers(config.enable_request_id_headers)
+            .with_log_requests(config.log_requests)
+            .with_request_id_headers(config.request_id_headers)
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
             .with_max_concurrent_requests(config.max_concurrent_requests)

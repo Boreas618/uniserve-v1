@@ -9,8 +9,12 @@
 //!
 //! The Dynamo frontend forwards each `/v1/videos` request to
 //! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
-//! The worker serves FastH3 text-to-video-and-audio at the canvases its
-//! `--video-resolutions` and `--video-aspect-ratios` prepare, as the started
+//! The worker takes `uniserve serve`'s options, `--config` file and `--set`
+//! included, and refuses before startup the ones it cannot honor: the HTTP
+//! server's, data and expert parallelism, condition media and asynchronous
+//! job storage, which a Dynamo `t2va` request never uses. It serves FastH3
+//! text-to-video-and-audio at the canvases its
+//! `video_config.resolutions` and `video_config.aspect_ratios` prepare, as the started
 //! deployment declares them, and refuses at startup a deployment that serves
 //! no `t2va`, such as a reference denoiser, or a canvas name its model does
 //! not generate: `prepare_request` maps the Dynamo request onto
@@ -40,13 +44,12 @@
 //! artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
 //!   --http-host 127.0.0.1 --http-port 18090 \
 //!   --namespace uniserve-fasth3 --discovery-backend file &
-//! target/release/uniserve-dynamo-worker \
-//!   --namespace uniserve-fasth3 \
-//!   --model-path "$UNISERVE_FAST_H3_MODEL" --served-model-name FastH3 \
+//! target/release/uniserve-dynamo-worker "$UNISERVE_FAST_H3_MODEL" \
+//!   --namespace uniserve-fasth3 --served-model-name FastH3 \
 //!   --worker-python "$PWD/.venv/bin/python" \
-//!   --workers configs/minimax_h3/ulysses4.json \
-//!   --max-model-len 16384 --max-video-seconds 15 \
-//!   --max-running-requests 2 --quantization-config '{"mode":"quality"}' &
+//!   --workers configs/minimax_h3/ulysses4.toml \
+//!   --max-model-len 16384 --max-running-requests 2 \
+//!   --set video_config.max_seconds=15 --set quantization_config.mode=quality &
 //! # Once `curl -fsS http://127.0.0.1:18090/v1/models` lists FastH3:
 //! curl --fail-with-body --max-time 600 http://127.0.0.1:18090/v1/videos \
 //!   -H 'Content-Type: application/json' -d '{"model": "FastH3",
@@ -64,7 +67,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -81,11 +83,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
-use uniserve_core::video::plan::MAX_VIDEO_SECONDS;
 use uniserve_core::{MediaKind, VideoTask};
-use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
+use uniserve_server::options::{ServeArgs, printed};
 use uniserve_server::{
-    AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
+    AppState, Config, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     serving::{
         ServeRequestId,
@@ -93,12 +94,25 @@ use uniserve_server::{
     },
 };
 
-// The served canvases come from `--video-resolutions` and
-// `--video-aspect-ratios`, as for `uniserve serve`; the loaded checkpoint
-// determines the step count.
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
 const DEFAULT_SECONDS: f64 = 5.0;
+
+/// Configuration paths of `uniserve serve` this worker cannot honor: it
+/// serves no HTTP API (so it neither listens nor logs HTTP requests), runs
+/// one replica without expert parallelism, receives requests without
+/// condition media and keeps no asynchronous jobs.
+const UNSUPPORTED_PATHS: [&str; 9] = [
+    "server_config",
+    "logging_config.log_requests",
+    "data_parallel_size",
+    "moe_config",
+    "placement_config.transfer",
+    "mm_processor_kwargs",
+    "video_config.max_condition_rows",
+    "media_config",
+    "video_job_config",
+];
 
 #[derive(Clone, Parser)]
 #[command(
@@ -109,61 +123,19 @@ struct Args {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Complete local FastH3 VSA checkpoint root.
-    #[arg(long)]
-    model_path: String,
-
-    #[arg(long, default_value = "FastH3")]
-    served_model_name: String,
-
-    #[arg(long, default_value_os_t = WorkerProcessArgs::default_python())]
-    worker_python: PathBuf,
-
-    /// JSON deployment configuration: the Worker instances, their node/device
-    /// ranks, and the FastH3 components placed on them, for example
-    /// `configs/minimax_h3/ulysses4.json`.
-    #[arg(long, value_name = "FILE", value_parser = WorkerConfig::read_all)]
-    workers: Box<[WorkerConfig]>,
-
-    /// This process's host identity. The engine owns exactly the placed ranks
-    /// whose node names it.
-    #[arg(long, default_value = "localhost")]
-    host_identity: String,
-
-    // These options mirror the `uniserve serve` flags of the same names and
-    // feed the engine configuration `build_state` assembles. The default
-    // prompt length is the one `uniserve serve` takes for a MiniMax-H3
-    // pipeline; the text encoder itself accepts more.
-    #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
-    max_model_len: u32,
-
-    #[arg(long, default_value_t = MAX_VIDEO_SECONDS)]
-    max_video_seconds: f64,
-
-    #[arg(long, value_delimiter = ',', default_value = "768p")]
-    video_resolutions: Vec<String>,
-
-    #[arg(long, value_delimiter = ',', default_value = "16:9,9:16")]
-    video_aspect_ratios: Vec<String>,
-
-    #[arg(long, default_value_t = 2)]
-    max_running_requests: usize,
-
-    #[arg(
-        long,
-        default_value = r#"{}"#,
-        value_parser = WorkerProcessArgs::parse_quantization_config
-    )]
-    quantization_config: Value,
-
-    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
-    graph_policy: String,
+    // The serving command line of `uniserve serve`; `UNSUPPORTED_PATHS`
+    // lists the options this worker refuses.
+    #[command(flatten)]
+    serve: ServeArgs,
 }
 
 /// Dynamo `RawEngine` serving FastH3 video generation from an in-process
 /// UniServe engine.
 pub struct DynamoFastH3Engine {
-    args: Args,
+    /// The UniServe configuration the engine starts with.
+    config: Config,
+    /// The single model name requests name and responses carry.
+    served_model_name: String,
     /// What the started deployment generates, and at which rasters, set once
     /// by `start` with `state`.
     outputs: OnceCell<Outputs>,
@@ -179,15 +151,28 @@ impl DynamoFastH3Engine {
     /// Parses the process command line into an unstarted engine and the
     /// Dynamo worker registration that advertises it as a `videos` endpoint.
     ///
-    /// Clap exits the process on a malformed command line, including an
-    /// unreadable or invalid `--workers` deployment file. Settings this
-    /// worker cannot honor (disaggregation, encoder routing, RL routes, a
-    /// non-finite or non-positive video length, a zero request limit) return
-    /// an invalid-argument error. No rank starts until `RawEngine::start`,
-    /// whose workers refuse a video canvas selection the model does not
-    /// generate.
+    /// The serving options resolve as for `uniserve serve`: a `--config`
+    /// file, its flags and `--set` assignments. With `--print-config` the
+    /// resolved configuration is printed and the process exits. Clap exits
+    /// the process on a malformed command line. Settings this worker cannot
+    /// honor (disaggregation, encoder routing, RL routes, a path in
+    /// `UNSUPPORTED_PATHS`, a missing deployment file) and a configuration
+    /// that does not resolve or that `ServeConfig::into_config` refuses
+    /// return an invalid-argument error. No rank starts until
+    /// `RawEngine::start`, whose workers refuse a video canvas selection the
+    /// model does not generate.
     pub fn from_args() -> Result<(Self, DynamoWorkerConfig), DynamoError> {
-        Self::try_from_args(<Args as Parser>::parse())
+        let args = <Args as Parser>::parse();
+        if args.serve.print_config {
+            let (config, _) = args
+                .serve
+                .resolve()
+                .map_err(|error| invalid_argument(format!("{error:#}")))?;
+            let printed = printed(&config).map_err(|error| invalid_argument(error.to_string()))?;
+            print!("{printed}");
+            std::process::exit(0);
+        }
+        Self::try_from_args(args)
     }
 
     fn try_from_args(args: Args) -> Result<(Self, DynamoWorkerConfig), DynamoError> {
@@ -202,17 +187,43 @@ impl DynamoFastH3Engine {
         if args.common.enable_rl {
             return Err(invalid_argument("RL engine routes are not supported"));
         }
-        if args.max_running_requests == 0 {
-            return Err(invalid_argument("max-running-requests must be positive"));
+
+        let (serve, stated) = args
+            .serve
+            .resolve()
+            .map_err(|error| invalid_argument(format!("{error:#}")))?;
+        if let Some(path) = UNSUPPORTED_PATHS
+            .iter()
+            .find(|path| stated.contains_within(path))
+        {
+            return Err(invalid_argument(format!(
+                "`{path}` is not supported by the Dynamo worker"
+            )));
+        }
+        if serve.workers.is_none() {
+            return Err(invalid_argument(
+                "`workers` is required: a deployment file places FastH3's components",
+            ));
         }
 
-        let config = DynamoWorkerConfig {
+        let mut config = serve
+            .into_config(&stated)
+            .map_err(|error| invalid_argument(format!("{error:#}")))?;
+        // The Dynamo request form carries no conditions, so the workers
+        // provision no condition rows.
+        config.engine.max_condition_rows = Some(0);
+        let served_model_name = config
+            .served_model_name
+            .clone()
+            .unwrap_or_else(|| config.model.clone());
+
+        let registration = DynamoWorkerConfig {
             namespace: args.common.namespace.clone(),
             component: args.common.component.clone(),
             endpoint: args.common.endpoint.clone(),
             endpoint_types: "videos".to_string(),
-            model_name: args.served_model_name.clone(),
-            served_model_name: Some(args.served_model_name.clone()),
+            model_name: served_model_name.clone(),
+            served_model_name: Some(served_model_name.clone()),
             model_input: ModelInput::Text,
             custom_jinja_template: None,
             tool_call_parser: None,
@@ -227,12 +238,13 @@ impl DynamoFastH3Engine {
         };
         Ok((
             Self {
-                args,
+                config,
+                served_model_name,
                 outputs: OnceCell::new(),
                 state: OnceCell::new(),
                 cancel: CancellationToken::new(),
             },
-            config,
+            registration,
         ))
     }
 
@@ -249,64 +261,21 @@ impl DynamoFastH3Engine {
     async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
-        let pipeline =
-            uniserve_server::profile::assets::resolve_pipeline_index(&self.args.model_path)
-                .await
-                .map_err(|error| invalid_argument(error.to_string()))?;
+        let pipeline = uniserve_server::profile::assets::resolve_pipeline_index(&self.config.model)
+            .await
+            .map_err(|error| invalid_argument(error.to_string()))?;
         if pipeline.and_then(|index| ModelDescription::from_pipeline_class(&index.class_name))
             != Some(ModelDescription::MiniMaxH3)
         {
             return Err(invalid_argument(
-                "model-path is not a FastH3 video-generation checkpoint",
+                "MODEL is not a FastH3 video-generation checkpoint",
             ));
         }
-        let worker_process = WorkerProcessArgs {
-            python: self.args.worker_python.clone(),
-            model: self.args.model_path.clone(),
-            host: self.args.host_identity.clone(),
-            quantization_config: self.args.quantization_config.clone(),
-            graph_policy: self.args.graph_policy.clone(),
-            ..WorkerProcessArgs::default()
-        };
 
-        // Only `uniserve_server::http` binds `listener_mode`, and this worker
-        // never serves UniServe's HTTP API; a loopback ephemeral address
-        // satisfies `Config::validate`.
-        let config = Config {
-            engine: EngineSettings {
-                max_batch: DEFAULT_MAX_BATCH,
-                max_num_batched_tokens: None,
-                max_num_seqs: self.args.max_running_requests,
-                max_num_waiting: None,
-                long_prefill_threshold: None,
-                prefix_reuse: true,
-                scheduler_policy: SchedulingPolicy::Fcfs,
-                max_model_len: Some(self.args.max_model_len),
-                max_video_seconds: self.args.max_video_seconds,
-                video_resolutions: self.args.video_resolutions.clone(),
-                video_aspect_ratios: self.args.video_aspect_ratios.clone(),
-                // The Dynamo request form carries no conditions, so the
-                // worker provisions no condition rows.
-                max_condition_rows: Some(0),
-                workers: self.args.workers.to_vec(),
-                transfer: Default::default(),
-                data_parallel_size: 1,
-                expert_parallel: None,
-                worker_process,
-            },
-            model: self.args.model_path.clone(),
-            served_model_name: Some(self.args.served_model_name.clone()),
-            listener_mode: HttpListenerMode::BindTcp {
-                host: "127.0.0.1".to_string(),
-                port: 0,
-            },
-            log_stats: true,
-            ..Config::default()
-        };
-        config
-            .validate()
-            .map_err(|error| invalid_argument(error.to_string()))?;
-        let state = uniserve_server::build_state(&config)
+        // Only `uniserve_server::http` binds the configuration's listener, and
+        // this worker never serves UniServe's HTTP API.
+        let config = &self.config;
+        let state = uniserve_server::build_state(config)
             .await
             .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
 
@@ -337,7 +306,7 @@ impl RawEngine for DynamoFastH3Engine {
             return Err(engine_error("UniServe engine already started"));
         }
         let (state, outputs) = self.build_state().await?;
-        let runtime_data = runtime_data(self.args.max_video_seconds, &outputs);
+        let runtime_data = runtime_data(self.config.engine.max_video_seconds, &outputs);
         self.state
             .set(state)
             .map_err(|_| engine_error("UniServe engine already started"))?;
@@ -345,8 +314,8 @@ impl RawEngine for DynamoFastH3Engine {
             .set(outputs)
             .map_err(|_| engine_error("UniServe engine already started"))?;
         Ok(EngineConfig {
-            model: self.args.served_model_name.clone(),
-            served_model_name: Some(self.args.served_model_name.clone()),
+            model: self.served_model_name.clone(),
+            served_model_name: Some(self.served_model_name.clone()),
             runtime_data,
             llm: None,
             ..Default::default()
@@ -376,8 +345,8 @@ impl RawEngine for DynamoFastH3Engine {
         // `generate` before the stream.
         let prepared = match prepare_request(
             request,
-            &self.args.served_model_name,
-            self.args.max_video_seconds,
+            &self.served_model_name,
+            self.config.engine.max_video_seconds,
             &outputs.rasters,
         ) {
             Ok(prepared) => prepared,
@@ -404,7 +373,7 @@ impl RawEngine for DynamoFastH3Engine {
             Err(error) => return Err(api_error(error)),
         };
         let cancel = self.cancel.clone();
-        let served_model_name = self.args.served_model_name.clone();
+        let served_model_name = self.served_model_name.clone();
         let response_format = prepared.response_format;
         let outputs = outputs.clone();
 
@@ -1032,6 +1001,73 @@ fn dynamo_error(kind: BackendError, message: impl Into<String>) -> DynamoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses a worker command line as `from_args` does.
+    fn parsed(flags: &[&str]) -> Result<(DynamoFastH3Engine, DynamoWorkerConfig), DynamoError> {
+        let args = Args::try_parse_from(["uniserve-dynamo-worker"].iter().chain(flags))
+            .expect("the command line parses");
+        DynamoFastH3Engine::try_from_args(args)
+    }
+
+    /// The worker takes `uniserve serve`'s options and refuses, by path,
+    /// those a Dynamo `t2va` worker cannot honor, and a missing deployment.
+    #[test]
+    fn serve_options_configure_the_worker_and_unsupported_ones_are_refused() {
+        let deployment = std::env::temp_dir().join(format!(
+            "uniserve-dynamo-deployment-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &deployment,
+            "[[workers]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 6\n\
+             [workers.components.transformer]\n",
+        )
+        .unwrap();
+        let workers = deployment.to_str().unwrap();
+
+        let (engine, registration) = parsed(&[
+            "/models/FastH3",
+            "--workers",
+            workers,
+            "--served-model-name",
+            "FastH3",
+            "--set",
+            "video_config.max_seconds=5",
+        ])
+        .unwrap();
+        assert_eq!(registration.model_name, "FastH3");
+        assert_eq!(engine.config.engine.max_video_seconds, 5.0);
+        assert_eq!(engine.config.engine.max_condition_rows, Some(0));
+
+        for flags in [
+            vec!["/models/FastH3", "--workers", workers, "--port", "9000"],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--data-parallel-size",
+                "2",
+            ],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--set",
+                "video_config.max_condition_rows=4",
+            ],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--set",
+                "media_config.allow_remote=false",
+            ],
+            vec!["/models/FastH3"],
+        ] {
+            let error = parsed(&flags).err().expect("refused");
+            assert!(error.to_string().contains('`'), "{flags:?}: {error}");
+        }
+    }
 
     fn request() -> Value {
         json!({

@@ -5,14 +5,14 @@
 //!   bounded by the request body limit; the decoded media is bounded like any
 //!   other source.
 //! - `file://` resolves only below the configured media directory
-//!   (`--media-directory`) and is refused when none is configured. A path
+//!   (`media_config.directory`) and is refused when none is configured. A path
 //!   outside the directory is refused before the filesystem is consulted, so
 //!   requests cannot learn which files exist elsewhere. The path is then
 //!   canonicalized, so symbolic links that lead outside the directory are
 //!   refused, and the canonical path is opened without following a final
 //!   symbolic link, so a link swapped in after the check is refused as well.
 //! - `http://` and `https://` are fetched by the server unless remote media is
-//!   disabled (`--remote-media`). A fetch has a connect timeout, a total
+//!   disabled (`media_config.allow_remote`). A fetch has a connect timeout, a total
 //!   timeout covering the body, a redirect limit and the size caps below; a
 //!   redirect may not leave HTTP(S) or downgrade HTTPS to HTTP.
 //!
@@ -27,7 +27,7 @@
 //! no intermediary resolves on the server's behalf. Ports are not
 //! restricted.
 //!
-//! A request's media are capped together by one total (`--max-request-bytes`),
+//! A request's media are capped together by one total (`media_config.max_request_bytes`),
 //! which a single condition may use up; a `Content-Length` above the cap is
 //! refused before the body is read and a body is abandoned as soon as it
 //! exceeds the cap.
@@ -55,7 +55,7 @@ use uniserve_core::video::plan::VideoInputError;
 /// One condition may be as large as the request's whole media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaLimits {
-    /// Cap of all media of one request (`--max-request-bytes`).
+    /// Cap of all media of one request (`media_config.max_request_bytes`).
     pub total_bytes: u64,
 }
 
@@ -69,7 +69,7 @@ impl MediaLimits {
 /// How the server fetches `http(s)://` media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteMediaPolicy {
-    /// Whether remote media is fetched at all (`--remote-media`).
+    /// Whether remote media is fetched at all (`media_config.allow_remote`).
     pub enabled: bool,
     /// Longest time to establish a connection.
     pub connect_timeout: Duration,
@@ -100,7 +100,7 @@ impl Default for RemoteMediaPolicy {
 /// The server's media policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPolicy {
-    /// The directory `file://` URIs resolve under (`--media-directory`);
+    /// The directory `file://` URIs resolve under (`media_config.directory`);
     /// `None` refuses `file://`.
     pub media_directory: Option<PathBuf>,
     /// How remote media is fetched.
