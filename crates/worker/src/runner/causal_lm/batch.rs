@@ -37,6 +37,7 @@ use crate::runner::vision::PositionLayout;
 use crate::sampling::SamplingControls;
 use crate::storage::Metadata;
 use crate::storage::{OutputPlacement, ProductBuffer};
+use crate::stream::Issue as _;
 use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
@@ -161,13 +162,16 @@ pub(super) struct TokenBatch<'a> {
 
 impl Opening {
     /// Bind the batch's outputs to their requests, then record in `job`
-    /// the batch's order after the previous one and the read of every
-    /// host-gated predicate: the job's completion carries one byte each.
+    /// the batch's order after the previous one and after `page_reads`,
+    /// the fence of the host page tier reads the copy lane issued for it
+    /// (`PrefixCache::issue_pages`), and the read of every host-gated
+    /// predicate: the job's completion carries one byte each.
     pub(super) fn open(
         owners: &mut Owners<'_>,
         placement: &crate::config::placement::GroupPlacement,
         rank: usize,
         job: &Job,
+        page_reads: Option<&Arc<uniserve_cuda::Event>>,
     ) -> Result<Self> {
         let plan = owners.plan;
         let runtime = &mut *owners.runtime;
@@ -198,6 +202,11 @@ impl Opening {
         // false one skips its call.
         let issue = job.on(stream.as_ref());
         runtime.order.wait(issue)?;
+        // The copy lane made the fence's record before the batch reached
+        // its lane: the batch's inputs waited for the job that records it.
+        if let Some(fence) = page_reads {
+            issue.wait(fence)?;
+        }
         let mut calls = crate::executor::batch::Opening::<TokenCall>::open(
             owners.requests,
             &owners.storage.tensors,
@@ -391,24 +400,24 @@ impl<'a> TokenBatch<'a> {
             )
         };
         prefix_cache.install(&assignments, stream)?;
+        // Units the host page tier's reads filled on the copy lane are
+        // overwritten whole there, and are not recycled.
+        let read: HashSet<u32> = plan
+            .page_reads
+            .iter()
+            .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
+            .collect();
         let units: Vec<u32> = plan
             .new_cache_units
             .iter()
             .filter(|allocation| active.contains(&allocation.request_pool_idx))
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
+            .filter(|unit| !read.contains(unit))
             .collect();
         let lane = self.runtime.groups[self.group][0];
         if !units.is_empty() {
             prefix_cache.recycle(&units, &self.runtime.columns[lane], stream)?;
         }
-        // Pages of the host tier fill recycled units before the forward,
-        // and published pages are copied out behind earlier forwards.
-        prefix_cache.copy_pages(
-            &plan.page_reads,
-            &plan.page_writes,
-            &self.runtime.columns[lane],
-            stream,
-        )?;
 
         // Each active call has one forward row on its own slot; a context
         // prefill has one per prompt run and vision block (checked against

@@ -19,6 +19,30 @@ use crate::lane::{Completion, Job, JobId};
 use crate::runner::encoder::inputs::Inputs;
 use crate::{Error, Result};
 
+/// Where a batch's host page tier copies stand on the copy lane
+/// (`PrefixCache::issue_pages`).
+#[derive(Default)]
+enum Pages {
+    /// Not recorded yet.
+    #[default]
+    Unissued,
+    /// Submitted to the copy lane, which has not performed the job yet.
+    Issuing(PageFences),
+    /// Performed: the fences' records are made.
+    Issued(PageFences),
+}
+
+/// The fences of a batch's page copies, recorded on the copy lane of the
+/// cache's `device`. A batch without copies has neither.
+#[derive(Default)]
+struct PageFences {
+    device: Option<uniserve_cuda::DeviceId>,
+    /// Behind the reads: the batch's forward waits on it.
+    reads: Option<Arc<uniserve_cuda::Event>>,
+    /// Behind the writes: the batch's output waits on it.
+    writes: Option<Arc<uniserve_cuda::Event>>,
+}
+
 /// A submitted batch with its lifecycle and numerical state.
 pub(crate) struct WorkerBatch {
     pub(super) plan: Arc<BatchPlan>,
@@ -52,6 +76,8 @@ pub(crate) struct WorkerBatch {
     sizing: Option<crate::request::video::Sizing>,
     /// Products and cache transfers imported from other calls.
     inputs: crate::executor::inputs::Inputs,
+    /// The batch's host page tier copies.
+    pages: Pages,
     /// A video model's media batch between two of its jobs.
     media: Option<crate::executor::video::Pending>,
     output: Option<BatchResult>,
@@ -85,8 +111,18 @@ impl WorkerBatch {
             image: None,
             sizing: None,
             inputs: crate::executor::inputs::Inputs::default(),
+            pages: Pages::default(),
             media: None,
             output: None,
+        }
+    }
+
+    /// The fence of the batch's host page tier reads once the copy lane
+    /// issued them; the batch's forward waits on it.
+    pub(crate) fn page_reads(&self) -> Option<&Arc<uniserve_cuda::Event>> {
+        match &self.pages {
+            Pages::Issued(fences) => fences.reads.as_ref(),
+            Pages::Unissued | Pages::Issuing(_) => None,
         }
     }
 
@@ -246,6 +282,15 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
+        // The batch's host page tier copies go to the copy lane first, so
+        // they overlap the forward the previous batch runs; the batch goes
+        // on once the lane issued them.
+        if matches!(batch.pages, Pages::Unissued)
+            && let Some(job) = self.issue_pages(batch)?
+        {
+            return Ok(Some(job));
+        }
+
         // A video request this batch started evaluates in a layout the
         // library selects for its size. Asking is a job of the Python
         // thread (it issues nothing on a stream); the batch goes on from
@@ -292,11 +337,50 @@ impl WorkerBackend {
         admitted.map(|()| submitted)
     }
 
+    /// Record the batch's host page tier copies and submit them to the copy
+    /// lane; `None` when the batch copies no page.
+    fn issue_pages(
+        &mut self,
+        batch: &mut WorkerBatch,
+    ) -> std::result::Result<Option<JobId>, WorkerError> {
+        let plan = &batch.plan;
+        if plan.page_reads.is_empty() && plan.page_writes.is_empty() {
+            batch.pages = Pages::Issued(PageFences::default());
+            return Ok(None);
+        }
+        let prefix_cache = self
+            .runtimes
+            .worker_storage
+            .as_mut()
+            .and_then(|storage| storage.prefix_cache.as_mut())
+            .ok_or_else(|| {
+                Error::Invalid("a batch copies pages but the rank has no prefix cache".into())
+            })?;
+        let issued = prefix_cache.issue_pages(&plan.page_reads, &plan.page_writes)?;
+        let job = self.jobs.start_copy(issued.job, true).map_err(lane_lost)?;
+        batch.pages = Pages::Issuing(PageFences {
+            device: Some(issued.device),
+            reads: issued.reads,
+            writes: issued.writes,
+        });
+        Ok(Some(job))
+    }
+
     pub(crate) fn inputs_admitted(
         &mut self,
         batch: &mut WorkerBatch,
         completion: Completion,
     ) -> std::result::Result<(), WorkerError> {
+        // The copy lane issued the batch's page copies: their fences are
+        // recorded, whether the copies were issued or failed.
+        if let Pages::Issuing(fences) = std::mem::take(&mut batch.pages) {
+            batch.pages = Pages::Issued(fences);
+            completion.check().map_err(|failure| {
+                WorkerError::classify(failure.error, Some("host page tier copies"))
+            })?;
+            return Ok(());
+        }
+
         let Some(mut sizing) = batch.sizing.take() else {
             return crate::executor::inputs::admitted(self, batch, completion);
         };
@@ -470,22 +554,34 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
-        let (Some(kind), Some(running)) = (batch.route(), &batch.running) else {
-            return Ok(None);
-        };
         // The fences are named by the lease, which holds them whatever the
         // event pool has released since they were recorded.
-        let fences: Vec<_> = crate::lock(&running.buffer)
-            .device_fences()
-            .map(|(device, fence)| (device, Arc::clone(fence)))
-            .collect();
+        let mut fences: Vec<_> = match &batch.running {
+            Some(running) => crate::lock(&running.buffer)
+                .device_fences()
+                .map(|(device, fence)| (device, Arc::clone(fence)))
+                .collect(),
+            None => Vec::new(),
+        };
+        // The output reports the batch's page writes complete.
+        if let Pages::Issued(PageFences {
+            device: Some(device),
+            writes: Some(fence),
+            ..
+        }) = &batch.pages
+        {
+            fences.push((*device, Arc::clone(fence)));
+        }
         let Some(&(device, _)) = fences.first() else {
             return Ok(None);
         };
         let fences = fences.into_iter().map(|(_, fence)| fence).collect();
 
         // The job holds no operation: its completion is posted once the
-        // lease's fences completed.
+        // fences completed. A batch without calls has none.
+        let Some(kind) = batch.route() else {
+            return Ok(None);
+        };
         let job = Job::new();
         job.after(device, fences);
         self.jobs

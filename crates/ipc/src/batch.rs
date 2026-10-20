@@ -375,10 +375,12 @@ pub struct Batch {
     pub input_products: Vec<TensorExport>,
     /// Imported cache exports consumed by explicit cache installation call kinds.
     pub cache_inputs: Vec<CacheTransfer>,
-    /// Pages read from the host page tier into new units before the
-    /// forward.
+    /// Pages read from the host page tier into new units, on the rank's
+    /// copy lane as soon as the batch arrives; the forward waits for them.
     pub page_reads: Vec<PageCopy>,
-    /// Published pages written to the host page tier.
+    /// Published pages written to the host page tier, on the rank's copy
+    /// lane as soon as the batch arrives; the batch's output reports them
+    /// complete.
     pub page_writes: Vec<PageCopy>,
 }
 
@@ -505,8 +507,8 @@ impl Batch {
             .map(|call| ((call.request_key, call.call_id), call))
             .collect::<HashMap<_, _>>();
 
-        // A page read fills new units of the batch, which the worker resets
-        // before it; every page copy names real units.
+        // A page read fills new units of the batch, which it overwrites
+        // whole; every page copy names real units.
         let new_units = self
             .new_cache_units
             .iter()

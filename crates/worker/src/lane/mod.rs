@@ -36,6 +36,12 @@
 //! stays inside one job, such as a driver call that does not return, is
 //! seen from the control thread, which reports it to the head.
 //!
+//! A rank whose prefix cache copies pages through the host page tier has a
+//! copy lane beside them: a full-device stream of the cache's device and
+//! its thread, which serves no call kind. A batch's page copies are its
+//! jobs ([`JobQueues::start_copy`]), issued as soon as the batch arrives,
+//! so they overlap the forward the previous batch runs on its lane.
+//!
 //! The lanes' streams belong to the rank's [`Streams`](crate::stream::Streams),
 //! which starts the lanes and closes every stream in dependency order.
 
@@ -69,9 +75,9 @@ pub(crate) struct Lane {
 }
 
 impl Lane {
-    /// Start the execution thread of `stream`, named `lane-{index}`.
+    /// Start the execution thread of `stream`, named `name`.
     pub(crate) fn start(
-        index: usize,
+        name: String,
         config: Option<LaneConfig>,
         stream: CUDAStream,
         completions: Sender<(JobId, Completion)>,
@@ -80,7 +86,7 @@ impl Lane {
         // The thread ends when the lane and every clone of its queue are
         // gone.
         std::thread::Builder::new()
-            .name(format!("lane-{index}"))
+            .name(name)
             .spawn(move || queue.run())
             .map_err(|error| Error::transport_source("execution thread", error))?;
 
@@ -100,10 +106,12 @@ impl Lane {
 }
 
 impl JobQueues {
-    /// The job queues of `lanes`, whose threads post to `posted`; the
-    /// control thread takes completions from `completions`.
+    /// The job queues of `lanes` and of the copy lane `copy`, whose threads
+    /// post to `posted`; the control thread takes completions from
+    /// `completions`.
     pub(crate) fn of(
         lanes: &[Lane],
+        copy: Option<&Lane>,
         posted: Sender<(JobId, Completion)>,
         completions: Receiver<(JobId, Completion)>,
     ) -> Self {
@@ -125,7 +133,13 @@ impl JobQueues {
                     .map_or_else(|| format!("lane-{index}"), |config| config.lane_id.clone())
             })
             .collect();
-        Self::new(queues, names, posted, completions)
+        Self::new(
+            queues,
+            names,
+            copy.map(|lane| lane.jobs.clone()),
+            posted,
+            completions,
+        )
     }
 }
 
@@ -140,6 +154,8 @@ pub(crate) struct JobQueues {
 struct Shared {
     /// Each lane's served call kinds (`None` serves every kind) and queue.
     queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
+    /// The copy lane's queue, when the rank has one.
+    copy: Option<JobQueue>,
     /// Where every lane and the Python thread post their completions.
     completions: Receiver<(JobId, Completion)>,
     /// The posting end the Python thread's work is given.
@@ -152,9 +168,9 @@ struct Shared {
     /// Completions taken while another job was waited for, in arrival
     /// order.
     arrived: Mutex<VecDeque<(JobId, Completion)>>,
-    /// What each lane, by position, and then the Python thread have been
-    /// given and not completed. Changed only by the thread that submits
-    /// jobs and takes completions.
+    /// What each lane, by position, then the copy lane when the rank has
+    /// one, and then the Python thread have been given and not completed.
+    /// Changed only by the thread that submits jobs and takes completions.
     running: Mutex<Vec<Running>>,
 }
 
@@ -188,26 +204,30 @@ impl Default for JobQueues {
     /// thread that submits it.
     fn default() -> Self {
         let (posted, completions) = crossbeam_channel::unbounded();
-        Self::new(Vec::new(), Vec::new(), posted, completions)
+        Self::new(Vec::new(), Vec::new(), None, posted, completions)
     }
 }
 
 impl JobQueues {
-    /// The queues `queues` of the lanes named `names`, in the same order.
+    /// The queues `queues` of the lanes named `names`, in the same order,
+    /// and the copy lane's queue `copy`.
     fn new(
         queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
         names: Vec<String>,
+        copy: Option<JobQueue>,
         posted: Sender<(JobId, Completion)>,
         completions: Receiver<(JobId, Completion)>,
     ) -> Self {
         let running = names
             .into_iter()
             .map(|name| Running::new(Some(name)))
+            .chain(copy.iter().map(|_| Running::new(Some(COPY_LANE.into()))))
             .chain([Running::new(None)])
             .collect();
         Self {
             shared: Arc::new(Shared {
                 queues,
+                copy,
                 completions,
                 posted,
                 wake: Mutex::new(None),
@@ -224,6 +244,16 @@ impl JobQueues {
 
     fn running(&self) -> std::sync::MutexGuard<'_, Vec<Running>> {
         lock(&self.shared.running)
+    }
+
+    /// The copy lane's position among the performers: after the lanes.
+    fn copy_performer(&self) -> usize {
+        self.shared.queues.len()
+    }
+
+    /// The Python thread's position among the performers: the last.
+    fn python_performer(&self) -> usize {
+        self.shared.queues.len() + usize::from(self.shared.copy.is_some())
     }
 
     /// Note that job `id`, which calls `method`, was given to `performer`
@@ -325,6 +355,20 @@ impl JobQueues {
         self.start(kind, job, true)
     }
 
+    /// Queue `job` on the copy lane without waiting for it, as
+    /// [`Self::start`] does on the lane serving a kind. Fails for a rank
+    /// without a copy lane.
+    pub(crate) fn start_copy(&self, job: Job, wake: bool) -> Result<JobId> {
+        let copy = self.shared.copy.as_ref().ok_or(Error::State(
+            "the rank has no copy lane: it maps no host page pool",
+        ))?;
+        let id = self.name();
+        let method = job.method();
+        copy.start(id, job, wake)?;
+        self.submitted(self.copy_performer(), id, method);
+        Ok(id)
+    }
+
     /// Queue on lane `lane` a job that completes once `events` completed,
     /// as [`Self::after`] does on the lane serving a kind.
     pub(crate) fn after_on(
@@ -385,7 +429,13 @@ impl JobQueues {
     pub(crate) fn drain(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut last = Vec::new();
-        for (index, (_, lane)) in self.shared.queues.iter().enumerate() {
+        let lanes = self
+            .shared
+            .queues
+            .iter()
+            .map(|(_, lane)| lane)
+            .chain(&self.shared.copy);
+        for (index, lane) in lanes.enumerate() {
             let id = self.name();
             lane.start(id, Job::new(), false)?;
             self.submitted(index, id, None);
@@ -438,8 +488,7 @@ impl JobQueues {
         let wake = if wake { self.wake().clone() } else { None };
         let post = queue::Post::new(id, self.shared.posted.clone(), wake);
         Interpreter::submit(move || post.now(calls.perform()));
-        // The Python thread is the performer after the lanes.
-        self.submitted(self.shared.queues.len(), id, method);
+        self.submitted(self.python_performer(), id, method);
         id
     }
 
@@ -488,7 +537,13 @@ impl JobQueues {
     /// of a completion it does not wait for.
     pub(crate) fn set_wake(&self, wake: Option<Wake>) {
         (*self.wake()).clone_from(&wake);
-        for (_, jobs) in &self.shared.queues {
+        let lanes = self
+            .shared
+            .queues
+            .iter()
+            .map(|(_, jobs)| jobs)
+            .chain(&self.shared.copy);
+        for jobs in lanes {
             // A lane that is gone posts nothing to be woken for; its next
             // job reports it.
             let _ = jobs.set_wake(wake.clone());
@@ -497,6 +552,9 @@ impl JobQueues {
 }
 
 const LOST: Error = Error::State("the rank's execution threads have exited");
+
+/// The copy lane's name, in its thread's name and in a stall report.
+pub(crate) const COPY_LANE: &str = "copy-lane";
 
 /// How long a caller that is not serving waits for one job
 /// ([`JobQueues::block_on`], [`JobQueues::drain`]). A startup job may
@@ -525,6 +583,7 @@ mod tests {
         let queues = JobQueues::new(
             vec![(None, queue)],
             vec!["lane-0".into()],
+            None,
             posted,
             completions,
         );
@@ -612,6 +671,48 @@ mod tests {
         assert_eq!(next(&queues).0, stuck);
         assert_eq!(next(&queues).0, behind);
         Ok(())
+    }
+
+    #[test]
+    fn a_copy_job_is_performed_beside_a_lane_that_is_busy() -> Result<()> {
+        let (posted, completions) = crossbeam_channel::unbounded();
+        let (lane, lane_jobs) = JobQueue::new(posted.clone());
+        let (copy, copy_jobs) = JobQueue::new(posted.clone());
+        std::thread::spawn(move || lane_jobs.run());
+        std::thread::spawn(move || copy_jobs.run());
+        let queues = JobQueues::new(
+            vec![(None, lane)],
+            vec!["lane-0".into()],
+            Some(copy),
+            posted,
+            completions,
+        );
+        let limit = Duration::from_secs(30);
+
+        // The lane stays inside a forward's job; a page copy submitted
+        // behind it is performed on the copy lane meanwhile.
+        let (open, gate) = crossbeam_channel::bounded::<()>(1);
+        let forward = Job::new();
+        forward.on(None).launch_host_fn(Box::new(move || {
+            let _ = gate.recv_timeout(limit);
+        }))?;
+        let forward = queues.start(DECODE, forward, true)?;
+        let copy = queues.start_copy(Job::new(), true)?;
+        assert_eq!(next(&queues).0, copy);
+        assert_eq!(
+            queues.performing(forward).map(|(lane, _)| lane),
+            Some(Some("lane-0".into()))
+        );
+
+        open.send(())
+            .map_err(|_| Error::State("the lane dropped its job"))?;
+        assert_eq!(next(&queues).0, forward);
+        queues.drain(limit)
+    }
+
+    #[test]
+    fn a_rank_without_a_copy_lane_refuses_page_copies() {
+        assert!(JobQueues::default().start_copy(Job::new(), true).is_err());
     }
 
     #[test]

@@ -414,7 +414,15 @@ impl Worker {
                 launch.storage.tcp.as_deref(),
             )
             .map_err(phase("storage"))?;
-            prefix_cache.set_page_tier(tier);
+            // The tier's copies run on a copy lane of the cache's device,
+            // beside the forwards of the lanes.
+            let copy = streams
+                .start_copy_lane(cuda)
+                .and_then(|lane| Ok(lane.stream()?.clone()))
+                .map_err(phase("streams"))?;
+            prefix_cache
+                .set_page_tier(tier, copy)
+                .map_err(phase("storage"))?;
             reported.page_pools = pools;
         }
         let mut components = components;

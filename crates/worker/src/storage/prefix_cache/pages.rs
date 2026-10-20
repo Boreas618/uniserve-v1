@@ -5,7 +5,8 @@
 //! of the host whose pages have the same shape. The rank maps each pool
 //! writable and registers it for device copies; the head decides which
 //! pages to copy and carries them in batches (`Batch::page_reads`,
-//! `Batch::page_writes`), and the copies run in the batch's lane job.
+//! `Batch::page_writes`), and the copies run on the rank's copy lane as soon
+//! as the batch arrives (`PrefixCache::issue_pages`).
 //!
 //! A page is one page of one group on this rank, layer-major:
 //!
@@ -226,8 +227,9 @@ impl PageTier {
     }
 
     /// Fill the units of `reads` from their slots in `stream` order. The
-    /// units are new units of the batch, recycled before this on the same
-    /// stream; an FP8 pool then marks them initialized with `column`.
+    /// units are new units of the batch, which the copies overwrite whole
+    /// (every column of both fields, and an FP8 pool's scales); an FP8 pool
+    /// then marks them initialized with `column`, bound to `stream`.
     pub(crate) fn read(
         &self,
         planes: &CachePlanes,
@@ -252,7 +254,8 @@ impl PageTier {
         );
         // SAFETY: the slots are pinned by the head until the batch's output
         // arrives, and the units are the batch's new units, which no other
-        // operation reads or writes before the batch's forward.
+        // operation reads or writes before the batch's forward, which waits
+        // for these copies.
         unsafe { stream.copy(&batch) }?;
         if planes.plan().quantized {
             let units: Vec<u32> = reads
@@ -265,7 +268,7 @@ impl PageTier {
     }
 
     /// Copy the units of the published pages of `writes` into their slots
-    /// in `stream` order; the batch's output follows the copies.
+    /// in `stream` order; the batch's output waits for the copies.
     pub(crate) fn write(
         &self,
         planes: &CachePlanes,
