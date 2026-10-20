@@ -61,6 +61,15 @@ pub struct WorkerProcessArgs {
     /// runs (`kv_cache_config.mooncake`), keeping committed pages in the
     /// distributed tier.
     pub storage_connector: Option<uniserve_storage::connector::Settings>,
+    /// Whether the group keeps a standby rank group beside its serving one
+    /// (`worker_config.standby`), promoted when the serving group fails.
+    pub keep_standby: bool,
+    /// Whether this launch's workers stand by for the group's serving
+    /// workers: they map the exclusive storages those hold without taking
+    /// write access, warm up on scratch units, and park until promoted.
+    pub standby: bool,
+    /// The cache units a standby launch adopts: the serving workers'.
+    pub cache_units: Option<u32>,
     /// Model identifier or local model path.
     pub model: String,
     /// Ordered physical members of this worker group.

@@ -342,7 +342,7 @@ impl WorkerProcess {
     ///
     /// The rank answers only once its model is built and warmed up;
     /// `poll_startup` takes the answer.
-    fn request_startup(&mut self) -> anyhow::Result<()> {
+    pub(super) fn request_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::info();
         request.set_message_id(Some(message_id));
@@ -357,7 +357,7 @@ impl WorkerProcess {
     /// Fails when the rank reports that its startup failed, and when its
     /// connection has closed, which is how a rank that died while starting
     /// is noticed.
-    fn poll_startup(&mut self) -> anyhow::Result<bool> {
+    pub(super) fn poll_startup(&mut self) -> anyhow::Result<bool> {
         let response = self
             .client
             .try_recv::<WorkerResponse>()
@@ -406,6 +406,51 @@ impl WorkerProcess {
             tracing::debug!(rank = self.rank, %error, "the rank's NCCL names could not be noted");
         }
         Ok(true)
+    }
+
+    /// Promotes a parked standby rank (`WorkerRequest::Promote`): it takes
+    /// write access to the exclusive storages its predecessor held, which
+    /// the Storage Server shoots down if it still holds them, and serves.
+    /// Waits for the rank's answer at most `timeout`.
+    ///
+    /// Fails when the rank refuses, dies, or does not answer in time.
+    pub(super) fn promote(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        let message_id = self.alloc_call_id();
+        let mut request = WorkerRequest::promote();
+        request.set_message_id(Some(message_id));
+        self.client.send(&request)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let response = self
+                .client
+                .try_recv::<WorkerResponse>()
+                .with_context(|| format!("standby rank {} was lost", self.rank))?;
+            match response {
+                Some(WorkerResponse::Ok {
+                    message_id: Some(id),
+                }) if id == message_id => {
+                    tracing::info!(rank = self.rank, "the standby rank was promoted");
+                    return Ok(());
+                }
+                Some(WorkerResponse::Error { error, .. }) => {
+                    bail!(
+                        "standby rank {} was not promoted: {}",
+                        self.rank,
+                        error.message
+                    )
+                }
+                Some(other) => bail!("unexpected promotion response: {:?}", other.kind()),
+                None => {}
+            }
+            self.check_worker("standby promotion")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "standby rank {} was not promoted within {timeout:?}",
+                self.rank
+            );
+            let _ = self.client.wait(remaining.min(WORKER_CHECK_INTERVAL));
+        }
     }
 
     /// Allocates the next worker message identifier.

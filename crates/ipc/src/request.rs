@@ -21,6 +21,8 @@ pub enum RequestKind {
     Submit,
     /// Requests orderly worker shutdown.
     Close,
+    /// Promotes a standby worker to serving.
+    Promote,
 }
 
 impl RequestKind {
@@ -30,6 +32,7 @@ impl RequestKind {
             Self::Info => "info",
             Self::Submit => "submit",
             Self::Close => "close",
+            Self::Promote => "promote",
         }
     }
 }
@@ -55,6 +58,14 @@ pub enum WorkerRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
     },
+    /// Promotes a parked standby worker to serving: it takes write access
+    /// to the exclusive storages its predecessor held, once the predecessor
+    /// is out, and makes their mappings writable at unchanged addresses.
+    /// Answered with `Ok` once the worker serves.
+    Promote {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+    },
 }
 
 impl WorkerRequest {
@@ -64,6 +75,7 @@ impl WorkerRequest {
             Self::Info { .. } => RequestKind::Info,
             Self::Submit { .. } => RequestKind::Submit,
             Self::Close { .. } => RequestKind::Close,
+            Self::Promote { .. } => RequestKind::Promote,
         }
     }
 
@@ -72,7 +84,8 @@ impl WorkerRequest {
         match self {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
-            | Self::Close { message_id } => *message_id,
+            | Self::Close { message_id }
+            | Self::Promote { message_id } => *message_id,
         }
     }
 
@@ -81,7 +94,8 @@ impl WorkerRequest {
         match self {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
-            | Self::Close { message_id } => *message_id = value,
+            | Self::Close { message_id }
+            | Self::Promote { message_id } => *message_id = value,
         }
     }
 
@@ -109,6 +123,11 @@ impl WorkerRequest {
     /// Constructs a worker-shutdown request.
     pub fn close() -> Self {
         Self::Close { message_id: None }
+    }
+
+    /// Constructs a standby promotion request.
+    pub fn promote() -> Self {
+        Self::Promote { message_id: None }
     }
 }
 

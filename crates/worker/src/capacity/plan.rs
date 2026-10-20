@@ -365,6 +365,7 @@ impl TokenLayout {
         let mut capacity = CacheCapacity::derive(&CacheDemand {
             pages: &pages,
             tokens,
+            units: config.cache_units.map(u64::from),
             unit_bytes,
             available_bytes: available,
             reserved_units,
@@ -522,6 +523,7 @@ pub(crate) mod tests {
             expert_microbatches: 1,
             block_size: None,
             max_total_tokens: None,
+            cache_units: None,
             attention_backend: "auto".into(),
             max_batch_calls: 1024,
             max_batch_tokens: 8192,

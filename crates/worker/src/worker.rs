@@ -722,12 +722,31 @@ impl Worker {
         stall_bound: std::time::Duration,
     ) -> std::result::Result<Ending, WorkerError> {
         self.warmup()?;
+        // The rank reports the scratch units its warmup used, which a
+        // standby worker's warmup stays inside while its predecessor serves.
+        let scratch = self
+            .executor
+            .backend()
+            .worker_storage()
+            .and_then(|storage| storage.prefix_cache.as_ref())
+            .map_or(0, crate::storage::PrefixCache::scratch_lent);
+        if let Some(cache) = self.info.prefix_cache.as_mut() {
+            cache.scratch_units = scratch;
+        }
+        // A standby worker parks with its exclusive storages read-only until
+        // the head promotes it.
+        let standby = if self.retained.standing_by() {
+            self.retained.park()?;
+            Some(Arc::clone(&self.retained))
+        } else {
+            None
+        };
         let info = self.info.clone();
         let executor = &mut self.executor;
         // Ranks of an expert union join every step outside their own.
         let experts = executor.backend().experts().is_some();
         executor.backend().set_storage_wake(Some(channel.wake()));
-        let served = Service::new(executor, channel, info, experts, stall_bound).run();
+        let served = Service::new(executor, channel, info, experts, stall_bound, standby).run();
         executor.backend().set_storage_wake(None);
         served
     }

@@ -79,6 +79,14 @@ pub(crate) struct Retained {
     state: Mutex<State>,
 }
 
+/// A standby worker's exclusive storages: their keys, which promotion
+/// takes write access to, and their mappings, read-only while it parks.
+#[derive(Default)]
+struct Standby {
+    keys: Vec<Key>,
+    storages: Vec<Arc<Storage>>,
+}
+
 struct State {
     client: Client,
     /// The GPU UUID of each device the worker addressed, by ordinal.
@@ -87,6 +95,9 @@ struct State {
     written: BTreeSet<Key>,
     /// Every tensor the worker uses, which its startup retains.
     used: BTreeSet<Key>,
+    /// A standby worker's exclusive storages, until it is promoted; `None`
+    /// for a worker that takes write access at once.
+    standby: Option<Standby>,
 }
 
 impl State {
@@ -103,7 +114,9 @@ impl State {
 
 impl Retained {
     /// Connect as worker `rank` of group `group`, started by the group's
-    /// launch `generation`, to the server `launch` names.
+    /// launch `generation`, to the server `launch` names. A standby worker
+    /// (`StorageLaunch::standby`) maps exclusive storages without taking
+    /// write access.
     pub(crate) fn connect(
         launch: &StorageLaunch,
         group: &str,
@@ -131,6 +144,7 @@ impl Retained {
                 gpus: BTreeMap::new(),
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
+                standby: launch.standby.then(Standby::default),
             }),
         }))
     }
@@ -295,6 +309,54 @@ impl Retained {
         Ok(())
     }
 
+    /// Park a standby worker once it warmed up: its exclusive storages
+    /// become read-only, so it writes none of them until it is promoted.
+    pub(crate) fn park(&self) -> Result<()> {
+        let state = lock(&self.state);
+        let Some(standby) = &state.standby else {
+            return Ok(());
+        };
+        for storage in &standby.storages {
+            storage.protect(Protection::ReadOnly)?;
+        }
+        tracing::info!(
+            storages = standby.storages.len(),
+            "the standby worker parked"
+        );
+        Ok(())
+    }
+
+    /// Promote a parked standby worker: take write access to its exclusive
+    /// storages once their previous writer is out (released, or shot down
+    /// by the server), and make the mappings writable at unchanged
+    /// addresses, which its captured graphs address. Fails for a worker
+    /// that is not a standby.
+    pub(crate) fn promote(&self) -> Result<()> {
+        let mut state = lock(&self.state);
+        let standby = state
+            .standby
+            .take()
+            .ok_or_else(|| Error::State("only a standby worker is promoted"))?;
+        state
+            .client
+            .promote(standby.keys.clone())
+            .map_err(|error| storage_error("promoting the standby worker", error))?;
+        for storage in &standby.storages {
+            storage.protect(Protection::ReadWrite)?;
+        }
+        state.written.extend(standby.keys.iter().copied());
+        tracing::info!(
+            storages = standby.storages.len(),
+            "the standby worker was promoted"
+        );
+        Ok(())
+    }
+
+    /// Whether the worker stands by, not yet promoted.
+    pub(crate) fn standing_by(&self) -> bool {
+        lock(&self.state).standby.is_some()
+    }
+
     /// Give up write access at an orderly close, once the worker drained
     /// its streams: a successor takes the storages without a shoot-down.
     pub(crate) fn release(&self) -> Result<()> {
@@ -326,10 +388,22 @@ impl ExclusiveMemory for &Retained {
             ));
         }
         let keys: Vec<Key> = keyed.iter().map(|(_, key, _)| *key).collect();
+        // A standby maps what its predecessor holds, and creates nothing.
+        let standby = state.standby.is_some();
+        let mode = if standby { Mode::Standby } else { Mode::Write };
         let got = state
             .client
-            .get(keys, Mode::Write)
+            .get(keys, mode)
             .map_err(|error| storage_error("taking exclusive storages", error))?;
+        if standby && let Some(missing) = got.missing.first() {
+            let name = keyed
+                .iter()
+                .find(|(_, key, _)| key == missing)
+                .map_or("an exclusive storage", |(name, _, _)| name.as_str());
+            return Err(Error::Invalid(format!(
+                "the standby worker found no {name} of its predecessor's shape"
+            )));
+        }
         if !got.missing.is_empty() {
             let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
             retained.release_untaken(&mut state, &taking)?;
@@ -383,8 +457,16 @@ impl ExclusiveMemory for &Retained {
                     storage
                 }
             };
-            state.written.insert(*key);
             state.used.insert(*key);
+            match &mut state.standby {
+                Some(standby) => {
+                    standby.keys.push(*key);
+                    standby.storages.push(Arc::clone(&storage));
+                }
+                None => {
+                    state.written.insert(*key);
+                }
+            }
             mapped.push(storage);
         }
         tracing::debug!(

@@ -52,6 +52,9 @@ pub struct WorkerConfig {
     /// Tokens per cache page in the group with the widest token rows; unset until binding.
     pub block_size: Option<usize>,
     pub max_total_tokens: Option<usize>,
+    /// The exact prefix cache units of a standby worker
+    /// (`LaunchDescriptor::cache_units`).
+    pub cache_units: Option<u32>,
     /// Attention provider name the model is loaded with, resolved by the
     /// attention registry (`uniserve.backends.attention.resolve`).
     pub attention_backend: String,
@@ -149,6 +152,7 @@ impl WorkerConfig {
         }
         Ok(Self {
             max_total_tokens: None,
+            cache_units: None,
             generation_device: None,
             max_batch_calls: slots,
             max_batch_tokens: slots,

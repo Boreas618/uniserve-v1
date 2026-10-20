@@ -29,6 +29,9 @@ pub(crate) struct CacheDemand<'a> {
     /// A configured token capacity, which sizes the pool instead of the
     /// storage grant.
     pub tokens: Option<u64>,
+    /// The exact units of a standby worker's pool: those of the worker it
+    /// stands by for, whose planes it maps rather than allocates.
+    pub units: Option<u64>,
     /// Device bytes of one unit, with what other owners keep per unit.
     pub unit_bytes: u64,
     /// The device storage grant, if the rank has one.
@@ -47,6 +50,7 @@ impl CacheCapacity {
         let CacheDemand {
             pages,
             tokens,
+            units: adopted,
             unit_bytes,
             available_bytes,
             reserved_units,
@@ -66,6 +70,15 @@ impl CacheCapacity {
             .iter()
             .map(|&(_, units)| u64::from(units))
             .sum::<u64>();
+        if let Some(units) = adopted {
+            if units < minimum {
+                return Err(Error::Invalid(
+                    "an adopted KV pool holds fewer units than one page of every group".into(),
+                ));
+            }
+            // The planes exist already: the grant need not hold them.
+            return Ok(Self { num_units: units });
+        }
         let num_units = if let Some(tokens) = tokens {
             if tokens == 0 {
                 return Err(Error::Invalid(

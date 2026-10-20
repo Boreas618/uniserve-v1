@@ -191,6 +191,9 @@ impl Default for WorkerProcessArgs {
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
             page_tier: false,
             storage_connector: None,
+            keep_standby: false,
+            standby: false,
+            cache_units: None,
             launcher_timeout: std::time::Duration::from_secs(120),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
@@ -399,6 +402,7 @@ impl WorkerProcessArgs {
                 .map(|value| value.as_str().to_owned()),
             mem_fraction_static: self.mem_fraction_static,
             max_total_tokens: self.max_total_tokens,
+            cache_units: self.cache_units,
             attention_backend: self.attention_backend.clone(),
             block_size: self.block_size,
             max_batch_calls: self.max_batch_calls,
@@ -522,6 +526,7 @@ mod tests {
             claim: [7; 16],
             page_tier: true,
             tcp: Some("10.0.0.2:4100".into()),
+            standby: false,
         }
     }
 

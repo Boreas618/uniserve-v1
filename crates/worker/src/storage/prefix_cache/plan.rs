@@ -254,6 +254,8 @@ impl CachePlan {
                 .collect(),
             // The rank reports its page pools once it mapped them.
             page_pools: Vec::new(),
+            // The worker reports the units its warmup lent once it warmed up.
+            scratch_units: 0,
         }
     }
 

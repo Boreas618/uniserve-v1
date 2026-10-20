@@ -67,6 +67,9 @@ pub struct PrefixCache {
     imports: Imports,
     /// The host page tier, when the head copies pages through it.
     pages: Option<PageTier>,
+    /// The most units warmup lent as scratch (`1..=` this), which the rank
+    /// reports so that a standby worker's warmup stays inside them.
+    scratch_lent: u32,
 }
 
 impl PrefixCache {
@@ -145,6 +148,7 @@ impl PrefixCache {
                 retired,
             },
             pages: None,
+            scratch_lent: 0,
         })
     }
 
@@ -691,7 +695,13 @@ impl PrefixCache {
             ));
         }
         self.planes.zero_leading(count, stream)?;
+        self.scratch_lent = self.scratch_lent.max(count);
         Ok(ScratchUnits { count })
+    }
+
+    /// The most units warmup lent as scratch: units `1..=` this.
+    pub(crate) fn scratch_lent(&self) -> u32 {
+        self.scratch_lent
     }
 
     /// Cancel every import and join the import copy threads, so no import

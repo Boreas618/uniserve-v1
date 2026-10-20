@@ -18,6 +18,7 @@ use crate::worker::WorkerProcessArgs;
 use crate::worker::registry::Registry;
 use crate::worker::storage::{Claims, StorageClaims};
 use crate::worker::{IncarnationRegistry, PendingWorker, WorkerProcess};
+use uniserve_ipc::StorageLaunch;
 
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (
@@ -70,7 +71,7 @@ impl WorkerProcessArgs {
     /// holds for the deployment. `expert_store` is the socket the group's
     /// first rank serves its expert-parallel world's store on, when that
     /// rank is the world's rank 0.
-    fn spawn_workers(
+    pub(super) fn spawn_workers(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         registry: &Registry,
@@ -176,7 +177,10 @@ impl WorkerProcessArgs {
             ranks.push(PendingWorker::spawn(
                 self,
                 rank as u32,
-                claims.launch(&self.ranks[rank].host)?,
+                StorageLaunch {
+                    standby: self.standby,
+                    ..claims.launch(&self.ranks[rank].host)?
+                },
                 rendezvous
                     .as_ref()
                     .map(|rendezvous| rendezvous.address.as_str()),
@@ -198,7 +202,7 @@ impl WorkerProcessArgs {
 
     /// Takes the connection each rank registered on and answers it with the
     /// rank's launch descriptor.
-    fn adopt_workers(&self, launched: LaunchedWorkers) -> anyhow::Result<LaunchedGroup> {
+    pub(super) fn adopt_workers(&self, launched: LaunchedWorkers) -> anyhow::Result<LaunchedGroup> {
         let LaunchedWorkers {
             registry,
             mut ranks,
@@ -393,6 +397,10 @@ impl WorkerGroup {
                 worker.failure_wake = Some(wake);
             }
         }
+        // Groups that keep a standby start it once every group serves.
+        for worker in &mut workers {
+            worker.start_standby();
+        }
         Ok(workers)
     }
 
@@ -586,6 +594,7 @@ impl WorkerGroup {
             failure_domain: None,
             failure_wake: None,
             awaiting: None,
+            standby: None,
         })
     }
 }
