@@ -1,10 +1,10 @@
 //! `POST /v1/chat/completions`: validation, the response options, and the
 //! buffered and streaming responses.
 //!
-//! The handler validates the body (the schema's `validator` rules in
-//! `ValidatedJson`, then [`validate_request_compat`]), captures the
-//! response options ([`ChatResponseContext`]), and runs the request through
-//! `Engine::generate_chat`. Both response paths consume the `RequestOutput`
+//! The handler validates and lowers the body (the schema's `validator` rules
+//! in `ValidatedJson`, then [`lower_chat_request`]), capturing the response
+//! options ([`ChatResponseContext`]), and runs the request through
+//! `Engine::generate`. Both response paths consume the `RequestOutput`
 //! stream it returns: [`collect_chat_completion`] folds it into one
 //! `ChatCompletionResponse`; [`chat_completion_chunk_stream`] maps it to
 //! `ChatCompletionStreamResponse` chunks, and [`chat_completion_sse_stream`]
@@ -34,21 +34,31 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
 use tracing_futures::Instrument as _;
+use uniserve_core::GenerationConstraint;
 
 use crate::engine::Engine;
 use crate::http::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
     ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
-    ChatLogProbsContent, ChatMessageDelta, ContentPart, FunctionCallDelta, FunctionCallResponse,
-    ImageUrl, ToolCall, ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served,
+    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
+    ChatImageConfig, ChatLogProbs, ChatLogProbsContent, ChatMessage, ChatMessageDelta,
+    ChatModality, ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent,
+    Tool, ToolCall, ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served,
+    convert_logit_bias,
 };
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
+use crate::profile::tools;
+use crate::serving::chat::{
+    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatContent,
+    ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
+};
 use crate::serving::text::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
 };
-use crate::serving::{FinishReason, RequestOutput, StopReason};
+use crate::serving::{
+    FinishReason, GenerateRequest, ImageGenControls, Prompt, RequestOutput, SamplingParams,
+    StopReason,
+};
 
 /// The chat completions route.
 pub(crate) fn router(engine: Arc<Engine>) -> Router {
@@ -68,12 +78,13 @@ async fn chat_completions(
     Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    // `body` moves into the engine below, so every option that shapes the
-    // response is captured first. Responses report the served model name.
     let stream = body.stream;
     let request_id = format!("chatcmpl-{base_id}");
-    let response =
-        ChatResponseContext::from_request(&body, request_id.clone(), engine.served_model_name());
+    let (request, response) = match lower_chat_request(request_id, engine.served_model_name(), body)
+    {
+        Ok(lowered) => lowered,
+        Err(error) => return error.into_response(),
+    };
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %response.request_id,
@@ -84,12 +95,12 @@ async fn chat_completions(
     let created = uniserve_core::now_unix_secs_u64();
 
     let serve_stream = match engine
-        .generate_chat(request_id.into(), body)
+        .generate(request)
         .instrument(request_span.clone())
         .await
     {
         Ok(stream) => stream,
-        Err(error) => return error.into_response(),
+        Err(error) => return ApiError::from(error).into_response(),
     };
 
     if stream {
@@ -118,8 +129,7 @@ async fn chat_completions(
 /// Rejects a `model` other than `served_model_name` with
 /// [`ApiError::ModelNotFound`], and rejects with [`ApiError::InvalidRequest`]
 /// a `prompt_logprobs` value below `-1` or a positive or `-1` value on a
-/// streamed request. `Engine::generate_chat` calls this before it fetches the
-/// request's images.
+/// streamed request.
 pub fn validate_request_compat(
     request: &ChatCompletionRequest,
     served_model_name: &str,
@@ -138,7 +148,7 @@ pub fn validate_request_compat(
         // Stream chunks (`ChatCompletionStreamResponse`) have no
         // `prompt_logprobs` field, so a streamed response could not deliver
         // them. A streamed `0` is accepted, as vLLM accepts it, and
-        // `preprocess_chat_request` drops it.
+        // `lower_chat_request` drops it.
         if request.stream && (prompt_logprobs > 0 || prompt_logprobs == -1) {
             bail_invalid_request!(
                 param = "prompt_logprobs",
@@ -150,8 +160,8 @@ pub fn validate_request_compat(
     Ok(())
 }
 
-/// The response options of one chat request, captured before the request
-/// moves into the engine.
+/// The response options of one chat request, captured when the request is
+/// lowered.
 ///
 /// The handler passes it to [`collect_chat_completion`] or
 /// [`chat_completion_chunk_stream`].
@@ -170,7 +180,7 @@ pub struct ChatResponseContext {
     /// Whether prompt-token logprobs were requested. Only non-streaming
     /// responses carry them; [`validate_request_compat`] rejects a streamed
     /// request that asks for a positive or `-1` count, and
-    /// `preprocess_chat_request` drops a streamed `0`.
+    /// [`lower_chat_request`] drops a streamed `0`.
     pub include_prompt_logprobs: bool,
     /// Whether parsed reasoning is exposed in responses.
     pub include_reasoning: bool,
@@ -1085,6 +1095,266 @@ fn stop_reason_value(reason: &FinishReason) -> Option<Value> {
         FinishReason::Stop(Some(StopReason::String(text))) => Some(serde_json::json!(text)),
         _ => None,
     }
+}
+
+/// Validates and lowers one chat completion request into the serving
+/// layer's generate request, capturing its response options.
+///
+/// # Errors
+///
+/// Fails as [`validate_request_compat`] does, and with an invalid request
+/// for template kwargs that set a variable the request itself determines, an
+/// assistant message with no reasoning, content, or tool calls or with image
+/// content, a non-function tool call, or a `logit_bias` key that is not a
+/// token ID.
+pub fn lower_chat_request(
+    request_id: String,
+    served_model_name: &str,
+    request: ChatCompletionRequest,
+) -> Result<(GenerateRequest, ChatResponseContext), ApiError> {
+    validate_request_compat(&request, served_model_name)?;
+    let context =
+        ChatResponseContext::from_request(&request, request_id.clone(), served_model_name);
+
+    // Template kwargs may not replace the variables the renderer derives
+    // from the request itself.
+    let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
+    if let Some(name) = crate::serving::chat::ChatOptions::RESERVED_TEMPLATE_KWARGS
+        .into_iter()
+        .find(|name| template_kwargs.contains_key(*name))
+    {
+        bail_invalid_request!(
+            param = "chat_template_kwargs",
+            "chat_template_kwargs may not set `{name}`, which the request itself determines."
+        );
+    }
+    // Stream chunks have no `prompt_logprobs` field. Validation accepts a
+    // streamed `prompt_logprobs: 0` for vLLM compatibility, but lowering it
+    // would score every prompt position and disable prefix-cache reads for
+    // output the client never receives, so it is dropped here.
+    let prompt_logprobs = request.prompt_logprobs.filter(|_| !request.stream);
+    let messages = request
+        .messages
+        .into_iter()
+        .map(convert_message)
+        .try_collect()?;
+
+    let lowered = GenerateRequest {
+        request_id,
+        prompt: Prompt::Chat(ChatRequest {
+            messages,
+            tools: convert_tools(request.tools)?,
+            // An absent choice lets the model decide, as OpenAI's default does.
+            tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
+            chat_options: crate::serving::chat::ChatOptions {
+                reasoning_effort: request.reasoning_effort,
+                template_kwargs,
+                ..Default::default()
+            },
+        }),
+        constraint: convert_modalities(&request.modalities),
+        sampling_params: SamplingParams {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            min_p: request.min_p,
+            seed: request.seed,
+            max_tokens: request.max_completion_tokens,
+            min_tokens: request.min_tokens,
+            frequency_penalty: request.frequency_penalty,
+            presence_penalty: request.presence_penalty,
+            repetition_penalty: request.repetition_penalty,
+            ignore_eos: request.ignore_eos,
+            stop: request.stop.map(|stop| stop.into_vec()).unwrap_or_default(),
+            stop_token_ids: request.stop_token_ids.unwrap_or_default(),
+            bad_words: request.bad_words.unwrap_or_default(),
+            allowed_token_ids: request.allowed_token_ids,
+            logit_bias: convert_logit_bias(request.logit_bias)?,
+            logprobs: request
+                .logprobs
+                .then_some(request.top_logprobs.unwrap_or(0)),
+            prompt_logprobs,
+            skip_special_tokens: request.skip_special_tokens,
+            include_stop_str_in_output: request.include_stop_str_in_output,
+        },
+        image_params: request.image_config.as_ref().map(convert_image_config),
+        priority: request.priority.unwrap_or(0),
+        cache_salt: request.cache_salt,
+    };
+    Ok((lowered, context))
+}
+
+/// Converts requested response modalities into the generation constraint.
+///
+/// An empty list selects both text and image output, like an explicit request
+/// for both.
+fn convert_modalities(modalities: &[ChatModality]) -> GenerationConstraint {
+    match (
+        modalities.contains(&ChatModality::Text),
+        modalities.contains(&ChatModality::Image),
+    ) {
+        (true, false) => GenerationConstraint::UndOnly,
+        (false, true) => GenerationConstraint::GenOnly,
+        (true, true) | (false, false) => GenerationConstraint::Default,
+    }
+}
+
+/// Maps chat `image_config` fields onto serving image controls.
+///
+/// Wire names differ from the serving names: `guidance_scale` and
+/// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
+/// renormalization type, and `num_images` is `max_images`.
+fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
+    ImageGenControls {
+        resolution: config.resolution,
+        width: config.width,
+        height: config.height,
+        steps: config.steps,
+        cfg_text_scale: config.guidance_scale,
+        cfg_img_scale: config.image_guidance_scale,
+        cfg_interval: config.cfg_interval,
+        cfg_renorm_type: config.cfg_norm,
+        cfg_renorm_min: config.cfg_renorm_min,
+        timestep_shift: config.timestep_shift,
+        seed: config.seed,
+        max_images: config.num_images,
+    }
+}
+
+/// Converts one wire chat message into the serving layer's structured message model.
+///
+/// Assistant content becomes ordered blocks: non-empty reasoning first, then
+/// text content, then tool calls.
+///
+/// # Errors
+///
+/// Rejects an assistant message with no reasoning, content, or tool calls, an
+/// assistant message with image content, and a non-function tool call.
+fn convert_message(message: ChatMessage) -> Result<ServingChatMessage, ApiError> {
+    match message {
+        ChatMessage::System { content, .. } => {
+            Ok(ServingChatMessage::system(convert_content(content)?))
+        }
+        ChatMessage::User { content, .. } => {
+            Ok(ServingChatMessage::user(convert_content(content)?))
+        }
+        ChatMessage::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+            ..
+        } => {
+            let mut blocks = Vec::new();
+            if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+                blocks.push(AssistantContentBlock::Reasoning { text: reasoning });
+            }
+            if let Some(content) = content {
+                blocks.extend(convert_assistant_content(content)?);
+            }
+            if let Some(tool_calls) = tool_calls {
+                blocks.extend(convert_assistant_tool_calls(tool_calls)?);
+            }
+            if blocks.is_empty() {
+                bail_invalid_request!("Assistant messages must contain content or tool_calls.");
+            }
+            Ok(ServingChatMessage::assistant_blocks(blocks))
+        }
+        ChatMessage::Tool {
+            content,
+            tool_call_id,
+        } => Ok(ServingChatMessage::tool_response(
+            convert_content(content)?,
+            tool_call_id,
+        )),
+        ChatMessage::Developer { content, tools, .. } => Ok(ServingChatMessage::developer(
+            convert_content(content)?,
+            convert_message_tools(tools)?,
+        )),
+    }
+}
+
+/// Converts OpenAI message content into serving chat content.
+fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
+    match content {
+        MessageContent::Text(text) => Ok(ChatContent::Text(text)),
+        MessageContent::Parts(parts) => parts
+            .into_iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Ok(ChatContentPart::text(text)),
+                ContentPart::ImageUrl { image_url, uuid } => Ok(ChatContentPart::ImageUrl {
+                    image_url: image_url.url,
+                    detail: image_url.detail,
+                    uuid,
+                }),
+            })
+            .try_collect()
+            .map(ChatContent::Parts),
+    }
+}
+
+/// Converts assistant message content into text blocks, rejecting image parts.
+fn convert_assistant_content(
+    content: MessageContent,
+) -> Result<Vec<AssistantContentBlock>, ApiError> {
+    match content {
+        MessageContent::Text(text) => Ok(vec![AssistantContentBlock::Text { text }]),
+        MessageContent::Parts(parts) => parts
+            .into_iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Ok(AssistantContentBlock::Text { text }),
+                ContentPart::ImageUrl { .. } => {
+                    bail_invalid_request!("Assistant message content must be text.")
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Validates and converts assistant function calls into structured content blocks.
+///
+/// Missing arguments become the empty JSON object `{}`.
+fn convert_assistant_tool_calls(
+    tool_calls: Vec<ToolCall>,
+) -> Result<Vec<AssistantContentBlock>, ApiError> {
+    tool_calls
+        .into_iter()
+        .map(|tool_call| {
+            if tool_call.tool_type != "function" {
+                bail_invalid_request!("Only function tool calls are supported.");
+            }
+            Ok(AssistantContentBlock::ToolCall(AssistantToolCall {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                arguments: tool_call
+                    .function
+                    .arguments
+                    .unwrap_or_else(|| "{}".to_string()),
+            }))
+        })
+        .collect()
+}
+
+/// Converts OpenAI function tools into serving tool definitions.
+fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError> {
+    tools
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tool| {
+            let Tool::Function { function } = tool;
+            Ok(tools::Tool {
+                name: function.name,
+                description: function.description,
+                parameters: function.parameters,
+                strict: None,
+            })
+        })
+        .collect()
+}
+
+/// Converts developer-message tools, mapping an absent or empty list to `None`.
+fn convert_message_tools(tools: Option<Vec<Tool>>) -> Result<Option<Vec<tools::Tool>>, ApiError> {
+    let tools = convert_tools(tools)?;
+    Ok((!tools.is_empty()).then_some(tools))
 }
 
 // Logprob values: the text layer's decoded candidates, where each position

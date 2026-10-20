@@ -85,14 +85,13 @@ use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{Canvas, MediaKind, ServedCanvas, VideoTask};
 use uniserve_engine::VideoDenoiserInfo;
+use uniserve_server::Engine;
+use uniserve_server::openai::ApiError;
 use uniserve_server::options::{ServeArgs, ServeConfig, Stated, printed};
 use uniserve_server::profile::ModelDescription;
 use uniserve_server::profile::assets::PipelineCheckpoint;
-use uniserve_server::{
-    Engine,
-    openai::{ApiError, VideoGenerationRequest, VideoTarget},
-    serving::{ServeRequestId, video::artifact::ArtifactCollector},
-};
+use uniserve_server::serving::video::artifact::ArtifactCollector;
+use uniserve_server::serving::video::{VideoGenerationRequest, VideoTarget};
 
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
@@ -356,13 +355,14 @@ impl RawEngine for DynamoFastH3Engine {
         };
         // The Dynamo context id names the request in UniServe's logs and the
         // response.
-        let request_id = ServeRequestId::new(ctx.id().to_string());
+        let request_id = ctx.id().to_string();
 
         // The engine runs the path the HTTP video route uses: prompt
         // preprocessing, submission and request accounting.
         let (_, mut events) = match state
             .generate_video(request_id.clone(), prepared.request)
             .await
+            .map_err(ApiError::from)
         {
             Ok(started) => started,
             // The video service refused the request, for example a duration

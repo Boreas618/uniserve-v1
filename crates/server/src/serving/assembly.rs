@@ -26,7 +26,6 @@ use crate::serving::text::output::decoded_text_event_stream;
 use crate::serving::text::{DecodedTextEvent, ImageEvent};
 use crate::serving::{
     FinishReason, OutputParams, RequestOutput, RequestUsage, Result, RuntimeTimings, ServeError,
-    ServeRequestId,
 };
 
 /// The timings of one request's stream.
@@ -86,9 +85,9 @@ fn is_visible(output: &RequestOutput) -> bool {
 }
 
 /// The error of engine output that violates the event protocol.
-fn malformed(request_id: &ServeRequestId, message: &str) -> ServeError {
+fn malformed(request_id: &str, message: &str) -> ServeError {
     ServeError::OutputProcessing {
-        request_id: request_id.clone(),
+        request_id: request_id.to_owned(),
         source: crate::serving::text::Error::MalformedOutput {
             request_id: request_id.to_string(),
             message: message.to_owned(),
@@ -104,7 +103,7 @@ fn malformed(request_id: &ServeRequestId, message: &str) -> ServeError {
 /// events followed by its `TokenDelta`, then the terminal event.
 #[try_stream]
 pub(super) async fn generation_output(
-    request_id: ServeRequestId,
+    request_id: String,
     started: Instant,
     compile_us: u64,
     output: OutputParams,
@@ -244,7 +243,7 @@ pub(super) async fn generation_output(
 /// The terminal usage reports `prompt_tokens` and no output tokens.
 #[try_stream]
 pub(super) async fn media_output(
-    request_id: ServeRequestId,
+    request_id: String,
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,

@@ -25,9 +25,7 @@ use uniserve_core::{
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
 use crate::serving::text::TextDecodeOptions;
-use crate::serving::{
-    InputProcessor, SamplingConfig, ServeError, ServeRequestId, StopConfig, TokenizeError, media,
-};
+use crate::serving::{InputProcessor, SamplingParams, ServeError, TokenizeError, media};
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
 /// prompt tokens and image inputs.
@@ -90,9 +88,8 @@ const FIRST_EOS: &str = "a canvas ends the reply at its first end-of-sequence to
 /// Returns [`ServeError::UnsupportedSamplingControl`] for the first control
 /// the request sets.
 pub(crate) fn refuse_token_sampling_controls(
-    request_id: &ServeRequestId,
-    sampling: &SamplingConfig,
-    stop: &StopConfig,
+    request_id: &str,
+    sampling: &SamplingParams,
 ) -> Result<(), ServeError> {
     let controls = [
         (
@@ -118,17 +115,17 @@ pub(crate) fn refuse_token_sampling_controls(
             sampling.repetition_penalty.is_some(),
             NO_PENALTIES,
         ),
-        ("logit_bias", stop.logit_bias.is_some(), UNCONSTRAINED),
+        ("logit_bias", sampling.logit_bias.is_some(), UNCONSTRAINED),
         (
             "allowed_token_ids",
-            stop.allowed_token_ids.is_some(),
+            sampling.allowed_token_ids.is_some(),
             UNCONSTRAINED,
         ),
-        ("bad_words", !stop.bad_words.is_empty(), UNCONSTRAINED),
-        ("logprobs", stop.logprobs.is_some(), NO_LOGPROBS),
+        ("bad_words", !sampling.bad_words.is_empty(), UNCONSTRAINED),
+        ("logprobs", sampling.logprobs.is_some(), NO_LOGPROBS),
         (
             "prompt_logprobs",
-            stop.prompt_logprobs.is_some(),
+            sampling.prompt_logprobs.is_some(),
             NO_LOGPROBS,
         ),
         ("min_tokens", sampling.min_tokens.is_some(), FIRST_EOS),
@@ -136,7 +133,7 @@ pub(crate) fn refuse_token_sampling_controls(
     ];
     match controls.into_iter().find(|(_, set, _)| *set) {
         Some((control, _, reason)) => Err(ServeError::UnsupportedSamplingControl {
-            request_id: request_id.clone(),
+            request_id: request_id.to_owned(),
             control,
             reason,
         }),
@@ -162,16 +159,16 @@ impl InputProcessor {
     pub(super) fn preprocess_diffusion_gemma_input(
         &self,
         profile: &DiffusionGemmaProfile,
-        mut chat: ChatRequest,
+        chat: ChatRequest,
         images: &[media::ImageInput],
-        sampling: &SamplingConfig,
+        sampling: &SamplingParams,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
     ) -> Result<ChatOutputProcessor, TokenizeError> {
-        chat.decode_options = decode.clone();
         chat.validate()?;
         let processor = ChatOutputProcessor::gemma4(
-            &mut chat,
+            &chat,
+            decode,
             Arc::clone(&self.tokenizer),
             self.parse_reasoning,
         )?;
@@ -222,7 +219,6 @@ impl InputProcessor {
                 .seed
                 .unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0),
         );
-        decode.skip_special_tokens = chat.decode_options.skip_special_tokens;
         Ok(processor)
     }
 }
@@ -317,7 +313,6 @@ mod tests {
         };
         let sampling = profile.sampling;
         let model = ModelConfig {
-            served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
             sampling_defaults: SamplingDefaults::default(),
             max_model_len: 4096,
@@ -354,7 +349,15 @@ mod tests {
             log_stats: false,
         };
         (
-            Engine::new(vec![core], processor, images, None, &logging).unwrap(),
+            Engine::new(
+                "sim-model".to_owned(),
+                vec![core],
+                processor,
+                images,
+                None,
+                &logging,
+            )
+            .unwrap(),
             tokenizer,
         )
     }
@@ -380,7 +383,10 @@ mod tests {
             "return_token_ids": true,
         }))
         .unwrap();
-        let mut stream = runtime.generate_chat(id.into(), request).await.unwrap();
+        let (request, _) =
+            crate::openai::chat_completions::lower_chat_request(id.into(), "sim-model", request)
+                .unwrap();
+        let mut stream = runtime.generate(request).await.unwrap();
         let (mut texts, mut token_ids, mut usage, mut finish) =
             (Vec::new(), Vec::new(), None, None);
         while let Some(event) = stream.next().await {

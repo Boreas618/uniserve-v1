@@ -59,7 +59,6 @@ use crate::serving::systemone::prompt::{
 };
 use crate::serving::systemone::request::{Criteria, SystemOneRequest};
 use crate::serving::systemone::vocabulary::Vocabulary;
-use crate::serving::text::TextDecodeOptions;
 
 /// Largest request context the endpoint admits, in tokens (the official 64k
 /// limit); a smaller `max_model_len` lowers it.
@@ -564,7 +563,6 @@ impl ReadoutEncoder {
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
-            decode_options: TextDecodeOptions::default(),
         };
         let rendered = self.renderer.render(&request)?;
         Ok(self.tokenizer.encode(&rendered, false)?)

@@ -6,7 +6,6 @@
 //! whether generated text is parsed for tool calls.
 
 pub use crate::profile::tools::Tool;
-use crate::serving::text::TextDecodeOptions;
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 
@@ -447,8 +446,6 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     /// Tool-choice behavior for this request.
     pub tool_choice: ChatToolChoice,
-    /// Text decode options for incremental detokenization.
-    pub decode_options: TextDecodeOptions,
 }
 
 impl ChatRequest {
@@ -459,7 +456,6 @@ impl ChatRequest {
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
-            decode_options: TextDecodeOptions::default(),
         }
     }
 
@@ -490,6 +486,33 @@ impl ChatRequest {
     /// messages.
     pub fn has_multimodal(&self) -> bool {
         self.messages.iter().any(ChatMessage::has_multimodal)
+    }
+
+    /// Returns the URL of every input image, in prompt order: the
+    /// `image_url` parts of system, developer, user, and tool-response
+    /// messages, in message order and then part order. Assistant content
+    /// carries no input images. Preprocessing pairs the resolved images with
+    /// their parts in this order.
+    pub fn image_urls(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { content }
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::User { content }
+                | ChatMessage::ToolResponse { content, .. } => Some(content),
+                ChatMessage::Assistant { .. } => None,
+            })
+            .filter_map(|content| match content {
+                ChatContent::Parts(parts) => Some(parts),
+                ChatContent::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                ChatContentPart::ImageUrl { image_url, .. } => Some(image_url.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Returns true if this request should enable tool parsing based on the tool

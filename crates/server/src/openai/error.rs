@@ -17,6 +17,8 @@ use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
 use crate::openai::{ErrorDetail, ErrorResponse};
+use uniserve_core::video::plan::VideoInputError;
+
 use crate::serving::ServeError;
 use crate::serving::video::artifact::VideoStreamError;
 
@@ -206,9 +208,10 @@ impl From<ServeError> for ApiError {
     /// Maps one serving error into the OpenAI error vocabulary.
     ///
     /// Unsupported features or sampling controls, context limits, input
-    /// images that cannot be fetched or decoded, and tokenization failures
-    /// become invalid requests; engine and output-processing failures become
-    /// server errors. An input-image or tokenization failure's message
+    /// images that cannot be fetched or decoded, refused video requests, and
+    /// tokenization failures become invalid requests, a refused video request
+    /// naming its field; engine, video-processing and output-processing
+    /// failures become server errors. An input-image or tokenization failure's message
     /// appends its cause (the failing image and rule, or the violated field
     /// or limit), which `ServeError::ImageInput` and `ServeError::Tokenize`
     /// carry as their error source rather than in their own `Display`.
@@ -230,6 +233,14 @@ impl From<ServeError> for ApiError {
             ServeError::Tokenize { ref source, .. } => {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
+            ServeError::Video(error) => match &error {
+                VideoInputError::Invalid { field, .. } => {
+                    Self::invalid_request(error.to_string(), Some(field.param()))
+                }
+                VideoInputError::Internal(message) => {
+                    Self::server_error(format!("video condition processing failed: {message}"))
+                }
+            },
             ServeError::Submit(source) => {
                 Self::server_error(format!("engine runtime error: {source}"))
             }
@@ -273,7 +284,7 @@ mod tests {
     fn a_tokenize_rejection_reports_its_cause() {
         let cause = "video duration must be finite, positive, and at most 15 seconds";
         let error = ApiError::from(ServeError::Tokenize {
-            request_id: crate::serving::ServeRequestId::new("vid-1"),
+            request_id: String::from("vid-1"),
             source: crate::serving::TokenizeError::Invalid(cause.to_string()),
         });
 

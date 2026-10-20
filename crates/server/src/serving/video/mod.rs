@@ -28,7 +28,7 @@
 //! the rank runtime library, and plans no request.
 //!
 //! Every rejection is a [`VideoInputError::Invalid`] naming the request field
-//! at fault, `conditions[i]` for a condition; it converts into an OpenAI
+//! at fault, `conditions[i]` for a condition; the API answers it as an
 //! `invalid_request_error`. Failures of the server's own resources (a missing
 //! `ffprobe`, scratch storage) are [`VideoInputError::Internal`].
 
@@ -37,7 +37,10 @@ pub mod probe;
 pub mod service;
 pub mod sources;
 
-pub use service::{ProcessedVideo, VideoService};
+pub use service::{
+    DEFAULT_VIDEO_SEED, ProcessedVideo, VideoCondition, VideoGenerationRequest, VideoService,
+    VideoTarget,
+};
 
 use uniserve_core::VideoTask;
 use uniserve_core::video::plan::{
@@ -45,26 +48,10 @@ use uniserve_core::video::plan::{
 };
 use uniserve_core::video::presentation::{self, Presentation};
 
-use crate::openai::ApiError;
 use crate::profile::tokenizer::DynTokenizer;
 
 use probe::MediaProber;
 use sources::{FetchedMedia, MediaFetcher};
-
-impl From<VideoInputError> for ApiError {
-    /// A rejection becomes a 400 `invalid_request_error` whose message starts
-    /// with the field path; a server failure becomes a 500 `server_error`.
-    fn from(error: VideoInputError) -> Self {
-        match &error {
-            VideoInputError::Invalid { field, .. } => {
-                ApiError::invalid_request(error.to_string(), Some(field.param()))
-            }
-            VideoInputError::Internal(message) => {
-                ApiError::server_error(format!("video condition processing failed: {message}"))
-            }
-        }
-    }
-}
 
 /// One condition of a request, as the request states it.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +201,7 @@ pub(super) mod tests {
     use crate::openai::ApiError;
     use crate::profile::assets::PipelineCheckpoint;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::serving::ServeError;
     use crate::serving::model::pipeline_tokenizer;
 
     /// The planning vectors the request rules are tested against.
@@ -472,14 +460,19 @@ pub(super) mod tests {
     /// failure is a server error.
     #[test]
     fn errors_map_to_openai_categories() {
-        let rejected: ApiError = VideoInputError::condition(2, "is not an image").into();
+        let rejected = ApiError::from(ServeError::from(VideoInputError::condition(
+            2,
+            "is not an image",
+        )));
         assert_eq!(
             rejected,
             ApiError::invalid_request("conditions[2]: is not an image", Some("conditions"))
         );
 
-        let rejected: ApiError =
-            VideoInputError::invalid(RequestField::TargetDuration, "is required").into();
+        let rejected: ApiError = ApiError::from(ServeError::from(VideoInputError::invalid(
+            RequestField::TargetDuration,
+            "is required",
+        )));
         assert_eq!(
             rejected,
             ApiError::invalid_request(
@@ -488,7 +481,9 @@ pub(super) mod tests {
             )
         );
 
-        let failed: ApiError = VideoInputError::internal("ffprobe did not start").into();
+        let failed = ApiError::from(ServeError::from(VideoInputError::internal(
+            "ffprobe did not start",
+        )));
         assert_eq!(failed.code(), "server_error");
     }
 

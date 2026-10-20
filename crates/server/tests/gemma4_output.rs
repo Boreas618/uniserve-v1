@@ -42,6 +42,7 @@ use uniserve_server::serving::chat::output::AssistantEvent;
 use uniserve_server::serving::chat::{
     AssistantBlockKind, ChatOutputProcessor, ChatRequest, ChatToolChoice, Tool,
 };
+use uniserve_server::serving::text::TextDecodeOptions;
 
 /// DiffusionGemma commits generated tokens in blocks of this many tokens.
 const COMMITTED_BLOCK_TOKENS: usize = 256;
@@ -294,9 +295,13 @@ fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block() {
 
     for sample in fixture().samples {
         for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
-            let mut request = request_with_tools();
-            let processor = ChatOutputProcessor::gemma4(&mut request, Arc::clone(&tokenizer), true)
-                .expect("build processor");
+            let processor = ChatOutputProcessor::gemma4(
+                &request_with_tools(),
+                &mut TextDecodeOptions::default(),
+                Arc::clone(&tokenizer),
+                true,
+            )
+            .expect("build processor");
 
             let blocks = assistant_blocks(processor, &sample, deltas(&sample, tokens_per_delta));
 
@@ -321,10 +326,14 @@ fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
     for (serving, hf) in tool_replies() {
         for sample in std::iter::once(&serving).chain(hf.as_ref()) {
             for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
-                let mut request = request_with_tools();
-                let processor =
-                    ChatOutputProcessor::gemma4(&mut request, Arc::clone(&tokenizer), true)
-                        .expect("build processor");
+                let request = request_with_tools();
+                let processor = ChatOutputProcessor::gemma4(
+                    &request,
+                    &mut TextDecodeOptions::default(),
+                    Arc::clone(&tokenizer),
+                    true,
+                )
+                .expect("build processor");
 
                 let blocks = assistant_blocks(processor, sample, deltas(sample, tokens_per_delta));
 
@@ -349,13 +358,18 @@ fn gemma4_processor_without_parsers_streams_delimiters_as_text() {
         .into_iter()
         .find(|sample| sample.name == "tool_calls_after_reasoning")
         .expect("fixture has a tool-call sample");
-    let mut request = ChatRequest::for_test();
-    let processor = ChatOutputProcessor::gemma4(&mut request, gemma4_tokenizer(), false)
-        .expect("build processor");
+    let mut decode = TextDecodeOptions::default();
+    let processor = ChatOutputProcessor::gemma4(
+        &ChatRequest::for_test(),
+        &mut decode,
+        gemma4_tokenizer(),
+        false,
+    )
+    .expect("build processor");
 
     let blocks = assistant_blocks(processor, &sample, deltas(&sample, 1));
 
-    assert!(!request.decode_options.skip_special_tokens);
+    assert!(!decode.skip_special_tokens);
     let raw: String = sample
         .output
         .iter()

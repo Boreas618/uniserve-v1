@@ -1,15 +1,16 @@
 //! Multimodal prompt preprocessing for SenseNova and Bagel profiles.
 //!
-//! `InputProcessor::preprocess_generation` in `serving::model` calls
+//! `InputProcessor::preprocess` in `serving::model` calls
 //! [`preprocess_sensenova`] or [`preprocess_bagel`] for the loaded profile.
 //! Each fills the model computation inputs of the `GenerationRequest`
 //! (`prompt_token_ids`, `negative_prompt_token_ids`, `multimodal_inputs`,
-//! `image`, and `image_generation`) and returns the output processor policy.
+//! `image`, and `image_generation`) and returns the request's chat output
+//! processor.
 //! [`prepare_generation_resources`] then resolves sampling, cache policy, and
 //! the cache budget for both profiles.
 //!
 //! Input images arrive already resolved (`serving::media`), in
-//! `chat_image_urls` order, and are carried through chat rendering as
+//! `ChatRequest::image_urls` order, and are carried through chat rendering as
 //! request-scoped text placeholders. After the chat template renders, each
 //! placeholder is replaced (SenseNova) or removed (Bagel), and its byte
 //! offset in the cleaned text is converted into a prompt-token position by
@@ -28,7 +29,7 @@ use crate::profile::omni::sensenova::SenseNovaProfile;
 use base64::Engine as _;
 use uniserve_core::{
     GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, ImageParams,
-    MultimodalInputs, SamplingParams,
+    MultimodalInputs, SamplingParams as EngineSamplingParams,
 };
 
 use crate::profile::tokenizer::DynTokenizer;
@@ -36,7 +37,7 @@ use crate::serving::chat::ChatOutputProcessor;
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
-use crate::serving::input::{ModalitySelection, PromptInput};
+use crate::serving::input::Prompt;
 
 pub(crate) use output::SenseNovaReasoningParser;
 
@@ -104,20 +105,21 @@ struct RenderedImage {
 /// `images` one to one, the prompt is empty, image controls are invalid, or
 /// the profile cannot size the image encoders or the requested output
 /// resolution.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one request's prompt, media and generation controls"
-)]
 pub(super) fn preprocess_sensenova(
     profile: &SenseNovaProfile,
     processor: &crate::serving::InputProcessor,
-    request_id: &crate::serving::ServeRequestId,
-    prompt: PromptInput,
+    request_id: &str,
+    prompt: Prompt,
     images: Vec<crate::serving::ImageInput>,
-    negative_text: Option<String>,
     image_gen: Option<crate::serving::ImageGenControls>,
     generation: &mut GenerationRequest,
 ) -> OmniResult<ChatOutputProcessor> {
+    let negative_text = match &prompt {
+        Prompt::Text {
+            negative_prompt, ..
+        } => negative_prompt.clone(),
+        Prompt::Chat(_) => None,
+    };
     let (prompt_token_ids, images) = sensenova_prompt(
         profile,
         &processor.tokenizer,
@@ -189,20 +191,21 @@ pub(super) fn preprocess_sensenova(
 /// # Errors
 ///
 /// Fails under the same kinds of conditions as [`preprocess_sensenova`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one request's prompt, media and generation controls"
-)]
 pub(super) fn preprocess_bagel(
     profile: &BagelProfile,
     processor: &crate::serving::InputProcessor,
-    request_id: &crate::serving::ServeRequestId,
-    prompt: PromptInput,
+    request_id: &str,
+    prompt: Prompt,
     images: Vec<crate::serving::ImageInput>,
-    negative_text: Option<String>,
     image_gen: Option<crate::serving::ImageGenControls>,
     generation: &mut GenerationRequest,
 ) -> OmniResult<ChatOutputProcessor> {
+    let negative_text = match &prompt {
+        Prompt::Text {
+            negative_prompt, ..
+        } => negative_prompt.clone(),
+        Prompt::Chat(_) => None,
+    };
     let (prompt_token_ids, images) = bagel_prompt(
         profile,
         &processor.tokenizer,
@@ -257,18 +260,18 @@ fn sensenova_prompt(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
     request_id: &str,
-    prompt: PromptInput,
+    prompt: Prompt,
     images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match prompt {
-        PromptInput::Text(prompt) => {
+        Prompt::Text { prompt, .. } => {
             let prompt_ids = profile
                 .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
                 .map_err(|error| error.to_string())?;
             Ok((prompt_ids, Vec::new()))
         }
-        PromptInput::Chat(chat) => render_sensenova_chat(
+        Prompt::Chat(chat) => render_sensenova_chat(
             profile, tokenizer, renderer, request_id, chat, images, constraint,
         ),
     }
@@ -283,15 +286,15 @@ fn bagel_prompt(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
     request_id: &str,
-    prompt: PromptInput,
+    prompt: Prompt,
     images: Vec<crate::serving::ImageInput>,
     constraint: GenerationConstraint,
 ) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match prompt {
-        PromptInput::Chat(chat) => {
+        Prompt::Chat(chat) => {
             render_bagel_chat(tokenizer, renderer, request_id, chat, images, constraint)
         }
-        PromptInput::Text(prompt) => {
+        Prompt::Text { prompt, .. } => {
             let prompt_ids = profile
                 .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
                 .map_err(|error| error.to_string())?;
@@ -457,20 +460,19 @@ fn tokenize_bagel_with_slots(
 /// the final request fails `GenerationRequest::validate`.
 pub(super) fn prepare_generation_resources(
     processor: &crate::serving::InputProcessor,
-    controls: &crate::serving::SamplingConfig,
-    stop: &crate::serving::StopConfig,
+    controls: &crate::serving::SamplingParams,
     generation: &mut GenerationRequest,
 ) -> OmniResult<()> {
     // Omni profiles start from these fixed sampler defaults rather than the
     // sampler values in the checkpoint's `sampling_defaults`; only its
     // `max_output_tokens` applies, below. The seed already resolved by
-    // `preprocess_generation` (image seed first, then text seed) is kept.
-    generation.sampling = SamplingParams {
+    // `InputProcessor::preprocess` (image seed first, then text seed) is kept.
+    generation.sampling = EngineSamplingParams {
         temperature: DEFAULT_TEMPERATURE,
         top_p: DEFAULT_TOP_P,
         top_k: DEFAULT_TOP_K,
         seed: generation.sampling.seed,
-        ..SamplingParams::default()
+        ..EngineSamplingParams::default()
     };
     // Resolve the autoregressive budget only for requests whose behavior can
     // enter text decoding.
@@ -490,13 +492,8 @@ pub(super) fn prepare_generation_resources(
 
     // Sampling choices determine logprob delivery and whether prefix-cache
     // reads remain semantically valid for this request.
-    super::sampling::apply_sampling(
-        &processor.tokenizer,
-        controls,
-        stop,
-        &mut generation.sampling,
-    )
-    .map_err(|error| error.to_string())?;
+    super::sampling::apply_sampling(&processor.tokenizer, controls, &mut generation.sampling)
+        .map_err(|error| error.to_string())?;
     let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
     generation.cache.read &= !prompt_logprobs_requested;
     // Encoder-cache identity folds in the request's cache isolation key, so
@@ -622,19 +619,10 @@ fn prepare_image_inputs(
     Ok(MultimodalInputs { images })
 }
 
-/// Resolves the generation constraint implied by requested modalities.
-pub(crate) fn generation_constraint(modalities: ModalitySelection) -> GenerationConstraint {
-    match modalities {
-        ModalitySelection::Text => GenerationConstraint::UndOnly,
-        ModalitySelection::Image => GenerationConstraint::GenOnly,
-        ModalitySelection::TextAndImage => GenerationConstraint::Default,
-    }
-}
-
 /// Replaces chat image parts with unique template placeholders.
 ///
 /// Returns the placeholders in message order, which is the
-/// `chat_image_urls` order of the resolved images. Assistant messages are
+/// `ChatRequest::image_urls` order of the resolved images. Assistant messages are
 /// skipped, so images in assistant content are not collected.
 ///
 /// # Errors

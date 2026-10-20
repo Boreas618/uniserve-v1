@@ -1,7 +1,8 @@
 //! `POST /v1/images/generations`: OpenAI-compatible image generation.
 //!
-//! The handler submits an `ImageGenerationRequest` through the engine and
-//! hands the resulting `RequestOutput` stream to [`collect_image_generation`],
+//! The handler lowers an `ImageGenerationRequest` ([`lower_image_request`]),
+//! submits it through the engine, and hands the resulting `RequestOutput`
+//! stream to [`collect_image_generation`],
 //! which buffers completed images until the request finishes and returns one
 //! non-streaming response.
 
@@ -15,10 +16,15 @@ use futures::{Stream, StreamExt as _};
 
 use crate::engine::Engine;
 use crate::http::RequestId;
+use uniserve_core::GenerationConstraint;
+
 use crate::openai::{
     ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,
+    check_model_served,
 };
-use crate::serving::{FinishReason, RequestOutput};
+use crate::serving::{
+    FinishReason, GenerateRequest, ImageGenControls, Prompt, RequestOutput, SamplingParams,
+};
 
 /// The image generation route.
 pub(crate) fn router(engine: Arc<Engine>) -> Router {
@@ -33,15 +39,99 @@ async fn images_generations(
     Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ImageGenerationRequest>,
 ) -> Response {
-    let request_id = format!("img-{base_id}");
-    let stream = match engine.generate_image(request_id.into(), body).await {
+    let request =
+        match lower_image_request(format!("img-{base_id}"), engine.served_model_name(), body) {
+            Ok(request) => request,
+            Err(error) => return error.into_response(),
+        };
+    let stream = match engine.generate(request).await {
         Ok(stream) => stream,
-        Err(error) => return error.into_response(),
+        Err(error) => return ApiError::from(error).into_response(),
     };
     match collect_image_generation(stream, uniserve_core::now_unix_secs_u64()).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// Validates and lowers one image-generation request into the serving
+/// layer's generate request: an image-only generation of exactly one image
+/// with the default shared cache policy and default text sampling.
+///
+/// # Errors
+///
+/// Rejects an empty or whitespace-only prompt, a model name other than the
+/// served one, and a malformed `size`.
+pub fn lower_image_request(
+    request_id: String,
+    served_model_name: &str,
+    request: ImageGenerationRequest,
+) -> Result<GenerateRequest, ApiError> {
+    if request.prompt.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "prompt must not be empty".to_string(),
+            Some("prompt"),
+        ));
+    }
+    if let Some(model) = request.model.as_deref() {
+        check_model_served(model, served_model_name)?;
+    }
+    // An absent size leaves both dimensions to the profile's resolution
+    // policy.
+    let (width, height) = request
+        .size
+        .as_deref()
+        .map(parse_size)
+        .transpose()?
+        .map_or((None, None), |(width, height)| (Some(width), Some(height)));
+    Ok(GenerateRequest {
+        request_id,
+        prompt: Prompt::Text {
+            prompt: request.prompt,
+            negative_prompt: request.negative_prompt,
+        },
+        constraint: GenerationConstraint::GenOnly,
+        sampling_params: SamplingParams::default(),
+        image_params: Some(ImageGenControls {
+            width,
+            height,
+            steps: request.steps,
+            cfg_text_scale: request.guidance_scale,
+            cfg_img_scale: request.image_guidance_scale,
+            cfg_interval: request.cfg_interval,
+            cfg_renorm_type: request.cfg_norm,
+            timestep_shift: request.timestep_shift,
+            seed: request.seed,
+            max_images: Some(1),
+            ..ImageGenControls::default()
+        }),
+        priority: 0,
+        cache_salt: None,
+    })
+}
+
+/// Parses a positive `WIDTHxHEIGHT` image-size string.
+fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
+    let Some((width, height)) = size.split_once('x') else {
+        return Err(ApiError::invalid_request(
+            "size must use WIDTHxHEIGHT syntax".to_string(),
+            Some("size"),
+        ));
+    };
+    if height.contains('x') {
+        return Err(ApiError::invalid_request(
+            "size must use WIDTHxHEIGHT syntax".to_string(),
+            Some("size"),
+        ));
+    }
+    let width = width.parse::<u32>().ok().filter(|value| *value > 0);
+    let height = height.parse::<u32>().ok().filter(|value| *value > 0);
+    width.zip(height).ok_or_else(|| {
+        ApiError::invalid_request(
+            "size dimensions must be positive integers".to_string(),
+            Some("size"),
+        )
+    })
 }
 
 /// Collects image events into one OpenAI-compatible response.

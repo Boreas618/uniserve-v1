@@ -15,10 +15,11 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uniserve_core::video::plan::{
-    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS,
-    PlanLimits, ProcessorConfig, ReferenceConfig, Target,
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
+    MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig, Role, Target, VideoInputError,
 };
 use uniserve_core::{
     Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
@@ -28,10 +29,79 @@ use uniserve_engine::VideoDenoiserInfo;
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
 use super::{ConditionInput, VideoInputs, VideoProcessor};
-use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
 use crate::options::MediaOptions;
 use crate::profile::tokenizer::DynTokenizer;
-use crate::serving::{ServeError, ServeRequestId};
+use crate::serving::ServeError;
+
+/// The seed a request without one uses, as the official reference does.
+pub const DEFAULT_VIDEO_SEED: u64 = 42;
+
+/// One video, audio or image condition of a request, in request order.
+///
+/// The order is semantic: the conditioner presents references in it and
+/// their ordinal labels name them.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoCondition {
+    /// `image`, `video`, `video_audio` (a video that must have a soundtrack)
+    /// or `audio`.
+    #[serde(rename = "type")]
+    pub condition_type: ConditionType,
+    /// `data:`, `file://` or `http(s)://` location of the media.
+    pub uri: String,
+    /// `keyframe` (an image anchoring a generated frame) or `reference`.
+    pub role: Role,
+    /// The generated frame a keyframe anchors: 0 or -1.
+    #[serde(default)]
+    pub frame_index: Option<i64>,
+    /// Offset into a video reference, seconds; its soundtrack follows it.
+    #[serde(default)]
+    pub start_time_seconds: Option<f64>,
+}
+
+/// The requested output; the canvas and the duration come only from here.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoTarget {
+    /// Short edge of the canvas in pixels; the deployment serves the short
+    /// edges `GET /v1/capabilities` reports.
+    pub short_edge: u32,
+    /// `auto` or `W:H`.
+    pub aspect_ratio: String,
+    /// Duration in seconds; a reference-conditioned request whose only
+    /// audio-bearing reference sets its duration may omit it.
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+}
+
+/// MiniMax-H3 video-and-audio generation request: the official MiniMax /
+/// SGLang form, a `task`, its ordered `conditions` and the requested
+/// `target`. The `/v1/videos` routes and the Dynamo worker build it, and
+/// `deny_unknown_fields` rejects every field not listed here, at every
+/// level. The served checkpoint fixes the schedule, and every request
+/// generates one video.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoGenerationRequest {
+    /// Served model name.
+    pub model: String,
+    /// Prompt; the conditioner presents it after the conditions.
+    pub prompt: String,
+    /// `t2va`, `fl2va` or `ref2va`; one the served denoiser serves.
+    pub task: VideoTask,
+    /// The task's conditions, in request order.
+    #[serde(default)]
+    pub conditions: Vec<VideoCondition>,
+    /// The requested output.
+    pub target: VideoTarget,
+    /// Video-generation random seed.
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+}
+
+const fn default_seed() -> u64 {
+    DEFAULT_VIDEO_SEED
+}
 
 /// The fields of the video request body, in schema order.
 pub(crate) const REQUEST_FIELDS: [&str; 6] =
@@ -232,15 +302,16 @@ impl VideoService {
     ///
     /// # Errors
     ///
-    /// Returns `invalid_request` naming the field at fault or the prompt
-    /// tokens the request needs, and a server error when processing's own
-    /// resources or the shared-memory allocation fail.
+    /// Returns `ServeError::Video` naming the field at fault, or failing
+    /// when processing's own resources or the shared-memory allocation fail,
+    /// and `ServeError::ContextLengthExceeded` for a presentation longer than
+    /// the prompt capacity.
     pub async fn process(
         &self,
-        request_id: &ServeRequestId,
+        request_id: &str,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<(DiffusionRequest, ProcessedVideo), ApiError> {
+    ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
         let processed = self
@@ -260,13 +331,11 @@ impl VideoService {
 
         let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
-            return Err(crate::openai::ApiError::from(
-                ServeError::ContextLengthExceeded {
-                    request_id: request_id.clone(),
-                    prompt_tokens: prompt_token_ids.len(),
-                    max_tokens: max_prompt_tokens,
-                },
-            ));
+            return Err(ServeError::ContextLengthExceeded {
+                request_id: request_id.to_owned(),
+                prompt_tokens: prompt_token_ids.len(),
+                max_tokens: max_prompt_tokens,
+            });
         }
 
         // Each condition's media reaches the worker's media reader through
@@ -281,7 +350,7 @@ impl VideoService {
             .zip(image_bands)
         {
             let source = MediaSource::publish(fetched.bytes()).map_err(|error| {
-                ApiError::server_error(format!(
+                VideoInputError::Internal(format!(
                     "publishing conditions[{}] for the worker failed: {error}",
                     condition.index
                 ))
@@ -354,10 +423,10 @@ mod tests {
     use uniserve_engine::VideoDenoiserInfo;
 
     use super::super::tests::{character_tokenizer, served_canvases, vision};
+    use super::VideoGenerationRequest;
     use super::VideoService;
-    use crate::openai::VideoGenerationRequest;
     use crate::options::MediaOptions;
-    use crate::serving::ServeRequestId;
+    use String;
 
     /// A base denoiser serving every task, on a latent encoder of one rank,
     /// in a deployment that sizes references as the released pipeline does.
@@ -454,11 +523,7 @@ mod tests {
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         });
         let (unenlarged, _) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
-            .process(
-                &ServeRequestId::new("reference"),
-                &request(body.clone()),
-                1 << 16,
-            )
+            .process(&String::from("reference"), &request(body.clone()), 1 << 16)
             .await
             .unwrap();
         // 90 is 2.8 patches and rounds to 96.
@@ -477,7 +542,7 @@ mod tests {
         );
 
         let (request, _) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
-            .process(&ServeRequestId::new("reference"), &request(body), 1 << 16)
+            .process(&String::from("reference"), &request(body), 1 << 16)
             .await
             .unwrap();
         assert_eq!(request.task, VideoTask::Ref2va);
@@ -540,7 +605,7 @@ mod tests {
             ];
             let (request, _) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
             .process(
-                &ServeRequestId::new("images"),
+                &String::from("images"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
                     "prompt": "a fox",
@@ -574,7 +639,7 @@ mod tests {
     async fn keyframes_are_fitted_to_the_canvas() {
         let (request, processed) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
-                &ServeRequestId::new("keyframes"),
+                &String::from("keyframes"),
                 &request(serde_json::json!({
                     "model": "minimax_h3",
                     "prompt": "a fox",
@@ -635,7 +700,7 @@ mod tests {
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         }));
         let (request, _) = service()
-            .process(&ServeRequestId::new("rows"), &body, 1 << 16)
+            .process(&String::from("rows"), &body, 1 << 16)
             .await
             .unwrap();
         assert_eq!(request.conditions[0].latent_units, [7296]);

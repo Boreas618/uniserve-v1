@@ -82,7 +82,6 @@ pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<EngineCore
 /// The simulated model's facts.
 fn sim_model(parameters: ModelParameters) -> ModelConfig {
     ModelConfig {
-        served_name: SERVED_MODEL.to_string(),
         parameters,
         sampling_defaults: SamplingDefaults::default(),
         max_model_len: 4096,
@@ -121,7 +120,15 @@ fn engine_over(
         log_requests: false,
         log_stats: false,
     };
-    Engine::new(cores, processor, images, readout, &logging).unwrap()
+    Engine::new(
+        SERVED_MODEL.to_owned(),
+        cores,
+        processor,
+        images,
+        readout,
+        &logging,
+    )
+    .unwrap()
 }
 
 /// The video service of a four-step text-to-video denoiser that generates

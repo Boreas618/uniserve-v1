@@ -34,10 +34,11 @@ use serde_json::{Value, json};
 use crate::engine::Engine;
 use crate::http::RequestId;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
-use crate::openai::{ApiError, VideoGenerationRequest};
-use crate::serving::ServeRequestId;
+use crate::openai::{ApiError, check_model_served};
+use crate::serving::video::VideoGenerationRequest;
 use crate::serving::video::artifact::ArtifactCollector;
 use crate::serving::video::service::REQUEST_FIELDS;
+use String;
 
 /// The state of the asynchronous video job routes.
 #[derive(Clone)]
@@ -92,11 +93,14 @@ async fn videos_sync(
     VideoBody(body): VideoBody,
 ) -> Response {
     let started_at = Instant::now();
-    let request_id = ServeRequestId::new(format!("vid-{base_id}"));
+    let request_id = format!("vid-{base_id}");
 
+    if let Err(error) = check_model_served(&body.model, engine.served_model_name()) {
+        return error.into_response();
+    }
     let (_, mut stream) = match engine.generate_video(request_id, body).await {
         Ok(generation) => generation,
-        Err(error) => return error.into_response(),
+        Err(error) => return ApiError::from(error).into_response(),
     };
 
     // The synchronous endpoint consumes lifecycle events until the runtime
@@ -158,8 +162,8 @@ async fn videos_sync(
 /// rejected. A JSON body that is not the schema is a `json_parse_error`, a
 /// refused multipart body an `invalid_request_error` (both `400`), and an
 /// unsupported content type `415 Unsupported Media Type`. Semantic checks
-/// (served model, task, conditions and target) happen in
-/// `InputProcessor::preprocess_video_request`.
+/// (served model, task, conditions and target) happen in the handlers and in
+/// `VideoService::process`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
 /// How a multipart text part of the video request becomes a JSON value.
@@ -278,10 +282,13 @@ async fn videos_create(
     Extension(RequestId(base_id)): Extension<RequestId>,
     VideoBody(body): VideoBody,
 ) -> Response {
-    let request_id = ServeRequestId::new(format!("vid-{base_id}"));
+    let request_id = format!("vid-{base_id}");
+    if let Err(error) = check_model_served(&body.model, engine.served_model_name()) {
+        return error.into_response();
+    }
     let (prepared, mut stream) = match engine.generate_video(request_id, body).await {
         Ok(generation) => generation,
-        Err(error) => return error.into_response(),
+        Err(error) => return ApiError::from(error).into_response(),
     };
 
     // Public IDs are server-generated, so caller request-ID headers cannot
@@ -514,6 +521,19 @@ mod tests {
         assert_eq!(failed["error"]["code"], sync_body["error"]["code"]);
     }
 
+    /// Both submission routes refuse a model the server does not serve.
+    #[tokio::test]
+    async fn the_video_routes_refuse_another_model() {
+        let router = video_router();
+        let mut request = video_request();
+        request["model"] = serde_json::json!("another-model");
+        for path in ["/v1/videos/sync", "/v1/videos"] {
+            let (status, _, body) = send(&router, post_json(path, &request)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(body["error"]["code"], "model_not_found", "{path}");
+        }
+    }
+
     #[tokio::test]
     async fn json_and_multipart_normalize_to_the_same_request() {
         let conditions = r#"[{"type": "image", "uri": "data:image/png;base64,AA==", "role": "keyframe", "frame_index": 0}]"#;
@@ -549,7 +569,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(defaulted.seed, crate::openai::DEFAULT_VIDEO_SEED);
+        assert_eq!(defaulted.seed, crate::serving::video::DEFAULT_VIDEO_SEED);
     }
 
     /// Fields outside the schema, a schedule field included, and file parts

@@ -173,8 +173,6 @@ pub enum ModelParameters {
 /// Immutable model facts shared by startup, request preprocessing, and discovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Model name exposed by discovery and generation responses.
-    pub served_name: String,
     /// Loaded model-specific settings, including the family identity.
     pub parameters: ModelParameters,
     /// Checkpoint defaults applied only to omitted request fields.
@@ -218,7 +216,6 @@ impl ModelConfig {
     /// metadata lacks a required field, or when Bagel's latent position table
     /// cannot be read.
     pub async fn from_files(
-        served_name: &str,
         model: &str,
         files: &ResolvedModelFiles,
         max_model_len: Option<u32>,
@@ -268,7 +265,6 @@ impl ModelConfig {
         };
 
         Ok(Self {
-            served_name: served_name.to_owned(),
             parameters,
             sampling_defaults: generation_defaults(&generation_config),
             max_model_len: max_model_len
@@ -292,7 +288,6 @@ impl ModelConfig {
     /// Returns [`assets::Error::UnsupportedPipeline`] for a family that does
     /// not ship as a pipeline.
     pub fn from_pipeline(
-        model_id: &str,
         description: ModelDescription,
         max_model_len: Option<u32>,
     ) -> assets::Result<Self> {
@@ -312,7 +307,6 @@ impl ModelConfig {
         };
 
         Ok(Self {
-            served_name: model_id.to_owned(),
             parameters,
             sampling_defaults: SamplingDefaults::default(),
             max_model_len: max_model_len.unwrap_or(default_max_model_len),
@@ -463,10 +457,8 @@ mod tests {
         (directory, files)
     }
 
-    /// Resolves `served_name` over the checkpoint [`configured_files`] writes
-    /// for `model_type`.
+    /// Resolves the checkpoint [`configured_files`] writes for `model_type`.
     async fn resolved_config(
-        served_name: &str,
         model_type: &str,
     ) -> (
         tempfile::TempDir,
@@ -475,14 +467,9 @@ mod tests {
     ) {
         let (directory, files) = configured_files(model_type);
         let tokenizer = HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap();
-        let config = ModelConfig::from_files(
-            served_name,
-            directory.path().to_str().unwrap(),
-            &files,
-            None,
-            &tokenizer,
-        )
-        .await;
+        let config =
+            ModelConfig::from_files(directory.path().to_str().unwrap(), &files, None, &tokenizer)
+                .await;
         (directory, tokenizer, config)
     }
 
@@ -494,8 +481,7 @@ mod tests {
             (ModelDescription::SenseNova, "neo_chat"),
             (ModelDescription::Bagel, "bagel"),
         ] {
-            let (_directory, _tokenizer, profile) =
-                resolved_config(description.id(), model_type).await;
+            let (_directory, _tokenizer, profile) = resolved_config(model_type).await;
             let profile = profile.unwrap();
             assert_eq!(profile.description(), description);
             assert_eq!(profile.max_model_len, 4096);
@@ -551,7 +537,7 @@ mod tests {
         );
         assert_eq!(ModelDescription::from_model_type("minimax_h3"), None);
 
-        let profile = ModelConfig::from_pipeline("h3", ModelDescription::MiniMaxH3, None).unwrap();
+        let profile = ModelConfig::from_pipeline(ModelDescription::MiniMaxH3, None).unwrap();
         assert_eq!(profile.description(), ModelDescription::MiniMaxH3);
         assert_eq!(profile.max_model_len, 16_384);
     }
@@ -576,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_repository_model_type_is_rejected() {
-        let (_directory, _tokenizer, config) = resolved_config("configured-model", "llama").await;
+        let (_directory, _tokenizer, config) = resolved_config("llama").await;
         let error = config.unwrap_err();
         assert!(matches!(
             error,
@@ -586,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn omni_descriptions_define_prompt_framing_and_image_geometry() {
-        let (_directory, tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let (_directory, tokenizer, config) = resolved_config("neo_chat").await;
         let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
             unreachable!()
         };
@@ -630,7 +616,7 @@ mod tests {
             vec![Some(2305)]
         );
 
-        let (_directory, tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let (_directory, tokenizer, config) = resolved_config("bagel").await;
         let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };
@@ -673,7 +659,7 @@ mod tests {
     /// SenseNova, the grid of each fixed bucket.
     #[tokio::test]
     async fn generation_limits_cover_every_image_the_profiles_admit() {
-        let (_directory, _tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let (_directory, _tokenizer, config) = resolved_config("neo_chat").await;
         let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
             unreachable!()
         };
@@ -697,7 +683,7 @@ mod tests {
             assert!(units <= u64::from(limits.max_vae_grid_tokens));
         }
 
-        let (_directory, _tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let (_directory, _tokenizer, config) = resolved_config("bagel").await;
         let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };
@@ -739,7 +725,7 @@ mod tests {
         ))
         .unwrap();
 
-        let (_directory, _tokenizer, config) = resolved_config("sensenova", "neo_chat").await;
+        let (_directory, _tokenizer, config) = resolved_config("neo_chat").await;
         let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
             unreachable!()
         };
@@ -782,7 +768,7 @@ mod tests {
         ))
         .unwrap();
 
-        let (_directory, _tokenizer, config) = resolved_config("bagel", "bagel").await;
+        let (_directory, _tokenizer, config) = resolved_config("bagel").await;
         let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };

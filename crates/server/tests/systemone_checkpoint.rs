@@ -109,7 +109,7 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
         .unwrap_or_else(|_| panic!("{variable} must name the checkpoint directory"));
     let files = ResolvedModelFiles::new(&directory).await.unwrap();
     let tokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
-    let config = ModelConfig::from_files("diffusion-gemma", &directory, &files, None, &tokenizer)
+    let config = ModelConfig::from_files(&directory, &files, None, &tokenizer)
         .await
         .unwrap();
 

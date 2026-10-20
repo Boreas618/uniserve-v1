@@ -34,15 +34,14 @@ use uniserve_core::{GenerationLimits, Request};
 use uniserve_engine::{EngineCore, EventRx, SubmitError, VideoDenoiserInfo};
 use uniserve_observability::{EngineLabels, METRICS};
 
-use crate::openai::ApiError;
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
 use crate::profile::{ModelConfig, ModelParameters};
 use crate::serving::media::ImageFetcher;
 use crate::serving::systemone::ReadoutEncoder;
-use crate::serving::video::{ProcessedVideo, VideoService};
+use crate::serving::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use crate::serving::{
-    self, InputProcessor, LoadedModel, LoadedRenderer, RequestOutputStream, RequestRenderer,
-    ServeError, ServeRequestId, TokenizeError,
+    self, GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, Prompt,
+    RequestOutputStream, RequestRenderer, ServeError, TokenizeError,
 };
 use log_stats::StatsLogger;
 pub(crate) use metrics::RequestStats;
@@ -52,6 +51,8 @@ pub(crate) use metrics::RequestStats;
 /// Construction spawns Tokio tasks, so every constructor must be called
 /// within a Tokio runtime.
 pub struct Engine {
+    /// The single model name the API serves.
+    served_model_name: String,
     processor: Arc<InputProcessor>,
     /// One engine core per data-parallel rank; every rank serves the same
     /// model with the same limits.
@@ -256,11 +257,18 @@ impl Engine {
         .context("failed to bind the configured model description")?;
         let images = ImageFetcher::new(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
-        Self::new(cores, processor, images, readout, &config.logging_config)
+        Self::new(
+            config.served_model_name().to_owned(),
+            cores,
+            processor,
+            images,
+            readout,
+            &config.logging_config,
+        )
     }
 
-    /// Serves `processor`'s model over started engine cores, one per
-    /// data-parallel rank.
+    /// Serves `processor`'s model under `served_model_name` over started
+    /// engine cores, one per data-parallel rank.
     ///
     /// `images` resolves the image references of every request, and
     /// `readout` serves `POST /v1/systemone` for a model that has one. One
@@ -273,6 +281,7 @@ impl Engine {
     /// generation limits: a request is prepared once against them and may
     /// land on any rank.
     pub fn new(
+        served_model_name: String,
         cores: Vec<EngineCore>,
         processor: InputProcessor,
         images: ImageFetcher,
@@ -328,6 +337,7 @@ impl Engine {
             .then(|| StatsLogger::start(model_name, replicas.len()));
 
         Ok(Self {
+            served_model_name,
             processor: Arc::new(processor),
             replicas,
             next_replica: AtomicUsize::new(0),
@@ -346,7 +356,7 @@ impl Engine {
 
     /// The single model name the API serves.
     pub fn served_model_name(&self) -> &str {
-        self.processor.served_model_name()
+        &self.served_model_name
     }
 
     /// The generation limits every engine core serves.
@@ -397,73 +407,47 @@ impl Engine {
         self.readout.as_ref()
     }
 
-    /// Fetches the images of a chat request, renders and tokenizes it, and
-    /// streams its output.
+    /// Fetches the input images of a generation request, renders and
+    /// tokenizes it, and streams its output.
     ///
-    /// The `image_url` parts are fetched only for a model that accepts image
-    /// input; for any other model, preprocessing rejects them without
-    /// network access.
+    /// A chat prompt's `image_url` parts are fetched only for a model that
+    /// accepts image input; for any other model, preprocessing rejects them
+    /// without network access.
     ///
     /// # Errors
     ///
-    /// Fails when the request does not name the served model or asks for
-    /// output it cannot stream, an image cannot be fetched, preprocessing
-    /// refuses the request, or no engine core accepts it.
-    pub async fn generate_chat(
+    /// Fails when an image cannot be fetched, preprocessing refuses the
+    /// request, or no engine core accepts it.
+    pub async fn generate(
         &self,
-        request_id: ServeRequestId,
-        request: crate::openai::ChatCompletionRequest,
-    ) -> crate::openai::Result<RequestOutputStream> {
+        request: GenerateRequest,
+    ) -> Result<RequestOutputStream, ServeError> {
         // Compilation, and with it the request's latency, is measured from
         // here, so image fetching and time queued for the blocking pool
         // count toward it.
         let started = Instant::now();
-        crate::openai::chat_completions::validate_request_compat(
-            &request,
-            self.served_model_name(),
-        )?;
-        let image_urls = if self.processor.supports_image_input() {
-            serving::chat_image_urls(&request)
-        } else {
-            Vec::new()
+        let request_id = request.request_id.clone();
+        let image_urls = match &request.prompt {
+            Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
+            _ => Vec::new(),
         };
-        let images = self.images.fetch_all(image_urls).await.map_err(|source| {
-            ApiError::from(ServeError::ImageInput {
-                request_id: request_id.clone(),
-                source,
-            })
-        })?;
+        let images =
+            self.images
+                .fetch_all(image_urls)
+                .await
+                .map_err(|source| ServeError::ImageInput {
+                    request_id: request_id.clone(),
+                    source,
+                })?;
         let processor = Arc::clone(&self.processor);
-        let id = request_id.clone();
-        let (request, output) = preprocess(&request_id, move || {
-            processor.preprocess_chat_request(id, request, images)
-        })
-        .await?;
-        self.generate(request_id, started, request, output)
-            .map_err(ApiError::from)
-    }
+        let (request, output) =
+            preprocess(&request_id, move || processor.preprocess(request, images)).await?;
 
-    /// Renders and tokenizes one image-generation request and streams its
-    /// output.
-    ///
-    /// # Errors
-    ///
-    /// Fails when preprocessing refuses the request or no engine core
-    /// accepts it.
-    pub async fn generate_image(
-        &self,
-        request_id: ServeRequestId,
-        request: crate::openai::ImageGenerationRequest,
-    ) -> crate::openai::Result<RequestOutputStream> {
-        let started = Instant::now();
-        let processor = Arc::clone(&self.processor);
-        let id = request_id.clone();
-        let (request, output) = preprocess(&request_id, move || {
-            processor.preprocess_image_request(id, request)
-        })
-        .await?;
-        self.generate(request_id, started, request, output)
-            .map_err(ApiError::from)
+        let compile_us = elapsed_us(started);
+        let (events, rank) = self.submit(request.into())?;
+        let output =
+            serving::generation_output(request_id.clone(), started, compile_us, output, events);
+        Ok(self.stats(request_id, started, rank, output))
     }
 
     /// Fetches, probes and plans a video request's media, presents its
@@ -474,22 +458,26 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Fails when the video service refuses the request or no engine core
-    /// accepts it.
+    /// Fails when the model serves no video, the video service refuses the
+    /// request, or no engine core accepts it.
     pub async fn generate_video(
         &self,
-        request_id: ServeRequestId,
-        request: crate::openai::VideoGenerationRequest,
-    ) -> crate::openai::Result<(ProcessedVideo, RequestOutputStream)> {
+        request_id: String,
+        request: VideoGenerationRequest,
+    ) -> Result<(ProcessedVideo, RequestOutputStream), ServeError> {
         let started = Instant::now();
-        let (request, video) = self
-            .processor
-            .preprocess_video_request(&request_id, &request)
+        let video =
+            self.processor
+                .video_service()
+                .ok_or_else(|| ServeError::UnsupportedFeature {
+                    request_id: request_id.clone(),
+                    feature: "video_generation",
+                })?;
+        let (request, processed) = video
+            .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, rank) = self
-            .submit(Request::Diffusion(request))
-            .map_err(|error| ApiError::from(ServeError::from(error)))?;
+        let (events, rank) = self.submit(Request::Diffusion(request))?;
         let output = serving::media_output(
             request_id.clone(),
             started,
@@ -497,28 +485,13 @@ impl Engine {
             prompt_tokens,
             events,
         );
-        Ok((video, self.stats(request_id, started, rank, output)))
-    }
-
-    /// Submits a tokenized generation request and streams its output.
-    fn generate(
-        &self,
-        request_id: ServeRequestId,
-        started: Instant,
-        request: uniserve_core::GenerationRequest,
-        output: serving::OutputParams,
-    ) -> Result<RequestOutputStream, ServeError> {
-        let compile_us = elapsed_us(started);
-        let (events, rank) = self.submit(request.into())?;
-        let output =
-            serving::generation_output(request_id.clone(), started, compile_us, output, events);
-        Ok(self.stats(request_id, started, rank, output))
+        Ok((processed, self.stats(request_id, started, rank, output)))
     }
 
     /// Records `output`'s request metrics under the rank that serves it.
     fn stats(
         &self,
-        request_id: ServeRequestId,
+        request_id: String,
         started: Instant,
         rank: u32,
         output: RequestOutputStream,
@@ -616,16 +589,16 @@ impl Engine {
 /// `request_id`. Dropping the returned future does not stop the work; its
 /// result is discarded.
 async fn preprocess<T: Send + 'static>(
-    request_id: &ServeRequestId,
-    work: impl FnOnce() -> crate::openai::Result<T> + Send + 'static,
-) -> crate::openai::Result<T> {
+    request_id: &str,
+    work: impl FnOnce() -> Result<T, ServeError> + Send + 'static,
+) -> Result<T, ServeError> {
     tokio::task::spawn_blocking(work)
         .await
         .unwrap_or_else(|error| {
-            Err(ApiError::from(ServeError::Tokenize {
-                request_id: request_id.clone(),
+            Err(ServeError::Tokenize {
+                request_id: request_id.to_owned(),
                 source: TokenizeError::Task(error),
-            }))
+            })
         })
 }
 

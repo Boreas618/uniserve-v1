@@ -5,9 +5,10 @@
 //! `ModelConfig::sampling_defaults`) and `omni::prepare_generation_resources`
 //! for SenseNova and Bagel (from fixed omni defaults).
 
-use super::{SamplingConfig, StopConfig, TokenizeError};
+use uniserve_core::SamplingParams as EngineSamplingParams;
+
+use super::{SamplingParams, TokenizeError};
 use crate::profile::tokenizer::HuggingFaceTokenizer;
-use uniserve_core::SamplingParams;
 
 /// Applies public controls once, preserving model biases and an explicit image seed.
 ///
@@ -27,9 +28,8 @@ use uniserve_core::SamplingParams;
 /// `SamplingParams::validate`. `sampling` may be partially updated on error.
 pub(super) fn apply_sampling(
     tokenizer: &HuggingFaceTokenizer,
-    controls: &SamplingConfig,
-    stop: &StopConfig,
-    sampling: &mut SamplingParams,
+    controls: &SamplingParams,
+    sampling: &mut EngineSamplingParams,
 ) -> Result<(), TokenizeError> {
     sampling.temperature = controls.temperature.unwrap_or(sampling.temperature);
     sampling.top_k = controls.top_k.unwrap_or(sampling.top_k);
@@ -49,18 +49,19 @@ pub(super) fn apply_sampling(
         .logit_bias
         .drain(..)
         .collect::<std::collections::BTreeMap<_, _>>();
-    if let Some(request) = &stop.logit_bias {
+    if let Some(request) = &controls.logit_bias {
         for (&token, &bias) in request {
             *biases.entry(token).or_insert(0.0) += bias;
         }
     }
     sampling.logit_bias = biases.into_iter().collect();
-    sampling.return_logprobs = stop.logprobs.is_some();
-    sampling.n_logprobs = logprob_count(stop.logprobs);
-    sampling.return_prompt_logprobs = stop.prompt_logprobs.is_some();
-    sampling.n_prompt_logprobs = logprob_count(stop.prompt_logprobs);
-    sampling.allowed_token_ids = stop.allowed_token_ids.clone();
-    sampling.bad_words_ids = tokenize_bad_words(&stop.bad_words, tokenizer)?.unwrap_or_default();
+    sampling.return_logprobs = controls.logprobs.is_some();
+    sampling.n_logprobs = logprob_count(controls.logprobs);
+    sampling.return_prompt_logprobs = controls.prompt_logprobs.is_some();
+    sampling.n_prompt_logprobs = logprob_count(controls.prompt_logprobs);
+    sampling.allowed_token_ids = controls.allowed_token_ids.clone();
+    sampling.bad_words_ids =
+        tokenize_bad_words(&controls.bad_words, tokenizer)?.unwrap_or_default();
     sampling.validate()?;
     Ok(())
 }

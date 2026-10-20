@@ -20,6 +20,17 @@ use uniserve_server::serving::media::ImageFetcher;
 use uniserve_server::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
 
 /// Builds an engine over a default `SimEngine`.
+/// `request` as the chat route lowers it for the served `sim-model`.
+fn lowered(id: &str, request: ChatCompletionRequest) -> uniserve_server::serving::GenerateRequest {
+    uniserve_server::openai::chat_completions::lower_chat_request(
+        id.to_owned(),
+        "sim-model",
+        request,
+    )
+    .unwrap()
+    .0
+}
+
 fn runtime() -> Engine {
     runtime_with_worker(SimEngine::new())
 }
@@ -61,7 +72,6 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> Engine {
     .unwrap();
     let processor = InputProcessor::new(
         ModelConfig {
-            served_name: "sim-model".to_string(),
             parameters: ModelParameters::Qwen3,
             sampling_defaults: SamplingDefaults::default(),
             max_model_len: 4096,
@@ -87,7 +97,15 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> Engine {
         log_requests: false,
         log_stats: false,
     };
-    Engine::new(vec![core], processor, images, None, &logging).unwrap()
+    Engine::new(
+        "sim-model".to_owned(),
+        vec![core],
+        processor,
+        images,
+        None,
+        &logging,
+    )
+    .unwrap()
 }
 
 /// Greedy chat request of at most `max_completion_tokens` tokens that may
@@ -127,7 +145,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     .unwrap();
 
     let stream = runtime
-        .generate_chat("rejected-chat".into(), request)
+        .generate(lowered("rejected-chat", request))
         .await
         .unwrap();
     let context = uniserve_server::openai::chat_completions::ChatResponseContext {
@@ -149,7 +167,7 @@ async fn chat_admission_rejection_remains_a_bad_request() {
     runtime.shutdown().await.unwrap();
 }
 
-/// `compile_us` is measured from the start of `generate_chat`, so it includes
+/// `compile_us` is measured from the start of `generate`, so it includes
 /// time spent queued for the blocking pool; the reported total latency must
 /// cover that wait as well.
 #[test]
@@ -171,7 +189,7 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
             release_rx.recv().unwrap();
         });
         ready_rx.await.unwrap();
-        let mut pending = Box::pin(runtime.generate_chat("timed".into(), request()));
+        let mut pending = Box::pin(runtime.generate(lowered("timed", request())));
         assert!(poll!(pending.as_mut()).is_pending());
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         release_tx.send(()).unwrap();
@@ -200,7 +218,7 @@ async fn completed_request_is_recorded_in_request_metrics() {
     let runtime = runtime_for_engine_model(SimEngine::new(), engine_model);
 
     let mut stream = runtime
-        .generate_chat("metrics".into(), request_with(3, &[]))
+        .generate(lowered("metrics", request_with(3, &[])))
         .await
         .unwrap();
     let mut usage = None;
@@ -251,7 +269,7 @@ async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
     let runtime = runtime_for_engine_model(worker, engine_model);
 
     let mut stream = runtime
-        .generate_chat("disconnect".into(), request_with(1_000, &[]))
+        .generate(lowered("disconnect", request_with(1_000, &[])))
         .await
         .unwrap();
     loop {

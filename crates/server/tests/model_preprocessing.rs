@@ -16,18 +16,21 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::video::plan::{ProcessorConfig, canvas};
 use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall, ServedCanvas};
 use uniserve_engine::VideoDenoiserInfo;
-use uniserve_server::openai::VideoGenerationRequest;
+use uniserve_server::openai::ApiError;
 use uniserve_server::options::{ImageFetchOptions, MediaOptions};
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::{ImageFetchError, ImageFetcher, ImageInput, ImageListError};
+use uniserve_server::serving::video::VideoGenerationRequest;
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::{
-    InputProcessor, ModelResolutionError, OutputParams, RequestRenderer, ServeRequestId,
-    chat_image_urls,
+    InputProcessor, ModelResolutionError, OutputParams, Prompt, RequestRenderer,
 };
+
+/// The model name every test request names and the routes check.
+const SERVED_MODEL: &str = "served-model";
 
 /// Base64 payload of a 1x1 PNG image.
 const PNG_1X1: &str =
@@ -228,14 +231,11 @@ fn try_resolved_model(
     // is built by `ModelConfig::from_pipeline` and served by a video service
     // with the server's default 15-second maximum video duration.
     let config = match description {
-        ModelDescription::MiniMaxH3 => {
-            ModelConfig::from_pipeline(description.id(), description, Some(4096)).unwrap()
-        }
+        ModelDescription::MiniMaxH3 => ModelConfig::from_pipeline(description, Some(4096)).unwrap(),
         _ => tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
             .block_on(ModelConfig::from_files(
-                description.id(),
                 directory.path().to_str().unwrap(),
                 &files,
                 Some(4096),
@@ -299,6 +299,74 @@ fn image_chat_request(
     .unwrap()
 }
 
+/// Preprocesses a chat completion as its route lowers it, answering a
+/// refusal as the route does.
+fn preprocess_chat(
+    processor: &InputProcessor,
+    request_id: String,
+    request: uniserve_server::openai::ChatCompletionRequest,
+    images: Vec<ImageInput>,
+) -> Result<(GenerationRequest, OutputParams), ApiError> {
+    let (request, _) = uniserve_server::openai::chat_completions::lower_chat_request(
+        request_id,
+        SERVED_MODEL,
+        request,
+    )?;
+    processor
+        .preprocess(request, images)
+        .map_err(ApiError::from)
+}
+
+/// Preprocesses an image-generation request as its route lowers it,
+/// answering a refusal as the route does.
+fn preprocess_image(
+    processor: &InputProcessor,
+    request_id: String,
+    request: uniserve_server::openai::ImageGenerationRequest,
+) -> Result<(GenerationRequest, OutputParams), ApiError> {
+    let request =
+        uniserve_server::openai::images::lower_image_request(request_id, SERVED_MODEL, request)?;
+    processor
+        .preprocess(request, Vec::new())
+        .map_err(ApiError::from)
+}
+
+/// The input-image URLs of a chat completion, in the order preprocessing
+/// pairs resolved images with them.
+fn chat_image_urls(request: &uniserve_server::openai::ChatCompletionRequest) -> Vec<String> {
+    let (lowered, _) = uniserve_server::openai::chat_completions::lower_chat_request(
+        String::new(),
+        &request.model,
+        request.clone(),
+    )
+    .unwrap();
+    match lowered.prompt {
+        Prompt::Chat(chat) => chat.image_urls(),
+        Prompt::Text { .. } => Vec::new(),
+    }
+}
+
+/// Processes a video request through the processor's video service, as
+/// `Engine::generate_video` does.
+async fn preprocess_video(
+    processor: &InputProcessor,
+    request_id: &str,
+    request: &VideoGenerationRequest,
+) -> Result<
+    (
+        uniserve_core::DiffusionRequest,
+        uniserve_server::serving::video::ProcessedVideo,
+    ),
+    ApiError,
+> {
+    processor
+        .video_service()
+        .expect("the processor serves video")
+        .process(request_id, request, processor.config().max_model_len)
+        .await
+        .map_err(ApiError::from)
+}
+
 /// Runs `ImageFetcher::fetch_all` to completion on a current-thread runtime.
 fn resolve_images(
     fetcher: &ImageFetcher,
@@ -311,14 +379,11 @@ fn resolve_images(
         .block_on(fetcher.fetch_all(urls))
 }
 
-/// A single-turn text chat request to `processor`'s served model, with the
-/// wire `fields` set on top.
-fn chat_request(
-    processor: &InputProcessor,
-    fields: serde_json::Value,
-) -> uniserve_server::openai::ChatCompletionRequest {
+/// A single-turn text chat request to the served model, with the wire
+/// `fields` set on top.
+fn chat_request(fields: serde_json::Value) -> uniserve_server::openai::ChatCompletionRequest {
     let mut request = serde_json::json!({
-        "model": processor.served_model_name(),
+        "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "hello"}],
         "modalities": ["text"],
     });
@@ -330,8 +395,7 @@ fn chat_request(
 }
 
 /// Resolves a chat request's input images under the default image policy
-/// and preprocesses the request with them, as `Engine::generate_chat`
-/// does.
+/// and preprocesses the request with them, as `Engine::generate` does.
 fn preprocess_image_chat(
     processor: &InputProcessor,
     request_id: &str,
@@ -339,9 +403,7 @@ fn preprocess_image_chat(
 ) -> (GenerationRequest, OutputParams) {
     let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
-    processor
-        .preprocess_chat_request(ServeRequestId::new(request_id), request, images)
-        .unwrap()
+    preprocess_chat(processor, String::from(request_id), request, images).unwrap()
 }
 
 /// HTTP server on an ephemeral 127.0.0.1 port that answers every request
@@ -413,11 +475,9 @@ fn image_urls_prepare_the_same_image_input_as_data_urls() {
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         let prepare = |image_url: &str| {
-            let request = image_chat_request(processor.served_model_name(), image_url);
+            let request = image_chat_request(SERVED_MODEL, image_url);
             let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
-            processor
-                .preprocess_chat_request(ServeRequestId::new("image-source"), request, images)
-                .unwrap()
+            preprocess_chat(&processor, String::from("image-source"), request, images).unwrap()
         };
 
         let (from_url, url_response) = prepare(&format!("http://{}/image.png", server.address));
@@ -444,7 +504,7 @@ fn loopback_image_urls_are_refused_by_default() {
     let port = server.address.port();
 
     for host in ["127.0.0.1", "localhost", "[::1]"] {
-        let request = image_chat_request("sensenova", &format!("http://{host}:{port}/image.png"));
+        let request = image_chat_request(SERVED_MODEL, &format!("http://{host}:{port}/image.png"));
         let error = resolve_images(&fetcher, chat_image_urls(&request)).unwrap_err();
 
         assert_eq!(error.index, 0);
@@ -524,7 +584,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
 #[test]
 fn sensenova_places_the_input_image_at_its_rendered_slot() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let request = image_chat_request(model.served_model_name(), &png_data_url());
+    let request = image_chat_request(SERVED_MODEL, &png_data_url());
     let (generation, response) = preprocess_image_chat(&model, "image-params", request);
 
     // The `image_config` seed takes precedence over the text sampling seed.
@@ -567,7 +627,7 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
 #[test]
 fn bagel_places_the_input_image_between_surrounding_chat_text() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = image_chat_request(model.served_model_name(), &png_data_url());
+    let request = image_chat_request(SERVED_MODEL, &png_data_url());
     let (generation, response) = preprocess_image_chat(&model, "image-params", request);
     assert_eq!(generation.sampling.seed, Some(17));
     assert_eq!(generation.image.seed, Some(17));
@@ -596,12 +656,12 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
 #[tokio::test]
 async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let id = ServeRequestId::new("video");
+    let id = String::from("video");
     let prepare = |fields: serde_json::Value| {
         let request = video_request(fields);
         let model = &model;
         let id = &id;
-        async move { model.preprocess_video_request(id, &request).await }
+        async move { preprocess_video(model, id, &request).await }
     };
 
     // The t2va presentation is the prompt tokenized without chat framing.
@@ -701,15 +761,6 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
             "{target}: {error:?}"
         );
     }
-
-    assert_eq!(
-        prepare(serde_json::json!({"model": "another-model"}))
-            .await
-            .unwrap_err(),
-        uniserve_server::openai::ApiError::ModelNotFound {
-            model: "another-model".to_string()
-        },
-    );
 }
 
 /// A FastH3 DMD deployment serves the training buckets its workers prepared,
@@ -793,16 +844,16 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     );
     assert_eq!(capabilities["max_prompt_tokens"], 4096);
 
-    let id = ServeRequestId::new("capacity");
-    let (request, prepared) = model
-        .preprocess_video_request(
-            &id,
-            &video_request(serde_json::json!({
-                "target": {"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 10.0}
-            })),
-        )
-        .await
-        .unwrap();
+    let id = String::from("capacity");
+    let (request, prepared) = preprocess_video(
+        &model,
+        &id,
+        &video_request(serde_json::json!({
+            "target": {"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 10.0}
+        })),
+    )
+    .await
+    .unwrap();
     assert_eq!(request.sampling.num_frames, 243);
     assert_eq!(prepared.num_frames, 243);
     // The checkpoint's nine sigma points fix eight evaluations per request.
@@ -810,15 +861,15 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     assert_eq!(prepared.canvas, canvas(1344, 768));
 
     // A 480 short edge names the 480p training bucket of the ratio.
-    let (narrow_request, narrow) = model
-        .preprocess_video_request(
-            &id,
-            &video_request(serde_json::json!({
-                "target": {"short_edge": 480, "aspect_ratio": "21:9", "duration_seconds": 5.0}
-            })),
-        )
-        .await
-        .unwrap();
+    let (narrow_request, narrow) = preprocess_video(
+        &model,
+        &id,
+        &video_request(serde_json::json!({
+            "target": {"short_edge": 480, "aspect_ratio": "21:9", "duration_seconds": 5.0}
+        })),
+    )
+    .await
+    .unwrap();
     assert_eq!(narrow.canvas, canvas(992, 416));
     assert_eq!(
         (
@@ -838,13 +889,13 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         serde_json::json!({"short_edge": 720, "aspect_ratio": "16:9", "duration_seconds": 5.0}),
     ] {
         assert!(
-            model
-                .preprocess_video_request(
-                    &id,
-                    &video_request(serde_json::json!({"target": target}))
-                )
-                .await
-                .is_err(),
+            preprocess_video(
+                &model,
+                &id,
+                &video_request(serde_json::json!({"target": target}))
+            )
+            .await
+            .is_err(),
             "{target}"
         );
     }
@@ -872,20 +923,17 @@ fn context_length_limits_preprocessed_requests() {
     )
     .unwrap();
 
-    let error = processor
-        .preprocess_chat_request(
-            ServeRequestId::new("context-capacity"),
-            chat_request(
-                &processor,
-                serde_json::json!({"messages": [{
-                    "role": "user",
-                    "content": "This prompt exceeds eight tokens"
-                }]}),
-            ),
-            Vec::new(),
-        )
-        .err()
-        .unwrap();
+    let error = preprocess_chat(
+        &processor,
+        String::from("context-capacity"),
+        chat_request(serde_json::json!({"messages": [{
+            "role": "user",
+            "content": "This prompt exceeds eight tokens"
+        }]})),
+        Vec::new(),
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
     let message = error.to_error_response().error.message;
     assert!(message.contains("8"), "{message}");
@@ -899,34 +947,35 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
     let mut request: uniserve_server::openai::ChatCompletionRequest =
         serde_json::from_value(serde_json::json!({
-            "model": "qwen3", "messages": [{"role": "user", "content": "hello"}]
+            "model": SERVED_MODEL, "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-    let (default, _) = model
-        .preprocess_chat_request(
-            ServeRequestId::new("sampling-defaults"),
-            request.clone(),
-            Vec::new(),
-        )
-        .unwrap();
+    let (default, _) = preprocess_chat(
+        &model,
+        String::from("sampling-defaults"),
+        request.clone(),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(default.max_und_tokens, 128);
     assert_eq!(default.sampling.temperature, 1.0);
 
     request.temperature = Some(0.0);
-    let (greedy, _) = model
-        .preprocess_chat_request(
-            ServeRequestId::new("sampling-defaults"),
-            request.clone(),
-            Vec::new(),
-        )
-        .unwrap();
+    let (greedy, _) = preprocess_chat(
+        &model,
+        String::from("sampling-defaults"),
+        request.clone(),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(greedy.sampling.temperature, 0.0);
     assert_eq!(greedy.max_und_tokens, 128);
 
     request.max_completion_tokens = Some(0);
     assert!(matches!(
-        model.preprocess_chat_request(
-            ServeRequestId::new("sampling-defaults"),
+        preprocess_chat(
+            &model,
+            String::from("sampling-defaults"),
             request,
             Vec::new()
         ),
@@ -948,7 +997,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         let request = |negative_prompt: Option<&str>| {
             let mut body = serde_json::json!({
-                "model": description.id(),
+                "model": SERVED_MODEL,
                 "prompt": "a blue bird",
                 "size": format!("{width}x{height}"),
                 "steps": 4,
@@ -960,8 +1009,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
             }
             let request: uniserve_server::openai::ImageGenerationRequest =
                 serde_json::from_value(body).unwrap();
-            processor
-                .preprocess_image_request(ServeRequestId::new("image-api"), request)
+            preprocess_image(&processor, String::from("image-api"), request)
                 .unwrap()
                 .0
         };
@@ -1008,7 +1056,7 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
             .collect::<Vec<_>>();
         let request: uniserve_server::openai::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
-                "model": "sensenova",
+                "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": content}]
             }))
             .unwrap();
@@ -1031,7 +1079,7 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
     let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Bagel, "bagel");
     let request = |size: &str| -> uniserve_server::openai::ImageGenerationRequest {
         serde_json::from_value(serde_json::json!({
-            "model": "bagel",
+            "model": SERVED_MODEL,
             "prompt": "a banner",
             "size": size
         }))
@@ -1039,8 +1087,7 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
     };
 
     for size in ["1040x16", "16x1040"] {
-        let Err(error) =
-            processor.preprocess_image_request(ServeRequestId::new("latent-side"), request(size))
+        let Err(error) = preprocess_image(&processor, String::from("latent-side"), request(size))
         else {
             panic!("{size} was admitted");
         };
@@ -1053,9 +1100,8 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
         );
     }
     for size in ["1024x16", "16x1024"] {
-        let (generation, _) = processor
-            .preprocess_image_request(ServeRequestId::new("latent-side"), request(size))
-            .unwrap();
+        let (generation, _) =
+            preprocess_image(&processor, String::from("latent-side"), request(size)).unwrap();
         assert_eq!(
             format!("{}x{}", generation.image.width, generation.image.height),
             size
@@ -1075,13 +1121,13 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         let preprocess = |fields: serde_json::Value| {
-            processor
-                .preprocess_chat_request(
-                    ServeRequestId::new("cache-controls"),
-                    chat_request(&processor, fields),
-                    Vec::new(),
-                )
-                .unwrap()
+            preprocess_chat(
+                &processor,
+                String::from("cache-controls"),
+                chat_request(fields),
+                Vec::new(),
+            )
+            .unwrap()
         };
 
         let (shared, _) = preprocess(serde_json::json!({}));
@@ -1118,7 +1164,7 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
         for stream in [true, false] {
             let request: uniserve_server::openai::ChatCompletionRequest =
                 serde_json::from_value(serde_json::json!({
-                    "model": processor.served_model_name(),
+                    "model": SERVED_MODEL,
                     "messages": [{"role": "user", "content": "hello"}],
                     "modalities": ["text"],
                     "stream": stream,
@@ -1126,13 +1172,13 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
                 }))
                 .unwrap();
 
-            let (generation, response) = processor
-                .preprocess_chat_request(
-                    ServeRequestId::new("stream-prompt-logprobs"),
-                    request,
-                    Vec::new(),
-                )
-                .unwrap();
+            let (generation, response) = preprocess_chat(
+                &processor,
+                String::from("stream-prompt-logprobs"),
+                request,
+                Vec::new(),
+            )
+            .unwrap();
 
             assert_eq!(
                 response.prompt_logprobs, !stream,
@@ -1184,7 +1230,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
 #[test]
 fn qwen3_family_declares_tool_calling_only_for_json_calls() {
     let tool_request = serde_json::json!({
-        "model": "qwen3",
+        "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "weather?"}],
         "tools": [{"type": "function", "function": {
             "name": "weather",
@@ -1194,25 +1240,25 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
     for model_type in ["qwen3", "qwen3_moe"] {
         let json_calls = with_template(model_type, QWEN3_TEMPLATE);
         assert!(json_calls.supports_tool_calling(), "{model_type}");
-        json_calls
-            .preprocess_chat_request(
-                ServeRequestId::new("json-tools"),
-                serde_json::from_value(tool_request.clone()).unwrap(),
-                Vec::new(),
-            )
-            .unwrap();
+        preprocess_chat(
+            &json_calls,
+            String::from("json-tools"),
+            serde_json::from_value(tool_request.clone()).unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
             let other = with_template(model_type, template);
             assert!(!other.supports_tool_calling(), "{model_type}");
-            let error = other
-                .preprocess_chat_request(
-                    ServeRequestId::new("other-tools"),
-                    serde_json::from_value(tool_request.clone()).unwrap(),
-                    Vec::new(),
-                )
-                .err()
-                .unwrap();
+            let error = preprocess_chat(
+                &other,
+                String::from("other-tools"),
+                serde_json::from_value(tool_request.clone()).unwrap(),
+                Vec::new(),
+            )
+            .err()
+            .unwrap();
             assert_eq!(error.status_code().as_u16(), 400, "{model_type}");
             let message = error.to_error_response().error.message;
             assert!(message.contains("tool_calling"), "{message}");
@@ -1232,16 +1278,15 @@ fn sampling_controls_have_the_same_meaning_across_token_models() {
     ] {
         let (_directory, _, model) = resolved_model(description, model_type);
         for seed in [-1, -2] {
-            let (request, _) = model
-                .preprocess_chat_request(
-                    ServeRequestId::new("sampling"),
-                    chat_request(
-                        &model,
-                        serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
-                    ),
-                    Vec::new(),
-                )
-                .unwrap();
+            let (request, _) = preprocess_chat(
+                &model,
+                String::from("sampling"),
+                chat_request(
+                    serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
+                ),
+                Vec::new(),
+            )
+            .unwrap();
             assert_eq!(request.sampling.seed, Some(seed as u64));
             assert_eq!(request.sampling.n_logprobs, u32::MAX);
         }

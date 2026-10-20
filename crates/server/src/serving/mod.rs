@@ -19,7 +19,6 @@ pub mod media;
 mod model;
 mod omni;
 mod output;
-mod preprocessing;
 mod sampling;
 pub mod systemone;
 #[cfg(test)]
@@ -28,21 +27,14 @@ pub(crate) mod test_support;
 pub mod text;
 pub mod video;
 
-use std::borrow::Borrow;
-use std::fmt;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::time::Instant;
 
 use futures::Stream;
-use serde::{Deserialize, Serialize};
 use uniserve_engine::EventRx;
 
 pub use error::{ServeError, TokenizeError};
-pub use input::{
-    DecodeControls, ImageGenControls, ModalitySelection, OutputParams, PromptInput, SamplingConfig,
-    StopConfig,
-};
+pub use input::{GenerateRequest, ImageGenControls, OutputParams, Prompt, SamplingParams};
 pub use media::ImageInput;
 pub use model::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub(crate) use model::{LoadedModel, LoadedRenderer};
@@ -50,79 +42,6 @@ pub use output::{
     FinishReason, GeneratedImage, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings,
     StopReason,
 };
-pub use preprocessing::chat_image_urls;
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-/// Caller-visible request identifier used throughout serving.
-///
-/// The type performs no validation. The HTTP routes build it from the resolved request ID
-/// with an endpoint prefix (for example `chatcmpl-`); it names the request in its response,
-/// events and logs, and two live requests may share it.
-pub struct ServeRequestId(String);
-
-impl ServeRequestId {
-    /// Constructs a serving request identifier.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Consumes the identifier and returns its string representation.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl fmt::Display for ServeRequestId {
-    /// Formats the value for diagnostic output.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl Deref for ServeRequestId {
-    type Target = str;
-
-    /// Returns shared access to the wrapped value.
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<str> for ServeRequestId {
-    /// Returns shared access to the wrapped value.
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Borrow<str> for ServeRequestId {
-    /// Borrows the wrapped value.
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for ServeRequestId {
-    /// Converts the source value into this type.
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for ServeRequestId {
-    /// Converts the source value into this type.
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<ServeRequestId> for String {
-    /// Converts the source value into this type.
-    fn from(value: ServeRequestId) -> Self {
-        value.0
-    }
-}
 
 /// Boxed asynchronous stream of serving events.
 pub type RequestOutputStream = Pin<Box<dyn Stream<Item = Result<RequestOutput>> + Send>>;
@@ -143,7 +62,7 @@ pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
 /// `started` is when the request entered the server and `compile_us` how
 /// long it took to reach the engine; both reach the terminal usage.
 pub(crate) fn generation_output(
-    request_id: ServeRequestId,
+    request_id: String,
     started: Instant,
     compile_us: u64,
     output: OutputParams,
@@ -157,7 +76,7 @@ pub(crate) fn generation_output(
 /// Builds the public event stream of one submitted media request, whose
 /// prompt holds `prompt_tokens` tokens; see [`generation_output`].
 pub(crate) fn media_output(
-    request_id: ServeRequestId,
+    request_id: String,
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,
@@ -427,8 +346,11 @@ mod tests {
         let block = |text: &str| EngineCoreOutput::TextTokens {
             ids: text.bytes().map(u32::from).collect(),
         };
-        let mut request = ChatRequest::for_test();
-        request.decode_options.stop_strings = Some(vec!["END".to_string()]);
+        let request = ChatRequest::for_test();
+        let decode = TextDecodeOptions {
+            stop_strings: Some(vec!["END".to_string()]),
+            ..TextDecodeOptions::default()
+        };
         let processor = ChatOutputProcessor::qwen3(
             &request,
             crate::serving::test_support::configured_tokenizer(),
@@ -437,7 +359,7 @@ mod tests {
         .unwrap();
         let outputs = output(
             processor,
-            request.decode_options.clone(),
+            decode,
             false,
             engine_events([
                 block("first block, "),

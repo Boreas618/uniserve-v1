@@ -23,6 +23,7 @@ use crate::serving::chat::{
     AssistantBlockKind, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice, Error,
     HfChatRenderer, Result,
 };
+use crate::serving::text::TextDecodeOptions;
 
 use tool::ToolStage;
 
@@ -112,7 +113,7 @@ impl ChatOutputProcessor {
     /// The thinking mode needs no separate input: the prompt suffix decides
     /// whether generation starts inside a thought channel, and otherwise the
     /// model's own channel delimiters mark reasoning. Sets
-    /// `request.decode_options.skip_special_tokens` to `false`: Gemma-4
+    /// `decode.skip_special_tokens` to `false`: Gemma-4
     /// delimits thought channels, tool calls, and string arguments with
     /// special tokens, which the parsers must see and which stream verbatim
     /// as content when parsing is disabled. DiffusionGemma commits output in
@@ -126,11 +127,12 @@ impl ChatOutputProcessor {
     /// Returns `Error::ParserInitialization` when the tokenizer lacks the
     /// `<|channel>` or `<channel|>` token.
     pub fn gemma4(
-        request: &mut ChatRequest,
+        request: &ChatRequest,
+        decode: &mut TextDecodeOptions,
         tokenizer: DynTokenizer,
         parse_reasoning: bool,
     ) -> Result<Self> {
-        request.decode_options.skip_special_tokens = false;
+        decode.skip_special_tokens = false;
         let reasoning = parse_reasoning
             .then(|| Gemma4ReasoningParser::new(tokenizer))
             .transpose()
@@ -244,7 +246,6 @@ pub fn template_instructs_json_tool_calls(renderer: &HfChatRenderer) -> bool {
         }],
         tool_choice: ChatToolChoice::Auto,
         chat_options: ChatOptions::default(),
-        decode_options: crate::serving::text::TextDecodeOptions::default(),
     };
     renderer
         .render(&probe)

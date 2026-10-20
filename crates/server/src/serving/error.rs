@@ -4,7 +4,6 @@
 
 use thiserror::Error;
 
-use super::ServeRequestId;
 use crate::serving::media;
 
 #[derive(Debug, Error)]
@@ -51,7 +50,7 @@ pub enum ServeError {
     #[error("request `{request_id}` requires unsupported feature `{feature}`")]
     UnsupportedFeature {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Stable feature name.
         feature: &'static str,
     },
@@ -60,7 +59,7 @@ pub enum ServeError {
     #[error("request `{request_id}` sets `{control}`, but {reason}")]
     UnsupportedSamplingControl {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Wire name of the control.
         control: &'static str,
         /// Why the model's generation has no such control.
@@ -72,7 +71,7 @@ pub enum ServeError {
     )]
     ContextLengthExceeded {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Tokenized prompt length.
         prompt_tokens: usize,
         /// Maximum token count declared by the profile.
@@ -85,16 +84,19 @@ pub enum ServeError {
     #[error("request `{request_id}` has an invalid input image")]
     ImageInput {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// The failing reference and its cause.
         #[source]
         source: media::ImageListError,
     },
+    /// The video service refuses a video request or cannot process it.
+    #[error(transparent)]
+    Video(#[from] uniserve_core::video::plan::VideoInputError),
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Underlying tokenization failure.
         #[source]
         source: TokenizeError,
@@ -104,7 +106,7 @@ pub enum ServeError {
     #[error("request `{request_id}` output processing failed")]
     OutputProcessing {
         /// Identifier of the affected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Underlying decoding or parsing failure.
         #[source]
         source: crate::serving::chat::Error,

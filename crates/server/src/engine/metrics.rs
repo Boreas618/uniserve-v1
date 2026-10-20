@@ -24,7 +24,7 @@ use uniserve_observability::{
     RequestMetrics, SchedulerMetrics, WaitingReasonLabels,
 };
 
-use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage, ServeRequestId};
+use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage};
 use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
@@ -359,7 +359,7 @@ pub(crate) struct RequestStats {
     started: Instant,
     /// The request whose summary line is logged when it ends, when request
     /// logging is on.
-    log: Option<ServeRequestId>,
+    log: Option<String>,
     /// Queue time from the engine's scheduling timestamps, kept for a request
     /// that ends before it finishes.
     queue_us: Option<u64>,
@@ -373,7 +373,7 @@ impl RequestStats {
         inner: RequestOutputStream,
         labels: EngineLabels,
         started: Instant,
-        log: Option<ServeRequestId>,
+        log: Option<String>,
     ) -> Self {
         Self {
             inner,

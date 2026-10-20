@@ -4,10 +4,7 @@
 //! Every request schema rejects unknown fields (`deny_unknown_fields`), at
 //! every level. The chat request's ranges and cross-field rules run through
 //! `validator` in the route's `ValidatedJson` extractor. The video request is
-//! the official MiniMax / SGLang form: a `task`, its ordered `conditions` and
-//! the requested `target`; the same names arrive as JSON or as multipart text
-//! fields, which the video route's `VideoBody` extractor parses into
-//! [`VideoGenerationRequest`].
+//! the video service's own form (`serving::video::VideoGenerationRequest`).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -17,8 +14,6 @@ use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::SerializeDisplay;
-use uniserve_core::VideoTask;
-use uniserve_core::video::plan::{ConditionType, Role};
 use validator::Validate;
 
 use crate::serving::chat::{ChatToolChoice, ReasoningEffort};
@@ -385,7 +380,7 @@ pub struct ListModelsResponse {
 /// rejected) and then runs the field validators below and
 /// `validate_chat_cross_parameters`. The served-model
 /// and `prompt_logprobs` checks run later in `validate_request_compat`, and
-/// `InputProcessor::preprocess_chat_request` lowers the request into serving
+/// `chat_completions::lower_chat_request` lowers the request into serving
 /// inputs. Besides the OpenAI fields, the schema accepts sampling and output
 /// extensions such as `top_k`, `min_p`, `prompt_logprobs`, and
 /// `return_token_ids`.
@@ -786,7 +781,7 @@ fn validate_chat_cross_parameters(
 /// Serde enforces the field set and types. The route generates exactly one
 /// image, so the request carries no image count. The value checks (non-blank
 /// prompt, served model name, well-formed `size`) run in
-/// `InputProcessor::preprocess_image_request` when the request is lowered,
+/// `images::lower_image_request` when the request is lowered,
 /// and the resolved image controls are checked by `ImageParams::validate`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
@@ -846,73 +841,6 @@ pub struct GeneratedImageData {
     pub width: u32,
     /// Encoded image length in bytes.
     pub bytes: u64,
-}
-
-/// The seed a request without one uses, as the official reference does.
-pub const DEFAULT_VIDEO_SEED: u64 = 42;
-
-/// One video, audio or image condition of a request, in request order.
-///
-/// The order is semantic: the conditioner presents references in it and
-/// their ordinal labels name them.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct VideoCondition {
-    /// `image`, `video`, `video_audio` (a video that must have a soundtrack)
-    /// or `audio`.
-    #[serde(rename = "type")]
-    pub condition_type: ConditionType,
-    /// `data:`, `file://` or `http(s)://` location of the media.
-    pub uri: String,
-    /// `keyframe` (an image anchoring a generated frame) or `reference`.
-    pub role: Role,
-    /// The generated frame a keyframe anchors: 0 or -1.
-    #[serde(default)]
-    pub frame_index: Option<i64>,
-    /// Offset into a video reference, seconds; its soundtrack follows it.
-    #[serde(default)]
-    pub start_time_seconds: Option<f64>,
-}
-
-/// The requested output; the canvas and the duration come only from here.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct VideoTarget {
-    /// Short edge of the canvas in pixels; the deployment serves the short
-    /// edges `GET /v1/capabilities` reports.
-    pub short_edge: u32,
-    /// `auto` or `W:H`.
-    pub aspect_ratio: String,
-    /// Duration in seconds; a reference-conditioned request whose only
-    /// audio-bearing reference sets its duration may omit it.
-    #[serde(default)]
-    pub duration_seconds: Option<f64>,
-}
-
-/// MiniMax-H3 video-and-audio generation request for the `/v1/videos`
-/// routes. The served checkpoint fixes the schedule, and every request
-/// generates one video.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct VideoGenerationRequest {
-    /// Served model name.
-    pub model: String,
-    /// Prompt; the conditioner presents it after the conditions.
-    pub prompt: String,
-    /// `t2va`, `fl2va` or `ref2va`; one the served denoiser serves.
-    pub task: VideoTask,
-    /// The task's conditions, in request order.
-    #[serde(default)]
-    pub conditions: Vec<VideoCondition>,
-    /// The requested output.
-    pub target: VideoTarget,
-    /// Video-generation random seed.
-    #[serde(default = "default_seed")]
-    pub seed: u64,
-}
-
-const fn default_seed() -> u64 {
-    DEFAULT_VIDEO_SEED
 }
 
 #[cfg(test)]
