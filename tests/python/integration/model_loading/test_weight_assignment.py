@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from uniserve import loading
 from uniserve.distributed import DeviceMesh
 from uniserve.loading import checkpoint, weights
+from uniserve.loading.retained import Retained
 from uniserve.nn.linear import (
     ColumnParallelLinear,
     Linear,
@@ -584,3 +585,84 @@ def test_component_selection_keeps_nonresident_modules_on_meta(tmp_path):
     )
     assert result.model.second.weight.is_meta
     assert result.model.second.weight.shape == (4, 4)
+
+
+def test_a_load_binds_retained_tensors_and_reads_only_the_rest(tmp_path):
+    first = torch.arange(16).view(4, 4).float() / 8
+    second = torch.eye(4) * 2
+    save_file(
+        {"first": first, "second": second}, tmp_path / "model.safetensors"
+    )
+    io = loading.Config()
+    sources = (checkpoint.Config().resolve(tmp_path, io=io),)
+    # The retained first weight differs from the checkpoint's, so binding
+    # it is told apart from reading it.
+    kept = torch.full((4, 4), 3.0)
+    result = loading.load_model(
+        Network,
+        NetworkConfig(),
+        checkpoint=sources,
+        mapping=_mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        io=io,
+        retained=Retained({"p:first.weight": kept}),
+        load=frozenset({"p:second.weight"}),
+    )
+
+    model = result.model
+    assert model.first.weight.data_ptr() == kept.data_ptr()
+    torch.testing.assert_close(model.second.weight, second, rtol=0, atol=0)
+    assert result.reports[0].loaded == frozenset({"second.weight"})
+    assert result.origins[id(model.second.weight)] == "primary"
+
+
+def test_a_tensor_derived_after_loading_reads_its_whole_mapping(tmp_path):
+    class Shifted(nn.Module):
+        def __init__(self, width):
+            super().__init__()
+            self.projection = Linear(width, width, bias=False)
+            self.register_buffer("offset", torch.empty(width))
+
+    def mapping(model):
+        def post_load(reader):
+            model.offset = reader.get("offset").read().square()
+
+        return (
+            weights.ModuleMapping(
+                model,
+                "primary",
+                lambda reader: (
+                    weights.Assignment(
+                        model.projection.weight, reader.get("weight")
+                    ),
+                ),
+                frozenset({"projection.weight"}),
+                post_load=post_load,
+            ),
+        )
+
+    matrix = torch.eye(4) * 2
+    offset = torch.tensor([-1.0, 2.0, -3.0, 4.0])
+    save_file(
+        {"weight": matrix, "offset": offset}, tmp_path / "model.safetensors"
+    )
+    io = loading.Config()
+    # Only the derived offset is missing, but deriving it reads its whole
+    # mapping: the stale retained projection is read again.
+    result = loading.load_model(
+        Shifted,
+        4,
+        checkpoint=(checkpoint.Config().resolve(tmp_path, io=io),),
+        mapping=mapping,
+        device="cpu",
+        weights=weights.Config(dtype=torch.float32),
+        io=io,
+        retained=Retained({"p:projection.weight": torch.zeros(4, 4)}),
+        load=frozenset({"b:offset"}),
+    )
+
+    torch.testing.assert_close(
+        result.model.projection.weight, matrix, rtol=0, atol=0
+    )
+    torch.testing.assert_close(result.model.offset, offset.square())

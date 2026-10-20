@@ -3,23 +3,28 @@
 //! Every device tensor of a loaded model, each parameter and buffer by its
 //! fields (a dense tensor's data, or a quantized tensor's encoded fields),
 //! is a read-only retained tensor. Its key is the digest of what determines
-//! its bytes: the model fingerprint (`uniserve.loading.retained.
-//! fingerprint`: the checkpoint, the normalized configuration, the weight
-//! choices and the numerics of the code that loads and lays them out), the
-//! worker's placement, the UUID of each GPU it addresses, and the field's
-//! identity. A manifest, a host storage beside them, names each tensor's
-//! representation, from which binding rebuilds it.
+//! its bytes (`uniserve.loading.retained.fingerprints`), the worker's
+//! placement, the UUID of each GPU it addresses, and the field's identity.
+//! What determines the bytes is the fingerprint of the checkpoint source the
+//! tensor is loaded from (its files, with the structure below), or, for a
+//! tensor no source loads, the structure fingerprint: the normalized
+//! configuration, the weight choices and the numerics of the code that
+//! loads and lays them out. A manifest, a host storage keyed by the
+//! structure, names each tensor's source and representation, from which
+//! binding rebuilds it.
 //!
-//! A worker binds retained weights only when every worker that loads with
-//! it (its worker group, or its expert union) finds all of its own:
-//! loading is collective, so either all of them load or none does. A worker
-//! that loads publishes afterwards: each torch storage of the loaded model
+//! Loading is collective, so every worker that loads with this one (its
+//! worker group, or its expert union) agrees on what to read from the
+//! checkpoint: the tensors any of them misses, or everything when one of
+//! them has no manifest ([`Load`]). A worker binds the rest. A change to one
+//! checkpoint source's files thus reloads only that source's tensors. A
+//! worker that read tensors publishes them afterwards: each torch storage
 //! moves into retained device memory of its own, or, below the allocation
 //! granularity, into one allocation shared with the other small ones, so
 //! branches that loading coalesced stay adjacent; the mappings are then
 //! downgraded to read-only, so any rewrite of a weight faults.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -46,12 +51,95 @@ const RETAINED: &str = "uniserve.loading.retained";
 /// the alignment torch's allocator gives a storage.
 const PACK_ALIGNMENT: usize = 512;
 
+/// What determines a rank's retained bytes besides its placement and GPUs,
+/// as `uniserve.loading.retained.fingerprints` states it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct Fingerprints {
+    /// Everything but the checkpoint's files: it keys the manifest and the
+    /// tensors no checkpoint source loads.
+    pub structure: String,
+    /// Each checkpoint source's fingerprint, by source name: it keys the
+    /// tensors loaded from that source.
+    pub sources: BTreeMap<String, String>,
+}
+
+impl Fingerprints {
+    /// One digest of the whole model, its structure and every source: what
+    /// depends on all of its weights, such as its cache pages, is keyed by
+    /// it.
+    pub(crate) fn model(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"uniserve-model\0");
+        for part in std::iter::once(&self.structure).chain(
+            self.sources
+                .iter()
+                .flat_map(|(source, fingerprint)| [source, fingerprint]),
+        ) {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part.as_bytes());
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 /// The keys of one worker's retained weights.
 #[derive(Clone)]
 pub(crate) struct WeightKeys {
-    key: Key,
+    /// The base of the manifest's key and of the tensors no source loads.
+    structure: Key,
+    /// The base of each checkpoint source's tensors' keys.
+    sources: BTreeMap<String, Key>,
     /// The GPU UUID of each device ordinal the worker addresses.
     gpus: BTreeMap<i32, [u8; 16]>,
+}
+
+/// What a worker reads from the checkpoint, as the workers that load with
+/// it agree: every tensor, or only the named tensors, which the others'
+/// retained ones complete.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Load {
+    All,
+    Tensors(BTreeSet<String>),
+}
+
+impl Load {
+    /// What this worker needs read: everything without a manifest, or when a
+    /// tensor of a stack streamed from host memory is missing (a stack's
+    /// host region is retained whole); otherwise its missing tensors.
+    pub(crate) fn of(found: Option<&Found>) -> Self {
+        match found {
+            Some(found) if !found.host_missing => Self::Tensors(found.missing.clone()),
+            _ => Self::All,
+        }
+    }
+
+    /// What every worker reads: the union of their needs.
+    pub(crate) fn union(needs: impl IntoIterator<Item = Self>) -> Self {
+        let mut tensors = BTreeSet::new();
+        for need in needs {
+            match need {
+                Self::All => return Self::All,
+                Self::Tensors(names) => tensors.extend(names),
+            }
+        }
+        Self::Tensors(tensors)
+    }
+}
+
+/// One tensor a manifest names.
+struct ManifestTensor {
+    id: String,
+    /// The checkpoint source the tensor is loaded from; empty for a tensor
+    /// no source loads.
+    source: String,
+    /// Whether the tensor lies in the host region of a streamed stack.
+    host: bool,
+    fields: Vec<String>,
 }
 
 /// Weights a worker moved into retained memory and has not put yet: the
@@ -72,16 +160,21 @@ pub(crate) struct Published {
 pub(crate) struct Found {
     manifest: String,
     storages: Vec<Arc<Storage>>,
-    /// Each field's identity and record, in manifest order.
+    /// Each field's identity and record, in manifest order, for every
+    /// tensor whose fields are all retained.
     fields: Vec<(String, TensorRecord)>,
+    /// The tensors the manifest names with a field missing.
+    missing: BTreeSet<String>,
+    /// Whether one of them lies in the host region of a streamed stack.
+    host_missing: bool,
 }
 
 impl WeightKeys {
-    /// The keys of weights of model `fingerprint` placed as `placement`
-    /// describes on `devices`.
+    /// The keys of weights of a model with `fingerprints` placed as
+    /// `placement` describes on `devices`.
     pub(crate) fn new(
         retained: &Retained,
-        fingerprint: &str,
+        fingerprints: &Fingerprints,
         placement: &[u8],
         devices: &[DeviceId],
     ) -> Result<Self> {
@@ -89,36 +182,61 @@ impl WeightKeys {
         for device in devices {
             gpus.insert(device.0, retained.gpu(*device)?);
         }
-        let mut digest = Sha256::new();
-        digest.update(b"uniserve-weights\0");
-        for part in [fingerprint.as_bytes(), placement] {
-            digest.update((part.len() as u64).to_le_bytes());
-            digest.update(part);
-        }
-        for (device, gpu) in &gpus {
-            digest.update(device.to_le_bytes());
-            digest.update(gpu);
-        }
+        let base = |fingerprint: &str| {
+            let mut digest = Sha256::new();
+            digest.update(b"uniserve-weights\0");
+            for part in [fingerprint.as_bytes(), placement] {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+            for (device, gpu) in &gpus {
+                digest.update(device.to_le_bytes());
+                digest.update(gpu);
+            }
+            Key(digest.finalize().into())
+        };
         Ok(Self {
-            key: Key(digest.finalize().into()),
+            structure: base(&fingerprints.structure),
+            sources: fingerprints
+                .sources
+                .iter()
+                .map(|(source, fingerprint)| (source.clone(), base(fingerprint)))
+                .collect(),
             gpus,
         })
     }
 
-    fn derive(&self, part: &[u8]) -> Key {
+    fn derive(base: &Key, part: &[u8]) -> Key {
         let mut digest = Sha256::new();
-        digest.update(self.key.0);
+        digest.update(base.0);
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part);
         Key(digest.finalize().into())
     }
 
     fn manifest(&self) -> Key {
-        self.derive(b"manifest")
+        Self::derive(&self.structure, b"manifest")
     }
 
-    fn field(&self, id: &str) -> Key {
-        self.derive(id.as_bytes())
+    /// The key of field `id` of a tensor loaded from checkpoint `source`
+    /// (empty for none); `None` for a source the model does not have.
+    fn field(&self, source: &str, id: &str) -> Option<Key> {
+        let base = if source.is_empty() {
+            &self.structure
+        } else {
+            self.sources.get(source)?
+        };
+        Some(Self::derive(base, id.as_bytes()))
+    }
+
+    /// The key of a field the worker publishes, whose source the model has.
+    fn published_key(&self, source: &str, id: &str) -> Result<Key> {
+        self.field(source, id).ok_or_else(|| {
+            Error::Invariant(format!(
+                "published weight {id} is loaded from checkpoint source {source}, \
+                 which the model's fingerprints do not name"
+            ))
+        })
     }
 
     fn device(&self, gpu: &[u8; 16]) -> Result<DeviceId> {
@@ -153,8 +271,8 @@ impl WeightKeys {
             })
     }
 
-    /// Map the weights a predecessor retained, when every one of them is
-    /// retained; `None` otherwise.
+    /// Map the weights a predecessor retained: every tensor its manifest
+    /// names whose fields are all retained. `None` without a manifest.
     pub(crate) fn find(&self, retained: &Retained) -> Result<Option<Found>> {
         let started = std::time::Instant::now();
         let manifest_key = self.manifest();
@@ -179,24 +297,57 @@ impl WeightKeys {
             })?;
         let manifest = String::from_utf8(bytes)
             .map_err(|_| Error::Interface("the retained weight manifest is not text".into()))?;
-        let ids = field_ids(&manifest)?;
+        let Some(tensors) = manifest_tensors(&manifest)? else {
+            tracing::info!("the retained weight manifest is of another version; loading");
+            return Ok(None);
+        };
 
-        let keys: Vec<Key> = ids.iter().map(|id| self.field(id)).collect();
+        // Every field of every tensor, keyed by the tensor's source.
+        let fields: Vec<(usize, String, Option<Key>)> = tensors
+            .iter()
+            .enumerate()
+            .flat_map(|(index, tensor)| {
+                tensor.fields.iter().map(move |field| {
+                    let id = format!("{}/{field}", tensor.id);
+                    let key = self.field(&tensor.source, &id);
+                    (index, id, key)
+                })
+            })
+            .collect();
+        let keys: Vec<Key> = fields.iter().filter_map(|(_, _, key)| *key).collect();
         let got = retained.call("finding retained weights", |client| {
             client.get(keys, Mode::Read)
         })?;
-        if !got.missing.is_empty() {
-            tracing::info!(
-                missing = got.missing.len(),
-                "retained weights are incomplete; loading"
-            );
-            return Ok(None);
+        let mut records: HashMap<Key, TensorRecord> = got
+            .tensors
+            .into_iter()
+            .map(|record| (record.key, record))
+            .collect();
+        let mut complete = vec![true; tensors.len()];
+        for (index, _, key) in &fields {
+            if key.is_none_or(|key| !records.contains_key(&key)) {
+                complete[*index] = false;
+            }
         }
-        if got.tensors.len() != ids.len() {
-            return Err(Error::Interface(
-                "retained weights disagree with their manifest".into(),
-            ));
+        let mut found = Vec::new();
+        for (index, id, key) in fields {
+            if complete[index]
+                && let Some(record) = key.and_then(|key| records.remove(&key))
+            {
+                found.push((id, record));
+            }
         }
+        let missing: BTreeSet<String> = tensors
+            .iter()
+            .zip(&complete)
+            .filter(|(_, complete)| !**complete)
+            .map(|(tensor, _)| tensor.id.clone())
+            .collect();
+        let host_missing = tensors
+            .iter()
+            .zip(&complete)
+            .any(|(tensor, complete)| tensor.host && !complete);
+
         let storages = got
             .storages
             .into_iter()
@@ -216,7 +367,7 @@ impl WeightKeys {
             })
             .collect::<Result<Vec<_>>>()?;
         retained.use_keys(
-            std::iter::once(manifest_key).chain(got.tensors.iter().map(|tensor| tensor.key)),
+            std::iter::once(manifest_key).chain(found.iter().map(|(_, record)| record.key)),
         );
         tracing::info!(
             storages = storages.len(),
@@ -224,24 +375,38 @@ impl WeightKeys {
                 .iter()
                 .map(|storage| storage.bytes())
                 .sum::<usize>(),
+            missing = missing.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "mapped the retained weights"
         );
         Ok(Some(Found {
             manifest,
             storages,
-            fields: ids.into_iter().zip(got.tensors).collect(),
+            fields: found,
+            missing,
+            host_missing,
         }))
     }
 
     /// Move a loaded model's device weights into retained memory (`model`
-    /// is `rank.Loaded`). The projection matrices of the stacks under
-    /// `host_paths` stream from host memory: their host regions join the
-    /// published weights once allocated ([`Published::add_host`]).
-    pub(crate) fn publish(&self, model: &Handle, host_paths: &[String]) -> Result<Published> {
+    /// is `rank.Loaded`): every tensor, or only the tensors `only` names,
+    /// which the worker read while it bound the others. The projection
+    /// matrices of the stacks under `host_paths` stream from host memory:
+    /// their host regions join the published weights once allocated
+    /// ([`Published::add_host`]).
+    pub(crate) fn publish(
+        &self,
+        model: &Handle,
+        host_paths: &[String],
+        only: Option<&BTreeSet<String>>,
+    ) -> Result<Published> {
         let layout = Handle::new(
-            Interpreter::import(&format!("{RETAINED}.describe"))?
-                .call_values(&[model.to_any(), Any::from(strings(host_paths))])?,
+            Interpreter::import(&format!("{RETAINED}.describe"))?.call_values(&[
+                model.to_any(),
+                Any::from(strings(host_paths)),
+                only.map(|names| Any::from(strings(names)))
+                    .unwrap_or_default(),
+            ])?,
         )?;
         let method = |name: &str| Interpreter::import(&format!("{RETAINED}.Layout.{name}"));
         let numbers = |name: &str| -> Result<Vec<i64>> {
@@ -256,6 +421,7 @@ impl WeightKeys {
         let devices = numbers("storage_devices")?;
         let sizes = numbers("storage_bytes")?;
         let ids = names("field_ids")?;
+        let sources = names("field_sources")?;
         let field_storages = numbers("field_storages")?;
         let offsets = numbers("field_offsets")?;
         let dtypes = names("field_dtypes")?;
@@ -327,7 +493,7 @@ impl WeightKeys {
             let rank = ranks[field] as usize;
             let (allocation, base) = placed[field_storages[field] as usize];
             tensors.push(TensorRecord {
-                key: self.field(id),
+                key: self.published_key(&sources[field], id)?,
                 name: format!("weights {id}"),
                 storage: allocation as u32,
                 offset: (base as i64 + offsets[field]) as u64,
@@ -392,13 +558,14 @@ impl Published {
         let ranks = integers(column(3)?).map_err(invalid)?;
         let shapes = integers(column(4)?).map_err(invalid)?;
         let strides = integers(column(5)?).map_err(invalid)?;
+        let sources = texts(column(6)?).map_err(invalid)?;
 
         let index = self.storages.len() as u32;
         let mut position = 0;
         for (field, id) in ids.iter().enumerate() {
             let rank = ranks[field] as usize;
             self.tensors.push(TensorRecord {
-                key: self.keys.field(id),
+                key: self.keys.published_key(&sources[field], id)?,
                 name: format!("weights {id}"),
                 storage: index,
                 offset: offsets[field] as u64,
@@ -490,8 +657,9 @@ impl Published {
 
 impl Found {
     /// The library's `Retained` tensors over the mapped storages, which
-    /// loading installs instead of reading the checkpoint.
-    pub(crate) fn bind(&self) -> Result<Handle> {
+    /// loading installs instead of reading the checkpoint, but for the
+    /// tensors `load` names, which it reads.
+    pub(crate) fn bind(&self, load: &BTreeSet<String>) -> Result<Handle> {
         let views = self
             .storages
             .iter()
@@ -501,12 +669,22 @@ impl Found {
             .iter()
             .map(|view| Ok(view.handle()?.to_any()))
             .collect::<Result<Vec<Any>>>()?;
-        let records = || self.fields.iter().map(|(_, record)| record);
+        // The fields of the tensors loading reads are left out.
+        let bound: Vec<&(String, TensorRecord)> = self
+            .fields
+            .iter()
+            .filter(|(id, _)| {
+                id.rsplit_once('/')
+                    .is_none_or(|(tensor, _)| !load.contains(tensor))
+            })
+            .collect();
+        let records = || bound.iter().map(|(_, record)| record);
         let build = Interpreter::import(&format!("{RETAINED}.Retained.build"))?;
         Handle::new(build.call_values(&[
             Any::from(tvm_ffi::String::from(self.manifest.as_str())),
             Any::from(list(tensors)),
-            Any::from(strings(self.fields.iter().map(|(id, _)| id))),
+            Any::from(strings(bound.iter().map(|(id, _)| id))),
+            Any::from(strings(load)),
             Any::from(integer_list(
                 records().map(|record| i64::from(record.storage)),
             )),
@@ -577,31 +755,47 @@ fn host_bytes(bytes: &[u8]) -> Result<OwnedFd> {
     Ok(file.into())
 }
 
-/// The field identities a manifest names, `<tensor id>/<field>`, in order.
-fn field_ids(manifest: &str) -> Result<Vec<String>> {
+/// The version of the manifest `uniserve.loading.retained` writes; a
+/// manifest of another version names no tensor this worker binds.
+const MANIFEST_VERSION: u64 = 2;
+
+/// The tensors a manifest names, in order; `None` for a manifest of
+/// another version.
+fn manifest_tensors(manifest: &str) -> Result<Option<Vec<ManifestTensor>>> {
     let invalid = |what: &str| Error::Interface(format!("the retained weight manifest {what}"));
     let manifest: serde_json::Value = serde_json::from_str(manifest)
         .map_err(|error| invalid(&format!("is not JSON: {error}")))?;
-    if manifest["version"] != 1 {
-        return Err(invalid("is of another version"));
+    if manifest["version"] != MANIFEST_VERSION {
+        return Ok(None);
     }
     let tensors = manifest["tensors"]
         .as_array()
         .ok_or_else(|| invalid("lists no tensors"))?;
-    let mut ids = Vec::new();
+    let mut named = Vec::with_capacity(tensors.len());
     for tensor in tensors {
         let id = tensor["id"]
             .as_str()
             .ok_or_else(|| invalid("names a tensor without an id"))?;
+        let source = tensor["source"]
+            .as_str()
+            .ok_or_else(|| invalid("names a tensor without a source"))?;
         let fields = tensor["fields"]
             .as_array()
-            .ok_or_else(|| invalid("names a tensor without fields"))?;
-        for field in fields {
-            let field = field
-                .as_str()
-                .ok_or_else(|| invalid("names a field that is not text"))?;
-            ids.push(format!("{id}/{field}"));
-        }
+            .ok_or_else(|| invalid("names a tensor without fields"))?
+            .iter()
+            .map(|field| {
+                field
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("names a field that is not text"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        named.push(ManifestTensor {
+            id: id.to_owned(),
+            source: source.to_owned(),
+            host: tensor["host"].as_bool().unwrap_or(false),
+            fields,
+        });
     }
-    Ok(ids)
+    Ok(Some(named))
 }

@@ -1025,6 +1025,7 @@ def load_model(
     experts: Communicator | None = None,
     expert_kernels: ExpertKernels = "local",
     retained: Retained | None = None,
+    load: frozenset[str] = frozenset(),
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
@@ -1085,4 +1086,5 @@ def load_model(
         experts=experts,
         expert_kernels=expert_kernels,
         retained=retained,
+        load=load,
     )

@@ -77,9 +77,12 @@ def _snapshot(model):
     }
 
 
-def _publish(model):
-    """Publish ``model`` into one byte tensor as a worker would."""
-    layout = Layout.describe(model)
+def _publish(model, only=None):
+    """Publish ``model`` into one byte tensor as a worker would.
+
+    Every tensor is published, or those ``only`` names.
+    """
+    layout = Layout.describe(model, only=only)
     sizes = layout.storage_bytes()
     offsets, total = [], 0
     for size in sizes:
@@ -134,7 +137,7 @@ def test_a_new_model_binds_the_published_weights():
     # The fresh model's placeholders are dense meta tensors, as before
     # loading: binding installs the encoded weight in their place.
     model = _Model("meta")
-    retained = Retained.build(manifest, [memory], **records)
+    retained = Retained.build(manifest, [memory], load=(), **records)
     retained.install(model, {id(module) for module in model.modules()})
 
     for name, value in _snapshot(model).items():
@@ -145,3 +148,27 @@ def test_a_new_model_binds_the_published_weights():
     assert model.up.weight.data_ptr() == (
         model.gate.weight.data_ptr() + model.gate.weight.nbytes
     )
+
+
+def test_a_worker_that_read_some_tensors_publishes_only_those():
+    published = _loaded()
+    manifest, memory, records = _publish(published)
+    # Its successor read the projection again and bound the rest; it
+    # publishes the projection alone, under the same manifest.
+    successor = _loaded()
+    read = frozenset({"p:projection.weight"})
+    partial_manifest, partial_memory, partial_records = _publish(
+        successor, only=read
+    )
+
+    assert partial_manifest == manifest
+    tensors = {name.rsplit("/", 1)[0] for name in partial_records["field_ids"]}
+    assert tensors == read
+
+    # Binding takes the retained tensors but the projection, which the
+    # binder reads itself.
+    model = _Model("meta")
+    retained = Retained.build(manifest, [memory], load=read, **records)
+    retained.install(model, {id(module) for module in model.modules()})
+    assert model.projection.weight.is_meta
+    assert not model.gate.weight.is_meta
