@@ -37,8 +37,8 @@ struct Fixture {
 #[derive(Deserialize)]
 struct Case {
     name: String,
-    layout: String,
-    canvas: String,
+    layout: ReadoutLayout,
+    canvas: CanvasMode,
     #[serde(default)]
     candidates: CandidateTokens,
     request: Value,
@@ -120,7 +120,7 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
     let ModelParameters::DiffusionGemma(profile) = &config.parameters else {
         unreachable!("the description is DiffusionGemma");
     };
-    assert_eq!(profile.canvas_length, 256);
+    assert_eq!(profile.sampling.canvas_length, 256);
     let tokens = profile.tokens;
     assert_eq!(
         (tokens.mask, tokens.pad, tokens.turn_end),
@@ -141,8 +141,8 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
         ),
         (16, 3, 280)
     );
-    let denoising = profile.denoising;
-    assert_eq!(denoising.max_denoising_steps, 48);
+    let denoising = profile.sampling;
+    assert_eq!(denoising.max_steps, 48);
     assert_eq!(denoising.entropy_bound, 0.1);
     assert_eq!((denoising.t_min, denoising.t_max), (0.4, 0.8));
     assert_eq!(denoising.confidence_threshold, 0.005);
@@ -153,15 +153,18 @@ async fn check_checkpoint(variable: &str, quantized: bool) {
         "../../../tests/python/fixtures/diffusion_gemma_readout_prompts.json"
     ))
     .unwrap();
-    assert_eq!(fixture.canvas_length, profile.canvas_length as usize);
+    assert_eq!(
+        fixture.canvas_length,
+        profile.sampling.canvas_length as usize
+    );
     let mcjev: Fixture = serde_json::from_str(include_str!(
         "../../../tests/python/fixtures/mcjev_readout_prompts.json"
     ))
     .unwrap();
     for case in fixture.cases.into_iter().chain(mcjev.cases) {
         let options = ReadoutOptions {
-            layout: case.layout.parse::<ReadoutLayout>().unwrap(),
-            canvas: case.canvas.parse::<CanvasMode>().unwrap(),
+            layout: case.layout,
+            canvas: case.canvas,
             candidates: case.candidates,
         };
         let encoder =

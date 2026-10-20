@@ -13,7 +13,6 @@
 mod assembly;
 pub mod chat;
 mod diffusion_gemma;
-pub(crate) use self::diffusion_gemma::canvas_sampling;
 mod error;
 mod input;
 pub mod media;
@@ -46,7 +45,7 @@ pub use input::{
     PromptInput, ResponseOptions, SamplingConfig, StopConfig,
 };
 pub use media::ImageInput;
-pub use model::{InputProcessor, RequestRenderer, WorkerCapabilities};
+pub use model::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub(crate) use model::{LoadedModel, LoadedRenderer};
 pub use preprocessing::chat_image_urls;
 

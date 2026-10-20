@@ -54,8 +54,7 @@ pub(crate) async fn chat_completions(
     };
 
     if stream {
-        let chunk_stream =
-            chat_completion_chunk_stream(serve_stream, response, created);
+        let chunk_stream = chat_completion_chunk_stream(serve_stream, response, created);
         let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
 
         // Emit periodic SSE keep-alive comments so long prefills (no chunks yet)

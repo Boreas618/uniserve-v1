@@ -705,7 +705,6 @@ pub struct ReadoutOptions {
     /// each its own prompt and canvas.
     pub layout: ReadoutLayout,
     /// Canvas length: `full`, `compact`, or a positive multiple of 16.
-    #[serde(with = "values::canvas")]
     pub canvas: CanvasMode,
     /// `variants` sums supported answer spellings; `primary` reads the
     /// space-prefixed one.

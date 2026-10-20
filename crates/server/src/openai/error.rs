@@ -174,12 +174,11 @@ impl IntoResponse for ApiError {
 ///
 /// Unsupported features or sampling controls, context limits, input images
 /// that cannot be fetched or decoded, and tokenization failures become
-/// invalid requests; model-resolution, engine, and
-/// output-processing failures become server errors. An input-image or
-/// tokenization failure's message appends its cause (the failing image and
-/// rule, or the violated field or limit), which `ServeError::ImageInput` and
-/// `ServeError::Tokenize` carry as their error source rather than in their
-/// own `Display`.
+/// invalid requests; engine and output-processing failures become server
+/// errors. An input-image or tokenization failure's message appends its cause
+/// (the failing image and rule, or the violated field or limit), which
+/// `ServeError::ImageInput` and `ServeError::Tokenize` carry as their error
+/// source rather than in their own `Display`.
 pub fn serve_error_to_api(error: ServeError) -> ApiError {
     match error {
         ServeError::UnsupportedSamplingControl {
@@ -197,9 +196,6 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         }
         ServeError::Tokenize { ref source, .. } => {
             ApiError::invalid_request(format!("{error}: {source}"), None)
-        }
-        ServeError::ModelResolution(source) => {
-            ApiError::server_error(format!("model resolution error: {source}"))
         }
         ServeError::Submit(source) => {
             ApiError::server_error(format!("engine runtime error: {source}"))

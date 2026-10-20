@@ -274,7 +274,6 @@ pub(crate) async fn videos_create(
         Ok(generation) => generation,
         Err(error) => return error.into_response(),
     };
-    let sampling = prepared.request.sampling;
 
     // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
@@ -287,7 +286,7 @@ pub(crate) async fn videos_create(
         expires_at: None,
         seconds: prepared.duration_seconds,
         actual_seconds: prepared.actual_seconds,
-        num_frames: sampling.num_frames,
+        num_frames: prepared.num_frames,
         size: format!("{}x{}", prepared.canvas.width, prepared.canvas.height),
         status: "queued",
         phase: "queued".to_owned(),

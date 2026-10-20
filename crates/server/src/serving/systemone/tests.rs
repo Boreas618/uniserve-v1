@@ -27,10 +27,9 @@ use base64::Engine as _;
 use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
 use crate::profile::ModelParameters;
 use crate::profile::assets::ResolvedModelFiles;
-use crate::profile::diffusion_gemma::{
-    ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
-};
+use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use uniserve_core::CanvasSampling;
 
 const SPECIAL_TOKENS: [&str; 11] = [
     "<pad>",
@@ -106,7 +105,6 @@ impl Checkpoint {
         let tokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path).unwrap());
         let id = |token: &str| tokenizer.token_to_id(token).unwrap();
         let profile = DiffusionGemmaProfile {
-            canvas_length: 256,
             tokens: ControlTokens {
                 mask: id("<mask>"),
                 pad: id("<pad>"),
@@ -120,8 +118,9 @@ impl Checkpoint {
                 pooling_kernel_size: 3,
                 max_soft_tokens: 280,
             },
-            denoising: DenoisingDefaults {
-                max_denoising_steps: 48,
+            sampling: CanvasSampling {
+                canvas_length: 256,
+                max_steps: 48,
                 entropy_bound: 0.1,
                 t_min: 0.4,
                 t_max: 0.8,
@@ -763,7 +762,7 @@ fn a_question_that_cannot_fit_an_empty_canvas_is_rejected() {
     let mut checkpoint = Checkpoint::new(&[]);
     // "1:", one slot, "\n", and <turn|> fill a 5-token canvas exactly; a
     // two-letter question needs one token more.
-    checkpoint.profile.canvas_length = 5;
+    checkpoint.profile.sampling.canvas_length = 5;
     let encoder = checkpoint.encoder(ReadoutOptions::default(), 4096);
 
     assert!(encoder.plan(&request(json!({"a": noul("?")})), &[]).is_ok());

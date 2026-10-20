@@ -20,8 +20,6 @@ use std::time::Duration;
 use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::serving::systemone::CanvasMode;
-
 /// Parses a duration: whole seconds or a value with units.
 pub(super) fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
@@ -299,33 +297,6 @@ impl<'de> Deserialize<'de> for ImageSize {
         String::deserialize(deserializer)?
             .parse()
             .map_err(de::Error::custom)
-    }
-}
-
-/// The serde form of a readout canvas length: `"full"`, `"compact"` or a
-/// positive multiple of 16.
-pub(super) mod canvas {
-    use super::*;
-
-    pub(in crate::options) fn serialize<S: Serializer>(
-        value: &CanvasMode,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            CanvasMode::Full => serializer.serialize_str("full"),
-            CanvasMode::Compact => serializer.serialize_str("compact"),
-            CanvasMode::Fixed(length) => serializer.serialize_u32(*length),
-        }
-    }
-
-    pub(in crate::options) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<CanvasMode, D::Error> {
-        let text = match NumberOrText::deserialize(deserializer)? {
-            NumberOrText::Number(length) => length.to_string(),
-            NumberOrText::Text(text) => text,
-        };
-        text.parse().map_err(de::Error::custom)
     }
 }
 

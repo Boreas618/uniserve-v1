@@ -77,9 +77,7 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> Engine {
             )
             .unwrap(),
         ),
-        uniserve_server::serving::WorkerCapabilities {
-            limits: core.generation_limits(),
-        },
+        core.generation_limits(),
         false,
     )
     .unwrap();

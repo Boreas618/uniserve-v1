@@ -6,7 +6,8 @@
 //! the image's vision features where that run stands ([`engine_images`]).
 //! The reply is generated in canvases of the checkpoint's `canvas_length`
 //! tokens under the deployment's block-diffusion sampling
-//! ([`canvas_sampling`]), which the engine and its ranks are launched with,
+//! (`DiffusionGemmaProfile::sampling`), which the engine and its ranks are
+//! launched with,
 //! and Gemma-4 parsers split its thought channel and tool calls
 //! ([`Gemma4ChatOutputProcessor`]). Token-sampling controls have no meaning
 //! for a denoised canvas, so a request that sets one is refused
@@ -18,7 +19,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
+    GenerationRequest, ImageEncoderInput, ImageInput, MediaCall, MultimodalInputs,
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
@@ -64,23 +65,6 @@ pub(crate) fn engine_images(
     }
     prompt.extend_from_slice(&token_ids[next..]);
     (prompt, inputs)
-}
-
-/// Returns the block-diffusion sampling of every canvas the deployment
-/// generates: the checkpoint's canvas length under its sampler defaults, as
-/// the server's configuration overrides them. The engine and the ranks are
-/// launched with it; requests do not carry it.
-pub(crate) fn canvas_sampling(profile: &DiffusionGemmaProfile) -> CanvasSampling {
-    let denoising = &profile.denoising;
-    CanvasSampling {
-        canvas_length: profile.canvas_length,
-        max_steps: denoising.max_denoising_steps,
-        entropy_bound: denoising.entropy_bound,
-        t_min: denoising.t_min,
-        t_max: denoising.t_max,
-        confidence_threshold: denoising.confidence_threshold,
-        stability_threshold: denoising.stability_threshold,
-    }
 }
 
 /// Why block diffusion defines no temperature or truncation control.
@@ -213,7 +197,7 @@ impl InputProcessor {
         // reply may use only the whole canvases that fit the context.
         let prompt_len = u32::try_from(expanded.len()).unwrap_or(u32::MAX);
         let max_model_len = self.config.max_model_len;
-        let canvas = profile.canvas_length;
+        let canvas = profile.sampling.canvas_length;
         let room = max_model_len.saturating_sub(prompt_len) / canvas * canvas;
         if room == 0 {
             return Err(TokenizeError::Invalid(format!(
@@ -261,9 +245,7 @@ mod tests {
 
     use crate::engine::Engine;
     use crate::options::{ImageFetchOptions, LoggingOptions};
-    use crate::profile::diffusion_gemma::{
-        ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
-    };
+    use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
@@ -272,7 +254,7 @@ mod tests {
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
-    use uniserve_core::ModelDtype;
+    use uniserve_core::{CanvasSampling, ModelDtype};
     use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
     /// Tokens of one canvas.
@@ -312,7 +294,6 @@ mod tests {
         let id = |token: &str| tokenizer.token_to_id(token).unwrap();
 
         let profile = DiffusionGemmaProfile {
-            canvas_length: CANVAS,
             tokens: ControlTokens {
                 mask: 4,
                 pad: 0,
@@ -326,8 +307,9 @@ mod tests {
                 pooling_kernel_size: 3,
                 max_soft_tokens: 280,
             },
-            denoising: DenoisingDefaults {
-                max_denoising_steps: 4,
+            sampling: CanvasSampling {
+                canvas_length: CANVAS,
+                max_steps: 4,
                 entropy_bound: 0.1,
                 t_min: 0.4,
                 t_max: 0.8,
@@ -336,7 +318,7 @@ mod tests {
             },
             quantized: false,
         };
-        let sampling = super::canvas_sampling(&profile);
+        let sampling = profile.sampling;
         let model = ModelConfig {
             served_name: "sim-model".to_string(),
             parameters: ModelParameters::DiffusionGemma(profile),
@@ -364,9 +346,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            crate::serving::WorkerCapabilities {
-                limits: core.generation_limits(),
-            },
+            core.generation_limits(),
             false,
         )
         .unwrap();

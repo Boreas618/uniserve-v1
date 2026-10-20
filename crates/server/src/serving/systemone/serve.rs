@@ -15,8 +15,7 @@
 
 use uniserve_core::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageGenerationConfig, ImageParams, MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind,
-    RequestId, SamplingParams,
+    ImageGenerationConfig, ImageParams, MultimodalInputs, RejectionKind, RequestId, SamplingParams,
 };
 
 use crate::engine::Engine;
@@ -198,20 +197,6 @@ fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> Gene
         cache: CachePolicy::default(),
         include_stop_token: false,
         image_generation: ImageGenerationConfig::default(),
-        readout: prompt
-            .rows
-            .iter()
-            .map(|row| ReadoutRow {
-                token_ids: row.token_ids.clone(),
-                slots: row
-                    .slots
-                    .iter()
-                    .map(|slot| ReadoutSlot {
-                        position: slot.position,
-                        candidates: slot.candidates.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        readout: prompt.rows.clone(),
     }
 }

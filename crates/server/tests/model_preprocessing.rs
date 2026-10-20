@@ -25,7 +25,8 @@ use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRend
 use uniserve_server::serving::media::{ImageFetchError, ImageFetcher, ImageInput, ImageListError};
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::{
-    InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
+    InputProcessor, ModelResolutionError, RequestRenderer, ResponseOptions, ServeRequestId,
+    chat_image_urls,
 };
 
 /// Base64 payload of a 1x1 PNG image.
@@ -147,7 +148,7 @@ fn try_resolved_model(
     description: ModelDescription,
     model_type: &str,
     limits: GenerationLimits,
-) -> uniserve_server::serving::Result<(tempfile::TempDir, DynTokenizer, InputProcessor)> {
+) -> Result<(tempfile::TempDir, DynTokenizer, InputProcessor), ModelResolutionError> {
     let directory = tempdir().unwrap();
 
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
@@ -248,13 +249,7 @@ fn try_resolved_model(
         }
         _ => RequestRenderer::Chat(renderer),
     };
-    let model = InputProcessor::new(
-        config,
-        Arc::clone(&tokenizer),
-        renderer,
-        uniserve_server::serving::WorkerCapabilities { limits },
-        true,
-    )?;
+    let model = InputProcessor::new(config, Arc::clone(&tokenizer), renderer, limits, true)?;
     Ok((directory, tokenizer, model))
 }
 
@@ -613,18 +608,18 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
     // The seed defaults to the reference's 42. Five seconds are 120 frames at 24 fps,
     // which extend upward to the next count of the form `17n + 5`: 124
     // frames, decoded as seven 17-frame units plus a tail.
-    let accepted = prepare(serde_json::json!({})).await.unwrap();
+    let (request, accepted) = prepare(serde_json::json!({})).await.unwrap();
     assert_eq!(
-        accepted.request.prompt_token_ids,
+        request.prompt_token_ids,
         tokenizer.encode("exact token sequence", false).unwrap()
     );
-    let sampling = accepted.request.sampling;
+    let sampling = request.sampling;
     assert_eq!(sampling.seed, 42);
     assert_eq!((sampling.num_frames, sampling.video_units), (124, 7));
     assert_eq!((sampling.width, sampling.height), (1344, 768));
     assert_eq!(accepted.duration_seconds, 5.0);
-    let seeded = prepare(serde_json::json!({"seed": 17})).await.unwrap();
-    assert_eq!(seeded.request.sampling.seed, 17);
+    let (seeded, _) = prepare(serde_json::json!({"seed": 17})).await.unwrap();
+    assert_eq!(seeded.sampling.seed, 17);
 
     // The admitted interval is [4, 15] seconds inclusive. Fractional
     // durations round half to even before alignment: 5.1875 s is 124.5
@@ -643,7 +638,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
         let target = serde_json::json!({
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": seconds}
         });
-        let sampling = prepare(target).await.unwrap().request.sampling;
+        let sampling = prepare(target).await.unwrap().0.sampling;
         assert_eq!(sampling.num_frames, frames, "{seconds} s");
         assert_eq!(sampling.video_units, (frames - 5) / 17, "{seconds} s");
     }
@@ -660,7 +655,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
         let target = serde_json::json!({
             "target": {"short_edge": 768, "aspect_ratio": ratio, "duration_seconds": 5.0}
         });
-        let prepared = prepare(target).await.unwrap();
+        let (_, prepared) = prepare(target).await.unwrap();
         assert_eq!(
             (prepared.canvas.width, prepared.canvas.height),
             canvas,
@@ -756,9 +751,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         loaded.config().clone(),
         Arc::clone(&tokenizer),
         RequestRenderer::Video(video_service(denoiser, 10.0, &tokenizer)),
-        uniserve_server::serving::WorkerCapabilities {
-            limits: runtime_limits(),
-        },
+        runtime_limits(),
         true,
     )
     .unwrap();
@@ -801,7 +794,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     assert_eq!(capabilities["max_prompt_tokens"], 4096);
 
     let id = ServeRequestId::new("capacity");
-    let prepared = model
+    let (request, prepared) = model
         .preprocess_video_request(
             &id,
             &video_request(serde_json::json!({
@@ -810,13 +803,14 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         )
         .await
         .unwrap();
-    assert_eq!(prepared.request.sampling.num_frames, 243);
+    assert_eq!(request.sampling.num_frames, 243);
+    assert_eq!(prepared.num_frames, 243);
     // The checkpoint's nine sigma points fix eight evaluations per request.
     assert_eq!(model.video_service().unwrap().num_inference_steps(), 8);
     assert_eq!(prepared.canvas, canvas(1344, 768));
 
     // A 480 short edge names the 480p training bucket of the ratio.
-    let narrow = model
+    let (narrow_request, narrow) = model
         .preprocess_video_request(
             &id,
             &video_request(serde_json::json!({
@@ -828,8 +822,8 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     assert_eq!(narrow.canvas, canvas(992, 416));
     assert_eq!(
         (
-            narrow.request.sampling.width,
-            narrow.request.sampling.height
+            narrow_request.sampling.width,
+            narrow_request.sampling.height
         ),
         (992, 416)
     );
@@ -873,9 +867,7 @@ fn context_length_limits_preprocessed_requests() {
         config,
         tokenizer,
         RequestRenderer::Chat(renderer),
-        uniserve_server::serving::WorkerCapabilities {
-            limits: runtime_limits(),
-        },
+        runtime_limits(),
         true,
     )
     .unwrap();
@@ -1179,9 +1171,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
         loaded.config().clone(),
         tokenizer,
         RequestRenderer::Chat(renderer),
-        uniserve_server::serving::WorkerCapabilities {
-            limits: runtime_limits(),
-        },
+        runtime_limits(),
         true,
     )
     .unwrap()

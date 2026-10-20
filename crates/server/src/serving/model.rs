@@ -4,7 +4,7 @@
 //! at startup: a diffusers pipeline index selects a video model, planned against its
 //! conditioner's vision processor, and otherwise the root `config.json` selects a
 //! token-generating model with its chat template. [`InputProcessor::new`] then binds the
-//! capabilities the connected worker advertises ([`WorkerCapabilities`]) and the request
+//! generation limits the started workers report and the request
 //! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
 //! serving runtime.
 //!
@@ -58,9 +58,6 @@ pub struct InputProcessor {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// Required numerical checkpoint metadata is missing or contradictory.
-    #[error("invalid media checkpoint contract: {0}")]
-    MediaContract(String),
     /// The conditioner's processor configs cannot be read or disagree.
     #[error("invalid media checkpoint contract")]
     ProcessorConfig(#[source] uniserve_core::video::plan::ProcessorConfigError),
@@ -95,8 +92,12 @@ pub(crate) struct LoadedModel {
 
 /// What renders a loaded checkpoint's requests, fixed by its layout.
 pub(crate) enum LoadedRenderer {
-    /// A token model's chat template.
-    Chat(Box<HfChatRenderer>),
+    /// A token model's chat template, with the checkpoint files it was read
+    /// from, which the System One readout renders its own prompts from.
+    Chat {
+        renderer: Box<HfChatRenderer>,
+        files: ResolvedModelFiles,
+    },
     /// A video pipeline's conditioner vision processor geometry; the video
     /// service built from the denoiser handshake plans requests against it.
     Video(ProcessorConfig),
@@ -203,7 +204,10 @@ impl ModelConfig {
         Ok(LoadedModel {
             config: model,
             tokenizer,
-            renderer: LoadedRenderer::Chat(Box::new(renderer)),
+            renderer: LoadedRenderer::Chat {
+                renderer: Box::new(renderer),
+                files,
+            },
         })
     }
 
@@ -251,34 +255,24 @@ impl ModelConfig {
     }
 }
 
-/// Capabilities the loaded worker advertises during its startup handshake.
-///
-/// These are facts about the running worker rather than the checkpoint, so they
-/// arrive after the engine connects and are bound onto the model once.
-pub struct WorkerCapabilities {
-    /// Runtime generation features and resource limits.
-    pub limits: GenerationLimits,
-}
-
 impl InputProcessor {
-    /// Binds model resources to verified worker capabilities without rebuilding model data.
+    /// Binds model resources to the generation limits the started workers
+    /// report in their handshake, without rebuilding model data.
     ///
     /// `renderer` is the checkpoint's chat template, or the video service a video pipeline's
     /// denoiser handshake built.
     ///
     /// # Errors
     ///
-    /// Returns `ServeError::ModelResolution` with `MissingFeature` when the worker limits do
-    /// not cover the features the configured model needs.
+    /// Returns [`ModelResolutionError::MissingFeature`] when `limits` do not cover the features
+    /// the configured model needs.
     pub fn new(
         config: ModelConfig,
         tokenizer: DynTokenizer,
         renderer: RequestRenderer,
-        worker: WorkerCapabilities,
+        limits: GenerationLimits,
         parse_reasoning: bool,
-    ) -> Result<Self> {
-        let WorkerCapabilities { limits } = worker;
-
+    ) -> std::result::Result<Self, ModelResolutionError> {
         let needs = match &config.parameters {
             ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
             // The System One readout denoises canvases over its prompt.
@@ -360,7 +354,10 @@ impl InputProcessor {
         &self,
         request_id: &crate::serving::ServeRequestId,
         request: &crate::openai::VideoGenerationRequest,
-    ) -> std::result::Result<ProcessedVideo, crate::openai::ApiError> {
+    ) -> std::result::Result<
+        (uniserve_core::DiffusionRequest, ProcessedVideo),
+        crate::openai::ApiError,
+    > {
         let Some(video) = self.video_service() else {
             return Err(crate::openai::serve_error_to_api(
                 ServeError::UnsupportedFeature {
@@ -680,13 +677,13 @@ fn validate_runtime_features(
     config: &ModelConfig,
     limits: &GenerationLimits,
     needs: GenerationFeatures,
-) -> Result<()> {
-    limits.covers(needs).map_err(|feature| {
-        ServeError::ModelResolution(ModelResolutionError::MissingFeature {
+) -> std::result::Result<(), ModelResolutionError> {
+    limits
+        .covers(needs)
+        .map_err(|feature| ModelResolutionError::MissingFeature {
             description: config.description().id(),
             feature,
         })
-    })
 }
 
 /// Returns the runtime features required for multimodal serving.
@@ -821,7 +818,7 @@ mod tests {
     use crate::options::ServeConfig;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
-    use crate::serving::{InputProcessor, RequestRenderer, ServeRequestId, WorkerCapabilities};
+    use crate::serving::{InputProcessor, RequestRenderer, ServeRequestId};
 
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
     /// transformers `config.json` beside a `DiffusionGemmaPipeline` diffusers
@@ -931,11 +928,11 @@ mod tests {
         assert_eq!(model.description(), ModelDescription::DiffusionGemma);
         assert_eq!(model.max_model_len, 262_144);
         assert!(model.eos_token_ids.is_superset(&[1, 50, 106].into()));
-        assert!(matches!(renderer, LoadedRenderer::Chat(_)));
+        assert!(matches!(renderer, LoadedRenderer::Chat { .. }));
         let ModelParameters::DiffusionGemma(profile) = &model.parameters else {
             unreachable!("the description is DiffusionGemma");
         };
-        assert_eq!(profile.canvas_length, 256);
+        assert_eq!(profile.sampling.canvas_length, 256);
         assert_eq!(
             profile.tokens.mask,
             tokenizer.token_to_id("<mask>").unwrap()
@@ -944,7 +941,7 @@ mod tests {
             profile.tokens.turn_end,
             tokenizer.token_to_id("<turn|>").unwrap()
         );
-        assert_eq!(profile.denoising.max_denoising_steps, 48);
+        assert_eq!(profile.sampling.max_steps, 48);
         assert!(!profile.quantized);
     }
 
@@ -962,24 +959,21 @@ mod tests {
         })
         .await
         .unwrap();
-        let LoadedRenderer::Chat(renderer) = renderer else {
+        let LoadedRenderer::Chat { renderer, .. } = renderer else {
             unreachable!("a DiffusionGemma checkpoint renders chat");
         };
         InputProcessor::new(
             model,
             tokenizer,
             RequestRenderer::Chat(*renderer),
-            WorkerCapabilities {
-                limits: GenerationLimits {
-                    features: GenerationFeatures::TOKEN_DENOISING
-                        | GenerationFeatures::VISION_ENCODE,
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    max_vit_grid_tokens: 280,
-                    max_vision_feature_bytes: u64::MAX,
-                    encoder_cache_entries: u32::MAX,
-                    ..Default::default()
-                },
+            GenerationLimits {
+                features: GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE,
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                max_vit_grid_tokens: 280,
+                max_vision_feature_bytes: u64::MAX,
+                encoder_cache_entries: u32::MAX,
+                ..Default::default()
             },
             true,
         )
@@ -1023,7 +1017,7 @@ mod tests {
             unreachable!("the processor serves DiffusionGemma");
         };
         assert_eq!(
-            crate::serving::canvas_sampling(profile),
+            profile.sampling,
             CanvasSampling {
                 canvas_length: 256,
                 max_steps: 48,

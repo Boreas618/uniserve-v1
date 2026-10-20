@@ -31,16 +31,15 @@ use anyhow::Context as _;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::info;
 use uniserve_core::{GenerationLimits, Request};
-use uniserve_engine::{EngineCore, EventRx, SubmitError};
+use uniserve_engine::{EngineCore, EventRx, SubmitError, VideoDenoiserInfo};
 use uniserve_observability::{EngineLabels, METRICS};
 
 use crate::openai::serve_error_to_api;
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
-use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::{ModelConfig, ModelParameters};
 use crate::serving::media::ImageFetcher;
 use crate::serving::systemone::ReadoutEncoder;
-use crate::serving::video::ProcessedVideo;
+use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{
     self, InputProcessor, LoadedModel, LoadedRenderer, RequestOutputStream, RequestRenderer,
     ServeError, ServeRequestId, TokenizeError,
@@ -111,9 +110,9 @@ impl Engine {
         // The server's block-diffusion sampling replaces the checkpoint's
         // defaults once, before any request is lowered.
         if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
-            profile.denoising = profile
-                .denoising
-                .with_overrides(&config.diffusion_generation_config)
+            profile.sampling = config
+                .diffusion_generation_config
+                .apply(profile.sampling)
                 .map_err(|message| {
                     anyhow::anyhow!("invalid diffusion_generation_config: {message}")
                 })?;
@@ -142,7 +141,7 @@ impl Engine {
         // Every generated canvas uses the served sampling, which the worker
         // sizes its canvas state for and prepares its canvas steps with.
         worker.canvas_sampling = match &model_config.parameters {
-            ModelParameters::DiffusionGemma(profile) => Some(serving::canvas_sampling(profile)),
+            ModelParameters::DiffusionGemma(profile) => Some(profile.sampling),
             _ => None,
         };
         // A DiffusionGemma prompt, image block or committed block only
@@ -164,14 +163,16 @@ impl Engine {
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
         // processor.
+        let mut model_files = None;
         let renderer = match renderer {
-            LoadedRenderer::Chat(renderer) => {
+            LoadedRenderer::Chat { renderer, files } => {
                 // No other served model's processor takes options.
                 anyhow::ensure!(
                     config.mm_processor_kwargs.is_empty(),
                     "invalid mm_processor_kwargs: the processor of `{}` takes no options",
                     config.model()
                 );
+                model_files = Some(files);
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video(vision) => {
@@ -194,7 +195,7 @@ impl Engine {
                 )
                 .map_err(|message| anyhow::anyhow!("invalid mm_processor_kwargs: {message}"))?;
                 RequestRenderer::Video(
-                    serving::video::VideoService::new(
+                    VideoService::new(
                         denoiser,
                         vision,
                         config.video_config.max_seconds,
@@ -210,13 +211,10 @@ impl Engine {
 
         // A DiffusionGemma checkpoint serves the System One readout, whose
         // encoder renders prompts with the checkpoint's own chat template.
-        let readout = match &model_config.parameters {
-            ModelParameters::DiffusionGemma(profile) => {
-                let files = ResolvedModelFiles::new(config.model())
-                    .await
-                    .context("failed to resolve the readout chat template")?;
+        let readout = match (&model_config.parameters, &model_files) {
+            (ModelParameters::DiffusionGemma(profile), Some(files)) => {
                 let encoder = ReadoutEncoder::load(
-                    &files,
+                    files,
                     Arc::clone(&tokenizer),
                     profile,
                     config.readout_config,
@@ -237,9 +235,7 @@ impl Engine {
             model_config,
             tokenizer,
             renderer,
-            serving::WorkerCapabilities {
-                limits: first.generation_limits(),
-            },
+            first.generation_limits(),
             config.chat_config.reasoning_parser == ReasoningParser::Auto,
         )
         .context("failed to bind the configured model description")?;
@@ -343,6 +339,12 @@ impl Engine {
         self.replicas[0].core.generation_limits()
     }
 
+    /// The video denoiser this deployment serves; `None` for a model that
+    /// generates no video.
+    pub fn video_denoiser(&self) -> Option<&VideoDenoiserInfo> {
+        self.processor.video_service().map(VideoService::denoiser)
+    }
+
     /// Whether the engine can accept requests: whether any data-parallel
     /// rank's core is alive. Requests go only to live ranks.
     pub fn is_healthy(&self) -> bool {
@@ -431,8 +433,8 @@ impl Engine {
     /// Fetches, probes and plans a video request's media, presents its
     /// prompt, and streams its output.
     ///
-    /// Also returns the processed request, whose duration, canvas and
-    /// sampling describe the generation.
+    /// Also returns what the request generates: its duration, frames and
+    /// canvas.
     ///
     /// # Errors
     ///
@@ -444,13 +446,13 @@ impl Engine {
         request: crate::openai::VideoGenerationRequest,
     ) -> crate::openai::Result<(ProcessedVideo, RequestOutputStream)> {
         let started = Instant::now();
-        let video = self
+        let (request, video) = self
             .processor
             .preprocess_video_request(&request_id, &request)
             .await?;
-        let prompt_tokens = video.request.prompt_token_ids.len();
+        let prompt_tokens = request.prompt_token_ids.len();
         let (events, rank) = self
-            .submit(Request::Diffusion(video.request.clone()))
+            .submit(Request::Diffusion(request))
             .map_err(|error| serve_error_to_api(error.into()))?;
         let output = serving::media_output(
             request_id.clone(),

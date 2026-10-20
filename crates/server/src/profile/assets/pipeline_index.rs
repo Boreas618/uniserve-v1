@@ -9,8 +9,6 @@
 //! Server startup (`ModelConfig::load` in `serving::model`) consults this
 //! index, through `PipelineCheckpoint`, before any other asset: its presence
 //! marks a checkpoint as a pipeline, and `_class_name` selects the family.
-//! The Dynamo worker binary uses the same index to accept only MiniMax H3
-//! checkpoints.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,9 +25,9 @@ const PIPELINE_INDEX_FILES: [&str; 2] = ["model_index.json", "modular_model_inde
 
 /// Pipeline class and component folders declared by a checkpoint's root index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelineIndex {
+pub(super) struct PipelineIndex {
     /// Pipeline class the index declares in `_class_name`.
-    pub class_name: String,
+    pub(super) class_name: String,
     /// Component name mapped to the checkpoint-relative folder holding its
     /// files.
     components: BTreeMap<String, String>,
@@ -48,7 +46,7 @@ impl PipelineIndex {
     /// Returns [`Error::Invalid`] when `content` is not JSON or not a JSON
     /// object, and [`Error::MissingField`] when `_class_name` is absent or not
     /// a string.
-    pub fn parse(content: &str) -> Result<Self> {
+    pub(super) fn parse(content: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(content)
             .map_err(|error| Error::invalid(format!("pipeline index is not JSON: {error}")))?;
         let index = value
@@ -83,7 +81,7 @@ impl PipelineIndex {
     ///
     /// The result is suitable for `ModelSource::file`. An undeclared
     /// component is [`Error::Invalid`].
-    pub fn component_file(&self, component: &str, filename: &str) -> Result<String> {
+    pub(super) fn component_file(&self, component: &str, filename: &str) -> Result<String> {
         let folder = self.components.get(component).ok_or_else(|| {
             Error::invalid(format!(
                 "pipeline {} declares no {component} component",
@@ -94,18 +92,14 @@ impl PipelineIndex {
     }
 }
 
-/// Resolves the root index of a diffusers pipeline checkpoint.
+/// Resolves the root index of the diffusers pipeline checkpoint `source`
+/// holds.
 ///
 /// A checkpoint that publishes neither index file is not a pipeline
 /// checkpoint: [`Error::MissingFile`] for both files yields `None`. Any other
 /// resolution failure, such as a refused, rate-limited or unreachable Hub
 /// request, is returned, since it says nothing about whether the index
 /// exists. An index that resolves but cannot be read or parsed is an error.
-pub async fn resolve_pipeline_index(model_id: &str) -> Result<Option<PipelineIndex>> {
-    pipeline_index(&ModelSource::from_model_id(model_id)?).await
-}
-
-/// Resolves the root index from an already classified model source.
 pub(super) async fn pipeline_index(source: &ModelSource) -> Result<Option<PipelineIndex>> {
     for filename in PIPELINE_INDEX_FILES {
         match source.file(filename).await {
@@ -171,7 +165,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("config.json"), "{}").unwrap();
 
-        let resolved = resolve_pipeline_index(directory.path().to_str().unwrap())
+        let resolved = pipeline_index(&ModelSource::Local(directory.path().to_path_buf()))
             .await
             .unwrap();
 

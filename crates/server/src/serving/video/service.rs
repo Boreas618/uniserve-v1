@@ -37,17 +37,16 @@ use crate::serving::{ServeError, ServeRequestId};
 pub(crate) const REQUEST_FIELDS: [&str; 6] =
     ["model", "prompt", "task", "conditions", "target", "seed"];
 
-/// A video request ready for submission.
-#[derive(Debug, Clone, PartialEq)]
+/// What a processed video request generates, as its job record reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProcessedVideo {
-    /// The engine request. `Engine::submit` stamps the engine's identifier
-    /// for the request at submission.
-    pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.
     pub duration_seconds: f64,
     /// The duration of the generated frames, in seconds: the frame count at
     /// the deployment's frame rate.
     pub actual_seconds: f64,
+    /// The frames generated.
+    pub num_frames: u32,
     /// The generated canvas.
     pub canvas: Canvas,
 }
@@ -55,8 +54,6 @@ pub struct ProcessedVideo {
 /// Processes the video requests of one deployment.
 pub struct VideoService {
     denoiser: VideoDenoiserInfo,
-    tasks: Vec<VideoTask>,
-    max_video_seconds: f64,
     /// Condition units one latent encoding round covers while a request's
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
@@ -71,11 +68,14 @@ impl VideoService {
     /// encoder covers in one round, its media policy, how it sizes
     /// references, and the tokenizer.
     ///
+    /// `denoiser` is the worker handshake the engine validated, and
+    /// `references` a sizing `ReferenceConfig::from_kwargs` validated against
+    /// it.
+    ///
     /// # Errors
     ///
-    /// Fails when the handshake names a task this server does not know or
-    /// is otherwise invalid, when the reference config is invalid, or when
-    /// the media fetcher cannot be built.
+    /// Fails when the handshake names a task this server does not know, or
+    /// when the media fetcher cannot be built.
     pub fn new(
         denoiser: VideoDenoiserInfo,
         vision: ProcessorConfig,
@@ -85,16 +85,6 @@ impl VideoService {
         references: ReferenceConfig,
         tokenizer: DynTokenizer,
     ) -> anyhow::Result<Self> {
-        denoiser
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid video denoiser handshake: {error}"))?;
-        anyhow::ensure!(
-            !denoiser.canvases.is_empty(),
-            "invalid video denoiser handshake: the worker prepared no canvas"
-        );
-        references
-            .validate(&denoiser.references)
-            .map_err(anyhow::Error::msg)?;
         let tasks = denoiser
             .tasks
             .iter()
@@ -113,7 +103,7 @@ impl VideoService {
         })?;
         let prober = MediaProber::new(ProbeConfig::new(media.ffprobe.clone()));
         let limits = PlanLimits {
-            tasks: tasks.clone(),
+            tasks,
             max_video_seconds,
             frame_rate: denoiser.frame_rate,
             frames: denoiser.frames,
@@ -124,11 +114,14 @@ impl VideoService {
         Ok(Self {
             processor: VideoProcessor::new(fetcher, prober, vision, limits, tokenizer),
             denoiser,
-            tasks,
-            max_video_seconds,
             latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
         })
+    }
+
+    /// The served video denoiser, as the engine's handshake validated it.
+    pub fn denoiser(&self) -> &VideoDenoiserInfo {
+        &self.denoiser
     }
 
     /// The denoiser network evaluations of every request: one per schedule
@@ -172,6 +165,8 @@ impl VideoService {
         let limits = MediaLimits::new(self.media.max_request_bytes);
         let references = self.processor.limits().references;
         let conditions: serde_json::Map<String, Value> = self
+            .processor
+            .limits()
             .tasks
             .iter()
             .map(|task| {
@@ -209,7 +204,7 @@ impl VideoService {
             "audio_sample_rate": self.denoiser.audio_sample_rate,
             "frames": self.denoiser.frames,
             "min_seconds": MIN_VIDEO_SECONDS,
-            "max_seconds": self.max_video_seconds,
+            "max_seconds": self.processor.limits().max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
             "schedule": {
                 "num_inference_steps": self.denoiser.schedule_points,
@@ -227,11 +222,13 @@ impl VideoService {
         })
     }
 
-    /// Validates, processes and sizes one video request.
+    /// Validates, processes and sizes one video request into its engine
+    /// request and what it generates.
     ///
     /// The presentation must fit the prompt capacity (`--max-model-len`).
     /// Each condition's fetched media is then copied to shared memory, which
-    /// the request holds until the engine retires it.
+    /// the request holds until the engine retires it. `Engine::submit` stamps
+    /// the engine's identifier on the request.
     ///
     /// # Errors
     ///
@@ -243,7 +240,7 @@ impl VideoService {
         request_id: &ServeRequestId,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<ProcessedVideo, ApiError> {
+    ) -> Result<(DiffusionRequest, ProcessedVideo), ApiError> {
         let conditions: Vec<ConditionInput<'_>> =
             request.conditions.iter().map(condition_input).collect();
         let processed = self
@@ -292,28 +289,30 @@ impl VideoService {
             conditions.push(condition.describe(plan.canvas, source.locator(), bands));
             media.push(Arc::new(source));
         }
-        Ok(ProcessedVideo {
-            request: DiffusionRequest {
-                request_id: RequestId::default(),
-                task: plan.task,
-                prompt_token_ids,
-                text_tags: processed.presentation.tags,
-                conditions,
-                media,
-                priority: 0,
-                sampling: DiffusionSamplingParams {
-                    num_frames: plan.num_frames,
-                    // One decode unit per clip of the denoiser's frame rule.
-                    video_units: self.denoiser.frames.units(plan.num_frames),
-                    seed: request.seed,
-                    width: plan.canvas.width,
-                    height: plan.canvas.height,
-                },
+        let request = DiffusionRequest {
+            request_id: RequestId::default(),
+            task: plan.task,
+            prompt_token_ids,
+            text_tags: processed.presentation.tags,
+            conditions,
+            media,
+            priority: 0,
+            sampling: DiffusionSamplingParams {
+                num_frames: plan.num_frames,
+                // One decode unit per clip of the denoiser's frame rule.
+                video_units: self.denoiser.frames.units(plan.num_frames),
+                seed: request.seed,
+                width: plan.canvas.width,
+                height: plan.canvas.height,
             },
+        };
+        let video = ProcessedVideo {
             duration_seconds: plan.duration_seconds,
             actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
+            num_frames: plan.num_frames,
             canvas: plan.canvas,
-        })
+        };
+        Ok((request, video))
     }
 }
 
@@ -454,7 +453,7 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         });
-        let unenlarged = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
+        let (unenlarged, _) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("reference"),
                 &request(body.clone()),
@@ -468,7 +467,7 @@ mod tests {
             height: 96,
         };
         assert_eq!(
-            unenlarged.request.conditions[0].media,
+            unenlarged.conditions[0].media,
             ConditionMedia::Image(ImageFit {
                 resized: own,
                 left: 0,
@@ -477,11 +476,10 @@ mod tests {
             })
         );
 
-        let processed = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
+        let (request, _) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
             .process(&ServeRequestId::new("reference"), &request(body), 1 << 16)
             .await
             .unwrap();
-        let request = &processed.request;
         assert_eq!(request.task, VideoTask::Ref2va);
         assert_eq!(request.text_tags.len(), request.prompt_token_ids.len());
         assert_eq!(request.validate(), Ok(()));
@@ -540,7 +538,7 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let processed = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
+            let (request, _) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("images"),
                 &request(serde_json::json!({
@@ -554,7 +552,7 @@ mod tests {
             )
             .await
             .unwrap();
-            for (index, condition) in processed.request.conditions.iter().enumerate() {
+            for (index, condition) in request.conditions.iter().enumerate() {
                 let expected = if index < count - split {
                     vec![64 * 64]
                 } else {
@@ -574,7 +572,7 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let processed = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
+        let (request, processed) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
                 &ServeRequestId::new("keyframes"),
                 &request(serde_json::json!({
@@ -592,7 +590,7 @@ mod tests {
             .await
             .unwrap();
         let canvas = processed.canvas;
-        let [first, last] = processed.request.conditions.as_slice() else {
+        let [first, last] = request.conditions.as_slice() else {
             panic!("two keyframes");
         };
         assert_eq!(first.role, ConditionRole::FirstFrame);
@@ -636,10 +634,10 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&png(160, 90)), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         }));
-        let processed = service()
+        let (request, _) = service()
             .process(&ServeRequestId::new("rows"), &body, 1 << 16)
             .await
             .unwrap();
-        assert_eq!(processed.request.conditions[0].latent_units, [7296]);
+        assert_eq!(request.conditions[0].latent_units, [7296]);
     }
 }

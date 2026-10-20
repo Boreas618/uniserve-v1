@@ -1198,10 +1198,9 @@ mod tests {
             return_token_ids: true,
             return_tokens_as_token_ids: false,
         };
-        let chunks =
-            chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0)
-                .collect::<Vec<_>>()
-                .await;
+        let chunks = chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0)
+            .collect::<Vec<_>>()
+            .await;
 
         let mut token_ids = Vec::new();
         let mut logprob_positions = 0;

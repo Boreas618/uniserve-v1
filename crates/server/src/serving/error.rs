@@ -98,9 +98,6 @@ pub enum ServeError {
         /// Maximum token count declared by the profile.
         max_tokens: u32,
     },
-    /// Model assets or capabilities cannot be resolved.
-    #[error(transparent)]
-    ModelResolution(#[from] crate::serving::model::ModelResolutionError),
     /// No live engine core accepts the request.
     #[error(transparent)]
     Submit(#[from] uniserve_engine::SubmitError),

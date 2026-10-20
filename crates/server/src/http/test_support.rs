@@ -24,7 +24,7 @@ use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::ImageFetcher;
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::{InputProcessor, RequestRenderer, WorkerCapabilities};
+use crate::serving::{InputProcessor, RequestRenderer};
 use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 
 /// Served model name the simulated state answers to.
@@ -104,9 +104,7 @@ fn engine_over(
         model,
         configured_tokenizer(),
         renderer,
-        WorkerCapabilities {
-            limits: cores[0].generation_limits(),
-        },
+        cores[0].generation_limits(),
         false,
     )
     .unwrap();

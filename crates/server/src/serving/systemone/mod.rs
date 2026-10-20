@@ -40,8 +40,8 @@ mod vocabulary;
 pub use answer::{Answer, OrderedMap, SystemOneResponse, Usage};
 pub use error::{LocItem, SystemOneError, ValidationIssue};
 pub use plan::{
-    CandidateTokens, CanvasMode, CanvasRow, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION,
-    ReadoutEncoder, ReadoutLayout, ReadoutPlan, ReadoutPrompt, ReadoutSlot, StartupError,
+    CandidateTokens, CanvasMode, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION,
+    ReadoutEncoder, ReadoutLayout, ReadoutPlan, ReadoutPrompt, StartupError,
 };
 pub use request::{
     ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, Question, SystemOneRequest,

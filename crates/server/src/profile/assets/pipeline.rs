@@ -145,8 +145,9 @@ impl PipelineCheckpoint {
     /// # Errors
     ///
     /// Returns [`Error::Invalid`] when the export's pin is malformed, and the
-    /// errors of [`resolve_pipeline_index`](super::resolve_pipeline_index)
-    /// for the root index and the inference contract.
+    /// errors of resolving and parsing the root index: any failure to
+    /// resolve it other than its absence, and an index that is not a JSON
+    /// object naming its `_class_name`.
     pub async fn resolve(model_id: &str) -> Result<Option<Self>> {
         let root = ModelSource::from_model_id(model_id)?;
         Self::locate(root, || HubClient::from_env(model_id)).await

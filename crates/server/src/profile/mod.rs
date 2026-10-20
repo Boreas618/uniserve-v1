@@ -3,7 +3,7 @@
 //! The server identifies the served model family from the checkpoint itself:
 //! the `model_type` of its root architecture config (see
 //! `ResolvedModelFiles::config_path`) or, for a diffusers pipeline, the
-//! `_class_name` of its root index (see [`assets::pipeline_index`]). The
+//! `_class_name` of its root index (see [`assets::PipelineCheckpoint`]). The
 //! result is one [`ModelConfig`], built at startup by `ModelConfig::load` in
 //! `serving::model`. Engine startup reads it, and `InputProcessor::new` then
 //! binds the worker's capabilities onto it before request preprocessing and
