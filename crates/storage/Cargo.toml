@@ -1,0 +1,23 @@
+[package]
+name = "uniserve-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Storage Server's protocol, client and server. It depends on no
+# workspace crate and never links CUDA: it outlives builds of the head and
+# the workers, and holds device memory only through descriptors.
+[dependencies]
+libc.workspace = true
+libloading.workspace = true
+rmp-serde.workspace = true
+rustix = { workspace = true, features = ["event", "net", "process", "time"] }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

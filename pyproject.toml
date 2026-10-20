@@ -125,6 +125,13 @@ target = "uniserve-worker"
 path = "crates/worker/Cargo.toml"
 debug = false
 
+# The Storage Server of one host, which the head and the launchers start when
+# their host has none.
+[[tool.setuptools-rust.bins]]
+target = "uniserve-storage-server"
+path = "crates/bin/uniserve-storage-server/Cargo.toml"
+debug = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
 addopts = "-ra"

@@ -6,12 +6,14 @@ members = [
     "crates/observability-derive",
     "crates/ipc",
     "crates/cuda",
+    "crates/storage",
     "crates/worker",
     "crates/engine",
     "crates/server",
     "crates/bin/uniserve",
     "crates/bin/uniserve-launcher",
     "crates/bin/dynamo",
+    "crates/bin/uniserve-storage-server",
 ]
 
 [workspace.package]
@@ -27,6 +29,7 @@ uniserve-observability = { path = "crates/observability" }
 uniserve-observability-derive = { path = "crates/observability-derive" }
 uniserve-ipc = { path = "crates/ipc" }
 uniserve-cuda = { path = "crates/cuda" }
+uniserve-storage = { path = "crates/storage" }
 uniserve-worker = { path = "crates/worker" }
 uniserve-engine = { path = "crates/engine" }
 uniserve-server = { path = "crates/server" }
