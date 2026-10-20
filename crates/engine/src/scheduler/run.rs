@@ -233,6 +233,7 @@ impl Scheduler {
             fatal: false,
             tiers: None,
             quiesce: None,
+            closing: false,
             stats,
         })
     }
@@ -390,10 +391,65 @@ impl Scheduler {
         }
         // Finish everything still queued or running with `Aborted` before
         // closing the executor, so every open consumer receives a terminal
-        // event rather than only a closed channel.
+        // event rather than only a closed channel. The pages published so
+        // far reach the host page tier first.
+        self.flush_page_tier();
         self.abort_all_requests();
         let _ = self.executor.close();
         false
+    }
+
+    /// Write to the host page tier every published page that is not there
+    /// yet, before the workers close: let the batches in flight complete,
+    /// which carry writes and settle them, then carry each worker group's
+    /// remaining reserved writes in a batch of page writes alone, and wait
+    /// for their commits. The scheduler admits and schedules nothing more.
+    /// Gives up after `PAGE_FLUSH_TIMEOUT` or when the engine fails, leaving
+    /// the pages still on their way out of the tier.
+    pub(super) fn flush_page_tier(&mut self) {
+        if self.tiers.is_none() || self.fatal {
+            return;
+        }
+        self.closing = true;
+        let deadline = Instant::now() + PAGE_FLUSH_TIMEOUT;
+        loop {
+            let idle = self.inflight.pending_batches.is_empty()
+                && self.inflight.pending_submissions.is_empty();
+            let Some(tiers) = self.tiers.as_mut() else {
+                return;
+            };
+            tiers.poll();
+            if idle {
+                for worker in tiers.queued_workers() {
+                    let mut batch = self.finish_generation_batch(
+                        ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
+                        Instant::now(),
+                    );
+                    let Some(tiers) = self.tiers.as_mut() else {
+                        return;
+                    };
+                    let pages = tiers.take_writes(&worker, batch.id);
+                    batch.page_writes = Some(crate::executor::PageWrites { worker, pages });
+                    self.inflight.pending_submissions.push_back(batch);
+                }
+            }
+            if !self
+                .tiers
+                .as_ref()
+                .is_some_and(crate::prefix_cache::Tiers::writing)
+            {
+                return;
+            }
+            if self.fatal || Instant::now() >= deadline {
+                tracing::warn!(
+                    "published pages did not all reach the host page tier before the workers close"
+                );
+                return;
+            }
+            if !self.step_nonblocking() {
+                self.park_for_progress();
+            }
+        }
     }
 
     /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.
@@ -408,10 +464,13 @@ impl Scheduler {
         let _span = tracing::trace_span!("scheduler.park").entered();
         // Answers of the host page tier arrive on a connection the executor
         // does not wait on: while some are awaited, the park is short.
-        let timeout = if self
-            .tiers
-            .as_ref()
-            .is_some_and(crate::prefix_cache::Tiers::waiting)
+        // So is the park of a closing scheduler, which awaits its last
+        // page commits.
+        let timeout = if self.closing
+            || self
+                .tiers
+                .as_ref()
+                .is_some_and(crate::prefix_cache::Tiers::waiting)
         {
             TIER_POLL
         } else {

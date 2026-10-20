@@ -101,9 +101,17 @@ pub struct ExecutionBatch {
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
     pub cache_inputs: Vec<uniserve_ipc::CacheTransfer>,
-    /// Published pages the batch writes to the host page tier, for every
-    /// rank of the one worker group that runs it (`PageCopy::rank`).
-    pub page_writes: Vec<uniserve_ipc::PageCopy>,
+    /// Published pages the batch writes to the host page tier.
+    pub page_writes: Option<PageWrites>,
+}
+
+/// Published pages one worker group writes to the host page tier, for
+/// every rank of the group (`PageCopy::rank`). The group runs every call
+/// of a batch that carries them; a batch without calls carries only them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageWrites {
+    pub worker: WorkerGroupId,
+    pub pages: Vec<uniserve_ipc::PageCopy>,
 }
 
 impl ExecutionBatch {
@@ -120,7 +128,7 @@ impl ExecutionBatch {
             commands,
             input_transfers,
             cache_inputs: Vec::new(),
-            page_writes: Vec::new(),
+            page_writes: None,
         }
     }
 
@@ -174,17 +182,19 @@ impl ExecutionBatch {
     /// Validates the scheduler's own bookkeeping: call identities, execution
     /// ownership and placement.
     ///
-    /// Requires at least one call or command; checks that call identities are
-    /// unique and belong to this batch, that each placement describes its own
-    /// call, and that every `Start` is unique and names a request with a call
-    /// in this batch. The records themselves and the wire-level constraints
+    /// Requires at least one call, command or page write; checks that call
+    /// identities are unique and belong to this batch, that each placement
+    /// describes its own call, and that every `Start` is unique and names a
+    /// request with a call in this batch. The records themselves and the wire-level constraints
     /// between calls (one kind and component per batch, allocation tables
     /// matching their calls, non-overlapping spans) are checked once, by
     /// `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // A batch of page writes alone writes the head's last published
+        // pages to the host page tier before it closes its workers.
         anyhow::ensure!(
-            !self.requests.is_empty() || !self.commands.is_empty(),
-            "logical batch must carry at least one call or command"
+            !self.requests.is_empty() || !self.commands.is_empty() || self.page_writes.is_some(),
+            "logical batch must carry at least one call, command or page write"
         );
 
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
@@ -304,7 +314,7 @@ impl ExecutionBatch {
             input_products,
             cache_inputs,
             page_reads,
-            page_writes,
+            page_writes: page_writes.map_or_else(Vec::new, |writes| writes.pages),
         };
         batch.validate_unplaced()?;
         Ok((batch, rank_buffers))

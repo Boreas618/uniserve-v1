@@ -816,6 +816,28 @@ impl Tiers {
         }
     }
 
+    /// Whether published pages are still on their way to the tier: slots
+    /// being reserved, writes waiting for or carried by a batch, or their
+    /// commits unanswered.
+    pub(crate) fn writing(&self) -> bool {
+        !self.reservations.is_empty()
+            || self.queued.values().any(|writes| !writes.is_empty())
+            || !self.carried.is_empty()
+            || self
+                .pending
+                .values()
+                .any(|purpose| matches!(purpose, Purpose::Reserve { .. } | Purpose::Settle))
+    }
+
+    /// The worker groups whose reserved page writes wait for a batch.
+    pub(crate) fn queued_workers(&self) -> Vec<WorkerGroupId> {
+        self.queued
+            .iter()
+            .filter(|(_, writes)| !writes.is_empty())
+            .map(|(worker, _)| worker.clone())
+            .collect()
+    }
+
     /// The page writes queued for `worker`, which the batch `batch` carries.
     pub(crate) fn take_writes(&mut self, worker: &WorkerGroupId, batch: u64) -> Vec<PageCopy> {
         let Some(writes) = self.queued.remove(worker) else {

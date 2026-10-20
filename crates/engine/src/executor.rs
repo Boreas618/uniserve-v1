@@ -35,7 +35,7 @@ use uniserve_ipc::{
 
 mod batch;
 
-pub use batch::{ExecutionBatch, RankBuffer, RequestPlacement};
+pub use batch::{ExecutionBatch, PageWrites, RankBuffer, RequestPlacement};
 
 /// What the engine launched one pool with.
 ///

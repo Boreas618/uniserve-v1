@@ -140,9 +140,10 @@ impl Scheduler {
         }
         let migrated_requests = requests.len();
 
-        // The tier's pins end with its connection; its pending writes are
-        // dropped. The workers close, releasing their exclusive storages
-        // with the contents intact.
+        // The pages published so far reach the host page tier, then the
+        // tier's pins end with its connection. The workers close, releasing
+        // their exclusive storages with the contents intact.
+        self.flush_page_tier();
         self.tiers = None;
         self.executor.close()?;
         // Finished requests' undelivered events go to their receivers.
