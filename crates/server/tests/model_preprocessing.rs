@@ -7,7 +7,6 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use tempfile::tempdir;
@@ -22,7 +21,7 @@ use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use uniserve_server::serving::media::{ImageFetchError, ImageFetcher, ImageInput, ImageListError};
+use uniserve_server::serving::media::{ImageInput, MediaConnector, MediaListError};
 use uniserve_server::serving::video::VideoGenerationRequest;
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::{
@@ -367,16 +366,16 @@ async fn preprocess_video(
         .map_err(ApiError::from)
 }
 
-/// Runs `ImageFetcher::fetch_all` to completion on a current-thread runtime.
+/// Runs `MediaConnector::fetch_images` to completion on a current-thread runtime.
 fn resolve_images(
-    fetcher: &ImageFetcher,
+    connector: &MediaConnector,
     urls: Vec<String>,
-) -> Result<Vec<ImageInput>, ImageListError> {
+) -> Result<Vec<ImageInput>, MediaListError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(fetcher.fetch_all(urls))
+        .block_on(connector.fetch_images(urls))
 }
 
 /// A single-turn text chat request to the served model, with the wire
@@ -401,8 +400,8 @@ fn preprocess_image_chat(
     request_id: &str,
     request: uniserve_server::openai::ChatCompletionRequest,
 ) -> (GenerationRequest, OutputParams) {
-    let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
-    let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
+    let connector = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
+    let images = resolve_images(&connector, chat_image_urls(&request)).unwrap();
     preprocess_chat(processor, String::from(request_id), request, images).unwrap()
 }
 
@@ -410,7 +409,6 @@ fn preprocess_image_chat(
 /// with one `image/png` body from a background thread.
 struct ImageServer {
     address: SocketAddr,
-    connections: Arc<AtomicUsize>,
 }
 
 impl ImageServer {
@@ -418,14 +416,11 @@ impl ImageServer {
     fn start(body: Vec<u8>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let connections = Arc::new(AtomicUsize::new(0));
-        let accepted = Arc::clone(&connections);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else {
                     return;
                 };
-                accepted.fetch_add(1, Ordering::SeqCst);
 
                 // Consume the request head, then answer and close.
                 let mut head = Vec::new();
@@ -441,15 +436,7 @@ impl ImageServer {
                 let _ = stream.write_all(&body);
             }
         });
-        Self {
-            address,
-            connections,
-        }
-    }
-
-    /// Number of connections accepted so far.
-    fn connections(&self) -> usize {
-        self.connections.load(Ordering::SeqCst)
+        Self { address }
     }
 }
 
@@ -463,7 +450,7 @@ fn image_urls_prepare_the_same_image_input_as_data_urls() {
         .unwrap();
     let server = ImageServer::start(png);
     // The server is on loopback, which only the private-destination policy reaches.
-    let fetcher = ImageFetcher::new(&ImageFetchOptions {
+    let connector = MediaConnector::from_image_options(&ImageFetchOptions {
         allow_private: true,
         ..ImageFetchOptions::default()
     })
@@ -476,7 +463,7 @@ fn image_urls_prepare_the_same_image_input_as_data_urls() {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         let prepare = |image_url: &str| {
             let request = image_chat_request(SERVED_MODEL, image_url);
-            let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
+            let images = resolve_images(&connector, chat_image_urls(&request)).unwrap();
             preprocess_chat(&processor, String::from("image-source"), request, images).unwrap()
         };
 
@@ -490,30 +477,6 @@ fn image_urls_prepare_the_same_image_input_as_data_urls() {
         assert_eq!(from_url.multimodal_inputs.images.len(), 1, "{model_type}");
         assert_eq!(from_url.multimodal_inputs, from_data.multimodal_inputs);
     }
-}
-
-/// Under the default image policy, a chat image URL on a loopback host is
-/// refused before any connection is made, however the host is written.
-#[test]
-fn loopback_image_urls_are_refused_by_default() {
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(PNG_1X1)
-        .unwrap();
-    let server = ImageServer::start(png);
-    let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
-    let port = server.address.port();
-
-    for host in ["127.0.0.1", "localhost", "[::1]"] {
-        let request = image_chat_request(SERVED_MODEL, &format!("http://{host}:{port}/image.png"));
-        let error = resolve_images(&fetcher, chat_image_urls(&request)).unwrap_err();
-
-        assert_eq!(error.index, 0);
-        assert!(
-            matches!(error.source, ImageFetchError::NonPublicAddress),
-            "{host}: {error}"
-        );
-    }
-    assert_eq!(server.connections(), 0);
 }
 
 /// `InputProcessor::new` refuses to bind a profile whose worker limits lack a

@@ -242,7 +242,7 @@ mod tests {
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-    use crate::serving::media::ImageFetcher;
+    use crate::serving::media::MediaConnector;
     use crate::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
@@ -343,7 +343,7 @@ mod tests {
         )
         .unwrap();
 
-        let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
+        let images = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
         let logging = LoggingOptions {
             log_requests: false,
             log_stats: false,

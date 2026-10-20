@@ -36,7 +36,7 @@ use uniserve_observability::{EngineLabels, METRICS};
 
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
 use crate::profile::{ModelConfig, ModelParameters};
-use crate::serving::media::ImageFetcher;
+use crate::serving::media::MediaConnector;
 use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use crate::serving::{
@@ -60,7 +60,7 @@ pub struct Engine {
     /// The rank a load scan starts from, advanced by every pick so that equal
     /// loads rotate across the ranks.
     next_replica: AtomicUsize,
-    images: ImageFetcher,
+    images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
     /// Whether every request logs a summary line when it ends.
@@ -255,7 +255,7 @@ impl Engine {
             config.chat_config.reasoning_parser == ReasoningParser::Auto,
         )
         .context("failed to bind the configured model description")?;
-        let images = ImageFetcher::new(&config.image_fetch_config)
+        let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
         Self::new(
             config.served_model_name().to_owned(),
@@ -284,7 +284,7 @@ impl Engine {
         served_model_name: String,
         cores: Vec<EngineCore>,
         processor: InputProcessor,
-        images: ImageFetcher,
+        images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         logging: &LoggingOptions,
     ) -> anyhow::Result<Self> {
@@ -397,8 +397,8 @@ impl Engine {
         self.replicas.iter().any(|replica| !replica.core.is_dead())
     }
 
-    /// The image fetcher every request's image references go through.
-    pub(crate) fn images(&self) -> &ImageFetcher {
+    /// The connector every request's image references go through.
+    pub(crate) fn images(&self) -> &MediaConnector {
         &self.images
     }
 
@@ -431,14 +431,15 @@ impl Engine {
             Prompt::Chat(chat) if self.processor.supports_image_input() => chat.image_urls(),
             _ => Vec::new(),
         };
-        let images =
-            self.images
-                .fetch_all(image_urls)
-                .await
-                .map_err(|source| ServeError::ImageInput {
-                    request_id: request_id.clone(),
-                    source,
-                })?;
+        let images = self
+            .images
+            .fetch_images(image_urls)
+            .await
+            .map_err(|error| ServeError::ImageInput {
+                request_id: request_id.clone(),
+                index: error.index,
+                source: error.source,
+            })?;
         let processor = Arc::clone(&self.processor);
         let (request, output) =
             preprocess(&request_id, move || processor.preprocess(request, images)).await?;

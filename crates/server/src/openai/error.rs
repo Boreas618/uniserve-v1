@@ -293,4 +293,55 @@ mod tests {
         assert!(message.contains("vid-1"), "{message}");
         assert!(message.contains(cause), "{message}");
     }
+
+    /// A refused video request is an invalid request that names the field at
+    /// fault in its message, with the condition list as the parameter of a
+    /// condition; a failure of the server's own video processing is a server
+    /// error.
+    #[test]
+    fn video_rejections_map_to_openai_categories() {
+        let rejected = ApiError::from(ServeError::from(VideoInputError::condition(
+            2,
+            "is not an image",
+        )));
+        assert_eq!(
+            rejected,
+            ApiError::invalid_request("conditions[2]: is not an image", Some("conditions"))
+        );
+
+        let rejected = ApiError::from(ServeError::from(VideoInputError::invalid(
+            uniserve_core::video::plan::RequestField::TargetDuration,
+            "is required",
+        )));
+        assert_eq!(
+            rejected,
+            ApiError::invalid_request(
+                "target.duration_seconds: is required",
+                Some("target.duration_seconds")
+            )
+        );
+
+        let failed = ApiError::from(ServeError::from(VideoInputError::internal(
+            "ffprobe did not start",
+        )));
+        assert_eq!(failed.code(), "server_error");
+    }
+
+    /// An input image failure names the request and the image's position,
+    /// then the rule the reference violates.
+    #[test]
+    fn an_image_input_rejection_reports_the_image_and_its_cause() {
+        let error = ApiError::from(ServeError::ImageInput {
+            request_id: String::from("chat-1"),
+            index: 1,
+            source: crate::serving::media::MediaError::Status { status: 404 },
+        });
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        let message = error.to_error_response().error.message;
+        assert_eq!(
+            message,
+            "request `chat-1` has an invalid input image 2: the URL returned HTTP status 404"
+        );
+    }
 }

@@ -16,7 +16,7 @@ use uniserve_server::options::{ImageFetchOptions, LoggingOptions};
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use uniserve_server::serving::media::ImageFetcher;
+use uniserve_server::serving::media::MediaConnector;
 use uniserve_server::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
 
 /// Builds an engine over a default `SimEngine`.
@@ -92,7 +92,7 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> Engine {
     )
     .unwrap();
 
-    let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
+    let images = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
     let logging = LoggingOptions {
         log_requests: false,
         log_stats: false,

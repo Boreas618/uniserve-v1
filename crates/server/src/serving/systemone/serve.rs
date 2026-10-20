@@ -50,7 +50,7 @@ impl Engine {
 
         let images = self
             .images()
-            .fetch_all(request.images.clone())
+            .fetch_images(request.images.clone())
             .await
             .map_err(|error| {
                 SystemOneError::Validation(vec![ValidationIssue::value_error(

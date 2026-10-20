@@ -87,13 +87,15 @@ pub enum ServeError {
     #[error(transparent)]
     Submit(#[from] uniserve_engine::SubmitError),
     /// An input image reference cannot be fetched or decoded.
-    #[error("request `{request_id}` has an invalid input image")]
+    #[error("request `{request_id}` has an invalid input image {}", .index + 1)]
     ImageInput {
         /// Identifier of the rejected request.
         request_id: String,
-        /// The failing reference and its cause.
+        /// Zero-based position of the failing reference among the request's images.
+        index: usize,
+        /// Why the reference could not be resolved.
         #[source]
-        source: media::ImageListError,
+        source: media::MediaError,
     },
     /// The video service refuses a video request or cannot process it.
     #[error(transparent)]

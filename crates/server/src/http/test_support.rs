@@ -23,7 +23,7 @@ use crate::openai::video_jobs::VideoJobs;
 use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use crate::serving::media::ImageFetcher;
+use crate::serving::media::MediaConnector;
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
 use crate::serving::{InputProcessor, RequestRenderer};
@@ -115,7 +115,7 @@ fn engine_over(
         false,
     )
     .unwrap();
-    let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
+    let images = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
     let logging = LoggingOptions {
         log_requests: false,
         log_stats: false,

@@ -35,9 +35,9 @@ use crate::engine::Engine;
 use crate::http::RequestId;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::openai::{ApiError, check_model_served};
+use crate::serving::video::REQUEST_FIELDS;
 use crate::serving::video::VideoGenerationRequest;
 use crate::serving::video::artifact::ArtifactCollector;
-use crate::serving::video::service::REQUEST_FIELDS;
 use String;
 
 /// The state of the asynchronous video job routes.
