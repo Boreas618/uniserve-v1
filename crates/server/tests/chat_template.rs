@@ -9,12 +9,9 @@
 
 use std::collections::HashMap;
 
-use uniserve_server::serving::chat::template::renderer::hf::{
-    ChatTemplateContentFormatOption, HfChatRenderer,
-};
-use uniserve_server::serving::chat::template::{AssistantContentBlock, AssistantToolCall};
 use uniserve_server::serving::chat::{
-    ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode,
+    AssistantContentBlock, AssistantToolCall, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
+    ChatTemplateContentFormatOption, GenerationPromptMode, HfChatRenderer,
 };
 
 const QWEN3_TEMPLATE: &str = include_str!("templates/qwen3.jinja");

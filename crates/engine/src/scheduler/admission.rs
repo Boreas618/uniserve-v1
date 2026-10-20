@@ -6,7 +6,7 @@
 //! `EngineCoreOutput::Rejected` on the request's event channel. Admission
 //! (`admit`, `admit_media`), which the scheduling pass runs before and
 //! between batch assembly, moves requests from the head of the token and
-//! media waiting queues into the running set while `max_num_seqs` and
+//! media waiting queues into the running set while `max_running_requests` and
 //! storage allow. A head that does not fit yet blocks the requests behind it
 //! in its queue, and running requests are never preempted to make room.
 //!
@@ -196,7 +196,7 @@ impl Scheduler {
         let waiting = self.pending_request_count() + self.output.retained_len();
         if self
             .config
-            .max_num_waiting
+            .max_queued_requests
             .is_some_and(|bound| waiting >= bound)
         {
             let _ = event_tx.send(EngineCoreOutput::Rejected {
@@ -566,7 +566,7 @@ impl Scheduler {
         let waiting = self.waiting.len() + self.waiting_media.len() + self.output.retained_len();
         if self
             .config
-            .max_num_waiting
+            .max_queued_requests
             .is_some_and(|bound| waiting >= bound)
         {
             reject(
@@ -651,12 +651,12 @@ impl Scheduler {
 
     /// Admits queued media requests while request and product storage remain available.
     ///
-    /// Media and token requests share the `max_num_seqs` running bound.
+    /// Media and token requests share the `max_running_requests` running bound.
     /// Admission stops at the first request that cannot be routed or
     /// reserved, leaving it at the queue head. A broken scheduler invariant
     /// also requeues the request, latches engine-fatal, and stops.
     pub(super) fn admit_media(&mut self) {
-        while self.running_request_count() < self.config.max_num_seqs {
+        while self.running_request_count() < self.config.max_running_requests {
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
@@ -1022,12 +1022,12 @@ impl Scheduler {
     /// the units of its first prefill chunk beyond its cached prefix, summed
     /// over every cache group. A head that can never fit the total cache
     /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
-    /// when the queue is empty, `max_num_seqs` is reached, no request row is
+    /// when the queue is empty, `max_running_requests` is reached, no request row is
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
         loop {
-            if self.running_request_count() >= self.config.max_num_seqs
+            if self.running_request_count() >= self.config.max_running_requests
                 || self.storage.request_pool.is_empty()
             {
                 break;
@@ -1094,11 +1094,11 @@ impl Scheduler {
                 };
 
                 // Units the first prefill chunk needs beyond the cached
-                // prefix. The chunk is bounded by `long_prefill_threshold`
+                // prefix. The chunk is bounded by `chunked_prefill_size`
                 // and `max_num_batched_tokens` and holds at least one token.
                 let chunk_limit = self
                     .config
-                    .long_prefill_threshold
+                    .chunked_prefill_size
                     .min(self.config.max_num_batched_tokens)
                     .max(1);
                 let cached_tokens = prefix_hit.cached_tokens.min(n);

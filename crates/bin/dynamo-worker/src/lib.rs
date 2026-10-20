@@ -9,8 +9,12 @@
 //!
 //! The Dynamo frontend forwards each `/v1/videos` request to
 //! `RawEngine::generate`, nesting unknown client fields under `extra_args`.
-//! The worker serves FastH3 text-to-video-and-audio at the canvases its
-//! `--video-resolutions` and `--video-aspect-ratios` prepare, as the started
+//! The worker takes `uniserve serve`'s options, `--config` file and `--set`
+//! included, and refuses before startup the ones it cannot honor: the HTTP
+//! server's, data and expert parallelism, condition media and asynchronous
+//! job storage, which a Dynamo `t2va` request never uses. It serves FastH3
+//! text-to-video-and-audio at the canvases its
+//! `video_config.resolutions` and `video_config.aspect_ratios` prepare, as the started
 //! deployment declares them, and refuses at startup a deployment that serves
 //! no `t2va`, such as a reference denoiser, or a canvas name its model does
 //! not generate: `prepare_request` maps the Dynamo request onto
@@ -20,8 +24,8 @@
 //! frontend at the pinned Dynamo revision answers it with a 400, while the
 //! 1.5.0 release answers every error of a video stream with a 500. The
 //! request then enters
-//! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
-//! route uses, and a successful request yields one terminal response object
+//! `Engine::generate_video`, the path the HTTP `/v1/videos` route uses, and a
+//! successful request yields one terminal response object
 //! carrying the single MP4 artifact.
 //! UniServe's own HTTP listener is never started.
 //!
@@ -40,13 +44,12 @@
 //! artifacts/dynamo/frontend-env/bin/python -m dynamo.frontend \
 //!   --http-host 127.0.0.1 --http-port 18090 \
 //!   --namespace uniserve-fasth3 --discovery-backend file &
-//! target/release/uniserve-dynamo-worker \
-//!   --namespace uniserve-fasth3 \
-//!   --model-path "$UNISERVE_FAST_H3_MODEL" --served-model-name FastH3 \
+//! target/release/uniserve-dynamo-worker "$UNISERVE_FAST_H3_MODEL" \
+//!   --namespace uniserve-fasth3 --served-model-name FastH3 \
 //!   --worker-python "$PWD/.venv/bin/python" \
-//!   --workers configs/minimax_h3/ulysses4.json \
-//!   --max-model-len 16384 --max-video-seconds 15 \
-//!   --max-running-requests 2 --quantization-config '{"mode":"quality"}' &
+//!   --workers configs/minimax_h3/ulysses4.toml \
+//!   --max-model-len 16384 --max-running-requests 2 \
+//!   --set video_config.max_seconds=15 --set quantization_config.mode=quality &
 //! # Once `curl -fsS http://127.0.0.1:18090/v1/models` lists FastH3:
 //! curl --fail-with-body --max-time 600 http://127.0.0.1:18090/v1/videos \
 //!   -H 'Content-Type: application/json' -d '{"model": "FastH3",
@@ -64,16 +67,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use clap::Parser;
 use dynamo_backend_common::{
-    AsyncEngineContext, BackendError, CommonArgs, DisaggregationMode, DynamoError, EngineConfig,
-    ErrorType, GenerateContext, ModelInput, RawEngine, WorkerConfig as DynamoWorkerConfig,
+    BackendError, CommonArgs, DisaggregationMode, DynamoError, EngineConfig, ErrorType,
+    GenerateContext, ModelInput, RawEngine, WorkerConfig as DynamoWorkerConfig,
 };
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -81,24 +83,35 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
-use uniserve_core::video::plan::MAX_VIDEO_SECONDS;
-use uniserve_core::{MediaKind, VideoTask};
-use uniserve_engine::{DEFAULT_MAX_BATCH, SchedulingPolicy, WorkerConfig, WorkerProcessArgs};
-use uniserve_server::{
-    AppState, Config, EngineSettings, HttpListenerMode, ModelDescription,
-    openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
-    serving::{
-        ServeRequestId,
-        video::artifact::{ArtifactCollector, VideoStreamError},
-    },
-};
+use uniserve_core::{Canvas, MediaKind, ServedCanvas, VideoTask};
+use uniserve_engine::VideoDenoiserInfo;
+use uniserve_server::Engine;
+use uniserve_server::openai::ApiError;
+use uniserve_server::options::{ServeArgs, ServeConfig, Stated, printed};
+use uniserve_server::profile::ModelDescription;
+use uniserve_server::profile::assets::PipelineCheckpoint;
+use uniserve_server::serving::video::artifact::ArtifactCollector;
+use uniserve_server::serving::video::{VideoGenerationRequest, VideoTarget};
 
-// The served canvases come from `--video-resolutions` and
-// `--video-aspect-ratios`, as for `uniserve serve`; the loaded checkpoint
-// determines the step count.
 /// The duration of a Dynamo request that omits `seconds`, at most the
 /// deployment's capacity.
 const DEFAULT_SECONDS: f64 = 5.0;
+
+/// Configuration paths of `uniserve serve` this worker cannot honor: it
+/// serves no HTTP API (so it neither listens nor logs HTTP requests), runs
+/// one replica without expert parallelism, receives requests without
+/// condition media and keeps no asynchronous jobs.
+const UNSUPPORTED_PATHS: [&str; 9] = [
+    "server_config",
+    "logging_config.log_requests",
+    "data_parallel_size",
+    "moe_config",
+    "placement_config.transfer",
+    "mm_processor_kwargs",
+    "video_config.max_condition_rows",
+    "media_config",
+    "video_job_config",
+];
 
 #[derive(Clone, Parser)]
 #[command(
@@ -109,68 +122,27 @@ struct Args {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Complete local FastH3 VSA checkpoint root.
-    #[arg(long)]
-    model_path: String,
-
-    #[arg(long, default_value = "FastH3")]
-    served_model_name: String,
-
-    #[arg(long, default_value_os_t = WorkerProcessArgs::default_python())]
-    worker_python: PathBuf,
-
-    /// JSON deployment configuration: the Worker instances, their node/device
-    /// ranks, and the FastH3 components placed on them, for example
-    /// `configs/minimax_h3/ulysses4.json`.
-    #[arg(long, value_name = "FILE", value_parser = WorkerConfig::read_all)]
-    workers: Box<[WorkerConfig]>,
-
-    /// This process's host identity. The engine owns exactly the placed ranks
-    /// whose node names it.
-    #[arg(long, default_value = "localhost")]
-    host_identity: String,
-
-    // These options mirror the `uniserve serve` flags of the same names and
-    // feed the engine configuration `build_state` assembles. The default
-    // prompt length is the one `uniserve serve` takes for a MiniMax-H3
-    // pipeline; the text encoder itself accepts more.
-    #[arg(long, default_value_t = 16_384, value_parser = clap::value_parser!(u32).range(1..))]
-    max_model_len: u32,
-
-    #[arg(long, default_value_t = MAX_VIDEO_SECONDS)]
-    max_video_seconds: f64,
-
-    #[arg(long, value_delimiter = ',', default_value = "768p")]
-    video_resolutions: Vec<String>,
-
-    #[arg(long, value_delimiter = ',', default_value = "16:9,9:16")]
-    video_aspect_ratios: Vec<String>,
-
-    #[arg(long, default_value_t = 2)]
-    max_running_requests: usize,
-
-    #[arg(
-        long,
-        default_value = r#"{}"#,
-        value_parser = WorkerProcessArgs::parse_quantization_config
-    )]
-    quantization_config: Value,
-
-    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
-    graph_policy: String,
+    // The serving command line of `uniserve serve`; `UNSUPPORTED_PATHS`
+    // lists the options this worker refuses.
+    #[command(flatten)]
+    serve: ServeArgs,
 }
 
 /// Dynamo `RawEngine` serving FastH3 video generation from an in-process
 /// UniServe engine.
 pub struct DynamoFastH3Engine {
-    args: Args,
-    /// What the started deployment generates, and at which rasters, set once
-    /// by `start` with `state`.
-    outputs: OnceCell<Outputs>,
-    /// The UniServe serving state, set once by `start`. Every other trait
-    /// method reads it and treats an unset state as not started.
-    state: OnceCell<Arc<AppState>>,
-    /// Cancelled by `cleanup`; every in-flight `generate` stream then aborts
+    /// The UniServe configuration the engine starts with.
+    config: ServeConfig,
+    /// The option paths the operator stated, against which startup refuses
+    /// options of another model family.
+    stated: Stated,
+    /// The single model name requests name and responses carry.
+    served_model_name: String,
+    /// The UniServe engine, set once by `start` after it verified that the
+    /// engine serves a `t2va` video denoiser. Every other trait method reads
+    /// it and treats an unset engine as not started.
+    state: OnceCell<Arc<Engine>>,
+    /// Cancelled by `cleanup`; every in-flight `generate` stream then drops
     /// its UniServe request and ends without a response.
     cancel: CancellationToken,
 }
@@ -179,15 +151,28 @@ impl DynamoFastH3Engine {
     /// Parses the process command line into an unstarted engine and the
     /// Dynamo worker registration that advertises it as a `videos` endpoint.
     ///
-    /// Clap exits the process on a malformed command line, including an
-    /// unreadable or invalid `--workers` deployment file. Settings this
-    /// worker cannot honor (disaggregation, encoder routing, RL routes, a
-    /// non-finite or non-positive video length, a zero request limit) return
-    /// an invalid-argument error. No rank starts until `RawEngine::start`,
-    /// whose workers refuse a video canvas selection the model does not
-    /// generate.
+    /// The serving options resolve as for `uniserve serve`: a `--config`
+    /// file, its flags and `--set` assignments. With `--print-config` the
+    /// resolved configuration is printed and the process exits. Clap exits
+    /// the process on a malformed command line. Settings this worker cannot
+    /// honor (disaggregation, encoder routing, RL routes, a path in
+    /// `UNSUPPORTED_PATHS`, a missing deployment file) and a configuration
+    /// that does not resolve or that `ServeConfig::validate` refuses
+    /// return an invalid-argument error. No rank starts until
+    /// `RawEngine::start`, whose workers refuse a video canvas selection the
+    /// model does not generate.
     pub fn from_args() -> Result<(Self, DynamoWorkerConfig), DynamoError> {
-        Self::try_from_args(<Args as Parser>::parse())
+        let args = <Args as Parser>::parse();
+        if args.serve.print_config {
+            let (config, _) = args
+                .serve
+                .resolve()
+                .map_err(|error| invalid_argument(format!("{error:#}")))?;
+            let printed = printed(&config).map_err(|error| invalid_argument(error.to_string()))?;
+            print!("{printed}");
+            std::process::exit(0);
+        }
+        Self::try_from_args(args)
     }
 
     fn try_from_args(args: Args) -> Result<(Self, DynamoWorkerConfig), DynamoError> {
@@ -202,17 +187,41 @@ impl DynamoFastH3Engine {
         if args.common.enable_rl {
             return Err(invalid_argument("RL engine routes are not supported"));
         }
-        if args.max_running_requests == 0 {
-            return Err(invalid_argument("max-running-requests must be positive"));
+
+        let (serve, stated) = args
+            .serve
+            .resolve()
+            .map_err(|error| invalid_argument(format!("{error:#}")))?;
+        if let Some(path) = UNSUPPORTED_PATHS
+            .iter()
+            .find(|path| stated.contains_within(path))
+        {
+            return Err(invalid_argument(format!(
+                "`{path}` is not supported by the Dynamo worker"
+            )));
+        }
+        if serve.workers.is_none() {
+            return Err(invalid_argument(
+                "`workers` is required: a deployment file places FastH3's components",
+            ));
         }
 
-        let config = DynamoWorkerConfig {
+        let mut config = serve;
+        config
+            .validate(&stated)
+            .map_err(|error| invalid_argument(format!("{error:#}")))?;
+        // The Dynamo request form carries no conditions, so the workers
+        // provision no condition rows.
+        config.video_config.max_condition_rows = Some(0);
+        let served_model_name = config.served_model_name().to_owned();
+
+        let registration = DynamoWorkerConfig {
             namespace: args.common.namespace.clone(),
             component: args.common.component.clone(),
             endpoint: args.common.endpoint.clone(),
             endpoint_types: "videos".to_string(),
-            model_name: args.served_model_name.clone(),
-            served_model_name: Some(args.served_model_name.clone()),
+            model_name: served_model_name.clone(),
+            served_model_name: Some(served_model_name.clone()),
             model_input: ModelInput::Text,
             custom_jinja_template: None,
             tool_call_parser: None,
@@ -227,104 +236,75 @@ impl DynamoFastH3Engine {
         };
         Ok((
             Self {
-                args,
-                outputs: OnceCell::new(),
+                config,
+                stated,
+                served_model_name,
                 state: OnceCell::new(),
                 cancel: CancellationToken::new(),
             },
-            config,
+            registration,
         ))
     }
 
     /// Starts UniServe's engine and worker ranks for the configured FastH3
-    /// checkpoint and returns the serving state with what it generates.
+    /// checkpoint.
     ///
     /// Fails with an invalid argument when the checkpoint's pipeline index
-    /// cannot be resolved or does not name MiniMax H3, when the configuration
-    /// does not validate, or when the started model reports no video
-    /// capabilities or not FastH3's. It fails with an engine error when
-    /// UniServe cannot start, including a canvas selection its workers
-    /// refuse. A refusal after startup shuts the engine down before
-    /// returning.
-    async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
+    /// cannot be resolved or does not name MiniMax H3, or when the started
+    /// deployment's video denoiser serves no `t2va`, such as a reference
+    /// denoiser. It fails with an engine error when UniServe cannot start,
+    /// including a canvas selection its workers refuse. A refusal after
+    /// startup shuts the engine down before returning.
+    async fn build_state(&self) -> Result<Arc<Engine>, DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
-        let pipeline =
-            uniserve_server::profile::assets::resolve_pipeline_index(&self.args.model_path)
-                .await
-                .map_err(|error| invalid_argument(error.to_string()))?;
-        if pipeline.and_then(|index| ModelDescription::from_pipeline_class(&index.class_name))
+        let pipeline = PipelineCheckpoint::resolve(self.config.model())
+            .await
+            .map_err(|error| invalid_argument(error.to_string()))?;
+        if pipeline
+            .and_then(|pipeline| ModelDescription::from_pipeline_class(pipeline.class_name()))
             != Some(ModelDescription::MiniMaxH3)
         {
             return Err(invalid_argument(
-                "model-path is not a FastH3 video-generation checkpoint",
+                "MODEL is not a FastH3 video-generation checkpoint",
             ));
         }
-        let worker_process = WorkerProcessArgs {
-            python: self.args.worker_python.clone(),
-            model: self.args.model_path.clone(),
-            host: self.args.host_identity.clone(),
-            quantization_config: self.args.quantization_config.clone(),
-            graph_policy: self.args.graph_policy.clone(),
-            ..WorkerProcessArgs::default()
-        };
 
-        // Only `uniserve_server::http` binds `listener_mode`, and this worker
-        // never serves UniServe's HTTP API; a loopback ephemeral address
-        // satisfies `Config::validate`.
-        let config = Config {
-            engine: EngineSettings {
-                max_batch: DEFAULT_MAX_BATCH,
-                max_num_batched_tokens: None,
-                max_num_seqs: self.args.max_running_requests,
-                max_num_waiting: None,
-                long_prefill_threshold: None,
-                prefix_reuse: true,
-                scheduler_policy: SchedulingPolicy::Fcfs,
-                max_model_len: Some(self.args.max_model_len),
-                max_video_seconds: self.args.max_video_seconds,
-                video_resolutions: self.args.video_resolutions.clone(),
-                video_aspect_ratios: self.args.video_aspect_ratios.clone(),
-                // The Dynamo request form carries no conditions, so the
-                // worker provisions no condition rows.
-                max_condition_rows: Some(0),
-                workers: self.args.workers.to_vec(),
-                transfer: Default::default(),
-                data_parallel_size: 1,
-                expert_parallel: None,
-                worker_process,
-            },
-            model: self.args.model_path.clone(),
-            served_model_name: Some(self.args.served_model_name.clone()),
-            listener_mode: HttpListenerMode::BindTcp {
-                host: "127.0.0.1".to_string(),
-                port: 0,
-            },
-            log_stats: true,
-            ..Config::default()
-        };
-        config
-            .validate()
-            .map_err(|error| invalid_argument(error.to_string()))?;
-        let state = uniserve_server::build_state(&config)
-            .await
-            .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
+        // Only `uniserve_server::http` binds the configuration's listener, and
+        // this worker never serves UniServe's HTTP API.
+        let state = Arc::new(
+            Engine::start(&self.config, &self.stated)
+                .await
+                .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?,
+        );
 
-        // Use the same checkpoint-derived schedule as the HTTP serving path.
-        // A request may confirm that schedule, but cannot override it.
-        let capabilities = state.runtime().model().video_capabilities();
-        if capabilities.is_null() {
-            let _ = state.engine().shutdown().await;
-            return Err(invalid_argument("checkpoint is not MiniMax H3"));
+        // The worker sends only `t2va` requests. The engine validated the
+        // denoiser's handshake, which declares positive frame and audio rates
+        // and at least one served canvas.
+        let tasks = state
+            .video_denoiser()
+            .map(|denoiser| denoiser.tasks.clone())
+            .unwrap_or_default();
+        if !tasks.iter().any(|task| task == VideoTask::T2va.as_str()) {
+            let _ = state.shutdown().await;
+            return Err(invalid_argument(format!(
+                "the Dynamo worker sends text-to-video requests; this deployment serves tasks {tasks:?}"
+            )));
         }
-        let outputs = match check_text_to_video(&capabilities) {
-            Ok(outputs) => outputs,
-            Err(mismatch) => {
-                let _ = state.engine().shutdown().await;
-                return Err(invalid_argument(mismatch.to_string()));
-            }
-        };
-        Ok((state, outputs))
+        Ok(state)
+    }
+
+    /// The started engine and the video denoiser it serves.
+    fn started(&self, call: &str) -> Result<(&Arc<Engine>, &VideoDenoiserInfo), DynamoError> {
+        let engine = self
+            .state
+            .get()
+            .ok_or_else(|| engine_error(format!("{call} called before start")))?;
+        // `start` sets only an engine that serves a video denoiser.
+        let denoiser = engine
+            .video_denoiser()
+            .ok_or_else(|| engine_error("the started engine serves no video denoiser"))?;
+        Ok((engine, denoiser))
     }
 }
 
@@ -336,17 +316,15 @@ impl RawEngine for DynamoFastH3Engine {
         if self.state.initialized() {
             return Err(engine_error("UniServe engine already started"));
         }
-        let (state, outputs) = self.build_state().await?;
-        let runtime_data = runtime_data(self.args.max_video_seconds, &outputs);
+        let state = self.build_state().await?;
         self.state
             .set(state)
             .map_err(|_| engine_error("UniServe engine already started"))?;
-        self.outputs
-            .set(outputs)
-            .map_err(|_| engine_error("UniServe engine already started"))?;
+        let (_, denoiser) = self.started("start")?;
+        let runtime_data = runtime_data(self.config.video_config.max_seconds, denoiser);
         Ok(EngineConfig {
-            model: self.args.served_model_name.clone(),
-            served_model_name: Some(self.args.served_model_name.clone()),
+            model: self.served_model_name.clone(),
+            served_model_name: Some(self.served_model_name.clone()),
             runtime_data,
             llm: None,
             ..Default::default()
@@ -358,15 +336,7 @@ impl RawEngine for DynamoFastH3Engine {
         request: Value,
         ctx: GenerateContext,
     ) -> Result<BoxStream<'static, Result<Value, DynamoError>>, DynamoError> {
-        let state = Arc::clone(
-            self.state
-                .get()
-                .ok_or_else(|| engine_error("generate called before start"))?,
-        );
-        let outputs = self
-            .outputs
-            .get()
-            .ok_or_else(|| engine_error("generate called before start"))?;
+        let (state, denoiser) = self.started("generate")?;
         // A refusal of this request is the stream's only item. Dynamo's
         // router reads an error returned before the stream as a worker that
         // cannot serve: it answers 500 and takes the instance out of routing
@@ -376,24 +346,23 @@ impl RawEngine for DynamoFastH3Engine {
         // `generate` before the stream.
         let prepared = match prepare_request(
             request,
-            &self.args.served_model_name,
-            self.args.max_video_seconds,
-            &outputs.rasters,
+            &self.served_model_name,
+            self.config.video_config.max_seconds,
+            &denoiser.canvases,
         ) {
             Ok(prepared) => prepared,
             Err(error) => return Ok(refusal(error)),
         };
-        // The Dynamo context id is the UniServe request id, so `abort` can name
-        // the same request from its own context.
-        let request_id = ServeRequestId::new(ctx.id().to_string());
+        // The Dynamo context id names the request in UniServe's logs and the
+        // response.
+        let request_id = ctx.id().to_string();
 
-        // The serving runtime owns the request lifecycle the HTTP video route
-        // uses: identity registration, prompt preprocessing, submission and
-        // terminal accounting.
+        // The engine runs the path the HTTP video route uses: prompt
+        // preprocessing, submission and request accounting.
         let (_, mut events) = match state
-            .runtime()
             .generate_video(request_id.clone(), prepared.request)
             .await
+            .map_err(ApiError::from)
         {
             Ok(started) => started,
             // The video service refused the request, for example a duration
@@ -404,14 +373,14 @@ impl RawEngine for DynamoFastH3Engine {
             Err(error) => return Err(api_error(error)),
         };
         let cancel = self.cancel.clone();
-        let served_model_name = self.args.served_model_name.clone();
+        let served_model_name = self.served_model_name.clone();
         let response_format = prepared.response_format;
-        let outputs = outputs.clone();
+        let denoiser = denoiser.clone();
 
         // Unless stopped, the stream yields exactly one item: the response
         // object, or the error that ended the request. A Dynamo stop or
-        // `cleanup` instead aborts the UniServe request and ends the stream
-        // without an item; abort failures are ignored.
+        // `cleanup` instead ends the stream without an item, and dropping the
+        // UniServe stream with it cancels the request in its engine core.
         Ok(Box::pin(async_stream::stream! {
             let started_at = Instant::now();
             let mut collector = ArtifactCollector::default();
@@ -420,19 +389,13 @@ impl RawEngine for DynamoFastH3Engine {
                 // take precedence over an event that is ready at the same time.
                 let event = tokio::select! {
                     biased;
-                    _ = ctx.stopped() => {
-                        let _ = state.runtime().abort(request_id.clone()).await;
-                        return;
-                    }
-                    _ = cancel.cancelled() => {
-                        let _ = state.runtime().abort(request_id.clone()).await;
-                        return;
-                    }
+                    _ = ctx.stopped() => return,
+                    _ = cancel.cancelled() => return,
                     event = events.next() => event,
                 };
                 let event = match event {
                     Some(Err(error)) => {
-                        yield Err(api_error(serve_error_to_api(error)));
+                        yield Err(api_error(ApiError::from(error)));
                         return;
                     }
                     Some(Ok(event)) => Some(event),
@@ -442,7 +405,7 @@ impl RawEngine for DynamoFastH3Engine {
                     match outcome {
                         Ok(artifact) => break artifact,
                         Err(error) => {
-                            yield Err(stream_error(error));
+                            yield Err(api_error(ApiError::from(error)));
                             return;
                         }
                     }
@@ -460,26 +423,16 @@ impl RawEngine for DynamoFastH3Engine {
                 &served_model_name,
                 response_format,
                 artifact.media.as_bytes(),
-                &outputs,
+                &denoiser,
                 started_at.elapsed(),
             ));
         }))
-    }
-
-    async fn abort(&self, ctx: Arc<dyn AsyncEngineContext>) {
-        if let Some(state) = self.state.get() {
-            let _ = state
-                .runtime()
-                .abort(ServeRequestId::new(ctx.id().to_string()))
-                .await;
-        }
     }
 
     async fn cleanup(&self) -> Result<(), DynamoError> {
         self.cancel.cancel();
         if let Some(state) = self.state.get() {
             state
-                .engine()
                 .shutdown()
                 .await
                 .map_err(|error| engine_error(format!("UniServe shutdown failed: {error}")))?;
@@ -565,9 +518,9 @@ struct PreparedRequest {
 /// Maps a Dynamo video request onto a `t2va` `VideoGenerationRequest` whose
 /// target is the selected raster and the request's duration.
 ///
-/// The raster is selected by `size` (`WIDTHxHEIGHT`, one of the served
-/// rasters), by the passthrough `resolution` (`768p`) and `aspect_ratio`
-/// fields, or by both when they name the same raster; omitted, it is the
+/// The canvas is selected by `size` (`WIDTHxHEIGHT`, one of the served
+/// canvases), by the passthrough `resolution` (`768p`) and `aspect_ratio`
+/// fields, or by both when they name the same canvas; omitted, it is the
 /// deployment's default, the first it declares. Its resolution class names
 /// the target's short edge.
 /// Omitted fields default to seed 0, a `url` response, and 5 seconds, capped
@@ -578,7 +531,7 @@ fn prepare_request(
     value: Value,
     served_model_name: &str,
     max_video_seconds: f64,
-    rasters: &Rasters,
+    canvases: &[ServedCanvas],
 ) -> Result<PreparedRequest, DynamoError> {
     let request: DynamoVideoRequest = serde_json::from_value(value)
         .map_err(|error| invalid_argument(format!("invalid video request: {error}")))?;
@@ -603,35 +556,38 @@ fn prepare_request(
     {
         return Err(invalid_argument("output_format must be mp4"));
     }
-    let (mut short_edge, mut aspect_ratio) = passthrough_raster(request.extra_args)?;
+    let (mut short_edge, mut aspect_ratio) = passthrough_canvas(request.extra_args)?;
     if let Some(size) = request.size.as_deref() {
-        let raster = size
+        let served = size
             .split_once('x')
             .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
-            .and_then(|(width, height)| rasters.find_size(width, height))
+            .and_then(|(width, height)| {
+                canvases
+                    .iter()
+                    .find(|served| served.canvas == Canvas { width, height })
+            })
             .ok_or_else(|| {
                 invalid_argument(format!(
                     "size must be one of {}",
-                    rasters.sizes().join(", ")
+                    sizes(canvases).join(", ")
                 ))
             })?;
-        if short_edge.is_some_and(|value| value != raster.short_edge)
+        if short_edge.is_some_and(|value| value != served.short_edge)
             || aspect_ratio
                 .as_deref()
-                .is_some_and(|value| value != raster.aspect_ratio)
+                .is_some_and(|value| value != served.aspect_ratio)
         {
             return Err(invalid_argument(format!(
                 "size {size} conflicts with resolution or aspect_ratio"
             )));
         }
-        short_edge = Some(raster.short_edge);
-        aspect_ratio = Some(raster.aspect_ratio.clone());
+        short_edge = Some(served.short_edge);
+        aspect_ratio = Some(served.aspect_ratio.clone());
     }
-    // Refuse an unprovisioned raster here; the video service refuses it
+    // Refuse an unprovisioned canvas here; the video service refuses it
     // again when it plans the target.
-    let raster = rasters
-        .select(short_edge, aspect_ratio.as_deref())
-        .map_err(invalid_argument)?;
+    let served =
+        select_canvas(canvases, short_edge, aspect_ratio.as_deref()).map_err(invalid_argument)?;
 
     // `seconds` is an integer in Dynamo's API; the video service refuses one
     // outside the deployment's duration range when it plans the target.
@@ -663,8 +619,8 @@ fn prepare_request(
             task: VideoTask::T2va,
             conditions: Vec::new(),
             target: VideoTarget {
-                short_edge: raster.short_edge,
-                aspect_ratio: raster.aspect_ratio.clone(),
+                short_edge: served.short_edge,
+                aspect_ratio: served.aspect_ratio.clone(),
                 duration_seconds: Some(seconds),
             },
             seed,
@@ -673,215 +629,75 @@ fn prepare_request(
     })
 }
 
-/// What a started deployment generates, as its video capabilities report it.
-#[derive(Debug, Clone, PartialEq)]
-struct Outputs {
-    /// Frames per second of every generated video (`fps`).
-    frame_rate: u32,
-    /// Sample rate, in Hz, of the audio muxed into each video
-    /// (`audio_sample_rate`).
-    audio_sample_rate: u32,
-    /// The rasters the deployment serves (`canvas.canvases`).
-    rasters: Rasters,
+/// Selects a served canvas; an omitted field takes the default's, the first
+/// canvas the deployment names.
+///
+/// # Errors
+///
+/// Returns a message naming the served values when the deployment does not
+/// serve the requested resolution, aspect ratio or their pair.
+fn select_canvas<'a>(
+    canvases: &'a [ServedCanvas],
+    short_edge: Option<u32>,
+    aspect_ratio: Option<&str>,
+) -> Result<&'a ServedCanvas, String> {
+    // The validated handshake serves at least one canvas.
+    let default = &canvases[0];
+    let short_edge = short_edge.unwrap_or(default.short_edge);
+    let aspect_ratio = aspect_ratio.unwrap_or(&default.aspect_ratio);
+    if !canvases
+        .iter()
+        .any(|served| served.short_edge == short_edge)
+    {
+        return Err(format!(
+            "resolution must be one of {}",
+            resolutions(canvases).join(", ")
+        ));
+    }
+    if !canvases
+        .iter()
+        .any(|served| served.aspect_ratio == aspect_ratio)
+    {
+        return Err(format!(
+            "aspect_ratio must be one of {}",
+            aspect_ratios(canvases).join(", ")
+        ));
+    }
+    canvases
+        .iter()
+        .find(|served| served.short_edge == short_edge && served.aspect_ratio == aspect_ratio)
+        .ok_or_else(|| format!("no canvas is served for {short_edge}p {aspect_ratio}"))
 }
 
-/// A raster the deployment serves and the request fields that select it.
-#[derive(Debug, Clone, PartialEq)]
-struct Raster {
-    /// The resolution class's short edge in pixels, `target.short_edge`.
-    short_edge: u32,
-    /// The display aspect ratio as `W:H`, `target.aspect_ratio`.
-    aspect_ratio: String,
-    width: u32,
-    height: u32,
+/// Served canvases as `WIDTHxHEIGHT`, the default first.
+fn sizes(canvases: &[ServedCanvas]) -> Vec<String> {
+    canvases
+        .iter()
+        .map(|served| format!("{}x{}", served.canvas.width, served.canvas.height))
+        .collect()
 }
 
-/// The rasters a deployment serves, as its capabilities report them, in the
-/// order the deployment names them: every prepared resolution class crossed
-/// with every prepared aspect ratio. The first is the default of a request
-/// that names neither a resolution nor an aspect ratio.
-#[derive(Debug, Clone, PartialEq)]
-struct Rasters(Vec<Raster>);
-
-impl Rasters {
-    /// Reads the served rasters from `canvas.canvases` of the capabilities.
-    fn from_capabilities(capabilities: &Value) -> Result<Self, DeploymentMismatch> {
-        let canvases = &capabilities["canvas"]["canvases"];
-        let unreadable = || DeploymentMismatch::Canvases(canvases.to_string());
-        let count = |value: &Value| {
-            value
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|&value| value > 0)
-        };
-        let rasters = canvases
-            .as_array()
-            .ok_or_else(unreadable)?
-            .iter()
-            .map(|canvas| {
-                Some(Raster {
-                    short_edge: count(&canvas["short_edge"])?,
-                    aspect_ratio: canvas["aspect_ratio"].as_str()?.to_owned(),
-                    width: count(&canvas["width"])?,
-                    height: count(&canvas["height"])?,
-                })
-            })
-            .collect::<Option<Vec<_>>>()
-            .filter(|rasters| !rasters.is_empty())
-            .ok_or_else(unreadable)?;
-        Ok(Self(rasters))
-    }
-
-    /// Selects a served raster; an omitted field takes the default's.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the served values when the deployment does
-    /// not serve the requested resolution, aspect ratio or their pair.
-    fn select(
-        &self,
-        short_edge: Option<u32>,
-        aspect_ratio: Option<&str>,
-    ) -> Result<&Raster, String> {
-        // `from_capabilities` admits no empty set, so there is a default.
-        let default = &self.0[0];
-        let short_edge = short_edge.unwrap_or(default.short_edge);
-        let aspect_ratio = aspect_ratio.unwrap_or(&default.aspect_ratio);
-        if !self.0.iter().any(|raster| raster.short_edge == short_edge) {
-            return Err(format!(
-                "resolution must be one of {}",
-                self.resolutions().join(", ")
-            ));
+/// Served resolution classes, as `768p`, the default first.
+fn resolutions(canvases: &[ServedCanvas]) -> Vec<String> {
+    let mut classes: Vec<String> = Vec::new();
+    for served in canvases {
+        let class = format!("{}p", served.short_edge);
+        if !classes.contains(&class) {
+            classes.push(class);
         }
-        if !self
-            .0
-            .iter()
-            .any(|raster| raster.aspect_ratio == aspect_ratio)
-        {
-            return Err(format!(
-                "aspect_ratio must be one of {}",
-                self.aspect_ratios().join(", ")
-            ));
-        }
-        self.0
-            .iter()
-            .find(|raster| raster.short_edge == short_edge && raster.aspect_ratio == aspect_ratio)
-            .ok_or_else(|| format!("no canvas is served for {short_edge}p {aspect_ratio}"))
     }
-
-    /// Returns the served raster with exactly these pixel dimensions.
-    fn find_size(&self, width: u32, height: u32) -> Option<&Raster> {
-        self.0
-            .iter()
-            .find(|raster| raster.width == width && raster.height == height)
-    }
-
-    /// Served rasters as `WIDTHxHEIGHT`, the default first.
-    fn sizes(&self) -> Vec<String> {
-        self.0
-            .iter()
-            .map(|raster| format!("{}x{}", raster.width, raster.height))
-            .collect()
-    }
-
-    /// Served resolution classes, as `768p`, the default first.
-    fn resolutions(&self) -> Vec<String> {
-        let mut classes: Vec<String> = Vec::new();
-        for raster in &self.0 {
-            let class = format!("{}p", raster.short_edge);
-            if !classes.contains(&class) {
-                classes.push(class);
-            }
-        }
-        classes
-    }
-
-    /// Served aspect ratios, the default first.
-    fn aspect_ratios(&self) -> Vec<String> {
-        let mut ratios: Vec<String> = Vec::new();
-        for raster in &self.0 {
-            if !ratios.contains(&raster.aspect_ratio) {
-                ratios.push(raster.aspect_ratio.clone());
-            }
-        }
-        ratios
-    }
+    classes
 }
 
-/// A deployment whose video capabilities are not the FastH3 contract.
-#[derive(Debug, thiserror::Error)]
-enum DeploymentMismatch {
-    /// No text-to-video task, the requests the worker sends.
-    #[error("the Dynamo worker sends text-to-video requests; this deployment serves tasks {0}")]
-    Tasks(
-        /// The deployment's `tasks` capability, as JSON.
-        String,
-    ),
-    /// Capabilities without a readable served canvas.
-    #[error("the deployment reports no readable canvas: {0}")]
-    Canvases(
-        /// The deployment's `canvas.canvases` capability, as JSON.
-        String,
-    ),
-    /// Capabilities without a rate of the generated media.
-    #[error("the deployment reports no output {name}: {value}")]
-    Rate {
-        /// The capability, `fps` or `audio_sample_rate`.
-        name: &'static str,
-        /// Its reported value, as JSON.
-        value: String,
-    },
-}
-
-/// Checks that a deployment's video capabilities include `t2va`, the
-/// requests `prepare_request` builds. Returns what the deployment generates
-/// and the rasters it serves.
-fn check_text_to_video(capabilities: &Value) -> Result<Outputs, DeploymentMismatch> {
-    let tasks = &capabilities["tasks"];
-    let serves_t2va = tasks
-        .as_array()
-        .is_some_and(|tasks| tasks.iter().any(|task| task == "t2va"));
-    if !serves_t2va {
-        return Err(DeploymentMismatch::Tasks(tasks.to_string()));
+/// Served aspect ratios, the default first.
+fn aspect_ratios(canvases: &[ServedCanvas]) -> Vec<String> {
+    let mut ratios: Vec<String> = Vec::new();
+    for served in canvases {
+        if !ratios.contains(&served.aspect_ratio) {
+            ratios.push(served.aspect_ratio.clone());
+        }
     }
-    // A rate is a positive count of the deployment's own.
-    let rate = |name: &'static str| {
-        let value = &capabilities[name];
-        value
-            .as_u64()
-            .and_then(|rate| u32::try_from(rate).ok())
-            .filter(|&rate| rate > 0)
-            .ok_or_else(|| DeploymentMismatch::Rate {
-                name,
-                value: value.to_string(),
-            })
-    };
-    Ok(Outputs {
-        frame_rate: rate("fps")?,
-        audio_sample_rate: rate("audio_sample_rate")?,
-        rasters: Rasters::from_capabilities(capabilities)?,
-    })
-}
-
-/// Maps a video stream that ended without an artifact to Dynamo's error type.
-fn stream_error(error: VideoStreamError) -> DynamoError {
-    match error {
-        VideoStreamError::Rejected { kind, message } => {
-            api_error(uniserve_server::openai::ApiError::rejected(kind, message))
-        }
-        VideoStreamError::Failed { message } => engine_error(message),
-        VideoStreamError::Ended { reason } => engine_error(format!(
-            "video generation ended without an artifact: {reason:?}"
-        )),
-        VideoStreamError::MissingArtifact => engine_error("UniServe produced no media artifact"),
-        VideoStreamError::MultipleArtifacts => {
-            engine_error("UniServe produced multiple media artifacts")
-        }
-        VideoStreamError::Cancelled | VideoStreamError::Incompatible => {
-            engine_error("UniServe emitted an incompatible event")
-        }
-        VideoStreamError::Closed => engine_error("UniServe generation stream stopped"),
-    }
+    ratios
 }
 
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
@@ -898,14 +714,14 @@ fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> 
 ///
 /// The MP4 is embedded in the response: `Url` returns it as a `data:` URL and
 /// `B64Json` as bare base64. `fps` and `audio_sample_rate` report the rates
-/// the deployment declares for its video and audio, not values read from the
-/// artifact.
+/// the deployment's denoiser declares for its video and audio, not values
+/// read from the artifact.
 fn video_response(
     id: &str,
     model: &str,
     response_format: ResponseFormat,
     media: &[u8],
-    outputs: &Outputs,
+    denoiser: &VideoDenoiserInfo,
     elapsed: Duration,
 ) -> Value {
     let encoded = base64::engine::general_purpose::STANDARD.encode(media);
@@ -919,13 +735,13 @@ fn video_response(
         "model": model,
         "status": "completed",
         "progress": 100,
-        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+        "created": uniserve_core::now_unix_secs_u64() as i64,
         "data": [{
             "output_format": "mp4",
             "url": url,
             "b64_json": b64_json,
-            "fps": outputs.frame_rate,
-            "audio_sample_rate": outputs.audio_sample_rate,
+            "fps": denoiser.frame_rate,
+            "audio_sample_rate": denoiser.audio_sample_rate,
         }],
         "inference_time_s": elapsed.as_secs_f64(),
     })
@@ -933,7 +749,7 @@ fn video_response(
 
 /// Reads `resolution` and `aspect_ratio` from the frontend's
 /// `extra_args["media_passthrough"]`, refusing every other extra argument.
-fn passthrough_raster(
+fn passthrough_canvas(
     extra_args: Option<Map<String, Value>>,
 ) -> Result<(Option<u32>, Option<String>), DynamoError> {
     let mut extra_args = extra_args.unwrap_or_default();
@@ -974,24 +790,24 @@ fn passthrough_raster(
 }
 
 /// Registration metadata Dynamo copies into the model's runtime config.
-fn runtime_data(max_video_seconds: f64, outputs: &Outputs) -> HashMap<String, Value> {
-    let rasters = &outputs.rasters;
-    let default = rasters.select(None, None).ok();
+fn runtime_data(max_video_seconds: f64, denoiser: &VideoDenoiserInfo) -> HashMap<String, Value> {
+    let canvases = &denoiser.canvases;
+    let default = select_canvas(canvases, None, None).ok();
     BTreeMap::from([
         ("backend".to_string(), json!("uniserve-inprocess")),
         ("task".to_string(), json!("t2va")),
-        ("fps".to_string(), json!(outputs.frame_rate)),
+        ("fps".to_string(), json!(denoiser.frame_rate)),
         (
             "width".to_string(),
-            json!(default.map(|raster| raster.width)),
+            json!(default.map(|served| served.canvas.width)),
         ),
         (
             "height".to_string(),
-            json!(default.map(|raster| raster.height)),
+            json!(default.map(|served| served.canvas.height)),
         ),
-        ("sizes".to_string(), json!(rasters.sizes())),
-        ("resolutions".to_string(), json!(rasters.resolutions())),
-        ("aspect_ratios".to_string(), json!(rasters.aspect_ratios())),
+        ("sizes".to_string(), json!(sizes(canvases))),
+        ("resolutions".to_string(), json!(resolutions(canvases))),
+        ("aspect_ratios".to_string(), json!(aspect_ratios(canvases))),
         ("max_video_seconds".to_string(), json!(max_video_seconds)),
     ])
     .into_iter()
@@ -1000,7 +816,7 @@ fn runtime_data(max_video_seconds: f64, outputs: &Outputs) -> HashMap<String, Va
 
 /// Maps a UniServe API error to Dynamo's error type: a 4xx status becomes an
 /// invalid argument and any other status an unknown backend error.
-fn api_error(error: uniserve_server::openai::ApiError) -> DynamoError {
+fn api_error(error: ApiError) -> DynamoError {
     let kind = if error.status_code().is_client_error() {
         BackendError::InvalidArgument
     } else {
@@ -1033,6 +849,71 @@ fn dynamo_error(kind: BackendError, message: impl Into<String>) -> DynamoError {
 mod tests {
     use super::*;
 
+    /// Parses a worker command line as `from_args` does.
+    fn parsed(flags: &[&str]) -> Result<(DynamoFastH3Engine, DynamoWorkerConfig), DynamoError> {
+        let args = Args::try_parse_from(["uniserve-dynamo-worker"].iter().chain(flags))
+            .expect("the command line parses");
+        DynamoFastH3Engine::try_from_args(args)
+    }
+
+    /// The worker takes `uniserve serve`'s options and refuses, by path,
+    /// those a Dynamo `t2va` worker cannot honor, and a missing deployment.
+    #[test]
+    fn serve_options_configure_the_worker_and_unsupported_ones_are_refused() {
+        let deployment = std::env::temp_dir().join(format!(
+            "uniserve-dynamo-deployment-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &deployment,
+            "[[workers]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 6\n\
+             [workers.components.transformer]\n",
+        )
+        .unwrap();
+        let workers = deployment.to_str().unwrap();
+
+        let (_engine, registration) = parsed(&[
+            "/models/FastH3",
+            "--workers",
+            workers,
+            "--served-model-name",
+            "FastH3",
+            "--set",
+            "video_config.max_seconds=5",
+        ])
+        .unwrap();
+        assert_eq!(registration.model_name, "FastH3");
+
+        for flags in [
+            vec!["/models/FastH3", "--workers", workers, "--port", "9000"],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--data-parallel-size",
+                "2",
+            ],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--set",
+                "video_config.max_condition_rows=4",
+            ],
+            vec![
+                "/models/FastH3",
+                "--workers",
+                workers,
+                "--set",
+                "media_config.allow_remote=false",
+            ],
+            vec!["/models/FastH3"],
+        ] {
+            let error = parsed(&flags).err().expect("refused");
+            assert!(error.to_string().contains('`'), "{flags:?}: {error}");
+        }
+    }
+
     fn request() -> Value {
         json!({
             "model": "FastH3",
@@ -1043,64 +924,46 @@ mod tests {
         })
     }
 
-    /// A served canvas as the capabilities report it.
-    fn canvas(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> Value {
-        json!({
-            "short_edge": short_edge,
-            "aspect_ratio": aspect_ratio,
-            "width": width,
-            "height": height,
-        })
+    /// A served canvas, named by its resolution class and aspect ratio.
+    fn canvas(short_edge: u32, aspect_ratio: &str, width: u32, height: u32) -> ServedCanvas {
+        ServedCanvas {
+            short_edge,
+            aspect_ratio: aspect_ratio.to_owned(),
+            canvas: Canvas { width, height },
+        }
     }
 
-    fn capabilities(tasks: Value, canvases: Value) -> Value {
-        json!({
-            "tasks": tasks,
-            "canvas": {"canvases": canvases},
-            "fps": 24,
-            "audio_sample_rate": 32_000,
-        })
+    /// A 24 fps text-to-video denoiser with 32 kHz audio serving `canvases`.
+    fn denoiser(canvases: Vec<ServedCanvas>) -> VideoDenoiserInfo {
+        VideoDenoiserInfo {
+            tasks: vec!["t2va".to_owned(), "fl2va".to_owned()],
+            schedule_points: 9,
+            video_shift: 5.0,
+            audio_shift: 5.0,
+            frame_rate: 24,
+            audio_sample_rate: 32_000,
+            frames: uniserve_core::FrameClips {
+                min_frames: 4,
+                clip_frames: 120,
+                clip_latent_frames: 15,
+                tail_latent_frames: 1,
+            },
+            canvases,
+            references: uniserve_core::ReferenceLimits::default(),
+        }
     }
 
-    /// What the default 24 fps deployment generates: 768p 16:9 and 9:16.
-    fn outputs() -> Outputs {
-        let served = json!([
+    /// The default deployment's canvases: 768p 16:9 and 9:16.
+    fn served() -> Vec<ServedCanvas> {
+        vec![
             canvas(768, "16:9", 1344, 768),
             canvas(768, "9:16", 768, 1344),
-        ]);
-        check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), served))
-            .unwrap_or_else(|error| panic!("the default deployment was refused: {error}"))
-    }
-
-    #[test]
-    fn only_text_to_video_deployments_are_served() {
-        let outputs = outputs();
-        assert_eq!(
-            (outputs.frame_rate, outputs.audio_sample_rate),
-            (24, 32_000)
-        );
-        // The served rasters keep the order the deployment names them.
-        assert_eq!(outputs.rasters.sizes(), ["1344x768", "768x1344"]);
-        let served = json!([canvas(768, "16:9", 1344, 768)]);
-        // A deployment that reports no frame or audio rate is refused.
-        for rate in ["fps", "audio_sample_rate"] {
-            let mut silent = capabilities(json!(["t2va"]), served.clone());
-            silent[rate] = json!(0);
-            assert!(check_text_to_video(&silent).is_err(), "{rate}");
-        }
-        // A deployment without a readable named canvas is refused.
-        for canvases in [json!([]), json!([{"width": 1344, "height": 768}])] {
-            assert!(
-                check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), canvases)).is_err()
-            );
-        }
-        // A reference denoiser generates no video from text alone.
-        assert!(check_text_to_video(&capabilities(json!(["ref2va"]), served)).is_err());
+        ]
     }
 
     #[test]
     fn request_maps_to_uniserve_contract() {
-        let prepared = match prepare_request(request(), "FastH3", 15.0, &outputs().rasters) {
+        let prepared = match prepare_request(request(), "FastH3", 15.0, &served()) {
             Ok(prepared) => prepared,
             Err(error) => panic!("supported request was rejected: {error}"),
         };
@@ -1116,15 +979,13 @@ mod tests {
     #[test]
     fn size_or_passthrough_fields_select_the_target() {
         // 768p and 480p, each at 16:9 and 21:9.
-        let served = json!([
+        let denoiser = denoiser(vec![
             canvas(768, "16:9", 1344, 768),
             canvas(768, "21:9", 1536, 672),
             canvas(480, "16:9", 832, 480),
             canvas(480, "21:9", 992, 416),
         ]);
-        let outputs = check_text_to_video(&capabilities(json!(["t2va", "fl2va"]), served))
-            .unwrap_or_else(|error| panic!("trained canvases were refused: {error}"));
-        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &outputs.rasters);
+        let prepare = |request: Value| prepare_request(request, "FastH3", 15.0, &denoiser.canvases);
         for (size, short_edge, aspect_ratio) in
             [("1344x768", 768, "16:9"), ("992x416", 480, "21:9")]
         {
@@ -1166,7 +1027,7 @@ mod tests {
         ] {
             assert!(prepare(request).is_err());
         }
-        let runtime = runtime_data(15.0, &outputs);
+        let runtime = runtime_data(15.0, &denoiser);
         assert_eq!(runtime["fps"], 24);
         assert_eq!(runtime["width"], 1344);
         assert_eq!(runtime["height"], 768);
@@ -1182,11 +1043,10 @@ mod tests {
     fn an_omitted_duration_defaults_to_five_seconds() {
         for (max_video_seconds, expected) in [(15.0, 5.0), (4.5, 4.5)] {
             let request = json!({"model": "FastH3", "prompt": "A stream in a forest"});
-            let prepared =
-                match prepare_request(request, "FastH3", max_video_seconds, &outputs().rasters) {
-                    Ok(prepared) => prepared,
-                    Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
-                };
+            let prepared = match prepare_request(request, "FastH3", max_video_seconds, &served()) {
+                Ok(prepared) => prepared,
+                Err(error) => panic!("max {max_video_seconds}s refused the default: {error}"),
+            };
             assert_eq!(prepared.request.target.duration_seconds, Some(expected));
         }
     }
@@ -1204,7 +1064,7 @@ mod tests {
             json!({"model":"FastH3", "prompt":"x", "nvext":{"num_inference_steps":4}}),
             json!({"model":"FastH3", "prompt":"x", "extra_args":{"media_passthrough":{"foo":1}}}),
         ] {
-            assert!(prepare_request(request, "FastH3", 15.0, &outputs().rasters).is_err());
+            assert!(prepare_request(request, "FastH3", 15.0, &served()).is_err());
         }
     }
 
@@ -1215,7 +1075,7 @@ mod tests {
             "FastH3",
             ResponseFormat::B64Json,
             b"mp4",
-            &outputs(),
+            &denoiser(served()),
             Duration::from_millis(1_500),
         );
         assert_eq!(response["data"][0]["b64_json"], "bXA0");
@@ -1229,7 +1089,7 @@ mod tests {
             "FastH3",
             ResponseFormat::Url,
             b"mp4",
-            &outputs(),
+            &denoiser(served()),
             Duration::ZERO,
         );
         assert_eq!(response["data"][0]["url"], "data:video/mp4;base64,bXA0");

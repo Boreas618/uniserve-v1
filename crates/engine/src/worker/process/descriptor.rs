@@ -1,5 +1,6 @@
 //! The launch settings `WorkerProcessArgs` carries (`LaneConfig`,
-//! [`FlashInferBackend`]), that type's defaults, the launch descriptor a rank
+//! [`FlashInferBackend`], [`GraphPolicy`], [`LoadFormat`]), that type's
+//! defaults, the launch descriptor a rank
 //! is started with, and the environment every rank is launched with, given the
 //! head's own.
 
@@ -53,6 +54,38 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+/// Which GPU computations a rank captures as CUDA graphs at startup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphPolicy {
+    /// Every call serves eagerly.
+    Off,
+    /// Captures graphs unless serving does not capture the attention
+    /// provider's calls, and then serves eagerly.
+    #[default]
+    Auto,
+    /// Requires graphs and refuses an attention provider serving does not
+    /// capture.
+    Full,
+}
+
+/// How a rank reads its checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadFormat {
+    /// Detects the checkpoint files' own format.
+    #[default]
+    Auto,
+    /// Reads safetensors files.
+    Safetensors,
+    /// Reads PyTorch pickle files.
+    Pt,
+    /// Initializes weights without reading the checkpoint.
+    Dummy,
+    /// Reads the checkpoint one layer at a time.
+    Layered,
+}
+
 impl WorkerProcessArgs {
     /// The interpreter that runs rank processes when none is configured: the
     /// one installed next to the running binary (an environment's `bin/`),
@@ -101,16 +134,12 @@ impl WorkerProcessArgs {
     /// queue depth.
     pub const DEFAULT_QUEUE_DEPTH: usize = 2;
     /// How long a submitted batch may go without rank progress before the
-    /// group is replaced (`--watchdog-timeout`), as SGLang's default.
+    /// group is replaced (`worker_config.watchdog_timeout`), as SGLang's default.
     pub const DEFAULT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-    /// Checkpoint loader format that detects the files' own format.
-    pub const DEFAULT_LOAD_FORMAT: &'static str = "auto";
     /// Share of device memory a rank may hold for weights and KV cache.
     pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
     /// Attention provider name: a native kernel chosen per call.
     pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
-    /// CUDA graph policy that captures what serving captures.
-    pub const DEFAULT_GRAPH_POLICY: &'static str = "auto";
     /// FlashInfer workspace capacity in bytes.
     pub const DEFAULT_FLASHINFER_WORKSPACE_SIZE: u64 = 512 * 1024 * 1024;
     /// FlashInfer backend of decode attention.
@@ -122,7 +151,7 @@ impl WorkerProcessArgs {
     /// Independent microbatches of attention and remote experts.
     pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
     /// Numeric data type of model parameters and activations.
-    pub const DEFAULT_MODEL_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
+    pub const DEFAULT_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
     /// Whether every prefill call replays a CUDA graph.
     pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
     /// Whether image denoising calls replay CUDA graphs.
@@ -159,22 +188,22 @@ impl Default for WorkerProcessArgs {
             max_batch_tokens: 16_384,
             // The engine's default running-request limit plus the largest
             // row reserve a runtime keeps outside it.
-            max_request_pool_size: (crate::scheduler::DEFAULT_MAX_NUM_SEQS
+            max_request_pool_size: (crate::scheduler::DEFAULT_MAX_RUNNING_REQUESTS
                 + crate::scheduler::MAX_GUIDANCE_PREFIX_ROWS)
                 as u32,
             attention_backend: Self::DEFAULT_ATTENTION_BACKEND.into(),
             transfer: Default::default(),
-            load_format: Self::DEFAULT_LOAD_FORMAT.to_string(),
+            load_format: LoadFormat::default(),
             download_dir: None,
             load_threads: None,
-            model_dtype: Self::DEFAULT_MODEL_DTYPE,
+            dtype: Self::DEFAULT_DTYPE,
             quantization_config: serde_json::json!({}),
-            prefix_cache_dtype: None,
+            kv_cache_dtype: None,
             mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
-            mesh: None,
+            worker_mesh: None,
             distributed_backend: None,
             lanes: Vec::new(),
-            graph_policy: Self::DEFAULT_GRAPH_POLICY.into(),
+            graph_policy: GraphPolicy::default(),
             decode_graph_batch_sizes: None,
             prefill_cuda_graph: Self::DEFAULT_PREFILL_CUDA_GRAPH,
             prefill_outputs: true,
@@ -192,7 +221,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_prefill_backend: Self::DEFAULT_FLASHINFER_PREFILL_BACKEND,
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
-            flashinfer_disable_split_kv: false,
+            flashinfer_split_kv: true,
             max_model_len: 8192,
             max_video_seconds: uniserve_core::video::plan::MAX_VIDEO_SECONDS,
             max_condition_rows: None,
@@ -329,16 +358,16 @@ impl WorkerProcessArgs {
             role: serde_name(&self.role)?,
             expert_microbatches: self.expert_microbatches,
             distributed_backend: self.distributed_backend.clone(),
-            mesh: self.mesh.clone(),
+            mesh: self.worker_mesh.clone(),
             lane: self.lanes.clone(),
             no_model: self.stub,
-            load_format: self.load_format.clone(),
+            load_format: serde_name(&self.load_format)?,
             download_dir: self.download_dir.as_deref().map(path),
             load_threads: self.load_threads,
-            model_dtype: self.model_dtype.as_str().to_owned(),
+            model_dtype: self.dtype.as_str().to_owned(),
             quantization_config: self.quantization_config.clone(),
             prefix_cache_dtype: self
-                .prefix_cache_dtype
+                .kv_cache_dtype
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
             mem_fraction_static: self.mem_fraction_static,
@@ -354,7 +383,7 @@ impl WorkerProcessArgs {
             encoder_cache_entries: self.encoder_cache_entries,
             ffmpeg: path(&self.ffmpeg),
             min_video_seconds: self.min_video_seconds,
-            graph_policy: self.graph_policy.clone(),
+            graph_policy: serde_name(&self.graph_policy)?,
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
             prefill_outputs: self.prefill_outputs,
@@ -367,12 +396,12 @@ impl WorkerProcessArgs {
             video_aspect_ratios: self.video_aspect_ratios.clone(),
             canvas_sampling: self.canvas_sampling,
             flashinfer_workspace_size: self.flashinfer_workspace_size,
-            flashinfer_use_tensor_core: self.flashinfer_use_tensor_core.clone(),
+            flashinfer_use_tensor_core: self.flashinfer_use_tensor_core,
             flashinfer_decode_backend: self.flashinfer_decode_backend.as_str().to_owned(),
             flashinfer_prefill_backend: self.flashinfer_prefill_backend.as_str().to_owned(),
             flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
-            flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
+            flashinfer_disable_split_kv: !self.flashinfer_split_kv,
         })
     }
 }
@@ -456,7 +485,7 @@ mod tests {
     use super::{WorkerProcessArgs, worker_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use uniserve_ipc::LaneConfig;
+    use uniserve_ipc::{LaneConfig, LaneSpec};
 
     /// The head answers a rank's registration with its launch descriptor as
     /// one frame, so every field must survive the frame's encoding, with and
@@ -474,17 +503,15 @@ mod tests {
         }
     }
 
-    /// `--lane` accepts only the fields the worker applies, so a misspelled
-    /// optional limit fails at argument parsing instead of leaving the lane
+    /// A lane binds the call kinds of the domains it names, and a field it
+    /// does not take is refused when it is read, instead of leaving the lane
     /// without that limit.
     #[test]
     fn a_lane_naming_an_unknown_field_is_refused() {
         let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
-        let parsed = format!("{lane}}}")
-            .parse::<LaneConfig>()
-            .expect("decode lane");
+        let spec = serde_json::from_str::<LaneSpec>(&format!("{lane}}}")).expect("decode lane");
         let args = WorkerProcessArgs {
-            lanes: vec![parsed],
+            lanes: vec![LaneConfig::try_from(spec).expect("a valid lane")],
             ..WorkerProcessArgs::default()
         };
         let descriptor = args
@@ -496,14 +523,14 @@ mod tests {
         );
 
         for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
-            let parsed = format!("{lane},{misspelled}}}").parse::<LaneConfig>();
+            let parsed = serde_json::from_str::<LaneSpec>(&format!("{lane},{misspelled}}}"));
             assert!(parsed.is_err(), "{misspelled} must be refused");
         }
     }
 
-    /// `--lane` is where a lane is validated: a lane without SM partition or
-    /// with a zero batch or in-flight limit is refused there, before any
-    /// rank starts, since a rank checks only what spans its lanes.
+    /// A lane without SM partition or with a zero batch or in-flight limit
+    /// is refused when it is resolved, before any rank starts, since a rank
+    /// checks only what spans its lanes.
     #[test]
     fn a_lane_with_a_zero_budget_or_limit_is_refused() {
         let lane = r#"{"lane_id":"decode","domains":["decode"]"#;
@@ -513,8 +540,12 @@ mod tests {
             r#""sm_budget":64,"max_batch_tokens":0"#,
             r#""sm_budget":64,"max_inflight":0"#,
         ] {
-            let parsed = format!("{lane},{field}}}").parse::<LaneConfig>();
-            assert!(parsed.is_err(), "{field} must be refused");
+            let spec = serde_json::from_str::<LaneSpec>(&format!("{lane},{field}}}"))
+                .expect("a lane spec");
+            assert!(
+                LaneConfig::try_from(spec).is_err(),
+                "{field} must be refused"
+            );
         }
     }
 

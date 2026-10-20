@@ -67,7 +67,7 @@ impl std::fmt::Display for Device {
     }
 }
 
-/// Resolve the generation (flow) tower device from `--worker-mesh`.
+/// Resolve the generation (flow) tower device from `worker_config.mesh`.
 ///
 /// The declaration is `tower=gen:<device>`: the text tower runs on the
 /// rank's device, and model loading places the flow route, denoiser and
@@ -92,13 +92,13 @@ pub(crate) fn generation_device(
         .map(|(_, target)| target.trim())
         .ok_or_else(|| {
             DescriptorError::new(format!(
-                "--worker-mesh must be tower=gen:<device>, got {mesh:?}"
+                "worker_config.mesh must be tower=gen:<device>, got {mesh:?}"
             ))
         })?;
-    let generation = Device::parse(target, "--worker-mesh tower gen")?;
+    let generation = Device::parse(target, "worker_config.mesh tower gen")?;
     if generation == device {
         return Err(DescriptorError::new(
-            "--worker-mesh tower gen must name a device other than the rank's",
+            "worker_config.mesh tower gen must name a device other than the rank's",
         ));
     }
     Ok(Some(generation))
@@ -111,16 +111,16 @@ mod tests {
     #[test]
     fn bare_cuda_names_the_first_visible_device() {
         assert_eq!(
-            Device::parse("cuda", "--device").ok(),
+            Device::parse("cuda", "rank device").ok(),
             Some(Device::Cuda(DeviceId(0)))
         );
         assert_eq!(
-            Device::parse("cuda:3", "--device").ok(),
+            Device::parse("cuda:3", "rank device").ok(),
             Some(Device::Cuda(DeviceId(3)))
         );
-        assert_eq!(Device::parse("cpu", "--device").ok(), Some(Device::Cpu));
-        assert!(Device::parse("tpu", "--device").is_err());
-        assert!(Device::parse("cuda:-1", "--device").is_err());
+        assert_eq!(Device::parse("cpu", "rank device").ok(), Some(Device::Cpu));
+        assert!(Device::parse("tpu", "rank device").is_err());
+        assert!(Device::parse("cuda:-1", "rank device").is_err());
     }
 
     /// `tower=gen:<device>` places the generation tower on another device

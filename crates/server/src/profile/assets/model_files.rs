@@ -30,8 +30,6 @@ pub struct ResolvedModelFiles {
     pub tokenizer_config_path: Option<PathBuf>,
     /// Optional generation defaults.
     pub generation_config_path: Option<PathBuf>,
-    /// Optional media preprocessor metadata.
-    pub preprocessor_config_path: Option<PathBuf>,
     /// Optional standalone chat template.
     pub chat_template_path: Option<PathBuf>,
     /// Optional model architecture metadata: `config.json` when it declares
@@ -55,17 +53,6 @@ impl ResolvedModelFiles {
     pub async fn new(model_id: &str) -> Result<Self> {
         ModelSource::from_model_id(model_id)?.model_files().await
     }
-}
-
-/// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
-///
-/// `filename` is checkpoint-relative and may name a subfolder. A file the
-/// directory or the repository does not have is [`Error::MissingFile`]; for
-/// an uncached Hub file that is the Hub's 404 answer. Every other Hub
-/// failure, such as a refused, rate-limited or unreachable request, is
-/// [`Error::Remote`], so callers never mistake it for an absent file.
-pub async fn resolve_model_file(model_id: &str, filename: &str) -> Result<PathBuf> {
-    ModelSource::from_model_id(model_id)?.file(filename).await
 }
 
 /// Where a configured model id's files are read from.
@@ -107,7 +94,14 @@ impl ModelSource {
         }
     }
 
-    /// Resolves one checkpoint-relative file; see [`resolve_model_file`].
+    /// Resolves one required checkpoint-relative file, which may name a
+    /// subfolder.
+    ///
+    /// A file the directory or the repository does not have is
+    /// [`Error::MissingFile`]; for an uncached Hub file that is the Hub's 404
+    /// answer. Every other Hub failure, such as a refused, rate-limited or
+    /// unreachable request, is [`Error::Remote`], so callers never mistake it
+    /// for an absent file.
     pub(crate) async fn file(&self, filename: &str) -> Result<PathBuf> {
         match self {
             Self::Local(directory) => local_file(directory, filename),
@@ -169,7 +163,6 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
         tokenizer_path,
         tokenizer_config_path: local_file_if_exists(model_dir, "tokenizer_config.json"),
         generation_config_path: local_file_if_exists(model_dir, "generation_config.json"),
-        preprocessor_config_path: local_file_if_exists(model_dir, "preprocessor_config.json"),
         chat_template_path: discover_chat_template_in_dir(model_dir),
         config_path: resolve_local_config_path(model_dir),
     })
@@ -201,8 +194,6 @@ async fn resolve_remote_model_files(api: &Api, model_id: &str) -> Result<Resolve
         download_if_present(&repo, model_id, &siblings, "tokenizer_config.json").await?;
     let generation_config_path =
         download_if_present(&repo, model_id, &siblings, "generation_config.json").await?;
-    let preprocessor_config_path =
-        download_if_present(&repo, model_id, &siblings, "preprocessor_config.json").await?;
     let chat_template_path = match select_chat_template_sibling(&siblings) {
         Some(name) => Some(fetch_file(&repo, model_id, name).await?),
         None => None,
@@ -217,7 +208,6 @@ async fn resolve_remote_model_files(api: &Api, model_id: &str) -> Result<Resolve
         tokenizer_path,
         tokenizer_config_path,
         generation_config_path,
-        preprocessor_config_path,
         chat_template_path,
         config_path,
     })
@@ -429,7 +419,6 @@ mod tests {
         assert_eq!(read(files.tokenizer_config_path), PUBLISHED[1].1);
         assert_eq!(read(files.generation_config_path), PUBLISHED[2].1);
         assert_eq!(read(files.config_path), PUBLISHED[3].1);
-        assert_eq!(files.preprocessor_config_path, None);
         assert_eq!(files.chat_template_path, None);
     }
 

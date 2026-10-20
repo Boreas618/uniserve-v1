@@ -7,6 +7,7 @@
 //! behave as in the served checkpoint. Token-exact prompts for the real
 //! checkpoints are covered by the `systemone_checkpoint` integration test.
 
+use crate::options::ReadoutOptions;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -17,19 +18,18 @@ use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use super::{
-    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions,
-    ReadoutPlan, StartupError, SystemOneError, SystemOneRequest,
+    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutPlan,
+    StartupError, SystemOneError, SystemOneRequest,
 };
 use axum::http::StatusCode;
 use base64::Engine as _;
 
-use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
 use crate::profile::ModelParameters;
 use crate::profile::assets::ResolvedModelFiles;
-use crate::profile::diffusion_gemma::{
-    ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
-};
+use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
+use uniserve_core::CanvasSampling;
 
 const SPECIAL_TOKENS: [&str; 11] = [
     "<pad>",
@@ -105,7 +105,6 @@ impl Checkpoint {
         let tokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path).unwrap());
         let id = |token: &str| tokenizer.token_to_id(token).unwrap();
         let profile = DiffusionGemmaProfile {
-            canvas_length: 256,
             tokens: ControlTokens {
                 mask: id("<mask>"),
                 pad: id("<pad>"),
@@ -119,8 +118,9 @@ impl Checkpoint {
                 pooling_kernel_size: 3,
                 max_soft_tokens: 280,
             },
-            denoising: DenoisingDefaults {
-                max_denoising_steps: 48,
+            sampling: CanvasSampling {
+                canvas_length: 256,
+                max_steps: 48,
                 entropy_bound: 0.1,
                 t_min: 0.4,
                 t_max: 0.8,
@@ -133,7 +133,6 @@ impl Checkpoint {
             tokenizer_path,
             tokenizer_config_path: Some(tokenizer_config_path),
             generation_config_path: None,
-            preprocessor_config_path: None,
             chat_template_path: None,
             config_path: None,
         };
@@ -763,7 +762,7 @@ fn a_question_that_cannot_fit_an_empty_canvas_is_rejected() {
     let mut checkpoint = Checkpoint::new(&[]);
     // "1:", one slot, "\n", and <turn|> fill a 5-token canvas exactly; a
     // two-letter question needs one token more.
-    checkpoint.profile.canvas_length = 5;
+    checkpoint.profile.sampling.canvas_length = 5;
     let encoder = checkpoint.encoder(ReadoutOptions::default(), 4096);
 
     assert!(encoder.plan(&request(json!({"a": noul("?")})), &[]).is_ok());
@@ -840,14 +839,14 @@ fn a_tokenizer_that_merges_two_letter_labels_is_refused_at_startup() {
     );
 }
 
-/// Application state serving `checkpoint`'s readout over the engine
-/// simulator, which answers every candidate with a fixed log-probability.
+/// The router serving `checkpoint`'s readout over the engine simulator,
+/// which answers every candidate with a fixed log-probability.
 fn readout_router(checkpoint: &Checkpoint, options: ReadoutOptions) -> axum::Router {
-    let runtime = crate::http::test_support::sim_runtime(ModelParameters::DiffusionGemma(
-        checkpoint.profile.clone(),
-    ))
-    .with_readout(checkpoint.encoder(options, 4096));
-    crate::http::build_router(Arc::new(crate::AppState::new(runtime)))
+    let engine = crate::test_support::sim_readout_engine(
+        ModelParameters::DiffusionGemma(checkpoint.profile.clone()),
+        Some(checkpoint.encoder(options, 4096)),
+    );
+    router(engine)
 }
 
 fn readout_body(questions: Value) -> Value {
@@ -975,7 +974,7 @@ async fn the_route_refuses_another_model_and_invalid_bodies() {
 /// A model without the readout does not serve the route.
 #[tokio::test]
 async fn a_model_without_the_readout_does_not_serve_the_route() {
-    let router = crate::http::build_router(Arc::new(sim_state(ModelParameters::Qwen3)));
+    let router = router(sim_engine(ModelParameters::Qwen3));
 
     let (status, _, body) = send(
         &router,

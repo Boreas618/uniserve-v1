@@ -373,7 +373,7 @@ const TEXT_CAPACITY_STEP: u32 = 2048;
 /// increasing order.
 ///
 /// The prompt capacity `max_text_tokens` (`--max-model-len`) is always the
-/// largest. `listed` (`--video-text-capacities`) names the capacities below
+/// largest. `listed` (`video_config.text_capacities`) names the capacities below
 /// it; a listed capacity equal to it repeats the largest. Without a list the
 /// capacities are [`TEXT_CAPACITY_FIRST`], then steps of
 /// [`TEXT_CAPACITY_STEP`] below the prompt capacity.
@@ -443,7 +443,7 @@ impl MediaPlan {
     /// ([`prompt_capacities`]); each maps to the text rows of its layout,
     /// capped at the largest layout's.
     /// `stated_rows` is the deployment's condition capacity
-    /// (`--max-condition-rows`); without it the plan provisions the rows of
+    /// (`video_config.max_condition_rows`); without it the plan provisions the rows of
     /// the largest condition set the denoiser admits at the longest frame
     /// count, on the admitted canvas where it packs the most, so no request
     /// is refused for its conditions. A denoiser that admits no condition
@@ -595,7 +595,7 @@ impl MediaPlan {
         if condition_rows > self.condition_rows {
             return Err(format!(
                 "conditions: the conditions take {condition_rows} denoiser rows, more than the \
-                 {} this deployment serves; serve with a larger --max-condition-rows",
+                 {} this deployment serves; serve with a larger video_config.max_condition_rows",
                 self.condition_rows
             ));
         }
@@ -1418,6 +1418,6 @@ mod tests {
                 .is_err()
         );
         let refusal = plan.select(size, 513, &layouts, &[true, true]).unwrap_err();
-        assert!(refusal.contains("513") && refusal.contains("--max-condition-rows"));
+        assert!(refusal.contains("513") && refusal.contains("video_config.max_condition_rows"));
     }
 }

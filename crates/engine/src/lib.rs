@@ -15,6 +15,7 @@
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
 mod core;
+mod deployment;
 mod executor;
 mod handle;
 mod prefix_cache;
@@ -28,6 +29,7 @@ mod warmup;
 mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};
+pub use crate::deployment::Deployment;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
@@ -40,8 +42,8 @@ pub use crate::handle::{
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
     PrefixCacheUsage, PrefixStats, Scheduler, SchedulerConfig, SchedulerStats,
     SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
 };
@@ -51,7 +53,8 @@ pub use crate::sim::{
 };
 pub use crate::worker::{
     BatchSubmitError, CallReaders, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
-    FlashInferBackendParseError, LaneConfig, WorkerExecutor, WorkerGroup, WorkerProcessArgs,
+    FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat, WorkerExecutor,
+    WorkerGroup, WorkerProcessArgs,
 };
 pub use uniserve_ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo};
 

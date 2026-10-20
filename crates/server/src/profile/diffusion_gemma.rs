@@ -4,10 +4,10 @@
 //! "diffusion_gemma"`) is a Gemma-4 encoder-decoder that denoises a fixed-length
 //! token canvas over a prompt prefix. [`DiffusionGemmaProfile::resolve`]
 //! normalizes the checkpoint metadata the server needs once at startup: the
-//! canvas length and its control tokens, the Gemma-4 image patch budget that
-//! sizes image placeholders, and the block-diffusion sampler defaults of
-//! `generation_config.json`, which a server may override
-//! ([`DenoisingOverrides`]). The text context limit lives under the root
+//! block-diffusion sampling of its canvases (the canvas length of the root
+//! configuration under the sampler defaults of `generation_config.json`,
+//! which a server may override, [`DenoisingOverrides`]), the canvas control
+//! tokens, and the Gemma-4 image patch budget that sizes image placeholders. The text context limit lives under the root
 //! configuration's `text_config` and is read by `assets::ModelConfig`.
 //! [`ControlTokens::expand_images`] expands a rendered prompt's image tokens
 //! as the Gemma-4 processor does.
@@ -20,6 +20,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use uniserve_core::CanvasSampling;
+
 use crate::profile::assets::{self, GenerationConfig, read_json};
 use crate::profile::omni::required_token_id;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -27,15 +29,18 @@ use crate::profile::tokenizer::HuggingFaceTokenizer;
 /// Serving facts of one DiffusionGemma checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffusionGemmaProfile {
-    /// Tokens in one denoising canvas (`canvas_length`): the block length of
-    /// block-diffusion generation and the full System One readout canvas.
-    pub canvas_length: u32,
+    /// The block-diffusion sampling of every canvas: its length
+    /// (`canvas_length`, the block length of generation and the full System
+    /// One readout canvas) and the sampler defaults of
+    /// `generation_config.json`, as the server's overrides replace them. The
+    /// sampler's temperature falls linearly from `t_max` at a canvas's first
+    /// step to `t_min` at its last (Transformers'
+    /// `LinearTemperatureScheduleLogitsProcessor`).
+    pub sampling: CanvasSampling,
     /// Vocabulary identities of the canvas and image control tokens.
     pub tokens: ControlTokens,
     /// Gemma-4 image patch arithmetic that sizes image placeholders.
     pub images: PatchBudget,
-    /// Block-diffusion sampler defaults from `generation_config.json`.
-    pub denoising: DenoisingDefaults,
     /// Whether the checkpoint declares a `quantization_config` (the ModelOpt
     /// NVFP4 variant quantizes only the MoE experts); serving is identical.
     pub quantized: bool,
@@ -132,79 +137,6 @@ impl PatchBudget {
     }
 }
 
-/// Block-diffusion sampler defaults of a DiffusionGemma checkpoint.
-///
-/// The sampling temperature falls linearly from `t_max` at a canvas's first
-/// step to `t_min` at its last (Transformers'
-/// `LinearTemperatureScheduleLogitsProcessor`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct DenoisingDefaults {
-    /// Maximum denoising steps per canvas (`max_denoising_steps`).
-    pub max_denoising_steps: u32,
-    /// Entropy budget of the tokens accepted in one step
-    /// (`sampler_config.entropy_bound`), in nats.
-    pub entropy_bound: f32,
-    /// Sampling temperature at the last step (`t_min`).
-    pub t_min: f32,
-    /// Sampling temperature at the first step (`t_max`).
-    pub t_max: f32,
-    /// Stopping threshold on the canvas's residual uncertainty
-    /// (`confidence_threshold`); zero never stops a canvas early, so every
-    /// canvas runs all its steps.
-    pub confidence_threshold: f32,
-    /// Consecutive unchanged steps that end denoising early
-    /// (`stability_threshold`); zero ends it on confidence alone.
-    pub stability_threshold: u32,
-}
-
-impl DenoisingDefaults {
-    /// Returns these defaults with every value `overrides` names replaced.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the first resulting value outside the
-    /// domain the block-diffusion sampler accepts
-    /// (`uniserve.diffusion.canvas.CanvasSampling`): a positive step limit,
-    /// a positive entropy bound, a non-negative confidence threshold, and
-    /// temperatures with `0 <= t_min < t_max`, all finite. A zero stability
-    /// threshold stops a canvas on confidence alone; a zero confidence
-    /// threshold runs every canvas for all its steps.
-    pub fn with_overrides(self, overrides: &DenoisingOverrides) -> Result<Self, String> {
-        let value = Self {
-            max_denoising_steps: overrides
-                .max_denoising_steps
-                .unwrap_or(self.max_denoising_steps),
-            entropy_bound: overrides.entropy_bound.unwrap_or(self.entropy_bound),
-            t_min: overrides.t_min.unwrap_or(self.t_min),
-            t_max: overrides.t_max.unwrap_or(self.t_max),
-            confidence_threshold: overrides
-                .confidence_threshold
-                .unwrap_or(self.confidence_threshold),
-            stability_threshold: overrides
-                .stability_threshold
-                .unwrap_or(self.stability_threshold),
-        };
-        let positive = |number: f32| number.is_finite() && number > 0.0;
-        let invalid = if value.max_denoising_steps == 0 {
-            Some("max_denoising_steps must be positive")
-        } else if !positive(value.entropy_bound) {
-            Some("entropy_bound must be positive and finite")
-        } else if !(value.t_min.is_finite() && value.t_min >= 0.0) {
-            Some("t_min must be finite and non-negative")
-        } else if !(value.t_max.is_finite() && value.t_max > value.t_min) {
-            Some("t_max must be finite and above t_min")
-        } else if !(value.confidence_threshold.is_finite() && value.confidence_threshold >= 0.0) {
-            Some("confidence_threshold must be finite and non-negative")
-        } else {
-            None
-        };
-        match invalid {
-            Some(message) => Err(message.to_owned()),
-            None => Ok(value),
-        }
-    }
-}
-
 /// Server-level replacements for the checkpoint's block-diffusion sampler
 /// defaults, read from a JSON object whose keys name `generation_config.json`
 /// fields. Requests carry no such fields, so these settings apply to every
@@ -224,6 +156,36 @@ pub struct DenoisingOverrides {
     pub confidence_threshold: Option<f32>,
     /// Replaces `stability_threshold`.
     pub stability_threshold: Option<u32>,
+}
+
+impl DenoisingOverrides {
+    /// Returns `sampling` with every value these overrides name replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming, by its `generation_config.json` key, the
+    /// first resulting value outside the block-diffusion sampler's domain
+    /// (`CanvasSampling::invalid_parameter`).
+    pub fn apply(&self, sampling: CanvasSampling) -> Result<CanvasSampling, String> {
+        let value = CanvasSampling {
+            max_steps: self.max_denoising_steps.unwrap_or(sampling.max_steps),
+            entropy_bound: self.entropy_bound.unwrap_or(sampling.entropy_bound),
+            t_min: self.t_min.unwrap_or(sampling.t_min),
+            t_max: self.t_max.unwrap_or(sampling.t_max),
+            confidence_threshold: self
+                .confidence_threshold
+                .unwrap_or(sampling.confidence_threshold),
+            stability_threshold: self
+                .stability_threshold
+                .unwrap_or(sampling.stability_threshold),
+            ..sampling
+        };
+        match value.invalid_parameter() {
+            Some("max_steps") => Err("max_denoising_steps is outside the sampler's domain".into()),
+            Some(parameter) => Err(format!("{parameter} is outside the sampler's domain")),
+            None => Ok(value),
+        }
+    }
 }
 
 /// Where one image's soft tokens sit in a prompt.
@@ -364,8 +326,9 @@ impl DiffusionGemmaProfile {
             .ok_or(assets::Error::MissingField {
                 field: "sampler_config",
             })?;
-        let denoising = DenoisingDefaults {
-            max_denoising_steps: required(generation.max_denoising_steps, "max_denoising_steps")?,
+        let sampling = CanvasSampling {
+            canvas_length: config.canvas_length,
+            max_steps: required(generation.max_denoising_steps, "max_denoising_steps")?,
             entropy_bound: required(sampler.entropy_bound, "sampler_config.entropy_bound")?,
             t_min: required(generation.t_min, "t_min")?,
             t_max: required(generation.t_max, "t_max")?,
@@ -377,14 +340,13 @@ impl DiffusionGemmaProfile {
         };
 
         Ok(Self {
-            canvas_length: config.canvas_length,
+            sampling,
             tokens,
             images: PatchBudget {
                 patch_size: config.vision_config.patch_size,
                 pooling_kernel_size: config.vision_config.pooling_kernel_size,
                 max_soft_tokens: config.vision_soft_tokens_per_image,
             },
-            denoising,
             quantized: config.quantization_config.is_some(),
         })
     }
@@ -397,10 +359,13 @@ fn required<T>(value: Option<T>, field: &'static str) -> assets::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DenoisingDefaults, DenoisingOverrides, PatchBudget};
+    use uniserve_core::CanvasSampling;
 
-    const CHECKPOINT: DenoisingDefaults = DenoisingDefaults {
-        max_denoising_steps: 48,
+    use super::{DenoisingOverrides, PatchBudget};
+
+    const CHECKPOINT: CanvasSampling = CanvasSampling {
+        canvas_length: 256,
+        max_steps: 48,
         entropy_bound: 0.1,
         t_min: 0.4,
         t_max: 0.8,
@@ -415,15 +380,15 @@ mod tests {
         let overrides: DenoisingOverrides =
             serde_json::from_str(r#"{"max_denoising_steps": 32, "t_max": 1.0}"#).unwrap();
         assert_eq!(
-            CHECKPOINT.with_overrides(&overrides),
-            Ok(DenoisingDefaults {
-                max_denoising_steps: 32,
+            overrides.apply(CHECKPOINT),
+            Ok(CanvasSampling {
+                max_steps: 32,
                 t_max: 1.0,
                 ..CHECKPOINT
             })
         );
         assert_eq!(
-            CHECKPOINT.with_overrides(&DenoisingOverrides::default()),
+            DenoisingOverrides::default().apply(CHECKPOINT),
             Ok(CHECKPOINT)
         );
     }
@@ -437,8 +402,8 @@ mod tests {
             serde_json::from_str(r#"{"confidence_threshold": 0, "stability_threshold": 0}"#)
                 .unwrap();
         assert_eq!(
-            CHECKPOINT.with_overrides(&overrides),
-            Ok(DenoisingDefaults {
+            overrides.apply(CHECKPOINT),
+            Ok(CanvasSampling {
                 confidence_threshold: 0.0,
                 stability_threshold: 0,
                 ..CHECKPOINT
@@ -458,7 +423,7 @@ mod tests {
             (r#"{"confidence_threshold": -0.1}"#, "confidence_threshold"),
         ] {
             let overrides: DenoisingOverrides = serde_json::from_str(json).unwrap();
-            let message = CHECKPOINT.with_overrides(&overrides).unwrap_err();
+            let message = overrides.apply(CHECKPOINT).unwrap_err();
             assert!(message.starts_with(field), "{message}");
         }
     }

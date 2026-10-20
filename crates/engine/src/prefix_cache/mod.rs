@@ -63,24 +63,17 @@ use freeq::UnitMeta;
 /// collision resistant, so callers must still compare exact tokens before
 /// reusing a page.
 pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &[u32]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001B3;
-    let token_count = tokens.len() as u32;
-    let mut h = OFFSET;
-    let mix = |bytes: &[u8], h: &mut u64| {
-        for b in bytes {
-            *h ^= u64::from(*b);
-            *h = h.wrapping_mul(PRIME);
-        }
-    };
-    mix(&parent.to_le_bytes(), &mut h);
-    mix(&group_id.to_le_bytes(), &mut h);
-    mix(&[modality_tag], &mut h);
-    mix(&token_count.to_le_bytes(), &mut h);
+    use std::hash::Hasher as _;
+
+    let mut hasher = uniserve_core::Fnv1a::default();
+    hasher.write(&parent.to_le_bytes());
+    hasher.write(&group_id.to_le_bytes());
+    hasher.write(&[modality_tag]);
+    hasher.write(&(tokens.len() as u32).to_le_bytes());
     for token in tokens {
-        mix(&token.to_le_bytes(), &mut h);
+        hasher.write(&token.to_le_bytes());
     }
-    h
+    hasher.finish()
 }
 
 /// Returns the stable byte tag included in modality-specific prefix hashes.

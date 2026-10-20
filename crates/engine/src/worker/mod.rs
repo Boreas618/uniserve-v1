@@ -21,7 +21,9 @@ mod rendezvous;
 pub use executor::WorkerExecutor;
 pub(crate) use incarnations::IncarnationRegistry;
 pub use instance::{CallReaders, WorkerGroup};
-pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
+pub use process::{
+    FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
+};
 use process::{PendingRank, RankProcess};
 
 /// Backpressure and terminal failures returned by a WorkerGroup batch submission.
@@ -73,7 +75,7 @@ pub struct WorkerProcessArgs {
     pub launcher_timeout: std::time::Duration,
     /// How long the group waits for progress of its ranks (a joined result)
     /// while a batch is pending before it treats them as hung and replaces
-    /// them, failing the requests they hold (`--watchdog-timeout`). A rank
+    /// them, failing the requests they hold (`worker_config.watchdog_timeout`). A rank
     /// that dies is detected at once; this bounds a rank that is alive but
     /// stuck, for example in a collective. The launch descriptor carries it
     /// to every rank, which reports a lane whose job has run for half of it
@@ -88,7 +90,7 @@ pub struct WorkerProcessArgs {
     pub stub: bool,
     /// Maximum number of physical batches concurrently in flight per rank.
     pub queue_depth: usize,
-    /// Optional prefix cache capacity in tokens (`--max-total-tokens`).
+    /// Optional prefix cache capacity in tokens (`kv_cache_config.max_tokens`).
     pub max_total_tokens: Option<u64>,
     /// Tokens per cache page of the cache group with the widest token rows;
     /// the worker derives every other group's block size from it. `None`
@@ -111,31 +113,33 @@ pub struct WorkerProcessArgs {
     /// Product transport exposed by the worker pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.
-    pub load_format: String,
+    pub load_format: LoadFormat,
     /// Optional cache directory for downloaded model artifacts.
     pub download_dir: Option<std::path::PathBuf>,
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
     /// Numeric data type used by model parameters and activations.
-    pub model_dtype: uniserve_core::ModelDtype,
+    pub dtype: uniserve_core::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
-    /// Numeric data type used by the prefix cache, when explicitly selected.
-    pub prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
+    /// Numeric data type of the KV (prefix) cache, when explicitly selected.
+    pub kv_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
     /// Each rank's share of its device's total memory, which bounds the
     /// process's static allocations, weights and KV cache;
     /// `WorkerConfig::validate_mem_fraction_static` states its range.
     pub mem_fraction_static: f64,
-    /// Optional device mesh specification for model components.
-    pub mesh: Option<String>,
+    /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
+    /// on a device other than the rank's; the rank parses it.
+    pub worker_mesh: Option<String>,
     /// Optional process-world communication backend.
     pub distributed_backend: Option<String>,
     /// Configuration-static execution lane descriptors.
     pub lanes: Vec<LaneConfig>,
-    /// Module graph coverage policy: off, auto, or full.
-    pub graph_policy: String,
-    /// Optional decode batch sizes selected for CUDA graph capture.
-    pub decode_graph_batch_sizes: Option<String>,
+    /// Module graph coverage policy.
+    pub graph_policy: GraphPolicy,
+    /// Strictly increasing decode batch sizes captured as CUDA graphs;
+    /// `None` keeps the rank's catalog.
+    pub decode_graph_batch_sizes: Option<Vec<u32>>,
     /// Whether every prefill call replays a CUDA graph captured at
     /// startup; without it prefill runs eagerly, for debugging.
     pub prefill_cuda_graph: bool,
@@ -143,18 +147,22 @@ pub struct WorkerProcessArgs {
     /// its prompt. Without it every prefill only writes the prefix cache, and
     /// the worker's prefill graphs stop at the final layer's cache write.
     pub prefill_outputs: bool,
-    /// Optional prefill token counts selected for CUDA graph capture.
-    pub prefill_graph_token_sizes: Option<String>,
+    /// Strictly increasing prefill token counts captured as CUDA graphs;
+    /// `None` keeps the rank's catalog.
+    pub prefill_graph_token_sizes: Option<Vec<u32>>,
     /// Whether image denoising calls capture and replay CUDA graphs at the
     /// configured flow shapes.
     pub flow_cuda_graph: bool,
-    /// Optional diffusion batch sizes selected for CUDA graph capture.
-    pub flow_graph_batch_sizes: Option<String>,
-    /// Optional diffusion tensor shapes selected for CUDA graph capture.
-    pub flow_graph_shapes: Option<String>,
-    /// Optional text capacities, in prompt tokens, of a video denoiser's
-    /// layouts, as a comma-separated increasing list.
-    pub video_text_capacities: Option<String>,
+    /// Strictly increasing image denoising batch sizes captured as CUDA
+    /// graphs; `None` keeps the rank's catalog.
+    pub flow_graph_batch_sizes: Option<Vec<u32>>,
+    /// Distinct image capture sizes, `[height, width]` in pixels; `None`
+    /// keeps the rank's catalog.
+    pub flow_graph_shapes: Option<Vec<[u32; 2]>>,
+    /// Strictly increasing text capacities, in prompt tokens, of a video
+    /// denoiser's layouts below the context length; `None` keeps the rank's
+    /// default steps.
+    pub video_text_capacities: Option<Vec<u32>>,
     /// Resolution classes (`768p`) a video deployment prepares, crossed with
     /// `video_aspect_ratios` resolution-major in the order the deployment
     /// names them. Its workers' video denoiser names the canvas of each pair;
@@ -173,8 +181,9 @@ pub struct WorkerProcessArgs {
     pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
-    /// Optional FlashInfer tensor-core selection forwarded to the worker.
-    pub flashinfer_use_tensor_core: Option<String>,
+    /// FlashInfer tensor-core decode selection; `None` lets the backend
+    /// decide.
+    pub flashinfer_use_tensor_core: Option<bool>,
     /// FlashInfer backend used for decode attention.
     pub flashinfer_decode_backend: FlashInferBackend,
     /// FlashInfer backend used for prefill attention.
@@ -183,8 +192,8 @@ pub struct WorkerProcessArgs {
     pub flashinfer_decode_split_tile_size: Option<u32>,
     /// Optional split-KV tile size used for FlashInfer prefill attention.
     pub flashinfer_prefill_split_tile_size: Option<u32>,
-    /// Whether FlashInfer split-KV execution is disabled.
-    pub flashinfer_disable_split_kv: bool,
+    /// Whether FlashInfer may split the KV sequence across thread blocks.
+    pub flashinfer_split_kv: bool,
     /// Maximum model context length in tokens.
     pub max_model_len: u32,
     /// Maximum accepted video duration in seconds.

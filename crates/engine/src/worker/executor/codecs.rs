@@ -389,13 +389,8 @@ mod tests {
         let mut checked = 0;
         for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
             let path = entry.expect("readable entry").path();
-            if path.extension().is_none_or(|extension| extension != "json") {
-                continue;
-            }
-            let workers: Vec<crate::WorkerConfig> =
-                serde_json::from_str(&std::fs::read_to_string(&path).expect("readable file"))
-                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            crate::WorkerConfig::validate_all(&workers)
+            let workers = crate::Deployment::read(path.to_str().expect("UTF-8 path"))
+                .and_then(|deployment| deployment.workers("localhost"))
                 .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             let ids = workers
                 .iter()

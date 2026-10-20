@@ -1,0 +1,17 @@
+# Qwen3 MoE with dedicated experts on two hosts: a TP2 attention replica on
+# rank-0 and two expert ranks on rank-1. Serve it with --expert-parallel
+# --expert-exchange deepep.
+
+[[workers]]
+id = "attention"
+ranks = ["rank-0/cuda:0-1"]
+queue_depth = 2
+
+[workers.components.model]
+tensor_parallel_size = 2
+
+[[workers]]
+id = "experts"
+role = "experts"
+ranks = ["rank-1/cuda:0-1"]
+queue_depth = 2

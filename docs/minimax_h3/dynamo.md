@@ -47,16 +47,15 @@ In another terminal, from the same repository and on the same host, start the wo
 export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 export DYN_DISCOVERY_BACKEND=file
 
-target/release/uniserve-dynamo-worker \
-  --namespace uniserve-fasth3 \
-  --model-path "$H3_MODEL" --served-model-name FastH3 \
+target/release/uniserve-dynamo-worker "$H3_MODEL" \
+  --namespace uniserve-fasth3 --served-model-name FastH3 \
   --worker-python "$PWD/.venv/bin/python" \
-  --workers configs/minimax_h3/ulysses4.json \
-  --max-model-len 16384 --max-video-seconds 15 \
-  --max-running-requests 2 --quantization-config '{"mode":"quality"}'
+  --workers configs/minimax_h3/ulysses4.toml \
+  --max-model-len 16384 --max-running-requests 2 \
+  --set video_config.max_seconds=15 --set quantization_config.mode=quality
 ```
 
-The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video codec ranks plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
+The worker takes the options of `uniserve serve`, including a `--config` file ([Configuration](../configuration.md)), and refuses those a Dynamo worker cannot honor: the HTTP server's, data and expert parallelism, condition media, asynchronous job storage and HTTP request logging. The placement uses four-way Ulysses denoising and TP4 text encoding, distributes temporal decoder units across the GPUs, and starts four host video codec ranks plus a host muxer. Weights remain resident; the quality configuration retains BF16 text encoding and denoising with the configured FP16 VAE projections.
 
 This single-host setup uses file discovery; requests travel over Dynamo's default TCP request plane. Both processes must share the discovery directory, `/tmp/dynamo_store_kv` by default, and the same namespace.
 
@@ -101,7 +100,7 @@ PY
 
 Open `artifacts/dynamo/video.mp4` to play the generated video and soundtrack. FastH3 aligns the requested duration to its temporal layout, so the resulting clip can be slightly longer than requested.
 
-`size` selects one of the canvases the worker serves: those its `--video-resolutions` and `--video-aspect-ratios` prepare, as for `uniserve serve` (1344x768 and 768x1344 by default), read from the started deployment's capabilities. Without `size` the worker generates the first of them. A client may instead name the canvas with top-level `resolution` (`768p` or `480p`) and `aspect_ratio` fields, which the frontend forwards to the worker; a `size` that disagrees with them is refused.
+`size` selects one of the canvases the worker serves: those its `video_config.resolutions` and `video_config.aspect_ratios` prepare, as for `uniserve serve` (1344x768 and 768x1344 by default), read from the started deployment's capabilities. Without `size` the worker generates the first of them. A client may instead name the canvas with top-level `resolution` (`768p` or `480p`) and `aspect_ratio` fields, which the frontend forwards to the worker; a `size` that disagrees with them is refused.
 
 The checkpoint determines the denoising schedule and the frame rate, and `seconds` the frame count, so `nvext.num_inference_steps`, `nvext.fps` and `nvext.num_frames` are refused; the video service refuses a `seconds` outside the deployment's duration range. A refused request leaves the worker serving: the worker ends its response stream with an invalid-argument error, which the Dynamo 1.5.0 frontend answers with HTTP 500 and a frontend built at the revision the worker pins (`c0de0008`) answers with HTTP 400. This integration supports text-to-video requests with completed responses; image input, streaming and guidance overrides are unsupported. Use `b64_json` to retrieve the MP4 directly, as above.
 

@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use crate::profile::tokenizer::DynTokenizer;
 
 use super::{
     DelimitedReasoningParser, Gemma4ReasoningParser, Qwen3ReasoningParser, ReasoningParser,
@@ -33,10 +32,7 @@ fn reasoning_tokenizer() -> DynTokenizer {
         AddedToken::from("</think>", true),
         AddedToken::from("<|im_end|>", true),
     ]);
-    let directory = tempdir().expect("create tokenizer directory");
-    let path = directory.path().join("tokenizer.json");
-    tokenizer.save(&path, false).expect("save tokenizer");
-    Arc::new(HuggingFaceTokenizer::new(&path).expect("load configured tokenizer"))
+    Arc::new(crate::test_support::load_tokenizer(&tokenizer))
 }
 
 fn token_id(tokenizer: &DynTokenizer, token: &str) -> u32 {
@@ -166,10 +162,7 @@ fn gemma4_tokenizer() -> DynTokenizer {
         .map(|(_, token)| AddedToken::from(token, true))
         .collect();
     tokenizer.add_special_tokens(&special_tokens);
-    let directory = tempdir().expect("create tokenizer directory");
-    let path = directory.path().join("tokenizer.json");
-    tokenizer.save(&path, false).expect("save tokenizer");
-    Arc::new(HuggingFaceTokenizer::new(&path).expect("load configured tokenizer"))
+    Arc::new(crate::test_support::load_tokenizer(&tokenizer))
 }
 
 /// Pushes every chunk, finishes the stream, and returns the concatenated

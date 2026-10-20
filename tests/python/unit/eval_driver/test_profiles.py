@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ def test_shipped_profiles_name_deployments_and_workloads_that_exist(
             config.root / server.command[server.command.index("--workers") + 1]
         )
         assert deployment.is_file(), f"{name} names {deployment}"
-        workers = json.loads(deployment.read_text())
+        workers = tomllib.loads(deployment.read_text())["workers"]
         assert workers and all(worker["components"] for worker in workers)
 
     for name, point in config.benchmarks.items():

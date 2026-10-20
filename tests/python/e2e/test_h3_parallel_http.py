@@ -319,22 +319,19 @@ def test_component_bindings_release_cancelled_requests(
         worker_id = names[0]
         components = {
             name: {
-                **worker_config[name],
                 "ranks": [
                     members.index(rank) for rank in worker_config[name]["ranks"]
                 ],
+                **worker_config[name].get("parallel_config", {}),
             }
             for name in names
         }
         workers.append(
             {
                 "id": worker_id,
-                "ranks": [
-                    {"node": "localhost", "device": f"cuda:{devices[rank]}"}
-                    for rank in members
-                ],
-                "components": components,
+                "ranks": [f"cuda:{devices[rank]}" for rank in members],
                 "queue_depth": 6,
+                "components": components,
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
@@ -346,8 +343,8 @@ def test_component_bindings_release_cancelled_requests(
     workers.append(
         {
             "id": "host",
-            "ranks": [{"node": "localhost", "device": "cpu"}]
-            * (decoder_units + 2),
+            "ranks": [f"cpu*{decoder_units + 2}"],
+            "queue_depth": 6,
             "components": {
                 "video_codec": {
                     "ranks": list(range(decoder_units)),
@@ -355,7 +352,6 @@ def test_component_bindings_release_cancelled_requests(
                 "muxer": {"ranks": [decoder_units]},
                 "media_reader": {"ranks": [decoder_units + 1]},
             },
-            "queue_depth": 6,
         }
     )
     owners.update(
@@ -389,8 +385,9 @@ def test_component_bindings_release_cancelled_requests(
         sys.executable,
         "--workers",
         str(written_deployment(tmp_path, workers)),
-        "--transfer",
-        ",".join(
+        "--set",
+        "placement_config.transfer="
+        + ",".join(
             # Device products cross workers over VMM handles where the
             # devices can map one another; the host worker's ranks have no
             # device, so their edges carry host products over shared storage
@@ -403,28 +400,26 @@ def test_component_bindings_release_cancelled_requests(
             )
             for source, destination in sorted(edges)
         ),
-        "--queue-depth",
-        "6",
         "--max-running-requests",
         str(max_running_requests),
         "--max-model-len",
         "16384",
-        "--max-video-seconds",
-        max_video_seconds,
+        "--set",
+        f"video_config.max_seconds={max_video_seconds}",
         # Two text capacities bound the startup capture of every admitted
         # duration; the requests below exercise both.
-        "--video-text-capacities",
-        "1024",
+        "--set",
+        "video_config.text_capacities=1024",
         # One and two device layouts hold the whole denoiser on each of their
         # ranks and split the 15-second sequence over fewer of them, so their
         # warmup reaches a larger share of the device than the four-device
         # deployment the default grant is sized for.
         "--mem-fraction-static",
         "0.92",
-        "--dtype",
-        "bfloat16",
-        "--quantization-config",
-        json.dumps({"mode": precision}),
+        "--set",
+        "dtype=bfloat16",
+        "--set",
+        f"quantization_config.mode={precision}",
     ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     payloads = []
@@ -524,7 +519,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         Path(__file__).resolve().parents[3]
         / "configs"
         / "minimax_h3"
-        / "ulysses4.json"
+        / "ulysses4.toml"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -542,14 +537,14 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         str(port),
         # Two text capacities bound the startup capture of every admitted
         # duration.
-        "--video-text-capacities",
-        "1024",
+        "--set",
+        "video_config.text_capacities=1024",
         # Full-duration decoder graphs need a larger static grant on H200
         # alongside BF16 weights and two resident request slots.
         "--mem-fraction-static",
         "0.92",
-        "--graph-policy",
-        "full",
+        "--set",
+        "cuda_graph_config.policy=full",
     ]
 
     def completed(client, job_id):

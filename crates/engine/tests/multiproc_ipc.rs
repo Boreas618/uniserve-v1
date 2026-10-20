@@ -1729,7 +1729,7 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
         max_cfg_branches: 1,
         ..Default::default()
     };
-    config.max_num_seqs = RUNNING;
+    config.max_running_requests = RUNNING;
     config.workers = vec![WorkerConfig::placed(
         &["localhost".to_owned()],
         "cpu",
@@ -4233,7 +4233,7 @@ fn cuda_worker(
     for rank in &mut args.ranks {
         rank.device = "cuda:0".into();
     }
-    args.prefix_cache_dtype = prefix_cache_dtype;
+    args.kv_cache_dtype = prefix_cache_dtype;
     args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
     WorkerGroup::spawn(args)
 }

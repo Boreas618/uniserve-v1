@@ -337,7 +337,7 @@ class Backend:
     # provider whose captured calls compute their live rows from device
     # lengths is captured; one whose captured calls grow with their rows and
     # capacity is not, and a rank serving with it runs eagerly
-    # (``--graph-policy auto``).
+    # (``cuda_graph_config.policy = "auto"``).
     captures = True
 
     def reads_pages(
@@ -409,9 +409,9 @@ class Backend:
 
 # The providers selectable by name, the one list of them: each names the
 # module of this package whose ``Backend`` it constructs, and that backend
-# reports it as its ``name``. ``uniserve serve --attention-backend`` forwards
-# its value to ``resolve`` unchanged, which accepts these names and
-# ``"auto"`` and refuses any other when a rank loads its model.
+# reports it as its ``name``. The serving option ``attention_backend``
+# reaches ``resolve`` unchanged, which accepts these names and ``"auto"``
+# and refuses any other when a rank loads its model.
 PROVIDERS = (
     "flash_attn",
     "flash_attn_4",

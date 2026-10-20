@@ -4,17 +4,16 @@
 //! at startup: a diffusers pipeline index selects a video model, planned against its
 //! conditioner's vision processor, and otherwise the root `config.json` selects a
 //! token-generating model with its chat template. [`InputProcessor::new`] then binds the
-//! capabilities the connected worker advertises ([`WorkerCapabilities`]) and the request
+//! generation limits the started workers report and the request
 //! renderer they complete ([`RequestRenderer`]), and the result is shared immutably by the
 //! serving runtime.
 //!
 //! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
-//! output processing. The chat and image entry points in the sibling `preprocessing` module
-//! route through `InputProcessor::preprocess_generation`, which produces a [`GenerationRequest`]
-//! and the [`ResponseOptions`] retained by the frontend, and delegates SenseNova and Bagel
-//! inputs to the sibling `omni` module; `omni` reads the `pub(super)` fields.
-//! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
-//! through the deployment's `VideoService`.
+//! output processing. [`InputProcessor::preprocess`] tokenizes a `GenerateRequest` into a
+//! [`GenerationRequest`] and the [`OutputParams`] retained by the frontend, and delegates
+//! SenseNova and Bagel inputs to the sibling `omni` module; `omni` reads the `pub(super)`
+//! fields.
+//! A MiniMax H3 deployment's `VideoService` produces its `DiffusionRequest`s.
 
 use std::sync::Arc;
 
@@ -26,23 +25,21 @@ use thiserror::Error;
 use uniserve_core::video::plan::ProcessorConfig;
 use uniserve_core::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
-    ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
+    ImageGenerationConfig, ImageParams, RequestId, SamplingParams as EngineSamplingParams,
 };
 
-use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
-use crate::serving::chat::{
-    ChatOutputProcessor, ChatRequest, ChatTemplateLoadOptions, HfChatRenderer,
-    Qwen3ChatOutputProcessor,
-};
-use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
-use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
-use crate::serving::video::{ProcessedVideo, VideoService};
+use crate::serving::chat::template::MultimodalRenderInfo;
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest, HfChatRenderer};
+use crate::serving::input::{GenerateRequest, OutputParams, Prompt, SamplingParams};
+use crate::serving::sampling::resolve_max_tokens;
+use crate::serving::text::TextDecodeOptions;
+use crate::serving::video::VideoService;
 use crate::serving::{Result, ServeError};
 
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
 ///
-/// Preprocessing methods are synchronous and CPU-bound; `ServingRuntime` runs its request
+/// Preprocessing methods are synchronous and CPU-bound; `Engine` runs its request
 /// preprocessing on the blocking pool.
 pub struct InputProcessor {
     pub(super) config: ModelConfig,
@@ -59,9 +56,6 @@ pub struct InputProcessor {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// Required numerical checkpoint metadata is missing or contradictory.
-    #[error("invalid media checkpoint contract: {0}")]
-    MediaContract(String),
     /// The conditioner's processor configs cannot be read or disagree.
     #[error("invalid media checkpoint contract")]
     ProcessorConfig(#[source] uniserve_core::video::plan::ProcessorConfigError),
@@ -96,8 +90,12 @@ pub(crate) struct LoadedModel {
 
 /// What renders a loaded checkpoint's requests, fixed by its layout.
 pub(crate) enum LoadedRenderer {
-    /// A token model's chat template.
-    Chat(Box<HfChatRenderer>),
+    /// A token model's chat template, with the checkpoint files it was read
+    /// from, which the System One readout renders its own prompts from.
+    Chat {
+        renderer: Box<HfChatRenderer>,
+        files: ResolvedModelFiles,
+    },
     /// A video pipeline's conditioner vision processor geometry; the video
     /// service built from the denoiser handshake plans requests against it.
     Video(ProcessorConfig),
@@ -142,15 +140,12 @@ impl ModelConfig {
     /// A diffusers pipeline has no chat template and carries its conditioner's
     /// vision processor geometry instead. The returned `max_model_len` is the
     /// configured one, else, for a root configuration, its
-    /// `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
+    /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
     pub(crate) async fn load(
-        config: &crate::Config,
+        config: &crate::options::ServeConfig,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
-        let served_name = config
-            .served_model_name
-            .clone()
-            .unwrap_or_else(|| config.model.clone());
+        let max_model_len = config.max_model_len.map(std::num::NonZeroU32::get);
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
@@ -159,7 +154,7 @@ impl ModelConfig {
         // workers do. A family that a root `config.json` describes is
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
-        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
+        if let Some(pipeline) = PipelineCheckpoint::resolve(config.model()).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
                     class_name: pipeline.class_name().to_owned(),
@@ -174,8 +169,7 @@ impl ModelConfig {
                 }
                 let vision = ProcessorConfig::read(&processor[0], &processor[1])
                     .map_err(ModelResolutionError::ProcessorConfig)?;
-                let model =
-                    Self::from_pipeline(&served_name, description, config.engine.max_model_len)?;
+                let model = Self::from_pipeline(description, max_model_len)?;
                 return Ok(LoadedModel {
                     config: model,
                     tokenizer,
@@ -184,16 +178,10 @@ impl ModelConfig {
             }
         }
 
-        let files = ResolvedModelFiles::new(&config.model).await?;
+        let files = ResolvedModelFiles::new(config.model()).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
-        let model = Self::from_files(
-            &served_name,
-            &config.model,
-            &files,
-            config.engine.max_model_len,
-            tokenizer.as_ref(),
-        )
-        .await?;
+        let model =
+            Self::from_files(config.model(), &files, max_model_len, tokenizer.as_ref()).await?;
         // DiffusionGemma's template renders each image part itself, as one
         // image token that preprocessing expands; the omni models replace
         // image parts before rendering.
@@ -203,22 +191,14 @@ impl ModelConfig {
                 .map(|placeholder_token| MultimodalRenderInfo { placeholder_token }),
             _ => None,
         };
-        let renderer = HfChatRenderer::load(
-            &files,
-            ChatTemplateLoadOptions {
-                chat_template_content_format: config.chat_template_content_format,
-                chat_template: config.chat_template.clone(),
-                default_chat_template_kwargs: config
-                    .default_chat_template_kwargs
-                    .clone()
-                    .unwrap_or_default(),
-            },
-            multimodal,
-        )?;
+        let renderer = HfChatRenderer::load(&files, &config.chat_config, multimodal)?;
         Ok(LoadedModel {
             config: model,
             tokenizer,
-            renderer: LoadedRenderer::Chat(Box::new(renderer)),
+            renderer: LoadedRenderer::Chat {
+                renderer: Box::new(renderer),
+                files,
+            },
         })
     }
 
@@ -240,16 +220,13 @@ impl ModelConfig {
         model_dtype: uniserve_core::ModelDtype,
     ) -> uniserve_core::GenerationLimits {
         match &self.parameters {
-            ModelParameters::Qwen3 => uniserve_core::GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
-            ModelParameters::MiniMaxH3 => uniserve_core::GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
+            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
+                uniserve_core::GenerationLimits {
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                }
+            }
             ModelParameters::SenseNova(profile) => profile.runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
             // A readout prefills text and encoded images and denoises its
@@ -269,34 +246,24 @@ impl ModelConfig {
     }
 }
 
-/// Capabilities the loaded worker advertises during its startup handshake.
-///
-/// These are facts about the running worker rather than the checkpoint, so they
-/// arrive after the engine connects and are bound onto the model once.
-pub struct WorkerCapabilities {
-    /// Runtime generation features and resource limits.
-    pub limits: GenerationLimits,
-}
-
 impl InputProcessor {
-    /// Binds model resources to verified worker capabilities without rebuilding model data.
+    /// Binds model resources to the generation limits the started workers
+    /// report in their handshake, without rebuilding model data.
     ///
     /// `renderer` is the checkpoint's chat template, or the video service a video pipeline's
     /// denoiser handshake built.
     ///
     /// # Errors
     ///
-    /// Returns `ServeError::ModelResolution` with `MissingFeature` when the worker limits do
-    /// not cover the features the configured model needs.
+    /// Returns [`ModelResolutionError::MissingFeature`] when `limits` do not cover the features
+    /// the configured model needs.
     pub fn new(
         config: ModelConfig,
         tokenizer: DynTokenizer,
         renderer: RequestRenderer,
-        worker: WorkerCapabilities,
+        limits: GenerationLimits,
         parse_reasoning: bool,
-    ) -> Result<Self> {
-        let WorkerCapabilities { limits } = worker;
-
+    ) -> std::result::Result<Self, ModelResolutionError> {
         let needs = match &config.parameters {
             ModelParameters::Qwen3 => GenerationFeatures::UNDERSTANDING,
             // The System One readout denoises canvases over its prompt.
@@ -335,11 +302,6 @@ impl InputProcessor {
         &self.config
     }
 
-    /// Public served-model name.
-    pub fn served_model_name(&self) -> &str {
-        &self.config.served_name
-    }
-
     /// The chat template of a token model; `None` for a video pipeline.
     pub(super) fn chat_renderer(&self) -> Option<&HfChatRenderer> {
         match &self.renderer {
@@ -356,41 +318,14 @@ impl InputProcessor {
         }
     }
 
-    /// The served video contract, as `GET /v1/capabilities` reports it.
-    ///
-    /// Returns `Value::Null` for a model that serves no video; the Dynamo worker uses that to
-    /// refuse a non-MiniMax H3 checkpoint. See `VideoService::capabilities`.
+    /// The served video contract, as `GET /v1/capabilities` reports it;
+    /// `Value::Null` for a model that serves no video. See
+    /// `VideoService::capabilities`.
     pub fn video_capabilities(&self) -> serde_json::Value {
         self.video_service()
             .map_or(serde_json::Value::Null, |video| {
                 video.capabilities(self.config.max_model_len)
             })
-    }
-
-    /// Validates a video request, fetches, probes and plans its media, presents its prompt,
-    /// and sizes it for direct engine submission.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API error when the model serves no video, the request names another model,
-    /// or `VideoService::process` refuses it.
-    pub async fn preprocess_video_request(
-        &self,
-        request_id: &crate::serving::ServeRequestId,
-        request: &crate::openai::VideoGenerationRequest,
-    ) -> std::result::Result<ProcessedVideo, crate::openai::ApiError> {
-        let Some(video) = self.video_service() else {
-            return Err(crate::openai::serve_error_to_api(
-                ServeError::UnsupportedFeature {
-                    request_id: request_id.clone(),
-                    feature: "video_generation",
-                },
-            ));
-        };
-        crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
-        video
-            .process(request_id, request, self.config.max_model_len)
-            .await
     }
 
     /// Returns whether the model supports image output.
@@ -440,13 +375,13 @@ impl InputProcessor {
     /// carries an input image.
     fn validate_generation_features(
         &self,
-        request_id: &crate::serving::ServeRequestId,
-        prompt: &PromptInput,
+        request_id: &str,
+        prompt: &Prompt,
         has_input_image: bool,
-        modalities: crate::serving::ModalitySelection,
+        constraint: GenerationConstraint,
     ) -> Result<()> {
         let reject = |feature| ServeError::UnsupportedFeature {
-            request_id: request_id.clone(),
+            request_id: request_id.to_owned(),
             feature,
         };
         if matches!(self.config.parameters, ModelParameters::MiniMaxH3) {
@@ -455,10 +390,10 @@ impl InputProcessor {
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if modalities.includes_image() && !self.supports_image_output() {
+        if constraint != GenerationConstraint::UndOnly && !self.supports_image_output() {
             return Err(reject("image_output"));
         }
-        if let PromptInput::Chat(chat) = prompt {
+        if let Prompt::Chat(chat) = prompt {
             // Tool definitions, prior assistant tool calls, and tool responses all require a
             // model that parses tool calls.
             let uses_tools = !chat.tools.is_empty()
@@ -485,13 +420,13 @@ impl InputProcessor {
                 &profile.image_generation,
                 &profile.image_encoders,
                 has_input_image,
-                modalities,
+                constraint,
             ),
             ModelParameters::Bagel(profile) => omni_required_features(
                 &profile.image_generation,
                 &profile.image_encoders,
                 has_input_image,
-                modalities,
+                constraint,
             ),
             // Block diffusion denoises canvases over a prompt whose images the
             // vision encoder writes into it.
@@ -512,117 +447,109 @@ impl InputProcessor {
             .map_err(|feature| reject(feature.name()))
     }
 
-    /// Tokenizes model input and resolves its final engine and output requirements.
+    /// Tokenizes one generation request into its engine request and the
+    /// output parameters the frontend keeps.
     ///
-    /// `images` are the resolved `image_url` parts of a chat prompt, in `chat_image_urls`
-    /// order; a text prompt has none.
+    /// `images` are the resolved `image_url` parts of a chat prompt, in
+    /// `ChatRequest::image_urls` order; a text prompt has none.
     ///
     /// # Errors
     ///
-    /// Returns `ServeError::UnsupportedFeature` from feature validation and
-    /// `ServeError::Tokenize` for every failure during tokenization, validation, and resource
-    /// sizing.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the validated fields of one generation request"
-    )]
-    pub(super) fn preprocess_generation(
+    /// Returns `ServeError::UnsupportedFeature` from feature validation,
+    /// `ServeError::UnsupportedSamplingControl` for a control the model's
+    /// generation does not define, and `ServeError::Tokenize` for every
+    /// failure during tokenization, validation, and resource sizing.
+    pub fn preprocess(
         &self,
-        request_id: crate::serving::ServeRequestId,
-        prompt: PromptInput,
+        request: GenerateRequest,
         images: Vec<crate::serving::ImageInput>,
-        modalities: crate::serving::ModalitySelection,
-        sampling: crate::serving::SamplingConfig,
-        stop: crate::serving::StopConfig,
-        negative_text: Option<String>,
-        image_gen: Option<crate::serving::ImageGenControls>,
-        cache: CachePolicy,
-        priority: i32,
-        output: OutputDetail,
-        decode: crate::serving::DecodeControls,
-    ) -> Result<(GenerationRequest, ResponseOptions)> {
-        let has_input_image = !images.is_empty()
-            || matches!(&prompt, PromptInput::Chat(chat) if chat.has_multimodal());
-        self.validate_generation_features(&request_id, &prompt, has_input_image, modalities)?;
+    ) -> Result<(GenerationRequest, OutputParams)> {
+        let GenerateRequest {
+            request_id,
+            prompt,
+            constraint,
+            sampling_params,
+            image_params,
+            priority,
+            cache_salt,
+        } = request;
+        let has_input_image =
+            !images.is_empty() || matches!(&prompt, Prompt::Chat(chat) if chat.has_multimodal());
+        self.validate_generation_features(&request_id, &prompt, has_input_image, constraint)?;
         if matches!(self.config.parameters, ModelParameters::DiffusionGemma(_)) {
             crate::serving::diffusion_gemma::refuse_token_sampling_controls(
                 &request_id,
-                &sampling,
-                &stop,
+                &sampling_params,
             )?;
         }
-        let constraint = crate::serving::omni::generation_constraint(modalities);
 
         let mut generation = GenerationRequest {
-            // `EngineClient` stamps the identifier it reserved for the request at submission.
+            // `Engine::submit` stamps the engine's identifier for the request.
             request_id: RequestId::default(),
             prompt_token_ids: Vec::new(),
             negative_prompt_token_ids: Vec::new(),
             multimodal_inputs: Default::default(),
             constraint,
-            sampling: SamplingParams {
-                // An image-generation seed takes precedence over the text sampling seed.
-                seed: image_gen
+            sampling: EngineSamplingParams {
+                // The request's one seed: an image-generation seed takes
+                // precedence over the text sampling seed, whose signed bit
+                // pattern seeds the engine.
+                seed: image_params
                     .as_ref()
                     .and_then(|image| image.seed)
-                    .or_else(|| sampling.seed.map(|seed| seed as u64)),
-                ..SamplingParams::default()
+                    .or_else(|| sampling_params.seed.map(|seed| seed as u64)),
+                ..EngineSamplingParams::default()
             },
             image: ImageParams::default(),
             max_images: 1,
             max_und_tokens: 0,
             include_stop_token: false,
-            stop_strings: stop.stop_strings.clone(),
-            stop_token_ids: stop.stop_token_ids.clone(),
+            stop_strings: sampling_params.stop.clone(),
+            stop_token_ids: sampling_params.stop_token_ids.clone(),
             priority,
-            cache,
+            cache: CachePolicy {
+                isolation_key: crate::serving::cache_isolation_key(cache_salt.as_deref()),
+                ..CachePolicy::default()
+            },
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
         };
-        let mut decode = TextDecodeOptions {
-            skip_special_tokens: decode.skip_special_tokens,
-            include_stop_str_in_output: decode.include_stop_string_in_output,
-            stop_strings: (!stop.stop_strings.is_empty()).then(|| stop.stop_strings.clone()),
-            min_tokens: sampling.min_tokens.unwrap_or(0),
-        };
+        let mut decode = sampling_params.decode_options();
 
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        let output_processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
-            let output_processor = match &self.config.parameters {
+        let processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
+            let processor = match &self.config.parameters {
                 ModelParameters::Qwen3 => self.preprocess_qwen3_input(
                     chat_only(prompt),
-                    &sampling,
-                    &stop,
+                    &sampling_params,
                     &mut generation,
                     &mut decode,
                 )?,
-                ModelParameters::SenseNova(profile) => crate::serving::omni::preprocess_sensenova(
+                ModelParameters::SenseNova(profile) => crate::serving::omni::preprocess_omni(
                     profile,
                     self,
                     &request_id,
                     prompt,
                     images,
-                    negative_text,
-                    image_gen,
+                    image_params,
                     &mut generation,
                 )?,
-                ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_bagel(
+                ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_omni(
                     profile,
                     self,
                     &request_id,
                     prompt,
                     images,
-                    negative_text,
-                    image_gen,
+                    image_params,
                     &mut generation,
                 )?,
                 ModelParameters::DiffusionGemma(profile) => self.preprocess_diffusion_gemma_input(
                     profile,
                     chat_only(prompt),
                     &images,
-                    &sampling,
+                    &sampling_params,
                     &mut generation,
                     &mut decode,
                 )?,
@@ -638,29 +565,27 @@ impl InputProcessor {
             } else {
                 crate::serving::omni::prepare_generation_resources(
                     self,
-                    &sampling,
-                    &stop,
+                    &sampling_params,
                     &mut generation,
                 )?;
             }
-            Ok(output_processor)
+            Ok(processor)
         })()
         .map_err(|source| ServeError::Tokenize {
             request_id: request_id.clone(),
             source,
         })?;
 
-        let response = ResponseOptions {
+        let output = OutputParams {
             tokenizer: Arc::clone(&self.tokenizer),
             // Detokenization needs the prompt after ownership moves to the engine.
             prompt_token_ids: generation.prompt_token_ids.clone(),
             decode,
-            emit_token_ids: matches!(output, OutputDetail::Tokens | OutputDetail::Logprobs),
-            prompt_logprobs_requested: generation.sampling.prompt_logprobs_requested(),
-            generated_logprobs_requested: generation.sampling.generated_logprobs_requested(),
-            output_processor,
+            prompt_logprobs: generation.sampling.prompt_logprobs_requested(),
+            logprobs: generation.sampling.generated_logprobs_requested(),
+            processor,
         };
-        Ok((generation, response))
+        Ok((generation, output))
     }
 }
 
@@ -668,10 +593,10 @@ impl InputProcessor {
 ///
 /// Only an image-generation request sends a text prompt, and feature validation
 /// refuses it for a model without image output.
-fn chat_only(prompt: PromptInput) -> ChatRequest {
+fn chat_only(prompt: Prompt) -> ChatRequest {
     match prompt {
-        PromptInput::Chat(chat) => chat,
-        PromptInput::Text(_) => {
+        Prompt::Chat(chat) => chat,
+        Prompt::Text { .. } => {
             unreachable!("a text prompt is image generation, refused above for a chat-only model")
         }
     }
@@ -698,13 +623,13 @@ fn validate_runtime_features(
     config: &ModelConfig,
     limits: &GenerationLimits,
     needs: GenerationFeatures,
-) -> Result<()> {
-    limits.covers(needs).map_err(|feature| {
-        ServeError::ModelResolution(ModelResolutionError::MissingFeature {
+) -> std::result::Result<(), ModelResolutionError> {
+    limits
+        .covers(needs)
+        .map_err(|feature| ModelResolutionError::MissingFeature {
             description: config.description().id(),
             feature,
         })
-    })
 }
 
 /// Returns the runtime features required for multimodal serving.
@@ -715,10 +640,8 @@ fn omni_required_features(
     policy: &ImageGenerationConfig,
     image_encoders: &[uniserve_core::ImageEncoderInput],
     has_input_image: bool,
-    modalities: crate::serving::ModalitySelection,
+    constraint: GenerationConstraint,
 ) -> GenerationFeatures {
-    let constraint = crate::serving::omni::generation_constraint(modalities);
-
     let context_steps = if has_input_image {
         image_encoders
             .iter()
@@ -734,16 +657,14 @@ impl InputProcessor {
     /// Renders a Qwen chat prompt and fills its token, sampling, and cache requirements.
     fn preprocess_qwen3_input(
         &self,
-        mut chat_request: ChatRequest,
-        controls: &crate::serving::SamplingConfig,
-        stop: &crate::serving::StopConfig,
+        chat_request: ChatRequest,
+        sampling_params: &SamplingParams,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
-    ) -> std::result::Result<OutputProcessorPolicy, crate::serving::TokenizeError> {
-        chat_request.decode_options = decode.clone();
+    ) -> std::result::Result<ChatOutputProcessor, crate::serving::TokenizeError> {
         chat_request.validate()?;
-        let processor = Qwen3ChatOutputProcessor::new(
-            &mut chat_request,
+        let processor = ChatOutputProcessor::qwen3(
+            &chat_request,
             std::sync::Arc::clone(&self.tokenizer),
             self.parse_reasoning,
         )?;
@@ -752,12 +673,10 @@ impl InputProcessor {
             .ok_or(crate::serving::chat::Error::MissingChatTemplate)?
             .render(&chat_request)?;
         let prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
-        let skip_special_tokens = chat_request.decode_options.skip_special_tokens;
-        let output_processor = OutputProcessorPolicy::Chat(ChatOutputProcessor::Qwen3(processor));
 
         let prompt_len = prompt_token_ids.len() as u32;
         let (sampling, max_tokens, stop_token_ids) =
-            self.resolve_sampling(controls, stop, prompt_len)?;
+            self.resolve_sampling(sampling_params, generation.sampling.seed, prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
         generation.sampling = sampling;
@@ -767,17 +686,19 @@ impl InputProcessor {
         // Prompt logprobs require computation for every prompt token, which a prefix-cache
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
-        decode.skip_special_tokens = skip_special_tokens;
-        Ok(output_processor)
+        Ok(processor)
     }
 
-    /// Resolves model defaults and request controls into validated engine sampling parameters.
+    /// Resolves model defaults and request controls into validated engine
+    /// sampling parameters under the request's resolved `seed`, with the
+    /// generation length and the stop tokens.
     fn resolve_sampling(
         &self,
-        sampling: &crate::serving::SamplingConfig,
-        stop: &crate::serving::StopConfig,
+        sampling: &SamplingParams,
+        seed: Option<u64>,
         prompt_len: u32,
-    ) -> std::result::Result<(SamplingParams, u32, Vec<u32>), crate::serving::TokenizeError> {
+    ) -> std::result::Result<(EngineSamplingParams, u32, Vec<u32>), crate::serving::TokenizeError>
+    {
         let defaults = &self.config.sampling_defaults;
 
         let max_tokens = resolve_max_tokens(
@@ -790,7 +711,7 @@ impl InputProcessor {
 
         // Unless the request ignores EOS, the checkpoint's EOS ids other than the primary one
         // become explicit stop tokens.
-        let mut stop_token_ids = stop.stop_token_ids.clone();
+        let mut stop_token_ids = sampling.stop_token_ids.clone();
         if !sampling.ignore_eos {
             for token_id in self
                 .config
@@ -811,15 +732,7 @@ impl InputProcessor {
             });
         }
 
-        let mut core = SamplingParams {
-            temperature: defaults.temperature.unwrap_or(1.0),
-            top_k: defaults.top_k.unwrap_or(0),
-            top_p: defaults.top_p.unwrap_or(1.0),
-            min_p: defaults.min_p.unwrap_or(0.0),
-            repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
-            ..SamplingParams::default()
-        };
-        super::sampling::apply_sampling(&self.tokenizer, sampling, stop, &mut core)?;
+        let core = super::sampling::resolve_sampling(&self.tokenizer, defaults, sampling, seed)?;
 
         Ok((core, max_tokens, stop_token_ids))
     }
@@ -836,10 +749,10 @@ mod tests {
     use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
 
     use super::{LoadedModel, LoadedRenderer};
-    use crate::Config;
+    use crate::options::ServeConfig;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
-    use crate::serving::{InputProcessor, RequestRenderer, ServeRequestId, WorkerCapabilities};
+    use crate::serving::{InputProcessor, RequestRenderer};
 
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
     /// transformers `config.json` beside a `DiffusionGemmaPipeline` diffusers
@@ -924,11 +837,11 @@ mod tests {
         directory
     }
 
-    fn config(directory: &TempDir) -> Config {
-        Config {
-            model: directory.path().to_str().unwrap().to_owned(),
+    fn config(directory: &TempDir) -> ServeConfig {
+        ServeConfig {
+            model: Some(directory.path().to_str().unwrap().to_owned()),
             served_model_name: Some("diffusion-gemma".to_owned()),
-            ..Config::default()
+            ..ServeConfig::default()
         }
     }
 
@@ -949,11 +862,11 @@ mod tests {
         assert_eq!(model.description(), ModelDescription::DiffusionGemma);
         assert_eq!(model.max_model_len, 262_144);
         assert!(model.eos_token_ids.is_superset(&[1, 50, 106].into()));
-        assert!(matches!(renderer, LoadedRenderer::Chat(_)));
+        assert!(matches!(renderer, LoadedRenderer::Chat { .. }));
         let ModelParameters::DiffusionGemma(profile) = &model.parameters else {
             unreachable!("the description is DiffusionGemma");
         };
-        assert_eq!(profile.canvas_length, 256);
+        assert_eq!(profile.sampling.canvas_length, 256);
         assert_eq!(
             profile.tokens.mask,
             tokenizer.token_to_id("<mask>").unwrap()
@@ -962,7 +875,7 @@ mod tests {
             profile.tokens.turn_end,
             tokenizer.token_to_id("<turn|>").unwrap()
         );
-        assert_eq!(profile.denoising.max_denoising_steps, 48);
+        assert_eq!(profile.sampling.max_steps, 48);
         assert!(!profile.quantized);
     }
 
@@ -974,37 +887,55 @@ mod tests {
             tokenizer,
             renderer,
             ..
-        } = ModelConfig::load(&Config {
-            engine: crate::EngineSettings {
-                max_model_len: Some(max_model_len),
-                ..crate::EngineSettings::default()
-            },
+        } = ModelConfig::load(&ServeConfig {
+            max_model_len: std::num::NonZeroU32::new(max_model_len),
             ..config(directory)
         })
         .await
         .unwrap();
-        let LoadedRenderer::Chat(renderer) = renderer else {
+        let LoadedRenderer::Chat { renderer, .. } = renderer else {
             unreachable!("a DiffusionGemma checkpoint renders chat");
         };
         InputProcessor::new(
             model,
             tokenizer,
             RequestRenderer::Chat(*renderer),
-            WorkerCapabilities {
-                limits: GenerationLimits {
-                    features: GenerationFeatures::TOKEN_DENOISING
-                        | GenerationFeatures::VISION_ENCODE,
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    max_vit_grid_tokens: 280,
-                    max_vision_feature_bytes: u64::MAX,
-                    encoder_cache_entries: u32::MAX,
-                    ..Default::default()
-                },
+            GenerationLimits {
+                features: GenerationFeatures::TOKEN_DENOISING | GenerationFeatures::VISION_ENCODE,
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                max_vit_grid_tokens: 280,
+                max_vision_feature_bytes: u64::MAX,
+                encoder_cache_entries: u32::MAX,
+                ..Default::default()
             },
             true,
         )
         .unwrap()
+    }
+
+    /// Preprocesses a chat completion as its route lowers it, answering a
+    /// refusal as the route does.
+    fn preprocess_chat(
+        processor: &InputProcessor,
+        request_id: String,
+        request: crate::openai::ChatCompletionRequest,
+        images: Vec<crate::serving::ImageInput>,
+    ) -> Result<
+        (
+            uniserve_core::GenerationRequest,
+            crate::serving::OutputParams,
+        ),
+        crate::openai::ApiError,
+    > {
+        let (request, _) = crate::openai::chat_completions::lower_chat_request(
+            request_id,
+            "diffusion-gemma",
+            request,
+        )?;
+        processor
+            .preprocess(request, images)
+            .map_err(crate::openai::ApiError::from)
     }
 
     fn chat_request(fields: serde_json::Value) -> crate::openai::ChatCompletionRequest {
@@ -1027,24 +958,24 @@ mod tests {
         let directory = indexed_checkpoint();
         let processor = diffusion_gemma_processor(&directory, 65_536).await;
 
-        let (generation, _) = processor
-            .preprocess_chat_request(
-                ServeRequestId::new("chat"),
-                chat_request(json!({
-                    "seed": 5,
-                    "max_completion_tokens": 300,
-                    "stop": ["END"],
-                })),
-                Vec::new(),
-            )
-            .unwrap();
+        let (generation, _) = preprocess_chat(
+            &processor,
+            String::from("chat"),
+            chat_request(json!({
+                "seed": 5,
+                "max_completion_tokens": 300,
+                "stop": ["END"],
+            })),
+            Vec::new(),
+        )
+        .unwrap();
         // Every canvas the deployment generates runs under the profile's
         // sampling, with which the engine and its ranks are launched.
         let ModelParameters::DiffusionGemma(profile) = &processor.config().parameters else {
             unreachable!("the processor serves DiffusionGemma");
         };
         assert_eq!(
-            crate::serving::canvas_sampling(profile),
+            profile.sampling,
             CanvasSampling {
                 canvas_length: 256,
                 max_steps: 48,
@@ -1066,13 +997,13 @@ mod tests {
         );
         assert!(generation.multimodal_inputs.images.is_empty());
 
-        let (unseeded, _) = processor
-            .preprocess_chat_request(
-                ServeRequestId::new("unseeded"),
-                chat_request(json!({})),
-                Vec::new(),
-            )
-            .unwrap();
+        let (unseeded, _) = preprocess_chat(
+            &processor,
+            String::from("unseeded"),
+            chat_request(json!({})),
+            Vec::new(),
+        )
+        .unwrap();
         assert!(unseeded.sampling.seed.is_some());
         // The checkpoint's `max_new_tokens` is the default length.
         assert_eq!(unseeded.max_und_tokens, 256);
@@ -1084,24 +1015,24 @@ mod tests {
         let directory = indexed_checkpoint();
         // `<bos>Hello` is six tokens, which leave 594 positions: two canvases.
         let processor = diffusion_gemma_processor(&directory, 600).await;
-        let (generation, _) = processor
-            .preprocess_chat_request(
-                ServeRequestId::new("long"),
-                chat_request(json!({"max_completion_tokens": 1000})),
-                Vec::new(),
-            )
-            .unwrap();
+        let (generation, _) = preprocess_chat(
+            &processor,
+            String::from("long"),
+            chat_request(json!({"max_completion_tokens": 1000})),
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(generation.max_und_tokens, 512);
 
         let processor = diffusion_gemma_processor(&directory, 200).await;
-        let error = processor
-            .preprocess_chat_request(
-                ServeRequestId::new("full"),
-                chat_request(json!({})),
-                Vec::new(),
-            )
-            .err()
-            .unwrap();
+        let error = preprocess_chat(
+            &processor,
+            String::from("full"),
+            chat_request(json!({})),
+            Vec::new(),
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.status_code().as_u16(), 400);
         let message = error.to_error_response().error.message;
         assert!(message.contains("256-token canvas"), "{message}");
@@ -1125,9 +1056,8 @@ mod tests {
                 {"type": "text", "text": "What is this?"},
             ]}],
         }));
-        let (generation, _) = processor
-            .preprocess_chat_request(ServeRequestId::new("image"), request, vec![image])
-            .unwrap();
+        let (generation, _) =
+            preprocess_chat(&processor, String::from("image"), request, vec![image]).unwrap();
 
         // The image's soft-token run leaves the prompt between `<|image>` and
         // `<image|>`; the image enters there with one position and one cache
@@ -1197,14 +1127,14 @@ mod tests {
             ("min_tokens", json!(3)),
             ("ignore_eos", json!(true)),
         ] {
-            let error = processor
-                .preprocess_chat_request(
-                    ServeRequestId::new("refused"),
-                    chat_request(json!({ control: value })),
-                    Vec::new(),
-                )
-                .err()
-                .unwrap();
+            let error = preprocess_chat(
+                &processor,
+                String::from("refused"),
+                chat_request(json!({ control: value })),
+                Vec::new(),
+            )
+            .err()
+            .unwrap();
             assert_eq!(error.status_code().as_u16(), 400, "{control}");
             let body = error.to_error_response().error;
             assert_eq!(body.param.as_deref(), Some(control));

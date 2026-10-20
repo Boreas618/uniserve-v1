@@ -1,9 +1,14 @@
-//! Listener abstraction for TCP, Unix-domain, and inherited sockets.
+//! Listener abstraction for TCP and Unix-domain sockets.
 //!
 //! [`Listener`] presents a single accept interface to Axum over either a TCP or
-//! a Unix-domain listener, obtained according to `HttpListenerMode`.
-//! `crate::http::serve` binds it, logs its inherent `local_addr` string, and
-//! wraps it with `tap_io` to enable `TCP_NODELAY` on TCP connections only.
+//! a Unix-domain listener, bound as `server_config` states. `crate::http`
+//! binds it and logs its inherent `local_addr` string.
+//!
+//! Every accepted TCP connection takes `TCP_NODELAY`, as vLLM's Rust listener
+//! sets it on accept: a streamed response writes each SSE event as its own
+//! small frame, which Nagle's algorithm would hold back until the previous
+//! frame is acknowledged. Python servers get the option from asyncio's TCP
+//! transports.
 //!
 //! A Unix-domain socket bound at a path leaves its file behind when the socket
 //! closes. The listener therefore owns the file of a socket it binds: binding
@@ -11,17 +16,14 @@
 //! listener (at shutdown) removes the file again.
 
 use std::io::{ErrorKind, Result};
-use std::net::TcpListener as StdTcpListener;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 
-use socket2::Socket;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
+use tracing::trace;
 
-use crate::HttpListenerMode;
+use crate::options::ServerOptions;
 
 /// Runtime listener type used by the OpenAI-compatible HTTP server, which is
 /// either a TCP listener or a Unix-domain listener.
@@ -30,9 +32,8 @@ pub(crate) enum Listener {
     Tcp(TcpListener),
     Unix {
         listener: UnixListener,
-        /// The socket's file when this process bound it at a path; `None` for
-        /// an inherited socket, whose file belongs to its supplier.
-        _socket_file: Option<SocketFile>,
+        /// The socket's file, removed when the listener is dropped.
+        _socket_file: SocketFile,
     },
 }
 
@@ -60,21 +61,19 @@ impl Drop for SocketFile {
 }
 
 impl Listener {
-    /// Binds or adopts the listener described by the frontend configuration.
+    /// Binds the listener `server` states: a Unix-domain socket at `uds`,
+    /// else TCP on `host` and `port`.
     ///
-    /// For inherited sockets, the concrete listener kind is detected from the
-    /// socket family of the supplied file descriptor. `BindUnix` first removes
-    /// a stale socket file at its path (see `remove_stale_socket`); it fails
-    /// with `EADDRINUSE` when the path holds a live server's socket or a file
-    /// that is not a socket. The bound socket's file is removed when the
-    /// listener is dropped.
-    pub(crate) async fn bind(mode: &HttpListenerMode) -> Result<Self> {
-        match mode {
-            HttpListenerMode::BindTcp { host, port } => {
-                Ok(Self::Tcp(TcpListener::bind((host.as_str(), *port)).await?))
-            }
-            HttpListenerMode::BindUnix { path } => Self::bind_unix(Path::new(path)).await,
-            HttpListenerMode::InheritedFd { fd } => Self::from_inherited_fd(*fd),
+    /// Binding a Unix-domain socket first removes a stale socket file at its
+    /// path (see `remove_stale_socket`); it fails with `EADDRINUSE` when the
+    /// path holds a live server's socket or a file that is not a socket. The
+    /// bound socket's file is removed when the listener is dropped.
+    pub(crate) async fn bind(server: &ServerOptions) -> Result<Self> {
+        match &server.uds {
+            Some(path) => Self::bind_unix(Path::new(path)).await,
+            None => Ok(Self::Tcp(
+                TcpListener::bind((server.host.as_str(), server.port)).await?,
+            )),
         }
     }
 
@@ -85,11 +84,11 @@ impl Listener {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self::Unix {
             listener,
-            _socket_file: Some(SocketFile {
+            _socket_file: SocketFile {
                 path: path.to_owned(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            }),
+            },
         })
     }
 
@@ -102,56 +101,6 @@ impl Listener {
                 Some(path) => format!("unix:{}", path.display()),
                 None => "unix:<unnamed>".to_string(),
             }),
-        }
-    }
-
-    /// Adopts an inherited stream socket and prepares it for asynchronous accepts.
-    ///
-    /// The descriptor must be a bound stream socket; it need not be listening
-    /// yet. Returns `EBADF` for a negative descriptor, and the underlying error
-    /// when the descriptor is not open or when `listen`, `set_nonblocking`,
-    /// the address lookup, or Tokio registration fails. Once the descriptor is
-    /// adopted, any later failure closes it.
-    fn from_inherited_fd(fd: i32) -> Result<Self> {
-        // Validate the raw integer before taking ownership of it. `OwnedFd` assumes
-        // the fd is open and will `close(2)` it on drop, so handing it a negative or
-        // already-closed descriptor is undefined behavior and could close an unrelated
-        // fd. A non-negative value plus a successful `fcntl(F_GETFD)` probe confirms the
-        // descriptor is open before we adopt it.
-        if fd < 0 {
-            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
-        }
-        // SAFETY: F_GETFD only reads the descriptor flags of `fd`; the call takes no
-        // pointers and does not change who owns the descriptor.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // SAFETY: `fd` was just validated as a non-negative, open descriptor, and we
-        // take ownership of it exactly once to create a single listener.
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let socket = Socket::from(owned_fd);
-
-        // The supplier may hand over a socket that is only bound, so this side
-        // puts it into the listening state. Tokio's `from_std` requires the
-        // socket to be non-blocking already.
-        socket.listen(libc::SOMAXCONN)?;
-        socket.set_nonblocking(true)?;
-
-        // Any non-Unix family is treated as TCP.
-        if socket.local_addr()?.is_unix() {
-            // SAFETY: `into_raw_fd` releases the `Socket`'s ownership of its open
-            // descriptor, so the std listener becomes the only owner.
-            let std_listener = unsafe { StdUnixListener::from_raw_fd(socket.into_raw_fd()) };
-            Ok(Self::Unix {
-                listener: UnixListener::from_std(std_listener)?,
-                _socket_file: None,
-            })
-        } else {
-            // SAFETY: as above, the std listener becomes the only owner of the open
-            // descriptor that `into_raw_fd` releases.
-            let std_listener = unsafe { StdTcpListener::from_raw_fd(socket.into_raw_fd()) };
-            Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }
     }
 }
@@ -192,14 +141,19 @@ impl axum::serve::Listener for Listener {
     /// rather than Tokio's fallible inherent `accept`. Axum retries accept
     /// errors internally (logging and pausing on errors other than
     /// per-connection ones), so this future resolves only with a connection.
+    /// A TCP connection that refuses `TCP_NODELAY` is traced and served
+    /// without it.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match self {
             Self::Tcp(listener) => {
-                let (io, addr) = listener.accept().await;
+                let (io, addr) = axum::serve::Listener::accept(listener).await;
+                if let Err(error) = io.set_nodelay(true) {
+                    trace!(%error, "failed to enable TCP_NODELAY on an accepted connection");
+                }
                 (Either::Left(io), Either::Left(addr))
             }
             Self::Unix { listener, .. } => {
-                let (io, addr) = listener.accept().await;
+                let (io, addr) = axum::serve::Listener::accept(listener).await;
                 (Either::Right(io), Either::Right(addr))
             }
         }
@@ -216,46 +170,15 @@ impl axum::serve::Listener for Listener {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::os::fd::IntoRawFd;
-
-    use socket2::{Domain, SockAddr, Socket, Type};
-    use uuid::Uuid;
-
     use super::Listener;
-    use crate::HttpListenerMode;
+    use crate::options::ServerOptions;
 
-    // The inherited sockets in the family-detection tests are bound but not
-    // yet listening; `Listener::bind` must start listening on them and detect
-    // their family.
-    #[tokio::test(flavor = "current_thread")]
-    async fn inherited_fd_detects_tcp_listener_without_uds_hint() {
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        socket
-            .bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-            .unwrap();
-        let fd = socket.into_raw_fd();
-
-        let listener = Listener::bind(&HttpListenerMode::InheritedFd { fd })
-            .await
-            .unwrap();
-
-        assert!(matches!(listener, Listener::Tcp(_)));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn inherited_fd_detects_unix_listener_from_fd() {
-        let path = std::env::temp_dir().join(format!("uniserve-{}.sock", Uuid::new_v4()));
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
-        socket.bind(&SockAddr::unix(&path).unwrap()).unwrap();
-        let fd = socket.into_raw_fd();
-
-        let listener = Listener::bind(&HttpListenerMode::InheritedFd { fd })
-            .await
-            .unwrap();
-
-        assert!(matches!(listener, Listener::Unix { .. }));
-        let _ = std::fs::remove_file(path);
+    /// The server options of a Unix-domain socket at `path`.
+    fn uds(path: &std::path::Path) -> ServerOptions {
+        ServerOptions {
+            uds: Some(path.to_str().unwrap().to_owned()),
+            ..ServerOptions::default()
+        }
     }
 
     /// A socket file left by a server that exited without unlinking it (a
@@ -267,11 +190,7 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
 
-        let listener = Listener::bind(&HttpListenerMode::BindUnix {
-            path: path.to_str().unwrap().to_owned(),
-        })
-        .await
-        .unwrap();
+        let listener = Listener::bind(&uds(&path)).await.unwrap();
 
         assert!(matches!(listener, Listener::Unix { .. }));
         std::os::unix::net::UnixStream::connect(&path).unwrap();
@@ -283,9 +202,7 @@ mod tests {
     async fn dropping_a_unix_listener_removes_its_socket_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("uniserve.sock");
-        let mode = HttpListenerMode::BindUnix {
-            path: path.to_str().unwrap().to_owned(),
-        };
+        let mode = uds(&path);
 
         let listener = Listener::bind(&mode).await.unwrap();
         assert!(path.exists());
@@ -302,31 +219,19 @@ mod tests {
 
         let live = directory.path().join("live.sock");
         let server = std::os::unix::net::UnixListener::bind(&live).unwrap();
-        let error = Listener::bind(&HttpListenerMode::BindUnix {
-            path: live.to_str().unwrap().to_owned(),
-        })
-        .await
-        .expect_err("a live server's socket must not be taken over");
+        let error = Listener::bind(&uds(&live))
+            .await
+            .expect_err("a live server's socket must not be taken over");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         std::os::unix::net::UnixStream::connect(&live).unwrap();
         drop(server);
 
         let file = directory.path().join("data.sock");
         std::fs::write(&file, b"not a socket").unwrap();
-        let error = Listener::bind(&HttpListenerMode::BindUnix {
-            path: file.to_str().unwrap().to_owned(),
-        })
-        .await
-        .expect_err("a regular file must not be replaced");
+        let error = Listener::bind(&uds(&file))
+            .await
+            .expect_err("a regular file must not be replaced");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(std::fs::read(&file).unwrap(), b"not a socket");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn inherited_fd_rejects_negative_fd() {
-        let err = Listener::bind(&HttpListenerMode::InheritedFd { fd: -1 })
-            .await
-            .expect_err("a negative fd must be rejected, not adopted");
-        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 }

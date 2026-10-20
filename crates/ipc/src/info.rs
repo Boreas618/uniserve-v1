@@ -307,8 +307,9 @@ impl VideoDenoiserInfo {
 
     /// Checks that tasks are named once each, the schedule has an endpoint
     /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, every canvas is a positive raster named by
-    /// its own `(short_edge, aspect_ratio)` pair, and the reference limits
+    /// frame rule are declared, at least one canvas is prepared and each is a
+    /// positive raster named by its own `(short_edge, aspect_ratio)` pair,
+    /// and the reference limits
     /// bound each kind within the total, with an image edge where images
     /// are taken.
     pub fn validate(&self) -> ValidationResult<()> {
@@ -346,6 +347,10 @@ impl VideoDenoiserInfo {
                 <= references.total
                 && (references.images == 0 || references.image_short_edge > 0),
             "a video denoiser declares reference limits beyond their total or images without an edge"
+        );
+        ensure_valid!(
+            !self.canvases.is_empty(),
+            "a video denoiser prepared no canvas"
         );
         ensure_valid!(
             self.canvases.iter().all(|served| {

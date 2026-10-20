@@ -1,27 +1,23 @@
-//! Converts assistant text into tool-call-aware updates.
+//! The tool-call stage of [`ChatOutputProcessor`](super::ChatOutputProcessor).
 //!
-//! This is the second chat output stage. Visible `Text` deltas pass through
-//! the model's `ToolParser`; every other event is forwarded unchanged. A
-//! parser error does not fail the request: the stage logs it and forwards all
-//! later text unparsed. After a parse error, the input the parser has not
-//! represented in its output, such as a whole call whose header failed, is
-//! re-emitted as visible text. Finalization fails only while a published call
-//! is open; that call keeps the arguments already streamed.
+//! Visible text passes through the model's `ToolParser`; reasoning passes
+//! unchanged. A parser error does not fail the request: the stage logs it and
+//! forwards all later text unparsed. After a parse error, the input the
+//! parser has not represented in its output, such as a whole call whose
+//! header failed, is re-emitted as visible text. Finalization fails only
+//! while a published call is open; that call keeps the arguments already
+//! streamed.
 
-use asynk_strim_attr::{TryYielder, try_stream};
-use futures::{StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 
+use super::{AssistantEvent, generate_tool_call_id};
 use crate::profile::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
-use crate::serving::chat::AssistantBlockKind;
-use crate::serving::chat::output::processor::AssistantEvent;
-use crate::serving::chat::output::processor::generate_tool_call_id;
-use crate::serving::chat::{Error, Result};
+use crate::serving::chat::{AssistantBlockKind, Error, Result};
 
 /// Tool-stage state for one request.
-struct ToolState<P> {
-    parser: P,
+pub(super) struct ToolStage {
+    parser: Box<dyn ToolParser>,
     /// Set after a parse or finalization error; later text bypasses the parser.
     parser_failed: bool,
     /// Parser-local index of the tool call that later argument deltas extend.
@@ -30,9 +26,9 @@ struct ToolState<P> {
     open_call_index: Option<usize>,
 }
 
-impl<P: ToolParser> ToolState<P> {
+impl ToolStage {
     /// Creates the stage state around the request's tool parser.
-    fn new(parser: P) -> Self {
+    pub(super) fn new(parser: Box<dyn ToolParser>) -> Self {
         Self {
             parser,
             parser_failed: false,
@@ -41,13 +37,14 @@ impl<P: ToolParser> ToolState<P> {
     }
 
     /// Feeds visible text through incremental tool parsing with a visible-text
-    /// fallback.
+    /// fallback; reasoning, and all text after a parser error, passes
+    /// unchanged and closes the open call.
     ///
     /// On a parser error, the events parsed before the error are still
     /// emitted, followed by `ToolParser::reset`'s unrepresented input as
     /// visible text: for example the whole attempted call when its header
     /// failed, or the input after the arguments of an already published call.
-    fn process_text_delta(
+    pub(super) fn push(
         &mut self,
         kind: AssistantBlockKind,
         delta: String,
@@ -143,7 +140,7 @@ impl<P: ToolParser> ToolState<P> {
     /// published call is still open; that error is logged and produces no
     /// events, because the call's arguments have already been streamed and
     /// only wrapper text remains buffered.
-    fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
+    pub(super) fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
         if self.parser_failed {
             return Ok(Vec::new());
         }
@@ -166,80 +163,4 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
     if !delta.is_empty() {
         events.push(AssistantEvent::TextDelta { kind, delta });
     }
-}
-
-#[try_stream]
-/// Converts assistant text events into tool-call-aware events.
-///
-/// Without a parser the input stream is forwarded unchanged. Errors are
-/// `Error::ToolCallStreamInvariant` from inconsistent parser output or errors
-/// propagated from the upstream stage.
-pub(super) async fn tool_event_stream(
-    stream: impl futures::Stream<Item = Result<AssistantEvent>> + Send,
-    parser: Option<impl ToolParser>,
-    mut y: TryYielder<AssistantEvent, Error>,
-) -> Result<()> {
-    let Some(parser) = parser else {
-        pin_mut!(stream);
-        while let Some(event) = stream.next().await.transpose()? {
-            y.yield_ok(event).await;
-        }
-        return Ok(());
-    };
-
-    pin_mut!(stream);
-    let mut state = ToolState::new(parser);
-    while let Some(event) = stream.next().await.transpose()? {
-        match event {
-            event @ (AssistantEvent::ToolCallStart { .. }
-            | AssistantEvent::ToolCallArgumentsDelta { .. }) => y.yield_ok(event).await,
-            AssistantEvent::Start {
-                prompt_token_ids,
-                prompt_logprobs,
-                queued_at,
-                scheduled_at,
-            } => {
-                y.yield_ok(AssistantEvent::Start {
-                    prompt_token_ids,
-                    prompt_logprobs,
-                    queued_at,
-                    scheduled_at,
-                })
-                .await;
-            }
-            AssistantEvent::TextDelta { kind, delta } => {
-                for next in state.process_text_delta(kind, delta)? {
-                    y.yield_ok(next).await;
-                }
-            }
-            AssistantEvent::SampleDelta {
-                logprobs,
-                token_ids,
-            } => {
-                y.yield_ok(AssistantEvent::SampleDelta {
-                    logprobs,
-                    token_ids,
-                })
-                .await;
-            }
-            AssistantEvent::Done {
-                prompt_token_count,
-                output_token_count,
-                internal_token_count,
-                finish_reason,
-            } => {
-                for next in state.finish()? {
-                    y.yield_ok(next).await;
-                }
-                y.yield_ok(AssistantEvent::Done {
-                    prompt_token_count,
-                    output_token_count,
-                    internal_token_count,
-                    finish_reason,
-                })
-                .await;
-            }
-        }
-    }
-    Ok(())
 }

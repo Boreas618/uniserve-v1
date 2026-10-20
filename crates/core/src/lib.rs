@@ -112,6 +112,46 @@ impl std::fmt::Debug for CommandWaker {
     }
 }
 
+/// 64-bit FNV-1a over the bytes written to it.
+///
+/// The hash is stable across processes, builds and platforms, which the
+/// prefix-cache page hashes, encoder-cache keys and cache-isolation keys
+/// rely on; it is not collision resistant, so a match still needs an exact
+/// comparison wherever correctness depends on it.
+#[derive(Debug, Clone, Copy)]
+pub struct Fnv1a(u64);
+
+impl Fnv1a {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// Hashes `bytes` in one call.
+    pub fn hash(bytes: &[u8]) -> u64 {
+        let mut hasher = Self::default();
+        std::hash::Hasher::write(&mut hasher, bytes);
+        std::hash::Hasher::finish(&hasher)
+    }
+}
+
+impl Default for Fnv1a {
+    /// Starts from the FNV offset basis.
+    fn default() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+}
+
+impl std::hash::Hasher for Fnv1a {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Returns wall-clock time in fractional seconds since the Unix epoch.
 ///
 /// Times before the epoch clamp to zero.

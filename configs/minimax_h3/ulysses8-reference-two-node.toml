@@ -1,0 +1,44 @@
+# OmniRef on four GPUs of each of two hosts, rank-0 and rank-1: a Ulysses8
+# transformer_ref denoiser, a TP4 text encoder on rank-0, and a one-GPU media
+# reader on rank-0 whose decoded references the latent encoder's ranks on both
+# hosts read.
+
+[[workers]]
+id = "model"
+ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
+queue_depth = 6
+
+[workers.components.transformer_ref]
+sequence_parallel = { kind = "ulysses", ulysses_degree = 8 }
+
+[workers.components.text_encoder]
+ranks = [0, 1, 2, 3]
+tensor_parallel_size = 4
+
+[workers.components.video_decoder]
+
+[workers.components.audio_decoder]
+distribution = "temporal_units"
+
+[workers.components.latent_encoder]
+ranks = [4, 5, 6, 7, 0, 1, 2, 3]
+distribution = "temporal_units"
+
+[[workers]]
+id = "host"
+ranks = ["rank-0/cpu*4", "rank-1/cpu*4", "rank-0/cpu"]
+queue_depth = 6
+
+[workers.components.video_codec]
+ranks = [0, 1, 2, 3, 4, 5, 6, 7]
+
+[workers.components.muxer]
+ranks = [8]
+
+[[workers]]
+id = "reader"
+ranks = ["rank-0/cuda:0"]
+queue_depth = 6
+mem_fraction_static = 0.04
+
+[workers.components.media_reader]

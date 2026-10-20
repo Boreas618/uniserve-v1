@@ -15,15 +15,10 @@ const TTFT_BUCKETS: [f64; 22] = [
     0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
     20.0, 40.0, 80.0, 160.0, 640.0, 2560.0,
 ];
-const ITL_BUCKETS: [f64; 19] = [
-    0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0,
-    40.0, 80.0,
-];
 const REQUEST_LATENCY_BUCKETS: [f64; 21] = [
     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0, 240.0,
     480.0, 960.0, 1920.0, 7680.0,
 ];
-const REQUEST_PARAMS_N_BUCKETS: [f64; 5] = [1.0, 2.0, 5.0, 10.0, 20.0];
 
 /// Builds logarithmic 1-2-5 histogram boundaries through an exact upper bound.
 ///
@@ -53,16 +48,6 @@ fn time_to_first_token_histogram() -> Histogram {
     Histogram::new(TTFT_BUCKETS.iter().copied())
 }
 
-/// Builds the histogram used for latency between generated tokens.
-fn inter_token_latency_histogram() -> Histogram {
-    Histogram::new(ITL_BUCKETS.iter().copied())
-}
-
-/// Builds the histogram used for request time per generated token.
-fn request_time_per_output_token_histogram() -> Histogram {
-    Histogram::new(ITL_BUCKETS.iter().copied())
-}
-
 /// Builds the histogram used for end-to-end and lifecycle-phase latency.
 fn request_latency_histogram() -> Histogram {
     Histogram::new(REQUEST_LATENCY_BUCKETS.iter().copied())
@@ -76,11 +61,6 @@ fn request_token_count_histogram() -> Histogram {
     Histogram::new(build_1_2_5_buckets(131_072))
 }
 
-/// Builds the histogram used for requested candidate counts.
-fn request_params_n_histogram() -> Histogram {
-    Histogram::new(REQUEST_PARAMS_N_BUCKETS.iter().copied())
-}
-
 /// Labels identifying a terminal request outcome.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct FinishedReasonLabels {
@@ -92,21 +72,8 @@ pub struct FinishedReasonLabels {
     pub finished_reason: &'static str,
 }
 
-/// Labels identifying the source of prompt tokens.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct PromptTokenSourceLabels {
-    /// Served model identity.
-    pub model_name: String,
-    /// Engine instance index.
-    pub engine: u32,
-    /// Prompt-token origin such as local compute or cache.
-    pub source: &'static str,
-}
-
 /// Completion counter family keyed by terminal outcome.
 pub(crate) type FinishedReasonCounterFamily = Family<FinishedReasonLabels, U64Counter>;
-/// Prompt-token counter family keyed by token source.
-pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels, U64Counter>;
 
 /// Request-lifecycle Prometheus families.
 ///
@@ -115,46 +82,22 @@ pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels,
 /// `request_queue_time_seconds` for every such request, and `prompt_tokens`,
 /// `generation_tokens`, `request_prompt_tokens`, `request_generation_tokens`,
 /// `request_max_num_generation_tokens`, and `time_to_first_token_seconds` for
-/// one whose output reported its final usage. The remaining families need
-/// inputs the request lifecycle does not carry (per-token timestamps,
-/// per-request prefix-cache hits, preemptions, and request sampling
-/// parameters) and are registered without samples. The server's
-/// `StatsLogger` reads `prompt_tokens` and `generation_tokens` to log
-/// throughput.
+/// one whose output reported its final usage. The server's `StatsLogger`
+/// reads `prompt_tokens` and `generation_tokens` to log throughput.
 #[derive(MetricFamily)]
 pub struct RequestMetrics {
-    // Request-derived counters.
-    /// Cumulative request preemption count.
-    #[metric(
-        name = "uniserve:num_preemptions",
-        help = "Cumulative number of preemption events."
-    )]
-    pub num_preemptions: Family<EngineLabels, U64Counter>,
     /// Prompt tokens processed by each engine.
     #[metric(
         name = "uniserve:prompt_tokens",
         help = "Number of prefill tokens processed."
     )]
     pub prompt_tokens: Family<EngineLabels, U64Counter>,
-    /// Prompt tokens grouped by their compute or cache source.
-    #[metric(
-        name = "uniserve:prompt_tokens_by_source",
-        help = "Number of prompt tokens by source."
-    )]
-    pub prompt_tokens_by_source: PromptTokenSourceCounterFamily,
-    /// Prompt tokens served from prefix cache.
-    #[metric(
-        name = "uniserve:prompt_tokens_cached",
-        help = "Number of prompt tokens with prefix cache hits."
-    )]
-    pub prompt_tokens_cached: Family<EngineLabels, U64Counter>,
     /// Generated tokens processed by each engine.
     #[metric(
         name = "uniserve:generation_tokens",
         help = "Number of generation tokens processed."
     )]
     pub generation_tokens: Family<EngineLabels, U64Counter>,
-
     /// Successfully completed requests grouped by terminal reason.
     #[metric(
         name = "uniserve:request_success",
@@ -182,27 +125,6 @@ pub struct RequestMetrics {
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_max_num_generation_tokens: HistogramFamily,
-    /// `max_tokens` request parameter distribution.
-    #[metric(
-        name = "uniserve:request_params_max_tokens",
-        help = "Histogram of the max_tokens request parameter.",
-        init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
-    )]
-    pub request_params_max_tokens: HistogramFamily,
-    /// Requested candidate-count distribution.
-    #[metric(
-        name = "uniserve:request_params_n",
-        help = "Histogram of the n request parameter.",
-        init = Family::new_with_constructor(request_params_n_histogram as fn() -> Histogram)
-    )]
-    pub request_params_n: HistogramFamily,
-    /// Newly computed prefill cache token distribution.
-    #[metric(
-        name = "uniserve:request_prefill_kv_computed_tokens",
-        help = "Histogram of new KV tokens computed during prefill (excluding cached tokens).",
-        init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
-    )]
-    pub request_prefill_cache_computed_tokens: HistogramFamily,
     /// Time-to-first-token distribution in seconds.
     #[metric(
         name = "uniserve:time_to_first_token_seconds",
@@ -210,13 +132,6 @@ pub struct RequestMetrics {
         init = Family::new_with_constructor(time_to_first_token_histogram as fn() -> Histogram)
     )]
     pub time_to_first_token_seconds: HistogramFamily,
-    /// Inter-token latency distribution in seconds.
-    #[metric(
-        name = "uniserve:inter_token_latency_seconds",
-        help = "Histogram of inter-token latency in seconds.",
-        init = Family::new_with_constructor(inter_token_latency_histogram as fn() -> Histogram)
-    )]
-    pub inter_token_latency_seconds: HistogramFamily,
     /// End-to-end request latency distribution in seconds.
     #[metric(
         name = "uniserve:e2e_request_latency_seconds",
@@ -231,32 +146,4 @@ pub struct RequestMetrics {
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub request_queue_time_seconds: HistogramFamily,
-    /// Time spent in request prefill.
-    #[metric(
-        name = "uniserve:request_prefill_time_seconds",
-        help = "Histogram of time spent in PREFILL phase for request.",
-        init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
-    )]
-    pub request_prefill_time_seconds: HistogramFamily,
-    /// Time spent in request decode.
-    #[metric(
-        name = "uniserve:request_decode_time_seconds",
-        help = "Histogram of time spent in DECODE phase for request.",
-        init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
-    )]
-    pub request_decode_time_seconds: HistogramFamily,
-    /// Total model inference time per request.
-    #[metric(
-        name = "uniserve:request_inference_time_seconds",
-        help = "Histogram of time spent in RUNNING phase for request.",
-        init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
-    )]
-    pub request_inference_time_seconds: HistogramFamily,
-    /// Request latency normalized by emitted output tokens.
-    #[metric(
-        name = "uniserve:request_time_per_output_token_seconds",
-        help = "Histogram of time_per_output_token_seconds per request.",
-        init = Family::new_with_constructor(request_time_per_output_token_histogram as fn() -> Histogram)
-    )]
-    pub request_time_per_output_token_seconds: HistogramFamily,
 }

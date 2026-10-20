@@ -62,7 +62,7 @@ pub struct WorkerConfig {
 
     /// Maximum admitted video duration, in seconds.
     pub max_video_seconds: f64,
-    /// Condition rows a video request may occupy (`--max-condition-rows`);
+    /// Condition rows a video request may occupy (`video_config.max_condition_rows`);
     /// `None` provisions the largest condition set the denoiser admits.
     pub max_condition_rows: Option<u32>,
     /// Caller-selected executable for decoding reference media.

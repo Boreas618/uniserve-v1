@@ -56,8 +56,11 @@ CHECKPOINTS = {
 # Each replica keeps every expert, or the replicas shard the experts.
 TOPOLOGIES = {
     "replicas": (),
-    "experts": ("--expert-parallel",),
-    "dwdp": ("--expert-parallel", "--expert-exchange", "dwdp"),
+    "experts": ("--set", "moe_config.expert_parallel=true"),
+    "dwdp": (
+        "--set",
+        'moe_config={ expert_parallel = true, exchange = "dwdp" }',
+    ),
 }
 ADMITTED = re.compile(
     r'^uniserve:num_requests_admitted_total\{[^}]*engine="(\d+)"[^}]*\} (\S+)$',

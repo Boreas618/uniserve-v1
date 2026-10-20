@@ -768,7 +768,7 @@ impl TransferEdge {
     }
 }
 
-/// Per-edge data-plane transfer selection (`--transfer`) and the placement it
+/// Per-edge data-plane transfer selection (`placement_config.transfer`) and the placement it
 /// is resolved against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferConfig {
@@ -1418,7 +1418,14 @@ mod tests {
                     clip_latent_frames: 5,
                     tail_latent_frames: 2,
                 },
-                canvases: Vec::new(),
+                canvases: vec![uniserve_core::ServedCanvas {
+                    short_edge: 480,
+                    aspect_ratio: "16:9".to_owned(),
+                    canvas: uniserve_core::Canvas {
+                        width: 832,
+                        height: 480,
+                    },
+                }],
                 references: uniserve_core::ReferenceLimits::default(),
             }),
             ..WorkerInfo::default()
@@ -1655,7 +1662,14 @@ mod tests {
                     clip_latent_frames: 5,
                     tail_latent_frames: 2,
                 },
-                canvases: Vec::new(),
+                canvases: vec![uniserve_core::ServedCanvas {
+                    short_edge: 480,
+                    aspect_ratio: "16:9".to_owned(),
+                    canvas: uniserve_core::Canvas {
+                        width: 832,
+                        height: 480,
+                    },
+                }],
                 references: uniserve_core::ReferenceLimits::default(),
             });
             ExecutorInfo {

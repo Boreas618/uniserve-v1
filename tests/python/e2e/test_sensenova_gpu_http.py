@@ -90,36 +90,38 @@ def production_server(
         str(port),
         "--worker-python",
         str(Path.cwd() / ".venv" / "bin" / "python"),
-        "--max-total-tokens",
-        "65536",
+        "--set",
+        "kv_cache_config.max_tokens=65536",
         "--max-running-requests",
         "1",
-        "--max-num-batched-tokens",
-        "4096",
-        "--prefill-cuda-graph",
-        "true" if graph_policy == "full" else "false",
-        "--graph-policy",
-        graph_policy,
-        "--worker-ranks",
+        "--set",
+        "max_num_batched_tokens=4096",
+        "--set",
+        "cuda_graph_config.capture_prefill="
+        + ("true" if graph_policy == "full" else "false"),
+        "--set",
+        f"cuda_graph_config.policy={graph_policy}",
+        "--tensor-parallel-size",
         str(ranks or len(devices.split(","))),
-        "--log-stats",
-        "false",
+        "--set",
+        "logging_config.log_stats=false",
         *extra,
     ]
     if binding == "shared":
         args.extend(
             [
-                "--lane",
-                '{"lane_id":"compute","sm_budget":152,"domains":["decode","prefill","flow"]}',
+                "--set",
+                'lanes=[{ lane_id = "compute", sm_budget = 152, '
+                'domains = ["decode", "prefill", "flow"] }]',
             ]
         )
     elif binding == "split":
         args.extend(
             [
-                "--lane",
-                '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
-                "--lane",
-                '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
+                "--set",
+                'lanes=[{ lane_id = "decode", sm_budget = 64, '
+                'domains = ["decode"] }, { lane_id = "compute", '
+                'sm_budget = 88, domains = ["prefill", "flow"] }]',
             ]
         )
     environment = {"CUDA_VISIBLE_DEVICES": devices}
@@ -382,7 +384,7 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
         "tower",
         devices=devices,
         ranks=1,
-        extra=("--worker-mesh", "tower=gen:cuda:1"),
+        extra=("--set", "worker_config.mesh=tower=gen:cuda:1"),
     )
     assert tower == one
 

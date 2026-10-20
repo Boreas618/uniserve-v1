@@ -66,7 +66,12 @@ DEPLOYMENTS = {
     "nvfp4": ("nvfp4", []),
     "bf16-compact": (
         "bf16",
-        ["--readout-layout", "independent", "--readout-canvas", "compact"],
+        [
+            "--set",
+            "readout_config.layout=independent",
+            "--set",
+            "readout_config.canvas=compact",
+        ],
     ),
 }
 FIXTURES = Path(__file__).parents[1] / "fixtures"

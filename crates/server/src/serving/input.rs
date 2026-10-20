@@ -1,73 +1,52 @@
-//! Typed serving inputs before and after model-owned tokenization.
+//! The serving layer's request vocabulary.
 //!
-//! [`PromptInput`] and the control structs ([`SamplingConfig`], [`StopConfig`],
-//! [`ImageGenControls`], [`DecodeControls`]) are the protocol-neutral request
-//! vocabulary. `serving::preprocessing` lowers the OpenAI wire requests into
-//! them. `InputProcessor::preprocess_generation` consumes them and splits each
-//! request into a `GenerationRequest`, which moves into the engine, and a
-//! [`ResponseOptions`], which the frontend keeps to assemble the response
-//! stream.
+//! A [`GenerateRequest`] is one generation request before tokenization, as
+//! vLLM's text and chat requests are: its [`Prompt`], what it generates, its
+//! northbound [`SamplingParams`], and its scheduling and cache controls. The
+//! API routes lower their wire requests into it; `InputProcessor::preprocess`
+//! splits it into the engine's `GenerationRequest`, which moves into the
+//! engine, and its [`OutputParams`], which the frontend keeps to decode and
+//! parse the output.
 
 use std::collections::HashMap;
 
+use uniserve_core::GenerationConstraint;
+
+use crate::profile::tokenizer::DynTokenizer;
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
 use crate::serving::text::TextDecodeOptions;
-use crate::serving::text::tokenizer::DynTokenizer;
 
-/// The public prompt: the text of an image-generation request or a chat
-/// conversation. Input images live inside the parts of a chat conversation.
+/// The prompt of a generation request.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PromptInput {
-    /// Plain text prompt of an image-generation request.
-    Text(String),
-    /// Conversation, rendering options, and tools consumed by the chat
-    /// renderer (`HfChatRenderer`).
-    Chat(crate::serving::chat::ChatRequest),
+pub enum Prompt {
+    /// The text prompt of an image-generation request.
+    Text {
+        /// The prompt.
+        prompt: String,
+        /// The prompt classifier-free guidance steers the image away from.
+        negative_prompt: Option<String>,
+    },
+    /// A chat conversation; its input images are `image_url` parts.
+    Chat(ChatRequest),
 }
 
-/// Closed output-modality selection. The input side is inferred from the prompt
-/// and images.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModalitySelection {
-    /// Text output only.
-    Text,
-    /// Image output only.
-    Image,
-    /// Interleaved text and image output.
-    TextAndImage,
-}
-
-impl ModalitySelection {
-    /// Returns whether image output is requested.
-    pub const fn includes_image(self) -> bool {
-        matches!(self, Self::Image | Self::TextAndImage)
-    }
-}
-
-impl Default for ModalitySelection {
-    /// Returns [`ModalitySelection::Text`].
-    fn default() -> Self {
-        Self::Text
-    }
-}
-
-/// The single canonical sampling configuration. All values are optional so that
-/// model and generation-config defaults apply when omitted.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct SamplingConfig {
-    /// Sampling temperature.
+/// The northbound sampling parameters of a generation request, as vLLM's
+/// `SamplingParams`. `None` leaves a value to the model's defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplingParams {
+    /// Sampling temperature; zero samples greedily.
     pub temperature: Option<f32>,
     /// Nucleus-sampling probability mass.
     pub top_p: Option<f32>,
-    /// Maximum number of highest-probability candidates considered per step.
+    /// Highest-probability candidates considered per step.
     pub top_k: Option<u32>,
     /// Minimum token probability relative to the most likely candidate.
     pub min_p: Option<f32>,
-    /// Optional deterministic sampler seed. For SenseNova and Bagel requests,
-    /// `ImageGenControls::seed` takes precedence when both are set.
+    /// Deterministic sampler seed; its bit pattern seeds the engine.
     pub seed: Option<i64>,
-    /// Maximum number of generated tokens.
+    /// Maximum generated tokens.
     pub max_tokens: Option<u32>,
-    /// Minimum number of generated tokens before stopping is allowed.
+    /// Generated tokens before a stop condition may end generation.
     pub min_tokens: Option<u32>,
     /// Penalty proportional to a token's prior frequency.
     pub frequency_penalty: Option<f32>,
@@ -75,34 +54,94 @@ pub struct SamplingConfig {
     pub presence_penalty: Option<f32>,
     /// Multiplicative repetition penalty.
     pub repetition_penalty: Option<f32>,
-    /// Whether end-of-sequence tokens are ignored as stopping conditions.
+    /// Whether end-of-sequence tokens are ignored as stop conditions.
     pub ignore_eos: bool,
+    /// Decoded strings that end generation.
+    pub stop: Vec<String>,
+    /// Token IDs that end generation, besides the model's EOS.
+    pub stop_token_ids: Vec<u32>,
+    /// Words the sampler may not generate.
+    pub bad_words: Vec<String>,
+    /// The only token IDs the sampler may generate.
+    pub allowed_token_ids: Option<Vec<u32>>,
+    /// Additive logit adjustments keyed by token ID.
+    pub logit_bias: Option<HashMap<u32, f32>>,
+    /// Candidates reported per generated token; `-1` reports every token.
+    pub logprobs: Option<i32>,
+    /// Candidates reported per prompt token; `-1` reports every token.
+    pub prompt_logprobs: Option<i32>,
+    /// Whether special tokens are omitted from decoded text.
+    pub skip_special_tokens: bool,
+    /// Whether a matched stop string remains in the output.
+    pub include_stop_str_in_output: bool,
 }
 
-/// Stop-token, stop-string, bad-word, allowed-token, logit-bias, and logprob
-/// controls supported by the configured sampler.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct StopConfig {
-    /// Additional token identifiers that terminate generation.
-    pub stop_token_ids: Vec<u32>,
-    /// Decoded text sequences that terminate generation.
-    pub stop_strings: Vec<String>,
-    /// Text sequences excluded from generated output.
-    pub bad_words: Vec<String>,
-    /// Optional allowlist of token identifiers available to the sampler.
-    pub allowed_token_ids: Option<Vec<u32>>,
-    /// Additive logit adjustments keyed by token identifier.
-    pub logit_bias: Option<HashMap<u32, f32>>,
-    /// Number of generated-token alternatives included in log probabilities.
-    pub logprobs: Option<i32>,
-    /// Number of prompt-token alternatives included in log probabilities.
-    pub prompt_logprobs: Option<i32>,
+impl Default for SamplingParams {
+    /// Leaves every value to the model's defaults, skips special tokens, and
+    /// excludes a matched stop string from the output.
+    fn default() -> Self {
+        Self {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            seed: None,
+            max_tokens: None,
+            min_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            ignore_eos: false,
+            stop: Vec::new(),
+            stop_token_ids: Vec::new(),
+            bad_words: Vec::new(),
+            allowed_token_ids: None,
+            logit_bias: None,
+            logprobs: None,
+            prompt_logprobs: None,
+            skip_special_tokens: true,
+            include_stop_str_in_output: false,
+        }
+    }
+}
+
+impl SamplingParams {
+    /// The decoder's options for these parameters.
+    pub fn decode_options(&self) -> TextDecodeOptions {
+        TextDecodeOptions {
+            skip_special_tokens: self.skip_special_tokens,
+            include_stop_str_in_output: self.include_stop_str_in_output,
+            stop_strings: (!self.stop.is_empty()).then(|| self.stop.clone()),
+            min_tokens: self.min_tokens.unwrap_or(0),
+        }
+    }
+}
+
+/// One generation request before tokenization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerateRequest {
+    /// Names the request in its errors and logs.
+    pub request_id: String,
+    /// The prompt.
+    pub prompt: Prompt,
+    /// What the request generates: text (`UndOnly`), an image (`GenOnly`),
+    /// or both (`Default`).
+    pub constraint: GenerationConstraint,
+    /// How text is sampled and decoded.
+    pub sampling_params: SamplingParams,
+    /// How images are generated, for a request that generates them.
+    pub image_params: Option<ImageSamplingParams>,
+    /// Scheduling priority; lower is earlier.
+    pub priority: i32,
+    /// Salt that isolates the request's prefix-cache and encoder-cache
+    /// entries from other salts.
+    pub cache_salt: Option<String>,
 }
 
 /// Image-generation controls: dimensions, denoise steps, guidance controls,
 /// seed, and image-count bounds.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ImageGenControls {
+pub struct ImageSamplingParams {
     /// Named output-resolution preset.
     pub resolution: Option<crate::profile::omni::resolution::ResolutionName>,
     /// Explicit output width in pixels.
@@ -124,80 +163,27 @@ pub struct ImageGenControls {
     /// Diffusion timestep shift.
     pub timestep_shift: Option<f32>,
     /// Optional deterministic seed. For SenseNova and Bagel requests it
-    /// replaces `SamplingConfig::seed` as the sampler seed; Qwen3
-    /// preprocessing resolves its seed from `SamplingConfig::seed` alone.
+    /// replaces `SamplingParams::seed` as the sampler seed; Qwen3
+    /// preprocessing resolves its seed from `SamplingParams::seed` alone.
     pub seed: Option<u64>,
     /// Maximum number of generated images.
     pub max_images: Option<u16>,
 }
 
-/// Per-token detail included in the public output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputDetail {
-    /// Emits decoded user-visible text without token metadata.
-    #[default]
-    VisibleText,
-    /// Emits generated token identifiers in addition to visible text.
-    Tokens,
-    /// Emits generated token identifiers and candidate log probabilities.
-    Logprobs,
-}
-
-/// Decode controls applied to the response path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeControls {
-    /// Whether tokenizer special tokens are omitted from decoded text.
-    pub skip_special_tokens: bool,
-    /// Whether the matched stop string remains in visible output.
-    pub include_stop_string_in_output: bool,
-}
-
-impl Default for DecodeControls {
-    /// Skips special tokens and omits the matched stop string.
-    fn default() -> Self {
-        Self {
-            skip_special_tokens: true,
-            include_stop_string_in_output: false,
-        }
-    }
-}
-
-/// Model-supplied committed-event processor selection, built by the per-model
-/// preprocessing that `InputProcessor::preprocess_generation` dispatches to.
-///
-/// `submit_and_stream` selects the response assembler (see
-/// `serving::assembly`) from this value.
-pub enum OutputProcessorPolicy {
-    /// Raw visible text.
-    None,
-    /// Chat reasoning and tool-call parsing over decoded text, selected for
-    /// the chat prompts of Qwen3 and DiffusionGemma. The processor parses
-    /// reasoning only when the server's
-    /// `reasoning_parsing` setting is on, and otherwise passes that text
-    /// through as visible text; it parses tool calls only when
-    /// `ChatRequest::tool_parsing_enabled` holds.
-    Chat(crate::serving::chat::ChatOutputProcessor),
-    /// SenseNova reasoning and visible-answer filtering over committed text.
-    SenseNova(crate::profile::omni::OutputFilterPolicy),
-}
-
-/// Tokenization resources and output requirements retained by the frontend.
-/// The corresponding generation request moves directly into the engine.
-pub struct ResponseOptions {
-    /// The model-bound tokenizer that owns decoding for this request.
+/// What the frontend keeps of a generation request to decode and parse its
+/// output once the request has moved into the engine.
+pub struct OutputParams {
+    /// The model's tokenizer.
     pub tokenizer: DynTokenizer,
-    /// Copy of the prompt token identifiers submitted to the engine, kept
-    /// because detokenization needs the prompt after the generation request
-    /// has moved into the engine.
+    /// The prompt token IDs submitted to the engine, which seed incremental
+    /// detokenization.
     pub prompt_token_ids: Vec<u32>,
-    /// Incremental detokenization behavior.
+    /// Incremental detokenization and stop strings.
     pub decode: TextDecodeOptions,
-    /// Whether generated token identifiers are included in public events.
-    pub emit_token_ids: bool,
-    /// Whether prompt log probabilities are requested.
-    pub prompt_logprobs_requested: bool,
-    /// Whether generated-token log probabilities are requested.
-    pub generated_logprobs_requested: bool,
-    /// Model-selected semantic output processor.
-    pub output_processor: OutputProcessorPolicy,
+    /// Whether prompt log-probabilities are requested.
+    pub prompt_logprobs: bool,
+    /// Whether generated-token log-probabilities are requested.
+    pub logprobs: bool,
+    /// The request's reasoning and tool-call parsers.
+    pub processor: ChatOutputProcessor,
 }

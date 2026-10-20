@@ -14,8 +14,8 @@ use uniserve_core::{
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
-    GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, encode, model_dtype_bytes,
-    required_token, required_token_id, stride_resize_tokens,
+    GenerationControls, ImageGenerationDefaults, OmniProfile, OutputFilterPolicy, encode,
+    model_dtype_bytes, required_token, required_token_id, stride_resize_tokens,
 };
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -33,8 +33,6 @@ pub struct BagelProfile {
     pub image_defaults: ImageGenerationDefaults,
     /// Supported image dimensions and default resolution.
     pub resolution_policy: ResolutionPolicy,
-    /// Filters applied to decoded assistant output.
-    pub output_filter: OutputFilterPolicy,
     /// Ordered encoders and their loaded cache requirements for input images.
     pub image_encoders: Vec<ImageEncoderInput>,
     /// Logical positions contributed by one input image, independently of cache tokens.
@@ -199,7 +197,6 @@ impl BagelProfile {
         Ok(Self {
             controls,
             image_defaults: ImageGenerationDefaults {
-                resolution: ResolutionName::Square,
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
@@ -220,73 +217,10 @@ impl BagelProfile {
                 allow_custom: true,
                 max_side: Some(max_latent_size.saturating_mul(Self::LATENT_DOWNSAMPLE)),
             },
-            output_filter: OutputFilterPolicy {
-                reasoning: None,
-                visible_wrappers: Vec::new(),
-            },
             image_encoders,
             image_num_positions,
             image_generation,
         })
-    }
-
-    /// Returns the default system instruction for a generation constraint.
-    pub fn default_system_prompt(constraint: GenerationConstraint) -> Option<&'static str> {
-        matches!(constraint, GenerationConstraint::Default).then_some(DEFAULT_SYSTEM_PROMPT)
-    }
-
-    /// Renders and encodes the positive prompt for one request.
-    ///
-    /// - `Default` places the system instruction directly after
-    ///   `<|im_start|>`, with no role line, followed by a user turn and an open
-    ///   assistant turn.
-    /// - `UndOnly` renders a plain user turn and an open assistant turn.
-    /// - `GenOnly` wraps the prompt with [`Self::wrap_context_text`].
-    ///
-    /// `system_prompt` applies only under `Default`; `assistant_prefix`
-    /// applies only to the `Default` and `UndOnly` layouts.
-    pub fn render_prompt_ids(
-        &self,
-        tokenizer: &HuggingFaceTokenizer,
-        constraint: GenerationConstraint,
-        prompt: &str,
-        system_prompt: Option<&str>,
-        assistant_prefix: Option<&str>,
-    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        match constraint {
-            GenerationConstraint::Default => encode(
-                tokenizer,
-                &format!(
-                    "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
-                    system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT),
-                    prompt,
-                    assistant_prefix.unwrap_or("")
-                ),
-            ),
-            GenerationConstraint::UndOnly => encode(
-                tokenizer,
-                &format!(
-                    "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
-                    prompt,
-                    assistant_prefix.unwrap_or("")
-                ),
-            ),
-            GenerationConstraint::GenOnly => self.wrap_context_text(tokenizer, prompt),
-        }
-    }
-
-    /// Renders and encodes classifier-free guidance context.
-    ///
-    /// An empty prompt yields no tokens rather than an empty framed turn.
-    pub fn render_negative_prompt_ids(
-        &self,
-        tokenizer: &HuggingFaceTokenizer,
-        prompt: &str,
-    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.wrap_context_text(tokenizer, prompt)
     }
 
     /// Wraps plain context text in the profile's required delimiters.
@@ -303,13 +237,83 @@ impl BagelProfile {
         ids.push(self.controls.eos);
         Ok(ids)
     }
+}
 
-    /// Builds the encoder inputs for an input image of the given dimensions.
-    ///
-    /// The VAE grid comes from the VAE resize; the ViT grid comes from the ViT
-    /// resize applied to that VAE canvas. Each adds two marker tokens. The
-    /// image count does not affect the result.
-    pub fn image_encoders_for_dimensions(
+impl OmniProfile for BagelProfile {
+    fn controls(&self) -> &GenerationControls {
+        &self.controls
+    }
+
+    fn image_defaults(&self) -> &ImageGenerationDefaults {
+        &self.image_defaults
+    }
+
+    fn resolution_policy(&self) -> &ResolutionPolicy {
+        &self.resolution_policy
+    }
+
+    fn image_num_positions(&self) -> u32 {
+        self.image_num_positions
+    }
+
+    /// Only `Default` has a system instruction.
+    fn default_system_prompt(&self, constraint: GenerationConstraint) -> Option<&'static str> {
+        matches!(constraint, GenerationConstraint::Default).then_some(DEFAULT_SYSTEM_PROMPT)
+    }
+
+    /// Every constraint opens a new assistant turn.
+    fn assistant_prefix(&self, _constraint: GenerationConstraint) -> &'static str {
+        ""
+    }
+
+    /// An image slot is removed, and the image enters after the text before
+    /// it.
+    fn image_slot(&self) -> (String, Option<u32>) {
+        (String::new(), None)
+    }
+
+    /// - `Default` places the system instruction directly after
+    ///   `<|im_start|>`, with no role line, followed by a user turn and an open
+    ///   assistant turn.
+    /// - `UndOnly` renders a plain user turn and an open assistant turn.
+    /// - `GenOnly` wraps the prompt with [`BagelProfile::wrap_context_text`].
+    fn render_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        constraint: GenerationConstraint,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
+        match constraint {
+            GenerationConstraint::Default => encode(
+                tokenizer,
+                &format!(
+                    "<|im_start|>{DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                ),
+            ),
+            GenerationConstraint::UndOnly => encode(
+                tokenizer,
+                &format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
+            ),
+            GenerationConstraint::GenOnly => self.wrap_context_text(tokenizer, prompt),
+        }
+    }
+
+    /// An empty prompt yields no tokens rather than an empty framed turn.
+    fn render_negative_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.wrap_context_text(tokenizer, prompt)
+    }
+
+    /// The VAE grid comes from the VAE resize; the ViT grid comes from the
+    /// ViT resize applied to that VAE canvas. Each adds two marker tokens.
+    /// The image count does not affect the result.
+    fn image_encoders_for_dimensions(
         &self,
         width: u32,
         height: u32,
@@ -343,12 +347,14 @@ impl BagelProfile {
         ])
     }
 
-    /// Resolves the generated-image feedback cache contribution for the requested canvas.
-    ///
+    fn input_image_cache_salt(&self, _image_count: usize) -> Option<u64> {
+        None
+    }
+
     /// Fails when the canvas cannot be resized under the VAE policy, or when
-    /// the profile's feedback configuration has no feedback source or is not a
-    /// single VAE encoder.
-    pub fn image_generation_for_dimensions(
+    /// the profile's feedback configuration has no feedback source or is not
+    /// a single VAE encoder.
+    fn image_generation_for_dimensions(
         &self,
         width: u32,
         height: u32,
@@ -372,5 +378,9 @@ impl BagelProfile {
         policy.feedback_encoders[0].num_cache_tokens = Some(tokens);
         policy.feedback_encoders[0].max_cache_tokens = None;
         Ok(policy)
+    }
+
+    fn output_filter(&self) -> Option<&OutputFilterPolicy> {
+        None
     }
 }

@@ -40,16 +40,18 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uniserve_core::{ReadoutRow, ReadoutSlot};
 
+use crate::options::ReadoutOptions;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::diffusion_gemma::{
     ControlTokens, DiffusionGemmaProfile, ImagePlacement, ImageTokenMismatch, PatchBudget,
 };
 use crate::profile::tokenizer::{DynTokenizer, TokenizerError};
-use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
+use crate::serving::chat::template::MultimodalRenderInfo;
 use crate::serving::chat::{
-    ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatTemplateLoadOptions,
-    ChatToolChoice, HfChatRenderer,
+    ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatToolChoice,
+    HfChatRenderer,
 };
 use crate::serving::systemone::error::{LocItem, SystemOneError, ValidationIssue};
 use crate::serving::systemone::prompt::{
@@ -57,7 +59,6 @@ use crate::serving::systemone::prompt::{
 };
 use crate::serving::systemone::request::{Criteria, SystemOneRequest};
 use crate::serving::systemone::vocabulary::Vocabulary;
-use crate::serving::text::TextDecodeOptions;
 
 /// Largest request context the endpoint admits, in tokens (the official 64k
 /// limit); a smaller `max_model_len` lowers it.
@@ -65,8 +66,9 @@ pub const MAX_REQUEST_CONTEXT: u32 = 65_536;
 /// Largest state plus longest question, in tokens (the official 32k limit);
 /// half a smaller request context lowers it.
 pub const MAX_STATE_AND_QUESTION: u32 = 32_768;
-/// Compact canvases are sized in multiples of this many tokens.
-const COMPACT_CANVAS_MULTIPLE: usize = 16;
+/// Readout canvases shorter than the checkpoint's are sized in multiples of
+/// this many tokens.
+const CANVAS_MULTIPLE: u32 = 16;
 
 /// How a request's questions are divided among prompts and canvases.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +83,11 @@ pub enum ReadoutLayout {
 }
 
 /// How long each readout canvas is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Its serde form is `"full"`, `"compact"`, or the token count of a fixed
+/// canvas, as a number or as text; [`ReadoutEncoder::load`] checks a fixed
+/// count against the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CanvasMode {
     /// The checkpoint's full `canvas_length`.
     #[default]
@@ -104,63 +109,47 @@ pub enum CandidateTokens {
     Primary,
 }
 
-impl FromStr for CandidateTokens {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "variants" => Ok(Self::Variants),
-            "primary" => Ok(Self::Primary),
-            other => Err(format!(
-                "unknown readout candidates `{other}`; expected variants or primary"
-            )),
-        }
-    }
-}
-
-impl FromStr for ReadoutLayout {
-    type Err = String;
-
-    /// Parses `joint` or `independent`.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "joint" => Ok(Self::Joint),
-            "independent" => Ok(Self::Independent),
-            other => Err(format!(
-                "unknown readout layout `{other}`; expected joint or independent"
-            )),
-        }
-    }
-}
-
 impl FromStr for CanvasMode {
     type Err = String;
 
-    /// Parses `full`, `compact`, or a positive token count divisible by 16.
+    /// Parses `full`, `compact`, or a token count.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "full" => Ok(Self::Full),
             "compact" => Ok(Self::Compact),
-            other => match other.parse::<u32>() {
-                Ok(length) if length > 0 && length.is_multiple_of(16) => Ok(Self::Fixed(length)),
-                _ => Err(format!(
-                    "unknown readout canvas `{other}`; expected full, compact, or a positive multiple of 16"
-                )),
-            },
+            other => other.parse().map(Self::Fixed).map_err(|_| {
+                format!(
+                    "unknown readout canvas `{other}`; expected full, compact, or a token count"
+                )
+            }),
         }
     }
 }
 
-/// Server-wide readout settings, fixed at startup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadoutOptions {
-    /// Division of questions among prompts and canvases.
-    pub layout: ReadoutLayout,
-    /// Canvas length.
-    pub canvas: CanvasMode,
-    /// Candidate spellings contributing to the returned probabilities.
-    #[serde(default)]
-    pub candidates: CandidateTokens,
+impl Serialize for CanvasMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Full => serializer.serialize_str("full"),
+            Self::Compact => serializer.serialize_str("compact"),
+            Self::Fixed(length) => serializer.serialize_u32(*length),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CanvasMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Length(u32),
+            Text(String),
+        }
+
+        match Form::deserialize(deserializer)? {
+            Form::Length(length) => Ok(Self::Fixed(length)),
+            Form::Text(text) => text.parse().map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 /// Pixel dimensions of one decoded request image.
@@ -233,7 +222,9 @@ impl ReadoutEncoder {
         })?;
         let renderer = HfChatRenderer::load(
             files,
-            ChatTemplateLoadOptions::default(),
+            // The readout renders with the checkpoint's own template, never
+            // the configured chat override.
+            &crate::options::ChatOptions::default(),
             Some(MultimodalRenderInfo {
                 placeholder_token: placeholder,
             }),
@@ -250,15 +241,18 @@ impl ReadoutEncoder {
         }
         let canvas_length = match options.canvas {
             CanvasMode::Fixed(length) => {
-                if length == 0 || !length.is_multiple_of(16) || length > profile.canvas_length {
+                if length == 0
+                    || !length.is_multiple_of(CANVAS_MULTIPLE)
+                    || length > profile.sampling.canvas_length
+                {
                     return Err(StartupError::Contract(format!(
-                        "readout canvas {length} must be a positive multiple of 16 no greater than {}",
-                        profile.canvas_length
+                        "readout canvas {length} must be a positive multiple of {CANVAS_MULTIPLE} no greater than {}",
+                        profile.sampling.canvas_length
                     )));
                 }
                 length as usize
             }
-            CanvasMode::Full | CanvasMode::Compact => profile.canvas_length as usize,
+            CanvasMode::Full | CanvasMode::Compact => profile.sampling.canvas_length as usize,
         };
         let numbers = (1..=canvas_length)
             .map(|number| tokenizer.encode(&format!("{number}:"), false))
@@ -569,7 +563,6 @@ impl ReadoutEncoder {
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
-            decode_options: TextDecodeOptions::default(),
         };
         let rendered = self.renderer.render(&request)?;
         Ok(self.tokenizer.encode(&rendered, false)?)
@@ -592,7 +585,7 @@ impl ReadoutEncoder {
         group: &[usize],
         candidates: &mut usize,
         readouts: &mut [Option<AnswerReadout>],
-    ) -> Vec<CanvasRow> {
+    ) -> Vec<ReadoutRow> {
         let mask = self.tokens.mask;
         let mut token_ids = Vec::with_capacity(self.canvas_length);
         let mut slots = Vec::with_capacity(group.len());
@@ -660,12 +653,12 @@ impl ReadoutEncoder {
             CanvasMode::Full | CanvasMode::Fixed(_) => self.canvas_length,
             CanvasMode::Compact => token_ids
                 .len()
-                .next_multiple_of(COMPACT_CANVAS_MULTIPLE)
+                .next_multiple_of(CANVAS_MULTIPLE as usize)
                 .min(self.canvas_length),
         };
         token_ids.resize(length, self.tokens.pad);
 
-        let mut rows = vec![CanvasRow { token_ids, slots }];
+        let mut rows = vec![ReadoutRow { token_ids, slots }];
         for (question, names, slot, first_candidates) in chained {
             let options = names.len();
             let first_letters = options.div_ceil(SECOND_LETTERS);
@@ -674,7 +667,7 @@ impl ReadoutEncoder {
                 let second_letters = (options - first * SECOND_LETTERS).min(SECOND_LETTERS);
                 let mut conditioned = rows[0].token_ids.clone();
                 conditioned[slot as usize] = self.vocabulary.labels[first];
-                rows.push(CanvasRow {
+                rows.push(ReadoutRow {
                     token_ids: conditioned,
                     slots: vec![ReadoutSlot {
                         position: slot + 1,
@@ -759,26 +752,7 @@ pub struct ReadoutPrompt {
     /// Canvas rows, each denoised once over the prompt. The first row has
     /// every answer slot masked; any further rows condition a two-letter
     /// label's second slot on its first letter.
-    pub rows: Vec<CanvasRow>,
-}
-
-/// One canvas denoised in a single pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanvasRow {
-    /// Canvas tokens; decoder positions continue after the prompt.
-    pub token_ids: Vec<u32>,
-    /// Slots whose candidate log-probabilities the row reads.
-    pub slots: Vec<ReadoutSlot>,
-}
-
-/// One canvas position read over candidate tokens.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadoutSlot {
-    /// Position in the canvas.
-    pub position: u32,
-    /// Tokens whose log-probabilities, under the log-softmax over the full
-    /// vocabulary of the softcapped logits at `position`, the readout needs.
-    pub candidates: Vec<u32>,
+    pub rows: Vec<ReadoutRow>,
 }
 
 /// How a question's answer is read from the flat candidate log-probabilities.

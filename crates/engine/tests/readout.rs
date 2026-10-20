@@ -331,7 +331,7 @@ fn a_non_finite_readout_logprob_fails_the_request_with_its_cause() {
 fn canvas_rows_split_into_passes_within_the_step_budget() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
-        long_prefill_threshold: 64,
+        chunked_prefill_size: 64,
         ..SchedulerConfig::default()
     };
     let running = Running::start(readout_worker(), config);
@@ -373,7 +373,7 @@ fn canvas_rows_split_into_passes_within_the_step_budget() {
 fn a_canvas_row_beyond_the_step_budget_is_refused() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
-        long_prefill_threshold: 64,
+        chunked_prefill_size: 64,
         ..SchedulerConfig::default()
     };
     let running = Running::start(readout_worker(), config);
@@ -644,7 +644,7 @@ fn image_contexts_respect_the_workers_staged_row_capacity() {
 #[test]
 fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
     let config = SchedulerConfig {
-        long_prefill_threshold: 16,
+        chunked_prefill_size: 16,
         ..SchedulerConfig::default()
     };
     let running = Running::start(readout_worker(), config);
@@ -772,7 +772,7 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     sim.set_results_on_wait(true);
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
-        long_prefill_threshold: 64,
+        chunked_prefill_size: 64,
         ..SchedulerConfig::default()
     };
     // Both requests are queued before the scheduler starts, so the first

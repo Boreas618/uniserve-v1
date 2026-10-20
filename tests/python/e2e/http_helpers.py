@@ -160,12 +160,36 @@ def tiny_input_png_b64() -> str:
 
 
 def written_deployment(directory: Path, workers: list[dict[str, Any]]) -> Path:
-    """Write the deployment configuration a serve invocation is given.
+    """Write the deployment file a serve invocation is given.
 
-    `--workers` names a file because a deployment configuration states every
-    rank's node and device and every component placed on them; a test states
-    one the same way a deployment does.
+    `--workers` names a TOML file because a deployment states every worker
+    group's ranks and the components placed on them; a test states one the
+    same way a deployment does. Each entry of `workers` is one `[[workers]]`
+    table, such as `{"id": "model", "ranks": ["cuda:0-1"], "queue_depth": 2,
+    "components": {"model": {"tensor_parallel_size": 2}}}`.
     """
-    path = directory / "deployment.json"
-    path.write_text(json.dumps(workers, indent=2))
+    path = directory / "deployment.toml"
+    tables = (
+        "[[workers]]\n"
+        + "".join(f"{key} = {_toml(item)}\n" for key, item in worker.items())
+        for worker in workers
+    )
+    path.write_text("".join(tables))
     return path
+
+
+def _toml(value: Any) -> str:
+    """Write a value as TOML: inline tables and arrays, JSON-escaped strings."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        # A JSON string is a valid TOML basic string.
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml(element) for element in value) + "]"
+    if isinstance(value, dict):
+        entries = (f"{key} = {_toml(item)}" for key, item in value.items())
+        return "{ " + ", ".join(entries) + " }"
+    raise TypeError(f"no TOML form for {value!r}")

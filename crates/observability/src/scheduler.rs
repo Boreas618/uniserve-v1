@@ -94,17 +94,6 @@ pub struct EngineBackendLabels {
     pub backend: String,
 }
 
-/// Labels identifying a reason that work remains queued.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct WaitingReasonLabels {
-    /// Served model identity.
-    pub model_name: String,
-    /// Engine instance index.
-    pub engine: u32,
-    /// Stable reason that work remains queued.
-    pub reason: &'static str,
-}
-
 /// Scheduler/batch-scoped Prometheus families exported from `SchedulerStats`.
 ///
 /// The gauge, lifetime, or interval-delta semantics of each source value are
@@ -124,18 +113,6 @@ pub struct SchedulerMetrics {
         help = "Number of requests waiting to be processed"
     )]
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
-    /// Waiting requests grouped by the limiting condition.
-    ///
-    /// `record_scheduler_stats` reports every waiting request under the
-    /// `capacity` reason.
-    #[metric(
-        name = "uniserve:num_requests_waiting_by_reason",
-        help = "Number of waiting requests by reason. \
-             Reason labels: 'capacity' = waiting for scheduling capacity; \
-             'deferred' = deferred by transient constraints (KV transfer, \
-             blocked status). Sum of all reasons equals uniserve:num_requests_waiting."
-    )]
-    pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     /// Fraction of usable cache blocks that are not free; `1.0` means full.
     #[metric(
         name = "uniserve:kv_cache_usage_perc",

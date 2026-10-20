@@ -13,8 +13,9 @@ use uniserve_core::{
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
-    DelimitedTextPolicy, GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, chatml,
-    encode, model_dtype_bytes, pixel_bound_tokens, required_token, required_token_id,
+    DelimitedTextPolicy, GenerationControls, ImageGenerationDefaults, OmniProfile,
+    OutputFilterPolicy, chatml, encode, model_dtype_bytes, pixel_bound_tokens, required_token,
+    required_token_id,
 };
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -153,7 +154,6 @@ impl SenseNovaProfile {
         Ok(Self {
             controls,
             image_defaults: ImageGenerationDefaults {
-                resolution: ResolutionName::Landscape16x9,
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
@@ -181,66 +181,14 @@ impl SenseNovaProfile {
         })
     }
 
-    /// Returns the default system instruction for a generation constraint.
-    pub fn default_system_prompt(constraint: GenerationConstraint) -> Option<&'static str> {
-        match constraint {
-            GenerationConstraint::Default => Some(DEFAULT_SYSTEM_PROMPT),
-            GenerationConstraint::GenOnly => Some(IMAGE_SYSTEM_PROMPT),
-            GenerationConstraint::UndOnly => None,
-        }
-    }
-
-    /// Returns the assistant prefix required by a generation constraint.
-    pub fn assistant_prefix(constraint: GenerationConstraint) -> &'static str {
-        match constraint {
-            GenerationConstraint::GenOnly => IMAGE_ASSISTANT_PREFIX,
-            GenerationConstraint::Default | GenerationConstraint::UndOnly => "",
-        }
-    }
-
-    /// Renders and encodes the positive prompt for one request.
-    pub fn render_prompt_ids(
-        &self,
-        tokenizer: &HuggingFaceTokenizer,
-        constraint: GenerationConstraint,
-        prompt: &str,
-        system_prompt: Option<&str>,
-        assistant_prefix: Option<&str>,
-    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        encode(
-            tokenizer,
-            &self.render_prompt_text(constraint, prompt, system_prompt, assistant_prefix),
-        )
-    }
-
-    /// Renders positive prompt text before tokenization.
-    ///
-    /// Explicit `system_prompt` and `assistant_prefix` values replace the
-    /// constraint's defaults; `UndOnly` has no default system instruction.
-    pub fn render_prompt_text(
-        &self,
-        constraint: GenerationConstraint,
-        prompt: &str,
-        system_prompt: Option<&str>,
-        assistant_prefix: Option<&str>,
-    ) -> String {
-        let system = system_prompt.or_else(|| Self::default_system_prompt(constraint));
-        let assistant = assistant_prefix.unwrap_or_else(|| Self::assistant_prefix(constraint));
-        chatml(system, prompt, assistant)
-    }
-
-    /// Renders and encodes classifier-free guidance context.
-    ///
-    /// Unlike Bagel, an empty prompt still renders the framed ChatML turn with
-    /// the image system instruction.
-    pub fn render_negative_prompt_ids(
-        &self,
-        tokenizer: &HuggingFaceTokenizer,
-        prompt: &str,
-    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
-        encode(
-            tokenizer,
-            &chatml(Some(IMAGE_SYSTEM_PROMPT), prompt, NEGATIVE_ASSISTANT_PREFIX),
+    /// Renders positive prompt text before tokenization: the constraint's
+    /// system instruction, the user turn, and the constraint's assistant
+    /// prefix. `UndOnly` has no system instruction.
+    pub fn render_prompt_text(&self, constraint: GenerationConstraint, prompt: &str) -> String {
+        chatml(
+            self.default_system_prompt(constraint),
+            prompt,
+            self.assistant_prefix(constraint),
         )
     }
 
@@ -256,14 +204,83 @@ impl SenseNovaProfile {
         let count = u64::try_from(image_count).unwrap_or(u64::MAX).max(1);
         Self::MAX_IMAGE_PIXELS.min(Self::MAX_TOTAL_PIXELS / count)
     }
+}
 
-    /// Builds the encoder inputs for an input image of the given dimensions.
-    ///
+impl OmniProfile for SenseNovaProfile {
+    fn controls(&self) -> &GenerationControls {
+        &self.controls
+    }
+
+    fn image_defaults(&self) -> &ImageGenerationDefaults {
+        &self.image_defaults
+    }
+
+    fn resolution_policy(&self) -> &ResolutionPolicy {
+        &self.resolution_policy
+    }
+
+    fn image_num_positions(&self) -> u32 {
+        self.image_num_positions
+    }
+
+    /// The default instruction, or the image-generation one under `GenOnly`;
+    /// `UndOnly` has none.
+    fn default_system_prompt(&self, constraint: GenerationConstraint) -> Option<&'static str> {
+        match constraint {
+            GenerationConstraint::Default => Some(DEFAULT_SYSTEM_PROMPT),
+            GenerationConstraint::GenOnly => Some(IMAGE_SYSTEM_PROMPT),
+            GenerationConstraint::UndOnly => None,
+        }
+    }
+
+    /// `GenOnly` continues an empty thinking block and the start-of-image
+    /// token.
+    fn assistant_prefix(&self, constraint: GenerationConstraint) -> &'static str {
+        match constraint {
+            GenerationConstraint::GenOnly => IMAGE_ASSISTANT_PREFIX,
+            GenerationConstraint::Default | GenerationConstraint::UndOnly => "",
+        }
+    }
+
+    /// An image slot becomes the start- and end-of-image markers, and the
+    /// image fills the gap between them, entering at the end-of-image token.
+    fn image_slot(&self) -> (String, Option<u32>) {
+        (
+            format!(
+                "{}{}",
+                self.controls.start_of_image_text, self.controls.end_of_image_text
+            ),
+            Some(self.controls.end_of_image),
+        )
+    }
+
+    fn render_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        constraint: GenerationConstraint,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
+        encode(tokenizer, &self.render_prompt_text(constraint, prompt))
+    }
+
+    /// Unlike Bagel, an empty prompt still renders the framed ChatML turn
+    /// with the image system instruction.
+    fn render_negative_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>> {
+        encode(
+            tokenizer,
+            &chatml(Some(IMAGE_SYSTEM_PROMPT), prompt, NEGATIVE_ASSISTANT_PREFIX),
+        )
+    }
+
     /// The image is fitted to a 32-aligned grid with an area of at least
-    /// 512x512 pixels and at most [`Self::input_image_max_pixels`] for the
-    /// request's `image_count` input images, and adds no marker tokens.
-    /// Fails for a zero dimension or an aspect ratio above 200.
-    pub fn image_encoders_for_dimensions(
+    /// 512x512 pixels and at most [`SenseNovaProfile::input_image_max_pixels`]
+    /// for the request's `image_count` input images, and adds no marker
+    /// tokens. Fails for a zero dimension or an aspect ratio above 200.
+    fn image_encoders_for_dimensions(
         &self,
         width: u32,
         height: u32,
@@ -285,14 +302,17 @@ impl SenseNovaProfile {
         }])
     }
 
-    /// Resolves the generated-image feedback cache contribution for the requested canvas.
-    ///
+    /// An input image's pixel bound follows the request's image count.
+    fn input_image_cache_salt(&self, image_count: usize) -> Option<u64> {
+        Some(Self::input_image_max_pixels(image_count))
+    }
+
     /// Uses the grid of a single input image plus one marker token: a
     /// generated image does not share the input images' pixel budget. Fails
     /// for a zero dimension or an aspect ratio above 200, or when the
     /// profile's feedback configuration has no feedback source or is not a
     /// single ViT encoder.
-    pub fn image_generation_for_dimensions(
+    fn image_generation_for_dimensions(
         &self,
         width: u32,
         height: u32,
@@ -318,6 +338,10 @@ impl SenseNovaProfile {
         policy.feedback_encoders[0].num_cache_tokens = Some(tokens);
         policy.feedback_encoders[0].max_cache_tokens = None;
         Ok(policy)
+    }
+
+    fn output_filter(&self) -> Option<&OutputFilterPolicy> {
+        Some(&self.output_filter)
     }
 }
 
@@ -346,9 +370,8 @@ fn resolution_policy() -> ResolutionPolicy {
         height,
     })
     .collect::<Vec<_>>();
-    // Index 1 is the 16:9 bucket, matching `image_defaults.resolution` in
-    // `SenseNovaProfile::resolve`; reordering the list changes the default.
-    // The fixed buckets already bound every side.
+    // Index 1, the 16:9 bucket, is the default resolution; reordering the
+    // list changes the default. The fixed buckets already bound every side.
     ResolutionPolicy {
         default: buckets[1].clone(),
         buckets,

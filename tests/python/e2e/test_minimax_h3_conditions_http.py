@@ -102,8 +102,8 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
         "MiniMax-H3",
         "--port",
         str(port),
-        "--media-directory",
-        str(inputs),
+        "--set",
+        f"media_config.directory={inputs}",
         *options,
     ]
 
@@ -131,16 +131,16 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
     # keyframe 1008 condition rows; without a stated condition capacity the
     # deployment provisions the two keyframes a request may bring.
     options = [
-        "--max-video-seconds",
-        "8",
+        "--set",
+        "video_config.max_seconds=8",
         "--max-model-len",
         "2048",
-        "--video-text-capacities",
-        "2048",
+        "--set",
+        "video_config.text_capacities=2048",
     ]
     with (
         server_process(
-            _command(model, "ulysses4.json", port, inputs, options),
+            _command(model, "ulysses4.toml", port, inputs, options),
             base,
             tmp_path / "server.log",
             timeout_s=3600,
@@ -172,18 +172,18 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     # prompt capacity admit W3, and the deployment provisions the two
     # keyframes a request may bring in tiles of their own.
     options = [
-        "--video-aspect-ratios",
-        "16:9",
-        "--max-video-seconds",
-        "8",
+        "--set",
+        "video_config.aspect_ratios=16:9",
+        "--set",
+        "video_config.max_seconds=8",
         "--max-model-len",
         "2048",
-        "--video-text-capacities",
-        "2048",
+        "--set",
+        "video_config.text_capacities=2048",
     ]
     with (
         server_process(
-            _command(model, "ulysses4.json", port, inputs, options),
+            _command(model, "ulysses4.toml", port, inputs, options),
             base,
             tmp_path / "server.log",
             timeout_s=3600,
@@ -220,14 +220,14 @@ def _reference_requests(command, base, tmp_path, *, inputs):
 # The official video-plus-audio presentation holds 6913 text rows and its
 # references about 38k condition rows.
 REFERENCE_OPTIONS = [
-    "--max-video-seconds",
-    "5",
+    "--set",
+    "video_config.max_seconds=5",
     "--max-model-len",
     "8192",
-    "--video-text-capacities",
-    "8192",
-    "--max-condition-rows",
-    "40960",
+    "--set",
+    "video_config.text_capacities=8192",
+    "--set",
+    "video_config.max_condition_rows=40960",
 ]
 
 
@@ -236,7 +236,7 @@ def test_base_reference_requests(tmp_path: Path) -> None:
     port = find_free_port()
     _reference_requests(
         _command(
-            model, "ulysses4-reference.json", port, inputs, REFERENCE_OPTIONS
+            model, "ulysses4-reference.toml", port, inputs, REFERENCE_OPTIONS
         ),
         f"http://127.0.0.1:{port}",
         tmp_path,
@@ -250,14 +250,14 @@ def test_base_reference_requests(tmp_path: Path) -> None:
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
 OMNIREF_OPTIONS = [
-    "--max-video-seconds",
-    "5",
+    "--set",
+    "video_config.max_seconds=5",
     "--max-model-len",
     "8192",
-    "--video-text-capacities",
-    "8192",
-    "--max-condition-rows",
-    "49152",
+    "--set",
+    "video_config.text_capacities=8192",
+    "--set",
+    "video_config.max_condition_rows=49152",
 ]
 
 
@@ -282,7 +282,7 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
     _reference_requests(
         _command(
             export,
-            "ulysses4-reference.json",
+            "ulysses4-reference.toml",
             port,
             inputs,
             OMNIREF_OPTIONS,
@@ -301,16 +301,16 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
 # states a 7,680-row condition capacity: each of W4's condition products fits
 # it and their packed rows do not. W4's image without its voice fits.
 SMALL_CAPACITY_OPTIONS = [
-    "--mm-processor-kwargs",
-    '{"enlarge_references": true}',
-    "--max-video-seconds",
-    "5",
+    "--set",
+    "mm_processor_kwargs.enlarge_references=true",
+    "--set",
+    "video_config.max_seconds=5",
     "--max-model-len",
     "8192",
-    "--video-text-capacities",
-    "8192",
-    "--max-condition-rows",
-    "7680",
+    "--set",
+    "video_config.text_capacities=8192",
+    "--set",
+    "video_config.max_condition_rows=7680",
 ]
 
 
@@ -324,7 +324,7 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
     base = f"http://127.0.0.1:{port}"
     command = _command(
         export,
-        "ulysses4-reference.json",
+        "ulysses4-reference.toml",
         port,
         inputs,
         SMALL_CAPACITY_OPTIONS,
@@ -341,7 +341,7 @@ def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
         assert error["type"] == "invalid_request_error", error
         message = error["message"]
         assert "7808" in message and "7680" in message, message
-        assert "--max-condition-rows" in message, message
+        assert "video_config.max_condition_rows" in message, message
 
         served = client.post("/v1/videos/sync", json=image_only)
         (tmp_path / "image_only.mp4").write_bytes(served.content)

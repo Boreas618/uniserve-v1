@@ -1,9 +1,10 @@
 //! Incremental conversion from engine events to decoded text events.
 //!
-//! [`decoded_text_event_stream`] consumes one request's `EventRx`, checks the
-//! engine event protocol, detokenizes generated tokens with the tokenizer's
-//! `IncrementalDecoder`, decodes requested logprobs, and matches stop strings.
-//! `serving::assembly` feeds its output to the chat output processor.
+//! [`decoded_text_event_stream`] consumes one generation request's `EventRx`,
+//! checks the engine event protocol, detokenizes generated tokens with the
+//! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
+//! strings, and passes image events through in order. `serving::assembly`
+//! feeds its output to the request's chat output processor.
 //!
 //! The decoder also reports its stop-string decisions to the engine: it
 //! acknowledges each token only after checking that it completes no stop
@@ -12,17 +13,15 @@
 
 use std::sync::Arc;
 
-use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{EngineCoreOutput, PositionLogprobs};
+use uniserve_core::{EngineCoreOutput, PositionLogprobs, RejectionKind};
 use uniserve_engine::EventRx;
 
-use super::finish::{FinishReason, StopReason};
-use super::logprobs::{
-    DecodedLogprobs, DecodedPromptLogprobs, decode_logprobs, decode_prompt_logprobs,
-};
+use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
+use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
+use crate::serving::output::{FinishReason, GeneratedImage, PromptInfo, StopReason};
 use crate::serving::text::error::Error;
 
 /// Request-neutral options for incremental text decoding.
@@ -51,58 +50,88 @@ impl Default for TextDecodeOptions {
     }
 }
 
-/// Terminal metadata carried on the final [`DecodedTextEvent`].
+/// How a decoded request finished, with its token counts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
-    /// Number of prompt tokens submitted to the engine.
-    pub prompt_token_count: usize,
-    /// Total number of generated tokens.
+    /// Why the request finished.
+    pub reason: FinishReason,
+    /// Prompt tokens submitted to the engine.
+    pub prompt_tokens: usize,
+    /// Generated tokens.
     ///
-    /// Taken from the engine's `completion_tokens` when the engine finishes
-    /// the request and from the decoder's own count when a stop string ends
-    /// the stream.
-    pub output_token_count: usize,
-    /// Number of generated tokens consumed by internal protocol sections.
-    ///
-    /// Computed as the engine's `completion_tokens` minus the text tokens this
-    /// decoder consumed; zero when a stop string ends the stream.
-    pub internal_token_count: usize,
-    /// Terminal condition and optional concrete stop cause.
-    pub finish_reason: FinishReason,
+    /// The engine's `completion_tokens` when the engine finishes the request,
+    /// which counts the tokens of internal sections it never published as
+    /// text; the decoder's own count when a stop string ends the stream.
+    pub output_tokens: usize,
+    /// Images the engine reports generating.
+    pub images: usize,
 }
 
-/// Internal decoded-text event emitted before higher-level assistant adaptation.
+/// An image-generation event of an interleaved text-and-image request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageEvent {
+    /// Generation of an image began; the request has visible output.
+    Begin,
+    /// One denoising step of the image completed.
+    Step {
+        /// Request-local image identifier.
+        image_id: u32,
+    },
+    /// The image is complete.
+    Done(GeneratedImage),
+}
+
+/// Decoded output of one generation request.
+///
+/// A stream yields one `Start`, then `TextDelta` and `Image` events in engine
+/// order, then one terminal event: `Done`, `Rejected`, or `Failed`. An
+/// engine refusal arrives before `Start`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedTextEvent {
-    /// The request has been scheduled and prompt metadata is available.
+    /// The engine scheduled the request and its prompt metadata is complete.
     Start {
-        /// Prompt token identifiers submitted to the engine.
-        prompt_token_ids: Arc<[u32]>,
-        /// Per-position prompt log probabilities, when requested.
-        prompt_logprobs: Option<DecodedPromptLogprobs>,
-        /// Unix timestamp in seconds at which the request entered the engine
-        /// queue.
-        queued_at: Option<f64>,
-        /// Unix timestamp in seconds at which the engine scheduler admitted
-        /// the request.
-        scheduled_at: Option<f64>,
+        /// The prompt, with its log-probabilities when requested.
+        prompt: PromptInfo,
+        /// Engine wall-clock time, in UNIX seconds, at which the request
+        /// entered the engine queue.
+        queued_at: f64,
+        /// Engine wall-clock time, in UNIX seconds, at which the scheduler
+        /// admitted the request.
+        scheduled_at: f64,
     },
-    /// Newly decoded text and token metadata.
+    /// Newly decoded text and the tokens it decodes.
     ///
-    /// Each non-terminal update covers the tokens of one engine output event:
-    /// one generated token, or a block of tokens committed together (its text
-    /// may be empty while the decoder holds bytes back). The terminal update
-    /// carries the flushed remainder of the text and, when a stop string
-    /// ended the stream, the tokens of the event up to the matching one.
+    /// Each update covers the tokens of one engine output event: one
+    /// generated token, or a block of tokens committed together (its text
+    /// may be empty while the decoder holds bytes back). The last update
+    /// before `Done` carries the flushed remainder of the text and, when a
+    /// stop string ended the stream, the tokens of its event through the
+    /// matching one.
     TextDelta {
         /// Newly visible decoded text.
         delta: String,
-        /// Token identifiers represented by this update.
+        /// Token identifiers of this update.
         token_ids: Vec<u32>,
-        /// Per-position candidate log probabilities, when requested.
+        /// Per-position candidate log-probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
-        /// Terminal metadata when this is the final update.
-        finished: Option<Finished>,
+    },
+    /// An image event. A completed image is held until the next generated
+    /// token or the end of the request, so it stays ordered ahead of the
+    /// text that follows it.
+    Image(ImageEvent),
+    /// The request finished.
+    Done(Finished),
+    /// The engine refused the request before executing it.
+    Rejected {
+        /// Whether the request is unservable or the engine is full.
+        kind: RejectionKind,
+        /// Engine-supplied rejection detail.
+        message: String,
+    },
+    /// The engine failed the request or could not deliver its output.
+    Failed {
+        /// Engine-supplied failure detail.
+        message: String,
     },
 }
 
@@ -122,22 +151,25 @@ struct DecodeState<'a> {
     options: TextDecodeOptions,
     /// Prompt logprob positions received so far.
     prompt_positions: Vec<PositionLogprobs>,
-    queued_at: Option<f64>,
-    scheduled_at: Option<f64>,
+    /// `(queued_at, scheduled_at)` of the engine's scheduling event.
+    scheduled: Option<(f64, f64)>,
     /// Whether `DecodedTextEvent::Start` has been yielded.
     started: bool,
     /// Generated token awaiting its `TokenLogprobs` event when generated
     /// logprobs are requested.
     pending_token: Option<u32>,
+    /// Completed images held until the next generated token or the end of
+    /// the request.
+    pending_images: Vec<GeneratedImage>,
     /// Generated text tokens consumed by the decoder.
-    output_token_count: usize,
+    output_tokens: usize,
 }
 
 impl DecodeState<'_> {
     /// Emits start metadata once scheduling and any requested prompt scores are complete.
     ///
     /// Idempotent: does nothing after `Start` has been yielded or while a
-    /// prerequisite is missing. The `TextToken` and `Finished` handlers check
+    /// prerequisite is missing. The handlers of generated output check
     /// `started` afterwards to reject output that arrives too early.
     async fn emit_start_if_ready(
         &mut self,
@@ -145,15 +177,19 @@ impl DecodeState<'_> {
         tokenizer: &HuggingFaceTokenizer,
         prompt_token_ids: &[u32],
         prompt_logprobs_requested: bool,
-        expected_prompt_positions: usize,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<(), Error> {
+        // The first prompt token has no left context to score, so prompt
+        // logprobs cover every position after it (see `DecodedPromptLogprobs`).
         let prompt_ready =
-            !prompt_logprobs_requested || self.prompt_positions.len() == expected_prompt_positions;
-        if self.started || !prompt_ready || self.scheduled_at.is_none() {
+            !prompt_logprobs_requested || self.prompt_positions.len() == prompt_token_ids.len() - 1;
+        let Some((queued_at, scheduled_at)) = self.scheduled else {
+            return Ok(());
+        };
+        if self.started || !prompt_ready {
             return Ok(());
         }
-        let prompt_logprobs = prompt_logprobs_requested
+        let logprobs = prompt_logprobs_requested
             .then(|| {
                 decode_prompt_logprobs(
                     request_id,
@@ -165,36 +201,60 @@ impl DecodeState<'_> {
             })
             .transpose()?;
         y.yield_ok(DecodedTextEvent::Start {
-            prompt_token_ids: Arc::from(prompt_token_ids),
-            prompt_logprobs,
-            queued_at: self.queued_at,
-            scheduled_at: self.scheduled_at,
+            prompt: PromptInfo {
+                token_ids: Arc::from(prompt_token_ids),
+                logprobs,
+            },
+            queued_at,
+            scheduled_at,
         })
         .await;
         self.started = true;
         Ok(())
     }
 
-    /// Decodes committed tokens in order, applies stop-string holdback, and
-    /// emits terminal metadata.
+    /// Fails unless `Start` has been yielded and no generated token awaits
+    /// its logprobs, the state every event after `Start` requires.
+    fn ensure_output_ready(&self, request_id: &str, event: &str) -> Result<(), Error> {
+        if self.started && self.pending_token.is_none() {
+            Ok(())
+        } else {
+            Err(Error::MalformedOutput {
+                request_id: request_id.to_owned(),
+                message: format!("{event} arrived before output metadata was complete"),
+            })
+        }
+    }
+
+    /// Yields the held completed images in arrival order.
+    async fn flush_images(&mut self, y: &mut TryYielder<DecodedTextEvent, Error>) {
+        for image in self.pending_images.drain(..) {
+            y.yield_ok(DecodedTextEvent::Image(ImageEvent::Done(image)))
+                .await;
+        }
+    }
+
+    /// Decodes committed tokens in order and applies stop-string holdback.
     ///
     /// `token_ids` are the tokens of one engine output event and `positions`
     /// their requested logprobs, if any. Returns `true` when a token completed
     /// a stop string. In that case the engine has been told to stop at the
     /// tokens received so far, the decoder has been flushed and truncated at
-    /// the match, and the terminal `TextDelta`, covering the tokens through
-    /// the matching one, has been yielded, so the caller must end the stream.
-    /// Otherwise the tokens are acknowledged to the engine and yielded as one
-    /// `TextDelta`.
+    /// the match, and the final `TextDelta`, covering the tokens through the
+    /// matching one, and `Done` have been yielded, so the caller must end the
+    /// stream. Otherwise the tokens are acknowledged to the engine and
+    /// yielded as one `TextDelta`.
     async fn consume_tokens(
         &mut self,
         tokenizer: &HuggingFaceTokenizer,
-        prompt_token_count: usize,
+        prompt_tokens: usize,
         token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
         raw_stream: &mut EventRx,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
+        // Images completed before these tokens stay ordered ahead of them.
+        self.flush_images(y).await;
         let decoded_logprobs = (!positions.is_empty())
             .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
             .transpose()?;
@@ -204,10 +264,10 @@ impl DecodeState<'_> {
             let decoded = decode_one_token(
                 &mut self.decoder,
                 token_id,
-                self.output_token_count,
+                self.output_tokens,
                 &mut self.options,
             )?;
-            self.output_token_count = self.output_token_count.saturating_add(1);
+            self.output_tokens = self.output_tokens.saturating_add(1);
             delta.push_str(&decoded.delta);
             let Some((stop_string, offset)) = decoded.stop else {
                 continue;
@@ -215,9 +275,8 @@ impl DecodeState<'_> {
 
             // Stop generation at exactly the tokens received so far, which
             // include this one.
-            raw_stream.cancel_at_consumed_prefix(
-                crate::engine_client::StreamCancelCause::StopStringMatched,
-            );
+            raw_stream
+                .cancel_at_consumed_prefix(uniserve_engine::StreamCancelCause::StopStringMatched);
             let truncate_to = Some(if self.options.include_stop_str_in_output {
                 offset + stop_string.len()
             } else {
@@ -230,16 +289,14 @@ impl DecodeState<'_> {
                 delta: delta + last_chunk.unwrap_or_default().as_str(),
                 token_ids: token_ids[..=index].to_vec(),
                 logprobs: decoded_logprobs,
-                finished: Some(Finished {
-                    prompt_token_count,
-                    output_token_count: self.output_token_count,
-                    internal_token_count: 0,
-                    finish_reason: FinishReason::with_stop_reason(
-                        uniserve_core::FinishReason::Stop,
-                        Some(StopReason::String(stop_string)),
-                    ),
-                }),
             })
+            .await;
+            y.yield_ok(DecodedTextEvent::Done(Finished {
+                reason: FinishReason::Stop(Some(StopReason::String(stop_string))),
+                prompt_tokens,
+                output_tokens: self.output_tokens,
+                images: 0,
+            }))
             .await;
             return Ok(true);
         }
@@ -248,7 +305,6 @@ impl DecodeState<'_> {
             delta,
             token_ids: token_ids.to_vec(),
             logprobs: decoded_logprobs,
-            finished: None,
         })
         .await;
         Ok(false)
@@ -258,16 +314,16 @@ impl DecodeState<'_> {
 /// Advances incremental decoding and returns only bytes newly made visible by this token.
 ///
 /// Stop strings are checked only from token number `min_tokens + 1` onward
-/// (`output_token_count` counts the tokens before this one). A matched stop
+/// (`output_tokens` counts the tokens before this one). A matched stop
 /// string is removed from `options.stop_strings`.
 fn decode_one_token(
     decoder: &mut IncrementalDecoder<'_>,
     token_id: u32,
-    output_token_count: usize,
+    output_tokens: usize,
     options: &mut TextDecodeOptions,
 ) -> Result<ArDecode, Error> {
     let new_bytes = decoder.push_token(token_id)?;
-    let stop = if output_token_count + 1 > options.min_tokens as usize {
+    let stop = if output_tokens + 1 > options.min_tokens as usize {
         if let Some(stops) = options.stop_strings.as_mut()
             && let Some((index, offset)) = matches_stop_string(stops, decoder.output(), new_bytes)
         {
@@ -286,23 +342,20 @@ fn decode_one_token(
     Ok(ArDecode { delta, stop })
 }
 
-/// Decodes one canonical generation event stream into text-runtime events.
+/// Decodes one generation request's engine events into decoded text events.
 ///
-/// On success the stream yields exactly one `DecodedTextEvent::Start`, then
-/// `TextDelta` updates, one per engine output event, the last of which
-/// carries `finished`. When `generated_logprobs_requested` is set, every
-/// `TextToken` must be followed by a `TokenLogprobs` event for the same token
-/// whose first candidate is that token.
+/// On success the stream follows the protocol of [`DecodedTextEvent`]. When
+/// `generated_logprobs_requested` is set, every `TextToken` must be followed
+/// by a `TokenLogprobs` event for the same token whose first candidate is
+/// that token. An engine error finish fails the request like an engine error
+/// event.
 ///
 /// # Errors
 ///
 /// Fails with [`Error::EmptyPromptTokenIds`] for an empty prompt,
-/// [`Error::Rejected`] when the engine rejects the request,
-/// [`Error::EngineFailed`] when the engine reports an error or an unavailable
-/// artifact, [`Error::MalformedOutput`] when engine events violate the
-/// protocol, [`Error::StreamClosedBeforeTerminalOutput`] when the channel
-/// closes without a terminal event, and a tokenizer error when decoding
-/// fails.
+/// [`Error::MalformedOutput`] when engine events violate the protocol,
+/// [`Error::StreamClosedBeforeTerminalOutput`] when the channel closes
+/// without a terminal event, and a tokenizer error when decoding fails.
 #[try_stream]
 pub async fn decoded_text_event_stream(
     request_id: String,
@@ -321,24 +374,21 @@ pub async fn decoded_text_event_stream(
             request_id: request_id.clone(),
         });
     }
-    let prompt_token_count = prompt_token_ids.len();
+    let prompt_tokens = prompt_token_ids.len();
     let decoder = tokenizer.create_decode_stream(
         &prompt_token_ids,
         decode_options.skip_special_tokens,
         stop_string_holdback_bytes(&decode_options),
     );
-    // The first prompt token has no left context to score, so prompt logprobs
-    // cover every position after it (see `DecodedPromptLogprobs`).
-    let expected_prompt_positions = prompt_token_count.saturating_sub(1);
     let mut state = DecodeState {
         decoder,
         options: decode_options,
         prompt_positions: Vec::new(),
-        queued_at: None,
-        scheduled_at: None,
+        scheduled: None,
         started: false,
         pending_token: None,
-        output_token_count: 0,
+        pending_images: Vec::new(),
+        output_tokens: 0,
     };
 
     // Engine events form an ordered protocol: scheduling and optional prompt
@@ -348,18 +398,16 @@ pub async fn decoded_text_event_stream(
             // Scheduling metadata may arrive before prompt logprobs; start is
             // emitted only after both prerequisites are complete.
             EngineCoreOutput::Scheduled {
-                queued_at: queued,
-                scheduled_at: scheduled,
+                queued_at,
+                scheduled_at,
             } => {
-                state.queued_at = Some(queued);
-                state.scheduled_at = Some(scheduled);
+                state.scheduled = Some((queued_at, scheduled_at));
                 state
                     .emit_start_if_ready(
                         &request_id,
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         prompt_logprobs_requested,
-                        expected_prompt_positions,
                         &mut y,
                     )
                     .await?;
@@ -372,7 +420,7 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 state.prompt_positions.extend(positions);
-                if state.prompt_positions.len() > expected_prompt_positions {
+                if state.prompt_positions.len() >= prompt_tokens {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "engine returned too many prompt logprob positions".to_string(),
@@ -384,7 +432,6 @@ pub async fn decoded_text_event_stream(
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         prompt_logprobs_requested,
-                        expected_prompt_positions,
                         &mut y,
                     )
                     .await?;
@@ -398,29 +445,16 @@ pub async fn decoded_text_event_stream(
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         prompt_logprobs_requested,
-                        expected_prompt_positions,
                         &mut y,
                     )
                     .await?;
-                if !state.started {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "generation began before prompt metadata was complete".to_string(),
-                    });
-                }
-                if state.pending_token.is_some() {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine emitted a new token before resolving prior logprobs"
-                            .to_string(),
-                    });
-                }
+                state.ensure_output_ready(&request_id, "a generated token")?;
                 if generated_logprobs_requested {
                     state.pending_token = Some(id);
                 } else if state
                     .consume_tokens(
                         tokenizer.as_ref(),
-                        prompt_token_count,
+                        prompt_tokens,
                         &[id],
                         Vec::new(),
                         &mut raw_stream,
@@ -440,17 +474,11 @@ pub async fn decoded_text_event_stream(
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         prompt_logprobs_requested,
-                        expected_prompt_positions,
                         &mut y,
                     )
                     .await?;
-                if !state.started {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "generation began before prompt metadata was complete".to_string(),
-                    });
-                }
-                if state.pending_token.is_some() || generated_logprobs_requested {
+                state.ensure_output_ready(&request_id, "a block of committed tokens")?;
+                if generated_logprobs_requested {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "engine emitted committed tokens without their requested logprobs"
@@ -460,7 +488,7 @@ pub async fn decoded_text_event_stream(
                 if state
                     .consume_tokens(
                         tokenizer.as_ref(),
-                        prompt_token_count,
+                        prompt_tokens,
                         &ids,
                         Vec::new(),
                         &mut raw_stream,
@@ -490,7 +518,7 @@ pub async fn decoded_text_event_stream(
                 if state
                     .consume_tokens(
                         tokenizer.as_ref(),
-                        prompt_token_count,
+                        prompt_tokens,
                         &[id],
                         vec![PositionLogprobs {
                             entries: candidates,
@@ -503,12 +531,43 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
+            EngineCoreOutput::ImageBegin { .. } => {
+                state.ensure_output_ready(&request_id, "an image start")?;
+                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Begin)).await;
+            }
+            EngineCoreOutput::ImageStep { image_id, .. } => {
+                state.ensure_output_ready(&request_id, "an image step")?;
+                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Step { image_id }))
+                    .await;
+            }
+            // A commit marks the image's entry into the model context; the
+            // completed image follows it.
+            EngineCoreOutput::ImageCommit { .. } => {
+                state.ensure_output_ready(&request_id, "an image commit")?;
+            }
+            EngineCoreOutput::ImageDone {
+                image_id,
+                height,
+                width,
+                bytes,
+                pixels_png_b64,
+            } => {
+                state.ensure_output_ready(&request_id, "a completed image")?;
+                state.pending_images.push(GeneratedImage {
+                    image_id,
+                    width,
+                    height,
+                    bytes,
+                    png_base64: pixels_png_b64,
+                });
+            }
             // A terminal event flushes decoder holdback only after every pending
             // token/logprob pair and all prompt metadata have resolved.
             EngineCoreOutput::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
+                images,
                 ..
             } => {
                 state
@@ -517,76 +576,65 @@ pub async fn decoded_text_event_stream(
                         tokenizer.as_ref(),
                         &prompt_token_ids,
                         prompt_logprobs_requested,
-                        expected_prompt_positions,
                         &mut y,
                     )
                     .await?;
-                if !state.started || state.pending_token.is_some() {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "terminal event arrived before output metadata was complete"
-                            .to_string(),
-                    });
-                }
-                let finish_reason = FinishReason::with_stop_reason(reason, stop_reason);
+                state.ensure_output_ready(&request_id, "the terminal event")?;
+                state.flush_images(&mut y).await;
+                let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
+                    y.yield_ok(DecodedTextEvent::Failed {
+                        message: "engine execution failed".to_owned(),
+                    })
+                    .await;
+                    return Ok(());
+                };
 
                 // Release the decoder's holdback untruncated: a stop-string
-                // match would have ended the stream in `consume_token`.
+                // match would have ended the stream in `consume_tokens`.
                 let (last_chunk, text) = state.decoder.flush(None)?;
-                let full_text = tracing::enabled!(Level::TRACE).then_some(text);
-
                 debug!(
-                    ?finish_reason,
-                    output_token_count = state.output_token_count,
+                    ?reason,
+                    output_tokens = state.output_tokens,
                     "request finished with decoded text"
                 );
-                if let Some(full_text) = full_text {
-                    trace!(full_text, "terminal decoded text");
+                if tracing::enabled!(Level::TRACE) {
+                    trace!(full_text = text, "terminal decoded text");
                 }
 
                 y.yield_ok(DecodedTextEvent::TextDelta {
                     delta: last_chunk.unwrap_or_default(),
                     token_ids: Vec::new(),
                     logprobs: None,
-                    finished: Some(Finished {
-                        prompt_token_count,
-                        output_token_count: completion_tokens,
-                        internal_token_count: completion_tokens
-                            .saturating_sub(state.output_token_count),
-                        finish_reason,
-                    }),
                 })
+                .await;
+                y.yield_ok(DecodedTextEvent::Done(Finished {
+                    reason,
+                    prompt_tokens,
+                    output_tokens: completion_tokens,
+                    images,
+                }))
                 .await;
                 return Ok(());
             }
             EngineCoreOutput::Rejected { kind, message } => {
-                return Err(Error::Rejected {
-                    request_id,
-                    kind,
-                    message,
-                });
+                y.yield_ok(DecodedTextEvent::Rejected { kind, message })
+                    .await;
+                return Ok(());
             }
-            // An engine failure is a terminal outcome, not malformed output;
-            // the chat assembler turns it into a `Failed` event.
             EngineCoreOutput::Error { message }
             | EngineCoreOutput::ArtifactUnavailable { message } => {
-                return Err(Error::EngineFailed {
-                    request_id: request_id.clone(),
-                    message,
-                });
+                state.flush_images(&mut y).await;
+                y.yield_ok(DecodedTextEvent::Failed { message }).await;
+                return Ok(());
             }
-            // Media lifecycle events and readout answers cannot be
-            // represented by a text-only stream.
-            EngineCoreOutput::ImageBegin { .. }
-            | EngineCoreOutput::ImageStep { .. }
-            | EngineCoreOutput::ImageCommit { .. }
-            | EngineCoreOutput::ImageDone { .. }
-            | EngineCoreOutput::Artifact(_)
+            // Media artifacts belong to diffusion requests, and readout
+            // answers to readout requests, which other consumers collect.
+            EngineCoreOutput::Artifact(_)
             | EngineCoreOutput::MediaProgress { .. }
             | EngineCoreOutput::Readout { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
-                    message: "text-only request received a non-text lifecycle event".to_string(),
+                    message: "a generation request received a media or readout event".to_string(),
                 });
             }
         }
@@ -601,7 +649,7 @@ pub async fn decoded_text_event_stream(
 /// match out of emitted text until the next token confirms or rules it out.
 /// No holdback is needed when matched stop strings stay in the output. The
 /// result is passed to the decoder as its `min_bytes_to_buffer`.
-pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
+fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
     if options.include_stop_str_in_output {
         return 0;
     }
@@ -630,11 +678,7 @@ pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
 /// Matching compares bytes. A match of a complete UTF-8 stop string in UTF-8
 /// text starts and ends on character boundaries, so the offset is a valid
 /// truncation point.
-pub(crate) fn matches_stop_string(
-    stops: &[String],
-    output: &str,
-    new_bytes: usize,
-) -> Option<(usize, usize)> {
+fn matches_stop_string(stops: &[String], output: &str, new_bytes: usize) -> Option<(usize, usize)> {
     let output = output.as_bytes();
     // A match must end at or after this offset to include a new byte.
     let next_offset = (output.len() + 1).saturating_sub(new_bytes);

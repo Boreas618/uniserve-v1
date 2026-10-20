@@ -141,21 +141,25 @@ pub struct CanvasSampling {
 }
 
 impl CanvasSampling {
-    /// Returns the first parameter the scheduler cannot plan with, if any:
-    /// an empty canvas or step limit, or a non-finite sampling value. The
-    /// worker's sampler checks the sampling values' domain itself.
+    /// Returns the first parameter outside the domain the block-diffusion
+    /// sampler takes, if any: a positive canvas length and step limit, a
+    /// positive entropy bound, temperatures with `0 <= t_min < t_max`, and a
+    /// non-negative confidence threshold, all finite. A zero stability
+    /// threshold stops a block on confidence alone, and a zero confidence
+    /// threshold runs every block for all its steps.
     pub fn invalid_parameter(&self) -> Option<&'static str> {
+        let positive = |value: f32| value.is_finite() && value > 0.0;
         if self.canvas_length == 0 {
             Some("canvas_length")
         } else if self.max_steps == 0 {
             Some("max_steps")
-        } else if !self.entropy_bound.is_finite() {
+        } else if !positive(self.entropy_bound) {
             Some("entropy_bound")
-        } else if !self.t_min.is_finite() {
+        } else if !(self.t_min.is_finite() && self.t_min >= 0.0) {
             Some("t_min")
-        } else if !self.t_max.is_finite() {
+        } else if !(self.t_max.is_finite() && self.t_max > self.t_min) {
             Some("t_max")
-        } else if !self.confidence_threshold.is_finite() {
+        } else if !(self.confidence_threshold.is_finite() && self.confidence_threshold >= 0.0) {
             Some("confidence_threshold")
         } else {
             None
@@ -223,20 +227,16 @@ pub struct ImageEncoderInput {
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
 pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: MediaCall) -> u64 {
+    use std::hash::Hasher as _;
+
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the encoder index distinguishes repeated encoder kinds within one image
     // input.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in image_hash
-        .to_le_bytes()
-        .into_iter()
-        .chain((encoder_index as u64).to_le_bytes())
-        .chain([encoder as u8])
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    let mut hasher = crate::Fnv1a::default();
+    hasher.write(&image_hash.to_le_bytes());
+    hasher.write(&(encoder_index as u64).to_le_bytes());
+    hasher.write(&[encoder as u8]);
+    hasher.finish()
 }
 
 /// Product channel through which a materialized image reaches feedback encode.

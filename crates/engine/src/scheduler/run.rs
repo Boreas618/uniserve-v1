@@ -66,11 +66,11 @@ fn resolve_generation_limits(
 }
 
 /// Largest number of request-pool rows a runtime keeps outside
-/// `max_num_seqs` (`guidance_prefix_rows`). A launch sizes worker request pools
+/// `max_running_requests` (`guidance_prefix_rows`). A launch sizes worker request pools
 /// before the loaded capabilities decide the actual reserve.
 pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 2;
 
-/// Request-pool rows the runtime keeps outside `max_num_seqs`.
+/// Request-pool rows the runtime keeps outside `max_running_requests`.
 ///
 /// A cache runtime with denoising keeps a row for a running request's
 /// text-unconditional guidance prefix, and another for its
@@ -143,10 +143,10 @@ impl Scheduler {
         // flight; the merged record carries the narrowest.
         let transfer_capacity = info.transfer_tickets as usize;
 
-        config.max_num_waiting = config.max_num_waiting.map(|bound| bound.max(1));
+        config.max_queued_requests = config.max_queued_requests.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_num_seqs` (`guidance_prefix_rows`). `EngineCore::new` launches
+        // `max_running_requests` (`guidance_prefix_rows`). `EngineCore::new` launches
         // workers with enough rows and refuses a token runtime whose workers
         // hold fewer, so this clamp lowers the limit only for a supplied
         // executor or for workers that fit their request pools to device
@@ -156,7 +156,7 @@ impl Scheduler {
             .saturating_sub(guidance_prefix_rows(&info))
             .max(1);
 
-        let requested_seqs = config.max_num_seqs.max(1);
+        let requested_seqs = config.max_running_requests.max(1);
         if requested_seqs > main_request_capacity {
             tracing::warn!(
                 requested = requested_seqs,
@@ -165,7 +165,7 @@ impl Scheduler {
                 "the workers' request rows lower the running-request limit"
             );
         }
-        config.max_num_seqs = requested_seqs.min(main_request_capacity);
+        config.max_running_requests = requested_seqs.min(main_request_capacity);
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
         if max_batch_calls > 0 {
             config.max_batch = config.max_batch.min(max_batch_calls.max(1));

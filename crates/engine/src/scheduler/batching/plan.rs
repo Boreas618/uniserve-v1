@@ -102,7 +102,7 @@ impl Scheduler {
                 // Chunked prefill with the clip rule: the chunk is bounded by
                 // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
-                    .min(self.config.long_prefill_threshold)
+                    .min(self.config.chunked_prefill_size)
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1)).min(n);
                 if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
@@ -497,7 +497,7 @@ impl Scheduler {
         // Select the next chunk: prompt tokens up to the budget, and each
         // encoded vision block they reach whole. A latent block or a block
         // not yet encoded ends the chunk.
-        let limit = budget.max(1).min(self.config.long_prefill_threshold);
+        let limit = budget.max(1).min(self.config.chunked_prefill_size);
         let (end, blocks, block_tokens) = {
             let state = self.running.get(&id)?;
             let prompt_len = state.req.prompt_token_ids.len();
@@ -610,7 +610,7 @@ impl Scheduler {
             return None;
         }
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
-        let reach = cursor.saturating_add(self.config.long_prefill_threshold);
+        let reach = cursor.saturating_add(self.config.chunked_prefill_size);
         let mut block = state.block_cursor();
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {

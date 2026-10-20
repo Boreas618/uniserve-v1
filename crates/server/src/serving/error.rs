@@ -1,10 +1,9 @@
 //! Serving errors: failures to resolve and tokenize a model input
-//! ([`TokenizeError`]), to interpret or assemble model output
-//! ([`OutputProcessingError`]), and the runtime's own ([`ServeError`]).
+//! ([`TokenizeError`]), and the runtime's own ([`ServeError`]), which
+//! include failures to decode or parse model output.
 
 use thiserror::Error;
 
-use super::ServeRequestId;
 use crate::serving::media;
 
 #[derive(Debug, Error)]
@@ -25,9 +24,15 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
-    /// Multimodal request controls or geometry are invalid.
+    /// The requested output resolution is not served.
     #[error(transparent)]
-    Omni(#[from] crate::serving::omni::OmniError),
+    Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
+    /// The profile cannot size the request's images.
+    #[error(transparent)]
+    Assets(#[from] crate::profile::assets::Error),
+    /// The request exceeds the loaded workers' resource limits.
+    #[error(transparent)]
+    Resources(#[from] uniserve_core::GenerationResourceError),
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {
@@ -44,26 +49,6 @@ pub enum TokenizeError {
     Task(#[source] tokio::task::JoinError),
 }
 
-#[derive(Debug, Error)]
-/// Failure while interpreting or assembling model output.
-pub enum OutputProcessingError {
-    /// Generated token identifiers cannot be decoded.
-    #[error(transparent)]
-    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
-    /// Structured chat output cannot be parsed or assembled.
-    #[error(transparent)]
-    Chat(#[from] crate::serving::chat::Error),
-    /// Text output cannot be decoded or collected.
-    #[error(transparent)]
-    Text(#[from] crate::serving::text::Error),
-    /// Reasoning delimiters cannot be parsed.
-    #[error(transparent)]
-    Reasoning(#[from] crate::profile::reasoning::ReasoningError),
-    /// Engine output violates a serving-layer invariant.
-    #[error("{0}")]
-    Malformed(String),
-}
-
 /// Runtime-local serving errors.
 #[derive(Debug, Error)]
 pub enum ServeError {
@@ -71,7 +56,7 @@ pub enum ServeError {
     #[error("request `{request_id}` requires unsupported feature `{feature}`")]
     UnsupportedFeature {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Stable feature name.
         feature: &'static str,
     },
@@ -80,7 +65,7 @@ pub enum ServeError {
     #[error("request `{request_id}` sets `{control}`, but {reason}")]
     UnsupportedSamplingControl {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Wire name of the control.
         control: &'static str,
         /// Why the model's generation has no such control.
@@ -92,60 +77,46 @@ pub enum ServeError {
     )]
     ContextLengthExceeded {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Tokenized prompt length.
         prompt_tokens: usize,
         /// Maximum token count declared by the profile.
         max_tokens: u32,
     },
-    /// Another live request already owns the same identifier.
-    #[error("request `{request_id}` is already active")]
-    DuplicateRequestId {
-        /// Conflicting request identifier.
-        request_id: ServeRequestId,
-    },
-    /// Model assets or capabilities cannot be resolved.
+    /// No live engine core accepts the request.
     #[error(transparent)]
-    ModelResolution(#[from] crate::serving::model::ModelResolutionError),
-    /// Engine submission or streaming fails.
-    #[error(transparent)]
-    Engine(#[from] crate::engine_client::Error),
+    Submit(#[from] uniserve_engine::SubmitError),
     /// An input image reference cannot be fetched or decoded.
-    #[error("request `{request_id}` has an invalid input image")]
+    #[error("request `{request_id}` has an invalid input image {}", .index + 1)]
     ImageInput {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
-        /// The failing reference and its cause.
+        request_id: String,
+        /// Zero-based position of the failing reference among the request's images.
+        index: usize,
+        /// Why the reference could not be resolved.
         #[source]
-        source: media::ImageListError,
+        source: media::MediaError,
     },
+    /// The video service refuses a video request or cannot process it.
+    #[error(transparent)]
+    Video(#[from] uniserve_core::video::plan::VideoInputError),
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {
         /// Identifier of the rejected request.
-        request_id: ServeRequestId,
+        request_id: String,
         /// Underlying tokenization failure.
         #[source]
         source: TokenizeError,
     },
-    /// Engine output cannot be converted into serving events.
+    /// Engine output cannot be decoded or parsed into serving events, for
+    /// example because it violates the engine event protocol.
     #[error("request `{request_id}` output processing failed")]
     OutputProcessing {
         /// Identifier of the affected request.
-        request_id: ServeRequestId,
-        /// Underlying output-processing failure.
+        request_id: String,
+        /// Underlying decoding or parsing failure.
         #[source]
-        source: OutputProcessingError,
+        source: crate::serving::chat::Error,
     },
-}
-
-/// Builds an output-processing error for malformed engine output.
-pub(super) fn malformed_output(
-    request_id: impl Into<ServeRequestId>,
-    message: impl Into<String>,
-) -> ServeError {
-    ServeError::OutputProcessing {
-        request_id: request_id.into(),
-        source: OutputProcessingError::Malformed(message.into()),
-    }
 }
