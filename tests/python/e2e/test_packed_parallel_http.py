@@ -165,7 +165,7 @@ def one_device(
             base_url = f"http://127.0.0.1:{port}"
             worker_config = {
                 "id": "model",
-                "ranks": [{"node": "localhost", "device": "cuda:3"}],
+                "ranks": ["cuda:3"],
                 "components": {"model": {"ranks": [0]}},
                 "queue_depth": 2,
             }
