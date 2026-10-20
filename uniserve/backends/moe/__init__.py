@@ -4,21 +4,22 @@ A provider evaluates one ``FusedMoE`` call site: routed tokens of up to the
 prepared ``TextSize`` capacity through that module's resident expert weights,
 returning the combined output or, uncombined, its ``Routes``. Operators borrow
 the module's parameters and context-owned workspace; host planning happens only
-in ``prepare`` so calls can be captured in CUDA graphs. A provider whose kernel
-reads expert weights in another physical row order places them in that order
-when it is prepared; the logical weights stay unchanged and only one copy stays
-resident (``NVFP4Backend``).
+in ``prepare`` so calls can be captured in CUDA graphs. A provider whose kernels
+read expert weights in a physical row order or scale layout of their own
+declares it (``Backend.weight_layout``); loading stores the weights in the
+declared layout of the provider that serves them (``uniserve.loading.layout``),
+and preparation verifies it and never rearranges a weight.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from importlib import import_module
+from typing import TypeAlias
 
 # The portable provider is the submodule ``torch``; importing it binds that
 # name on this package, so the library keeps a distinct name here.
 import torch as torch_lib
-from torch import nn
 
 from uniserve.models.inputs import TextSize
 from uniserve.nn.functional import Routes
@@ -42,6 +43,38 @@ from uniserve.tensors import BufferConfig
 # 16-64 tokens (artifacts/diffusion_gemma/stage5/moe/bf16/).
 _NATIVE = ("cutedsl", "cutlass")
 _PROVIDERS = frozenset((*_NATIVE, "trtllm", "torch"))
+
+# The physical arrangement a provider reads each named expert projection's
+# encoded weight in, by projection name (``up_gate``, ``down``).
+WeightLayout: TypeAlias = Mapping[str, tuple[ScaleLayout, RowOrder]]
+
+
+def verify(module, layout: WeightLayout, provider: str) -> None:
+    """Reject expert weights stored in another layout than ``layout``.
+
+    Raises:
+        ValueError: A projection ``layout`` names is not an encoded weight
+            in that scale layout and row order.
+    """
+    for name, (scale_layout, row_order) in layout.items():
+        weight = getattr(module, name).weight
+        if (
+            not isinstance(weight, QuantizedTensor)
+            or weight.scale_layout is not scale_layout
+            or weight.row_order is not row_order
+        ):
+            stored = (
+                f"{weight.scale_layout.value} scales in the "
+                f"{weight.row_order.value} row order"
+                if isinstance(weight, QuantizedTensor)
+                else "dense values"
+            )
+            raise ValueError(
+                f"the {provider} experts read {name} weights as "
+                f"{scale_layout.value} scales in the {row_order.value} row "
+                f"order, not {stored}; loading stores weights in the layout "
+                "of the provider that serves them"
+            )
 
 
 class Operator:
@@ -219,6 +252,13 @@ class Backend:
         """Return why this provider cannot evaluate ``module``, or ``None``."""
         return None
 
+    def weight_layout(self, module) -> WeightLayout:
+        """The layout this provider's kernels read ``module``'s weights in.
+
+        Empty when they read the weights as loaded.
+        """
+        return {}
+
     def invalid_expert(self, module) -> int:
         """The routed expert id this provider's kernels skip.
 
@@ -235,33 +275,10 @@ class Backend:
         return {}
 
     def prepare(self, *, module, size: TextSize, workspace) -> Operator:
+        verify(module, self.weight_layout(module), self.name)
         return self.operator_class(
             module=module, size=size, workspace=workspace
         )
-
-
-def _place(linear, order: RowOrder) -> None:
-    """Store an ``ExpertLinear``'s stacked NVFP4 weight in ``order``.
-
-    Block scales take the 128x4 swizzled layout the grouped kernels read.
-    The rearranged encoding replaces the parameter, so one copy stays
-    resident; the transient copy is one projection of one layer. The work
-    completes before returning: later calls may run on another stream, and
-    the released encoding must have no pending reads.
-    """
-    weight = linear.weight
-    if (
-        weight.row_order is order
-        and weight.scale_layout is ScaleLayout.SWIZZLED_128X4
-    ):
-        return
-    if torch_lib.cuda.is_current_stream_capturing():
-        raise RuntimeError("expert weights must be placed before capture")
-    placed = weight.repack(
-        scale_layout=ScaleLayout.SWIZZLED_128X4, row_order=order
-    )
-    torch_lib.cuda.current_stream(weight.device).synchronize()
-    linear.weight = nn.Parameter(placed, requires_grad=False)
 
 
 class NVFP4Backend(Backend):
@@ -272,10 +289,10 @@ class NVFP4Backend(Backend):
     activations with the static calibrated scales of ``up_gate`` and
     ``down``'s input quantizers. A subclass names the physical row orders
     its kernels read (``up_gate_order``, ``down_order``) and the devices
-    they run on (``kernels_unsupported``). Preparation places loaded
-    linear-order weights in those orders once; weights another provider
-    placed in a different order are rejected, because a prepared operator
-    of that provider may still borrow them.
+    they run on (``kernels_unsupported``); loading stores the weights in
+    those orders (``weight_layout``). Weights stored in another provider's
+    order are not served, because a prepared operator of that provider may
+    still borrow them.
     """
 
     up_gate_order: RowOrder
@@ -339,15 +356,16 @@ class NVFP4Backend(Backend):
             if stored is not RowOrder.LINEAR and stored is not order:
                 return (
                     f"{name} weights are stored in the {stored.value} row "
-                    f"order another expert provider placed; these kernels "
+                    f"order another expert provider reads; these kernels "
                     f"read {order.value}"
                 )
         return None
 
-    def prepare(self, *, module, size: TextSize, workspace) -> Operator:
-        _place(module.up_gate, self.up_gate_order)
-        _place(module.down, self.down_order)
-        return super().prepare(module=module, size=size, workspace=workspace)
+    def weight_layout(self, module) -> WeightLayout:
+        return {
+            "up_gate": (ScaleLayout.SWIZZLED_128X4, self.up_gate_order),
+            "down": (ScaleLayout.SWIZZLED_128X4, self.down_order),
+        }
 
 
 def resolve(

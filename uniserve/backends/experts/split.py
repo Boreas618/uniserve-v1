@@ -16,16 +16,38 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-from torch import nn
 
 from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
 
-from ..moe import Operator
+from ..moe import Operator, WeightLayout, verify
 
 
 def _padded(width: int) -> int:
     """Physical tile padding of a hidden or intermediate width."""
     return (width + 511) // 512 * 512
+
+
+# The physical row orders the expert kernels read: eight gate channels
+# followed by the matching eight up channels, and ``down`` in logical order.
+_ORDERS = {"up_gate": RowOrder.INTERLEAVED_8, "down": RowOrder.LINEAR}
+
+
+def weight_layout(module) -> WeightLayout:
+    """The layout split MegaMoE's expert kernels read ``module``'s weights in.
+
+    The kernels read encoded values in ``_ORDERS`` and block scales as
+    MN-major 128x4 tiles. A layer whose hidden or intermediate width the
+    kernels pad to whole 512-column tiles is read through padded copies its
+    operator derives from the weights as loaded, so its layout is empty.
+    """
+    # [E, 2I, H] and [E, H, I]: the resident widths of this rank's experts.
+    hidden, intermediate = module.down.weight.shape[1:]
+    if _padded(hidden) != hidden or _padded(intermediate) != intermediate:
+        return {}
+    return {
+        name: (ScaleLayout.SWIZZLED_128X4_MN, order)
+        for name, order in _ORDERS.items()
+    }
 
 
 def symmetric_bytes(
@@ -300,7 +322,15 @@ class _Step:
 
 
 def _weights(linear, order, rows, columns, *, halves=1):
-    """Reorder encoded rows and place their scales in MN-major order."""
+    """An expert projection's kernel operands: values and MN-major scales.
+
+    Returns the encoded values ``[E, rows, columns / 2]`` (NVFP4) or
+    ``[E, rows, columns]`` (MXFP8) in ``order`` and the block scales as
+    ``[E, columns / 128, rows]`` 32-bit words of four scales, the MN-major
+    order UTCCP's 128-row tiles load. A weight of the kernels' padded width
+    is stored that way (``weight_layout``) and borrowed; a narrower one is
+    copied into zero-padded operands, its up and gate halves padded apart.
+    """
     weight = linear.weight
     if not isinstance(weight, QuantizedTensor):
         raise ValueError("split MegaMoE requires encoded expert weights")
@@ -335,26 +365,16 @@ def _weights(linear, order, rows, columns, *, halves=1):
                 )
         placed = weight.quantizer.from_tensors(
             fields, shape=(experts, rows, columns), dtype=weight.dtype
-        ).repack(row_order=order)
+        ).repack(row_order=order, scale_layout=ScaleLayout.SWIZZLED_128X4_MN)
     else:
-        placed = weight.repack(row_order=order, scale_layout=ScaleLayout.LINEAR)
-    if placed is not weight and placed.shape == weight.shape:
-        linear.weight = nn.Parameter(placed, requires_grad=False)
+        placed = weight
     fields = placed.buffers()
     experts, rows, _ = placed.shape
     nvfp4 = placed.quantizer.format == "nvfp4"
-    scales = fields["block_scale" if nvfp4 else "scale"].reshape(
-        experts, rows, -1
-    )
-    words = scales.contiguous().view(torch.int32)
-    # UTCCP's 128-row tile loads four groups of 32 scale rows in transposed
-    # order. The TMA descriptor advances N contiguously between word columns.
     scales = (
-        words.reshape(experts, rows // 128, 4, 32, -1)
-        .transpose(2, 3)
-        .reshape_as(words)
-        .transpose(1, 2)
-        .contiguous()
+        fields["block_scale" if nvfp4 else "scale"]
+        .view(torch.int32)
+        .reshape(experts, -1, rows)
     )
     values = fields["values"]
     return values.view(torch.int8 if nvfp4 else torch.float8_e4m3fn), scales
@@ -388,15 +408,16 @@ class _SplitOperator(Operator):
                 )
             return
 
+        verify(module, weight_layout(module), "split MegaMoE")
         fc1 = _weights(
             module.up_gate,
-            RowOrder.INTERLEAVED_8,
+            _ORDERS["up_gate"],
             2 * buffer.intermediate,
             buffer.hidden,
             halves=2,
         )
         fc2 = _weights(
-            module.down, RowOrder.LINEAR, buffer.hidden, buffer.intermediate
+            module.down, _ORDERS["down"], buffer.hidden, buffer.intermediate
         )
         for projection in (module.up_gate, module.down):
             if projection.weight.quantizer.format != buffer.format:

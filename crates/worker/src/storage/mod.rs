@@ -10,6 +10,7 @@ mod prefix_cache;
 pub(crate) mod products;
 mod request_slots;
 pub mod retained;
+pub(crate) mod weights;
 
 // The storage owners the integration tests and the storage harness drive.
 pub use buffer::{BufferBinding, BufferPool};

@@ -137,7 +137,8 @@ def test_expert_encodings_keep_values_and_per_expert_scales(tmp_path):
     _load(tmp_path, module)
 
     up_gate = module.up_gate.weight
-    assert up_gate.scale_layout is ScaleLayout.SWIZZLED_128X4
+    # Host experts take the portable provider, which reads them as loaded.
+    assert up_gate.scale_layout is ScaleLayout.LINEAR
     torch.testing.assert_close(
         up_gate.buffers()["tensor_scale"],
         torch.tensor([0.01, 0.02, 0.03]),

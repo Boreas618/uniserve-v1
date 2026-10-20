@@ -76,7 +76,9 @@ use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
+use crate::storage::memory::Storage;
 use crate::storage::retained::Retained;
+use crate::storage::weights::{self, WeightKeys};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
@@ -138,6 +140,9 @@ pub(crate) struct Worker {
     context: Option<PrimaryContext>,
     /// The worker's connection to its host's Storage Server.
     retained: Arc<Retained>,
+    /// The retained storages of the model's weights, mapped for the
+    /// worker's lifetime.
+    _weights: Vec<Arc<Storage>>,
     warmed: bool,
 }
 
@@ -214,8 +219,46 @@ impl Worker {
                 dedicated,
             });
         let loading = range(c"uniserve.worker.load", None);
-        let model = LoadedModel::load(description, &launch, meshes, experts, host_only)
+        // The weights the rank retained when it last loaded this model on
+        // this placement bind instead of loading, when every rank that
+        // loads with it found its own.
+        let keys = weight_keys(&launch, &description, &retained, host_only, &components)
             .map_err(phase("load"))?;
+        let found = match &keys {
+            Some(keys) => keys.find(&retained).map_err(phase("load"))?,
+            None => None,
+        };
+        let agreement = world.union.as_ref().unwrap_or(&world.host);
+        let everywhere = agreement
+            .all_reduce_min(&[i64::from(found.is_some())])
+            .map_err(phase("load"))?[0]
+            == 1;
+        let found = found.filter(|_| everywhere);
+        if found.is_none() && keys.is_some() {
+            retained.release_read_only().map_err(phase("load"))?;
+        }
+        let binding = found
+            .as_ref()
+            .map(weights::Found::bind)
+            .transpose()
+            .map_err(phase("load"))?;
+        let model = LoadedModel::load(
+            description,
+            &launch,
+            meshes,
+            experts,
+            host_only,
+            binding.as_ref(),
+        )
+        .map_err(phase("load"))?;
+        drop(binding);
+        let weight_storages = match (found, &keys) {
+            (Some(found), _) => found.into_storages(),
+            (None, Some(keys)) => keys
+                .publish(&retained, model.handle())
+                .map_err(phase("load"))?,
+            (None, None) => Vec::new(),
+        };
         // Every later graph decision of the rank reads the resolved policy.
         let host_component = components
             .placed()
@@ -558,6 +601,7 @@ impl Worker {
             hooks,
             context,
             retained,
+            _weights: weight_storages,
             warmed: false,
         })
     }
@@ -862,6 +906,51 @@ impl Worker {
 
 /// Graph pools for an expert union member's captured joins, one per microbatch,
 /// when no text runner shares its pools on the microbatch streams.
+/// The keys of the rank's retained weights, or `None` when its weights are
+/// not retained: the stub model, a rank without CUDA weights, and a rank
+/// whose loaded weights move to memory of another owner after loading,
+/// host-resident layers (`weights = "host"`) and distributed expert weights
+/// (`dwdp`).
+fn weight_keys(
+    launch: &WorkerLaunch,
+    description: &crate::worker::loading::Description,
+    retained: &Retained,
+    host_only: bool,
+    components: &Components,
+) -> Result<Option<WeightKeys>> {
+    let moved = components
+        .placed()
+        .iter()
+        .any(|placed| placed.config.weights == ComponentWeights::Host)
+        || launch
+            .expert_parallel
+            .as_ref()
+            .is_some_and(|union| union.exchange == "dwdp");
+    if host_only || moved || launch.device().cuda().is_none() {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let fingerprint = LoadedModel::fingerprint(description, launch)?;
+    if fingerprint.is_empty() {
+        return Ok(None);
+    }
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "fingerprinted the model's weights"
+    );
+    let devices: Vec<DeviceId> = launch
+        .execution
+        .devices()
+        .filter_map(|device| device.cuda())
+        .collect();
+    Ok(Some(WeightKeys::new(
+        retained,
+        &fingerprint,
+        &weights::placement(launch)?,
+        &devices,
+    )?))
+}
+
 fn reserve_join_pools(
     config: &WorkerConfig,
     experts: &mut ExpertUnion,

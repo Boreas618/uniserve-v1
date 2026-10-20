@@ -20,6 +20,7 @@ from uniserve.backends.experts import create as create_transport
 from uniserve.backends.experts.split import symmetric_bytes
 from uniserve.bindings.context import ExecutionContext
 from uniserve.distributed import Communicator, partition_experts
+from uniserve.loading.layout import finalize
 from uniserve.models import TextSize
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import Quantizer
@@ -133,6 +134,9 @@ def _exercise(
                 linear.weight = torch.nn.Parameter(
                     Quantizer(format).quantize(value), requires_grad=False
                 )
+        # Expert ranks store the weights in the split kernels' layout, as
+        # loading stores them.
+        finalize(model, experts="split")
 
         storage, pointers, _mapping = _peer_storage(
             symmetric_bytes(

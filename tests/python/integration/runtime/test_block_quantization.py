@@ -75,6 +75,10 @@ def test_encoded_gemm_writes_exact_projection_to_borrowed_output(format):
     weight = torch.ones((128, 256), dtype=torch.bfloat16, device="cuda:0")
     converter = Quantizer(format, axis=0 if format == "fp8" else None)
     left, right = converter.quantize(x), converter.quantize(weight)
+    if format != "fp8":
+        # Block GEMMs read weight scales 128x4-swizzled, the layout loading
+        # stores them in.
+        right = right.repack(scale_layout=ScaleLayout.SWIZZLED_128X4)
     out = torch.full((128, 128), -1.0, device="cuda:0", dtype=torch.bfloat16)
     assert linear(left, right, out=out) is out
     expected = (
@@ -144,7 +148,9 @@ def test_natively_swizzled_nvfp4_activations_project_as_their_repack(rows):
         scale_layout=ScaleLayout.SWIZZLED_128X4,
     )
     linear_layout = native.repack(scale_layout=ScaleLayout.LINEAR)
-    encoded = converter.quantize(weight)
+    encoded = converter.quantize(weight).repack(
+        scale_layout=ScaleLayout.SWIZZLED_128X4
+    )
 
     swizzled = linear(native, encoded)
     expected = linear(linear_layout, encoded)
@@ -153,14 +159,28 @@ def test_natively_swizzled_nvfp4_activations_project_as_their_repack(rows):
     torch.testing.assert_close(swizzled, expected, rtol=2**-7, atol=2**-7)
 
 
-@pytest.mark.parametrize("format", [None, "fp8", "mxfp8", "nvfp4"])
-@pytest.mark.parametrize("branch_width", [None, 4])
+# Block-scaled branches interleave in groups of whole 128-row scale tiles,
+# which the grouped GEMM reads in place.
+@pytest.mark.parametrize(
+    ("format", "widths", "branch_width"),
+    [
+        (None, (8, 12), None),
+        (None, (8, 12), 4),
+        ("fp8", (8, 12), None),
+        ("fp8", (8, 12), 4),
+        ("mxfp8", (8, 12), None),
+        ("mxfp8", (256, 384), 128),
+        ("nvfp4", (8, 12), None),
+        ("nvfp4", (256, 384), 128),
+    ],
+)
 @torch.inference_mode()
 def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
-    format, branch_width
+    format, widths, branch_width
 ):
     from uniserve import cuda_graph
     from uniserve.bindings.context import ExecutionContext
+    from uniserve.loading.layout import finalize
     from uniserve.models import TextSize
     from uniserve.nn import MergedColumnParallelLinear
 
@@ -168,7 +188,7 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
     generator = torch.Generator(device=device).manual_seed(718)
     layer = MergedColumnParallelLinear(
         128,
-        {"first": 8, "second": 12},
+        dict(zip(("first", "second"), widths, strict=True)),
         branch_width=branch_width,
         device=device,
         dtype=torch.bfloat16,
@@ -193,16 +213,14 @@ def test_merged_projections_preserve_live_parameters_bias_and_strided_outputs(
                 else quantizer
             )
             encoded = converter.quantize(value)
-            if index and format in {"nvfp4", "mxfp8"}:
-                encoded = encoded.repack(
-                    scale_layout=ScaleLayout.SWIZZLED_128X4
-                )
             branch.weight = torch.nn.Parameter(encoded, requires_grad=False)
             branch.input_quantizer = quantizer
         if index == 0:
             branch.bias.fill_(3)
         else:
             branch.register_parameter("bias", None)
+    # The weights take the layout their kernels read, as loading stores them.
+    finalize(layer)
 
     def expected(x):
         left = (

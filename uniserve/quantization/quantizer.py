@@ -289,7 +289,11 @@ class Quantizer:
         elif amax is None and self.format != "mxfp8":
             amax = self.amax(x, distribution=distribution)
 
+        # The encoders write linear or 128x4-swizzled scales; another layout
+        # ``out`` stores is a rearrangement of the linear one.
         layout = ScaleLayout.LINEAR if out is None else out.scale_layout
+        if layout is ScaleLayout.SWIZZLED_128X4_MN:
+            layout = ScaleLayout.LINEAR
         if self.format == "fp8":
             # FP8 off CUDA: it never carries a calibrated scale, so amax was
             # supplied or computed above.
@@ -307,9 +311,14 @@ class Quantizer:
         )
         if out is None:
             return result
-        if out.row_order is not result.row_order:
+        if (
+            out.row_order is not result.row_order
+            or out.scale_layout is not result.scale_layout
+        ):
             # Encoding follows logical rows; ``out`` may store them permuted.
-            result = result.repack(row_order=out.row_order)
+            result = result.repack(
+                scale_layout=out.scale_layout, row_order=out.row_order
+            )
         for name, value in result.buffers().items():
             out.buffers()[name].copy_(value.reshape_as(out.buffers()[name]))
         return out
@@ -684,6 +693,12 @@ class Quantizer:
             block = 32 if self.format == "mxfp8" else 16
             rows, columns = prod(shape[:-1]), shape[-1] // block
             scales = tensors["scale" if block == 32 else "block_scale"]
+            if scale_layout is ScaleLayout.SWIZZLED_128X4_MN and (
+                len(shape) not in {2, 3} or shape[-2] % 128
+            ):
+                raise ValueError(
+                    "MN-major scales store matrices of whole 128-row blocks"
+                )
             physical_shape = (
                 (rows, columns)
                 if scale_layout is ScaleLayout.LINEAR

@@ -23,8 +23,10 @@ from torch.nn import functional as F
 
 from uniserve import cuda_graph
 from uniserve.backends import experts as transports
+from uniserve.backends import moe
 from uniserve.bindings.context import ExecutionContext
 from uniserve.distributed import Communicator, partition_experts
+from uniserve.loading.layout import finalize, place
 from uniserve.models import TextSize
 from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
@@ -320,12 +322,13 @@ def _nvfp4(codes, device, block_scale=None):
     )
 
 
-def _nvfp4_moe(codes, device, group=None):
+def _nvfp4_moe(codes, device, provider, group=None):
     """NVFP4 experts of ``codes``, sharded over ``group`` when given.
 
     Positive E2M1 codes 1..7 (0.5 to 6) keep every product and sum
     positive, so each output element is a positive sum without
-    cancellation.
+    cancellation. The weights take the layout ``provider`` reads, as
+    loading stores them.
     """
     module = FusedMoE(
         EXPERTS,
@@ -350,6 +353,8 @@ def _nvfp4_moe(codes, device, group=None):
     module.up_gate.input_quantizer, module.down.input_quantizer = (
         Quantizer("nvfp4", calibrated_scale=scale) for scale in INPUT_SCALES
     )
+    backend = moe.resolve(provider, module=module, device=torch.device(device))
+    place(module, backend.weight_layout(module))
     return module
 
 
@@ -455,7 +460,7 @@ def _run_encoded(rank, port, provider, transport):
         # none and joins every step with its empty rows.
         codes, tokens = _encoded_inputs(TOKENS, device)
         hidden, ids, weights = tokens[rank]
-        module = _nvfp4_moe(codes, device, group)
+        module = _nvfp4_moe(codes, device, provider, group)
         # A rank without tokens only joins, with no rows to encode.
         encoded = (
             module.up_gate.input_quantizer.quantize(hidden)
@@ -496,7 +501,7 @@ def _run_encoded(rank, port, provider, transport):
         # route products; one GPU rounds each route and the sum to BF16
         # (within gamma(2) of the exact positive sum), expert parallelism
         # also rounds each rank's partial sum (within gamma(3)).
-        single = _nvfp4_moe(codes, device)
+        single = _nvfp4_moe(codes, device, provider)
         with ExecutionContext(single, moe=provider) as context:
             context.prepare(TextSize(CAPACITY, 1))
             with context.activate():
@@ -598,6 +603,8 @@ def _run_megamoe(rank, port, activation):
             requires_grad=False,
         )
         module.up_gate.input_quantizer, module.down.input_quantizer = quantizers
+        # The weights take the fused kernel's layout, as loading stores them.
+        finalize(module, experts="megamoe")
 
         exchange = _transport(group, "megamoe", top_k=1, activation=activation)
         stream = torch.cuda.Stream(device=device)

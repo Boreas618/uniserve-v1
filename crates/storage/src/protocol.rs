@@ -189,7 +189,9 @@ pub enum Request {
     Get { keys: Vec<Key>, mode: Mode },
     /// Publish tensors whose bytes are written, over the storages this
     /// message carries. Read-only tensors become readable; exclusive ones
-    /// keep the caller as their writer.
+    /// keep the caller as their writer. A read-only tensor already retained
+    /// under the same key holds the same bytes: the put adds the caller's
+    /// scope to it and the server keeps the retained one.
     Put {
         tensors: Vec<TensorRecord>,
         storages: Vec<StorageRecord>,

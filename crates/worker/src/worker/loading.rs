@@ -120,38 +120,81 @@ pub(crate) struct LoadedModel {
     pub(crate) attention_captures: bool,
 }
 
+/// The module paths a rank loads and those left unloaded below them:
+/// dedicated expert ranks hold only the routed experts, and attention ranks
+/// of a disaggregated union exclude them.
+fn selection<'a>(
+    description: &'a Description,
+    launch: &WorkerLaunch,
+) -> (Vec<String>, &'a [String]) {
+    let execution = &launch.execution;
+    let dedicated = execution.role == "experts";
+    let split = launch
+        .expert_parallel
+        .as_ref()
+        .is_some_and(|union| union.disaggregated());
+    let modules: Vec<String> = if dedicated {
+        description.expert_paths.clone()
+    } else {
+        description
+            .declarations
+            .resident(execution.rank, &launch.components)
+            .into_iter()
+            .collect()
+    };
+    let excluded: &[String] = if split && !dedicated {
+        &description.expert_paths
+    } else {
+        &[]
+    };
+    (modules, excluded)
+}
+
+/// The precision selectors of the launch's model, as JSON object text.
+fn quantization(launch: &WorkerLaunch) -> &str {
+    launch
+        .model
+        .as_ref()
+        .map_or("{}", |model| model.quantization.as_str())
+}
+
 impl LoadedModel {
-    /// Materialize this rank's modules (`load_model`). The checkpoint is
-    /// narrowed to the rank's resident modules: dedicated expert ranks hold
-    /// only the routed experts, and attention ranks of a disaggregated
-    /// union exclude them.
+    /// The digest of what determines this rank's loaded weights besides
+    /// its placement and GPUs (`fingerprint`); empty for the stub model,
+    /// whose weights are not retained.
+    pub(crate) fn fingerprint(description: &Description, launch: &WorkerLaunch) -> Result<String> {
+        let (modules, excluded) = selection(description, launch);
+        let text = |value: &str| Any::from(tvm_ffi::String::from(value));
+        let union = launch.expert_parallel.as_ref();
+        let fingerprint: tvm_ffi::String = Interpreter::import(&format!("{LOADING}.fingerprint"))?
+            .call_values(&[
+                description.handle.to_any(),
+                Any::from(strings(&modules)),
+                Any::from(strings(excluded)),
+                text(quantization(launch)),
+                text(&launch.execution.model_dtype),
+                union.map(|union| text(&union.exchange)).unwrap_or_default(),
+                Any::from(union.map_or(0, |union| union.attention_ranks as i64)),
+            ])?
+            .try_into()
+            .map_err(|error| Error::numerical("fingerprint", &error))?;
+        Ok(fingerprint.as_str().to_owned())
+    }
+
+    /// Materialize this rank's modules (`load_model`), or bind `retained`,
+    /// the library's tensors this rank retained when it last loaded the
+    /// same model on the same placement. The checkpoint is narrowed to the
+    /// rank's resident modules (`selection`).
     pub(crate) fn load(
         description: Description,
         launch: &WorkerLaunch,
         meshes: Vec<ComponentMesh>,
         experts: Option<ExpertPartition>,
         host_only: bool,
+        retained: Option<&Handle>,
     ) -> Result<Self> {
         let execution = &launch.execution;
-        let dedicated = execution.role == "experts";
-        let split = launch
-            .expert_parallel
-            .as_ref()
-            .is_some_and(|union| union.disaggregated());
-        let modules: Vec<String> = if dedicated {
-            description.expert_paths.clone()
-        } else {
-            description
-                .declarations
-                .resident(execution.rank, &launch.components)
-                .into_iter()
-                .collect()
-        };
-        let excluded: &[String] = if split && !dedicated {
-            &description.expert_paths
-        } else {
-            &[]
-        };
+        let (modules, excluded) = selection(&description, launch);
 
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
         let optional = |value: Option<i64>| value.map(Any::from).unwrap_or_default();
@@ -173,12 +216,7 @@ impl LoadedModel {
                 description.handle.to_any(),
                 Any::from(strings(&modules)),
                 Any::from(strings(excluded)),
-                text(
-                    launch
-                        .model
-                        .as_ref()
-                        .map_or("{}", |model| model.quantization.as_str()),
-                ),
+                text(quantization(launch)),
                 text(&execution.model_dtype),
                 text(&execution.device.to_string()),
                 generation.as_deref().map(text).unwrap_or_default(),
@@ -201,6 +239,12 @@ impl LoadedModel {
                 world,
                 Any::from(attention_ranks),
                 Any::from(expert_dedicated),
+                launch
+                    .expert_parallel
+                    .as_ref()
+                    .map(|union| text(&union.exchange))
+                    .unwrap_or_default(),
+                retained.map(Handle::to_any).unwrap_or_default(),
                 text(execution.attention_backend.as_str()),
                 Any::from(attention.workspace_size as i64),
                 text(&attention.decode_backend),

@@ -62,6 +62,8 @@ def load_model(description, **overrides):
         "expert_world": None,
         "attention_ranks": 0,
         "expert_dedicated": False,
+        "expert_exchange": None,
+        "retained": None,
         "attention_backend": "auto",
         "workspace_size": 1 << 20,
         "decode_backend": "fa2",

@@ -948,16 +948,6 @@ class _Loader:
         elif isinstance(value, QuantizedTensor) and explicit:
             value = value.dequantize(dtype=dtype)
 
-        owner, _ = self._owners[key]
-        if (
-            isinstance(owner, ExpertLinear)
-            and isinstance(value, QuantizedTensor)
-            and value.quantizer.format == "nvfp4"
-        ):
-            # Expert block scales reside in the swizzled layout grouped
-            # expert kernels read; expert row blocks are whole 128-row tiles.
-            value = value.repack(scale_layout=ScaleLayout.SWIZZLED_128X4)
-
         # One resident Parameter object serves every module that shared the
         # original placeholder, preserving alias identity after the swap.
         resident = nn.Parameter(

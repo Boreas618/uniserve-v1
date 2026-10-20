@@ -22,12 +22,13 @@ dequantize with ``tensor_scale2[e] * s2``, and each route's FP32 weight
 multiplies after FC2 (``apply_topk_in_fc1=False``), with the explicit BF16
 top-k combine (no in-kernel atomic reduce, no low-precision wire, no clamp).
 
-Weights stay one resident copy: preparation places ``up_gate`` in
+Weights stay one resident copy: loading stores ``up_gate`` in
 ``RowOrder.INTERLEAVED_16`` (each 16-row gate block followed by its up
 block, as the fused gated epilogue reads) and ``down`` linearly, both with
-128x4-swizzled block scales, and the kernel reads K-major transposed views
-of them. ``MegaMoEBuffer`` holds the worker's symmetric buffers and compiled
-kernel for the group; every expert layer on the worker's stream shares it.
+128x4-swizzled block scales (``Backend.weight_layout``), and the kernel
+reads K-major transposed views of them. ``MegaMoEBuffer`` holds the
+worker's symmetric buffers and compiled kernel for the group; every expert
+layer on the worker's stream shares it.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from uniserve.distributed import Communicator
 from uniserve.nn.moe import Activation
 from uniserve.quantization import RowOrder
 
-from . import NVFP4Backend, NVFP4Operator
+from . import NVFP4Backend, NVFP4Operator, verify
 
 __all__ = ["Backend", "MegaMoEBuffer"]
 
@@ -289,9 +290,11 @@ class Backend(NVFP4Backend):
         return None
 
     def prepare_fused(self, *, module, size, buffer: MegaMoEBuffer):
-        """Place ``module``'s weights and bind its fused call to ``buffer``."""
-        from . import _place
+        """Bind ``module``'s fused call to ``buffer``.
 
-        _place(module.up_gate, self.up_gate_order)
-        _place(module.down, self.down_order)
+        Raises:
+            ValueError: The weights are not stored in this provider's
+                layout (``weight_layout``).
+        """
+        verify(module, self.weight_layout(module), self.name)
         return _MegaMoE(module=module, size=size, workspace={}, buffer=buffer)

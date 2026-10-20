@@ -46,6 +46,19 @@ pub trait ExclusiveMemory {
     fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Arc<Storage>>>;
 }
 
+/// The device bytes a worker's scope retains on one GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScopeBytes {
+    /// Storages the worker uses: its weights and the exclusive storages it
+    /// took.
+    pub held: u64,
+    /// Exclusive storages a predecessor left that the worker has not taken
+    /// yet: its owners take them again, or release them when their shape
+    /// changed, before allocating their own memory. A storage no owner
+    /// asks for any more is released once the worker started.
+    pub reclaimable: u64,
+}
+
 /// Exclusive memory a process allocates for itself, which ends with it.
 pub struct LocalMemory;
 
@@ -145,53 +158,122 @@ impl Retained {
         Key(digest.finalize().into())
     }
 
-    /// The bytes of the scope's retained device storages on `device`,
-    /// which NVML attributes to no process: capacity planning counts them
-    /// as the worker's own.
-    pub(crate) fn scope_bytes(&self, device: DeviceId) -> Result<u64> {
+    /// The UUID of `device`, which retained keys and records name.
+    pub(crate) fn gpu(&self, device: DeviceId) -> Result<[u8; 16]> {
+        lock(&self.state).gpu(device)
+    }
+
+    /// Make one call on the connection, as the worker doing `what`.
+    pub(crate) fn call<T>(
+        &self,
+        what: &str,
+        request: impl FnOnce(&mut Client) -> uniserve_storage::Result<T>,
+    ) -> Result<T> {
+        request(&mut lock(&self.state).client).map_err(|error| storage_error(what, error))
+    }
+
+    /// Note tensors the worker uses, which its startup retains.
+    pub(crate) fn use_keys(&self, keys: impl IntoIterator<Item = Key>) {
+        lock(&self.state).used.extend(keys);
+    }
+
+    /// Release the scope's read-only tensors before the worker loads its
+    /// weights again, so the memory of weights it no longer binds returns
+    /// before loading needs it. Exclusive storages stay.
+    pub(crate) fn release_read_only(&self) -> Result<()> {
+        let mut state = lock(&self.state);
+        let listing = state
+            .client
+            .list()
+            .map_err(|error| storage_error("listing the storage server", error))?;
+        let keep: Vec<Key> = listing
+            .tensors
+            .iter()
+            .filter(|tensor| {
+                tensor.scopes.contains(&self.scope) && tensor.access != Access::ReadOnly
+            })
+            .map(|tensor| tensor.key)
+            .collect();
+        let released = state
+            .client
+            .retain(keep)
+            .map_err(|error| storage_error("releasing retained weights", error))?;
+        if released > 0 {
+            tracing::info!(released, "released retained weights before loading");
+        }
+        Ok(())
+    }
+
+    /// The scope's retained device bytes on `device`, which NVML attributes
+    /// to no process: capacity planning counts the held ones as the
+    /// worker's own and the reclaimable ones as free.
+    pub(crate) fn scope_bytes(&self, device: DeviceId) -> Result<ScopeBytes> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let listing = state
             .client
             .list()
             .map_err(|error| storage_error("listing the storage server", error))?;
-        Ok(listing
+        let total: u64 = listing
             .device_bytes
             .iter()
             .filter(|entry| entry.gpu == Some(gpu) && entry.scope == self.scope)
             .map(|entry| entry.bytes)
-            .sum())
+            .sum();
+        // Every exclusive tensor is a storage of its own.
+        let reclaimable: u64 = listing
+            .tensors
+            .iter()
+            .filter(|tensor| {
+                tensor.access == Access::Exclusive
+                    && tensor.placement == Placement::Device { gpu }
+                    && tensor.scopes.contains(&self.scope)
+                    && !state.written.contains(&tensor.key)
+            })
+            .map(|tensor| tensor.storage_bytes)
+            .sum();
+        Ok(ScopeBytes {
+            held: total.saturating_sub(reclaimable),
+            reclaimable,
+        })
     }
 
-    /// Release the scope's tensors named like a spec of `specs` whose key
-    /// is not the spec's: an owner whose shape changed frees its old memory
-    /// before it allocates the new.
-    fn release_superseded(&self, state: &mut State, specs: &[(String, Key)]) -> Result<()> {
+    /// Release the exclusive storages a predecessor left that no owner of
+    /// this worker took and that `taking` does not take now. An owner that
+    /// allocates new memory calls this first: capacity planning counted
+    /// those storages as free (`ScopeBytes::reclaimable`), and an owner
+    /// whose shape changed, or that this worker no longer has, leaves them
+    /// to no one.
+    fn release_untaken(&self, state: &mut State, taking: &BTreeSet<Key>) -> Result<()> {
         let listing = state
             .client
             .list()
             .map_err(|error| storage_error("listing the storage server", error))?;
         let mut keep = Vec::new();
-        let mut superseded = 0;
+        let mut untaken = 0;
         for tensor in listing
             .tensors
             .iter()
             .filter(|tensor| tensor.scopes.contains(&self.scope))
         {
-            let stale = specs
-                .iter()
-                .any(|(name, key)| *name == tensor.name && *key != tensor.key);
-            if stale {
-                superseded += 1;
+            if tensor.access == Access::Exclusive
+                && !state.written.contains(&tensor.key)
+                && !taking.contains(&tensor.key)
+            {
+                untaken += 1;
             } else {
                 keep.push(tensor.key);
             }
         }
-        if superseded > 0 {
+        if untaken > 0 {
             state
                 .client
                 .retain(keep)
-                .map_err(|error| storage_error("releasing superseded storages", error))?;
+                .map_err(|error| storage_error("releasing untaken storages", error))?;
+            tracing::info!(
+                released = untaken,
+                "released exclusive storages no owner takes again"
+            );
         }
         Ok(())
     }
@@ -243,16 +325,15 @@ impl ExclusiveMemory for &Retained {
                 gpu,
             ));
         }
-        let names: Vec<(String, Key)> = keyed
-            .iter()
-            .map(|(name, key, _)| (name.clone(), *key))
-            .collect();
-        retained.release_superseded(&mut state, &names)?;
-
+        let keys: Vec<Key> = keyed.iter().map(|(_, key, _)| *key).collect();
         let got = state
             .client
-            .get(names.iter().map(|(_, key)| *key).collect(), Mode::Write)
+            .get(keys, Mode::Write)
             .map_err(|error| storage_error("taking exclusive storages", error))?;
+        if !got.missing.is_empty() {
+            let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
+            retained.release_untaken(&mut state, &taking)?;
+        }
         let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
             got.storages.into_iter().map(Some).collect();
         let mut found = BTreeMap::new();
