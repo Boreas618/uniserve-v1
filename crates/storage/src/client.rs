@@ -190,9 +190,26 @@ impl Client {
     /// See [`Request::Claim`]: become the deployment's head, keeping
     /// `scopes`.
     pub fn claim(&mut self, scopes: Vec<Scope>) -> Result<Claim> {
-        match Self::expect(self.call(&Request::Claim { scopes }, &[])?)?.reply {
+        let request = Request::Claim {
+            scopes,
+            handover: None,
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
             Reply::Claimed { claim } => Ok(claim),
             other => Err(unexpected("claim", &other)),
+        }
+    }
+
+    /// See [`Request::Claim`]: take the deployment over from its head,
+    /// which gave its `claim`, keeping `scopes`.
+    pub fn take_over(&mut self, scopes: Vec<Scope>, claim: Claim) -> Result<Claim> {
+        let request = Request::Claim {
+            scopes,
+            handover: Some(claim),
+        };
+        match Self::expect(self.call(&request, &[])?)?.reply {
+            Reply::Claimed { claim } => Ok(claim),
+            other => Err(unexpected("take over", &other)),
         }
     }
 

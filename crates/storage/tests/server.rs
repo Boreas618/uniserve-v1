@@ -503,7 +503,10 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     );
     // A connection from another host claims nothing.
     assert!(matches!(
-        ask(Request::Claim { scopes: Vec::new() }),
+        ask(Request::Claim {
+            scopes: Vec::new(),
+            handover: None
+        }),
         Reply::Error {
             kind: ErrorKind::Invalid,
             ..
@@ -710,5 +713,42 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     assert_eq!(
         head.wait(lookup).unwrap().reply,
         Reply::Lookup { l2: 2, l3: 2 }
+    );
+}
+
+#[test]
+fn a_successor_head_takes_the_deployment_over_with_its_claim() {
+    let server = Running::start();
+    let mut predecessor = head(&server.socket);
+    let claim = predecessor.claim(vec![scope("text", 0)]).unwrap();
+
+    // A head that does not know the claim is refused while the predecessor
+    // is connected; the successor, which the predecessor gave its claim,
+    // takes the deployment over under the same claim.
+    let mut stranger = head(&server.socket);
+    assert_eq!(
+        server_error(stranger.take_over(vec![scope("text", 0)], Claim([9; 16]))),
+        ErrorKind::Claimed
+    );
+    let mut successor = head(&server.socket);
+    assert_eq!(
+        successor.take_over(vec![scope("text", 0)], claim).unwrap(),
+        claim
+    );
+
+    // A worker of the claim keeps serving the deployment, and the
+    // predecessor's leaving does not end the successor's headship.
+    let mut worker = worker(&server.socket, scope("text", 0), 2, claim);
+    worker.retain(Vec::new()).unwrap();
+    drop(predecessor);
+    let listing = retry(|| {
+        let listing = successor.list()?;
+        Ok(listing)
+    });
+    assert!(
+        listing
+            .deployments
+            .iter()
+            .any(|deployment| deployment.deployment == "model" && deployment.head_connected)
     );
 }

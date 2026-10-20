@@ -560,8 +560,8 @@ impl Server {
                 Ok(Outcome::Reply(Reply::Finished, Vec::new()))
             }
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
-            (Request::Claim { scopes }, Role::Head { deployment }) => {
-                self.claim(id, &deployment, scopes)
+            (Request::Claim { scopes, handover }, Role::Head { deployment }) => {
+                self.claim(id, &deployment, scopes, *handover)
             }
             (
                 request,
@@ -610,7 +610,11 @@ impl Server {
         id: ClientId,
         deployment: &str,
         scopes: &[Scope],
+        handover: Option<Claim>,
     ) -> Result<Outcome, (ErrorKind, String)> {
+        if let Some(given) = handover {
+            return self.take_over(id, deployment, scopes, given);
+        }
         if let Some(entry) = self.deployments.get(deployment)
             && let Some(head) = entry.head
             && head != id
@@ -692,6 +696,48 @@ impl Server {
         }
         tracing::info!(deployment, "a head claimed the deployment");
         Ok(Outcome::Reply(Reply::Claimed { claim }, Vec::new()))
+    }
+
+    /// A claim that `handover` names: the deployment's head becomes `id`
+    /// under the same claim, which its previous head gave it. Nothing is
+    /// shot down: the previous head's workers release their write access as
+    /// they quiesce, and the successor's standby workers, which hold the
+    /// same claim, take it by promotion.
+    fn take_over(
+        &mut self,
+        id: ClientId,
+        deployment: &str,
+        scopes: &[Scope],
+        given: Claim,
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        let Some(entry) = self.deployments.get_mut(deployment) else {
+            return Err(invalid(&format!(
+                "deployment {deployment} has no claim to hand over"
+            )));
+        };
+        if entry.claim != given {
+            return Err((
+                ErrorKind::Claimed,
+                format!("the handover names another claim than deployment {deployment}'s"),
+            ));
+        }
+        entry.head = Some(id);
+        let listed: BTreeSet<&Scope> = scopes.iter().collect();
+        let released: Vec<Key> = self
+            .tensors
+            .iter_mut()
+            .filter_map(|(key, tensor)| {
+                tensor
+                    .scopes
+                    .retain(|scope| scope.deployment != deployment || listed.contains(scope));
+                tensor.scopes.is_empty().then_some(*key)
+            })
+            .collect();
+        for key in released {
+            self.remove_tensor(&key);
+        }
+        tracing::info!(deployment, "a successor head took the deployment over");
+        Ok(Outcome::Reply(Reply::Claimed { claim: given }, Vec::new()))
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
