@@ -6,7 +6,7 @@
 //! and resolves the final `GenerationRequest`. Wire-level checks that need the
 //! served configuration run here; model-specific validation happens during
 //! preprocessing. Serving errors are mapped back to `ApiError` with
-//! `serve_error_to_api`. [`chat_image_urls`] lists a chat request's image
+//! `From<ServeError> for ApiError`. [`chat_image_urls`] lists a chat request's image
 //! references so the serving runtime can resolve them before preprocessing.
 
 use crate::profile::tools;
@@ -21,8 +21,8 @@ use crate::serving::{
 use itertools::Itertools as _;
 use uniserve_core::CachePolicy;
 
+use crate::openai::convert_logit_bias;
 use crate::openai::error::{ApiError, bail_invalid_request};
-use crate::openai::utils::convert_logit_bias;
 use crate::openai::{
     ChatCompletionRequest, ChatImageConfig, ChatMessage, ChatModality, ContentPart, MessageContent,
     Tool, ToolCall,
@@ -182,7 +182,7 @@ impl crate::serving::InputProcessor {
                 include_stop_string_in_output: request.include_stop_str_in_output,
             },
         )
-        .map_err(crate::openai::serve_error_to_api)
+        .map_err(crate::openai::ApiError::from)
     }
 }
 
@@ -389,7 +389,7 @@ impl crate::serving::InputProcessor {
             ));
         }
         if let Some(model) = request.model.as_deref() {
-            crate::openai::utils::check_model_served(model, self.served_model_name())?;
+            crate::openai::check_model_served(model, self.served_model_name())?;
         }
         // An absent size leaves both dimensions to the profile's resolution
         // policy.
@@ -425,7 +425,7 @@ impl crate::serving::InputProcessor {
             OutputDetail::VisibleText,
             DecodeControls::default(),
         )
-        .map_err(crate::openai::serve_error_to_api)
+        .map_err(crate::openai::ApiError::from)
     }
 }
 

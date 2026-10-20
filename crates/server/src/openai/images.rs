@@ -1,15 +1,48 @@
-//! Collection of image-generation output into OpenAI responses.
+//! `POST /v1/images/generations`: OpenAI-compatible image generation.
 //!
-//! The `/v1/images/generations` route submits an `ImageGenerationRequest`
-//! through the serving runtime and hands the resulting `RequestOutput` stream
-//! to [`collect_image_generation`], which buffers completed images until the
-//! request finishes and returns one non-streaming response.
+//! The handler submits an `ImageGenerationRequest` through the engine and
+//! hands the resulting `RequestOutput` stream to [`collect_image_generation`],
+//! which buffers completed images until the request finishes and returns one
+//! non-streaming response.
 
-use crate::serving::RequestOutput;
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _};
 
-use crate::openai::error::{ApiError, serve_error_to_api};
-use crate::openai::types::{GeneratedImageData, ImageGenerationResponse};
+use crate::engine::Engine;
+use crate::http::RequestId;
+use crate::openai::{
+    ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,
+};
+use crate::serving::RequestOutput;
+
+/// The image generation route.
+pub(crate) fn router(engine: Arc<Engine>) -> Router {
+    Router::new()
+        .route("/v1/images/generations", post(images_generations))
+        .with_state(engine)
+}
+
+/// Validates, submits, and collects one image-generation request.
+async fn images_generations(
+    State(engine): State<Arc<Engine>>,
+    Extension(RequestId(base_id)): Extension<RequestId>,
+    ValidatedJson(body): ValidatedJson<ImageGenerationRequest>,
+) -> Response {
+    let request_id = format!("img-{base_id}");
+    let stream = match engine.generate_image(request_id.into(), body).await {
+        Ok(stream) => stream,
+        Err(error) => return error.into_response(),
+    };
+    match collect_image_generation(stream, uniserve_core::now_unix_secs_u64()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
 
 /// Collects image events into one OpenAI-compatible response.
 ///
@@ -20,7 +53,7 @@ use crate::openai::types::{GeneratedImageData, ImageGenerationResponse};
 ///
 /// # Errors
 ///
-/// Returns a stream error mapped by [`serve_error_to_api`], the category
+/// Returns a stream error mapped by `From<ServeError>`, the category
 /// chosen by [`ApiError::rejected`] for an admission rejection, and a server
 /// error when the request fails, is cancelled or aborted, finishes with an
 /// error status, emits a video event, reports an image without its
@@ -35,7 +68,7 @@ pub async fn collect_image_generation(
     let mut data = Vec::new();
     let mut finished = false;
     while let Some(event) = stream.next().await {
-        match event.map_err(serve_error_to_api)? {
+        match event? {
             // `ImageDone` metadata is optional in the serving protocol; an
             // image response cannot be built without all four fields.
             RequestOutput::ImageDone {

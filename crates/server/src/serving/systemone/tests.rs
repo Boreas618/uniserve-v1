@@ -24,7 +24,7 @@ use super::{
 use axum::http::StatusCode;
 use base64::Engine as _;
 
-use crate::http::test_support::{SERVED_MODEL, post_json, send, sim_state};
+use crate::http::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 use crate::profile::ModelParameters;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
@@ -839,14 +839,14 @@ fn a_tokenizer_that_merges_two_letter_labels_is_refused_at_startup() {
     );
 }
 
-/// Application state serving `checkpoint`'s readout over the engine
-/// simulator, which answers every candidate with a fixed log-probability.
+/// The router serving `checkpoint`'s readout over the engine simulator,
+/// which answers every candidate with a fixed log-probability.
 fn readout_router(checkpoint: &Checkpoint, options: ReadoutOptions) -> axum::Router {
     let engine = crate::http::test_support::sim_readout_engine(
         ModelParameters::DiffusionGemma(checkpoint.profile.clone()),
         Some(checkpoint.encoder(options, 4096)),
     );
-    crate::http::build_router(Arc::new(crate::AppState::new(engine)))
+    router(engine)
 }
 
 fn readout_body(questions: Value) -> Value {
@@ -974,7 +974,7 @@ async fn the_route_refuses_another_model_and_invalid_bodies() {
 /// A model without the readout does not serve the route.
 #[tokio::test]
 async fn a_model_without_the_readout_does_not_serve_the_route() {
-    let router = crate::http::build_router(Arc::new(sim_state(ModelParameters::Qwen3)));
+    let router = router(sim_engine(ModelParameters::Qwen3));
 
     let (status, _, body) = send(
         &router,

@@ -262,8 +262,8 @@ pub struct ServerOptions {
     /// Unix domain socket to listen on instead of TCP; a stale socket file
     /// is replaced and the socket file is removed at shutdown.
     pub uds: Option<String>,
-    /// Bearer token the public routes require; `UNISERVE_API_KEY` supplies
-    /// it when unset or blank. Never printed.
+    /// Bearer token every route but `/health` and `/metrics` requires;
+    /// `UNISERVE_API_KEY` supplies it when unset or blank. Never printed.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
     /// Time until a response head is sent, answered with 504 when it

@@ -1,24 +1,26 @@
-//! Application state over the in-process engine simulator for HTTP route
-//! tests.
+//! Engines over the in-process engine simulator, and their routers, for
+//! HTTP route tests.
 //!
-//! Requests travel through the public router (`routes::build_router`) into a
-//! real `Engine`, whose engine core drives `SimEngine` through `SimExecutor`.
-//! The default simulator provides no video media components, so the engine
+//! Requests travel through the server's router (`http::router`) into a real
+//! `Engine`, whose engine core drives `SimEngine` through `SimExecutor`. The
+//! default simulator provides no video media components, so the engine
 //! refuses every video submission as an invalid request.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 use uniserve_core::ModelDtype;
 use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
-use crate::AppState;
 use crate::engine::Engine;
-use crate::options::{ImageFetchOptions, LoggingOptions};
+use crate::openai::video_jobs::VideoJobs;
+use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::ImageFetcher;
@@ -30,10 +32,16 @@ use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
-/// Builds application state for a model with `parameters` over a default
-/// `SimEngine`; see [`sim_engine`].
-pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
-    AppState::new(sim_engine(parameters))
+/// The server's router over `engine` under the default server options.
+pub(crate) fn router(engine: Engine) -> Router {
+    router_with(engine, &ServerOptions::default())
+}
+
+/// The server's router over `engine` under `server`, with the HTTP body limit
+/// for the video submission routes and default video job options.
+pub(crate) fn router_with(engine: Engine, server: &ServerOptions) -> Router {
+    let jobs = VideoJobs::new(VideoJobOptions::default(), CancellationToken::new());
+    super::router(Arc::new(engine), Arc::new(jobs), server, super::BODY_LIMIT)
 }
 
 /// Builds an engine for a model with `parameters` over one default

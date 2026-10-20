@@ -1,101 +1,99 @@
 //! OpenAI-compatible error categories and HTTP response conversion.
 //!
-//! [`ApiError`] is the error vocabulary of the OpenAI surface. Each variant
-//! fixes an HTTP status ([`ApiError::status_code`]) and an OpenAI error body
-//! with a stable `type` and `code` ([`ApiError::to_error_response`]).
-//! Serving-layer failures enter through [`serve_error_to_api`] and engine
-//! admission rejections through [`ApiError::rejected`].
+//! [`ApiError`] is the error vocabulary of the OpenAI surface, as vLLM's
+//! Rust frontend defines it. Each variant fixes an HTTP status
+//! ([`ApiError::status_code`]) and an OpenAI error body with a stable `type`
+//! and `code` ([`ApiError::to_error_response`]). The derived constructors
+//! (`ApiError::invalid_request`, ...) and macros (`invalid_request!`,
+//! `bail_server_error!`, ...) build each variant; serving failures convert
+//! through `From<ServeError>` and engine admission rejections through
+//! [`ApiError::rejected`].
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::extract::rejection::JsonRejection;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use thiserror_ext::{Construct, Macro};
 
-use crate::openai::types::{ErrorDetail, ErrorResponse};
+use crate::openai::{ErrorDetail, ErrorResponse};
 use crate::serving::ServeError;
+use crate::serving::video::artifact::VideoStreamError;
 
-/// Error categories raised while validating or lowering OpenAI-compatible
-/// requests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Retry-After` hint, in seconds, of a `503 Service Unavailable`.
+const RETRY_AFTER_SECONDS: HeaderValue = HeaderValue::from_static("1");
+
+/// Error categories of the OpenAI-compatible API.
+#[derive(Debug, Clone, PartialEq, Eq, Construct, Macro)]
+#[thiserror_ext(macro(vis = pub(crate), path = "crate::openai::error"))]
 pub enum ApiError {
-    /// The JSON request is syntactically valid but asks for unsupported or
-    /// invalid behavior.
+    /// The request is valid JSON but asks for unsupported or invalid
+    /// behavior.
     InvalidRequest {
         /// Human-readable validation failure.
         message: String,
         /// Request parameter associated with the failure, when known.
         param: Option<&'static str>,
     },
-    /// The requested model name does not match any served model.
-    ModelNotFound {
-        /// Requested model name.
-        model: String,
-    },
-    /// The server could not produce a result, for example because an
-    /// internal invariant, model resolution, the engine, or output processing
-    /// failed, or because generation ended without a usable output.
-    ServerError {
-        /// Human-readable internal failure.
-        message: String,
-    },
-    /// The request body could not be parsed as valid JSON.
+    /// The request body could not be parsed as the endpoint's JSON schema.
     JsonParseError {
         /// Parser failure message.
         message: String,
     },
+    /// The request carries no valid API key.
+    Unauthorized,
+    /// The requested model name does not match the served model.
+    ModelNotFound {
+        /// Requested model name.
+        model: String,
+    },
+    /// The request names a resource that does not exist, such as an unknown
+    /// or expired video job.
+    NotFound {
+        /// Stable machine-readable error code, such as `video_not_found`.
+        code: &'static str,
+        /// Human-readable description.
+        message: String,
+    },
     /// A valid call conflicts with the current runtime state, for example a
-    /// request for the content of a video job that has none (queued, running,
-    /// or failed).
+    /// request for the content of a video job that has none (queued,
+    /// running, or failed).
     Conflict {
         /// Human-readable conflict description.
         message: String,
     },
-    /// The engine's waiting queue is full; the same request may succeed later.
-    Overloaded {
+    /// The request body has a content type the endpoint does not take.
+    UnsupportedMediaType {
+        /// The content types the endpoint takes.
+        message: String,
+    },
+    /// The server could not produce a result, for example because an
+    /// internal invariant, the engine, or output processing failed, or
+    /// because generation ended without a usable output.
+    ServerError {
+        /// Human-readable internal failure.
+        message: String,
+    },
+    /// The server cannot take the request now, but the same request may
+    /// succeed later: the engine's waiting queue or the server's in-flight
+    /// limit is full.
+    ServiceUnavailable {
+        /// Stable machine-readable error code, such as `server_overloaded`.
+        code: &'static str,
         /// Human-readable admission failure.
+        message: String,
+    },
+    /// The server did not answer within its request timeout.
+    Timeout {
+        /// Human-readable description of the expired timeout.
         message: String,
     },
 }
 
-/// Result type for OpenAI request validation and conversion.
+/// Result type of the OpenAI-compatible API.
 pub type Result<T> = std::result::Result<T, ApiError>;
 
 impl ApiError {
-    /// Constructs an invalid-request error for an optional parameter.
-    pub fn invalid_request(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self::InvalidRequest {
-            message: message.into(),
-            param,
-        }
-    }
-
-    /// Constructs an error for a model name not served by this configuration.
-    pub fn model_not_found(model: impl Into<String>) -> Self {
-        Self::ModelNotFound {
-            model: model.into(),
-        }
-    }
-
-    /// Constructs an internal server error.
-    pub fn server_error(message: impl Into<String>) -> Self {
-        Self::ServerError {
-            message: message.into(),
-        }
-    }
-
-    /// Constructs an error for malformed JSON input.
-    pub fn json_parse_error(message: impl Into<String>) -> Self {
-        Self::JsonParseError {
-            message: message.into(),
-        }
-    }
-
-    /// Constructs a request-conflict error.
-    pub fn conflict(message: impl Into<String>) -> Self {
-        Self::Conflict {
-            message: message.into(),
-        }
-    }
-
     /// Maps an engine admission rejection to its caller-facing category.
     ///
     /// `Invalid` becomes a 400 invalid request that fails the same way on
@@ -104,9 +102,9 @@ impl ApiError {
     pub fn rejected(kind: uniserve_core::RejectionKind, message: impl Into<String>) -> Self {
         match kind {
             uniserve_core::RejectionKind::Invalid => Self::invalid_request(message, None),
-            uniserve_core::RejectionKind::Overloaded => Self::Overloaded {
-                message: message.into(),
-            },
+            uniserve_core::RejectionKind::Overloaded => {
+                Self::service_unavailable("server_overloaded", message)
+            }
         }
     }
 
@@ -114,23 +112,29 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidRequest { .. } | Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
-            Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
-            Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::ModelNotFound { .. } | Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Conflict { .. } => StatusCode::CONFLICT,
-            Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::UnsupportedMediaType { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 
-    /// Returns the stable machine-readable `code` of this error category, as
-    /// the error body reports it.
+    /// Returns the stable machine-readable `code` of this error, as the error
+    /// body reports it.
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest { .. } => "invalid_request_error",
-            Self::ModelNotFound { .. } => "model_not_found",
-            Self::ServerError { .. } => "server_error",
             Self::JsonParseError { .. } => "json_parse_error",
+            Self::Unauthorized => "invalid_api_key",
+            Self::ModelNotFound { .. } => "model_not_found",
+            Self::NotFound { code, .. } | Self::ServiceUnavailable { code, .. } => code,
             Self::Conflict { .. } => "runtime_state_conflict",
-            Self::Overloaded { .. } => "server_overloaded",
+            Self::UnsupportedMediaType { .. } => "unsupported_media_type",
+            Self::ServerError { .. } => "server_error",
+            Self::Timeout { .. } => "request_timeout",
         }
     }
 
@@ -141,15 +145,27 @@ impl ApiError {
             Self::InvalidRequest { message, param } => {
                 (message.clone(), "invalid_request_error", *param)
             }
+            Self::Unauthorized => (
+                "Missing or invalid API key. Provide `Authorization: Bearer <key>`.".to_owned(),
+                "invalid_request_error",
+                None,
+            ),
             Self::ModelNotFound { model } => (
                 format!("The model `{model}` does not exist."),
                 "invalid_request_error",
                 Some("model"),
             ),
-            Self::ServerError { message } => (message.clone(), "server_error", None),
-            Self::JsonParseError { message } => (message.clone(), "invalid_request_error", None),
+            Self::JsonParseError { message }
+            | Self::NotFound { message, .. }
+            | Self::UnsupportedMediaType { message } => {
+                (message.clone(), "invalid_request_error", None)
+            }
             Self::Conflict { message } => (message.clone(), "conflict_error", None),
-            Self::Overloaded { message } => (message.clone(), "server_error", None),
+            Self::ServerError { message } => (message.clone(), "server_error", None),
+            Self::ServiceUnavailable { message, .. } => {
+                (message.clone(), "service_unavailable_error", None)
+            }
+            Self::Timeout { message } => (message.clone(), "timeout", None),
         };
 
         ErrorResponse {
@@ -164,83 +180,76 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
-    /// Converts the error into an HTTP response.
+    /// Converts the error into an HTTP response; a `503` carries a
+    /// `Retry-After` hint.
     fn into_response(self) -> Response {
-        (self.status_code(), Json(self.to_error_response())).into_response()
+        let mut response = (self.status_code(), Json(self.to_error_response())).into_response();
+        if let Self::ServiceUnavailable { .. } = self {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, RETRY_AFTER_SECONDS);
+        }
+        response
     }
 }
 
-/// Maps one canonical serving error into the OpenAI error vocabulary.
-///
-/// Unsupported features or sampling controls, context limits, input images
-/// that cannot be fetched or decoded, and tokenization failures become
-/// invalid requests; engine and output-processing failures become server
-/// errors. An input-image or tokenization failure's message appends its cause
-/// (the failing image and rule, or the violated field or limit), which
-/// `ServeError::ImageInput` and `ServeError::Tokenize` carry as their error
-/// source rather than in their own `Display`.
-pub fn serve_error_to_api(error: ServeError) -> ApiError {
-    match error {
-        ServeError::UnsupportedSamplingControl {
-            control, reason, ..
-        } => ApiError::invalid_request(
-            format!("`{control}` is not supported by this model: {reason}."),
-            Some(control),
-        ),
-        error @ (ServeError::UnsupportedFeature { .. }
-        | ServeError::ContextLengthExceeded { .. }) => {
-            ApiError::invalid_request(error.to_string(), None)
-        }
-        ServeError::ImageInput { ref source, .. } => {
-            ApiError::invalid_request(format!("{error}: {source}"), None)
-        }
-        ServeError::Tokenize { ref source, .. } => {
-            ApiError::invalid_request(format!("{error}: {source}"), None)
-        }
-        ServeError::Submit(source) => {
-            ApiError::server_error(format!("engine runtime error: {source}"))
-        }
-        ServeError::OutputProcessing { source, .. } => {
-            ApiError::server_error(format!("output processing error: {source}"))
+impl From<JsonRejection> for ApiError {
+    /// A body that is not the endpoint's JSON is a JSON parse error, whatever
+    /// the cause: a missing JSON content type, malformed JSON, a schema
+    /// mismatch, or a body over the size limit.
+    fn from(rejection: JsonRejection) -> Self {
+        Self::json_parse_error(rejection.body_text())
+    }
+}
+
+impl From<ServeError> for ApiError {
+    /// Maps one serving error into the OpenAI error vocabulary.
+    ///
+    /// Unsupported features or sampling controls, context limits, input
+    /// images that cannot be fetched or decoded, and tokenization failures
+    /// become invalid requests; engine and output-processing failures become
+    /// server errors. An input-image or tokenization failure's message
+    /// appends its cause (the failing image and rule, or the violated field
+    /// or limit), which `ServeError::ImageInput` and `ServeError::Tokenize`
+    /// carry as their error source rather than in their own `Display`.
+    fn from(error: ServeError) -> Self {
+        match error {
+            ServeError::UnsupportedSamplingControl {
+                control, reason, ..
+            } => Self::invalid_request(
+                format!("`{control}` is not supported by this model: {reason}."),
+                Some(control),
+            ),
+            error @ (ServeError::UnsupportedFeature { .. }
+            | ServeError::ContextLengthExceeded { .. }) => {
+                Self::invalid_request(error.to_string(), None)
+            }
+            ServeError::ImageInput { ref source, .. } => {
+                Self::invalid_request(format!("{error}: {source}"), None)
+            }
+            ServeError::Tokenize { ref source, .. } => {
+                Self::invalid_request(format!("{error}: {source}"), None)
+            }
+            ServeError::Submit(source) => {
+                Self::server_error(format!("engine runtime error: {source}"))
+            }
+            ServeError::OutputProcessing { source, .. } => {
+                Self::server_error(format!("output processing error: {source}"))
+            }
         }
     }
 }
 
-/// Returns early with an [`ApiError::InvalidRequest`] built from a format
-/// string, optionally tagged with `param = <&'static str>`.
-///
-/// The expansion is a `return` statement, so it is usable only inside a
-/// function whose error type is [`ApiError`].
-macro_rules! bail_invalid_request {
-    (param = $param:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {
-        {
-            return Err($crate::openai::error::ApiError::invalid_request(
-                format!($fmt $(, $arg)*),
-                Some($param),
-            ))
+impl From<VideoStreamError> for ApiError {
+    /// An engine rejection keeps its category ([`ApiError::rejected`]); any
+    /// other video stream that ended without an artifact is a server error.
+    fn from(error: VideoStreamError) -> Self {
+        match error {
+            VideoStreamError::Rejected { kind, message } => Self::rejected(kind, message),
+            error => Self::server_error(error.to_string()),
         }
-    };
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        {
-            return Err($crate::openai::error::ApiError::invalid_request(
-                format!($fmt $(, $arg)*),
-                None,
-            ))
-        }
-    };
+    }
 }
-
-pub(crate) use bail_invalid_request;
-
-/// Builds (without returning) an [`ApiError::ServerError`] from a format
-/// string.
-macro_rules! server_error {
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::openai::error::ApiError::server_error(format!($fmt $(, $arg)*))
-    };
-}
-
-pub(crate) use server_error;
 
 #[cfg(test)]
 mod tests {
@@ -249,12 +258,10 @@ mod tests {
 
     #[test]
     fn an_overloaded_engine_is_retryable_and_an_invalid_request_is_not() {
-        let overloaded = ApiError::rejected(RejectionKind::Overloaded, "queue full");
-        assert_eq!(overloaded.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            overloaded.to_error_response().error.code.as_deref(),
-            Some("server_overloaded")
-        );
+        let overloaded =
+            ApiError::rejected(RejectionKind::Overloaded, "queue full").into_response();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[RETRY_AFTER], "1");
 
         let invalid = ApiError::rejected(RejectionKind::Invalid, "unsupported");
         assert_eq!(invalid.status_code(), StatusCode::BAD_REQUEST);
@@ -265,7 +272,7 @@ mod tests {
     #[test]
     fn a_tokenize_rejection_reports_its_cause() {
         let cause = "video duration must be finite, positive, and at most 15 seconds";
-        let error = serve_error_to_api(ServeError::Tokenize {
+        let error = ApiError::from(ServeError::Tokenize {
             request_id: crate::serving::ServeRequestId::new("vid-1"),
             source: crate::serving::TokenizeError::Invalid(cause.to_string()),
         });

@@ -260,7 +260,7 @@ impl VideoService {
 
         let prompt_token_ids = processed.presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
-            return Err(crate::openai::serve_error_to_api(
+            return Err(crate::openai::ApiError::from(
                 ServeError::ContextLengthExceeded {
                     request_id: request_id.clone(),
                     prompt_tokens: prompt_token_ids.len(),

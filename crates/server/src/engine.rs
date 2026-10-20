@@ -34,7 +34,7 @@ use uniserve_core::{GenerationLimits, Request};
 use uniserve_engine::{EngineCore, EventRx, SubmitError, VideoDenoiserInfo};
 use uniserve_observability::{EngineLabels, METRICS};
 
-use crate::openai::serve_error_to_api;
+use crate::openai::ApiError;
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
 use crate::profile::{ModelConfig, ModelParameters};
 use crate::serving::media::ImageFetcher;
@@ -69,6 +69,21 @@ pub struct Engine {
     _stats_export: Box<[AbortOnDropHandle<()>]>,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
+}
+
+/// A task an engine serves, which selects the API routes the server
+/// registers, as vLLM's `supported_tasks` selects its routers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Task {
+    /// Chat completions (`/v1/chat/completions`): every model that renders
+    /// a chat prompt.
+    Generate,
+    /// Image generation (`/v1/images/generations`).
+    ImageGeneration,
+    /// Video generation (`/v1/videos`, `/v1/capabilities`).
+    VideoGeneration,
+    /// The System One decision readout (`/v1/systemone`).
+    Readout,
 }
 
 /// One data-parallel rank: its engine core and the requests in flight on it.
@@ -345,6 +360,27 @@ impl Engine {
         self.processor.video_service().map(VideoService::denoiser)
     }
 
+    /// The tasks this engine serves.
+    ///
+    /// A video model serves video generation alone; every other model serves
+    /// chat completions, an omni model image generation as well, and a model
+    /// with a readout encoder the System One readout.
+    pub fn supported_tasks(&self) -> Vec<Task> {
+        let mut tasks = Vec::new();
+        if self.processor.video_service().is_some() {
+            tasks.push(Task::VideoGeneration);
+        } else {
+            tasks.push(Task::Generate);
+        }
+        if self.processor.supports_image_output() {
+            tasks.push(Task::ImageGeneration);
+        }
+        if self.readout.is_some() {
+            tasks.push(Task::Readout);
+        }
+        tasks
+    }
+
     /// Whether the engine can accept requests: whether any data-parallel
     /// rank's core is alive. Requests go only to live ranks.
     pub fn is_healthy(&self) -> bool {
@@ -392,7 +428,7 @@ impl Engine {
             Vec::new()
         };
         let images = self.images.fetch_all(image_urls).await.map_err(|source| {
-            serve_error_to_api(ServeError::ImageInput {
+            ApiError::from(ServeError::ImageInput {
                 request_id: request_id.clone(),
                 source,
             })
@@ -404,7 +440,7 @@ impl Engine {
         })
         .await?;
         self.generate(request_id, started, request, response)
-            .map_err(serve_error_to_api)
+            .map_err(ApiError::from)
     }
 
     /// Renders and tokenizes one image-generation request and streams its
@@ -427,7 +463,7 @@ impl Engine {
         })
         .await?;
         self.generate(request_id, started, request, response)
-            .map_err(serve_error_to_api)
+            .map_err(ApiError::from)
     }
 
     /// Fetches, probes and plans a video request's media, presents its
@@ -453,7 +489,7 @@ impl Engine {
         let prompt_tokens = request.prompt_token_ids.len();
         let (events, rank) = self
             .submit(Request::Diffusion(request))
-            .map_err(|error| serve_error_to_api(error.into()))?;
+            .map_err(|error| ApiError::from(ServeError::from(error)))?;
         let output = serving::media_output(
             request_id.clone(),
             started,
@@ -591,7 +627,7 @@ async fn preprocess<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .unwrap_or_else(|error| {
-            Err(serve_error_to_api(ServeError::Tokenize {
+            Err(ApiError::from(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: TokenizeError::Task(error),
             }))

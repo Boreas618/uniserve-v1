@@ -359,14 +359,14 @@ impl InputProcessor {
         crate::openai::ApiError,
     > {
         let Some(video) = self.video_service() else {
-            return Err(crate::openai::serve_error_to_api(
+            return Err(crate::openai::ApiError::from(
                 ServeError::UnsupportedFeature {
                     request_id: request_id.clone(),
                     feature: "video_generation",
                 },
             ));
         };
-        crate::openai::utils::check_model_served(&request.model, self.served_model_name())?;
+        crate::openai::check_model_served(&request.model, self.served_model_name())?;
         video
             .process(request_id, request, self.config.max_model_len)
             .await

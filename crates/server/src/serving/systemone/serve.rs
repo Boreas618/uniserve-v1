@@ -26,11 +26,6 @@ use crate::serving::systemone::plan::{ImageSize, ReadoutPrompt};
 use crate::serving::systemone::{SystemOneRequest, SystemOneResponse};
 
 impl Engine {
-    /// Returns whether this engine serves `POST /v1/systemone`.
-    pub fn serves_readout(&self) -> bool {
-        self.readout_encoder().is_some()
-    }
-
     /// Answers one System One request body.
     ///
     /// Dropping the returned future cancels every readout still running.

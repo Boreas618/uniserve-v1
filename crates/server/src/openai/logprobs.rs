@@ -14,7 +14,7 @@ use crate::serving::text::{
 use itertools::Itertools as _;
 
 use crate::openai::error::{ApiError, server_error};
-use crate::openai::types::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
+use crate::openai::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
 
 /// Converts decoded prompt positions into token-to-logprob maps.
 ///

@@ -98,7 +98,7 @@ retention = "30m"
 | `host` | `"127.0.0.1"` | TCP address the server listens on |
 | `port` | `8000` | TCP port the server listens on |
 | `uds` | Unset | Unix domain socket to listen on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
-| `api_key` | Unset | Bearer token the public routes require; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
+| `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
 | `max_concurrent_requests` | Unset | In-flight chat, image generation, System One and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |

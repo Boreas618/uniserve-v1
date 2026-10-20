@@ -4,8 +4,9 @@
 //! the Dynamo worker) waits for the same outcome: exactly one artifact
 //! followed by a normal finish. [`ArtifactCollector`] classifies the events
 //! once; each consumer keeps its own read loop, with its own cancellation and
-//! progress handling, and renders a [`VideoStreamError`] in its own error
-//! envelope.
+//! progress handling. A [`VideoStreamError`] has one message and one code,
+//! which the synchronous route renders as an OpenAI error, a job records as
+//! its failure, and the Dynamo worker returns as its error.
 
 use std::ops::ControlFlow;
 
@@ -14,9 +15,10 @@ use uniserve_core::{ArtifactEvent, RejectionKind};
 use crate::serving::{FinishStatus, RequestOutput};
 
 /// Why a video generation stream did not end in an artifact.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum VideoStreamError {
     /// The engine refused the request before executing it.
+    #[error("{message}")]
     Rejected {
         /// Whether the request is unservable or the engine is full.
         kind: RejectionKind,
@@ -24,25 +26,57 @@ pub enum VideoStreamError {
         message: String,
     },
     /// Generation failed.
+    #[error("{message}")]
     Failed {
         /// Description of the failure.
         message: String,
     },
     /// The request finished without completing normally.
+    #[error("video generation ended without an artifact: {reason:?}")]
     Ended {
         /// How the request finished.
         reason: FinishStatus,
     },
     /// The request was cancelled or aborted.
+    #[error("video generation was cancelled")]
     Cancelled,
     /// The request completed normally but produced no artifact.
+    #[error("video generation produced no artifact")]
     MissingArtifact,
     /// The runtime emitted a second artifact.
+    #[error("video generation produced more than one artifact")]
     MultipleArtifacts,
     /// The runtime emitted an event a video generation never carries.
+    #[error("the engine emitted an event a video generation does not carry")]
     Incompatible,
     /// The stream ended before the request finished.
+    #[error("the engine closed the video stream before the request finished")]
     Closed,
+}
+
+impl VideoStreamError {
+    /// Returns the stable machine-readable code of this outcome.
+    ///
+    /// A rejection has the code of the OpenAI error it answers as
+    /// (`invalid_request_error` or `server_overloaded`), so a job reports the
+    /// code the synchronous route answers the same rejection with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            } => "invalid_request_error",
+            Self::Rejected {
+                kind: RejectionKind::Overloaded,
+                ..
+            } => "server_overloaded",
+            Self::Failed { .. } => "generation_failed",
+            Self::Ended { .. } | Self::Cancelled => "generation_terminated",
+            Self::MissingArtifact => "missing_artifact",
+            Self::MultipleArtifacts | Self::Incompatible => "invalid_runtime_event",
+            Self::Closed => "generation_stopped",
+        }
+    }
 }
 
 /// Holds the artifact of a video generation while its events arrive.

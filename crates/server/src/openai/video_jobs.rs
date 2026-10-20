@@ -1,10 +1,11 @@
 //! Process-local video jobs and immutable retained artifacts.
 //!
 //! `VideoJobs` is the job store behind the asynchronous video routes in
-//! `http::routes::openai::videos`. It holds each job's public record, its
-//! generated artifact once complete, and the cancellation token of its
-//! detached generation task. Nothing persists across a restart. Synchronous
-//! video requests do not use it.
+//! `openai::videos`. It holds each job's public record, its generated
+//! artifact once complete, and the cancellation token of its detached
+//! generation task, and it tracks those tasks so server shutdown can wait for
+//! them. Nothing persists across a restart, so server shutdown cancels every
+//! job. Synchronous video requests do not use it.
 //!
 //! The operator's `video_job_config` states the two policies of the store,
 //! and the video `capabilities` route advertises both:
@@ -15,15 +16,19 @@
 //! - `retention`, after which a completed or failed job's record is deleted.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
-
+use tokio_util::task::TaskTracker;
 use uniserve_core::SharedMedia;
 
 use crate::options::VideoJobOptions;
+use crate::serving::RequestOutput;
+use crate::serving::video::artifact::VideoStreamError;
 
 /// Public job record, serialized in the responses of the video job routes.
 ///
@@ -84,14 +89,84 @@ pub(crate) struct GenerationTiming {
     pub stage_durations: BTreeMap<String, f64>,
 }
 
+/// Times one generation's phases from its runtime events.
+///
+/// Scheduling starts the `encoding` phase; each `MediaProgress` report whose
+/// phase differs from the current one starts that phase. `finish` closes the
+/// current phase and yields [`GenerationTiming`], or `None` when the request
+/// was never scheduled.
+#[derive(Default)]
+pub(crate) struct StageClock {
+    scheduled: Option<Instant>,
+    phases: Vec<(String, Instant)>,
+}
+
+impl StageClock {
+    /// Records `event` and returns the progress it reports: the phase and
+    /// completed steps of a scheduling (`encoding`, no step) or media-progress
+    /// event.
+    pub(crate) fn observe<'a>(&mut self, event: &'a RequestOutput) -> Option<(&'a str, u32)> {
+        let now = Instant::now();
+        match event {
+            RequestOutput::Scheduled { .. } => {
+                if self.scheduled.is_none() {
+                    self.scheduled = Some(now);
+                    self.phases.push(("encoding".to_owned(), now));
+                }
+                Some(("encoding", 0))
+            }
+            RequestOutput::MediaProgress {
+                phase,
+                completed_steps,
+            } => {
+                if self.scheduled.is_some()
+                    && self
+                        .phases
+                        .last()
+                        .is_some_and(|(current, _)| current != phase)
+                {
+                    self.phases.push((phase.clone(), now));
+                }
+                Some((phase, *completed_steps))
+            }
+            _ => None,
+        }
+    }
+
+    /// Closes the current phase and returns the generation's timing.
+    pub(crate) fn finish(&self) -> Option<GenerationTiming> {
+        let scheduled = self.scheduled?;
+        let end = Instant::now();
+        let mut stage_durations = BTreeMap::new();
+        for (index, (phase, start)) in self.phases.iter().enumerate() {
+            let stop = self.phases.get(index + 1).map_or(end, |(_, next)| *next);
+            *stage_durations.entry(phase.clone()).or_insert(0.0) +=
+                stop.duration_since(*start).as_secs_f64();
+        }
+        Some(GenerationTiming {
+            inference_time_s: end.duration_since(scheduled).as_secs_f64(),
+            stage_durations,
+        })
+    }
+}
+
 /// Failure reported on a `failed` job.
 ///
-/// Codes are assigned by the generation task in the video routes, and by
-/// `VideoJobs::finish` (`artifact_capacity_exceeded`).
+/// The code is the video stream error's (`VideoStreamError::code`), or
+/// `artifact_capacity_exceeded` from `VideoJobs::finish`.
 #[derive(Clone, Serialize)]
 pub(crate) struct VideoFailure {
     pub code: &'static str,
     pub message: String,
+}
+
+impl From<VideoStreamError> for VideoFailure {
+    fn from(error: VideoStreamError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
 }
 
 /// One entry of the job table.
@@ -99,7 +174,8 @@ struct RetainedJob {
     record: VideoJob,
     /// The generated artifact; set only on successful completion.
     media: Option<Arc<RetainedMedia>>,
-    /// Shared with the job's generation task.
+    /// Shared with the job's generation task and its expiry timer; a child
+    /// of the store's shutdown token.
     cancellation: CancellationToken,
 }
 
@@ -126,7 +202,7 @@ impl AsRef<[u8]> for RetainedMedia {
     }
 }
 
-/// Process-local job table and its byte budget.
+/// Process-local job table, its byte budget, and its generation tasks.
 pub(crate) struct VideoJobs {
     /// Jobs keyed by public job ID.
     entries: Mutex<BTreeMap<String, RetainedJob>>,
@@ -134,15 +210,22 @@ pub(crate) struct VideoJobs {
     bytes: Arc<Semaphore>,
     /// The configured retention and byte budget.
     settings: VideoJobOptions,
+    /// Cancelled at server shutdown; every job's token is its child.
+    shutdown: CancellationToken,
+    /// The generation tasks and expiry timers of the jobs.
+    tasks: TaskTracker,
 }
 
 impl VideoJobs {
-    /// Creates an empty store under `settings`.
-    pub(crate) fn new(settings: VideoJobOptions) -> Self {
+    /// Creates an empty store under `settings` whose jobs stop when
+    /// `shutdown` is cancelled.
+    pub(crate) fn new(settings: VideoJobOptions, shutdown: CancellationToken) -> Self {
         Self {
             entries: Mutex::default(),
             bytes: Arc::new(Semaphore::new(settings.max_bytes)),
             settings,
+            shutdown,
+            tasks: TaskTracker::new(),
         }
     }
 
@@ -156,17 +239,17 @@ impl VideoJobs {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Adds a record before detaching generation from its HTTP caller.
+    /// Adds a record and runs its generation task, `generation(token)`.
     ///
-    /// Returns the cancellation token the generation task must watch. Fails
-    /// without inserting when `record.id` is already present.
-    pub(crate) fn insert(&self, record: VideoJob) -> Result<CancellationToken, &'static str> {
-        let mut entries = self.entries();
-        if entries.contains_key(&record.id) {
-            return Err("video job already exists");
-        }
-        let cancellation = CancellationToken::new();
-        entries.insert(
+    /// The token is cancelled when the job is deleted or the server shuts
+    /// down; the task must then end. Record IDs are server-generated UUIDs,
+    /// so an insert never replaces another job.
+    pub(crate) fn start<F>(&self, record: VideoJob, generation: impl FnOnce(CancellationToken) -> F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancellation = self.shutdown.child_token();
+        self.entries().insert(
             record.id.clone(),
             RetainedJob {
                 record,
@@ -174,7 +257,14 @@ impl VideoJobs {
                 cancellation: cancellation.clone(),
             },
         );
-        Ok(cancellation)
+        self.tasks.spawn(generation(cancellation));
+    }
+
+    /// Waits until every generation task and expiry timer has ended, which
+    /// they do promptly once the shutdown token is cancelled.
+    pub(crate) async fn wait(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<VideoJob> {
@@ -267,12 +357,12 @@ impl VideoJobs {
 
         // The expiry timer holds only a clone of the token and a `Weak` handle,
         // so a pending timer does not keep `VideoJobs` alive. `delete` and
-        // `cancel_all` cancel the token, which ends it.
+        // server shutdown cancel the token, which ends it.
         let expiry_cancellation = job.cancellation.clone();
         let weak = Arc::downgrade(self);
         let id = id.to_owned();
         let retention = self.settings.retention;
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(retention) => {}
                 _ = expiry_cancellation.cancelled() => return,
@@ -288,28 +378,16 @@ impl VideoJobs {
         self.entries().get(id).and_then(|job| job.media.clone())
     }
 
-    /// Removal wins over a racing completion; active work drains through runtime cancellation.
-    ///
-    /// Removes the record and cancels its token, which makes a running
-    /// generation task cancel its runtime request and ends a pending expiry
-    /// timer. Returns `false` for an unknown ID.
+    /// Removes the record and cancels its token, which ends a running
+    /// generation task (dropping its stream cancels its engine request) and
+    /// a pending expiry timer. Removal wins over a racing completion. Returns
+    /// `false` for an unknown ID.
     pub(crate) fn delete(&self, id: &str) -> bool {
         if let Some(job) = self.entries().remove(id) {
             job.cancellation.cancel();
             true
         } else {
             false
-        }
-    }
-
-    /// Cancels every job's token without removing any record.
-    ///
-    /// Running generation tasks cancel their runtime requests, drain, and
-    /// publish their results; the expiry timers of finished jobs end.
-    /// `AppState::shutdown` calls this.
-    pub(crate) fn cancel_all(&self) {
-        for job in self.entries().values() {
-            job.cancellation.cancel();
         }
     }
 }
@@ -343,13 +421,26 @@ mod tests {
     }
 
     fn store() -> Arc<VideoJobs> {
-        Arc::new(VideoJobs::new(VideoJobOptions::default()))
+        Arc::new(VideoJobs::new(
+            VideoJobOptions::default(),
+            CancellationToken::new(),
+        ))
+    }
+
+    /// Starts a job whose task waits for its token and reports it.
+    fn start(jobs: &VideoJobs, id: &str) -> tokio::sync::oneshot::Receiver<()> {
+        let (cancelled, receiver) = tokio::sync::oneshot::channel();
+        jobs.start(record(id), |token| async move {
+            token.cancelled().await;
+            let _ = cancelled.send(());
+        });
+        receiver
     }
 
     #[tokio::test]
     async fn deleted_work_is_cancelled_and_cannot_reappear() {
         let jobs = store();
-        let cancellation = jobs.insert(record("video-a")).unwrap();
+        let cancelled = start(&jobs, "video-a");
         jobs.progress("video-a", "denoising", 2);
         let running = jobs.get("video-a").unwrap();
         assert_eq!(
@@ -358,7 +449,7 @@ mod tests {
         );
 
         assert!(jobs.delete("video-a"));
-        assert!(cancellation.is_cancelled());
+        cancelled.await.unwrap();
 
         // A completion racing the deletion must not recreate the record.
         jobs.finish(
@@ -375,11 +466,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_job_expires_after_the_configured_retention() {
-        let jobs = Arc::new(VideoJobs::new(VideoJobOptions {
-            retention: Duration::from_secs(90),
-            ..VideoJobOptions::default()
-        }));
-        jobs.insert(record("video-0")).unwrap();
+        let jobs = Arc::new(VideoJobs::new(
+            VideoJobOptions {
+                retention: Duration::from_secs(90),
+                ..VideoJobOptions::default()
+            },
+            CancellationToken::new(),
+        ));
+        let _cancelled = start(&jobs, "video-0");
 
         jobs.finish(
             "video-0",
@@ -399,5 +493,23 @@ mod tests {
 
         assert!(jobs.delete("video-0"));
         assert!(jobs.list().is_empty());
+    }
+
+    /// Server shutdown stops every job's task, and waiting returns once they
+    /// have ended.
+    #[tokio::test]
+    async fn shutdown_stops_every_job() {
+        let shutdown = CancellationToken::new();
+        let jobs = VideoJobs::new(VideoJobOptions::default(), shutdown.clone());
+        let first = start(&jobs, "video-a");
+        let second = start(&jobs, "video-b");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), jobs.wait())
+            .await
+            .unwrap();
+
+        first.await.unwrap();
+        second.await.unwrap();
     }
 }

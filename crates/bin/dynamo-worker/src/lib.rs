@@ -86,14 +86,12 @@ use tokio_util::sync::CancellationToken;
 use uniserve_core::{Canvas, MediaKind, ServedCanvas, VideoTask};
 use uniserve_engine::VideoDenoiserInfo;
 use uniserve_server::options::{ServeArgs, ServeConfig, Stated, printed};
+use uniserve_server::profile::ModelDescription;
 use uniserve_server::profile::assets::PipelineCheckpoint;
 use uniserve_server::{
-    Engine, ModelDescription,
-    openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
-    serving::{
-        ServeRequestId,
-        video::artifact::{ArtifactCollector, VideoStreamError},
-    },
+    Engine,
+    openai::{ApiError, VideoGenerationRequest, VideoTarget},
+    serving::{ServeRequestId, video::artifact::ArtifactCollector},
 };
 
 /// The duration of a Dynamo request that omits `seconds`, at most the
@@ -397,7 +395,7 @@ impl RawEngine for DynamoFastH3Engine {
                 };
                 let event = match event {
                     Some(Err(error)) => {
-                        yield Err(api_error(serve_error_to_api(error)));
+                        yield Err(api_error(ApiError::from(error)));
                         return;
                     }
                     Some(Ok(event)) => Some(event),
@@ -407,7 +405,7 @@ impl RawEngine for DynamoFastH3Engine {
                     match outcome {
                         Ok(artifact) => break artifact,
                         Err(error) => {
-                            yield Err(stream_error(error));
+                            yield Err(api_error(ApiError::from(error)));
                             return;
                         }
                     }
@@ -702,27 +700,6 @@ fn aspect_ratios(canvases: &[ServedCanvas]) -> Vec<String> {
     ratios
 }
 
-/// Maps a video stream that ended without an artifact to Dynamo's error type.
-fn stream_error(error: VideoStreamError) -> DynamoError {
-    match error {
-        VideoStreamError::Rejected { kind, message } => {
-            api_error(uniserve_server::openai::ApiError::rejected(kind, message))
-        }
-        VideoStreamError::Failed { message } => engine_error(message),
-        VideoStreamError::Ended { reason } => engine_error(format!(
-            "video generation ended without an artifact: {reason:?}"
-        )),
-        VideoStreamError::MissingArtifact => engine_error("UniServe produced no media artifact"),
-        VideoStreamError::MultipleArtifacts => {
-            engine_error("UniServe produced multiple media artifacts")
-        }
-        VideoStreamError::Cancelled | VideoStreamError::Incompatible => {
-            engine_error("UniServe emitted an incompatible event")
-        }
-        VideoStreamError::Closed => engine_error("UniServe generation stream stopped"),
-    }
-}
-
 fn reject_present<T>(field: &str, value: Option<&T>) -> Result<(), DynamoError> {
     match value {
         Some(_) => Err(invalid_argument(format!(
@@ -839,7 +816,7 @@ fn runtime_data(max_video_seconds: f64, denoiser: &VideoDenoiserInfo) -> HashMap
 
 /// Maps a UniServe API error to Dynamo's error type: a 4xx status becomes an
 /// invalid argument and any other status an unknown backend error.
-fn api_error(error: uniserve_server::openai::ApiError) -> DynamoError {
+fn api_error(error: ApiError) -> DynamoError {
     let kind = if error.status_code().is_client_error() {
         BackendError::InvalidArgument
     } else {

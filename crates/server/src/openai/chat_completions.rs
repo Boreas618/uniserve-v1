@@ -1,9 +1,13 @@
-//! Buffered and streaming OpenAI chat-completion response assembly.
+//! `POST /v1/chat/completions`: validation, the response options, and the
+//! buffered and streaming responses.
 //!
-//! Both paths consume the `RequestOutput` stream that
-//! `Engine::generate_chat` returns. `collect_chat_completion` folds it
-//! into one `ChatCompletionResponse`; `chat_completion_chunk_stream` maps it to
-//! `ChatCompletionStreamResponse` chunks, and `chat_completion_sse_stream`
+//! The handler validates the body (the schema's `validator` rules in
+//! `ValidatedJson`, then [`validate_request_compat`]), captures the
+//! response options ([`ChatResponseContext`]), and runs the request through
+//! `Engine::generate_chat`. Both response paths consume the `RequestOutput`
+//! stream it returns: [`collect_chat_completion`] folds it into one
+//! `ChatCompletionResponse`; [`chat_completion_chunk_stream`] maps it to
+//! `ChatCompletionStreamResponse` chunks, and [`chat_completion_sse_stream`]
 //! frames those chunks as SSE events ending in `data: [DONE]`.
 //!
 //! One decoded update from the engine becomes several events: semantic events
@@ -19,26 +23,195 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::result::Result;
+use std::sync::Arc;
 
-use crate::openai::types::{
-    AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionResponse,
-    ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs, ChatMessageDelta,
-    ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, ToolCall, ToolCallDelta, Usage,
-};
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
-use crate::serving::text::DecodedLogprobs;
-use crate::serving::{FinishStatus, RequestOutput};
 use asynk_strim_attr::{TryYielder, try_stream};
-use axum::response::sse::Event;
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _, pin_mut};
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
+use tracing_futures::Instrument as _;
 
-use crate::openai::ApiError;
-use crate::openai::chat_completions::ChatResponseContext;
+use crate::engine::Engine;
+use crate::http::RequestId;
+use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps};
-use crate::openai::utils::completion_token_count;
+use crate::openai::{
+    ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
+    ChatMessageDelta, ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, ToolCall,
+    ToolCallDelta, Usage, ValidatedJson, check_model_served,
+};
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
+use crate::serving::text::DecodedLogprobs;
+use crate::serving::{FinishStatus, RequestOutput};
+
+/// The chat completions route.
+pub(crate) fn router(engine: Arc<Engine>) -> Router {
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(engine)
+}
+
+/// Validates one chat completion request and runs it through the engine.
+///
+/// Returns an SSE stream when `stream` is set and one JSON completion
+/// otherwise. Errors from submission, and from collection in the
+/// non-streaming case, become `ApiError` responses; errors after an SSE
+/// stream has started are reported inside the stream.
+async fn chat_completions(
+    State(engine): State<Arc<Engine>>,
+    Extension(RequestId(base_id)): Extension<RequestId>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    // `body` moves into the engine below, so every option that shapes the
+    // response is captured first. Responses report the served model name.
+    let stream = body.stream;
+    let request_id = format!("chatcmpl-{base_id}");
+    let response =
+        ChatResponseContext::from_request(&body, request_id.clone(), engine.served_model_name());
+    let request_span = tracing::info_span!(
+        "chat_completions",
+        request_id = %response.request_id,
+        engine_request_id = tracing::field::Empty,
+    );
+
+    // One timestamp for the whole response, shared by every streamed chunk.
+    let created = uniserve_core::now_unix_secs_u64();
+
+    let serve_stream = match engine
+        .generate_chat(request_id.into(), body)
+        .instrument(request_span.clone())
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => return error.into_response(),
+    };
+
+    if stream {
+        let chunk_stream = chat_completion_chunk_stream(serve_stream, response, created);
+        let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
+
+        // Emit periodic SSE keep-alive comments so long prefills (no chunks
+        // yet) do not get torn down by idle-timeout proxies between client
+        // and server.
+        Sse::new(sse_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        match collect_chat_completion(serve_stream, response, created)
+            .instrument(request_span)
+            .await
+        {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+}
+
+/// Validates the rules of a chat request that depend on the served model.
+///
+/// Rejects a `model` other than `served_model_name` with
+/// [`ApiError::ModelNotFound`], and rejects with [`ApiError::InvalidRequest`]
+/// a `prompt_logprobs` value below `-1` or a positive or `-1` value on a
+/// streamed request. `Engine::generate_chat` calls this before it fetches the
+/// request's images.
+pub fn validate_request_compat(
+    request: &ChatCompletionRequest,
+    served_model_name: &str,
+) -> Result<(), ApiError> {
+    check_model_served(&request.model, served_model_name)?;
+
+    if let Some(prompt_logprobs) = request.prompt_logprobs {
+        // Any non-negative count, or `-1` for the full vocabulary.
+        if prompt_logprobs < -1 {
+            bail_invalid_request!(
+                param = "prompt_logprobs",
+                "prompt_logprobs must be a non-negative value or -1."
+            );
+        }
+
+        // Stream chunks (`ChatCompletionStreamResponse`) have no
+        // `prompt_logprobs` field, so a streamed response could not deliver
+        // them. A streamed `0` is accepted, as vLLM accepts it, and
+        // `preprocess_chat_request` drops it.
+        if request.stream && (prompt_logprobs > 0 || prompt_logprobs == -1) {
+            bail_invalid_request!(
+                param = "prompt_logprobs",
+                "prompt_logprobs are not available when stream=true."
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The response options of one chat request, captured before the request
+/// moves into the engine.
+///
+/// The handler passes it to [`collect_chat_completion`] or
+/// [`chat_completion_chunk_stream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatResponseContext {
+    /// OpenAI-compatible response identifier.
+    pub request_id: String,
+    /// Model name reported in response objects.
+    pub response_model: String,
+    /// Whether streaming responses include a terminal usage chunk
+    /// (`stream_options.include_usage`). Non-streaming responses always
+    /// carry usage.
+    pub include_usage: bool,
+    /// Whether generated-token logprobs were requested.
+    pub requested_logprobs: bool,
+    /// Whether prompt-token logprobs were requested. Only non-streaming
+    /// responses carry them; [`validate_request_compat`] rejects a streamed
+    /// request that asks for a positive or `-1` count, and
+    /// `preprocess_chat_request` drops a streamed `0`.
+    pub include_prompt_logprobs: bool,
+    /// Whether parsed reasoning is exposed in responses.
+    pub include_reasoning: bool,
+    /// Whether token identifiers are exposed in responses.
+    pub return_token_ids: bool,
+    /// Whether textual tokens use token-identifier placeholders.
+    pub return_tokens_as_token_ids: bool,
+}
+
+impl ChatResponseContext {
+    /// Captures the response options of `request`.
+    pub fn from_request(
+        request: &ChatCompletionRequest,
+        request_id: String,
+        served_model_name: &str,
+    ) -> Self {
+        Self {
+            request_id,
+            response_model: served_model_name.to_string(),
+            include_usage: request
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                .unwrap_or(false),
+            requested_logprobs: request.logprobs,
+            include_prompt_logprobs: request.prompt_logprobs.is_some(),
+            include_reasoning: request.include_reasoning,
+            return_token_ids: request.return_token_ids.unwrap_or(false),
+            return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
+        }
+    }
+}
+
+/// Counts every generated token included in OpenAI completion usage,
+/// including tokens retained internally for reasoning or model control.
+///
+/// The sum saturates at `u32::MAX` instead of overflowing.
+fn completion_token_count(visible: u32, internal: u32) -> u32 {
+    visible.saturating_add(internal)
+}
 
 /// Converts a terminal serving event into its OpenAI representation.
 ///
@@ -55,18 +228,6 @@ fn openai_terminal_event(event: RequestOutput) -> RequestOutput {
         }
         event => event,
     }
-}
-
-macro_rules! server_error {
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        ApiError::server_error(format!($fmt $(, $arg)*))
-    };
-}
-
-macro_rules! bail_server_error {
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        return Err(server_error!($fmt $(, $arg)*))
-    };
 }
 
 /// Collects a chat event stream into one non-streaming response.
@@ -1113,8 +1274,8 @@ fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
 mod tests {
     use futures::{StreamExt as _, stream};
 
+    use super::ChatResponseContext;
     use super::chat_completion_chunk_stream;
-    use crate::openai::chat_completions::ChatResponseContext;
     use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
     use crate::serving::{FinishStatus, RequestOutput};

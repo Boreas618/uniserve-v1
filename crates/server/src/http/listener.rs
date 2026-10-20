@@ -1,9 +1,14 @@
 //! Listener abstraction for TCP and Unix-domain sockets.
 //!
 //! [`Listener`] presents a single accept interface to Axum over either a TCP or
-//! a Unix-domain listener, bound as `server_config` states.
-//! `crate::http::serve` binds it, logs its inherent `local_addr` string, and
-//! wraps it with `tap_io` to enable `TCP_NODELAY` on TCP connections only.
+//! a Unix-domain listener, bound as `server_config` states. `crate::http`
+//! binds it and logs its inherent `local_addr` string.
+//!
+//! Every accepted TCP connection takes `TCP_NODELAY`, as vLLM's Rust listener
+//! sets it on accept: a streamed response writes each SSE event as its own
+//! small frame, which Nagle's algorithm would hold back until the previous
+//! frame is acknowledged. Python servers get the option from asyncio's TCP
+//! transports.
 //!
 //! A Unix-domain socket bound at a path leaves its file behind when the socket
 //! closes. The listener therefore owns the file of a socket it binds: binding
@@ -16,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
+use tracing::trace;
 
 use crate::options::ServerOptions;
 
@@ -135,14 +141,19 @@ impl axum::serve::Listener for Listener {
     /// rather than Tokio's fallible inherent `accept`. Axum retries accept
     /// errors internally (logging and pausing on errors other than
     /// per-connection ones), so this future resolves only with a connection.
+    /// A TCP connection that refuses `TCP_NODELAY` is traced and served
+    /// without it.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match self {
             Self::Tcp(listener) => {
-                let (io, addr) = listener.accept().await;
+                let (io, addr) = axum::serve::Listener::accept(listener).await;
+                if let Err(error) = io.set_nodelay(true) {
+                    trace!(%error, "failed to enable TCP_NODELAY on an accepted connection");
+                }
                 (Either::Left(io), Either::Left(addr))
             }
             Self::Unix { listener, .. } => {
-                let (io, addr) = listener.accept().await;
+                let (io, addr) = axum::serve::Listener::accept(listener).await;
                 (Either::Right(io), Either::Right(addr))
             }
         }
