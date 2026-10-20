@@ -231,6 +231,7 @@ impl Scheduler {
             prefer_media: true,
             config,
             fatal: false,
+            tiers: None,
             stats,
         })
     }
@@ -244,6 +245,40 @@ impl Scheduler {
     pub fn set_prefix_reuse(&mut self, on: bool) {
         if let Some(cache) = self.storage.cache.as_mut() {
             cache.set_prefix_reuse(on);
+        }
+    }
+
+    /// Copy prompt pages of the worker groups whose ranks all map a page
+    /// pool through the host page tier, as a head of `deployment` on `host`:
+    /// ranks on `host` through its Storage Server's socket, the others
+    /// through their servers' TCP addresses. A failure to reach this host's
+    /// server leaves the tier off.
+    pub fn enable_page_tier(&mut self, deployment: &str, host: &str) {
+        let socket = uniserve_storage::socket::default_socket();
+        let mut tiers = match crate::prefix_cache::Tiers::connect(&socket, deployment) {
+            Ok(tiers) => tiers,
+            Err(error) => {
+                tracing::warn!(%error, "the host page tier is off: the storage server is unreachable");
+                return;
+            }
+        };
+        let mut served = false;
+        for (worker, ranks) in &self.executor.info().rank_caches {
+            let reports: Option<Vec<crate::prefix_cache::RankCache<'_>>> = ranks
+                .iter()
+                .map(|(rank_host, cache)| {
+                    cache.as_ref().map(|cache| crate::prefix_cache::RankCache {
+                        local: rank_host == host,
+                        cache,
+                    })
+                })
+                .collect();
+            if let Some(reports) = reports {
+                served |= tiers.add_worker(worker, &reports);
+            }
+        }
+        if served {
+            self.tiers = Some(tiers);
         }
     }
 
@@ -363,7 +398,18 @@ impl Scheduler {
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        match self.executor.poll(IDLE_LIVENESS_POLL) {
+        // Answers of the host page tier arrive on a connection the executor
+        // does not wait on: while some are awaited, the park is short.
+        let timeout = if self
+            .tiers
+            .as_ref()
+            .is_some_and(crate::prefix_cache::Tiers::waiting)
+        {
+            TIER_POLL
+        } else {
+            IDLE_LIVENESS_POLL
+        };
+        match self.executor.poll(timeout) {
             Ok(Some(result)) => self.apply_result(result),
             Ok(None) => {}
             Err(error) => self.on_executor_error(error),

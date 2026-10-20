@@ -509,6 +509,15 @@ impl Scheduler {
         if batch_complete && !calls_complete {
             invalid_result = true;
         }
+        // The page writes the batch carried are committed when every call
+        // ran, and aborted otherwise.
+        if batch_complete && let Some(tiers) = self.tiers.as_mut() {
+            let succeeded = report
+                .results
+                .iter()
+                .all(|result| result.output.status != uniserve_ipc::CallStatus::Error);
+            tiers.completed(result_batch_id, succeeded && !invalid_result);
+        }
         if invalid_result {
             self.fatal = true;
             self.fail_all_running("executor returned an invalid call result");

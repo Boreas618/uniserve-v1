@@ -25,6 +25,8 @@ use uniserve_storage::{
 /// A server on its own socket, stopped when dropped.
 struct Running {
     socket: PathBuf,
+    /// The loopback address other hosts' heads connect to.
+    tcp: String,
     stop: Arc<AtomicBool>,
     wake: OwnedFd,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -45,15 +47,20 @@ impl Running {
             unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
-            let mut server = Server::new(listener).unwrap();
+            // Pools of four 16-byte pages.
+            let mut server = Server::new(listener, 64, None).unwrap();
+            server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                 .unwrap();
         });
         Self {
             socket,
+            tcp: address,
             stop,
             wake: writer,
             thread: Some(thread),
@@ -418,4 +425,276 @@ fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
         }
     }
     panic!("the server did not notice the disconnect");
+}
+
+#[test]
+fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
+    use uniserve_storage::protocol::{PageShape, PageSlot, Reply, Request};
+
+    let server = Running::start();
+    let claim = head(&server.socket).claim(vec![scope("text", 0)]).unwrap();
+
+    // The worker maps its pool on the host.
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    let shape = PageShape {
+        content: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes: 16,
+    };
+    let answer = worker
+        .call(
+            &Request::PagePool {
+                shape,
+                numa_node: None,
+            },
+            &[],
+        )
+        .unwrap();
+    let Reply::PagePool { pool, slots, .. } = answer.reply else {
+        panic!("a page pool request answered {:?}", answer.reply);
+    };
+    assert_eq!((slots, answer.descriptors.len()), (4, 1));
+
+    // The head reaches the pool from another host.
+    let mut remote = Client::connect_tcp(
+        &server.tcp,
+        Role::Head {
+            deployment: "model".into(),
+        },
+    )
+    .unwrap();
+    let mut ask = |request: Request| remote.call(&request, &[]).unwrap().reply;
+    let Reply::Reserved { slots } = ask(Request::Reserve {
+        pool,
+        writer: scope("text", 0),
+        keys: vec![key(1), key(2)],
+    }) else {
+        panic!("a reservation was refused");
+    };
+    assert!(matches!(
+        slots[..],
+        [PageSlot::Reserved { .. }, PageSlot::Reserved { .. }]
+    ));
+    ask(Request::Commit {
+        pool,
+        keys: vec![key(1)],
+    });
+    assert_eq!(
+        ask(Request::Lookup {
+            pool,
+            keys: vec![key(1), key(2)],
+        }),
+        Reply::Lookup { l2: 1, l3: 1 }
+    );
+    // A connection from another host claims nothing.
+    assert!(matches!(
+        ask(Request::Claim { scopes: Vec::new() }),
+        Reply::Error {
+            kind: ErrorKind::Invalid,
+            ..
+        }
+    ));
+
+    // A worker connects on its host only.
+    assert!(matches!(
+        Client::connect_tcp(
+            &server.tcp,
+            Role::Worker {
+                scope: scope("text", 0),
+                generation: 1,
+                claim,
+            },
+        ),
+        Err(Error::Refused(_))
+    ));
+}
+
+/// The next event `client` receives, waiting up to ten seconds.
+fn next_event(client: &mut Client) -> (uniserve_storage::protocol::Event, Vec<OwnedFd>) {
+    for _ in 0..1000 {
+        client.pump().unwrap();
+        if let Some(event) = client.next_event() {
+            return event;
+        }
+        let mut descriptor = libc::pollfd {
+            fd: client.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polls one descriptor this test holds.
+        unsafe { libc::poll(&mut descriptor, 1, 10) };
+    }
+    panic!("no event arrived");
+}
+
+#[test]
+fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() {
+    use uniserve_storage::protocol::{Event, PageShape, PageSlot, Reply, Request};
+
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(vec![scope("text", 0)]).unwrap();
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    let shape = PageShape {
+        content: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes: 16,
+    };
+    let Reply::PagePool { pool, .. } = worker
+        .call(
+            &Request::PagePool {
+                shape,
+                numa_node: None,
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the page pool was refused");
+    };
+
+    // The connector is given the pool with its memory.
+    let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
+    let (event, descriptors) = next_event(&mut connector);
+    assert_eq!(
+        event,
+        Event::Pool {
+            pool,
+            shape,
+            slots: 4
+        }
+    );
+    assert_eq!(descriptors.len(), 1);
+    // A second connector is refused.
+    assert!(matches!(
+        Client::connect(&server.socket, Role::Connector),
+        Err(Error::Refused(_))
+    ));
+
+    // A committed page is uploaded from its slot.
+    let Reply::Reserved { slots } = head
+        .call(
+            &Request::Reserve {
+                pool,
+                writer: scope("text", 0),
+                keys: vec![key(1)],
+            },
+            &[],
+        )
+        .unwrap()
+        .reply
+    else {
+        panic!("the reservation was refused");
+    };
+    let [PageSlot::Reserved { slot }] = slots[..] else {
+        panic!("the reservation answered {slots:?}");
+    };
+    head.call(
+        &Request::Commit {
+            pool,
+            keys: vec![key(1)],
+        },
+        &[],
+    )
+    .unwrap();
+    let (
+        Event::Upload {
+            task,
+            pool: uploaded,
+            pages,
+        },
+        _,
+    ) = next_event(&mut connector)
+    else {
+        panic!("the committed page was not uploaded");
+    };
+    assert_eq!((uploaded, pages), (pool, vec![(key(1), slot)]));
+    let finished = Request::Finished {
+        task,
+        results: vec![true],
+    };
+    assert_eq!(
+        connector.call(&finished, &[]).unwrap().reply,
+        Reply::Finished
+    );
+
+    // A lookup counts the pages the connector finds after the L2 run.
+    let lookup = head
+        .submit(
+            &Request::Lookup {
+                pool,
+                keys: vec![key(1), key(2), key(3)],
+            },
+            &[],
+        )
+        .unwrap();
+    let (Event::Exists { task, keys, .. }, _) = next_event(&mut connector) else {
+        panic!("the lookup did not reach the connector");
+    };
+    assert_eq!(keys, vec![key(2), key(3)]);
+    connector
+        .call(
+            &Request::Finished {
+                task,
+                results: vec![true, false],
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        head.wait(lookup).unwrap().reply,
+        Reply::Lookup { l2: 1, l3: 2 }
+    );
+
+    // A prefetch reads the pages the pool lacks into reserved slots, and its
+    // event reports which pages the pool holds after.
+    let prefetch = Request::Prefetch {
+        pool,
+        keys: vec![key(1), key(2), key(3)],
+        tag: 7,
+    };
+    assert_eq!(head.call(&prefetch, &[]).unwrap().reply, Reply::Prefetching);
+    let (Event::Download { task, pages, .. }, _) = next_event(&mut connector) else {
+        panic!("the prefetch did not reach the connector");
+    };
+    assert_eq!(
+        pages.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        vec![key(2), key(3)]
+    );
+    connector
+        .call(
+            &Request::Finished {
+                task,
+                results: vec![true, false],
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        next_event(&mut head).0,
+        Event::Prefetched {
+            tag: 7,
+            results: vec![true, true, false]
+        }
+    );
+
+    // A connector that leaves fails its lookups: L3 holds what L2 holds.
+    let lookup = head
+        .submit(
+            &Request::Lookup {
+                pool,
+                keys: vec![key(1), key(2), key(3)],
+            },
+            &[],
+        )
+        .unwrap();
+    next_event(&mut connector);
+    drop(connector);
+    assert_eq!(
+        head.wait(lookup).unwrap().reply,
+        Reply::Lookup { l2: 2, l3: 2 }
+    );
 }

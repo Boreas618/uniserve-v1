@@ -645,6 +645,24 @@ impl Scheduler {
             batch.id = self.inflight.next_batch_id();
         }
 
+        // A text batch of one worker group carries the page writes the
+        // host page tier reserved for that group: its runner copies them
+        // before its forward, and its output settles them.
+        if let Some(tiers) = self.tiers.as_mut()
+            && let Some((_, first)) = batch.requests.first()
+            && batch.requests.iter().all(|(call, placement)| {
+                placement.worker == first.worker
+                    && call.component == DEFAULT_COMPONENT
+                    && matches!(
+                        call.kind,
+                        CallKind::Forward(ForwardMode::Prefill | ForwardMode::Decode)
+                    )
+            })
+        {
+            let worker = first.worker.clone();
+            batch.page_writes = tiers.take_writes(&worker, batch.id);
+        }
+
         // Snapshot scheduler gauges at the batch boundary before ownership moves
         // into the executor.
         self.stats

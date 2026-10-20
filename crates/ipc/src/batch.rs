@@ -57,6 +57,39 @@ pub struct CacheUnitAllocation {
     pub unit_ids: Vec<UnitId>,
 }
 
+/// One page copied between a rank's cache units and a slot of its host
+/// page pool.
+///
+/// A read fills `units` (one page of `group_id`, page-major as in a
+/// [`BlockTable`]) from the slot before the batch's forward; the units are
+/// new units of the batch, which the worker resets first. A write copies
+/// the units of a published page into the slot; the rank's output for the
+/// batch reports the write complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageCopy {
+    /// The rank of the worker group that copies the page.
+    pub rank: u32,
+    /// The page pool at the rank's host's Storage Server.
+    pub pool: u64,
+    /// The cache group of the page.
+    pub group_id: u32,
+    /// The pool slot.
+    pub slot: u64,
+    /// The page's units.
+    pub units: Vec<UnitId>,
+}
+
+impl PageCopy {
+    /// Validates the page's units.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            !self.units.is_empty() && distinct_units(&self.units),
+            "a page copy is empty, repeats a unit, or carries unit zero"
+        );
+        Ok(())
+    }
+}
+
 /// Whether `units` are real units (never the zero sentinel) without repeats.
 fn distinct_units(units: &[UnitId]) -> bool {
     units.iter().all(|unit| unit.0 > 0) && units.iter().collect::<HashSet<_>>().len() == units.len()
@@ -342,6 +375,11 @@ pub struct Batch {
     pub input_products: Vec<TensorExport>,
     /// Imported cache exports consumed by explicit cache installation call kinds.
     pub cache_inputs: Vec<CacheTransfer>,
+    /// Pages read from the host page tier into new units before the
+    /// forward.
+    pub page_reads: Vec<PageCopy>,
+    /// Published pages written to the host page tier.
+    pub page_writes: Vec<PageCopy>,
 }
 
 impl Batch {
@@ -368,6 +406,8 @@ impl Batch {
                 .collect(),
             input_products: Vec::new(),
             cache_inputs: Vec::new(),
+            page_reads: Vec::new(),
+            page_writes: Vec::new(),
         }
     }
 
@@ -464,6 +504,23 @@ impl Batch {
             .iter()
             .map(|call| ((call.request_key, call.call_id), call))
             .collect::<HashMap<_, _>>();
+
+        // A page read fills new units of the batch, which the worker resets
+        // before it; every page copy names real units.
+        let new_units = self
+            .new_cache_units
+            .iter()
+            .flat_map(|allocation| allocation.unit_ids.iter())
+            .collect::<HashSet<_>>();
+        for copy in self.page_reads.iter().chain(&self.page_writes) {
+            copy.validate()?;
+        }
+        ensure_valid!(
+            self.page_reads
+                .iter()
+                .all(|copy| copy.units.iter().all(|unit| new_units.contains(unit))),
+            "a page read fills units that are not new units of the batch"
+        );
 
         // Cache allocations are subsets of unique block tables for the same pool group.
         let mut table_ids = HashSet::with_capacity(self.block_tables.len());

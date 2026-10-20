@@ -128,6 +128,9 @@ enum BatchKind {
 /// with wake integration also returns early on commands and consumer reads;
 /// the timeout is only a liveness deadline.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
+/// Timeout of a park while the host page tier's answers are awaited: the
+/// Storage Server answers a local connection within this.
+const TIER_POLL: Duration = Duration::from_millis(1);
 /// Number of batches carrying prefill-lane calls that may await their
 /// results before ready decode work takes precedence over further prefill
 /// (`Scheduler::select_batch_kind`).
@@ -406,6 +409,9 @@ pub struct Scheduler {
     fatal: bool,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
+    /// The host page tier, when it serves a worker group
+    /// (`Scheduler::enable_page_tier`).
+    tiers: Option<crate::prefix_cache::Tiers>,
 }
 
 impl Scheduler {

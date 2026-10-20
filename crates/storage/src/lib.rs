@@ -13,11 +13,14 @@
 //!   asynchronously by the head.
 //! - [`Server`]: the server's state and its loop.
 //! - [`socket`]: where the server listens, and starting it when absent.
+//! - [`connector`]: the Mooncake connector the server runs, which keeps
+//!   committed pages in the distributed tier (L3).
 //!
 //! The server holds memory and never interprets it: clients compute every
 //! key, define what the bytes mean, and run every device copy.
 
 pub mod client;
+pub mod connector;
 pub mod protocol;
 pub mod server;
 pub mod socket;
@@ -27,4 +30,4 @@ pub use client::{Answer, Client, Error, Got, Result};
 pub use protocol::{
     Access, Claim, Key, Listing, Mode, Placement, Role, Scope, StorageRecord, TensorRecord,
 };
-pub use server::Server;
+pub use server::{ConnectorLaunch, DEFAULT_POOL_BYTES, Server};

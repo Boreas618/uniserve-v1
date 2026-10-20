@@ -323,6 +323,14 @@ pub struct KvCacheOptions {
     pub dtype: Option<PrefixCacheDtype>,
     /// Reuse and retain cached prompt prefixes across requests.
     pub prefix_caching: bool,
+    /// Copy full prompt pages to the host page tier of each host's Storage
+    /// Server and read them back on a later prefix match the device cache
+    /// no longer holds. Applies with `prefix_caching`.
+    pub host_tier: bool,
+    /// Keep every page of the host page tier in Mooncake, the distributed
+    /// tier, through the Storage Servers this deployment starts, and
+    /// prefetch long hits back. Applies with `host_tier`; none when unset.
+    pub mooncake: Option<MooncakeOptions>,
 }
 
 impl Default for KvCacheOptions {
@@ -332,6 +340,59 @@ impl Default for KvCacheOptions {
             block_size: None,
             dtype: None,
             prefix_caching: true,
+            host_tier: true,
+            mooncake: None,
+        }
+    }
+}
+
+/// Mooncake, the distributed page tier (`kv_cache_config.mooncake`): the
+/// settings of each Storage Server's Mooncake client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MooncakeOptions {
+    /// Mooncake's master, `host:port`.
+    pub master: String,
+    /// The transfer engine's metadata server: `P2PHANDSHAKE`, or an
+    /// `http://`, `etcd://` or `redis://` URL.
+    #[serde(default = "MooncakeOptions::default_metadata_server")]
+    pub metadata_server: String,
+    /// The transfer protocol: `tcp` or `rdma`.
+    #[serde(default = "MooncakeOptions::default_protocol")]
+    pub protocol: String,
+    /// The RDMA devices; selected automatically when empty.
+    #[serde(default)]
+    pub device: String,
+    /// Host memory each host contributes to Mooncake's pool, in GiB; zero
+    /// makes the hosts clients of segments others provide.
+    #[serde(default)]
+    pub global_segment_gib: u64,
+    /// `libmooncake_store.so`; `MOONCAKE_STORE_LIBRARY` or the loader's
+    /// search path when unset.
+    #[serde(default)]
+    pub library: Option<PathBuf>,
+}
+
+impl MooncakeOptions {
+    fn default_metadata_server() -> String {
+        "P2PHANDSHAKE".into()
+    }
+
+    fn default_protocol() -> String {
+        "tcp".into()
+    }
+
+    /// The connector settings of a Storage Server this deployment starts.
+    /// Each host names itself to Mooncake.
+    fn connector(&self) -> uniserve_storage::connector::Settings {
+        uniserve_storage::connector::Settings {
+            master: self.master.clone(),
+            metadata: self.metadata_server.clone(),
+            protocol: self.protocol.clone(),
+            device: self.device.clone(),
+            hostname: None,
+            segment_bytes: self.global_segment_gib << 30,
+            library: self.library.clone(),
         }
     }
 }
@@ -847,6 +908,13 @@ impl ServeConfig {
             ),
             // A deployment is what one head serves under its served name.
             deployment: self.served_model_name().to_owned(),
+            page_tier: self.kv_cache_config.prefix_caching && self.kv_cache_config.host_tier,
+            storage_connector: self
+                .kv_cache_config
+                .mooncake
+                .as_ref()
+                .filter(|_| self.kv_cache_config.prefix_caching && self.kv_cache_config.host_tier)
+                .map(MooncakeOptions::connector),
             model: self.model().to_owned(),
             host: self.host_identity.clone(),
             queue_depth: self.placement_config.queue_depth.get(),

@@ -325,6 +325,21 @@ impl Storage {
         ))
     }
 
+    /// Map host memory the Storage Server keeps, `bytes` long, through its
+    /// `descriptor`, writable or read-only, registered in `device`'s
+    /// context: a page pool, which the rank's copies write and read.
+    pub(crate) fn map_host(
+        descriptor: OwnedFd,
+        bytes: usize,
+        device: DeviceId,
+        writable: bool,
+    ) -> Result<Arc<Self>> {
+        let mapping = HostMapping::map(&descriptor, bytes, device, writable)?;
+        Ok(Arc::new(Self {
+            kind: Kind::Retained(mapping),
+        }))
+    }
+
     /// Map retained host memory, `bytes` long, read-only through its
     /// `descriptor`, registered in `device`'s context.
     pub(crate) fn import_host(

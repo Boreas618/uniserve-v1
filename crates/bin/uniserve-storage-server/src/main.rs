@@ -7,6 +7,11 @@
 //! signals its starter once it listens, so restarting a head or a launcher
 //! never ends it.
 //!
+//! With `--mooncake-master`, the server also runs the Mooncake connector,
+//! which keeps committed pages in Mooncake (L3): the same executable's
+//! `connector` command, as a child process the server starts again when it
+//! ends.
+//!
 //! `list` prints what a running server holds, and `retire` releases the
 //! memory of a deployment that is no longer served.
 
@@ -19,8 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
-use uniserve_storage::{Client, Role, Server, socket};
+use clap::{Args, Parser, Subcommand};
+use uniserve_storage::connector::Settings;
+use uniserve_storage::{Client, ConnectorLaunch, Role, Server, socket};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +49,25 @@ enum Commands {
         /// the starter once listening.
         #[arg(long)]
         daemon: bool,
+        /// The size of each host page pool, in GiB. The workers that copy
+        /// through a pool pin it, so it is allocated whole when the first
+        /// one maps it.
+        #[arg(long, default_value_t = uniserve_storage::DEFAULT_POOL_BYTES >> 30)]
+        page_pool_gib: u64,
+        /// Also accept other hosts' heads, for page requests, on this TCP
+        /// address (`host:port`; port 0 picks one, which `Endpoint` names).
+        #[arg(long)]
+        tcp: Option<String>,
+        #[command(flatten)]
+        mooncake: Mooncake,
+    },
+    /// The Mooncake connector a server runs as its child.
+    #[command(hide = true)]
+    Connector {
+        #[arg(long)]
+        socket: PathBuf,
+        #[command(flatten)]
+        mooncake: Mooncake,
     },
     /// Print the tensors, bytes and deployments the running server holds.
     List {
@@ -59,9 +84,69 @@ enum Commands {
     },
 }
 
+/// Where the Mooncake connector finds Mooncake: the arguments of its
+/// client's `setup` (`uniserve_storage::connector::Settings`).
+#[derive(Args, Debug, Clone)]
+struct Mooncake {
+    /// Run the Mooncake connector, which keeps committed pages in Mooncake
+    /// (L3), with Mooncake's master at this `host:port`.
+    #[arg(long = "mooncake-master")]
+    master: Option<String>,
+    /// The transfer engine's metadata server: `P2PHANDSHAKE`, or an
+    /// `http://`, `etcd://` or `redis://` URL.
+    #[arg(long = "mooncake-metadata", default_value = "P2PHANDSHAKE")]
+    metadata: String,
+    /// The transfer protocol: `tcp` or `rdma`.
+    #[arg(long = "mooncake-protocol", default_value = "tcp")]
+    protocol: String,
+    /// The RDMA devices; empty to select them automatically.
+    #[arg(long = "mooncake-device", default_value = "")]
+    device: String,
+    /// The name other Mooncake clients reach this host by; the host name
+    /// when unset.
+    #[arg(long = "mooncake-hostname")]
+    hostname: Option<String>,
+    /// Host memory this host contributes to Mooncake's pool, in bytes.
+    #[arg(long = "mooncake-segment-bytes", default_value_t = 0)]
+    segment_bytes: u64,
+    /// `libmooncake_store.so`; found on the loader's search path when
+    /// unset.
+    #[arg(long = "mooncake-library")]
+    library: Option<PathBuf>,
+}
+
+impl Mooncake {
+    /// The connector's settings, when a master is given.
+    fn settings(&self) -> anyhow::Result<Option<Settings>> {
+        let Some(master) = &self.master else {
+            return Ok(None);
+        };
+        let hostname = match &self.hostname {
+            Some(hostname) => hostname.clone(),
+            None => host_name()?,
+        };
+        Ok(Some(Settings {
+            master: master.clone(),
+            metadata: self.metadata.clone(),
+            protocol: self.protocol.clone(),
+            device: self.device.clone(),
+            hostname: Some(hostname),
+            segment_bytes: self.segment_bytes,
+            library: self.library.clone(),
+        }))
+    }
+}
+
 fn main() -> ExitCode {
-    let (socket, daemon) = match Arguments::parse().command {
-        Commands::Serve { socket, daemon } => (socket, daemon),
+    let (socket, daemon, page_pool_bytes, tcp, mooncake) = match Arguments::parse().command {
+        Commands::Serve {
+            socket,
+            daemon,
+            page_pool_gib,
+            tcp,
+            mooncake,
+        } => (socket, daemon, page_pool_gib << 30, tcp, mooncake),
+        Commands::Connector { socket, mooncake } => return connect(&socket, &mooncake),
         Commands::List { socket } => {
             return operate(socket, |client| {
                 let listing = client.list()?;
@@ -93,6 +178,25 @@ fn main() -> ExitCode {
                         }
                     );
                 }
+                for pool in &listing.page_pools {
+                    println!(
+                        "page pool {} kv heads {}+{} {} slots of {} bytes: {} ready, {} reserved, \
+                         {} pinned, {} fetching, {} uploading",
+                        pool.pool,
+                        pool.shape.kv_head_offset,
+                        pool.shape.kv_head_count,
+                        pool.slots,
+                        pool.shape.page_bytes,
+                        pool.ready,
+                        pool.reserved,
+                        pool.pinned,
+                        pool.fetching,
+                        pool.uploading
+                    );
+                }
+                if listing.connector {
+                    println!("mooncake connector connected");
+                }
                 Ok(())
             });
         }
@@ -117,15 +221,8 @@ fn main() -> ExitCode {
     } else {
         None
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("UNISERVE_STORAGE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-    match serve(&socket, ready) {
+    init_logging();
+    match serve(&socket, ready, page_pool_bytes, tcp.as_deref(), &mooncake) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("storage server failed: {error:#}");
@@ -151,9 +248,59 @@ fn operate(
     }
 }
 
+/// This host's name, as `gethostname(2)` gives it.
+fn host_name() -> anyhow::Result<String> {
+    let mut name = [0_u8; 256];
+    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the host name");
+    }
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    String::from_utf8(name[..length].to_vec()).context("the host name is not UTF-8")
+}
+
+/// Run the Mooncake connector for the server on `socket` until the server
+/// closes its connection.
+fn connect(socket: &Path, mooncake: &Mooncake) -> ExitCode {
+    init_logging();
+    let result = mooncake.settings().and_then(|settings| {
+        let settings = settings.context("the connector needs --mooncake-master")?;
+        uniserve_storage::connector::run(socket, &settings).map_err(anyhow::Error::from)
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!("the Mooncake connector failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Log to standard error at `UNISERVE_STORAGE_LOG`'s level, `info` when
+/// unset.
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("UNISERVE_STORAGE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+}
+
 /// Bind the socket and serve until stopped. `ready` is the starter's pipe,
 /// written once the server listens or found another one listening.
-fn serve(socket: &Path, ready: Option<OwnedFd>) -> anyhow::Result<()> {
+fn serve(
+    socket: &Path,
+    ready: Option<OwnedFd>,
+    page_pool_bytes: u64,
+    tcp: Option<&str>,
+    mooncake: &Mooncake,
+) -> anyhow::Result<()> {
     let signal = |ready: Option<OwnedFd>| {
         if let Some(ready) = ready {
             let _ = std::fs::File::from(ready).write_all(b"1");
@@ -168,7 +315,28 @@ fn serve(socket: &Path, ready: Option<OwnedFd>) -> anyhow::Result<()> {
     };
     raise_descriptor_limit()?;
     let (wake, stop) = stop_signals()?;
-    let mut server = Server::new(listener)?;
+    let connector = match mooncake.settings()? {
+        Some(settings) => {
+            let mut arguments = vec![
+                "connector".into(),
+                "--socket".into(),
+                socket.as_os_str().to_owned(),
+            ];
+            arguments.extend(settings.arguments().into_iter().map(Into::into));
+            Some(ConnectorLaunch {
+                program: std::env::current_exe().context("locating this executable")?,
+                arguments,
+            })
+        }
+        None => None,
+    };
+    let mut server = Server::new(listener, page_pool_bytes, connector)?;
+    if let Some(address) = tcp {
+        let listener = std::net::TcpListener::bind(address)
+            .with_context(|| format!("binding {address} for other hosts"))?;
+        let bound = server.listen_tcp(listener)?;
+        tracing::info!(address = %bound, "accepting other hosts' page requests");
+    }
     tracing::info!(socket = %socket.display(), "storage server listening");
     signal(ready);
     server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))?;
@@ -275,5 +443,31 @@ fn detach(socket: &Path) -> anyhow::Result<OwnedFd> {
             // SAFETY: `_exit` ends the starter without running handlers.
             unsafe { libc::_exit(if started { 0 } else { 1 }) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A head states the connector's settings as arguments of `serve`
+    /// (`Settings::arguments`); the server must read back the same settings.
+    #[test]
+    fn connector_settings_survive_the_command_line() {
+        let settings = Settings {
+            master: "10.0.0.1:50051".into(),
+            metadata: "http://10.0.0.1:8080/metadata".into(),
+            protocol: "rdma".into(),
+            device: "mlx5_0,mlx5_1".into(),
+            hostname: Some("10.0.0.2".into()),
+            segment_bytes: 4 << 30,
+            library: Some("/opt/mooncake/libmooncake_store.so".into()),
+        };
+        let mut arguments = vec!["uniserve-storage-server".to_owned(), "serve".to_owned()];
+        arguments.extend(settings.arguments());
+        let Commands::Serve { mooncake, .. } = Arguments::parse_from(arguments).command else {
+            panic!("the arguments are not a `serve` command");
+        };
+        assert_eq!(mooncake.settings().unwrap(), Some(settings));
     }
 }

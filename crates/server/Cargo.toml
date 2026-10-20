@@ -45,6 +45,7 @@ tracing-futures.workspace = true
 uniserve-core.workspace = true
 uniserve-engine.workspace = true
 uniserve-observability.workspace = true
+uniserve-storage.workspace = true
 url.workspace = true
 uuid.workspace = true
 validator.workspace = true

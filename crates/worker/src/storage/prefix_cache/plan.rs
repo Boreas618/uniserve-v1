@@ -252,6 +252,8 @@ impl CachePlan {
                     head_dim: group.head_dim,
                 })
                 .collect(),
+            // The rank reports its page pools once it mapped them.
+            page_pools: Vec::new(),
         }
     }
 

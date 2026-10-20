@@ -342,6 +342,11 @@ impl Owners<'_> {
             .filter(|state| state.active)
             .map(|state| state.slot as u32)
             .collect();
+        if !plan.page_reads.is_empty() || !plan.page_writes.is_empty() {
+            return Err(reserve(Error::Invalid(
+                "diffusion LM calls copy no pages of the host page tier".into(),
+            )));
+        }
         if plan
             .new_cache_units
             .iter()

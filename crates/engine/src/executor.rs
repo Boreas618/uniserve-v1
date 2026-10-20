@@ -83,6 +83,13 @@ pub struct ExecutorInfo {
     /// its launched ranks (`PoolPlacement::ranks`, one when it has no
     /// placement), each backing its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
+    /// For each pool, each rank's prefix cache as the rank reported it, with
+    /// the host page pools it maps, and the rank's host, in rank order.
+    ///
+    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// and `SimExecutor` leave it empty, which serves no pool through the
+    /// host page tier.
+    pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<uniserve_ipc::PrefixCacheInfo>)>>,
 }
 
 impl ExecutorInfo {
@@ -641,7 +648,7 @@ pub type ExecutorError = anyhow::Error;
 pub enum ExecutorSubmitError {
     #[error("executor queue is full")]
     /// Returns ownership of a batch rejected by bounded queue capacity.
-    WouldBlock(ExecutionBatch),
+    WouldBlock(Box<ExecutionBatch>),
     #[error(transparent)]
     /// Reports a terminal submission failure.
     Failed(#[from] anyhow::Error),

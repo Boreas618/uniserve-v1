@@ -9,16 +9,25 @@
 //! The physical memory of a storage lives while the server holds its
 //! descriptor or any process maps it.
 //!
+//! The server also keeps the host's page pools ([`pages`]): the slots of
+//! the host page tier and which page each holds. Its Mooncake connector
+//! ([`connector`]) keeps committed pages in the distributed tier and reads
+//! them back for prefetches.
+//!
 //! One thread serves every client with `poll(2)`. Requests are answered in
 //! order on their connection. A request that must wait for a previous
-//! writer to be shot down ([`shoot`]) holds its connection's queue until the
-//! shoot-down ends, while every other connection is served on.
+//! writer to be shot down ([`shoot`]), or for the connector's lookup, holds
+//! its connection's queue until then, while every other connection is
+//! served on.
 
+mod connector;
 mod nvml;
+mod pages;
 mod shoot;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
+use std::net::TcpListener;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -26,12 +35,16 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 
+use crate::connector::BATCH_PAGES;
 use crate::protocol::{
-    Access, Claim, ClientMessage, ErrorKind, Hello, Key, ListedDeployment, ListedTensor, Listing,
-    Mode, Placement, Reply, Request, Role, Scope, ScopeBytes, ServerMessage, StorageRecord,
-    TensorRecord, VERSION, Welcome,
+    Access, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment, ListedTensor,
+    Listing, Mode, Placement, Reply, Request, Role, Scope, ScopeBytes, ServerMessage,
+    StorageRecord, TensorRecord, VERSION, Welcome,
 };
 use crate::transport::Connection;
+pub use connector::Launch as ConnectorLaunch;
+use connector::{Connector, Task};
+pub use pages::DEFAULT_POOL_BYTES;
 use shoot::ShootDowns;
 
 /// How often a shoot-down that waits for a GPU to drop its victim polls
@@ -55,11 +68,19 @@ struct Holder {
 
 struct Client {
     connection: Connection,
+    /// The peer process of a connection on the host; 0 for a connection
+    /// from another host.
     pid: i32,
-    pidfd: Arc<OwnedFd>,
+    /// The peer process, held so that its identity cannot be reused; `None`
+    /// for a connection from another host, which may only make a head's
+    /// page requests.
+    pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
     /// Requests received and not yet answered, in arrival order.
     queue: VecDeque<(u64, Request, Vec<OwnedFd>)>,
+    /// Whether a request taken from the queue waits for the connector, which
+    /// holds the queue until it is answered.
+    held: bool,
 }
 
 struct StorageEntry {
@@ -93,14 +114,26 @@ struct Deployment {
 
 /// What handling a request came to.
 enum Outcome {
-    Reply(Reply, Vec<StorageId>),
+    Reply(Reply, Vec<Attachment>),
     /// The request waits for these processes to be shot down.
     Wait(Vec<Holder>),
+    /// The request is answered when the connector finishes this task.
+    Connector(Task),
+}
+
+/// A descriptor that travels with a reply.
+#[derive(Clone, Copy)]
+enum Attachment {
+    Storage(StorageId),
+    Pool(u64),
 }
 
 /// The server's state and its listening socket.
 pub struct Server {
     listener: UnixListener,
+    /// The TCP listener other hosts' heads reach the page pools through,
+    /// with the address it is bound to.
+    tcp: Option<(TcpListener, String)>,
     clients: BTreeMap<ClientId, Client>,
     next_client: ClientId,
     storages: HashMap<StorageId, StorageEntry>,
@@ -108,14 +141,25 @@ pub struct Server {
     tensors: HashMap<Key, TensorEntry>,
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
+    pages: pages::Pools,
+    connector: Connector,
+    /// Events to send once the request being handled is answered.
+    events: Vec<(ClientId, Event, Vec<Attachment>)>,
 }
 
 impl Server {
-    /// Serve on `listener`, which the caller bound with mode 0600.
-    pub fn new(listener: UnixListener) -> io::Result<Self> {
+    /// Serve on `listener`, which the caller bound with mode 0600, with
+    /// page pools of `page_pool_bytes` each, and run the Mooncake connector
+    /// `connector` when given.
+    pub fn new(
+        listener: UnixListener,
+        page_pool_bytes: u64,
+        connector: Option<ConnectorLaunch>,
+    ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
+            tcp: None,
             clients: BTreeMap::new(),
             next_client: 1,
             storages: HashMap::new(),
@@ -123,7 +167,19 @@ impl Server {
             tensors: HashMap::new(),
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
+            pages: pages::Pools::new(page_pool_bytes),
+            connector: Connector::new(connector),
+            events: Vec::new(),
         })
+    }
+
+    /// Also accept connections from other hosts on `listener`: a head's
+    /// page requests, without descriptors. Returns the bound address.
+    pub fn listen_tcp(&mut self, listener: TcpListener) -> io::Result<String> {
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?.to_string();
+        self.tcp = Some((listener, address.clone()));
+        Ok(address)
     }
 
     /// Serve until `stop` reads true. `stop` is checked after every wake;
@@ -140,9 +196,14 @@ impl Server {
     fn turn(&mut self, wake: BorrowedFd<'_>) -> io::Result<()> {
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         let pidfds = self.shootdowns.pending_pidfds();
-        let mut fds = Vec::with_capacity(2 + ids.len() + pidfds.len());
+        let mut fds = Vec::with_capacity(3 + ids.len() + pidfds.len());
         fds.push(PollFd::new(&self.listener, PollFlags::IN));
         fds.push(PollFd::new(&wake, PollFlags::IN));
+        let tcp = self.tcp.as_ref().map(|(listener, _)| listener);
+        if let Some(listener) = tcp {
+            fds.push(PollFd::new(listener, PollFlags::IN));
+        }
+        let first = fds.len();
         for id in &ids {
             let client = &self.clients[id];
             let mut flags = PollFlags::IN;
@@ -154,10 +215,17 @@ impl Server {
         for pidfd in &pidfds {
             fds.push(PollFd::new(pidfd.as_ref(), PollFlags::IN));
         }
-        let timeout = self
-            .shootdowns
-            .polling()
-            .then(|| rustix::time::Timespec::try_from(NVML_POLL).unwrap_or_default());
+        if let Some((_, pidfd)) = &self.connector.child {
+            fds.push(PollFd::new(pidfd, PollFlags::IN));
+        }
+        let timeout = [
+            self.shootdowns.polling().then_some(NVML_POLL),
+            self.connector.timeout(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|timeout| rustix::time::Timespec::try_from(timeout).unwrap_or_default());
         match poll(&mut fds, timeout.as_ref()) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
             Err(error) => return Err(error.into()),
@@ -166,9 +234,10 @@ impl Server {
         if !fds[1].revents().is_empty() {
             drain(wake);
         }
+        let accept_tcp = tcp.is_some() && !fds[2].revents().is_empty();
         let ready: Vec<ClientId> = ids
             .iter()
-            .zip(&fds[2..2 + ids.len()])
+            .zip(&fds[first..first + ids.len()])
             .filter(|(_, fd)| !fd.revents().is_empty())
             .map(|(id, _)| *id)
             .collect();
@@ -177,12 +246,17 @@ impl Server {
         if accept {
             self.accept();
         }
+        if accept_tcp {
+            self.accept_tcp();
+        }
         for id in ready {
             self.read(id);
         }
         if self.shootdowns.advance() {
             self.settle_shootdowns();
         }
+        self.connector.reap();
+        self.connector.start_due();
         self.serve_queues();
         self.flush_and_reap();
         Ok(())
@@ -210,6 +284,43 @@ impl Server {
         }
     }
 
+    /// Take every pending connection from another host.
+    fn accept_tcp(&mut self) {
+        loop {
+            let Some((listener, _)) = &self.tcp else {
+                return;
+            };
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) => {
+                    tracing::warn!(%error, "accepting a remote storage client failed");
+                    return;
+                }
+            };
+            let admitted = stream
+                .set_nonblocking(true)
+                .and_then(|()| stream.set_nodelay(true));
+            if let Err(error) = admitted {
+                tracing::warn!(%error, "a remote storage client could not be admitted");
+                continue;
+            }
+            let id = self.next_client;
+            self.next_client += 1;
+            self.clients.insert(
+                id,
+                Client {
+                    connection: Connection::new(stream),
+                    pid: 0,
+                    pidfd: None,
+                    role: None,
+                    queue: VecDeque::new(),
+                    held: false,
+                },
+            );
+        }
+    }
+
     /// A connection's peer process, held by a pidfd so that its identity
     /// cannot be reused while the server refers to it.
     fn admit(&self, stream: UnixStream) -> io::Result<Client> {
@@ -220,9 +331,10 @@ impl Server {
         Ok(Client {
             connection: Connection::new(stream),
             pid: pid.as_raw_nonzero().get(),
-            pidfd: Arc::new(pidfd),
+            pidfd: Some(Arc::new(pidfd)),
             role: None,
             queue: VecDeque::new(),
+            held: false,
         })
     }
 
@@ -263,6 +375,10 @@ impl Server {
                         let _ = client
                             .connection
                             .send(&ServerMessage::Welcome(welcome), &[]);
+                    }
+                    if self.connector.client == Some(id) {
+                        self.offer_pools();
+                        self.send_events();
                     }
                 }
                 ClientMessage::Request {
@@ -305,6 +421,22 @@ impl Server {
                     message: "the connection already said hello".into(),
                 };
             }
+            if client.pidfd.is_none() && !matches!(hello.role, Role::Head { .. }) {
+                return Welcome::Refused {
+                    message: "a connection from another host is a head's".into(),
+                };
+            }
+            if matches!(hello.role, Role::Connector) {
+                // The connector's client is forgotten when its connection
+                // closes, so one that is known is connected.
+                if self.connector.client.is_some() {
+                    return Welcome::Refused {
+                        message: "the server has a connector".into(),
+                    };
+                }
+                self.connector.client = Some(id);
+                tracing::info!(pid = client.pid, "the Mooncake connector connected");
+            }
             client.role = Some(hello.role);
         }
         Welcome::Accepted { version: VERSION }
@@ -324,12 +456,28 @@ impl Server {
             let Some(client) = self.clients.get_mut(&id) else {
                 return;
             };
+            if client.held {
+                return;
+            }
             let Some((request_id, request, descriptors)) = client.queue.pop_front() else {
                 return;
             };
-            match self.handle(id, &request, descriptors) {
+            let outcome = self.handle(id, &request, descriptors);
+            match outcome {
                 Ok(Outcome::Reply(reply, storages)) => {
-                    self.answer(id, request_id, reply, &storages)
+                    self.answer(id, request_id, reply, &storages);
+                    self.send_events();
+                }
+                Ok(Outcome::Connector(mut task)) => {
+                    if let Task::Lookup { request, .. } = &mut task {
+                        *request = request_id;
+                    }
+                    if let Some(client) = self.clients.get_mut(&id) {
+                        client.held = true;
+                    }
+                    self.assign(task);
+                    self.send_events();
+                    return;
                 }
                 Ok(Outcome::Wait(victims)) => {
                     for victim in victims {
@@ -352,11 +500,16 @@ impl Server {
     }
 
     /// Send a reply with the descriptors of `storages`, in order.
-    fn answer(&mut self, id: ClientId, request: u64, reply: Reply, storages: &[StorageId]) {
-        let descriptors: Vec<BorrowedFd<'_>> = storages
+    fn answer(&mut self, id: ClientId, request: u64, reply: Reply, attachments: &[Attachment]) {
+        let descriptors: Vec<BorrowedFd<'_>> = attachments
             .iter()
-            .filter_map(|storage| self.storages.get(storage))
-            .map(|entry| entry._descriptor.as_fd())
+            .filter_map(|attachment| match attachment {
+                Attachment::Storage(storage) => self
+                    .storages
+                    .get(storage)
+                    .map(|entry| entry._descriptor.as_fd()),
+                Attachment::Pool(pool) => self.pages.get(*pool).map(|pool| pool.descriptor.as_fd()),
+            })
             .collect();
         let Some(client) = self.clients.get_mut(&id) else {
             return;
@@ -382,6 +535,30 @@ impl Server {
             .ok_or_else(|| invalid("a request precedes the client's hello"))?;
         match (request, role) {
             (Request::List, _) => Ok(Outcome::Reply(Reply::Listing(self.listing()), Vec::new())),
+            (Request::Endpoint, _) => Ok(Outcome::Reply(
+                Reply::Endpoint {
+                    tcp: self.tcp.as_ref().map(|(_, address)| address.clone()),
+                },
+                Vec::new(),
+            )),
+            (Request::Claim { .. }, Role::Head { .. }) if client.pidfd.is_none() => Err(invalid(
+                "a deployment is claimed at its host's server, not from another host",
+            )),
+            (
+                Request::PagePool { .. }
+                | Request::Lookup { .. }
+                | Request::Reserve { .. }
+                | Request::Commit { .. }
+                | Request::Abort { .. }
+                | Request::Pin { .. }
+                | Request::Unpin { .. }
+                | Request::Prefetch { .. },
+                role,
+            ) => self.pages(id, request, &role),
+            (Request::Finished { task, results }, Role::Connector) => {
+                self.finished(*task, results);
+                Ok(Outcome::Reply(Reply::Finished, Vec::new()))
+            }
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
             (Request::Claim { scopes }, Role::Head { deployment }) => {
                 self.claim(id, &deployment, scopes)
@@ -394,10 +571,14 @@ impl Server {
                     claim,
                 },
             ) => {
+                let pidfd = client
+                    .pidfd
+                    .clone()
+                    .ok_or_else(|| invalid("a worker connects on its host"))?;
                 let holder = Holder {
                     client: Some(id),
                     pid: client.pid,
-                    pidfd: Arc::clone(&client.pidfd),
+                    pidfd,
                     scope,
                     generation,
                     claim,
@@ -410,9 +591,10 @@ impl Server {
                     }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
-                    Request::List | Request::Claim { .. } | Request::Retire { .. } => {
-                        Err(invalid("a worker cannot claim or retire a deployment"))
-                    }
+                    _ => Err(invalid(&format!(
+                        "{} is not a worker request",
+                        request_name(request)
+                    ))),
                 }
             }
             (request, role) => Err(invalid(&format!(
@@ -455,15 +637,18 @@ impl Server {
             self.clients
                 .iter()
                 .filter(|(other, _)| **other != id)
-                .filter_map(|(other, client)| match &client.role {
-                    Some(Role::Worker {
-                        scope,
-                        generation,
-                        claim,
-                    }) if scope.deployment == deployment => Some(Holder {
+                .filter_map(|(other, client)| match (&client.role, &client.pidfd) {
+                    (
+                        Some(Role::Worker {
+                            scope,
+                            generation,
+                            claim,
+                        }),
+                        Some(pidfd),
+                    ) if scope.deployment == deployment => Some(Holder {
                         client: Some(*other),
                         pid: client.pid,
-                        pidfd: Arc::clone(&client.pidfd),
+                        pidfd: Arc::clone(pidfd),
                         scope: scope.clone(),
                         generation: *generation,
                         claim: *claim,
@@ -688,7 +873,7 @@ impl Server {
                 storages: records,
                 missing,
             },
-            storages,
+            storages.into_iter().map(Attachment::Storage).collect(),
         ))
     }
 
@@ -905,6 +1090,18 @@ impl Server {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
+        match &client.role {
+            Some(Role::Head { .. }) => {
+                let clients = &self.clients;
+                self.pages
+                    .head_gone(id, &|scope| connected_worker(clients, scope));
+            }
+            Some(Role::Worker { scope, .. }) if !connected_worker(&self.clients, scope) => {
+                self.pages.worker_gone(scope);
+            }
+            Some(Role::Connector) if self.connector.client == Some(id) => self.connector_gone(),
+            _ => {}
+        }
         if let Some(Role::Head { deployment }) = &client.role
             && let Some(entry) = self.deployments.get_mut(deployment)
             && entry.head == Some(id)
@@ -998,8 +1195,330 @@ impl Server {
                         .is_some_and(|head| self.clients.contains_key(&head)),
                 })
                 .collect(),
+            page_pools: self.pages.listing(),
+            connector: self.connector.client.is_some(),
         }
     }
+
+    /// Send the events queued while handling requests.
+    fn send_events(&mut self) {
+        for (id, event, attachments) in std::mem::take(&mut self.events) {
+            let descriptors: Vec<BorrowedFd<'_>> = attachments
+                .iter()
+                .filter_map(|attachment| match attachment {
+                    Attachment::Pool(pool) => {
+                        self.pages.get(*pool).map(|pool| pool.descriptor.as_fd())
+                    }
+                    Attachment::Storage(storage) => self
+                        .storages
+                        .get(storage)
+                        .map(|entry| entry._descriptor.as_fd()),
+                })
+                .collect();
+            let Some(client) = self.clients.get_mut(&id) else {
+                continue;
+            };
+            if let Err(error) = client
+                .connection
+                .send(&ServerMessage::Event(event), &descriptors)
+            {
+                tracing::warn!(pid = client.pid, %error, "an event to a storage client failed");
+            }
+        }
+    }
+
+    /// Give the connector every page pool it does not map yet.
+    fn offer_pools(&mut self) {
+        let Some(connector) = self.connector.client else {
+            return;
+        };
+        for listed in self.pages.listing() {
+            if self.connector.offered.insert(listed.pool) {
+                self.events.push((
+                    connector,
+                    Event::Pool {
+                        pool: listed.pool,
+                        shape: listed.shape,
+                        slots: listed.slots,
+                    },
+                    vec![Attachment::Pool(listed.pool)],
+                ));
+            }
+        }
+    }
+
+    /// Hand `task` to the connector; without one, the task fails at once.
+    fn assign(&mut self, task: Task) {
+        let Some(connector) = self.connector.client else {
+            self.fail(task);
+            return;
+        };
+        let id = self.connector.next_task();
+        let event = match &task {
+            Task::Lookup { pool, keys, .. } => Event::Exists {
+                task: id,
+                pool: *pool,
+                keys: keys.clone(),
+            },
+            Task::Upload { pool, pages } => Event::Upload {
+                task: id,
+                pool: *pool,
+                pages: wide(pages),
+            },
+            Task::Download { pool, pages, .. } => Event::Download {
+                task: id,
+                pool: *pool,
+                pages: wide(pages),
+            },
+        };
+        self.connector.tasks.insert(id, task);
+        self.events.push((connector, event, Vec::new()));
+    }
+
+    /// Write pages committed in `pool` to the distributed tier, in tasks of
+    /// at most [`BATCH_PAGES`] pages, holding their slots until each task
+    /// ends.
+    fn upload(&mut self, pool: u64, pages: Vec<(Key, u32)>) {
+        if self.connector.client.is_none() || pages.is_empty() {
+            return;
+        }
+        let Some(entry) = self.pages.get_mut(pool) else {
+            return;
+        };
+        entry.upload(&pages);
+        for chunk in pages.chunks(BATCH_PAGES) {
+            self.assign(Task::Upload {
+                pool,
+                pages: chunk.to_vec(),
+            });
+        }
+    }
+
+    /// `prefetch`: see [`Request::Prefetch`].
+    fn prefetch(
+        &mut self,
+        head: ClientId,
+        pool: u64,
+        keys: &[Key],
+        tag: u64,
+    ) -> Result<(), (ErrorKind, String)> {
+        let entry = pool_of(&mut self.pages, pool)?;
+        let fetches = if self.connector.client.is_some() {
+            entry.prefetch(keys)
+        } else {
+            vec![pages::Fetch::Full; keys.len()]
+        };
+        let pages: Vec<(Key, u32)> = keys
+            .iter()
+            .zip(&fetches)
+            .filter_map(|(key, fetch)| match fetch {
+                pages::Fetch::Reserved(slot) => Some((*key, *slot)),
+                _ => None,
+            })
+            .collect();
+        if pages.is_empty() {
+            let results = keys.iter().map(|key| entry.holds(key)).collect();
+            self.events
+                .push((head, Event::Prefetched { tag, results }, Vec::new()));
+            return Ok(());
+        }
+        self.assign(Task::Download {
+            head,
+            tag,
+            pool,
+            pages,
+            keys: keys.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// The connector reported the results of `task`.
+    fn finished(&mut self, task: u64, results: &[bool]) {
+        let Some(task) = self.connector.tasks.remove(&task) else {
+            return;
+        };
+        self.complete(task, results);
+    }
+
+    /// End `task` as if the connector reported every page failed.
+    fn fail(&mut self, task: Task) {
+        self.complete(task, &[]);
+    }
+
+    /// End `task` with the connector's `results`, one per page of the task;
+    /// a page without a result failed.
+    fn complete(&mut self, task: Task, results: &[bool]) {
+        let succeeded = |index: usize| results.get(index).copied().unwrap_or(false);
+        match task {
+            Task::Lookup {
+                client,
+                request,
+                pool,
+                keys,
+                l2,
+            } => {
+                // A page counts in L3 when the connector found it or L2
+                // holds it by now.
+                let run = self.pages.get(pool).map_or(0, |entry| {
+                    keys.iter()
+                        .enumerate()
+                        .take_while(|(index, key)| succeeded(*index) || entry.holds(key))
+                        .count()
+                });
+                self.answer(
+                    client,
+                    request,
+                    Reply::Lookup {
+                        l2,
+                        l3: l2 + run as u32,
+                    },
+                    &[],
+                );
+                if let Some(entry) = self.clients.get_mut(&client) {
+                    entry.held = false;
+                }
+                self.serve_queue(client);
+            }
+            Task::Upload { pool, pages } => {
+                let failed = (0..pages.len()).filter(|index| !succeeded(*index)).count();
+                if failed > 0 {
+                    tracing::warn!(
+                        pool,
+                        failed,
+                        "pages were not written to the distributed tier"
+                    );
+                }
+                if let Some(entry) = self.pages.get_mut(pool) {
+                    entry.uploaded(&pages);
+                }
+            }
+            Task::Download {
+                head,
+                tag,
+                pool,
+                pages,
+                keys,
+            } => {
+                let Some(entry) = self.pages.get_mut(pool) else {
+                    return;
+                };
+                let arrived: Vec<bool> = (0..pages.len()).map(succeeded).collect();
+                entry.fetched(&pages, &arrived);
+                let results = keys.iter().map(|key| entry.holds(key)).collect();
+                self.events
+                    .push((head, Event::Prefetched { tag, results }, Vec::new()));
+                self.send_events();
+            }
+        }
+    }
+
+    /// The connector's connection closed: its tasks fail, and the next
+    /// connector maps every pool again.
+    fn connector_gone(&mut self) {
+        tracing::warn!("the Mooncake connector disconnected");
+        self.connector.client = None;
+        self.connector.offered.clear();
+        let tasks: Vec<Task> = self.connector.tasks.drain().map(|(_, task)| task).collect();
+        for task in tasks {
+            self.fail(task);
+        }
+        self.pages.connector_gone();
+    }
+
+    /// A page pool request: `page_pool` from a worker, the others from a
+    /// head, for scopes of its deployment.
+    fn pages(
+        &mut self,
+        id: ClientId,
+        request: &Request,
+        role: &Role,
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        let reply = |reply| Ok(Outcome::Reply(reply, Vec::new()));
+        if let (Request::PagePool { shape, numa_node }, Role::Worker { .. }) = (request, role) {
+            let pool = self.pages.pool(*shape, *numa_node).map_err(resource)?;
+            let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
+            self.offer_pools();
+            return Ok(Outcome::Reply(
+                Reply::PagePool {
+                    pool,
+                    slots,
+                    page_bytes: shape.page_bytes,
+                },
+                vec![Attachment::Pool(pool)],
+            ));
+        }
+        let Role::Head { deployment } = role else {
+            return Err(invalid(&format!(
+                "{} is a request of a head",
+                request_name(request)
+            )));
+        };
+        let of_deployment = |scope: &Scope| {
+            if &scope.deployment == deployment {
+                Ok(())
+            } else {
+                Err(invalid(&format!("{scope} is not a scope of {deployment}")))
+            }
+        };
+        match request {
+            Request::Lookup { pool, keys } => {
+                let l2 = pool_of(&mut self.pages, *pool)?.lookup(keys);
+                if self.connector.client.is_none() || l2 as usize >= keys.len() {
+                    // Without a connector, L3 holds nothing beyond L2.
+                    return reply(Reply::Lookup { l2, l3: l2 });
+                }
+                // The connector looks up the pages after the L2 run; the
+                // request waits for it.
+                Ok(Outcome::Connector(Task::Lookup {
+                    client: id,
+                    request: 0,
+                    pool: *pool,
+                    keys: keys[l2 as usize..].to_vec(),
+                    l2,
+                }))
+            }
+            Request::Reserve { pool, writer, keys } => {
+                of_deployment(writer)?;
+                let slots = pool_of(&mut self.pages, *pool)?.reserve(writer, id, keys);
+                reply(Reply::Reserved { slots })
+            }
+            Request::Commit { pool, keys } => {
+                let committed = pool_of(&mut self.pages, *pool)?.commit(keys);
+                self.upload(*pool, committed);
+                reply(Reply::Committed)
+            }
+            Request::Abort { pool, keys } => {
+                pool_of(&mut self.pages, *pool)?.abort(keys);
+                reply(Reply::Aborted)
+            }
+            Request::Pin { pool, reader, keys } => {
+                of_deployment(reader)?;
+                let slots = pool_of(&mut self.pages, *pool)?.pin(reader, id, keys);
+                reply(Reply::Pinned { slots })
+            }
+            Request::Unpin { pool, reader, keys } => {
+                of_deployment(reader)?;
+                pool_of(&mut self.pages, *pool)?.unpin(reader, keys);
+                reply(Reply::Unpinned)
+            }
+            Request::Prefetch { pool, keys, tag } => {
+                self.prefetch(id, *pool, keys, *tag)?;
+                reply(Reply::Prefetching)
+            }
+            _ => Err(invalid(&format!(
+                "{} is not a page request of a head",
+                request_name(request)
+            ))),
+        }
+    }
+}
+
+/// Slots in the protocol's width.
+fn wide(pages: &[(Key, u32)]) -> Vec<(Key, u64)> {
+    pages
+        .iter()
+        .map(|(key, slot)| (*key, u64::from(*slot)))
+        .collect()
 }
 
 /// The record of a retained tensor, naming storage `storage` of a reply.
@@ -1063,7 +1582,31 @@ fn request_name(request: &Request) -> &'static str {
         Request::Release { .. } => "release",
         Request::List => "list",
         Request::Retire { .. } => "retire",
+        Request::PagePool { .. } => "page_pool",
+        Request::Lookup { .. } => "lookup",
+        Request::Reserve { .. } => "reserve",
+        Request::Commit { .. } => "commit",
+        Request::Abort { .. } => "abort",
+        Request::Pin { .. } => "pin",
+        Request::Unpin { .. } => "unpin",
+        Request::Endpoint => "endpoint",
+        Request::Prefetch { .. } => "prefetch",
+        Request::Finished { .. } => "finished",
     }
+}
+
+/// Page pool `pool`, which a head request names.
+fn pool_of(pages: &mut pages::Pools, pool: u64) -> Result<&mut pages::Pool, (ErrorKind, String)> {
+    pages
+        .get_mut(pool)
+        .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))
+}
+
+/// Whether a worker of `scope` is connected.
+fn connected_worker(clients: &BTreeMap<ClientId, Client>, scope: &Scope) -> bool {
+    clients.values().any(
+        |client| matches!(&client.role, Some(Role::Worker { scope: other, .. }) if other == scope),
+    )
 }
 
 /// A fresh claim token.

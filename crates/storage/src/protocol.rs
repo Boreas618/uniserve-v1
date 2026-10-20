@@ -15,11 +15,19 @@
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean.
+//!
+//! Besides tensors, the server keeps host page pools (L2): one memfd of
+//! equal slots per NUMA node and [`PageShape`], shared by every worker
+//! whose pages have that shape. The server indexes committed pages by key
+//! and tracks each slot's state; workers copy pages in and out of the slots
+//! on their own streams, at the head's direction. Behind the pools, the
+//! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
+//! in the distributed tier (L3) and reads them back for prefetches.
 
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -158,6 +166,36 @@ pub struct TensorRecord {
     pub access: Access,
 }
 
+/// What the pages of one page pool are: every worker of a host's NUMA node
+/// whose pages have this shape shares the pool, whatever its deployment,
+/// worker group or engine core, so an identical page is stored once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PageShape {
+    /// The digest of what determines a page's encoding, computed by the
+    /// worker: the model fingerprint, the page encoding version, the cache
+    /// dtype, the block size and the cache group list.
+    pub content: Key,
+    /// The first kv head the pages hold.
+    pub kv_head_offset: u32,
+    /// The number of kv heads the pages hold.
+    pub kv_head_count: u32,
+    /// The bytes of one page.
+    pub page_bytes: u64,
+}
+
+/// What a `reserve` made of one page key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageSlot {
+    /// The slot reserved for the page, which its writer writes and the
+    /// head then commits or aborts.
+    Reserved { slot: u64 },
+    /// The page is committed already, or another writer has it reserved.
+    Present,
+    /// Every slot is reserved or pinned; the page is not stored.
+    Full,
+}
+
 /// How a `get` takes the tensors it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +245,52 @@ pub enum Request {
     /// Release every tensor of `deployment` and forget its claim: the
     /// deployment is no longer served. Refused while its head is connected.
     Retire { deployment: String },
+    /// A worker's page pool for pages of `shape` on `numa_node`: the pool
+    /// of that shape, created when absent, whose memfd travels with the
+    /// reply.
+    PagePool {
+        shape: PageShape,
+        numa_node: Option<u32>,
+    },
+    /// The lengths of the leading runs of `keys` committed in the pool
+    /// (L2), and committed in the pool or in the distributed tier (L3).
+    Lookup { pool: u64, keys: Vec<Key> },
+    /// A slot for each key the pool holds no page of, to be written by the
+    /// worker of `writer`.
+    Reserve {
+        pool: u64,
+        writer: Scope,
+        keys: Vec<Key>,
+    },
+    /// The reserved pages are written: they become readable.
+    Commit { pool: u64, keys: Vec<Key> },
+    /// The reserved pages were not written: their slots become free.
+    Abort { pool: u64, keys: Vec<Key> },
+    /// The slots of the committed pages of `keys`, which stay readable and
+    /// are not evicted until the head unpins them, for the worker of
+    /// `reader` to read; `None` for a key the pool holds no page of.
+    Pin {
+        pool: u64,
+        reader: Scope,
+        keys: Vec<Key>,
+    },
+    /// The worker of `reader` read the pinned pages.
+    Unpin {
+        pool: u64,
+        reader: Scope,
+        keys: Vec<Key>,
+    },
+    /// Where the server accepts connections from other hosts.
+    Endpoint,
+    /// Read the pages of `keys` the pool does not hold from the distributed
+    /// tier into slots reserved for them. Answered at once; the event
+    /// [`Event::Prefetched`] with the same `tag` follows when the reads
+    /// end.
+    Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
+    /// The connector ran task `task` of an [`Event::Exists`],
+    /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
+    /// task.
+    Finished { task: u64, results: Vec<bool> },
 }
 
 /// Why a request failed.
@@ -251,6 +335,33 @@ pub enum Reply {
     Retired {
         released: u64,
     },
+    /// The page pool, whose memfd travels with the reply: `slots` slots of
+    /// `page_bytes` bytes, slot `i` at byte `i * page_bytes`.
+    PagePool {
+        pool: u64,
+        slots: u64,
+        page_bytes: u64,
+    },
+    Lookup {
+        l2: u32,
+        l3: u32,
+    },
+    Reserved {
+        slots: Vec<PageSlot>,
+    },
+    Committed,
+    Aborted,
+    Pinned {
+        slots: Vec<Option<u64>>,
+    },
+    Unpinned,
+    /// The `host:port` other hosts connect to; `None` when the server
+    /// accepts local connections only.
+    Endpoint {
+        tcp: Option<String>,
+    },
+    Prefetching,
+    Finished,
     Error {
         kind: ErrorKind,
         message: String,
@@ -268,6 +379,28 @@ pub struct Listing {
     pub host_bytes: Vec<ScopeBytes>,
     /// The deployments claimed, and whether their head is connected.
     pub deployments: Vec<ListedDeployment>,
+    /// The page pools.
+    pub page_pools: Vec<ListedPool>,
+    /// Whether the Mooncake connector is connected.
+    #[serde(default)]
+    pub connector: bool,
+}
+
+/// One page pool in a [`Listing`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedPool {
+    pub pool: u64,
+    pub shape: PageShape,
+    pub numa_node: Option<u32>,
+    pub slots: u64,
+    /// Slots holding committed pages, pinned ones included.
+    pub ready: u64,
+    pub reserved: u64,
+    pub pinned: u64,
+    /// Slots the connector is reading pages into.
+    pub fetching: u64,
+    /// Committed pages the connector is writing to the distributed tier.
+    pub uploading: u64,
 }
 
 /// One retained tensor in a [`Listing`].
@@ -303,10 +436,41 @@ pub struct ListedDeployment {
     pub head_connected: bool,
 }
 
-/// An asynchronous completion.
+/// A message the server sends outside the answers to requests: the
+/// completion of a head's prefetch, and the connector's work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Event {}
+pub enum Event {
+    /// To a head: the prefetch `tag` ended. `results[i]` is whether the pool
+    /// holds the page of the prefetch's key `i`.
+    Prefetched { tag: u64, results: Vec<bool> },
+    /// To the connector: a page pool, whose memfd travels with the event.
+    Pool {
+        pool: u64,
+        shape: PageShape,
+        slots: u64,
+    },
+    /// To the connector: which pages of `keys` the distributed tier holds.
+    Exists {
+        task: u64,
+        pool: u64,
+        keys: Vec<Key>,
+    },
+    /// To the connector: write the committed pages in these slots to the
+    /// distributed tier.
+    Upload {
+        task: u64,
+        pool: u64,
+        pages: Vec<(Key, u64)>,
+    },
+    /// To the connector: read these pages from the distributed tier into
+    /// their slots.
+    Download {
+        task: u64,
+        pool: u64,
+        pages: Vec<(Key, u64)>,
+    },
+}
 
 /// A message from a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -91,26 +91,37 @@ pub fn serving(socket: &Path) -> bool {
 /// `executable` (`uniserve-storage-server`) in a session of its own, not as
 /// a child of this process, so that this process's end never ends it.
 ///
+/// A server this starts is given `arguments` after its socket, such as
+/// `--tcp` to accept other hosts' heads or its Mooncake connector's
+/// settings (`connector::Settings::arguments`). A server that serves already
+/// keeps the arguments it was started with.
+///
 /// The server's `--daemon` start returns once the server listens or found
 /// another server listening; the wait for a connection is bounded by
 /// `timeout` all the same. Fails when the server cannot be started or does
 /// not serve in time.
-pub fn ensure(executable: &Path, socket: &Path, timeout: Duration) -> io::Result<()> {
+pub fn ensure(
+    executable: &Path,
+    socket: &Path,
+    timeout: Duration,
+    arguments: &[String],
+) -> io::Result<()> {
     if serving(socket) {
         return Ok(());
     }
-    let status = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("serve")
         .arg("--socket")
         .arg(socket)
         .arg("--daemon")
-        .status()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("starting {}: {error}", executable.display()),
-            )
-        })?;
+        .args(arguments);
+    let status = command.status().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("starting {}: {error}", executable.display()),
+        )
+    })?;
     if !status.success() {
         return Err(io::Error::other(format!(
             "{} could not start a storage server on {}: {status}",

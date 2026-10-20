@@ -54,6 +54,13 @@ pub struct WorkerProcessArgs {
     /// The deployment the group belongs to, which its workers' storage
     /// scopes name: the served model name.
     pub deployment: String,
+    /// Whether the head copies the group's cache pages through the host
+    /// page tier (`kv_cache_config.host_tier`).
+    pub page_tier: bool,
+    /// The Mooncake connector a host's Storage Server the deployment starts
+    /// runs (`kv_cache_config.mooncake`), keeping committed pages in the
+    /// distributed tier.
+    pub storage_connector: Option<uniserve_storage::connector::Settings>,
     /// Model identifier or local model path.
     pub model: String,
     /// Ordered physical members of this worker group.
