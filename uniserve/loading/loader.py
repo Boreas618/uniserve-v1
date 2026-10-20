@@ -20,6 +20,8 @@ from uniserve.nn.attention import AttentionParallelConfig
 from . import checkpoint as checkpoint_module
 from . import weights as weight_options
 from .config import Config
+from .layout import ExpertKernels, finalize
+from .retained import Retained
 
 ConfigT = TypeVar("ConfigT")
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -106,18 +108,22 @@ def load_weights(
     weights: weight_options.Config = weight_options.Config(),
     io: Config = Config(),
     devices: Mapping[str, torch.device | str] | None = None,
+    expert_kernels: ExpertKernels = "local",
 ) -> tuple[weight_options.Report, ...]:
     """Load an existing module via the construction-time assignment path.
 
     The same assignment and conversion path applies as in construction.
     Complete-source matrix assignments follow already bound mathematical
     partitions. Readers retire before return; Parameters retain their storage
-    and shared identities independently of checkpoint file handles.
+    and shared identities independently of checkpoint file handles. Encoded
+    weights end in the layout of the kernels that read them
+    (``uniserve.loading.layout``; ``expert_kernels`` names those of the
+    routed experts).
     """
     known_paths = frozenset(
         path for path, _ in model.named_modules(remove_duplicate=False)
     )
-    return _load(
+    reports = _load(
         model,
         checkpoint,
         mapping(model),
@@ -127,6 +133,8 @@ def load_weights(
         devices=devices,
         known_paths=known_paths,
     )
+    finalize(model, experts=expert_kernels)
+    return reports
 
 
 def load_model(
@@ -144,6 +152,8 @@ def load_model(
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
     experts: Communicator | None = None,
+    expert_kernels: ExpertKernels = "local",
+    retained: Retained | None = None,
 ) -> Result[ModelT]:
     """Construct on meta, bind partitions, then materialize selected modules.
 
@@ -156,7 +166,14 @@ def load_model(
     ``exclude_modules`` leaves named subtrees on meta even when their
     ancestors are selected, as when attention ranks borrow remote experts.
     These subtrees also retain their own mathematical partition instead of
-    inheriting a selected ancestor's mesh.
+    inheriting a selected ancestor's mesh. Encoded weights end in the layout
+    of the kernels that read them (``uniserve.loading.layout``);
+    ``expert_kernels`` names those of the routed experts.
+
+    With ``retained``, the selected modules take the tensors a worker
+    published when it last loaded this model on this placement
+    (``uniserve.loading.retained``) instead of reading the checkpoint; they
+    are already in their final layout, and the reports are empty.
     """
     with torch.device("meta"):
         model = model_class(config)
@@ -213,7 +230,27 @@ def load_model(
     if experts is not None:
         partition_experts(model, experts)
 
+    # Declaring the mappings may also prune the model to the modules a
+    # pipeline stage holds, so it precedes installing retained tensors too.
     declared = mapping(model)
+    if retained is not None:
+        # Indexing the weight settings applies their module-level choices,
+        # such as each projection's activation quantizer, as loading does.
+        weight_options._Loader(
+            model,
+            checkpoint,
+            (),
+            device=device,
+            weights=weights,
+            io=io,
+            devices=devices,
+            selected=selected,
+            known_paths=known_paths,
+        ).close()
+        retained.install(model, selected)
+        model.eval()
+        return Result(model, checkpoint, ())
+
     parameters = {
         id(parameter)
         for child in model.modules()
@@ -271,5 +308,6 @@ def load_model(
         selected=selected,
         known_paths=known_paths,
     )
+    finalize(model, experts=expert_kernels)
     model.eval()
     return Result(model, checkpoint, reports)

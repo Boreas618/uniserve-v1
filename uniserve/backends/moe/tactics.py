@@ -360,6 +360,7 @@ def measure(provider, module, tokens: int, args, generator) -> dict:
 
 def main(argv: Sequence[str] | None = None) -> None:
     from uniserve.backends import moe
+    from uniserve.loading.layout import place
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--provider", required=True)
@@ -380,6 +381,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     with torch.inference_mode():
         module = _experts(args, device, generator)
         provider = moe.resolve(args.provider, module=module, device=device)
+        # The experts take the layout the provider reads, as loading
+        # stores them.
+        place(module, provider.weight_layout(module))
         key = dict(
             zip(KEY_FIELDS, table_key(provider.name, module), strict=True)
         )

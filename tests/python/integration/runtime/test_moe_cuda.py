@@ -3,7 +3,9 @@
 Every value is positive where a test bounds relative error, so each rounding
 step bounds the relative error of every output independently of
 cancellation. BF16 cases run on every native BF16 provider, NVFP4 cases on
-every native NVFP4 provider.
+every native NVFP4 provider. Encoded expert weights are stored in the layout
+of the provider that serves them before it is prepared, as loading stores
+them (``uniserve.loading.layout``).
 """
 
 import pytest
@@ -14,6 +16,7 @@ from uniserve import cuda_graph
 from uniserve.backends import moe as moe_backends
 from uniserve.bindings.context import ExecutionContext
 from uniserve.bindings.workspace import TensorBuffers
+from uniserve.loading.layout import place
 from uniserve.models import TextSize
 from uniserve.nn import functional
 from uniserve.nn.moe import FusedMoE
@@ -65,10 +68,18 @@ def _reference(hidden, up_gate, down, ids, weights, activation):
     return result
 
 
+def _placed(module, provider="auto"):
+    """``module`` with its expert weights in the layout ``provider`` reads."""
+    backend = moe_backends.resolve(provider, module=module, device=DEVICE)
+    place(module, backend.weight_layout(module))
+    return module
+
+
 def _replay_matches(
     module, hidden, ids, weights, expected, *, rtol, provider="auto"
 ):
     """Evaluate eagerly, then replay a capture over rewritten routing."""
+    _placed(module, provider)
     stream = torch.cuda.Stream(device=DEVICE)
     stream.wait_stream(torch.cuda.current_stream(DEVICE))
     generator = torch.Generator().manual_seed(47)
@@ -416,7 +427,11 @@ def test_nvfp4_experts_apply_per_expert_scales_and_static_activations(
 def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights(
     provider,
 ):
-    """A kernel's physical placement changes neither values nor footprint."""
+    """A kernel's physical layout changes neither values nor footprint.
+
+    Placing the weights replaces each projection's encoding, and preparing
+    the provider keeps no copy of them.
+    """
     module, _ = _exact_nvfp4(
         "gelu_pytorch_tanh", torch.Generator().manual_seed(53)
     )
@@ -435,6 +450,12 @@ def test_preparing_nvfp4_experts_keeps_one_copy_of_the_logical_weights(
     )
     torch.cuda.synchronize(DEVICE)
     resident = torch.cuda.memory_allocated(DEVICE)
+
+    _placed(module, provider)
+    torch.cuda.synchronize(DEVICE)
+    assert torch.cuda.memory_allocated(DEVICE) - resident < smallest
+    for name, value in logical.items():
+        assert torch.equal(getattr(module, name).weight.dequantize(), value)
 
     with ExecutionContext(module, moe=provider) as context:
         context.prepare(TextSize(TOKENS, 1))
@@ -520,7 +541,7 @@ def test_nvfp4_gating_applies_the_declared_nonlinearity(activation, provider):
         ),
     )
 
-    with ExecutionContext(module, moe=provider) as context:
+    with ExecutionContext(_placed(module, provider), moe=provider) as context:
         context.prepare(TextSize(tokens, 1))
         with context.activate():
             actual = module(hidden, ids, weights)
@@ -551,6 +572,7 @@ def test_nvfp4_experts_read_hidden_states_stored_in_their_input_encoding(
 
     stream = torch.cuda.Stream(device=DEVICE)
     stream.wait_stream(torch.cuda.current_stream(DEVICE))
+    _placed(module, provider)
     with (
         ExecutionContext(module, stream=stream, moe=provider) as context,
     ):
@@ -587,6 +609,7 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
     top_k = EXPERTS
     generator = torch.Generator().manual_seed(61)
     module, hidden = _exact_nvfp4("gelu_pytorch_tanh", generator, top_k=top_k)
+    _placed(module, provider)
     ids, weights = _routes(generator, top_k=top_k)
     expected = _reference(
         hidden,
@@ -627,10 +650,10 @@ def test_nvfp4_calls_of_the_same_inputs_repeat_bit_for_bit(provider):
 def test_nvfp4_providers_reject_weights_placed_for_another_kernel(
     placed, selected
 ):
-    """A provider never rearranges weights another provider has placed."""
+    """A provider does not serve weights stored for another provider."""
     module, hidden = _exact_nvfp4("silu", torch.Generator().manual_seed(67))
     ids, weights = _routes(torch.Generator().manual_seed(71))
-    with ExecutionContext(module, moe=placed) as context:
+    with ExecutionContext(_placed(module, placed), moe=placed) as context:
         context.prepare(TextSize(TOKENS, 1))
         with context.activate():
             before = module(hidden, ids, weights)
@@ -746,5 +769,5 @@ def test_native_experts_prepare_after_the_portable_reference_is_loaded():
     resolve("auto", module=reference, device=torch.device("cpu"))
 
     module, _ = _exact_nvfp4("silu", torch.Generator().manual_seed(61))
-    with ExecutionContext(module) as context:
+    with ExecutionContext(_placed(module)) as context:
         context.prepare(TextSize(TOKENS, 1))

@@ -11,8 +11,11 @@ from importlib import import_module
 
 import torch as torch_lib
 
-from uniserve.quantization import QuantizedTensor, Quantizer
+from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
 from uniserve.tensors import BufferConfig, _join_channels
+
+# Encodings whose weights carry block scales in a provider-declared layout.
+_BLOCK_SCALED = frozenset(("mxfp8", "nvfp4"))
 
 
 class Operator:
@@ -256,10 +259,37 @@ def _fused_weight(weights, scale):
 
 
 class Backend:
-    """A provider factory; each prepare call creates an independent operator."""
+    """A provider factory; each prepare call creates an independent operator.
+
+    ``scale_layout`` declares the layout this provider's kernels read the
+    block scales of an MXFP8 or NVFP4 weight in. Loading stores every such
+    weight in the declared layout of the provider serving it
+    (``uniserve.loading.layout``); preparation verifies it and never
+    rearranges a weight.
+    """
 
     name: str
     operator_class: type[Operator]
+    scale_layout: ScaleLayout = ScaleLayout.LINEAR
+
+    def verify(self, weight: torch_lib.Tensor) -> None:
+        """Reject a block-scaled weight stored in another scale layout.
+
+        Raises:
+            ValueError: ``weight`` is an MXFP8 or NVFP4 tensor whose block
+                scales are not in :attr:`scale_layout`.
+        """
+        if (
+            isinstance(weight, QuantizedTensor)
+            and weight.quantizer.format in _BLOCK_SCALED
+            and weight.scale_layout is not self.scale_layout
+        ):
+            raise ValueError(
+                f"the {self.name} matmul reads {weight.quantizer.format} "
+                f"weight scales in the {self.scale_layout.value} layout, not "
+                f"{weight.scale_layout.value}; loading stores weights in the "
+                "layout of the provider that serves them"
+            )
 
     def workspace_buffers(
         self,
@@ -297,6 +327,7 @@ class Backend:
         output_dtype: torch_lib.dtype,
         workspace: Mapping[str, torch_lib.Tensor],
     ) -> Operator:
+        self.verify(weight)
         return self.operator_class(
             weight,
             input_dtype=input_dtype,

@@ -711,7 +711,12 @@ impl Server {
             )));
         }
         for tensor in tensors {
-            if self.tensors.contains_key(&tensor.key) {
+            // A key is a content address: a read-only tensor already
+            // retained holds these very bytes, and the put only adds the
+            // caller's scope to it. Exclusive tensors are created once.
+            if let Some(existing) = self.tensors.get(&tensor.key)
+                && (existing.access, tensor.access) != (Access::ReadOnly, Access::ReadOnly)
+            {
                 return Err(invalid(&format!("{} is already retained", tensor.name)));
             }
             if tensor.storage as usize >= storages.len() {
@@ -739,6 +744,10 @@ impl Server {
             })
             .collect();
         for tensor in tensors {
+            if let Some(existing) = self.tensors.get_mut(&tensor.key) {
+                existing.scopes.insert(holder.scope.clone());
+                continue;
+            }
             let storage = ids[tensor.storage as usize];
             if let Some(entry) = self.storages.get_mut(&storage) {
                 entry.tensors += 1;

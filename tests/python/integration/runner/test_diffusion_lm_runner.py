@@ -142,7 +142,10 @@ class _Session:
         self._prefill()
 
         loaded = Loaded(
-            module=self.model, description=None, attention=setup.attention
+            module=self.model,
+            description=None,
+            root=self.model,
+            attention=setup.attention,
         )
         self.loaded = loaded
         self.buffers = self._buffers(sampling)

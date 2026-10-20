@@ -38,6 +38,8 @@ from uniserve import loading
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
+from uniserve.loading.layout import ExpertKernels
+from uniserve.loading.retained import Retained
 from uniserve.loading.tokenizer import read_vocabulary, token_id
 from uniserve.models import ComponentEntry
 from uniserve.nn.attention import AttentionParallelConfig
@@ -1021,6 +1023,8 @@ def load_model(
     modules: frozenset[str] | None = None,
     exclude_modules: frozenset[str] = frozenset(),
     experts: Communicator | None = None,
+    expert_kernels: ExpertKernels = "local",
+    retained: Retained | None = None,
 ) -> loading.Result[ModelT]:
     """Materialize the selected capability modules through the common loader.
 
@@ -1079,4 +1083,6 @@ def load_model(
         modules=selected,
         exclude_modules=excluded,
         experts=experts,
+        expert_kernels=expert_kernels,
+        retained=retained,
     )

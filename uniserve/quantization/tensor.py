@@ -22,7 +22,15 @@ class ScaleLayout(Enum):
     """
 
     LINEAR = "linear"
+    # 128x4 tiles of 512 bytes, each storing (row % 32, row % 128 // 32,
+    # column % 4); tiles follow the rows' 128-row blocks, then the columns'
+    # 4-column blocks. Rows pad to a multiple of 128 and columns to 4.
     SWIZZLED_128X4 = "128x4"
+    # The same 128x4 tiles, with each matrix of a stacked [E, rows, K]
+    # tensor stored in turn and its tiles following the 4-column blocks,
+    # then the 128-row blocks: the MN-major order DeepGEMM's grouped
+    # kernels load scales in. Each matrix's rows are a multiple of 128.
+    SWIZZLED_128X4_MN = "128x4-mn"
 
 
 class RowOrder(Enum):
@@ -236,7 +244,10 @@ class QuantizedTensor(torch.Tensor):
         name = "block_scale" if self.quantizer.format == "nvfp4" else "scale"
         rows = prod(self.shape[:-1])
         columns = self.shape[-1] // (16 if name == "block_scale" else 32)
-        linear = _linear_scales(fields[name], rows, columns, self.scale_layout)
+        matrices = prod(self.shape[:-2])
+        linear = _linear_scales(
+            fields[name], rows, columns, self.scale_layout, matrices
+        )
 
         if row_order is not self.row_order:
             if self.quantizer.format == "fp8" or len(self.shape) != 3:
@@ -257,11 +268,7 @@ class QuantizedTensor(torch.Tensor):
                 .reshape(rows, columns)
             )
 
-        fields[name] = (
-            _swizzle_scales(linear)
-            if scale_layout is ScaleLayout.SWIZZLED_128X4
-            else linear.contiguous()
-        )
+        fields[name] = _stored_scales(linear, scale_layout, matrices)
         result = self.quantizer.from_tensors(
             fields,
             shape=tuple(self.shape),
@@ -448,7 +455,11 @@ class _MXFP8Tensor(QuantizedTensor):
     def _decode(self):
         rows, width = prod(self.shape[:-1]), self.shape[-1]
         scales = _linear_scales(
-            self._buffers["scale"], rows, width // 32, self.scale_layout
+            self._buffers["scale"],
+            rows,
+            width // 32,
+            self.scale_layout,
+            prod(self.shape[:-2]),
         )
         scales = scales.view(torch.float8_e8m0fnu).float()
         # [rows, width // 32, 32] blocks, one E8M0 exponent per block
@@ -468,7 +479,11 @@ class _NVFP4Tensor(QuantizedTensor):
         )
         values = magnitudes[codes & 7] * torch.where(codes < 8, 1, -1)
         scales = _linear_scales(
-            self._buffers["block_scale"], rows, width // 16, self.scale_layout
+            self._buffers["block_scale"],
+            rows,
+            width // 16,
+            self.scale_layout,
+            prod(self.shape[:-2]),
         )
         # One tensor scale, or one per leading expert of a stacked tensor.
         tensor_scale = self._buffers["tensor_scale"]
@@ -482,20 +497,55 @@ class _NVFP4Tensor(QuantizedTensor):
         ).reshape(self.shape)
 
 
-def _linear_scales(scales, rows, columns, layout):
-    """Restore the [rows, columns] block-scale matrix.
+def _linear_scales(scales, rows, columns, layout, matrices=1):
+    """Restore the [rows, columns] block-scale matrix from its storage.
 
-    From its storage layout.
+    ``rows`` counts the rows of all ``matrices`` stacked matrices; only the
+    MN-major layout stores each matrix apart.
     """
     if layout is ScaleLayout.LINEAR:
         return scales.reshape(rows, columns)
-    padded_rows = (rows + 127) // 128 * 128
     padded_columns = (columns + 3) // 4 * 4
+    if layout is ScaleLayout.SWIZZLED_128X4_MN:
+        # Stored as (matrix, column block, row block, row % 32,
+        # row % 128 // 32, column % 4).
+        blocks = rows // matrices // 128
+        return (
+            scales.reshape(matrices, padded_columns // 4, blocks, 32, 4, 4)
+            .permute(0, 2, 4, 3, 1, 5)
+            .reshape(rows, padded_columns)[:, :columns]
+        )
+    padded_rows = (rows + 127) // 128 * 128
     # Each 128x4 tile stores (row % 32, row // 32, column % 4).
     return (
         scales.reshape(padded_rows // 128, padded_columns // 4, 32, 4, 4)
         .permute(0, 3, 2, 1, 4)
         .reshape(padded_rows, padded_columns)[:rows, :columns]
+    )
+
+
+def _stored_scales(scales, layout, matrices=1):
+    """Store a [rows, columns] block-scale matrix in ``layout``.
+
+    ``scales`` stacks the rows of ``matrices`` matrices; the result is new
+    contiguous storage (flat for the swizzled layouts).
+    """
+    if layout is ScaleLayout.LINEAR:
+        return scales.contiguous()
+    if layout is ScaleLayout.SWIZZLED_128X4:
+        return _swizzle_scales(scales)
+    rows, columns = scales.shape
+    padded_columns = (columns + 3) // 4 * 4
+    padded = torch.zeros(
+        (rows, padded_columns), dtype=scales.dtype, device=scales.device
+    )
+    padded[:, :columns].copy_(scales)
+    blocks = rows // matrices // 128
+    return (
+        padded.reshape(matrices, blocks, 4, 32, padded_columns // 4, 4)
+        .permute(0, 4, 1, 3, 2, 5)
+        .contiguous()
+        .reshape(-1)
     )
 
 

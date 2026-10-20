@@ -6,8 +6,9 @@ checkpoint's representation, the post-feed-forward sandwich normalization
 of the experts' routes (``FusedMoE(..., combine=False)``) equals, bit for
 bit, the normalization of their combined output, eager and replayed, so
 evaluating the combination inside the sandwich launch changes no stream
-value. Each provider prepares a freshly loaded block, since preparation
-places the weights in the provider's physical row order.
+value. Each provider prepares a freshly loaded block whose experts are
+stored in the layout that provider reads, as loading stores them for the
+provider that serves them (``uniserve.loading.layout``).
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4).
@@ -16,6 +17,7 @@ The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 from __future__ import annotations
 
 import os
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ import torch
 from uniserve import cuda_graph
 from uniserve.backends import moe as backends
 from uniserve.bindings.context import ExecutionContext
+from uniserve.loading.layout import place
 from uniserve.models import TextSize
 from uniserve.models import registry as models
 from uniserve.nn.functional import sandwich_rms_norm
@@ -55,25 +58,26 @@ def _moe_block(precision: str):
     return models.load_model(config, device=DEVICE).model.get_submodule(BLOCK)
 
 
-def _providers(experts):
-    """Every native provider that serves the experts' representation."""
-    served = []
-    for name in ("cutlass", "cutedsl", "trtllm"):
-        try:
-            backends.resolve(name, module=experts, device=DEVICE)
-        except ValueError:
-            continue
-        served.append(name)
-    return served
+def _served(experts, provider):
+    """Store ``experts`` in ``provider``'s layout; whether it serves them."""
+    backend = import_module(f"{backends.__name__}.{provider}").Backend()
+    try:
+        place(experts, backend.weight_layout(experts))
+    except ValueError:
+        return False
+    return backend.unsupported(experts) is None
 
 
 @pytest.mark.parametrize("precision", sorted(CHECKPOINTS))
 @torch.inference_mode()
 def test_sandwich_of_expert_routes_equals_sandwich_of_their_sum(precision):
-    providers = _providers(_moe_block(precision).experts)
-    assert providers, "no native expert provider serves the checkpoint"
-    for provider in providers:
-        _check_provider(_moe_block(precision), provider)
+    served = 0
+    for provider in ("cutlass", "cutedsl", "trtllm"):
+        block = _moe_block(precision)
+        if _served(block.experts, provider):
+            _check_provider(block, provider)
+            served += 1
+    assert served, "no native expert provider serves the checkpoint"
 
 
 def _check_provider(block, provider):

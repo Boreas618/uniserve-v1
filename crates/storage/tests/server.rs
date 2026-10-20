@@ -207,6 +207,62 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
 }
 
 #[test]
+fn putting_a_retained_read_only_key_again_keeps_the_retained_bytes_for_both_scopes() {
+    let server = Running::start();
+    let claim = head(&server.socket)
+        .claim(vec![scope("text", 0), scope("text", 1)])
+        .unwrap();
+    let mut first = worker(&server.socket, scope("text", 0), 1, claim);
+    let storage = memfd(b"abcd");
+    first
+        .put(
+            vec![tensor(key(4), "weight", 0, 0, Access::ReadOnly)],
+            &[(host(4), storage.as_fd())],
+        )
+        .unwrap();
+
+    // A key names its content: a second publisher of the same key adds its
+    // scope, and the server keeps the bytes it retains.
+    let mut second = worker(&server.socket, scope("text", 1), 1, claim);
+    let copy = memfd(b"abcd");
+    second
+        .put(
+            vec![tensor(key(4), "weight", 0, 0, Access::ReadOnly)],
+            &[(host(4), copy.as_fd())],
+        )
+        .unwrap();
+    let listing = second.list().unwrap();
+    assert_eq!(listing.tensors.len(), 1);
+    assert_eq!(
+        listing.tensors[0].scopes,
+        vec![scope("text", 0), scope("text", 1)]
+    );
+    assert_eq!(
+        listing
+            .host_bytes
+            .iter()
+            .map(|entry| entry.bytes)
+            .sum::<u64>(),
+        8
+    );
+
+    // Exclusive tensors are created once.
+    second
+        .put(
+            vec![tensor(key(5), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), copy.as_fd())],
+        )
+        .unwrap();
+    assert_eq!(
+        server_error(first.put(
+            vec![tensor(key(5), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), storage.as_fd())],
+        )),
+        ErrorKind::Invalid
+    );
+}
+
+#[test]
 fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     let server = Running::start();
     let claim = head(&server.socket).claim(vec![scope("flow", 0)]).unwrap();

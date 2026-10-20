@@ -548,6 +548,11 @@ class Backend(_Backend):
             return _NVFP4Backend().unsupported(module)
         return _bf16_unsupported(module)
 
+    def weight_layout(self, module):
+        if _nvfp4(module):
+            return _NVFP4Backend().weight_layout(module)
+        return {}
+
     def prepare(self, *, module, size, workspace) -> Operator:
         if _nvfp4(module):
             return _NVFP4Backend().prepare(

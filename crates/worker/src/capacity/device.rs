@@ -11,8 +11,11 @@
 //!
 //! NVML attributes memory held only through descriptors to no process, so
 //! the storages the worker's scope keeps at the host's Storage Server count
-//! as the worker's own on top of NVML's figure. Other scopes' retained
-//! memory is used memory the device no longer reports free.
+//! as the worker's own on top of NVML's figure: its weights and the
+//! exclusive storages it took. Exclusive storages a predecessor left that
+//! the worker has not taken yet are about to be reused or released by its
+//! owners, so they count as free. Other scopes' retained memory is used
+//! memory the device no longer reports free.
 
 use std::sync::Arc;
 
@@ -38,7 +41,8 @@ pub(crate) struct DeviceBudget {
 pub(crate) struct Budget {
     /// Bytes the rank may still allocate on the device.
     pub available: u64,
-    /// Bytes the device reports free.
+    /// Bytes the device reports free, with the scope's reclaimable
+    /// retained bytes.
     pub free: u64,
     /// Bytes the process holds.
     pub process: u64,
@@ -78,16 +82,18 @@ impl DeviceBudget {
                 )),
                 error => Error::Cuda(error),
             })?;
-        Ok(process + self.retained.scope_bytes(device)?)
+        Ok(process + self.retained.scope_bytes(device)?.held)
     }
 
     /// The storage grant on `device` for a rank allowed `fraction` of it.
     pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
         let process = self.process_bytes(device)?;
+        let reclaimable = self.retained.scope_bytes(device)?.reclaimable;
         let memory = device.memory_info()?;
+        let free = memory.free + reclaimable;
         Ok(Budget {
-            available: grant(memory.total, fraction, process, memory.free),
-            free: memory.free,
+            available: grant(memory.total, fraction, process, free),
+            free,
             process,
             total: memory.total,
         })

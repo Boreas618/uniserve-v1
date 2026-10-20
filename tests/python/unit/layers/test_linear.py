@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.distributed import DeviceMesh, parallelize_
+from uniserve.loading.layout import finalize
 from uniserve.nn.functional import Rounding
 from uniserve.nn.linear import (
     ColumnParallelLinear,
@@ -72,6 +73,8 @@ def test_encoded_projection_chunks_preserve_the_source_scale_domain(quantizer):
         layer.weight = nn.Parameter(
             quantizer.quantize(layer.weight), requires_grad=False
         )
+        # The block GEMM reads the weight's scales as loading stores them.
+        finalize(layer)
     layer.input_quantizer = quantizer
     expected = layer(encoded)
 
@@ -114,6 +117,8 @@ def test_calibrated_nvfp4_projection_chunks_match_complete_input():
     layer.weight = nn.Parameter(
         quantizer.quantize(layer.weight), requires_grad=False
     )
+    # The block GEMM reads the weight's scales as loading stores them.
+    finalize(layer)
     layer.input_quantizer = quantizer
     source = torch.randn(257, 32, device="cuda", dtype=torch.bfloat16)
     expected = layer(source)

@@ -166,12 +166,33 @@ fn serve(socket: &Path, ready: Option<OwnedFd>) -> anyhow::Result<()> {
         signal(ready);
         return Ok(());
     };
+    raise_descriptor_limit()?;
     let (wake, stop) = stop_signals()?;
     let mut server = Server::new(listener)?;
     tracing::info!(socket = %socket.display(), "storage server listening");
     signal(ready);
     server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))?;
     tracing::info!("storage server stopped");
+    Ok(())
+}
+
+/// Raise the soft limit on open descriptors to the hard limit: the server
+/// holds one descriptor per retained storage of every worker on the host,
+/// thousands for a large model.
+fn raise_descriptor_limit() -> anyhow::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the descriptor limit");
+    }
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: setrlimit reads the struct it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("raising the descriptor limit");
+    }
     Ok(())
 }
 

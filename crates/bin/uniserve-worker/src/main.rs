@@ -82,9 +82,36 @@ fn main() {
     unsafe { libc::_exit(status) }
 }
 
+/// Raise the soft limit on open descriptors to the hard limit: a worker
+/// holds the descriptor of every retained storage it maps, one per large
+/// weight of its model.
+fn raise_descriptor_limit() -> Result<(), String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(format!(
+            "reading the descriptor limit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: setrlimit reads the struct it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(format!(
+            "raising the descriptor limit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// Load the environment's runtime and run the worker; returns its exit
 /// status, or why it could not start.
 fn run() -> Result<c_int, String> {
+    raise_descriptor_limit()?;
     let python = environment_interpreter()?;
     let [libpython, libtvm_ffi, library] = locate(&python)?;
     if libpython.as_os_str().is_empty() {

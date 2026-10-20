@@ -53,19 +53,18 @@ class _FlashInferOperator(_Operator):
         # dependent launch: the GEMM's thread blocks may start while the
         # kernel before it on the stream still runs, and its epilogue reads
         # alpha from device memory as each block starts, before waiting for
-        # that kernel. Alpha is therefore computed before the operands are
+        # that kernel. Alpha is therefore computed before the input is
         # repacked. CUTLASS serves only linear input scales, so their swizzle
         # kernels always run between the alpha write and the GEMM, which
-        # cannot start before the alpha write has completed.
+        # cannot start before the alpha write has completed. The weight's
+        # scales are stored swizzled (``Backend.scale_layout``).
         alpha = (
             x.buffers()["tensor_scale"] * self.weight.buffers()["tensor_scale"]
             if format == "nvfp4"
             else None
         )
         left = x.repack(scale_layout=ScaleLayout.SWIZZLED_128X4).buffers()
-        right = self.weight.repack(
-            scale_layout=ScaleLayout.SWIZZLED_128X4
-        ).buffers()
+        right = self.weight.buffers()
         if format == "mxfp8":
             flashinfer.mm_mxfp8(
                 left["values"],
@@ -120,6 +119,7 @@ class Backend(_GroupedBackend):
 
     name = "flashinfer"
     operator_class = _FlashInferOperator
+    scale_layout = ScaleLayout.SWIZZLED_128X4
 
     def merged_workspace_buffers(
         self,

@@ -224,6 +224,19 @@ impl Storage {
         }
     }
 
+    /// Change the access of every device mapping the storage has, in place
+    /// at an unchanged address: retained weights are downgraded to
+    /// read-only once published, so any write through them faults.
+    pub(crate) fn protect(&self, protection: Protection) -> Result<()> {
+        match &self.kind {
+            Kind::Device(allocation) => Ok(allocation.protect(protection)?),
+            Kind::Mapped { mapping, .. } => Ok(mapping.protect(protection)?),
+            Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
+                "only device memory changes its protection".into(),
+            )),
+        }
+    }
+
     /// The device allocation, `None` for host memory and mappings.
     pub(crate) fn allocation(&self) -> Option<&DeviceAllocation> {
         match &self.kind {

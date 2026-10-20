@@ -9,7 +9,9 @@ reached by import path with explicit arguments:
    returned :class:`Description`, one scalar or flat list per method.
 2. :func:`load_model` narrows the checkpoint to this rank's modules and the
    launch's weight choices and materializes them on the meshes the rank
-   created.
+   created, or binds the tensors the rank retained when it last loaded the
+   same model on the same placement (:func:`fingerprint`,
+   ``uniserve.loading.retained``).
 
 The objects returned here are opaque to the rank and passed back unchanged.
 What the rank reports of a loaded model it reads from the functions below
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,6 +35,8 @@ from torch import nn
 from uniserve import loading as library
 from uniserve.distributed import Communicator, communication_axes
 from uniserve.errors import SetupError
+from uniserve.loading import retained as retention
+from uniserve.loading.layout import ExpertKernels
 from uniserve.loading.precision import weight_config
 from uniserve.models import (
     CausalLM,
@@ -156,10 +161,16 @@ class Resolved:
 
 @dataclass
 class Loaded:
-    """A rank's loaded model and what serving needs from it."""
+    """A rank's loaded model and what serving needs from it.
+
+    ``module`` is what the rank calls: the model, or a dedicated expert
+    rank's routed expert layers. ``root`` is the whole loaded model, whose
+    tensors the rank retains under their paths in it.
+    """
 
     module: nn.Module
     description: Description
+    root: nn.Module
     calls: dict[str, tuple[Call, ...]] = field(default_factory=dict)
     attention: Any = None
     attention_backend: str = "auto"
@@ -320,6 +331,46 @@ def _resolve(
     return Resolved(replace(source, weights=weights), description)
 
 
+def _expert_kernels(
+    exchange: str | None, attention_ranks: int
+) -> ExpertKernels:
+    """Which kernels read the routed experts of a launch.
+
+    A ``megamoe`` exchange runs them in the fused MegaMoE kernel, or in
+    split MegaMoE's expert kernels when experts have ranks of their own;
+    every other launch runs them in the provider ``auto`` resolves.
+    """
+    if exchange != "megamoe":
+        return "local"
+    return "split" if attention_ranks else "megamoe"
+
+
+def fingerprint(
+    description: Description,
+    modules: Sequence[str],
+    exclude_modules: Sequence[str],
+    quantization: str,
+    model_dtype: str,
+    expert_exchange: str | None,
+    attention_ranks: int,
+) -> str:
+    """The digest of what determines this rank's loaded weights.
+
+    Placement and GPUs aside (``uniserve.loading.retained.fingerprint``);
+    the arguments are those of :func:`load_model`. Empty for the stub
+    model, whose weights are not retained.
+    """
+    resolved = _resolve(
+        description, modules, exclude_modules, quantization, model_dtype
+    )
+    if isinstance(resolved, Description):
+        return ""
+    kernels = _expert_kernels(_text(expert_exchange), int(attention_ranks))
+    return retention.fingerprint(
+        resolved.source, description.io, str(model_dtype), kernels
+    )
+
+
 def load_model(
     description: Description,
     modules: Sequence[str],
@@ -341,6 +392,8 @@ def load_model(
     expert_world: Any,
     attention_ranks: int,
     expert_dedicated: bool,
+    expert_exchange: str | None,
+    retained: retention.Retained | None,
     attention_backend: str,
     workspace_size: int,
     decode_backend: str,
@@ -379,6 +432,12 @@ def load_model(
             communicator; ``None`` without an expert union.
         attention_ranks: Attention ranks of a disaggregated union.
         expert_dedicated: This rank holds only routed experts.
+        expert_exchange: The expert union's exchange transport, which
+            selects the kernels its routed experts are laid out for;
+            ``None`` without an expert union.
+        retained: The tensors this rank retained when it last loaded this
+            model on this placement, which it binds instead of reading the
+            checkpoint; ``None`` loads.
         attention_backend: The attention backend's name.
         workspace_size, decode_backend, prefill_backend, disable_split_kv,
         decode_split_tile_size, prefill_split_tile_size, use_tensor_core:
@@ -438,6 +497,7 @@ def load_model(
         loaded = Loaded(
             module,
             description,
+            module,
             image_processor=image_processor(),
             attention_backend="torch",
         )
@@ -453,6 +513,7 @@ def load_model(
         loaded = Loaded(
             description.model,
             description,
+            description.model,
             attention_backend=backend,
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
@@ -463,6 +524,7 @@ def load_model(
         partition = _expert_partition(
             expert_world, int(attention_ranks), bool(expert_dedicated)
         )
+        started = time.perf_counter()
         result = registry.load_model(
             source,
             device=device,
@@ -470,6 +532,10 @@ def load_model(
             attention=attention,
             devices=_devices(description.model, generation),
             experts=partition,
+            expert_kernels=_expert_kernels(
+                _text(expert_exchange), int(attention_ranks)
+            ),
+            retained=retained,
         )
         module = result.model
         if dedicated:
@@ -480,10 +546,16 @@ def load_model(
                 for child in module.modules()
                 if isinstance(child, FusedMoE)
             )
-        logger.info("loaded numerical model %s", type(module).__qualname__)
+        logger.info(
+            "%s numerical model %s in %.1f s",
+            "loaded" if retained is None else "bound retained",
+            type(module).__qualname__,
+            time.perf_counter() - started,
+        )
         loaded = Loaded(
             module,
             description,
+            result.model,
             attention_backend=backend,
             image_processor=source.image_processor,
             flow_prompt=source.flow_prompt,
