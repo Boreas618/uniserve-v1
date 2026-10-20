@@ -12,6 +12,7 @@ use uniserve_cuda::{DeviceId, Stream, memset_d8};
 
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::storage::memory::{Storage, StorageView};
+use crate::storage::retained::{ExclusiveMemory, ExclusiveSpec};
 use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
 use crate::{Error, Result};
@@ -118,25 +119,45 @@ fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> 
     })
 }
 
-/// Storage of the page banks. A latent export aliases the pages its
-/// trajectory occupies, so device banks are one exportable allocation: a
-/// CUDA VMM export names the pages where they lie, whatever the pool's size.
-/// Every local peer device may address them, because readers on those
-/// devices in this process copy from the pages directly.
-fn allocate_banks(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> {
+/// Storage of the page banks, named `name` among the worker's exclusive
+/// storages. A latent export aliases the pages its trajectory occupies, so
+/// device banks are one exclusive storage `memory` provides, exported in
+/// place: a CUDA VMM export names the pages where they lie, whatever the
+/// pool's size. Every local peer device may address them, because readers
+/// on those devices in this process copy from the pages directly.
+fn allocate_banks(
+    device: Option<DeviceId>,
+    bytes: usize,
+    name: &str,
+    memory: &mut dyn ExclusiveMemory,
+) -> Result<Arc<dyn Backing>> {
     Ok(match device {
-        Some(device) => Storage::exportable(device, bytes.max(1), &Storage::peers(device)?)?,
+        Some(device) => {
+            let peers = Storage::peers(device)?;
+            memory
+                .exclusive(&[ExclusiveSpec {
+                    name,
+                    device,
+                    bytes: bytes.max(1),
+                    access: &peers,
+                }])?
+                .pop()
+                .ok_or_else(|| Error::Invariant("the latent banks' storage is missing".into()))?
+        }
         None => Storage::host(bytes.max(1)),
     })
 }
 
 impl LatentStorage {
     /// Allocate the storage `plan` states, with zeroed banks (reset on
-    /// `stream`, which is synchronized before returning).
+    /// `stream`, which is synchronized before returning). Device banks are
+    /// the exclusive storage `name` of `memory`.
     pub fn allocate(
         plan: &LatentPlan,
         device: Option<DeviceId>,
         stream: Option<&Stream>,
+        name: &str,
+        memory: &mut dyn ExclusiveMemory,
     ) -> Result<Self> {
         plan.validate()?;
         if device.is_some() != stream.is_some() {
@@ -152,7 +173,7 @@ impl LatentStorage {
             |shape: &[i64], dtype: DType| shape.iter().product::<i64>() as usize * dtype.bytes();
         let bank_shape = plan.bank_shape();
         let page_bytes = bytes(&bank_shape, dtype);
-        let banks = allocate_banks(device, page_bytes)?;
+        let banks = allocate_banks(device, page_bytes, name, memory)?;
         let pages = StorageView::contiguous(Arc::clone(&banks), 0, dtype, &bank_shape)?;
         let step = plan
             .step_shape()
@@ -320,7 +341,13 @@ mod tests {
             dtype: DType::F32,
             with_workspace: true,
         };
-        let storage = LatentStorage::allocate(&plan, None, None)?;
+        let storage = LatentStorage::allocate(
+            &plan,
+            None,
+            None,
+            "latent_banks",
+            &mut crate::storage::LocalMemory,
+        )?;
         // Capacity planning charges exactly what the pool allocates.
         let bytes = |view: &StorageView| view.numel() * view.dtype().bytes() as u64;
         let step = storage

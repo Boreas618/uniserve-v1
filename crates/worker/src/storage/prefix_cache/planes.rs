@@ -30,6 +30,7 @@ use crate::ffi::{
     Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
 };
 use crate::storage::memory::{Storage, StorageView};
+use crate::storage::retained::{ExclusiveMemory, ExclusiveSpec};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
@@ -53,34 +54,23 @@ pub struct CachePlanes {
     fields: Vec<(String, StorageView)>,
 }
 
-fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Storage>> {
-    match device {
-        Some(device) => Storage::device(device, bytes),
-        None => Ok(Storage::host(bytes)),
-    }
-}
-
-/// Storage of one field's values. A dense cache export aliases the live pages,
-/// so device planes are exportable allocations: a CUDA VMM export names the
-/// pages where they lie, whatever the pool's size. Every local peer device
-/// may address them, because readers on those devices in this process copy
-/// from the pages directly.
-fn allocate_values(device: Option<DeviceId>, bytes: usize) -> Result<Arc<Storage>> {
-    match device {
-        Some(device) => Storage::exportable(device, bytes, &Storage::peers(device)?),
-        None => Ok(Storage::host(bytes)),
-    }
-}
-
 impl CachePlanes {
     /// Allocate and reset a pool of `num_units` units (the sentinel
     /// included): values and flags zero, scales one. On a device the resets
     /// run on `stream`, which is synchronized before returning.
+    ///
+    /// Device planes are exclusive storages `memory` provides, whose
+    /// contents outlive the worker. A dense cache export aliases the live
+    /// pages, so the values are exported where they lie, whatever the
+    /// pool's size, and every local peer device may address them, because
+    /// readers on those devices in this process copy from the pages
+    /// directly.
     pub fn allocate(
         plan: Arc<CachePlan>,
         device: Option<DeviceId>,
         num_units: u32,
         stream: Option<&Stream>,
+        memory: &mut dyn ExclusiveMemory,
     ) -> Result<Self> {
         if num_units < 2 {
             return Err(Error::Invalid(
@@ -94,15 +84,46 @@ impl CachePlanes {
         }
         let cells = plan.columns as usize * num_units as usize;
         let plane_bytes = cells * plan.plane_bytes as usize;
-        let values = [
-            allocate_values(device, plane_bytes)?,
-            allocate_values(device, plane_bytes)?,
-        ];
-        let initialized = [allocate(device, cells)?, allocate(device, cells)?];
-        let scales = if plan.quantized {
-            Some([allocate(device, cells * 4)?, allocate(device, cells * 4)?])
-        } else {
-            None
+        let (values, initialized, scales) = match device {
+            Some(device) => {
+                let peers = Storage::peers(device)?;
+                let spec = |name, bytes| ExclusiveSpec {
+                    name,
+                    device,
+                    bytes,
+                    access: &peers,
+                };
+                let mut specs = vec![
+                    spec("prefix_cache.key.values", plane_bytes),
+                    spec("prefix_cache.value.values", plane_bytes),
+                    spec("prefix_cache.key.initialized", cells),
+                    spec("prefix_cache.value.initialized", cells),
+                ];
+                if plan.quantized {
+                    specs.push(spec("prefix_cache.key.scale", cells * 4));
+                    specs.push(spec("prefix_cache.value.scale", cells * 4));
+                }
+                let mut taken = memory.exclusive(&specs)?.into_iter();
+                let mut next = || {
+                    taken
+                        .next()
+                        .ok_or_else(|| Error::Invariant("an exclusive storage is missing".into()))
+                };
+                let values = [next()?, next()?];
+                let initialized = [next()?, next()?];
+                let scales = if plan.quantized {
+                    Some([next()?, next()?])
+                } else {
+                    None
+                };
+                (values, initialized, scales)
+            }
+            None => (
+                [Storage::host(plane_bytes), Storage::host(plane_bytes)],
+                [Storage::host(cells), Storage::host(cells)],
+                plan.quantized
+                    .then(|| [Storage::host(cells * 4), Storage::host(cells * 4)]),
+            ),
         };
         let mut planes = Self {
             plan,
@@ -381,7 +402,12 @@ impl UnitColumn {
     /// `UnitResets` over it on `stream` (`None` for a CPU pool).
     pub(crate) fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
         let count = i64::from(planes.num_units);
-        let memory = allocate(planes.device, Self::bytes(planes.num_units) as usize)?;
+        let bytes = Self::bytes(planes.num_units) as usize;
+        // A column is rebuilt with its lane, so it is the worker's own memory.
+        let memory = match planes.device {
+            Some(device) => Storage::device(device, bytes)?,
+            None => Storage::host(bytes),
+        };
         let units = StorageView::contiguous(memory as Arc<dyn Backing>, 0, DType::I64, &[count])?;
 
         let mut arguments = vec![

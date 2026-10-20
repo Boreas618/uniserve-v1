@@ -84,6 +84,9 @@ pub enum Role {
     },
     /// The Mooncake connector the server runs.
     Connector,
+    /// An operator's client, which lists what the server holds and retires
+    /// deployments that are no longer served.
+    Operator,
 }
 
 /// The first message on a connection.
@@ -199,6 +202,9 @@ pub enum Request {
     Release { keys: Vec<Key> },
     /// Every tensor, storage and claim the server holds.
     List,
+    /// Release every tensor of `deployment` and forget its claim: the
+    /// deployment is no longer served. Refused while its head is connected.
+    Retire { deployment: String },
 }
 
 /// Why a request failed.
@@ -240,6 +246,9 @@ pub enum Reply {
     Promoted,
     Released,
     Listing(Listing),
+    Retired {
+        released: u64,
+    },
     Error {
         kind: ErrorKind,
         message: String,

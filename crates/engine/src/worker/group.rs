@@ -21,13 +21,14 @@
 //! locally or through the host launchers in `launcher`, before any group
 //! waits for its ranks' registrations and startup capabilities.
 
+mod domain;
 mod reports;
 pub(crate) mod routing;
 mod spawn;
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::registry::Registry;
@@ -85,10 +86,17 @@ pub struct WorkerGroup {
     closed: bool,
     /// Rank loss is reported after all already-agreed results have been delivered.
     failure: Option<anyhow::Error>,
-    /// Groups sharing an expert communicator cannot recover independently.
-    /// The first terminal loss wakes every group's ordinary progress loop.
-    failure_domain: Option<Arc<FailureDomain>>,
+    /// The failure domain the group shares an expert world in, and the
+    /// group's position in it: its groups are replaced together
+    /// (`domain::FailureDomain`). `None` for a group that is its own domain.
+    failure_domain: Option<(Arc<domain::FailureDomain>, usize)>,
+    /// Wakes the group's scheduler when its domain starts or finishes a
+    /// replacement; each owner keeps its own, so an idle group observes the
+    /// domain even when another consumes its notification first.
     failure_wake: Option<crate::handle::WakeSignal>,
+    /// While the group waits for its failure domain's relaunch: the info
+    /// its workers reported, which their replacements must match.
+    awaiting: Option<Vec<WorkerInfo>>,
     /// The deployment's launchers of the hosts this head does not run
     /// on, shared with the other groups. A launcher terminates the ranks it
     /// started when the registry's last owner closes the connection, so the
@@ -96,30 +104,9 @@ pub struct WorkerGroup {
     launchers: Option<super::launcher::Launchers>,
     /// The deployment's listener, which a relaunch's ranks connect to.
     registry: Registry,
-}
-
-/// One terminal failure shared by groups participating in the same collectives.
-///
-/// Each owner keeps its own pollable wake, so an idle replica observes failure
-/// even when another replica consumes its notification first. Normal request
-/// errors and graceful retirement do not fail the domain.
-struct FailureDomain {
-    cause: OnceLock<String>,
-    wakers: Vec<uniserve_core::CommandWaker>,
-}
-
-impl FailureDomain {
-    fn fail(&self, worker: &str, cause: &anyhow::Error) {
-        if self
-            .cause
-            .set(format!("worker {worker}: {cause:#}"))
-            .is_ok()
-        {
-            for waker in &self.wakers {
-                waker.wake();
-            }
-        }
-    }
+    /// The deployment's storage claims, which a relaunch's workers start
+    /// with and which hold while any group of the deployment lives.
+    claims: super::storage::StorageClaims,
 }
 
 /// A call's identity across request epochs: engine identifier, request
@@ -278,7 +265,7 @@ impl WorkerGroup {
             "replacing the rank group: {cause:#}"
         );
 
-        if let Some(domain) = &self.failure_domain {
+        if let Some((domain, _)) = &self.failure_domain {
             domain.fail(&self.process_args.worker_id, cause);
         }
         // The lost endpoints, resident requests, and reported capabilities
@@ -306,6 +293,44 @@ impl WorkerGroup {
         );
         self.clear_execution();
 
+        if let Some((domain, index)) = self.failure_domain.clone() {
+            // The group's workers on other hosts are stopped before the
+            // domain relaunches them. Arriving never waits: the last group
+            // of the domain to arrive relaunches every group, and this one
+            // installs its workers when it is polled next.
+            if let Some(registry) = &self.launchers
+                && let Err(error) = super::launcher::lock(registry)
+                    .and_then(|mut hosts| hosts.stop_worker(&self.process_args.worker_id))
+            {
+                tracing::warn!(
+                    worker = %self.process_args.worker_id,
+                    "stopping remote workers: {error:#}"
+                );
+            }
+            if let Some(wake) = &mut self.failure_wake {
+                let _ = wake.drain();
+            }
+            self.awaiting = Some(expected);
+            domain.arrive(index);
+            let _ = self.install_from_domain();
+            self.readiness_changed = true;
+            return WorkerFailure {
+                worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
+                endpoints,
+                requests,
+                refusals: HashMap::new(),
+                retired: Vec::new(),
+                buffers: Vec::new(),
+                execution: cause.downcast_ref::<WorkerExecError>().cloned(),
+                message: format!(
+                    "WorkerGroup {} lost its resident allocations and is replaced with its \
+                     failure domain: {cause:#}",
+                    self.process_args.worker_id
+                ),
+            }
+            .into();
+        }
+
         let recovery = (|| -> anyhow::Result<()> {
             // The group's ranks on other hosts are stopped by their launchers
             // before the group is relaunched through the same registry, which
@@ -313,9 +338,12 @@ impl WorkerGroup {
             if let Some(registry) = &self.launchers {
                 super::launcher::lock(registry)?.stop_worker(&self.process_args.worker_id)?;
             }
-            let (mut workers, launchers) =
-                self.process_args
-                    .launch(None, &self.registry, self.launchers.clone())?;
+            let (mut workers, launchers) = self.process_args.launch(
+                None,
+                &self.registry,
+                self.launchers.clone(),
+                &self.claims,
+            )?;
             self.launchers = launchers;
             super::process::finish_startup(&mut workers.iter_mut().collect::<Vec<_>>())?;
             anyhow::ensure!(
@@ -355,6 +383,53 @@ impl WorkerGroup {
             ),
         }
         .into()
+    }
+
+    /// Installs the workers the failure domain relaunched for this group,
+    /// once they are posted. Returns whether the group is ready; a failed
+    /// relaunch closes it.
+    fn install_from_domain(&mut self) -> anyhow::Result<bool> {
+        let (Some((domain, index)), Some(expected)) = (&self.failure_domain, &self.awaiting) else {
+            return Ok(self.is_ready());
+        };
+        let Some(replacement) = domain.take_replacement(*index) else {
+            return Ok(false);
+        };
+        let installed = replacement
+            .map_err(|message| anyhow::anyhow!("the failure domain's relaunch failed: {message}"))
+            .and_then(|workers| {
+                anyhow::ensure!(
+                    workers.len() == expected.len(),
+                    "replacement rank count changed"
+                );
+                for (rank, (before, after)) in expected.iter().zip(&workers).enumerate() {
+                    validate_replacement_info(before, after.info(), rank)?;
+                }
+                Ok(workers)
+            });
+        self.awaiting = None;
+        self.readiness_changed = true;
+        if let Some(wake) = &mut self.failure_wake {
+            let _ = wake.drain();
+        }
+        match installed {
+            Ok(workers) => {
+                tracing::info!(
+                    worker = %self.process_args.worker_id,
+                    "rank group recovered with its failure domain"
+                );
+                self.install_replacement(workers);
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::error!(
+                    worker = %self.process_args.worker_id,
+                    "rank recovery failed: {error:#}"
+                );
+                self.closed = true;
+                Ok(false)
+            }
+        }
     }
 
     /// Installs a capability-compatible replacement rank group and resets rank-local state.
@@ -473,10 +548,15 @@ impl WorkerGroup {
             .collect()
     }
 
+    /// The failure of the domain's replacement round that this group has
+    /// not yet answered by terminating its workers.
     fn peer_failure(&self) -> Option<anyhow::Error> {
+        if self.awaiting.is_some() {
+            return None;
+        }
         self.failure_domain
             .as_ref()
-            .and_then(|domain| domain.cause.get())
+            .and_then(|(domain, index)| domain.pending_failure(*index))
             .map(|cause| anyhow::anyhow!("shared expert communicator failed: {cause}"))
     }
 
@@ -905,6 +985,15 @@ impl WorkerGroup {
 
     fn poll_progress(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         let deadline = Instant::now() + timeout;
+        // A group waiting for its failure domain's relaunch makes no progress
+        // until it installs the workers the domain posts.
+        if self.awaiting.is_some() && !self.install_from_domain()? {
+            if !self.closed {
+                crate::worker::park_descriptors(&self.progress_fds(), timeout)?;
+                self.install_from_domain()?;
+            }
+            return Ok(None);
+        }
         loop {
             // A drain can observe both final replies and rank death. Join every
             // complete reply before recovery invalidates outstanding ownership.
@@ -969,7 +1058,12 @@ impl WorkerGroup {
         for worker in &self.workers {
             worker.cancel_startup();
         }
-        if self.peer_failure().is_some() {
+        if self
+            .failure_domain
+            .as_ref()
+            .is_some_and(|(domain, _)| domain.failing())
+            || self.awaiting.is_some()
+        {
             // A failed collective cannot drain. Terminate the local readers
             // and ask remote launchers to do the same before dropping storage.
             for worker in &mut self.workers {

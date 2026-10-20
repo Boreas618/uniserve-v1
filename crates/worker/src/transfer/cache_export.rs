@@ -517,7 +517,13 @@ mod tests {
             }],
             handle: crate::ffi::Handle::none(),
         });
-        let planes = CachePlanes::allocate(Arc::clone(&plan), None, 2, None)?;
+        let planes = CachePlanes::allocate(
+            Arc::clone(&plan),
+            None,
+            2,
+            None,
+            &mut crate::storage::LocalMemory,
+        )?;
         let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
         let update = tables.prepare(&[BlockTable {
             request_pool_idx: 1,

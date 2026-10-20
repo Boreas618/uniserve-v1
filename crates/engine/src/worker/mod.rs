@@ -17,6 +17,7 @@ mod launcher;
 mod process;
 mod registry;
 mod rendezvous;
+mod storage;
 
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
@@ -47,6 +48,12 @@ pub struct WorkerProcessArgs {
     pub worker_id: String,
     /// The `uniserve-worker` executable each worker of the group runs.
     pub executable: std::path::PathBuf,
+    /// The `uniserve-storage-server` executable that starts a host's
+    /// Storage Server when the host has none.
+    pub storage_server: std::path::PathBuf,
+    /// The deployment the group belongs to, which its workers' storage
+    /// scopes name: the served model name.
+    pub deployment: String,
     /// Model identifier or local model path.
     pub model: String,
     /// Ordered physical members of this worker group.

@@ -156,6 +156,8 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) scratch: Handle,
     pub(crate) graph_pool: Option<Arc<GraphPool>>,
     pub(crate) transient_layouts: usize,
+    /// Where the latent banks are taken.
+    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
 }
 
 fn bytes_of(view: &StorageView) -> u64 {
@@ -191,7 +193,13 @@ impl DenoiserRunner {
         let banks = RequestSlots::allocate(&setup.envelope.device, setup.slots, Some(device))?;
         let host = RequestSlots::allocate(&setup.envelope.host, setup.slots, Some(device))?;
         let latent = setup.latent;
-        let storage = LatentStorage::allocate(&latent, Some(device), Some(&setup.stream))?;
+        let storage = LatentStorage::allocate(
+            &latent,
+            Some(device),
+            Some(&setup.stream),
+            "video.latent_banks",
+            setup.memory,
+        )?;
         let pool = LatentPool::new(
             latent.request_pool_size,
             latent.num_pages,

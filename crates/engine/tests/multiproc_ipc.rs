@@ -1853,6 +1853,7 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
     // rather than waiting for them or starting them in the wrong place.
     let spawned = WorkerGroup::spawn(WorkerProcessArgs {
         executable: worker_executable(),
+        storage_server: WorkerProcessArgs::storage_server_beside(&worker_executable()),
         model: String::new(),
         host: "compute-0".into(),
         ranks: WorkerGroupConfig::placed(
@@ -1988,6 +1989,7 @@ fn worker_group_args() -> WorkerProcessArgs {
         ..WorkerProcessArgs::default()
     };
     WorkerProcessArgs {
+        storage_server: WorkerProcessArgs::storage_server_beside(&executable),
         executable,
         model: String::new(),
         ranks: WorkerGroupConfig::placed(
@@ -2016,11 +2018,52 @@ fn worker_group_args() -> WorkerProcessArgs {
 /// states it, as a launch's does.
 const STUB_WORKER: &str = "worker";
 
+/// The Storage Server the directly driven stub workers keep their memory
+/// at, served by a thread of this test process, and the claim its head,
+/// this process, holds for their deployment.
+fn stub_storage() -> uniserve_ipc::StorageLaunch {
+    static STORAGE: std::sync::OnceLock<(
+        std::sync::Mutex<uniserve_storage::Client>,
+        uniserve_ipc::StorageLaunch,
+    )> = std::sync::OnceLock::new();
+    STORAGE
+        .get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let socket = directory.join("storage.sock");
+            let (listener, lock) = uniserve_storage::socket::bind(&socket).unwrap().unwrap();
+            std::thread::spawn(move || {
+                let _lock = lock;
+                let (_keep, wake) = std::os::unix::net::UnixStream::pair().unwrap();
+                let mut server = uniserve_storage::Server::new(listener).unwrap();
+                server
+                    .run(std::os::fd::AsFd::as_fd(&wake), &|| false)
+                    .unwrap();
+            });
+            let mut head = uniserve_storage::Client::connect(
+                &socket,
+                uniserve_storage::Role::Head {
+                    deployment: STUB_WORKER.into(),
+                },
+            )
+            .unwrap();
+            let claim = head.claim(Vec::new()).unwrap();
+            let launch = uniserve_ipc::StorageLaunch {
+                socket: socket.to_string_lossy().into_owned(),
+                deployment: STUB_WORKER.into(),
+                claim: claim.0,
+            };
+            (std::sync::Mutex::new(head), launch)
+        })
+        .1
+        .clone()
+}
+
 /// Production launches receive the same typed descriptor from the engine;
 /// these tests state one directly because they drive the worker process
 /// without a group.
 fn stub_launch_descriptor() -> LaunchDescriptor {
     LaunchDescriptor {
+        storage: stub_storage(),
         acknowledgment_slot: 0,
         host_slots: vec![0],
         products_cross_hosts: false,
@@ -3751,16 +3794,17 @@ fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyho
 fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerGroupId};
 
+    let retire = Retire::default();
     let edges = "source->target=cuda_vmm";
     let mut executor = WorkerExecutor::try_new(
         vec![
             (
                 WorkerGroupId("source".into()),
-                cuda_worker("source", edges, None)?,
+                cuda_worker(&retire, "source", edges, None)?,
             ),
             (
                 WorkerGroupId("target".into()),
-                cuda_worker("target", edges, None)?,
+                cuda_worker(&retire, "target", edges, None)?,
             ),
         ],
         uniserve_engine::TransferConfig::parse(edges)?,
@@ -3874,16 +3918,18 @@ fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
 fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Result<()> {
     use uniserve_engine::{WorkerExecutor, WorkerGroupId};
 
+    let retire = Retire::default();
     let edges = "source->target=cuda_vmm";
     let mut executor = WorkerExecutor::try_new(
         vec![
             (
                 WorkerGroupId("source".into()),
-                cuda_worker("source", edges, None)?,
+                cuda_worker(&retire, "source", edges, None)?,
             ),
             (
                 WorkerGroupId("target".into()),
                 cuda_worker(
+                    &retire,
                     "target",
                     edges,
                     Some(uniserve_core::PrefixCacheDtype::Float16),
@@ -4022,6 +4068,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
 
     let model = std::env::var("UNISERVE_KV_INSTALL_MODEL")?;
     let prompt: Vec<u32> = serde_json::from_str(&std::env::var("UNISERVE_KV_INSTALL_PROMPT")?)?;
+    let retire = Retire::default();
     let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
         let mut args = single_worker_args(worker_id, QUEUE_DEPTH);
         for rank in &mut args.ranks {
@@ -4035,6 +4082,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
         args.attention_backend = "auto".into();
         args.components = WorkerGroupConfig::single_component("model", 1);
         args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
+        retire.add(&args);
         WorkerGroup::spawn(args)
     };
     let mut executor = WorkerExecutor::try_new(
@@ -4225,6 +4273,7 @@ fn decode_step(
 /// device, with a cache of `prefix_cache_dtype` (the model's dtype by default)
 /// and the transfer `edges`.
 fn cuda_worker(
+    retire: &Retire,
     worker_id: &str,
     edges: &str,
     prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
@@ -4235,7 +4284,39 @@ fn cuda_worker(
     }
     args.kv_cache_dtype = prefix_cache_dtype;
     args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
+    retire.add(&args);
     WorkerGroup::spawn(args)
+}
+
+/// The deployments of a test's CUDA workers, retired at the host's Storage
+/// Server once the test's workers are gone: their device memory outlives
+/// them there, and no later launch claims a test's deployment again. A test
+/// declares it before its workers, so that it drops after them.
+#[derive(Default)]
+struct Retire(std::sync::Mutex<Vec<String>>);
+
+impl Retire {
+    fn add(&self, args: &WorkerProcessArgs) {
+        self.0.lock().unwrap().push(args.deployment.clone());
+    }
+}
+
+impl Drop for Retire {
+    fn drop(&mut self) {
+        let socket = uniserve_storage::socket::default_socket();
+        for deployment in self.0.lock().unwrap().drain(..) {
+            // The server notices the head's disconnect on its next turn.
+            for _ in 0..500 {
+                let retired =
+                    uniserve_storage::Client::connect(&socket, uniserve_storage::Role::Operator)
+                        .and_then(|mut client| client.retire(deployment.clone()));
+                if retired.is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// A one-element U8 flag that `producer` publishes as output `index`.

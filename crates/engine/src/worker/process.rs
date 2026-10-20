@@ -182,6 +182,7 @@ impl PendingWorker {
     pub(crate) fn spawn(
         args: &WorkerProcessArgs,
         rank: u32,
+        storage: uniserve_ipc::StorageLaunch,
         rendezvous: Option<&str>,
         sockets: WorkerSockets,
         store_fd: Option<std::os::fd::RawFd>,
@@ -231,8 +232,13 @@ impl PendingWorker {
 
         // One typed descriptor carries every launch value. The head keeps it
         // and answers the rank's registration with it.
-        let descriptor =
-            args.launch_descriptor(rank, rendezvous, rendezvous_listen_fd, expert_listen_fd)?;
+        let descriptor = args.launch_descriptor(
+            rank,
+            storage,
+            rendezvous,
+            rendezvous_listen_fd,
+            expert_listen_fd,
+        )?;
 
         // A rank placed on another host is started by that host's launcher,
         // which needs the same command and environment this process would

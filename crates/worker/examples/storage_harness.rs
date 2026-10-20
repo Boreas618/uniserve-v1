@@ -30,6 +30,7 @@ use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use uniserve_worker::ffi::{Function, Handle, Interpreter};
+use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView, UnitColumn};
 use uniserve_worker::transfer::exports;
 use uniserve_worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
@@ -148,6 +149,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         Some(devices[0]),
         Some(&streams[0]),
+        &mut LocalMemory,
     )?;
     let mut destination = PrefixCache::new(
         Arc::clone(&destination_plan),
@@ -157,6 +159,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
         2,
         Some(devices[1]),
         Some(&streams[1]),
+        &mut LocalMemory,
     )?;
 
     // Python writes the producer's tokens through the bound views.
@@ -307,6 +310,7 @@ fn lifecycle(config: Any) -> Result<Map<FfiString, Any>> {
         1,
         None,
         None,
+        &mut LocalMemory,
     )?;
     let column = cache.bind_units(None)?;
     let views = tensor_map(&cache.views()?)?;

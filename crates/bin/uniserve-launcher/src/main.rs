@@ -19,6 +19,10 @@
 //! is often started over an SSH session whose pipe closes before the
 //! deployment stops, and a failed log write must not end supervision.
 //!
+//! On the head's instruction it also claims the deployment at its host's
+//! Storage Server, starting the server when the host has none, and holds
+//! that claim for the head while their connection lasts.
+//!
 //! It does nothing else. The head derives every launch value once, so a
 //! launcher's command line is the head's address and its own host identity.
 //!
@@ -35,12 +39,17 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use uniserve_ipc::launch::WorkerChild;
-use uniserve_ipc::launcher::{Instruction, Report, Reservation, WorkerExit, WorkerSpawn};
+use uniserve_ipc::launcher::{
+    Instruction, Report, Reservation, StorageClaim, WorkerExit, WorkerSpawn,
+};
 use uniserve_ipc::{Channel, IpcError, Registration, VERSION};
 
 /// Bounds how long a worker's exit waits to be reported: exit reporting must
 /// not depend on another instruction arriving.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Longest a Storage Server this launcher starts takes to listen.
+const STORAGE_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often a running worker's NCCL names are noted
 /// (`WorkerChild::note_nccl_segments`). A worker reports that it is ready to the
@@ -121,6 +130,9 @@ fn supervise(
     // Bound store sockets by worker group, each held until that group's first
     // worker is spawned here and inherits it.
     let mut rendezvous: HashMap<String, TcpListener> = HashMap::new();
+    // The connection that holds the deployment's claim at this host's
+    // Storage Server for the head; the claim ends with it.
+    let mut storage: Option<uniserve_storage::Client> = None;
     loop {
         report_exits(head, workers)?;
 
@@ -202,12 +214,62 @@ fn supervise(
                 rendezvous.remove(&worker_id);
                 tracing::info!(worker = %worker_id, "head asked this host to stop a worker group's workers");
             }
+            Instruction::Claim(claim) => {
+                let deployment = claim.deployment.clone();
+                let claimed =
+                    claim_storage(claim, &mut storage).map_err(|error| format!("{error:#}"));
+                if let Err(message) = &claimed {
+                    tracing::warn!(deployment, message, "claiming this host's storage failed");
+                } else {
+                    tracing::info!(deployment, "claimed this host's storage for the head");
+                }
+                head.send(&Report::Claim(claimed))
+                    .context("reporting a storage claim to the head")?;
+            }
             Instruction::Terminate => {
                 tracing::info!("head asked this host to stop");
                 return Ok(());
             }
         }
     }
+}
+
+/// Claims the deployment at this host's Storage Server, starting the server
+/// when the host has none, and keeps the claiming connection in `storage`.
+fn claim_storage(
+    claim: StorageClaim,
+    storage: &mut Option<uniserve_storage::Client>,
+) -> anyhow::Result<uniserve_ipc::StorageLaunch> {
+    let socket = uniserve_storage::socket::default_socket();
+    uniserve_storage::socket::ensure(
+        std::path::Path::new(&claim.server),
+        &socket,
+        STORAGE_START_TIMEOUT,
+    )
+    .context("starting this host's storage server")?;
+    let mut client = uniserve_storage::Client::connect(
+        &socket,
+        uniserve_storage::Role::Head {
+            deployment: claim.deployment.clone(),
+        },
+    )?;
+    let token = client.claim(
+        claim
+            .scopes
+            .into_iter()
+            .map(|(group, rank)| uniserve_storage::Scope {
+                deployment: claim.deployment.clone(),
+                group,
+                rank,
+            })
+            .collect(),
+    )?;
+    *storage = Some(client);
+    Ok(uniserve_ipc::StorageLaunch {
+        socket: socket.to_string_lossy().into_owned(),
+        deployment: claim.deployment,
+        claim: token.0,
+    })
 }
 
 /// Starts one worker, which connects to the head, registers as a member of

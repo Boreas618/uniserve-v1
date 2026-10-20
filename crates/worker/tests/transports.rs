@@ -16,6 +16,7 @@ use uniserve_core::PrefixCacheDtype;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
 use uniserve_ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, MemoryKind};
+use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{
     CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentPlan, LatentStorage, Storage,
     StorageView,
@@ -828,7 +829,7 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
     // Six tokens of both columns: 6 MiB of bfloat16, more than the 4 MiB
     // pool the transports configure.
     let plan = Arc::new(cache_plan(1 << 17));
-    let planes = CachePlanes::allocate(plan, Some(DEVICE), 2, Some(&stream))?;
+    let planes = CachePlanes::allocate(plan, Some(DEVICE), 2, Some(&stream), &mut LocalMemory)?;
     let cache_page = Spans::single(planes.page(0, 0, 1, 0, 6)?)?;
 
     // One page of 768 units of 2048 f32 elements, also 6 MiB.
@@ -843,6 +844,8 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
         },
         Some(DEVICE),
         Some(&stream),
+        "latent_banks",
+        &mut LocalMemory,
     )?;
     let latent_page = latents.spans(0, &[1], 768)?;
 

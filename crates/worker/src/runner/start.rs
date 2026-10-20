@@ -106,6 +106,8 @@ pub(crate) struct Startup<'a> {
     pub(crate) graphs: &'a mut GraphStorage,
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
+    /// Where the latent banks are taken.
+    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
 }
 
 /// One call startup binds.
@@ -379,7 +381,13 @@ impl ImageOwners {
             .map(|target| target.device);
         let latents = match (denoiser_device, startup.latent) {
             (Some(device), Some(plan)) => {
-                let storage = LatentStorage::allocate(&plan, device.cuda(), startup.preparation)?;
+                let storage = LatentStorage::allocate(
+                    &plan,
+                    device.cuda(),
+                    startup.preparation,
+                    "image.latent_banks",
+                    &mut *startup.memory,
+                )?;
                 let pool =
                     LatentPool::new(plan.request_pool_size, plan.num_pages, plan.page_units)?;
                 Some(LatentCache::new(pool, storage))

@@ -11,6 +11,7 @@ use uniserve_ipc::{
     RequestKey, ShapeBound, TensorRef, TransferHandle, WorkerEndpoint,
 };
 use uniserve_worker::ffi::MemoryKind;
+use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{
     BufferPool, OutputPlacement, ProductBuffer, ProductStore, StorageView,
 };
@@ -55,7 +56,7 @@ fn store(pool_bytes: u64, request_capacity: usize, relay_depth: usize) -> Result
         vec![CPU],
         request_capacity,
         relay_depth,
-        BufferPool::allocate(pool_bytes, &[CPU])?,
+        BufferPool::allocate(pool_bytes, &[CPU], &mut LocalMemory)?,
         EventPool::new(),
     )
 }

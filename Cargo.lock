@@ -9180,6 +9180,8 @@ dependencies = [
  "uniserve-core",
  "uniserve-engine",
  "uniserve-ipc",
+ "uniserve-storage",
+ "uuid",
 ]
 
 [[package]]
@@ -9208,6 +9210,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uniserve-ipc",
+ "uniserve-storage",
 ]
 
 [[package]]
@@ -9321,6 +9324,7 @@ dependencies = [
  "pyo3-ffi",
  "rustix 1.1.4",
  "serde_json",
+ "sha2 0.10.9",
  "signal-hook-registry",
  "tempfile",
  "thiserror 2.0.18",
@@ -9331,7 +9335,16 @@ dependencies = [
  "uniserve-core",
  "uniserve-cuda",
  "uniserve-ipc",
+ "uniserve-storage",
  "uuid",
+]
+
+[[package]]
+name = "uniserve-worker-main"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]

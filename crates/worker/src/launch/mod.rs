@@ -248,7 +248,7 @@ fn serve(
         Ok(registered) => registered,
         Err(error) => return error.into(),
     };
-    let launch = match resolve(descriptor) {
+    let launch = match resolve(descriptor, &arguments.worker_id, arguments.generation) {
         Ok(launch) => launch,
         Err(error) => return Failure::Descriptor(error).into(),
     };

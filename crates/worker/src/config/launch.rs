@@ -105,6 +105,13 @@ pub struct DataPlane {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerLaunch {
     pub ipc: IpcConfig,
+    /// The worker group the worker was started for, and the generation of
+    /// its launch: with the rank, the worker's scope and incarnation at the
+    /// Storage Server.
+    pub group: String,
+    pub generation: u64,
+    /// Where the worker retains its weights and exclusive storages.
+    pub storage: uniserve_ipc::StorageLaunch,
     /// The deployment's name of this worker's host, its host identity in
     /// transfers and peer storage.
     pub host: String,
@@ -144,7 +151,11 @@ impl WorkerLaunch {
 /// the lanes taken together. Fails with the first violated
 /// rule; messages name the launch option the operator sets, because the
 /// engine reports them as the rank's exit cause.
-pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorError> {
+pub fn resolve(
+    descriptor: LaunchDescriptor,
+    group: &str,
+    launch_generation: u64,
+) -> Result<WorkerLaunch, DescriptorError> {
     let role = descriptor.role.trim().to_owned();
     let experts = expert_parallel(&descriptor)?;
 
@@ -192,6 +203,9 @@ pub fn resolve(descriptor: LaunchDescriptor) -> Result<WorkerLaunch, DescriptorE
             // group's last progress.
             stall_bound: std::time::Duration::from_millis(descriptor.watchdog_timeout_ms / 2),
         },
+        group: group.to_owned(),
+        generation: launch_generation,
+        storage: descriptor.storage.clone(),
         host: descriptor.host.clone(),
         local_rank: descriptor.local_rank as usize,
         distributed_backend: text(descriptor.distributed_backend.as_deref()),

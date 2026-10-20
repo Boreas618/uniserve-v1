@@ -28,10 +28,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use uniserve_ipc::Channel;
-use uniserve_ipc::launcher::{Instruction, Report, WorkerExit, WorkerSpawn};
+use uniserve_ipc::launcher::{Instruction, Report, StorageClaim, WorkerExit, WorkerSpawn};
 
 /// Longest a launcher may take to answer a reservation.
 const RESERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a launcher may take to claim the deployment at its host's
+/// Storage Server, starting the server when the host has none.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The registry of one deployment, shared by every group that places a rank
 /// on another host.
@@ -252,6 +255,9 @@ impl LauncherRegistry {
                     });
                 }
                 Ok(Some(Report::Exit(exit))) => self.exits.file(host, exit),
+                Ok(Some(Report::Claim(_))) => {
+                    anyhow::bail!("the launcher of host {host} answered no claim with a claim")
+                }
                 Ok(None) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     anyhow::ensure!(
@@ -262,6 +268,44 @@ impl LauncherRegistry {
                 }
                 Err(error) => {
                     return Err(error).context("launcher disconnected while reserving rendezvous");
+                }
+            }
+        }
+    }
+
+    /// Has the launcher of `host` claim the deployment at its host's Storage
+    /// Server and returns the storage launch of that host's workers.
+    pub(crate) fn claim_on(
+        &mut self,
+        host: &str,
+        claim: StorageClaim,
+    ) -> anyhow::Result<uniserve_ipc::StorageLaunch> {
+        let launcher = self
+            .hosts
+            .get_mut(host)
+            .with_context(|| format!("no launcher presented host {host}"))?;
+        launcher.channel.send(&Instruction::Claim(claim))?;
+        let deadline = Instant::now() + CLAIM_TIMEOUT;
+        loop {
+            match launcher.channel.try_recv::<Report>() {
+                Ok(Some(Report::Claim(Ok(launch)))) => return Ok(launch),
+                Ok(Some(Report::Claim(Err(message)))) => {
+                    anyhow::bail!("host {host} could not claim the deployment's storage: {message}")
+                }
+                Ok(Some(Report::Exit(exit))) => self.exits.file(host, exit),
+                Ok(Some(Report::Reservation(_))) => {
+                    anyhow::bail!("the launcher of host {host} answered a claim with a reservation")
+                }
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    anyhow::ensure!(
+                        !remaining.is_zero(),
+                        "the launcher of host {host} did not answer a storage claim"
+                    );
+                    launcher.channel.wait(remaining)?;
+                }
+                Err(error) => {
+                    return Err(error).context("launcher disconnected while claiming storage");
                 }
             }
         }

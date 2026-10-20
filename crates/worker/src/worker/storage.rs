@@ -203,6 +203,7 @@ pub(super) fn allocate_storage(
     config: &WorkerConfig,
     plan: &Plan,
     streams: &Streams,
+    memory: &mut dyn crate::storage::ExclusiveMemory,
 ) -> Result<WorkerStorage> {
     let events = EventPool::new();
     let kinds = launch
@@ -241,7 +242,8 @@ pub(super) fn allocate_storage(
     // lanes, one per request slot and unresolved call, on the primary
     // device where every binding computes.
     let devices = vec![config.device.memory()];
-    let buffer_pool = BufferPool::allocate(plan.info.buffer_pool_bytes.max(1), &devices)?;
+    let buffer_pool =
+        BufferPool::allocate(plan.info.buffer_pool_bytes.max(1), &devices, &mut *memory)?;
     let tensors = ProductStore::new(
         plan.arena.device_product_bytes.max(1) as usize,
         plan.info.encoder_entry_bytes.max(1) as usize,
@@ -263,6 +265,7 @@ pub(super) fn allocate_storage(
             plan.info.max_unresolved_calls as usize,
             device,
             preparation.map(CUDAStream::stream).transpose()?,
+            memory,
         )?),
         _ => None,
     };

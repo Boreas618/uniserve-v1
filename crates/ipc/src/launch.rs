@@ -43,6 +43,11 @@ pub fn worker_command(
     generation: u64,
 ) -> Command {
     let mut command = Command::new(executable);
+    // A worker leads a process group of its own, with every process it
+    // starts: the Storage Server shoots down a previous writer by its group,
+    // which ends the children that may have inherited its device
+    // descriptors, and never the head's.
+    command.process_group(0);
     command
         .arg("--head")
         .arg(head)
@@ -374,6 +379,21 @@ impl NcclSegments {
     }
 }
 
+/// The Storage Server a worker retains its memory at, and its deployment's
+/// claim there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageLaunch {
+    /// The Unix socket of the worker's host's Storage Server.
+    pub socket: String,
+    /// The deployment the worker's scope belongs to: the served model name.
+    pub deployment: String,
+    /// The token of the claim the head holds at that server, which the
+    /// worker states so that the server knows it belongs to the current
+    /// head.
+    pub claim: [u8; 16],
+}
+
 /// Every value one rank process is launched with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -396,6 +416,8 @@ pub struct LaunchDescriptor {
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
+    /// Where the worker retains its weights and exclusive storages.
+    pub storage: StorageLaunch,
     /// The deployment's name of the host the worker runs on: the head's
     /// `host_identity` or a launcher's. Peers compare it to tell whether a
     /// product or a peer allocation is on their own host.

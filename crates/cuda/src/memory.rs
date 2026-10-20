@@ -3,7 +3,7 @@
 use std::ptr::NonNull;
 
 use crate::driver::{MemAllocationProp, driver, in_context};
-use crate::vmm::VirtualRange;
+use crate::vmm::{CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, Protection, VirtualRange};
 use crate::{DeviceId, Error, HandleType, PrimaryContext, Result, ShareableHandle, reclaim};
 
 const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
@@ -41,7 +41,13 @@ enum Kind {
     Exportable {
         handle: u64,
         handle_type: HandleType,
-        _range: VirtualRange,
+        /// Whether the allocation also exports a POSIX descriptor, which a
+        /// Storage Server retains.
+        retainable: bool,
+        /// The devices granted access, which a change of protection names
+        /// again.
+        access: Vec<DeviceId>,
+        range: VirtualRange,
     },
 }
 
@@ -100,6 +106,23 @@ impl DeviceAllocation {
     /// [`DeviceAllocation::granularity`], with read-write access for `device`
     /// and every device in `access` (other local GPUs that address it).
     pub fn exportable(device: DeviceId, bytes: usize, access: &[DeviceId]) -> Result<Self> {
+        Self::create_exportable(device, bytes, access, false)
+    }
+
+    /// Allocates exportable device memory, as [`DeviceAllocation::exportable`],
+    /// that also exports a POSIX descriptor ([`Self::export_descriptor`]),
+    /// which a Storage Server holds to retain the memory after this process
+    /// releases it.
+    pub fn retainable(device: DeviceId, bytes: usize, access: &[DeviceId]) -> Result<Self> {
+        Self::create_exportable(device, bytes, access, true)
+    }
+
+    fn create_exportable(
+        device: DeviceId,
+        bytes: usize,
+        access: &[DeviceId],
+        retainable: bool,
+    ) -> Result<Self> {
         require_bytes(bytes)?;
         let handle_type = HandleType::probe(device)?;
         let granularity = handle_type.granularity(device)?;
@@ -113,11 +136,15 @@ impl DeviceAllocation {
         let context = PrimaryContext::retain(device)?;
         let _guard = context.enter()?;
         let mut range = VirtualRange::new(context.clone());
-        let properties = MemAllocationProp::device(device.handle()?, handle_type.raw());
+        let mut handle_types = handle_type.raw();
+        if retainable {
+            handle_types |= CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        }
+        let properties = MemAllocationProp::device(device.handle()?, handle_types);
         let handle = range.create(rounded, &properties)?;
         range.reserve(rounded, granularity)?;
         range.map(0, rounded, handle)?;
-        range.grant(&devices)?;
+        range.grant(&devices, Protection::ReadWrite)?;
 
         Ok(Self {
             device,
@@ -126,7 +153,9 @@ impl DeviceAllocation {
             kind: Kind::Exportable {
                 handle,
                 handle_type,
-                _range: range,
+                retainable,
+                access: devices,
+                range,
             },
         })
     }
@@ -172,6 +201,38 @@ impl DeviceAllocation {
                 handle_type,
                 ..
             } => ShareableHandle::export(*handle, *handle_type).map(Some),
+        }
+    }
+
+    /// Exports the physical allocation as a POSIX descriptor for a Storage
+    /// Server to retain. `None` for an allocation that is not retainable.
+    pub fn export_descriptor(&self) -> Result<Option<std::os::fd::OwnedFd>> {
+        match &self.kind {
+            Kind::Exportable {
+                handle,
+                retainable: true,
+                ..
+            } => match ShareableHandle::export(*handle, HandleType::Descriptor)? {
+                ShareableHandle::Descriptor(descriptor) => Ok(Some(descriptor)),
+                ShareableHandle::Fabric(_) => Err(Error::invalid(
+                    "a descriptor export returned a fabric handle",
+                )),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Change the allocation's access in place, at an unchanged address. The
+    /// caller has drained every access the new protection forbids. Fails
+    /// for linear memory, whose access is fixed.
+    pub fn protect(&self, protection: Protection) -> Result<()> {
+        match &self.kind {
+            Kind::Linear { .. } => Err(Error::invalid("the access of linear memory cannot change")),
+            Kind::Exportable { access, range, .. } => {
+                let context = PrimaryContext::retain(self.device)?;
+                let _guard = context.enter()?;
+                range.grant(access, protection)
+            }
         }
     }
 }

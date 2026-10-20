@@ -7,13 +7,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 
 use crate::driver::{
-    CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
-    MemAllocationProp, MemLocation, driver, in_context,
+    CU_MEM_ACCESS_FLAGS_PROT_READ, CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE,
+    MemAccessDesc, MemAllocationProp, MemLocation, driver, in_context,
 };
 use crate::memory::DeviceAllocation;
 use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, lock, reclaim};
 
-const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: i32 = 1;
+pub(crate) const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: i32 = 1;
 const CU_MEM_HANDLE_TYPE_FABRIC: i32 = 8;
 const CU_MEM_ALLOC_GRANULARITY_MINIMUM: i32 = 0;
 
@@ -109,6 +109,24 @@ fn fabric_usable(device: DeviceId) -> Result<bool> {
     // SAFETY: releases the probe allocation created above; it was never mapped.
     driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease")?;
     Ok(true)
+}
+
+/// What the devices granted access to a mapping may do with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protection {
+    /// Reads only: a kernel that writes the mapping fails its context with
+    /// an illegal address and leaves the bytes unchanged.
+    ReadOnly,
+    ReadWrite,
+}
+
+impl Protection {
+    fn flags(self) -> i32 {
+        match self {
+            Self::ReadOnly => CU_MEM_ACCESS_FLAGS_PROT_READ,
+            Self::ReadWrite => CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        }
+    }
 }
 
 /// An exported allocation handle, owned by the holder.
@@ -290,8 +308,10 @@ impl VirtualRange {
         Ok(())
     }
 
-    /// Grants read-write access to the whole range to each device.
-    pub(crate) fn grant(&self, devices: &[DeviceId]) -> Result<()> {
+    /// Grants `protection` over the whole range to each device. A grant
+    /// over a mapped range changes its access in place, at an unchanged
+    /// address.
+    pub(crate) fn grant(&self, devices: &[DeviceId], protection: Protection) -> Result<()> {
         let descriptors = devices
             .iter()
             .map(|device| {
@@ -300,7 +320,7 @@ impl VirtualRange {
                         kind: CU_MEM_LOCATION_TYPE_DEVICE,
                         id: device.handle()?,
                     },
-                    flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+                    flags: protection.flags(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -373,8 +393,11 @@ pub struct PeerMapping {
     device: DeviceId,
     address: u64,
     bytes: usize,
+    /// The devices granted access, which a change of protection names
+    /// again.
+    access: Vec<DeviceId>,
     // Declared last so that the fields above stay valid until teardown.
-    _range: VirtualRange,
+    range: VirtualRange,
 }
 
 impl PeerMapping {
@@ -429,14 +452,74 @@ impl PeerMapping {
         for (index, handle) in imported.into_iter().enumerate() {
             range.map(index * bytes_each, bytes_each, handle)?;
         }
-        range.grant(&[device])?;
+        range.grant(&[device], Protection::ReadWrite)?;
 
         Ok(Self {
             device,
             address: range.address(),
             bytes: total,
-            _range: range,
+            access: vec![device],
+            range,
         })
+    }
+
+    /// Maps a physical allocation a Storage Server retains, through its
+    /// POSIX descriptor, with `protection` for `device` and every device in
+    /// `access`. `bytes` is the allocation's size, a multiple of the
+    /// granularity.
+    ///
+    /// The mapping holds its own reference to the physical memory, which
+    /// lives while any process maps it or the server holds its descriptor.
+    /// An imported allocation exports no handle of its own: other processes
+    /// on the host map the same descriptor, and a fabric handle of the
+    /// allocation stopped importing when its creator released it.
+    pub fn import_retained(
+        device: DeviceId,
+        descriptor: &OwnedFd,
+        bytes: usize,
+        access: &[DeviceId],
+        protection: Protection,
+    ) -> Result<Self> {
+        let granularity = HandleType::Descriptor.granularity(device)?;
+        if bytes == 0 || !bytes.is_multiple_of(granularity) {
+            return Err(Error::invalid(format!(
+                "a retained allocation of {bytes} bytes is not a positive multiple of \
+                 the {granularity}-byte granularity"
+            )));
+        }
+        let descriptor = descriptor
+            .try_clone()
+            .map_err(|error| Error::invalid(format!("duplicating a descriptor: {error}")))?;
+        let handle = ShareableHandle::Descriptor(descriptor);
+
+        let mut devices = vec![device];
+        devices.extend(access.iter().filter(|peer| **peer != device));
+        let context = PrimaryContext::retain(device)?;
+        let _guard = context.enter()?;
+        let mut range = VirtualRange::new(context.clone());
+        let imported = handle.import()?;
+        range.adopt(imported);
+        range.reserve(bytes, granularity)?;
+        range.map(0, bytes, imported)?;
+        range.grant(&devices, protection)?;
+
+        Ok(Self {
+            device,
+            address: range.address(),
+            bytes,
+            access: devices,
+            range,
+        })
+    }
+
+    /// Change the mapping's access in place, at an unchanged address, so
+    /// that pointers into it, captured graphs among them, stay valid. The
+    /// caller has drained every access the old protection allowed and the
+    /// new one does not.
+    pub fn protect(&self, protection: Protection) -> Result<()> {
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        self.range.grant(&self.access, protection)
     }
 
     /// Maps whole exportable allocations of one device contiguously, without
@@ -491,13 +574,14 @@ impl PeerMapping {
             range.map(offset, bytes, handle)?;
             offset += bytes;
         }
-        range.grant(&[device])?;
+        range.grant(&[device], Protection::ReadWrite)?;
 
         Ok(Self {
             device,
             address: range.address(),
             bytes: total,
-            _range: range,
+            access: vec![device],
+            range,
         })
     }
 

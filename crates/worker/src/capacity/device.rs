@@ -8,15 +8,24 @@
 //! workspaces), communicator buffers and loaded modules. The caching
 //! allocator first returns unused cached blocks, so reusable cache does not
 //! count against the grant.
+//!
+//! NVML attributes memory held only through descriptors to no process, so
+//! the storages the worker's scope keeps at the host's Storage Server count
+//! as the worker's own on top of NVML's figure. Other scopes' retained
+//! memory is used memory the device no longer reports free.
+
+use std::sync::Arc;
 
 use uniserve_cuda::{DeviceId, Nvml};
 
 use crate::ffi::Function;
+use crate::storage::retained::Retained;
 use crate::{Error, Result};
 
 /// Per-process device storage measurements.
 pub(crate) struct DeviceBudget {
     nvml: Nvml,
+    retained: Arc<Retained>,
     /// `torch.cuda.synchronize(device)` and `torch.cuda.empty_cache()`,
     /// called before a measurement so blocks freed by completed work are
     /// returned to the device and process memory excludes reusable cache.
@@ -38,16 +47,21 @@ pub(crate) struct Budget {
 }
 
 impl DeviceBudget {
-    pub(crate) fn new(synchronize: Function, empty_cache: Function) -> Result<Self> {
+    pub(crate) fn new(
+        synchronize: Function,
+        empty_cache: Function,
+        retained: Arc<Retained>,
+    ) -> Result<Self> {
         Ok(Self {
             nvml: Nvml::init()?,
+            retained,
             synchronize,
             empty_cache,
         })
     }
 
     /// Device memory this process holds on `device`, after PyTorch returns
-    /// its unused cached blocks.
+    /// its unused cached blocks, with the storages its scope retains there.
     ///
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
@@ -55,14 +69,16 @@ impl DeviceBudget {
         self.synchronize
             .invoke(&[(&tvm_ffi::Any::from(i64::from(device.0))).into()])?;
         self.empty_cache.invoke(&[])?;
-        self.nvml
+        let process = self
+            .nvml
             .process_memory(device)
             .map_err(|error| match error {
                 uniserve_cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                     "NVML reports no device storage for this process on {device}"
                 )),
                 error => Error::Cuda(error),
-            })
+            })?;
+        Ok(process + self.retained.scope_bytes(device)?)
     }
 
     /// The storage grant on `device` for a rank allowed `fraction` of it.

@@ -15,8 +15,8 @@ use uniserve_cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
-    PitchedBatch, PrimaryContext, SourceOrder, Stream, Strided, StridedCopy, memcpy_async,
-    memset_d8, memset_d32, reclaim,
+    PitchedBatch, PrimaryContext, Protection, SourceOrder, Stream, Strided, StridedCopy,
+    memcpy_async, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -386,6 +386,69 @@ fn interprocess_event_process() {
     // SAFETY: this process uses no device after the reset.
     let devices = unsafe { PrimaryContext::reset_all() }.unwrap();
     assert!(devices.contains(&DEVICE));
+}
+
+/// A retainable allocation's descriptor keeps its physical memory alive
+/// after the allocation is released, as a Storage Server's does after its
+/// creator exits: later mappings of the descriptor read the contents and
+/// change their access in place, at an unchanged address.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn retained_memory_outlives_its_creator_and_changes_access_in_place() {
+    let _driver = exclusive_driver();
+    let stream = Stream::new(DEVICE).unwrap();
+    let granularity = DeviceAllocation::granularity(DEVICE).unwrap();
+    let mut host = PinnedBuffer::new(DEVICE, 4096).unwrap();
+    let pattern: Vec<u8> = (0..4096).map(|index| (index % 239) as u8).collect();
+    // SAFETY: no copy is pending on the buffer.
+    unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
+
+    let created = DeviceAllocation::retainable(DEVICE, granularity, &[]).unwrap();
+    let bytes = created.len();
+    // SAFETY: both ranges lie inside their allocations, which outlive the
+    // synchronization.
+    unsafe { memcpy_async(created.address(), host.address(), 4096, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    let descriptor = created.export_descriptor().unwrap().unwrap();
+    assert!(
+        DeviceAllocation::exportable(DEVICE, granularity, &[])
+            .unwrap()
+            .export_descriptor()
+            .unwrap()
+            .is_none()
+    );
+    drop(created);
+    reclaim::flush().unwrap();
+
+    let retained =
+        PeerMapping::import_retained(DEVICE, &descriptor, bytes, &[], Protection::ReadOnly)
+            .unwrap();
+    // SAFETY: as above; the mapping is read only for the copy.
+    unsafe {
+        memset_d8(host.address(), 0, 4096, &stream).unwrap();
+        memcpy_async(host.address(), retained.address(), 4096, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), pattern);
+
+    // A second mapping of the descriptor sees writes through the first.
+    let again = PeerMapping::import_retained(DEVICE, &descriptor, bytes, &[], Protection::ReadOnly)
+        .unwrap();
+
+    // Write access is granted in place, at the same address.
+    let address = retained.address();
+    retained.protect(Protection::ReadWrite).unwrap();
+    assert_eq!(retained.address(), address);
+    // SAFETY: the write lies inside the now read-write mapping.
+    unsafe {
+        memset_d8(retained.address(), 9, 16, &stream).unwrap();
+        memcpy_async(host.address(), again.address(), 4096, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let bytes = read(&host);
+    assert!(bytes[..16].iter().all(|byte| *byte == 9));
+    assert_eq!(&bytes[16..], &pattern[16..]);
+    retained.protect(Protection::ReadOnly).unwrap();
 }
 
 #[test]

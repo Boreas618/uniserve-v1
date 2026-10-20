@@ -201,67 +201,67 @@ impl CudaExports {
 
         let result = (|| -> Result<Option<Staged>> {
             let first = source.first().address();
-            let (spans, handle, size, offset, residency) =
-                match Storage::exportable_containing(first) {
-                    Some((memory, offset, residency)) => {
-                        let allocation = memory.allocation().ok_or_else(|| {
-                            Error::Invariant("an exportable allocation is device memory".into())
-                        })?;
-                        let shareable = allocation.export()?.ok_or_else(|| {
-                            Error::Invariant(
-                                "a registered exportable allocation has a handle".into(),
-                            )
-                        })?;
-                        let handle = AllocationHandle::of(&shareable);
-                        if let ShareableHandle::Descriptor(fd) = shareable {
-                            state.descriptor = Some(fd);
-                        }
-                        (
-                            source.clone(),
-                            handle,
-                            memory.bytes() as u64,
-                            offset,
-                            residency,
-                        )
+            // Memory registered as exportable is exported in place when it
+            // has a handle its readers can import: retained memory exports
+            // its descriptor, which reaches this host's readers only.
+            let in_place = match Storage::exportable_containing(first) {
+                Some((memory, offset, residency)) => memory
+                    .export(self.cross_host)?
+                    .map(|shareable| (memory, offset, residency, shareable)),
+                None => None,
+            };
+            let (spans, handle, size, offset, residency) = match in_place {
+                Some((memory, offset, residency, shareable)) => {
+                    let handle = AllocationHandle::of(&shareable);
+                    if let ShareableHandle::Descriptor(fd) = shareable {
+                        state.descriptor = Some(fd);
                     }
-                    None => {
-                        let pool = self.pool(device)?;
-                        let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
-                        let Some(chunk) = chunk else {
-                            return Ok(None);
-                        };
-                        state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
-                        let memory = Arc::clone(lock(&pool.pool).backing()?);
-                        // Readers map the whole allocation, whose length the
-                        // driver rounded up to its granularity.
-                        let storage_bytes = memory.bytes() as u64;
-                        let backing = memory as Arc<dyn Backing>;
-                        let shape: Vec<i64> =
-                            source.shape().iter().map(|&extent| extent as i64).collect();
-                        let payload = Spans::single(StorageView::contiguous(
-                            backing,
-                            chunk.payload_offset(),
-                            source.dtype(),
-                            &shape,
-                        )?)?;
+                    (
+                        source.clone(),
+                        handle,
+                        memory.bytes() as u64,
+                        offset,
+                        residency,
+                    )
+                }
+                None => {
+                    let pool = self.pool(device)?;
+                    let chunk = lock(&pool.pool).reserve(nbytes as usize, issue)?;
+                    let Some(chunk) = chunk else {
+                        return Ok(None);
+                    };
+                    state.allocation = Some((Arc::clone(&pool.pool), Arc::clone(&chunk)));
+                    let memory = Arc::clone(lock(&pool.pool).backing()?);
+                    // Readers map the whole allocation, whose length the
+                    // driver rounded up to its granularity.
+                    let storage_bytes = memory.bytes() as u64;
+                    let backing = memory as Arc<dyn Backing>;
+                    let shape: Vec<i64> =
+                        source.shape().iter().map(|&extent| extent as i64).collect();
+                    let payload = Spans::single(StorageView::contiguous(
+                        backing,
+                        chunk.payload_offset(),
+                        source.dtype(),
+                        &shape,
+                    )?)?;
 
-                        let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
-                        payload.plan_copy(source, &mut plan)?;
-                        state.submitted = true;
-                        // SAFETY: the chunk stays reserved and the producer's spans
-                        // stay retained (`copied`) until the export retires.
-                        unsafe { issue.copy_strided(&plan) }?;
-                        state.copied = Some(source.clone());
-                        // The pool lives as long as the transport.
-                        (
-                            payload,
-                            pool.handle,
-                            storage_bytes,
-                            chunk.payload_offset() as u64,
-                            Residency::Resident,
-                        )
-                    }
-                };
+                    let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
+                    payload.plan_copy(source, &mut plan)?;
+                    state.submitted = true;
+                    // SAFETY: the chunk stays reserved and the producer's spans
+                    // stay retained (`copied`) until the export retires.
+                    unsafe { issue.copy_strided(&plan) }?;
+                    state.copied = Some(source.clone());
+                    // The pool lives as long as the transport.
+                    (
+                        payload,
+                        pool.handle,
+                        storage_bytes,
+                        chunk.payload_offset() as u64,
+                        Residency::Resident,
+                    )
+                }
+            };
 
             // CUDA IPC events are host-local. Cross-host exports establish
             // readiness before sending their allocation handle to readers.

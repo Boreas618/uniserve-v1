@@ -358,6 +358,8 @@ mod tests {
                 },
                 None,
                 None,
+                "latent_banks",
+                &mut crate::storage::LocalMemory,
             )?,
         ))
     }

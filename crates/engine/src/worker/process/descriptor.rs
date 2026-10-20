@@ -119,6 +119,19 @@ impl WorkerProcessArgs {
         EXECUTABLE.into()
     }
 
+    /// The `uniserve-storage-server` executable installed beside the worker
+    /// executable `executable`, the environment's; `uniserve-storage-server`
+    /// on `PATH` when none is.
+    pub fn storage_server_beside(executable: &std::path::Path) -> std::path::PathBuf {
+        const EXECUTABLE: &str = "uniserve-storage-server";
+        let beside = executable.with_file_name(EXECUTABLE);
+        if beside.is_file() {
+            beside
+        } else {
+            EXECUTABLE.into()
+        }
+    }
+
     /// Parses a quantization policy as a command line states it: a JSON
     /// object such as `{"mode":"balanced"}`, where an empty object selects
     /// the model's default policy.
@@ -172,6 +185,10 @@ impl Default for WorkerProcessArgs {
         Self {
             worker_id: "worker".into(),
             executable: Self::default_executable(),
+            storage_server: Self::storage_server_beside(&Self::default_executable()),
+            // A launch the server does not name serves a deployment of its
+            // own, so independent launches never contest one claim.
+            deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
             launcher_timeout: std::time::Duration::from_secs(120),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
@@ -279,6 +296,7 @@ impl WorkerProcessArgs {
     pub(crate) fn launch_descriptor(
         &self,
         rank: u32,
+        storage: uniserve_ipc::StorageLaunch,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         expert_listen_fd: Option<std::os::fd::RawFd>,
@@ -328,6 +346,7 @@ impl WorkerProcessArgs {
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
+            storage,
             host: self.ranks[rank as usize].host.clone(),
             device: self.ranks[rank as usize].device.clone(),
             rank,
@@ -491,7 +510,16 @@ mod tests {
     use super::{WorkerProcessArgs, worker_environment};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use uniserve_ipc::{LaneConfig, LaneSpec};
+    use uniserve_ipc::{LaneConfig, LaneSpec, StorageLaunch};
+
+    /// A storage launch as a claim at a host's server states it.
+    fn storage() -> StorageLaunch {
+        StorageLaunch {
+            socket: "/run/uniserve/storage.sock".into(),
+            deployment: "model".into(),
+            claim: [7; 16],
+        }
+    }
 
     /// The head answers a rank's registration with its launch descriptor as
     /// one frame, so every field must survive the frame's encoding, with and
@@ -501,7 +529,7 @@ mod tests {
         let args = WorkerProcessArgs::default();
         for (rendezvous, generation) in [(None, None), (Some("127.0.0.1:29500"), Some(7))] {
             let descriptor = args
-                .launch_descriptor(0, rendezvous, generation, None)
+                .launch_descriptor(0, storage(), rendezvous, generation, None)
                 .expect("descriptor");
             let frame = uniserve_ipc::Frame::encode(&descriptor).expect("a frame");
             let received: uniserve_ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
@@ -521,7 +549,7 @@ mod tests {
             ..WorkerProcessArgs::default()
         };
         let descriptor = args
-            .launch_descriptor(0, None, None, None)
+            .launch_descriptor(0, storage(), None, None, None)
             .expect("descriptor");
         assert_eq!(
             serde_json::to_value(&descriptor.lane[0].call_kinds).expect("kinds"),

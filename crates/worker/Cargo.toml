@@ -11,12 +11,6 @@ license.workspace = true
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# The process of one worker. It loads the cdylib rather than linking the
-# runtime, so the process holds the one instance Python also loads.
-[[bin]]
-name = "uniserve-worker"
-path = "src/bin/uniserve-worker.rs"
-
 [dependencies]
 base64.workspace = true
 bytemuck.workspace = true
@@ -32,6 +26,7 @@ png.workspace = true
 pyo3-ffi = { version = "0.30.1", features = ["extension-module"] }
 rustix = { workspace = true, features = ["pipe", "fs", "system"] }
 serde_json.workspace = true
+sha2.workspace = true
 signal-hook-registry.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -41,6 +36,7 @@ tvm-ffi.workspace = true
 uniserve-core.workspace = true
 uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
+uniserve-storage.workspace = true
 uuid.workspace = true
 
 # A TVM-FFI library that Python GPU tests load to drive the native cache owners

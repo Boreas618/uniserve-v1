@@ -11,18 +11,22 @@
 //! waits for device work: owners must retire all device accesses to an
 //! allocation before dropping it.
 //!
-//! Exportable device allocations (`cuMemCreate` with a shareable handle) are
-//! recorded in a process-wide registry by address, with how long they live,
-//! so a transport can export any view of them in place
+//! Exportable device allocations (`cuMemCreate` with a shareable handle) and
+//! mappings of memory the host's Storage Server retains are recorded in a
+//! process-wide registry by address, with how long they live, so a
+//! transport can export any view of them in place
 //! ([`Storage::exportable_containing`]).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use std::os::fd::OwnedFd;
+
 use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{
-    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, SourceOrder, Strided,
+    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Protection, ShareableHandle,
+    SourceOrder, Strided,
 };
 
 use crate::ffi::{
@@ -43,8 +47,12 @@ enum Kind {
     /// Pageable host memory for CPU lanes. Boxed so its address is stable.
     Host(Box<[u8]>),
     /// Another process's (or peer device's) exported allocation mapped into
-    /// this process.
-    Mapped(PeerMapping),
+    /// this process; for memory the Storage Server retains, with the
+    /// descriptor that maps it, which this process exports it by.
+    Mapped {
+        mapping: PeerMapping,
+        descriptor: Option<OwnedFd>,
+    },
 }
 
 /// How long an exportable allocation lives, which its exports state so a
@@ -141,8 +149,79 @@ impl Storage {
     /// Adopt a mapping of exported device memory.
     pub(crate) fn mapped(mapping: PeerMapping) -> Arc<Self> {
         Arc::new(Self {
-            kind: Kind::Mapped(mapping),
+            kind: Kind::Mapped {
+                mapping,
+                descriptor: None,
+            },
         })
+    }
+
+    /// Map an allocation the host's Storage Server retains, `bytes` long,
+    /// through its `descriptor`, with `protection` for `device` and every
+    /// device in `access`. The mapping is registered as resident exportable
+    /// memory, which this process exports in place by its descriptor.
+    pub(crate) fn import(
+        descriptor: OwnedFd,
+        bytes: usize,
+        device: DeviceId,
+        access: &[DeviceId],
+        protection: Protection,
+    ) -> Result<Arc<Self>> {
+        let mapping = PeerMapping::import_retained(device, &descriptor, bytes, access, protection)?;
+        let address = mapping.address();
+        let storage = Arc::new(Self {
+            kind: Kind::Mapped {
+                mapping,
+                descriptor: Some(descriptor),
+            },
+        });
+        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&storage), Residency::Resident));
+        Ok(storage)
+    }
+
+    /// New device memory for the Storage Server to retain, of at least
+    /// `bytes`, mapped read-write for `device` and every device in `access`,
+    /// and the descriptor that publishes it. Contents are uninitialized.
+    ///
+    /// The creating allocation is released at once and the memory is used
+    /// through a mapping of its descriptor, as a later worker maps it, so
+    /// that retained memory is uniformly held through descriptors, which
+    /// NVML attributes to no process.
+    pub(crate) fn retainable(
+        device: DeviceId,
+        bytes: usize,
+        access: &[DeviceId],
+    ) -> Result<(Arc<Self>, OwnedFd)> {
+        let created = DeviceAllocation::retainable(device, bytes, access)?;
+        let descriptor = created.export_descriptor()?.ok_or_else(|| {
+            Error::Invariant("a retainable allocation exports a descriptor".into())
+        })?;
+        let mapped = descriptor
+            .try_clone()
+            .map_err(|error| Error::transport_source("duplicating a descriptor", error))?;
+        let storage = Self::import(mapped, created.len(), device, access, Protection::ReadWrite)?;
+        drop(created);
+        Ok((storage, descriptor))
+    }
+
+    /// A handle that exports the whole allocation in place to other
+    /// processes: an exportable allocation's own handle, or the descriptor
+    /// of retained memory, which reaches readers on this host only (an
+    /// imported allocation exports no handle of its own). `None` when the
+    /// allocation cannot be exported in place to the readers `cross_hosts`
+    /// says there are.
+    pub(crate) fn export(&self, cross_hosts: bool) -> Result<Option<ShareableHandle>> {
+        match &self.kind {
+            Kind::Device(allocation) => Ok(allocation.export()?),
+            Kind::Mapped {
+                descriptor: Some(descriptor),
+                ..
+            } if !cross_hosts => descriptor
+                .try_clone()
+                .map(|descriptor| Some(ShareableHandle::Descriptor(descriptor)))
+                .map_err(|error| Error::transport_source("duplicating a descriptor", error)),
+            _ => Ok(None),
+        }
     }
 
     /// The device allocation, `None` for host memory and mappings.
@@ -170,7 +249,7 @@ impl Storage {
     /// slice is alive.
     pub unsafe fn host_bytes(&self) -> Option<&[u8]> {
         match &self.kind {
-            Kind::Device(_) | Kind::Mapped(_) => None,
+            Kind::Device(_) | Kind::Mapped { .. } => None,
             Kind::Pinned(buffer) => {
                 // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which
                 // the slice borrows; the caller excludes concurrent writers.
@@ -183,17 +262,25 @@ impl Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        if let Kind::Device(allocation) = &self.kind
-            && allocation.handle_type().is_some()
-        {
+        let registered = match &self.kind {
+            Kind::Device(allocation) if allocation.handle_type().is_some() => {
+                Some(allocation.address())
+            }
+            Kind::Mapped {
+                mapping,
+                descriptor: Some(_),
+            } => Some(mapping.address()),
+            _ => None,
+        };
+        if let Some(address) = registered {
             let mut registry = lock(&EXPORTABLE);
             // A new allocation may already reuse the address; remove only a
             // dead entry.
             if registry
-                .get(&allocation.address())
+                .get(&address)
                 .is_some_and(|(entry, _)| entry.strong_count() == 0)
             {
-                registry.remove(&allocation.address());
+                registry.remove(&address);
             }
         }
     }
@@ -203,7 +290,7 @@ impl Backing for Storage {
     fn device(&self) -> MemoryKind {
         match &self.kind {
             Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
-            Kind::Mapped(mapping) => MemoryKind::Cuda(mapping.device()),
+            Kind::Mapped { mapping, .. } => MemoryKind::Cuda(mapping.device()),
             Kind::Pinned(_) => MemoryKind::PinnedHost,
             Kind::Host(_) => MemoryKind::Host,
         }
@@ -212,7 +299,7 @@ impl Backing for Storage {
     fn address(&self) -> u64 {
         match &self.kind {
             Kind::Device(allocation) => allocation.address(),
-            Kind::Mapped(mapping) => mapping.address(),
+            Kind::Mapped { mapping, .. } => mapping.address(),
             Kind::Pinned(buffer) => buffer.address(),
             Kind::Host(bytes) => bytes.as_ptr() as u64,
         }
@@ -221,7 +308,7 @@ impl Backing for Storage {
     fn bytes(&self) -> usize {
         match &self.kind {
             Kind::Device(allocation) => allocation.len(),
-            Kind::Mapped(mapping) => mapping.len(),
+            Kind::Mapped { mapping, .. } => mapping.len(),
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),
         }

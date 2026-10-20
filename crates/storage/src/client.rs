@@ -167,8 +167,7 @@ impl Client {
         Ok(())
     }
 
-    /// The reply to a request that answers with `expected`, or the server's
-    /// error.
+    /// The answer, unless the server answered with an error.
     fn expect(answer: Answer) -> Result<Answer> {
         match answer.reply {
             Reply::Error { kind, message } => Err(Error::Server { kind, message }),
@@ -252,6 +251,14 @@ impl Client {
         match Self::expect(self.call(&Request::Release { keys }, &[])?)?.reply {
             Reply::Released => Ok(()),
             other => Err(unexpected("release", &other)),
+        }
+    }
+
+    /// See [`Request::Retire`]. Returns how many tensors were released.
+    pub fn retire(&mut self, deployment: String) -> Result<u64> {
+        match Self::expect(self.call(&Request::Retire { deployment }, &[])?)?.reply {
+            Reply::Retired { released } => Ok(released),
+            other => Err(unexpected("retire", &other)),
         }
     }
 

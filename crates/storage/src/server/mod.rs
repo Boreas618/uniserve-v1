@@ -382,6 +382,7 @@ impl Server {
             .ok_or_else(|| invalid("a request precedes the client's hello"))?;
         match (request, role) {
             (Request::List, _) => Ok(Outcome::Reply(Reply::Listing(self.listing()), Vec::new())),
+            (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
             (Request::Claim { scopes }, Role::Head { deployment }) => {
                 self.claim(id, &deployment, scopes)
             }
@@ -409,8 +410,8 @@ impl Server {
                     }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
-                    Request::List | Request::Claim { .. } => {
-                        Err(invalid("a worker cannot claim a deployment"))
+                    Request::List | Request::Claim { .. } | Request::Retire { .. } => {
+                        Err(invalid("a worker cannot claim or retire a deployment"))
                     }
                 }
             }
@@ -506,6 +507,40 @@ impl Server {
         }
         tracing::info!(deployment, "a head claimed the deployment");
         Ok(Outcome::Reply(Reply::Claimed { claim }, Vec::new()))
+    }
+
+    /// `retire`: see [`Request::Retire`]. Processes that still map the
+    /// deployment's memory keep it alive until they end; nobody takes new
+    /// access to it.
+    fn retire(&mut self, deployment: &str) -> Result<Outcome, (ErrorKind, String)> {
+        if let Some(entry) = self.deployments.get(deployment)
+            && entry
+                .head
+                .is_some_and(|head| self.clients.contains_key(&head))
+        {
+            return Err((
+                ErrorKind::Claimed,
+                format!("deployment {deployment} has a connected head"),
+            ));
+        }
+        self.deployments.remove(deployment);
+        let released: Vec<Key> = self
+            .tensors
+            .iter_mut()
+            .filter_map(|(key, tensor)| {
+                tensor.scopes.retain(|scope| scope.deployment != deployment);
+                tensor.scopes.is_empty().then_some(*key)
+            })
+            .collect();
+        let count = released.len() as u64;
+        for key in released {
+            self.remove_tensor(&key);
+        }
+        tracing::info!(deployment, released = count, "retired a deployment");
+        Ok(Outcome::Reply(
+            Reply::Retired { released: count },
+            Vec::new(),
+        ))
     }
 
     /// Whether `holder` is a worker of its deployment's current head.
@@ -1018,6 +1053,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Promote { .. } => "promote",
         Request::Release { .. } => "release",
         Request::List => "list",
+        Request::Retire { .. } => "retire",
     }
 }
 
