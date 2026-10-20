@@ -19,7 +19,7 @@
 //!    [`ReadoutPlan::assemble`] turns into the official response, with the
 //!    `x_candidate_mass` extension on every answer.
 //!
-//! [`ServingRuntime::systemone`](crate::serving::ServingRuntime::systemone)
+//! [`Engine::systemone`](crate::engine::Engine::systemone)
 //! runs these steps for one request body.
 //!
 //! The readout matches the reference DJev encoder token for token for every

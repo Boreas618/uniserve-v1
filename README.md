@@ -96,7 +96,7 @@ See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for chec
 
 A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/minimax_h3/minimax_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
-The metrics endpoint publishes serving lifecycle state as `uniserve:serving_requests`, labeled by served-model name, profile, description, and state. `active` is the instantaneous in-flight count; `accepted`, `scheduled`, `finished`, `rejected`, `cancelled`, `aborted`, and `failed` are cumulative for the running serving runtime. Scheduler, worker, request-latency, and HTTP metrics share the same OpenMetrics response.
+The metrics endpoint publishes scheduler, worker, request and HTTP metrics in one OpenMetrics response. Each finished request is counted in `uniserve:request_success_total` under its `finished_reason` (`stop`, `length`, `abort`, `error`), with its latency, queue time and token counts in the request histograms, labeled by model name and the data-parallel rank (`engine`) that served it; running and waiting requests are the scheduler gauges `uniserve:num_requests_running` and `uniserve:num_requests_waiting`.
 
 ## Serving options
 

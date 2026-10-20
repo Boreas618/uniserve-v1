@@ -23,7 +23,7 @@ pub struct RuntimeTimings {
 
 /// Runtime event consumed by the HTTP response layer.
 ///
-/// A stream returned by [`ServingRuntime`](super::ServingRuntime) yields at most one
+/// A stream returned by [`Engine`](crate::engine::Engine) yields at most one
 /// terminal variant (`Finished`, `Rejected`, `Cancelled`, `Aborted`, or `Failed`) or one
 /// error, and then ends.
 #[derive(Debug, Clone)]

@@ -335,7 +335,7 @@ fn chat_request(
 }
 
 /// Resolves a chat request's input images under the default image policy
-/// and preprocesses the request with them, as `ServingRuntime::generate_chat`
+/// and preprocesses the request with them, as `Engine::generate_chat`
 /// does.
 fn preprocess_image_chat(
     processor: &InputProcessor,

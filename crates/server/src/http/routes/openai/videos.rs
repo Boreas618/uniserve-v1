@@ -61,7 +61,7 @@ pub(crate) async fn videos_sync(
 
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
 
-    let (_, mut stream) = match state.runtime().generate_video(request_id, body).await {
+    let (_, mut stream) = match state.engine().generate_video(request_id, body).await {
         Ok(generation) => generation,
         Err(error) => return error.into_response(),
     };
@@ -270,17 +270,9 @@ pub(crate) async fn videos_create(
 
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
 
-    let (prepared, mut stream) = match state
-        .runtime()
-        .generate_video(request_id.clone(), body)
-        .await
-    {
+    let (prepared, mut stream) = match state.engine().generate_video(request_id, body).await {
         Ok(generation) => generation,
         Err(error) => return error.into_response(),
-    };
-    let Some(prepared) = prepared else {
-        return ApiError::server_error("the video request ended before it was prepared")
-            .into_response();
     };
     let sampling = prepared.request.sampling;
 
@@ -302,8 +294,8 @@ pub(crate) async fn videos_create(
         completed_steps: 0,
         // The deployment's denoiser fixes every request's step count.
         total_steps: state
-            .runtime()
-            .model()
+            .engine()
+            .processor()
             .video_service()
             .map_or(0, |video| video.num_inference_steps()),
         inference_time_s: None,
@@ -323,23 +315,20 @@ pub(crate) async fn videos_create(
         let mut clock = StageClock::default();
         let result = async {
             let mut collector = ArtifactCollector::default();
-            let mut cancelled = false;
             loop {
-                // Cancellation (from `VideoJobs::delete` or `cancel_all`) is
-                // forwarded to the runtime once. The token stays cancelled, so
-                // the `cancelled` flag disables the branch afterwards and the
-                // loop keeps draining the stream until its terminal event. A
-                // failed runtime cancel ends the task with
-                // `cancellation_failed` instead.
+                // Cancellation (from `VideoJobs::delete` or `cancel_all`) ends
+                // the task, and returning drops the stream, which cancels the
+                // request in its engine core.
                 let event = tokio::select! {
                     event = stream.next() => event,
-                    _ = cancellation.cancelled(), if !cancelled => {
-                        state.runtime().cancel(request_id.clone()).await.map_err(|error| VideoFailure { code: "cancellation_failed", message: error.to_string() })?;
-                        cancelled = true;
-                        continue;
+                    () = cancellation.cancelled() => {
+                        return Err(job_failure(VideoStreamError::Cancelled));
                     }
                 };
-                let event = event.transpose().map_err(|error| VideoFailure { code: "generation_failed", message: error.to_string() })?;
+                let event = event.transpose().map_err(|error| VideoFailure {
+                    code: "generation_failed",
+                    message: error.to_string(),
+                })?;
                 if let Some(event) = &event {
                     clock.observe(event);
                 }
@@ -356,9 +345,7 @@ pub(crate) async fn videos_create(
                     _ => {}
                 }
                 if let ControlFlow::Break(outcome) = collector.push(event) {
-                    return outcome
-                        .map(|artifact| artifact.media)
-                        .map_err(job_failure);
+                    return outcome.map(|artifact| artifact.media).map_err(job_failure);
                 }
             }
         }
@@ -592,7 +579,7 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
 /// and the settings of the job store in `crate::video_jobs`.
 pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
     let mut value = serde_json::json!({"model": state.served_model_name()});
-    value["video"] = state.runtime().model().video_capabilities();
+    value["video"] = state.engine().processor().video_capabilities();
     let jobs = state.videos.settings();
     value["video_jobs"] = serde_json::json!({
         "max_retained_bytes": jobs.max_bytes,

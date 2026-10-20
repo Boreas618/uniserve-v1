@@ -5,7 +5,7 @@ use crate::openai::ChatCompletionRequest;
 /// Public response metadata retained by HTTP response construction.
 ///
 /// The chat-completions route handler builds this before calling
-/// `ServingRuntime::generate_chat`, which takes the request by value, and
+/// `Engine::generate_chat`, which takes the request by value, and
 /// passes it to `collect_chat_completion` or `chat_completion_chunk_stream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {

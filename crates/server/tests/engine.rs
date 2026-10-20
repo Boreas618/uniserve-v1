@@ -1,4 +1,5 @@
-//! Frontend identity, cancellation, and drain across real preprocessing and output.
+//! Requests through the engine with real preprocessing and output assembly:
+//! admission rejections, request timing, and the request metrics.
 
 #![cfg(test)]
 
@@ -8,30 +9,28 @@ use std::sync::Arc;
 use futures::{StreamExt, poll};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer};
-use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
-use uniserve_server::engine_client::EngineClient;
+use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
+use uniserve_server::Engine;
 use uniserve_server::openai::ChatCompletionRequest;
-use uniserve_server::options::ImageFetchOptions;
+use uniserve_server::options::{ImageFetchOptions, LoggingOptions};
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::ImageFetcher;
-use uniserve_server::serving::{
-    FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime, StopCause,
-};
+use uniserve_server::serving::{FinishStatus, InputProcessor, RequestOutput, RequestRenderer};
 
-/// Builds a serving runtime over a default `SimEngine`.
-fn runtime() -> ServingRuntime {
+/// Builds an engine over a default `SimEngine`.
+fn runtime() -> Engine {
     runtime_with_worker(SimEngine::new())
 }
 
-/// Builds a Qwen3 serving runtime whose engine drives `worker` in process
-/// through `SimExecutor`.
-fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
+/// Builds a Qwen3 engine whose engine core drives `worker` in process through
+/// `SimExecutor`.
+fn runtime_with_worker(worker: SimEngine) -> Engine {
     runtime_for_engine_model(worker, "sim-model")
 }
 
-/// Builds a Qwen3 serving runtime whose engine, named `engine_model`, drives
+/// Builds a Qwen3 engine whose engine core, named `engine_model`, drives
 /// `worker` in process through `SimExecutor`.
 ///
 /// The engine's model name labels the process-wide request metrics, so a test
@@ -39,7 +38,7 @@ fn runtime_with_worker(worker: SimEngine) -> ServingRuntime {
 /// below 128 to one token whose ID is the code point; `<|im_end|>` is added
 /// as ID 128, which the model config names as its end-of-sequence token. The
 /// chat template renders only the first message's content.
-fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRuntime {
+fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> Engine {
     let vocabulary = (0_u32..128)
         .map(|id| (char::from_u32(id).unwrap().to_string(), id))
         .collect::<Vocab>();
@@ -55,13 +54,11 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
     tokenizer.save(&path, false).unwrap();
     let tokenizer = Arc::new(HuggingFaceTokenizer::new(&path).unwrap());
 
-    let client = Arc::new(
-        EngineClient::connect_with_executor(
-            EngineConfig::sim(engine_model),
-            Box::new(SimExecutor::new(worker)),
-        )
-        .unwrap(),
-    );
+    let core = EngineCore::with_executor(
+        EngineConfig::sim(engine_model),
+        Box::new(SimExecutor::new(worker)),
+    )
+    .unwrap();
     let processor = InputProcessor::new(
         ModelConfig {
             served_name: "sim-model".to_string(),
@@ -81,14 +78,18 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
             .unwrap(),
         ),
         uniserve_server::serving::WorkerCapabilities {
-            limits: client.generation_limits(),
+            limits: core.generation_limits(),
         },
         false,
     )
     .unwrap();
 
     let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
-    ServingRuntime::new(processor, client, images, false)
+    let logging = LoggingOptions {
+        log_requests: false,
+        log_stats: false,
+    };
+    Engine::new(vec![core], processor, images, None, &logging).unwrap()
 }
 
 /// Greedy chat request of at most `max_completion_tokens` tokens that may
@@ -111,137 +112,9 @@ fn request() -> ChatCompletionRequest {
     request_with(8, &["aa"])
 }
 
-/// A request identifier is refused while a request holding it is live and
-/// becomes reusable once the finished request leaves the runtime, which
-/// `drain` waits for. Dropping the first, already exhausted stream afterwards
-/// must not affect the second request that reuses the identifier.
-#[tokio::test]
-async fn stop_completion_releases_identity_without_dropping_the_exhausted_stream() {
-    let runtime = runtime();
-    let mut first = runtime
-        .generate_chat("same-id".into(), request())
-        .await
-        .unwrap();
-    assert!(matches!(
-        runtime.generate_chat("same-id".into(), request()).await,
-        Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
-    ));
-
-    let mut text = String::new();
-    let mut output_tokens = None;
-    loop {
-        match first.next().await.unwrap().unwrap() {
-            RequestOutput::TextDelta { text: delta, .. } => text.push_str(&delta),
-            RequestOutput::Usage {
-                visible_output_tokens,
-                internal_tokens,
-                ..
-            } => {
-                output_tokens = Some(visible_output_tokens + internal_tokens);
-            }
-            RequestOutput::Finished { reason, .. } => {
-                assert_eq!(
-                    reason,
-                    FinishStatus::Stop {
-                        cause: Some(StopCause::Text("aa".to_string()))
-                    }
-                );
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    // The matched stop string is withheld from the visible text, but both
-    // sampled tokens count toward usage.
-    assert_eq!(text, "");
-    assert_eq!(output_tokens, Some(2));
-    runtime.drain().await;
-    assert_eq!(runtime.metrics_snapshot().finished, 1);
-
-    let mut second = runtime
-        .generate_chat("same-id".into(), request())
-        .await
-        .unwrap();
-    // A retained exhausted stream must not cancel a reused external identity.
-    drop(first);
-    while let Some(event) = second.next().await {
-        if let RequestOutput::Finished { .. } = event.unwrap() {
-            break;
-        }
-    }
-    assert_eq!(runtime.metrics_snapshot().finished, 2);
-    runtime.shutdown().await.unwrap();
-}
-
-/// Cancel, abort, and a dropped `generate_chat` future each end a request
-/// whose preprocessing has not started. A control yields a single terminal
-/// event, abort takes precedence over an earlier or later cancel, and a
-/// disconnect is recorded as a cancellation.
-#[test]
-fn controls_and_disconnection_release_requests_during_preprocessing() {
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        .build()
-        .unwrap();
-    executor.block_on(async {
-        let runtime = runtime();
-
-        // Occupy the real blocking pool so preprocessing remains queued. This
-        // controls the execution environment without replacing the tokenizer.
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let occupied = tokio::task::spawn_blocking(move || {
-            let _ = ready_tx.send(());
-            let _ = release_rx.recv();
-        });
-        ready_rx.await.unwrap();
-
-        // Each request adds to the cumulative count of its own outcome.
-        for (id, aborted, cancelled) in [("cancel", 0, 1), ("abort", 1, 1), ("disconnect", 1, 2)] {
-            // One poll registers the request before it waits for the blocking
-            // pool; the registered identifier already refuses a duplicate.
-            let mut pending = Box::pin(runtime.generate_chat(id.into(), request()));
-            assert!(poll!(pending.as_mut()).is_pending());
-            assert_eq!(runtime.metrics_snapshot().active, 1);
-            assert!(matches!(
-                runtime.generate_chat(id.into(), request()).await,
-                Err(uniserve_server::openai::ApiError::InvalidRequest { .. })
-            ));
-            if id == "disconnect" {
-                drop(pending);
-            } else {
-                runtime.cancel(id).await.unwrap();
-                if id == "abort" {
-                    runtime.abort(id).await.unwrap();
-                    runtime.cancel(id).await.unwrap();
-                }
-                let mut stream = pending.await.unwrap();
-                let terminal = stream.next().await.unwrap().unwrap();
-                assert!(if id == "abort" {
-                    matches!(terminal, RequestOutput::Aborted { .. })
-                } else {
-                    matches!(terminal, RequestOutput::Cancelled { .. })
-                });
-                assert!(stream.next().await.is_none());
-            }
-            runtime.drain().await;
-            let metrics = runtime.metrics_snapshot();
-            assert_eq!((metrics.aborted, metrics.cancelled), (aborted, cancelled));
-            assert_eq!(metrics.active, 0);
-        }
-
-        release_tx.send(()).unwrap();
-        occupied.await.unwrap();
-        runtime.shutdown().await.unwrap();
-    });
-}
-
 /// A chat prompt that exceeds the total capacity of a two-unit prefix cache is
 /// returned as a stream and then rejected by engine admission. Collecting the
-/// completion must report that rejection as HTTP 400 and count the request
-/// as rejected.
+/// completion must report that rejection as HTTP 400.
 #[tokio::test]
 async fn chat_admission_rejection_remains_a_bad_request() {
     let mut worker = SimEngine::new();
@@ -275,7 +148,6 @@ async fn chat_admission_rejection_remains_a_bad_request() {
             .unwrap_err();
 
     assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(runtime.metrics_snapshot().rejected, 1);
     runtime.shutdown().await.unwrap();
 }
 

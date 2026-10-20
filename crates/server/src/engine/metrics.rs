@@ -1,25 +1,32 @@
-//! Prometheus metrics for engine-reported scheduler statistics and
-//! completed request lifecycles.
+//! Prometheus metrics for engine-reported scheduler statistics and finished
+//! requests.
 //!
-//! `EngineClient` (in `in_process`) runs a once-per-second task that asks the
-//! engine's `SchedulerStatsReporter` for a `SchedulerStats` snapshot and
-//! passes it to [`record_scheduler_stats`] as engine `0`. The reporter already
-//! turns cumulative scheduler counters into per-interval increments; this
-//! module only maps fields onto the `SchedulerMetrics` families.
+//! `Engine::new` runs a once-per-second task per engine core that asks the
+//! core's `SchedulerStatsReporter` for a `SchedulerStats` snapshot and passes
+//! it to [`record_scheduler_stats`] under the core's data-parallel rank. The
+//! reporter already turns cumulative scheduler counters into per-interval
+//! increments; this module only maps fields onto the `SchedulerMetrics`
+//! families.
 //!
-//! When a request the engine accepted completes, the request registry maps
-//! its final statistics onto the `RequestMetrics` families: its outcome
-//! through `record_request_outcome`, and its token usage through
-//! `record_request_usage` when its output reported final usage.
+//! [`RequestStats`] wraps the output stream of every request an engine core
+//! accepted and records the request once into the `RequestMetrics` families:
+//! its outcome, and its token usage when its output reported final usage.
 
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
+use std::time::Instant;
+
+use futures::{Stream, StreamExt as _};
+use tracing::info;
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, RequestMetrics,
-    SchedulerMetrics, WaitingReasonLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, METRICS,
+    RequestMetrics, SchedulerMetrics, WaitingReasonLabels,
 };
 
-use super::requests::RequestStats;
-use crate::serving::FinishStatus;
+use crate::serving::{
+    FinishStatus, RequestOutput, RequestOutputStream, RuntimeTimings, ServeRequestId,
+};
 use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
@@ -32,7 +39,7 @@ const WAITING_REASON_CAPACITY: &str = "capacity";
 /// credits) and lifetime maxima (`max_queue_wait_us`, `peak_credits`) are set
 /// on gauges. `stats` must therefore be an interval snapshot: passing a
 /// cumulative one, or the same snapshot twice, double-counts every counter.
-pub fn record_scheduler_stats(
+pub(crate) fn record_scheduler_stats(
     metrics: &SchedulerMetrics,
     model_name: impl Into<String>,
     engine: u32,
@@ -339,7 +346,7 @@ pub fn record_scheduler_stats(
 }
 
 /// Returns the `finished_reason` label value of a finish status.
-pub(crate) fn finished_reason_name(status: &FinishStatus) -> &'static str {
+fn finished_reason_name(status: &FinishStatus) -> &'static str {
     match status {
         FinishStatus::Stop { .. } => "stop",
         FinishStatus::Length => "length",
@@ -349,57 +356,182 @@ pub(crate) fn finished_reason_name(status: &FinishStatus) -> &'static str {
     }
 }
 
-/// Records the outcome of one completed request into the request metric
-/// families.
+/// The output stream of one request an engine core accepted, recording the
+/// request into the request metric families once.
 ///
-/// Counts the request under `finished_reason` and observes its end-to-end
-/// latency, measured from the start of its lifecycle, and its queue time when
-/// the engine reported scheduling timestamps.
-pub(crate) fn record_request_outcome(
-    metrics: &RequestMetrics,
-    labels: &EngineLabels,
-    finished_reason: &'static str,
-    stats: &RequestStats,
-) {
-    metrics
-        .request_success
-        .get_or_create(&FinishedReasonLabels {
-            model_name: labels.model_name.clone(),
-            engine: labels.engine,
-            finished_reason,
-        })
-        .inc();
-    metrics
-        .e2e_request_latency_seconds
-        .get_or_create(labels)
-        .observe(seconds(stats.timings.total_us));
-    if let Some(queue_us) = stats.timings.queue_us {
+/// Every event passes through unchanged. The request is recorded when its
+/// stream ends: under its finish status when it finished, under `abort` when
+/// it was cancelled or aborted or the stream was dropped before its terminal
+/// event (a client that disconnected), and under `error` when it failed, its
+/// stream yielded an error, or its stream ended without a terminal event. A
+/// rejected request, which consumed no engine work, is not recorded. The
+/// token metrics count only a request whose output reported final usage.
+pub(crate) struct RequestStats {
+    inner: RequestOutputStream,
+    labels: EngineLabels,
+    started: Instant,
+    /// The request whose summary line is logged when it ends, when request
+    /// logging is on.
+    log: Option<ServeRequestId>,
+    /// Prompt and generated tokens and phase timings of the final `Usage`
+    /// event; `None` until it arrives.
+    usage: Option<Usage>,
+    /// Queue time from the engine's scheduling timestamps, kept for a request
+    /// that ends before reporting usage.
+    queue_us: Option<u64>,
+    recorded: bool,
+}
+
+/// The final usage of one request.
+struct Usage {
+    prompt_tokens: u32,
+    /// Generated tokens, the visible and internal ones together, as the
+    /// engine counts its completion tokens.
+    generation_tokens: u32,
+    timings: RuntimeTimings,
+}
+
+impl RequestStats {
+    /// Wraps the output of a request accepted at `started`, recorded under
+    /// `labels`.
+    pub(crate) fn new(
+        inner: RequestOutputStream,
+        labels: EngineLabels,
+        started: Instant,
+        log: Option<ServeRequestId>,
+    ) -> Self {
+        Self {
+            inner,
+            labels,
+            started,
+            log,
+            usage: None,
+            queue_us: None,
+            recorded: false,
+        }
+    }
+
+    /// Folds one output event into the request's statistics, recording the
+    /// request at its terminal event.
+    fn observe(&mut self, event: &RequestOutput) {
+        match event {
+            // `queued_at` and `scheduled_at` are engine wall-clock UNIX
+            // seconds; a negative difference is clamped to zero.
+            RequestOutput::Scheduled {
+                queued_at,
+                scheduled_at,
+                ..
+            } => {
+                self.queue_us = queued_at
+                    .zip(*scheduled_at)
+                    .map(|(queued, scheduled)| ((scheduled - queued).max(0.0) * 1e6) as u64);
+            }
+            RequestOutput::Usage {
+                prompt_tokens,
+                visible_output_tokens,
+                internal_tokens,
+                timings,
+                ..
+            } => {
+                self.usage = Some(Usage {
+                    prompt_tokens: *prompt_tokens,
+                    generation_tokens: visible_output_tokens.saturating_add(*internal_tokens),
+                    timings: timings.clone(),
+                });
+            }
+            RequestOutput::Finished { reason, .. } => self.record(finished_reason_name(reason)),
+            RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. } => self.record("abort"),
+            RequestOutput::Failed { .. } => self.record("error"),
+            RequestOutput::Rejected { .. } => self.recorded = true,
+            _ => {}
+        }
+    }
+
+    /// Records the request under `finished_reason` unless it was recorded
+    /// already.
+    ///
+    /// The end-to-end latency is the larger of the reported total and the
+    /// time since the request started.
+    fn record(&mut self, finished_reason: &'static str) {
+        if std::mem::replace(&mut self.recorded, true) {
+            return;
+        }
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        let metrics = &METRICS.request;
+        let total_us = self
+            .usage
+            .as_ref()
+            .map_or(elapsed_us, |usage| usage.timings.total_us.max(elapsed_us));
+        let queue_us = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.timings.queue_us)
+            .or(self.queue_us);
         metrics
-            .request_queue_time_seconds
-            .get_or_create(labels)
-            .observe(seconds(queue_us));
+            .request_success
+            .get_or_create(&FinishedReasonLabels {
+                model_name: self.labels.model_name.clone(),
+                engine: self.labels.engine,
+                finished_reason,
+            })
+            .inc();
+        metrics
+            .e2e_request_latency_seconds
+            .get_or_create(&self.labels)
+            .observe(seconds(total_us));
+        if let Some(queue_us) = queue_us {
+            metrics
+                .request_queue_time_seconds
+                .get_or_create(&self.labels)
+                .observe(seconds(queue_us));
+        }
+        if let Some(usage) = &self.usage {
+            record_usage(metrics, &self.labels, usage);
+        }
+        if let Some(request_id) = &self.log {
+            info!(
+                %request_id,
+                finished_reason,
+                prompt_tokens = self.usage.as_ref().map_or(0, |usage| usage.prompt_tokens),
+                output_tokens = self.usage.as_ref().map_or(0, |usage| usage.generation_tokens),
+                latency_s = seconds(total_us),
+                "request finished"
+            );
+        }
     }
 }
 
-/// Records the final usage of one completed request into the request metric
-/// families.
+impl Stream for RequestStats {
+    type Item = crate::serving::Result<RequestOutput>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let next = ready!(self.inner.poll_next_unpin(cx));
+        match &next {
+            Some(Ok(event)) => self.observe(event),
+            Some(Err(_)) | None => self.record("error"),
+        }
+        Poll::Ready(next)
+    }
+}
+
+impl Drop for RequestStats {
+    /// Records a request whose stream was dropped before its terminal event
+    /// as aborted.
+    fn drop(&mut self) {
+        self.record("abort");
+    }
+}
+
+/// Records the final usage of one request into the request metric families.
 ///
-/// `stats` must carry the totals of the request's `Usage` event. Its prompt
-/// and generated tokens are added to the cumulative token counters and
-/// observed in the per-request token histograms. Time to first token is
-/// measured from the start of the request's lifecycle to its first visible
-/// output, and observed only for a request that generated tokens and produced
-/// visible output.
-pub(crate) fn record_request_usage(
-    metrics: &RequestMetrics,
-    labels: &EngineLabels,
-    stats: &RequestStats,
-) {
-    // Hidden protocol tokens are generated tokens too; together with the
-    // visible ones they make up the engine's completion tokens.
-    let prompt_tokens = u64::from(stats.prompt_tokens);
-    let generation_tokens =
-        u64::from(stats.visible_output_tokens) + u64::from(stats.internal_tokens);
+/// Its prompt and generated tokens are added to the cumulative token counters
+/// and observed in the per-request token histograms. Time to first token is
+/// measured from the request's start to its first visible output, and
+/// observed only for a request that generated tokens and produced visible
+/// output.
+fn record_usage(metrics: &RequestMetrics, labels: &EngineLabels, usage: &Usage) {
+    let prompt_tokens = u64::from(usage.prompt_tokens);
+    let generation_tokens = u64::from(usage.generation_tokens);
 
     metrics
         .prompt_tokens
@@ -426,7 +558,7 @@ pub(crate) fn record_request_usage(
         .observe(generation_tokens as f64);
 
     if generation_tokens > 0
-        && let Some(first_output_us) = stats.timings.first_visible_output_us
+        && let Some(first_output_us) = usage.timings.first_visible_output_us
     {
         metrics
             .time_to_first_token_seconds

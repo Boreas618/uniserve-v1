@@ -337,10 +337,6 @@ pub(super) async fn assemble_chat_event_stream(
                         scheduled_at: Some(scheduled_at),
                     })
                     .await;
-                    event_context
-                        .metrics
-                        .scheduled
-                        .fetch_add(1, Ordering::Relaxed);
                 }
                 accepted = true;
                 continue;
@@ -782,11 +778,6 @@ pub(super) async fn assemble_event_stream(
                 } else {
                     state.pending_scheduled = Some((queued_at, scheduled_at));
                 }
-
-                event_context
-                    .metrics
-                    .scheduled
-                    .fetch_add(1, Ordering::Relaxed);
             }
             EngineCoreOutput::PromptLogprobs { positions } => {
                 state.prompt_positions.extend(positions);
@@ -1143,7 +1134,6 @@ pub(super) async fn assemble_media_event_stream(
                 scheduled_at,
             } => {
                 queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64);
-                context.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
                 y.yield_ok(RequestOutput::Scheduled {
                     request_id: request_id.clone(),
                     queued_at: Some(queued_at),

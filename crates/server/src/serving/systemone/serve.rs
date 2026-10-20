@@ -1,6 +1,6 @@
 //! Serving one System One request on the block-diffusion engine.
 //!
-//! [`ServingRuntime::systemone`] validates the request body, resolves its
+//! [`Engine::systemone`] validates the request body, resolves its
 //! `x_images`, plans the readout on the blocking pool, and submits one engine
 //! readout per planned prompt. Each readout prefills its prompt, with every
 //! image's features written where its soft-token placeholders stand, and
@@ -19,22 +19,21 @@ use uniserve_core::{
     RequestId, SamplingParams,
 };
 
+use crate::engine::Engine;
 use crate::serving::diffusion_gemma::engine_images;
 use crate::serving::media;
 use crate::serving::systemone::error::{LocItem, SystemOneError, ValidationIssue};
 use crate::serving::systemone::plan::{ImageSize, ReadoutPrompt};
 use crate::serving::systemone::{SystemOneRequest, SystemOneResponse};
-use crate::serving::{ServeRequestId, ServingRuntime};
 
-impl ServingRuntime {
-    /// Returns whether this runtime serves `POST /v1/systemone`.
+impl Engine {
+    /// Returns whether this engine serves `POST /v1/systemone`.
     pub fn serves_readout(&self) -> bool {
-        self.readout.is_some()
+        self.readout_encoder().is_some()
     }
 
     /// Answers one System One request body.
     ///
-    /// Engine requests are registered as `{request_id}-{prompt index}`.
     /// Dropping the returned future cancels every readout still running.
     ///
     /// # Errors
@@ -44,14 +43,10 @@ impl ServingRuntime {
     ///   limits, or a readout the engine refuses as unservable;
     /// - [`SystemOneError::ModelNotFound`] for another model name;
     /// - [`SystemOneError::Overloaded`] when the engine queue is full;
-    /// - [`SystemOneError::Server`] when this runtime serves no readout or a
+    /// - [`SystemOneError::Server`] when this engine serves no readout or a
     ///   readout fails.
-    pub async fn systemone(
-        &self,
-        request_id: &ServeRequestId,
-        body: &[u8],
-    ) -> Result<SystemOneResponse, SystemOneError> {
-        let Some(encoder) = self.readout.clone() else {
+    pub async fn systemone(&self, body: &[u8]) -> Result<SystemOneResponse, SystemOneError> {
+        let Some(encoder) = self.readout_encoder().cloned() else {
             return Err(SystemOneError::Server(
                 "this model serves no System One readout".to_owned(),
             ));
@@ -60,7 +55,7 @@ impl ServingRuntime {
         request.check_model(self.served_model_name())?;
 
         let images = self
-            .images
+            .images()
             .fetch_all(request.images.clone())
             .await
             .map_err(|error| {
@@ -96,9 +91,7 @@ impl ServingRuntime {
             .collect();
         let shares_prefix =
             images.is_empty() && plan.shared_prefix_tokens > 0 && requests.len() > 1;
-        let logprobs = self
-            .run_readouts(request_id, requests, shares_prefix)
-            .await?;
+        let logprobs = self.run_readouts(requests, shares_prefix).await?;
         plan.assemble(self.served_model_name(), &logprobs)
     }
 
@@ -109,38 +102,27 @@ impl ServingRuntime {
     /// are submitted, so they find the shared prefix in the prefix cache.
     async fn run_readouts(
         &self,
-        request_id: &ServeRequestId,
         requests: Vec<GenerationRequest>,
         shares_prefix: bool,
     ) -> Result<Vec<f32>, SystemOneError> {
-        let mut requests = requests.into_iter().enumerate();
+        let mut requests = requests.into_iter();
         let mut logprobs = Vec::new();
-        if shares_prefix && let Some((index, request)) = requests.next() {
-            logprobs.extend(self.readout(request_id, index, request).await?);
+        if shares_prefix && let Some(request) = requests.next() {
+            logprobs.extend(self.readout(request).await?);
         }
-        let rest = futures::future::try_join_all(
-            requests.map(|(index, request)| self.readout(request_id, index, request)),
-        )
-        .await?;
+        let rest =
+            futures::future::try_join_all(requests.map(|request| self.readout(request))).await?;
         logprobs.extend(rest.into_iter().flatten());
         Ok(logprobs)
     }
 
     /// Submits one prompt's readout and waits for its answer.
-    async fn readout(
-        &self,
-        request_id: &ServeRequestId,
-        index: usize,
-        request: GenerationRequest,
-    ) -> Result<Vec<f32>, SystemOneError> {
-        let external = format!("{request_id}-{index}");
-        self.engine
-            .register_request(external.clone(), false)
-            .map_err(|error| SystemOneError::Server(error.to_string()))?;
-        let mut events = self
-            .engine
-            .submit_generation(external, request)
-            .await
+    ///
+    /// Dropping the future drops the readout's event stream, which cancels
+    /// it in its engine core.
+    async fn readout(&self, request: GenerationRequest) -> Result<Vec<f32>, SystemOneError> {
+        let (mut events, _) = self
+            .submit(request.into())
             .map_err(|error| SystemOneError::Server(error.to_string()))?;
 
         let mut answer = None;
@@ -199,7 +181,7 @@ fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> Gene
     let (token_ids, inputs) = engine_images(&prompt.token_ids, &prompt.images, images);
 
     GenerationRequest {
-        // `EngineClient` stamps the identifier it reserved for the readout at
+        // `Engine::submit` stamps the engine's identifier for the readout at
         // submission.
         request_id: RequestId::default(),
         prompt_token_ids: token_ids,

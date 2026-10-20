@@ -215,9 +215,8 @@ impl DecodeState<'_> {
 
             // Stop generation at exactly the tokens received so far, which
             // include this one.
-            raw_stream.cancel_at_consumed_prefix(
-                crate::engine_client::StreamCancelCause::StopStringMatched,
-            );
+            raw_stream
+                .cancel_at_consumed_prefix(uniserve_engine::StreamCancelCause::StopStringMatched);
             let truncate_to = Some(if self.options.include_stop_str_in_output {
                 offset + stop_string.len()
             } else {

@@ -4,12 +4,12 @@
 //! by the router, in-flight handlers and middleware, and the detached
 //! video-job tasks, and its strong count is the shutdown signal:
 //! `AppState::shutdown` waits until it is the last owner before shutting down
-//! the `ServingRuntime`.
+//! the `Engine`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::serving::ServingRuntime;
+use crate::engine::Engine;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
 
@@ -17,14 +17,13 @@ use tracing::warn;
 /// reference.
 const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Shared router state: the single-model `ServingRuntime`, the asynchronous
-/// video job store, and the HTTP policies the router and middleware apply.
+/// Shared router state: the single-model `Engine`, the asynchronous video job
+/// store, and the HTTP policies the router and middleware apply.
 pub struct AppState {
-    runtime: ServingRuntime,
+    engine: Engine,
     /// Process-local video jobs and retained artifacts used by the video
     /// routes; `shutdown` cancels every job in it.
     pub(crate) videos: Arc<crate::video_jobs::VideoJobs>,
-    enable_log_requests: bool,
     enable_request_id_headers: bool,
     api_key: Option<String>,
     request_timeout: Option<Duration>,
@@ -39,13 +38,12 @@ pub struct AppState {
 
 impl AppState {
     /// Creates application state with default HTTP policies.
-    pub fn new(runtime: ServingRuntime) -> Self {
+    pub fn new(engine: Engine) -> Self {
         Self {
-            runtime,
+            engine,
             videos: Arc::new(crate::video_jobs::VideoJobs::new(
                 crate::options::VideoJobOptions::default(),
             )),
-            enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
             request_timeout: None,
@@ -53,12 +51,6 @@ impl AppState {
             video_body_limit: crate::http::BODY_LIMIT,
             server_load: AtomicU64::new(0),
         }
-    }
-
-    /// Configures request lifecycle logging.
-    pub fn with_log_requests(mut self, enabled: bool) -> Self {
-        self.enable_log_requests = enabled;
-        self
     }
 
     /// Configures request-ID response headers.
@@ -92,7 +84,6 @@ impl AppState {
         self
     }
 
-    /// Returns the serving runtime.
     /// Sets the HTTP body limit of the video submission routes, whose bodies
     /// may carry condition media inline (`MediaOptions::body_limit`).
     pub fn with_video_body_limit(mut self, bytes: usize) -> Self {
@@ -103,15 +94,6 @@ impl AppState {
     /// Returns the HTTP body limit of the video submission routes.
     pub fn video_body_limit(&self) -> usize {
         self.video_body_limit
-    }
-
-    pub fn runtime(&self) -> &ServingRuntime {
-        &self.runtime
-    }
-
-    /// Returns whether request lifecycle logging is enabled.
-    pub fn enable_log_requests(&self) -> bool {
-        self.enable_log_requests
     }
 
     /// Returns whether response request-ID headers are enabled.
@@ -136,12 +118,12 @@ impl AppState {
 
     /// Returns the externally served model name.
     pub fn served_model_name(&self) -> &str {
-        self.runtime.served_model_name()
+        self.engine.served_model_name()
     }
 
-    /// Returns the engine client backing the serving runtime.
-    pub fn engine(&self) -> &crate::engine_client::EngineClient {
-        self.runtime.engine()
+    /// Returns the engine serving the model.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Returns the current number of active HTTP requests.
@@ -164,26 +146,26 @@ impl AppState {
     }
 
     /// Waits until request-owned references are dropped, then shuts down the
-    /// serving runtime and its engine client.
+    /// engine.
     ///
     /// Every video job is cancelled first: each detached generation task in
     /// the video routes holds an `Arc<AppState>` until the task ends, and
-    /// cancellation makes a running task end once its runtime request drains.
+    /// cancellation ends a running task, dropping its request stream.
     /// The state is then polled until this call owns the last strong
-    /// reference; `ServingRuntime::shutdown` drains active requests and shuts
-    /// down the engine client. If `deadline` passes first, the runtime shutdown
-    /// is skipped with a warning and the call still returns `Ok`.
+    /// reference, when no request stream is left, and `Engine::shutdown`
+    /// shuts down the engine cores. If `deadline` passes first, the engine
+    /// shutdown is skipped with a warning and the call still returns `Ok`.
     ///
     /// # Errors
     ///
-    /// Returns the engine client's shutdown error.
+    /// Returns the engine's shutdown error.
     pub async fn shutdown(mut self: Arc<Self>, deadline: Instant) -> anyhow::Result<()> {
         self.videos.cancel_all();
 
         loop {
             match Arc::try_unwrap(self) {
                 Ok(state) => {
-                    state.runtime.shutdown().await?;
+                    state.engine.shutdown().await?;
                     return Ok(());
                 }
                 Err(state) => self = state,
@@ -193,7 +175,7 @@ impl AppState {
             if now >= deadline {
                 warn!(
                     ref_count,
-                    "shutdown deadline elapsed before app state became idle; skipping engine-client shutdown"
+                    "shutdown deadline elapsed before app state became idle; skipping engine shutdown"
                 );
                 return Ok(());
             }

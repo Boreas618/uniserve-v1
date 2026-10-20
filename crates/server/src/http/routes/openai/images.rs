@@ -19,11 +19,7 @@ pub(crate) async fn images_generations(
     ValidatedJson(body): ValidatedJson<ImageGenerationRequest>,
 ) -> Response {
     let request_id = format!("img-{base_id}");
-    let serve_stream = match state
-        .runtime()
-        .generate_image(request_id.into(), body)
-        .await
-    {
+    let serve_stream = match state.engine().generate_image(request_id.into(), body).await {
         Ok(stream) => stream,
         Err(error) => return error.into_response(),
     };

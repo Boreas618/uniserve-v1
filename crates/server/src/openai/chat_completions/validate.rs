@@ -14,7 +14,7 @@ use crate::openai::utils::{check_model_served, check_prompt_logprobs_bound};
 /// Rejects a `model` other than `served_model_name` with
 /// [`ApiError::ModelNotFound`], and rejects with [`ApiError::InvalidRequest`]
 /// a `prompt_logprobs` value below `-1` or a positive or `-1` value on a
-/// streamed request. `ServingRuntime::generate_chat` calls this before it
+/// streamed request. `Engine::generate_chat` calls this before it
 /// registers the request or fetches its images.
 pub fn validate_request_compat(
     request: &ChatCompletionRequest,

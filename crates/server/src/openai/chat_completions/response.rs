@@ -1,7 +1,7 @@
 //! Buffered and streaming OpenAI chat-completion response assembly.
 //!
 //! Both paths consume the `RequestOutput` stream that
-//! `ServingRuntime::generate_chat` returns. `collect_chat_completion` folds it
+//! `Engine::generate_chat` returns. `collect_chat_completion` folds it
 //! into one `ChatCompletionResponse`; `chat_completion_chunk_stream` maps it to
 //! `ChatCompletionStreamResponse` chunks, and `chat_completion_sse_stream`
 //! frames those chunks as SSE events ending in `data: [DONE]`.
@@ -33,7 +33,7 @@ use axum::response::sse::Event;
 use futures::{Stream, StreamExt as _, pin_mut};
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, trace};
 
 use crate::openai::ApiError;
 use crate::openai::chat_completions::ChatResponseContext;
@@ -390,8 +390,7 @@ async fn collect_chat_events(
 
 /// Converts one serving event stream into OpenAI chat-completion chunks.
 ///
-/// `context` holds the response options the request chose; `log_request`
-/// logs one summary line when the request finishes. Prompt logprobs are never
+/// `context` holds the response options the request chose. Prompt logprobs are never
 /// streamed (`ChatResponseContext::include_prompt_logprobs`). The chunk sequence is an
 /// assistant-role start chunk, content, reasoning, tool-call, logprob, and
 /// image deltas, one chunk carrying `finish_reason`, and, with
@@ -414,7 +413,6 @@ pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     context: ChatResponseContext,
     created: u64,
-    log_request: bool,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
     let ChatResponseContext {
@@ -634,17 +632,6 @@ pub async fn chat_completion_chunk_stream(
                 image_steps = generated_steps;
             }
             Ok(RequestOutput::Finished { reason, .. }) => {
-                if log_request {
-                    info!(
-                        stream = true,
-                        model = %response_model,
-                        prompt_tokens = prompt_token_count,
-                        output_tokens = output_token_count,
-                        finish_reason = finish_status_as_str(&reason),
-                        "chat completion finished"
-                    );
-                }
-
                 if let Some(pending_chunk) = pending_chunk.as_mut()
                     && let Some(chunk) =
                         pending_chunk.take_chunk(&request_id, &response_model, created)
@@ -1105,19 +1092,6 @@ fn chat_finish_status_to_openai(
     }
 }
 
-/// Names a finish status for request logs, keeping the `repetition` and
-/// `error` statuses that `chat_finish_status_to_openai` does not report as
-/// such.
-fn finish_status_as_str(status: &FinishStatus) -> &'static str {
-    match status {
-        FinishStatus::Stop { .. } => "stop",
-        FinishStatus::Length => "length",
-        FinishStatus::Abort => "abort",
-        FinishStatus::Error => "error",
-        FinishStatus::Repetition => "repetition",
-    }
-}
-
 /// Returns the `stop_reason` response value: the matched stop token ID or
 /// stop string, or `None` for an EOS stop, a stop without a recorded cause,
 /// and every non-stop status.
@@ -1225,7 +1199,7 @@ mod tests {
             return_tokens_as_token_ids: false,
         };
         let chunks =
-            chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0, false)
+            chat_completion_chunk_stream(stream::iter(thinking_response()), context, 0)
                 .collect::<Vec<_>>()
                 .await;
 

@@ -843,11 +843,11 @@ fn a_tokenizer_that_merges_two_letter_labels_is_refused_at_startup() {
 /// Application state serving `checkpoint`'s readout over the engine
 /// simulator, which answers every candidate with a fixed log-probability.
 fn readout_router(checkpoint: &Checkpoint, options: ReadoutOptions) -> axum::Router {
-    let runtime = crate::http::test_support::sim_runtime(ModelParameters::DiffusionGemma(
-        checkpoint.profile.clone(),
-    ))
-    .with_readout(checkpoint.encoder(options, 4096));
-    crate::http::build_router(Arc::new(crate::AppState::new(runtime)))
+    let engine = crate::http::test_support::sim_readout_engine(
+        ModelParameters::DiffusionGemma(checkpoint.profile.clone()),
+        Some(checkpoint.encoder(options, 4096)),
+    );
+    crate::http::build_router(Arc::new(crate::AppState::new(engine)))
 }
 
 fn readout_body(questions: Value) -> Value {

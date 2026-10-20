@@ -259,8 +259,8 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
-    use crate::engine_client::EngineClient;
-    use crate::options::ImageFetchOptions;
+    use crate::engine::Engine;
+    use crate::options::{ImageFetchOptions, LoggingOptions};
     use crate::profile::diffusion_gemma::{
         ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
     };
@@ -268,26 +268,24 @@ mod tests {
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::ImageFetcher;
-    use crate::serving::{
-        FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
-    };
+    use crate::serving::{FinishStatus, InputProcessor, RequestOutput, RequestRenderer};
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
     use uniserve_core::ModelDtype;
-    use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
+    use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
     /// Tokens of one canvas.
     const CANVAS: u32 = 16;
     /// Synthetic reply tokens before the simulator's EOS.
     const TEXT_LEN: usize = 40;
 
-    /// Builds a DiffusionGemma serving runtime over the simulator.
+    /// Builds a DiffusionGemma engine over the simulator.
     ///
     /// The tokenizer maps ASCII code points to themselves and every larger id
     /// below 6000 to the word `w<id>`, followed by the control tokens. The chat
     /// template renders the first message's content.
-    fn runtime() -> (ServingRuntime, Arc<HuggingFaceTokenizer>) {
+    fn runtime() -> (Engine, Arc<HuggingFaceTokenizer>) {
         let vocabulary = (0_u32..6_000)
             .map(|id| {
                 let token = if id < 128 {
@@ -354,10 +352,7 @@ mod tests {
         let mut config = EngineConfig::sim("sim-model");
         config.worker_process.canvas_sampling = Some(sampling);
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-        let client = Arc::new(
-            EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(worker)))
-                .unwrap(),
-        );
+        let core = EngineCore::with_executor(config, Box::new(SimExecutor::new(worker))).unwrap();
         let processor = InputProcessor::new(
             model,
             Arc::clone(&tokenizer),
@@ -370,15 +365,19 @@ mod tests {
                 .unwrap(),
             ),
             crate::serving::WorkerCapabilities {
-                limits: client.generation_limits(),
+                limits: core.generation_limits(),
             },
             false,
         )
         .unwrap();
 
         let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
+        let logging = LoggingOptions {
+            log_requests: false,
+            log_stats: false,
+        };
         (
-            ServingRuntime::new(processor, client, images, false),
+            Engine::new(vec![core], processor, images, None, &logging).unwrap(),
             tokenizer,
         )
     }
@@ -396,7 +395,7 @@ mod tests {
 
     /// Runs one chat request with its token ids returned. The chat stream
     /// publishes parsed text and token ids as separate deltas.
-    async fn chat(runtime: &ServingRuntime, id: &str, max_completion_tokens: u32) -> Reply {
+    async fn chat(runtime: &Engine, id: &str, max_completion_tokens: u32) -> Reply {
         let request = serde_json::from_value(serde_json::json!({
             "model": "sim-model",
             "messages": [{"role": "user", "content": "hi"}],

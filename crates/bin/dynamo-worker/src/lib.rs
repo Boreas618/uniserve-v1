@@ -24,8 +24,8 @@
 //! frontend at the pinned Dynamo revision answers it with a 400, while the
 //! 1.5.0 release answers every error of a video stream with a 500. The
 //! request then enters
-//! `ServingRuntime::generate_video`, the lifecycle the HTTP `/v1/videos`
-//! route uses, and a successful request yields one terminal response object
+//! `Engine::generate_video`, the path the HTTP `/v1/videos` route uses, and a
+//! successful request yields one terminal response object
 //! carrying the single MP4 artifact.
 //! UniServe's own HTTP listener is never started.
 //!
@@ -74,8 +74,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use clap::Parser;
 use dynamo_backend_common::{
-    AsyncEngineContext, BackendError, CommonArgs, DisaggregationMode, DynamoError, EngineConfig,
-    ErrorType, GenerateContext, ModelInput, RawEngine, WorkerConfig as DynamoWorkerConfig,
+    BackendError, CommonArgs, DisaggregationMode, DynamoError, EngineConfig, ErrorType,
+    GenerateContext, ModelInput, RawEngine, WorkerConfig as DynamoWorkerConfig,
 };
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -86,7 +86,7 @@ use tokio_util::sync::CancellationToken;
 use uniserve_core::{MediaKind, VideoTask};
 use uniserve_server::options::{ServeArgs, ServeConfig, Stated, printed};
 use uniserve_server::{
-    AppState, ModelDescription,
+    Engine, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     serving::{
         ServeRequestId,
@@ -142,10 +142,10 @@ pub struct DynamoFastH3Engine {
     /// What the started deployment generates, and at which rasters, set once
     /// by `start` with `state`.
     outputs: OnceCell<Outputs>,
-    /// The UniServe serving state, set once by `start`. Every other trait
-    /// method reads it and treats an unset state as not started.
-    state: OnceCell<Arc<AppState>>,
-    /// Cancelled by `cleanup`; every in-flight `generate` stream then aborts
+    /// The UniServe engine, set once by `start`. Every other trait method
+    /// reads it and treats an unset engine as not started.
+    state: OnceCell<Arc<Engine>>,
+    /// Cancelled by `cleanup`; every in-flight `generate` stream then drops
     /// its UniServe request and ends without a response.
     cancel: CancellationToken,
 }
@@ -260,7 +260,7 @@ impl DynamoFastH3Engine {
     /// UniServe cannot start, including a canvas selection its workers
     /// refuse. A refusal after startup shuts the engine down before
     /// returning.
-    async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
+    async fn build_state(&self) -> Result<(Arc<Engine>, Outputs), DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
         let pipeline =
@@ -277,21 +277,23 @@ impl DynamoFastH3Engine {
 
         // Only `uniserve_server::http` binds the configuration's listener, and
         // this worker never serves UniServe's HTTP API.
-        let state = uniserve_server::build_state(&self.config, &self.stated)
-            .await
-            .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
+        let state = Arc::new(
+            Engine::start(&self.config, &self.stated)
+                .await
+                .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?,
+        );
 
         // Use the same checkpoint-derived schedule as the HTTP serving path.
         // A request may confirm that schedule, but cannot override it.
-        let capabilities = state.runtime().model().video_capabilities();
+        let capabilities = state.processor().video_capabilities();
         if capabilities.is_null() {
-            let _ = state.engine().shutdown().await;
+            let _ = state.shutdown().await;
             return Err(invalid_argument("checkpoint is not MiniMax H3"));
         }
         let outputs = match check_text_to_video(&capabilities) {
             Ok(outputs) => outputs,
             Err(mismatch) => {
-                let _ = state.engine().shutdown().await;
+                let _ = state.shutdown().await;
                 return Err(invalid_argument(mismatch.to_string()));
             }
         };
@@ -354,15 +356,13 @@ impl RawEngine for DynamoFastH3Engine {
             Ok(prepared) => prepared,
             Err(error) => return Ok(refusal(error)),
         };
-        // The Dynamo context id is the UniServe request id, so `abort` can name
-        // the same request from its own context.
+        // The Dynamo context id names the request in UniServe's logs and the
+        // response.
         let request_id = ServeRequestId::new(ctx.id().to_string());
 
-        // The serving runtime owns the request lifecycle the HTTP video route
-        // uses: identity registration, prompt preprocessing, submission and
-        // terminal accounting.
+        // The engine runs the path the HTTP video route uses: prompt
+        // preprocessing, submission and request accounting.
         let (_, mut events) = match state
-            .runtime()
             .generate_video(request_id.clone(), prepared.request)
             .await
         {
@@ -381,8 +381,8 @@ impl RawEngine for DynamoFastH3Engine {
 
         // Unless stopped, the stream yields exactly one item: the response
         // object, or the error that ended the request. A Dynamo stop or
-        // `cleanup` instead aborts the UniServe request and ends the stream
-        // without an item; abort failures are ignored.
+        // `cleanup` instead ends the stream without an item, and dropping the
+        // UniServe stream with it cancels the request in its engine core.
         Ok(Box::pin(async_stream::stream! {
             let started_at = Instant::now();
             let mut collector = ArtifactCollector::default();
@@ -391,14 +391,8 @@ impl RawEngine for DynamoFastH3Engine {
                 // take precedence over an event that is ready at the same time.
                 let event = tokio::select! {
                     biased;
-                    _ = ctx.stopped() => {
-                        let _ = state.runtime().abort(request_id.clone()).await;
-                        return;
-                    }
-                    _ = cancel.cancelled() => {
-                        let _ = state.runtime().abort(request_id.clone()).await;
-                        return;
-                    }
+                    _ = ctx.stopped() => return,
+                    _ = cancel.cancelled() => return,
                     event = events.next() => event,
                 };
                 let event = match event {
@@ -437,20 +431,10 @@ impl RawEngine for DynamoFastH3Engine {
         }))
     }
 
-    async fn abort(&self, ctx: Arc<dyn AsyncEngineContext>) {
-        if let Some(state) = self.state.get() {
-            let _ = state
-                .runtime()
-                .abort(ServeRequestId::new(ctx.id().to_string()))
-                .await;
-        }
-    }
-
     async fn cleanup(&self) -> Result<(), DynamoError> {
         self.cancel.cancel();
         if let Some(state) = self.state.get() {
             state
-                .engine()
                 .shutdown()
                 .await
                 .map_err(|error| engine_error(format!("UniServe shutdown failed: {error}")))?;

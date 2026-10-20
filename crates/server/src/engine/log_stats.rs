@@ -3,15 +3,13 @@
 //! The logger only reads the process-wide `METRICS` registry and updates no
 //! metric value, although resolving its handles creates any of its series
 //! that do not exist yet. Scheduler gauges and prefix-cache counters are
-//! written by the engine client's scheduler-stats export task
-//! (`EngineClient::from_core` through
-//! `engine_client::metrics::record_scheduler_stats`). The prompt and
-//! generation token counters are written by the engine client's request
-//! registry when a request completes with its final usage
-//! (`RequestRegistry::complete`), so an interval's throughput counts the
-//! tokens of the requests that completed in it; a request whose stream ended
-//! before its usage report adds none.
-//! `ServingRuntime::new` starts the logger when `Config::log_stats` is set.
+//! written by the engine's scheduler-stats export tasks
+//! (`metrics::record_scheduler_stats`). The prompt and generation token
+//! counters are written when a request ends with its final usage
+//! (`metrics::RequestStats`), so an interval's throughput counts the tokens of
+//! the requests that completed in it; a request whose stream ended before its
+//! usage report adds none. `Engine::new` starts the logger when
+//! `logging_config.log_stats` is set.
 
 use std::fmt::Write;
 use std::time::{Duration, Instant};

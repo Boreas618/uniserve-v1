@@ -11,7 +11,6 @@ use axum::extract::State;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use tracing::info;
 use tracing_futures::Instrument as _;
 
 use crate::AppState;
@@ -43,10 +42,9 @@ pub(crate) async fn chat_completions(
 
     // One timestamp for the whole response, shared by every streamed chunk.
     let created = uniserve_core::now_unix_secs_u64();
-    let log_request = state.enable_log_requests();
 
     let serve_stream = match state
-        .runtime()
+        .engine()
         .generate_chat(request_id.into(), body)
         .instrument(request_span.clone())
         .await
@@ -57,7 +55,7 @@ pub(crate) async fn chat_completions(
 
     if stream {
         let chunk_stream =
-            chat_completion_chunk_stream(serve_stream, response, created, log_request);
+            chat_completion_chunk_stream(serve_stream, response, created);
         let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
 
         // Emit periodic SSE keep-alive comments so long prefills (no chunks yet)
@@ -73,18 +71,6 @@ pub(crate) async fn chat_completions(
             Ok(response) => response,
             Err(error) => return error.into_response(),
         };
-
-        if log_request {
-            let usage = response.usage.as_ref();
-            info!(
-                parent: &request_span,
-                model = %response.model,
-                prompt_tokens = usage.map_or(0, |u| u.prompt_tokens),
-                output_tokens = usage.map_or(0, |u| u.completion_tokens),
-                finish_reason = response.choices.first().and_then(|c| c.finish_reason.as_deref()).unwrap_or("unknown"),
-                "chat completion finished"
-            );
-        }
 
         Json(response).into_response()
     }

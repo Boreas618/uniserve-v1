@@ -40,7 +40,7 @@ pub(crate) const REQUEST_FIELDS: [&str; 6] =
 /// A video request ready for submission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessedVideo {
-    /// The engine request. `EngineClient` stamps the identifier it reserved
+    /// The engine request. `Engine::submit` stamps the engine's identifier
     /// for the request at submission.
     pub request: DiffusionRequest,
     /// The requested duration in seconds, before frame alignment.

@@ -2,12 +2,11 @@
 //! tests.
 //!
 //! Requests travel through the public router (`routes::build_router`) into a
-//! real `ServingRuntime`, whose engine drives `SimEngine` through
-//! `SimExecutor`. The default simulator provides no video media components,
-//! so the engine refuses every video submission as an invalid request.
+//! real `Engine`, whose engine core drives `SimEngine` through `SimExecutor`.
+//! The default simulator provides no video media components, so the engine
+//! refuses every video submission as an invalid request.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -15,54 +14,81 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use tower::ServiceExt as _;
 use uniserve_core::ModelDtype;
-use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
+use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
 use crate::AppState;
-use crate::engine_client::EngineClient;
-use crate::options::ImageFetchOptions;
+use crate::engine::Engine;
+use crate::options::{ImageFetchOptions, LoggingOptions};
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::ImageFetcher;
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
-use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
+use crate::serving::{InputProcessor, RequestRenderer, WorkerCapabilities};
 use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 
 /// Served model name the simulated state answers to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// Builds application state for a model with `parameters` over a default
-/// `SimEngine`; see [`sim_runtime`].
+/// `SimEngine`; see [`sim_engine`].
 pub(crate) fn sim_state(parameters: ModelParameters) -> AppState {
-    AppState::new(sim_runtime(parameters))
+    AppState::new(sim_engine(parameters))
 }
 
-/// Builds a serving runtime for a model with `parameters` over a default
+/// Builds an engine for a model with `parameters` over one default
 /// `SimEngine`.
 ///
 /// The tokenizer is `serving::test_support::configured_tokenizer`, whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does, and a
-/// DiffusionGemma model runs readouts under its own generation limits, as
-/// `build_state` starts it.
-pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
-    let model = ModelConfig {
+/// DiffusionGemma model runs under its own generation limits, as
+/// `Engine::start` starts it.
+pub(crate) fn sim_engine(parameters: ModelParameters) -> Engine {
+    sim_readout_engine(parameters, None)
+}
+
+/// Builds an engine like [`sim_engine`] that serves the System One readout
+/// with `readout`.
+pub(crate) fn sim_readout_engine(
+    parameters: ModelParameters,
+    readout: Option<crate::serving::systemone::ReadoutEncoder>,
+) -> Engine {
+    let model = sim_model(parameters);
+    let mut config = EngineConfig::sim(SERVED_MODEL);
+    if let ModelParameters::DiffusionGemma(_) = model.parameters {
+        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
+    }
+    let core = EngineCore::with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
+        .expect("start a sim engine core");
+    engine_over(model, vec![core], readout)
+}
+
+/// Builds an engine for a model with `parameters` over started engine cores,
+/// one per data-parallel rank; see [`sim_engine`].
+pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<EngineCore>) -> Engine {
+    engine_over(sim_model(parameters), cores, None)
+}
+
+/// The simulated model's facts.
+fn sim_model(parameters: ModelParameters) -> ModelConfig {
+    ModelConfig {
         served_name: SERVED_MODEL.to_string(),
         parameters,
         sampling_defaults: SamplingDefaults::default(),
         max_model_len: 4096,
         primary_eos_token_id: Some(2),
         eos_token_ids: BTreeSet::from([2]),
-    };
-    let mut config = EngineConfig::sim(SERVED_MODEL);
-    if let ModelParameters::DiffusionGemma(_) = model.parameters {
-        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
     }
-    let client = Arc::new(
-        EngineClient::connect_with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
-            .unwrap(),
-    );
+}
+
+/// Serves `model` over `cores` without request or stats logging.
+fn engine_over(
+    model: ModelConfig,
+    cores: Vec<EngineCore>,
+    readout: Option<crate::serving::systemone::ReadoutEncoder>,
+) -> Engine {
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
         _ => RequestRenderer::Chat(
@@ -79,14 +105,17 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
         configured_tokenizer(),
         renderer,
         WorkerCapabilities {
-            limits: client.generation_limits(),
+            limits: cores[0].generation_limits(),
         },
         false,
     )
     .unwrap();
-
     let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
-    ServingRuntime::new(processor, client, images, false)
+    let logging = LoggingOptions {
+        log_requests: false,
+        log_stats: false,
+    };
+    Engine::new(cores, processor, images, readout, &logging).unwrap()
 }
 
 /// The video service of a four-step text-to-video denoiser that generates

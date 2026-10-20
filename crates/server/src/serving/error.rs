@@ -98,18 +98,12 @@ pub enum ServeError {
         /// Maximum token count declared by the profile.
         max_tokens: u32,
     },
-    /// Another live request already owns the same identifier.
-    #[error("request `{request_id}` is already active")]
-    DuplicateRequestId {
-        /// Conflicting request identifier.
-        request_id: ServeRequestId,
-    },
     /// Model assets or capabilities cannot be resolved.
     #[error(transparent)]
     ModelResolution(#[from] crate::serving::model::ModelResolutionError),
-    /// Engine submission or streaming fails.
+    /// No live engine core accepts the request.
     #[error(transparent)]
-    Engine(#[from] crate::engine_client::Error),
+    Submit(#[from] uniserve_engine::SubmitError),
     /// An input image reference cannot be fetched or decoded.
     #[error("request `{request_id}` has an invalid input image")]
     ImageInput {

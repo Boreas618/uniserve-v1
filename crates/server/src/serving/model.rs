@@ -41,7 +41,7 @@ use crate::serving::{Result, ServeError};
 /// Owns the tokenizer and template resources used to produce final engine inputs.
 /// Runtime capabilities are fixed at construction, before this value is shared.
 ///
-/// Preprocessing methods are synchronous and CPU-bound; `ServingRuntime` runs its request
+/// Preprocessing methods are synchronous and CPU-bound; `Engine` runs its request
 /// preprocessing on the blocking pool.
 pub struct InputProcessor {
     pub(super) config: ModelConfig,
@@ -536,7 +536,7 @@ impl InputProcessor {
         let constraint = crate::serving::omni::generation_constraint(modalities);
 
         let mut generation = GenerationRequest {
-            // `EngineClient` stamps the identifier it reserved for the request at submission.
+            // `Engine::submit` stamps the engine's identifier for the request.
             request_id: RequestId::default(),
             prompt_token_ids: Vec::new(),
             negative_prompt_token_ids: Vec::new(),

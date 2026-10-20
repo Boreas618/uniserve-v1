@@ -69,7 +69,7 @@ impl crate::serving::InputProcessor {
     /// model without image input, which rejects image parts.
     ///
     /// The served model name and `prompt_logprobs` are checked before
-    /// preprocessing, by `ServingRuntime::generate_chat`
+    /// preprocessing, by `Engine::generate_chat`
     /// (`validate_request_compat`).
     ///
     /// # Errors

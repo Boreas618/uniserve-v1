@@ -172,9 +172,9 @@ impl IntoResponse for ApiError {
 
 /// Maps one canonical serving error into the OpenAI error vocabulary.
 ///
-/// Unsupported features or sampling controls, context limits, duplicate request
-/// IDs, input images that cannot be fetched or decoded, and tokenization
-/// failures become invalid requests; model-resolution, engine, and
+/// Unsupported features or sampling controls, context limits, input images
+/// that cannot be fetched or decoded, and tokenization failures become
+/// invalid requests; model-resolution, engine, and
 /// output-processing failures become server errors. An input-image or
 /// tokenization failure's message appends its cause (the failing image and
 /// rule, or the violated field or limit), which `ServeError::ImageInput` and
@@ -189,8 +189,7 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
             Some(control),
         ),
         error @ (ServeError::UnsupportedFeature { .. }
-        | ServeError::ContextLengthExceeded { .. }
-        | ServeError::DuplicateRequestId { .. }) => {
+        | ServeError::ContextLengthExceeded { .. }) => {
             ApiError::invalid_request(error.to_string(), None)
         }
         ServeError::ImageInput { ref source, .. } => {
@@ -202,7 +201,7 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         ServeError::ModelResolution(source) => {
             ApiError::server_error(format!("model resolution error: {source}"))
         }
-        ServeError::Engine(source) => {
+        ServeError::Submit(source) => {
             ApiError::server_error(format!("engine runtime error: {source}"))
         }
         ServeError::OutputProcessing { source, .. } => {
