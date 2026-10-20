@@ -133,13 +133,11 @@ fn main() -> Result<()> {
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve(args) => {
-            let (serve, stated) = args.resolve()?;
-            let config = serve.into_config(&stated)?;
-            info!(model = %config.model,
-                workers = ?config.engine.workers,
-                resident_requests = config.engine.max_running_requests,
-                python = %config.engine.worker_process.python.display(), "resolved deployment");
-            uniserve_server::serve(config, shutdown_signal()).await
+            let (config, stated) = args.resolve()?;
+            info!(model = %config.model(),
+                resident_requests = config.max_running_requests,
+                python = %config.worker_config.python.display(), "resolved serving options");
+            uniserve_server::serve(config, stated, shutdown_signal()).await
         }
     }
 }

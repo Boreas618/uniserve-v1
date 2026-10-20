@@ -260,13 +260,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine_client::EngineClient;
+    use crate::options::ImageFetchOptions;
     use crate::profile::diffusion_gemma::{
         ControlTokens, DenoisingDefaults, DiffusionGemmaProfile, PatchBudget,
     };
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-    use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
+    use crate::serving::media::ImageFetcher;
     use crate::serving::{
         FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime,
     };
@@ -375,7 +376,7 @@ mod tests {
         )
         .unwrap();
 
-        let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+        let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
         (
             ServingRuntime::new(processor, client, images, false),
             tokenizer,

@@ -6,10 +6,10 @@
 //! detached generation task. Nothing persists across a restart. Synchronous
 //! video requests do not use it.
 //!
-//! The operator's [`VideoJobSettings`] state the two policies of the store,
+//! The operator's `video_job_config` states the two policies of the store,
 //! and the video `capabilities` route advertises both:
 //!
-//! - `max_retained_bytes` of artifact bytes, counting artifacts retained by
+//! - `max_bytes` of artifact bytes, counting artifacts retained by
 //!   a job and artifacts held by an unfinished download. Retained artifacts
 //!   are shared-memory mappings, so this is the memory the store may hold.
 //! - `retention`, after which a completed or failed job's record is deleted.
@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use uniserve_core::SharedMedia;
 
-use crate::config::VideoJobSettings;
+use crate::options::VideoJobOptions;
 
 /// Public job record, serialized in the responses of the video job routes.
 ///
@@ -133,22 +133,22 @@ pub(crate) struct VideoJobs {
     /// One permit per retained artifact byte, up to the configured budget.
     bytes: Arc<Semaphore>,
     /// The configured retention and byte budget.
-    settings: VideoJobSettings,
+    settings: VideoJobOptions,
 }
 
 impl VideoJobs {
     /// Creates an empty store under `settings`.
-    pub(crate) fn new(settings: VideoJobSettings) -> Self {
+    pub(crate) fn new(settings: VideoJobOptions) -> Self {
         Self {
             entries: Mutex::default(),
-            bytes: Arc::new(Semaphore::new(settings.max_retained_bytes)),
+            bytes: Arc::new(Semaphore::new(settings.max_bytes)),
             settings,
         }
     }
 
     /// The retention and byte budget the store was created with.
-    pub(crate) fn settings(&self) -> VideoJobSettings {
-        self.settings
+    pub(crate) fn settings(&self) -> &VideoJobOptions {
+        &self.settings
     }
 
     /// Locks the job table and recovers it after poisoning.
@@ -235,7 +235,7 @@ impl VideoJobs {
                     code: "artifact_capacity_exceeded",
                     message: format!(
                         "retained videos and active downloads exceed the {}-byte limit",
-                        self.settings.max_retained_bytes
+                        self.settings.max_bytes
                     ),
                 }),
             }
@@ -343,7 +343,7 @@ mod tests {
     }
 
     fn store() -> Arc<VideoJobs> {
-        Arc::new(VideoJobs::new(VideoJobSettings::default()))
+        Arc::new(VideoJobs::new(VideoJobOptions::default()))
     }
 
     #[tokio::test]
@@ -375,9 +375,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_job_expires_after_the_configured_retention() {
-        let jobs = Arc::new(VideoJobs::new(VideoJobSettings {
+        let jobs = Arc::new(VideoJobs::new(VideoJobOptions {
             retention: Duration::from_secs(90),
-            ..VideoJobSettings::default()
+            ..VideoJobOptions::default()
         }));
         jobs.insert(record("video-0")).unwrap();
 

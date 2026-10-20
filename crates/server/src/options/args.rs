@@ -135,21 +135,13 @@ impl Stated {
             .iter()
             .any(|stated| stated == path || stated.starts_with(&prefix))
     }
-
-    /// The top-level tables among `tables` that were stated.
-    pub(super) fn tables(&self, tables: &[&str]) -> Vec<String> {
-        tables
-            .iter()
-            .filter(|table| self.contains(table))
-            .map(|table| (*table).to_owned())
-            .collect()
-    }
 }
 
 impl ServeArgs {
     /// Resolves the configuration: the `--config` file, overridden by the
     /// flags, overridden by `--set`, with every unstated option at its
-    /// default. Returns it with the paths the invocation stated.
+    /// default and `server_config.api_key` falling back to
+    /// `UNISERVE_API_KEY`. Returns it with the paths the invocation stated.
     ///
     /// # Errors
     ///
@@ -175,8 +167,8 @@ impl ServeArgs {
         }
 
         let stated = Stated::of(&tree);
-        let config: ServeConfig =
-            serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
+        let mut config: ServeConfig = serde_path_to_error::deserialize(Value::Table(tree))
+            .map_err(|error| {
                 let path = error.path().to_string();
                 let cause = error.into_inner();
                 if path == "." {
@@ -185,6 +177,10 @@ impl ServeArgs {
                     anyhow!("invalid option `{path}`: {cause}")
                 }
             })?;
+        // The environment supplies the key the configuration leaves unset or
+        // blank.
+        config.server_config.api_key =
+            super::configured_api_key(config.server_config.api_key.as_deref());
         Ok((config, stated))
     }
 
@@ -560,5 +556,212 @@ mod tests {
         let text = printed(&config).unwrap();
         let reread: ServeConfig = toml::from_str(&text).unwrap();
         assert_eq!(reread, config, "{text}");
+    }
+
+    /// Resolves `args`, checks them, and derives the engine configuration
+    /// they state.
+    fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, uniserve_engine::EngineConfig)> {
+        let (config, stated) = resolved(args)?;
+        config.validate(&stated)?;
+        let engine = config.engine_config()?;
+        Ok((config, engine))
+    }
+
+    #[test]
+    fn the_model_is_required_from_the_command_line_or_the_file() {
+        let error = lowered(&[]).unwrap_err();
+        assert!(error.to_string().contains("`model` is required"), "{error}");
+        let (config, engine) = lowered(&["/models/m"]).unwrap();
+        assert_eq!(config.model(), "/models/m");
+        assert_eq!(config.served_model_name(), "/models/m");
+        assert_eq!(engine.worker_process.model, "/models/m");
+
+        let file = written("model", "model = \"/models/file\"\n");
+        let (config, _) = lowered(&["--config", file.to_str().unwrap()]).unwrap();
+        assert_eq!(config.model(), "/models/file");
+    }
+
+    /// Without a deployment file each replica runs one component
+    /// tensor-parallel over its ranks; the placement shorthand is refused
+    /// beside a file.
+    #[test]
+    fn the_shorthand_places_replicas_and_is_refused_beside_a_file() {
+        let (_, engine) = lowered(&[
+            "m",
+            "--tensor-parallel-size",
+            "2",
+            "--data-parallel-size",
+            "2",
+            "--set",
+            "placement_config.device=cpu",
+        ])
+        .unwrap();
+        assert_eq!(engine.workers.len(), 2);
+        assert!(engine.workers.iter().all(|worker| worker.ranks.len() == 2));
+
+        let deployment = written(
+            "deployment",
+            "[[workers]]\nid = \"model\"\nranks = [\"cpu*2\"]\nqueue_depth = 2\n\
+             [workers.components.model]\ntensor_parallel_size = 2\n",
+        );
+        let path = deployment.to_str().unwrap();
+        assert_eq!(
+            lowered(&["m", "--workers", path]).unwrap().1.workers.len(),
+            1
+        );
+        for shorthand in [
+            ["--tensor-parallel-size", "2"],
+            ["--set", "placement_config.device=cpu"],
+            ["--set", "placement_config.queue_depth=3"],
+        ] {
+            let mut args = vec!["m", "--workers", path];
+            args.extend(shorthand);
+            let error = lowered(&args).unwrap_err();
+            assert!(
+                error.to_string().contains("deployment file"),
+                "{shorthand:?}: {error}"
+            );
+        }
+    }
+
+    /// A deployment rank entry without a host runs on this process's host.
+    #[test]
+    fn a_deployment_places_unnamed_ranks_on_this_host() {
+        let deployment = written(
+            "head-deployment",
+            "[[workers]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
+             [workers.components.model]\ntensor_parallel_size = 2\n",
+        );
+        let (_, engine) = lowered(&[
+            "m",
+            "--workers",
+            deployment.to_str().unwrap(),
+            "--host-identity",
+            "rank-0",
+        ])
+        .unwrap();
+        let nodes = engine.workers[0]
+            .ranks
+            .iter()
+            .map(|rank| rank.node.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(nodes, ["rank-0", "rank-1"]);
+        assert!(lowered(&["m", "--workers", "/nonexistent/deployment.toml"]).is_err());
+    }
+
+    /// Capture lists and capacities are checked before any rank starts.
+    #[test]
+    fn capture_lists_are_strictly_increasing_and_shapes_distinct() {
+        let (_, engine) = lowered(&[
+            "m",
+            "--set",
+            "video_config.text_capacities=1024,4096",
+            "--set",
+            "cuda_graph_config.flow_shapes=1152x2048,2048x1152",
+        ])
+        .unwrap();
+        let worker = &engine.worker_process;
+        assert_eq!(worker.video_text_capacities, Some(vec![1024, 4096]));
+        assert_eq!(
+            worker.flow_graph_shapes,
+            Some(vec![[1152, 2048], [2048, 1152]])
+        );
+
+        for refused in [
+            "video_config.text_capacities=4096,1024",
+            "cuda_graph_config.decode_batch_sizes=1,0",
+            "cuda_graph_config.flow_shapes=1152x2048,1152x2048",
+            "cuda_graph_config.flow_shapes=1152",
+        ] {
+            assert!(
+                lowered(&["m", "--set", refused]).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    /// Lanes, the precision policy, expert parallelism, prefix caching and
+    /// the scheduler budgets reach the engine configuration as stated, and
+    /// unstated budgets take the engine defaults.
+    #[test]
+    fn grouped_options_reach_the_engine() {
+        let (_, engine) = lowered(&[
+            "m",
+            "--set",
+            "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"] }]",
+            "--set",
+            "quantization_config.mode=performance",
+            "--set",
+            "moe_config={ expert_parallel = true, exchange = \"dwdp\" }",
+            "--set",
+            "kv_cache_config.prefix_caching=false",
+            "--set",
+            "scheduler_config.chunked_prefill_size=512",
+        ])
+        .unwrap();
+        let worker = &engine.worker_process;
+        assert_eq!(worker.lanes.len(), 1);
+        assert_eq!(worker.quantization_config["mode"], "performance");
+        assert_eq!(
+            engine.expert_parallel,
+            Some(uniserve_engine::ExpertExchange::Dwdp)
+        );
+        assert!(!engine.prefix_cache);
+        assert_eq!(engine.chunked_prefill_size, 512);
+        assert_eq!(
+            engine.max_num_batched_tokens,
+            uniserve_engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        );
+        assert_eq!(
+            worker.max_batch_tokens as usize,
+            uniserve_engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        );
+
+        let lane = "lanes=[{ lane_id = \"decode\", sm_budget = 0, domains = [\"decode\"] }]";
+        assert!(lowered(&["m", "--set", lane]).is_err());
+    }
+
+    /// The server listens on a non-blank host or Unix socket path, port 0
+    /// asks for an ephemeral port, and a video capacity lies within the
+    /// durations the video API admits.
+    #[test]
+    fn listeners_and_video_capacities_are_checked() {
+        assert!(lowered(&["m", "--port", "0"]).is_ok());
+        assert!(lowered(&["m", "--host", " "]).is_err());
+        assert!(lowered(&["m", "--set", "server_config.uds=\"\""]).is_err());
+        for (seconds, valid) in [("4", true), ("15", true), ("3.9", false), ("15.5", false)] {
+            let set = format!("video_config.max_seconds={seconds}");
+            assert_eq!(lowered(&["m", "--set", &set]).is_ok(), valid, "{seconds} s");
+        }
+    }
+
+    /// An option of another model family than the served one is refused
+    /// rather than ignored; unstated defaults never are.
+    #[test]
+    fn options_of_another_family_are_refused() {
+        use crate::profile::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
+
+        let (_, defaults) = resolved(&["m"]).unwrap();
+        for description in [Qwen3, Bagel, MiniMaxH3, DiffusionGemma] {
+            assert!(defaults.refuse_foreign_options(description).is_ok());
+        }
+
+        let refused = |set: &str, description| {
+            let (_, stated) = resolved(&["m", "--set", set]).unwrap();
+            stated.refuse_foreign_options(description).is_err()
+        };
+        assert!(refused("readout_config.canvas=compact", Qwen3));
+        assert!(!refused("readout_config.canvas=compact", DiffusionGemma));
+        assert!(refused("video_config.max_seconds=5", DiffusionGemma));
+        assert!(!refused("video_config.max_seconds=5", MiniMaxH3));
+        // A video pipeline schedules no token batches and renders no chat.
+        for token_option in [
+            "max_num_batched_tokens=2048",
+            "scheduler_config.chunked_prefill_size=512",
+            "chat_config.reasoning_parser=none",
+        ] {
+            assert!(refused(token_option, MiniMaxH3), "{token_option}");
+            assert!(!refused(token_option, Qwen3), "{token_option}");
+        }
     }
 }

@@ -31,8 +31,7 @@ use uniserve_core::{
 
 use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
 use crate::serving::chat::{
-    ChatOutputProcessor, ChatRequest, ChatTemplateLoadOptions, HfChatRenderer,
-    Qwen3ChatOutputProcessor,
+    ChatOutputProcessor, ChatRequest, HfChatRenderer, Qwen3ChatOutputProcessor,
 };
 use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
@@ -142,15 +141,13 @@ impl ModelConfig {
     /// A diffusers pipeline has no chat template and carries its conditioner's
     /// vision processor geometry instead. The returned `max_model_len` is the
     /// configured one, else, for a root configuration, its
-    /// `max_position_embeddings` or `EngineSettings::DEFAULT_MAX_MODEL_LEN`,
+    /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
     pub(crate) async fn load(
-        config: &crate::Config,
+        config: &crate::options::ServeConfig,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
-        let served_name = config
-            .served_model_name
-            .clone()
-            .unwrap_or_else(|| config.model.clone());
+        let served_name = config.served_model_name().to_owned();
+        let max_model_len = config.max_model_len.map(std::num::NonZeroU32::get);
         // A diffusers pipeline declares its class and component folders in a
         // root index rather than a root `config.json`, so the index selects the
         // profile and locates the tokenizer component before any other asset
@@ -159,7 +156,7 @@ impl ModelConfig {
         // workers do. A family that a root `config.json` describes is
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
-        if let Some(pipeline) = PipelineCheckpoint::resolve(&config.model).await? {
+        if let Some(pipeline) = PipelineCheckpoint::resolve(config.model()).await? {
             let description = ModelDescription::from_pipeline_class(pipeline.class_name())
                 .ok_or_else(|| crate::profile::assets::Error::UnsupportedPipeline {
                     class_name: pipeline.class_name().to_owned(),
@@ -174,8 +171,7 @@ impl ModelConfig {
                 }
                 let vision = ProcessorConfig::read(&processor[0], &processor[1])
                     .map_err(ModelResolutionError::ProcessorConfig)?;
-                let model =
-                    Self::from_pipeline(&served_name, description, config.engine.max_model_len)?;
+                let model = Self::from_pipeline(&served_name, description, max_model_len)?;
                 return Ok(LoadedModel {
                     config: model,
                     tokenizer,
@@ -184,13 +180,13 @@ impl ModelConfig {
             }
         }
 
-        let files = ResolvedModelFiles::new(&config.model).await?;
+        let files = ResolvedModelFiles::new(config.model()).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
         let model = Self::from_files(
             &served_name,
-            &config.model,
+            config.model(),
             &files,
-            config.engine.max_model_len,
+            max_model_len,
             tokenizer.as_ref(),
         )
         .await?;
@@ -203,18 +199,7 @@ impl ModelConfig {
                 .map(|placeholder_token| MultimodalRenderInfo { placeholder_token }),
             _ => None,
         };
-        let renderer = HfChatRenderer::load(
-            &files,
-            ChatTemplateLoadOptions {
-                chat_template_content_format: config.chat_template_content_format,
-                chat_template: config.chat_template.clone(),
-                default_chat_template_kwargs: config
-                    .default_chat_template_kwargs
-                    .clone()
-                    .unwrap_or_default(),
-            },
-            multimodal,
-        )?;
+        let renderer = HfChatRenderer::load(&files, &config.chat_config, multimodal)?;
         Ok(LoadedModel {
             config: model,
             tokenizer,
@@ -833,7 +818,7 @@ mod tests {
     use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
 
     use super::{LoadedModel, LoadedRenderer};
-    use crate::Config;
+    use crate::options::ServeConfig;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
     use crate::serving::{InputProcessor, RequestRenderer, ServeRequestId, WorkerCapabilities};
@@ -921,11 +906,11 @@ mod tests {
         directory
     }
 
-    fn config(directory: &TempDir) -> Config {
-        Config {
-            model: directory.path().to_str().unwrap().to_owned(),
+    fn config(directory: &TempDir) -> ServeConfig {
+        ServeConfig {
+            model: Some(directory.path().to_str().unwrap().to_owned()),
             served_model_name: Some("diffusion-gemma".to_owned()),
-            ..Config::default()
+            ..ServeConfig::default()
         }
     }
 
@@ -971,11 +956,8 @@ mod tests {
             tokenizer,
             renderer,
             ..
-        } = ModelConfig::load(&Config {
-            engine: crate::EngineSettings {
-                max_model_len: Some(max_model_len),
-                ..crate::EngineSettings::default()
-            },
+        } = ModelConfig::load(&ServeConfig {
+            max_model_len: std::num::NonZeroU32::new(max_model_len),
             ..config(directory)
         })
         .await

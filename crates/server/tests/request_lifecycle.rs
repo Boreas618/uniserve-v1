@@ -11,10 +11,11 @@ use tokenizers::{AddedToken, Tokenizer};
 use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 use uniserve_server::engine_client::EngineClient;
 use uniserve_server::openai::ChatCompletionRequest;
+use uniserve_server::options::ImageFetchOptions;
 use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use uniserve_server::serving::media::{ImageFetchPolicy, ImageFetcher};
+use uniserve_server::serving::media::ImageFetcher;
 use uniserve_server::serving::{
     FinishStatus, InputProcessor, RequestOutput, RequestRenderer, ServingRuntime, StopCause,
 };
@@ -86,7 +87,7 @@ fn runtime_for_engine_model(worker: SimEngine, engine_model: &str) -> ServingRun
     )
     .unwrap();
 
-    let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     ServingRuntime::new(processor, client, images, false)
 }
 

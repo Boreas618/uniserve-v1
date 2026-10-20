@@ -22,8 +22,9 @@ use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
+use crate::build_state;
 use crate::http::listener::Listener;
-use crate::{Config, build_state};
+use crate::options::{ServeConfig, Stated};
 
 pub use crate::openai::ApiError;
 pub use routes::build_router;
@@ -33,7 +34,7 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 
 /// Runs the configured HTTP server until the shutdown token is cancelled.
 ///
-/// Shutdown has one budget of `config.shutdown_timeout`, measured from
+/// Shutdown has one budget of `server_config.shutdown_timeout`, measured from
 /// cancellation: axum first drains open connections gracefully, and the server
 /// is aborted if the deadline passes first. `AppState::shutdown` then cancels
 /// the detached video jobs and waits, against the same deadline, for every
@@ -47,16 +48,16 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 /// fails, the listener cannot be bound or report its address, the server
 /// fails, or runtime shutdown fails. Cancellation before the state is built
 /// returns `Ok(())` without binding a listener.
-pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
+pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationToken) -> Result<()> {
     config
-        .validate()
-        .context("invalid HTTP frontend configuration")?;
+        .validate(&stated)
+        .context("invalid serving configuration")?;
 
     let state = tokio::select! {
-        result = build_state(&config) => result?,
+        result = build_state(&config, &stated) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
-    let listener = Listener::bind(&config.listener_mode)
+    let listener = Listener::bind(&config.server_config)
         .await
         .context("failed to bind listener for HTTP server")?;
     let bind_address = listener.local_addr()?;
@@ -84,7 +85,7 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         let shutdown = shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         let shutdown_deadline = Arc::clone(&shutdown_deadline);
-        let shutdown_timeout = config.shutdown_timeout;
+        let shutdown_timeout = config.server_config.shutdown_timeout;
         async move {
             shutdown.cancelled().await;
             let deadline = Instant::now() + shutdown_timeout;
@@ -112,6 +113,6 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
     let shutdown_deadline = shutdown_deadline
         .get()
         .copied()
-        .unwrap_or_else(|| Instant::now() + config.shutdown_timeout);
+        .unwrap_or_else(|| Instant::now() + config.server_config.shutdown_timeout);
     state.shutdown(shutdown_deadline).await
 }

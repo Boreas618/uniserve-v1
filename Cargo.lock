@@ -9233,7 +9233,6 @@ dependencies = [
  "serde_path_to_error",
  "serde_with",
  "sha2 0.10.9",
- "socket2 0.6.4",
  "tempfile",
  "thiserror 2.0.18",
  "thiserror-ext",

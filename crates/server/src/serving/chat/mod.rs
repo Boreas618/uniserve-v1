@@ -12,7 +12,7 @@
 //! chat requests with the same renderer, but their output bypasses this
 //! module's output processors.
 //!
-//! The template comes from the model files or [`ChatTemplateLoadOptions`], and
+//! The template comes from the model files or `chat_config.template`, and
 //! the server's `reasoning_parsing` setting decides whether Qwen3 `<think>`
 //! sections become reasoning blocks.
 
@@ -23,7 +23,6 @@ pub use request::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,
     GenerationPromptMode, ReasoningEffort, Tool,
 };
-pub use template::ChatTemplateLoadOptions;
 pub use template::renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
 
 mod error;

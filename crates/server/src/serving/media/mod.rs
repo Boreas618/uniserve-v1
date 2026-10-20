@@ -11,7 +11,5 @@
 mod fetch;
 mod image;
 
-pub use fetch::{
-    ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageListError, is_public_address,
-};
+pub use fetch::{ImageFetchError, ImageFetcher, ImageListError, is_public_address};
 pub use image::ImageInput;

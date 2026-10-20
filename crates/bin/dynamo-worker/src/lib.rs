@@ -84,9 +84,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use uniserve_core::{MediaKind, VideoTask};
-use uniserve_server::options::{ServeArgs, printed};
+use uniserve_server::options::{ServeArgs, ServeConfig, Stated, printed};
 use uniserve_server::{
-    AppState, Config, ModelDescription,
+    AppState, ModelDescription,
     openai::{VideoGenerationRequest, VideoTarget, serve_error_to_api},
     serving::{
         ServeRequestId,
@@ -133,7 +133,10 @@ struct Args {
 /// UniServe engine.
 pub struct DynamoFastH3Engine {
     /// The UniServe configuration the engine starts with.
-    config: Config,
+    config: ServeConfig,
+    /// The option paths the operator stated, against which startup refuses
+    /// options of another model family.
+    stated: Stated,
     /// The single model name requests name and responses carry.
     served_model_name: String,
     /// What the started deployment generates, and at which rasters, set once
@@ -157,7 +160,7 @@ impl DynamoFastH3Engine {
     /// the process on a malformed command line. Settings this worker cannot
     /// honor (disaggregation, encoder routing, RL routes, a path in
     /// `UNSUPPORTED_PATHS`, a missing deployment file) and a configuration
-    /// that does not resolve or that `ServeConfig::into_config` refuses
+    /// that does not resolve or that `ServeConfig::validate` refuses
     /// return an invalid-argument error. No rank starts until
     /// `RawEngine::start`, whose workers refuse a video canvas selection the
     /// model does not generate.
@@ -206,16 +209,14 @@ impl DynamoFastH3Engine {
             ));
         }
 
-        let mut config = serve
-            .into_config(&stated)
+        let mut config = serve;
+        config
+            .validate(&stated)
             .map_err(|error| invalid_argument(format!("{error:#}")))?;
         // The Dynamo request form carries no conditions, so the workers
         // provision no condition rows.
-        config.engine.max_condition_rows = Some(0);
-        let served_model_name = config
-            .served_model_name
-            .clone()
-            .unwrap_or_else(|| config.model.clone());
+        config.video_config.max_condition_rows = Some(0);
+        let served_model_name = config.served_model_name().to_owned();
 
         let registration = DynamoWorkerConfig {
             namespace: args.common.namespace.clone(),
@@ -239,6 +240,7 @@ impl DynamoFastH3Engine {
         Ok((
             Self {
                 config,
+                stated,
                 served_model_name,
                 outputs: OnceCell::new(),
                 state: OnceCell::new(),
@@ -261,9 +263,10 @@ impl DynamoFastH3Engine {
     async fn build_state(&self) -> Result<(Arc<AppState>, Outputs), DynamoError> {
         // A MiniMax H3 checkpoint names its pipeline class in a root index in
         // place of config.json; refuse anything else before a rank starts.
-        let pipeline = uniserve_server::profile::assets::resolve_pipeline_index(&self.config.model)
-            .await
-            .map_err(|error| invalid_argument(error.to_string()))?;
+        let pipeline =
+            uniserve_server::profile::assets::resolve_pipeline_index(self.config.model())
+                .await
+                .map_err(|error| invalid_argument(error.to_string()))?;
         if pipeline.and_then(|index| ModelDescription::from_pipeline_class(&index.class_name))
             != Some(ModelDescription::MiniMaxH3)
         {
@@ -274,8 +277,7 @@ impl DynamoFastH3Engine {
 
         // Only `uniserve_server::http` binds the configuration's listener, and
         // this worker never serves UniServe's HTTP API.
-        let config = &self.config;
-        let state = uniserve_server::build_state(config)
+        let state = uniserve_server::build_state(&self.config, &self.stated)
             .await
             .map_err(|error| engine_error(format!("failed to start UniServe: {error:#}")))?;
 
@@ -306,7 +308,7 @@ impl RawEngine for DynamoFastH3Engine {
             return Err(engine_error("UniServe engine already started"));
         }
         let (state, outputs) = self.build_state().await?;
-        let runtime_data = runtime_data(self.config.engine.max_video_seconds, &outputs);
+        let runtime_data = runtime_data(self.config.video_config.max_seconds, &outputs);
         self.state
             .set(state)
             .map_err(|_| engine_error("UniServe engine already started"))?;
@@ -346,7 +348,7 @@ impl RawEngine for DynamoFastH3Engine {
         let prepared = match prepare_request(
             request,
             &self.served_model_name,
-            self.config.engine.max_video_seconds,
+            self.config.video_config.max_seconds,
             &outputs.rasters,
         ) {
             Ok(prepared) => prepared,
@@ -1036,8 +1038,8 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(registration.model_name, "FastH3");
-        assert_eq!(engine.config.engine.max_video_seconds, 5.0);
-        assert_eq!(engine.config.engine.max_condition_rows, Some(0));
+        assert_eq!(engine.config.video_config.max_seconds, 5.0);
+        assert_eq!(engine.config.video_config.max_condition_rows, Some(0));
 
         for flags in [
             vec!["/models/FastH3", "--workers", workers, "--port", "9000"],

@@ -8,13 +8,16 @@
 //! parallelism, `video_config` for MiniMax-H3 video generation, and so on).
 //! [`ServeArgs`] reads the tree: a `--config` file first, then the flags that
 //! name a path of it, then `--set` assignments, each overriding the last.
-//! [`ServeConfig::into_config`] lowers the tree into the server [`Config`].
+//! The tree is the server's configuration: each part of the server reads its
+//! own table, and [`ServeConfig::engine_config`] derives the engine
+//! configuration the scheduler and placement options state.
 //!
-//! Some tables configure one model family: `chat_config` and
-//! `image_fetch_config` chat models, `video_config`, `media_config` and
-//! `video_job_config` MiniMax-H3, `readout_config` and
-//! `diffusion_generation_config` DiffusionGemma. Startup refuses such a table
-//! stated for a checkpoint of another family rather than ignoring it.
+//! Some options configure one model family: the token batch budgets,
+//! `chat_config` and `image_fetch_config` token models, `video_config`,
+//! `media_config` and `video_job_config` MiniMax-H3, `readout_config` and
+//! `diffusion_generation_config` DiffusionGemma. Startup refuses such an
+//! option stated for a checkpoint of another family rather than ignoring it
+//! ([`Stated::refuse_foreign_options`]).
 
 mod args;
 mod values;
@@ -27,20 +30,19 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uniserve_core::{ModelDtype, PrefixCacheDtype};
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+use uniserve_core::{GenerationLimits, ModelDtype, PrefixCacheDtype};
 use uniserve_engine::{
-    DEFAULT_COMPONENT, DEFAULT_MAX_BATCH, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, ExpertExchange,
-    FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat, SchedulingPolicy,
-    TransferConfig, WorkerConfig, WorkerProcessArgs,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
+    ExpertExchange, FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
+    SchedulingPolicy, TransferConfig, WorkerConfig, WorkerProcessArgs,
 };
 
-use crate::config::{
-    Config, EngineSettings, FamilyOptions, HttpListenerMode, VideoJobSettings, VideoMediaSettings,
-};
+use crate::profile::ModelDescription;
 use crate::profile::diffusion_gemma::DenoisingOverrides;
 use crate::serving::chat::ChatTemplateContentFormatOption;
-use crate::serving::media::ImageFetchPolicy;
-use crate::serving::systemone::{self, CandidateTokens, CanvasMode, ReadoutLayout};
+use crate::serving::systemone::{CandidateTokens, CanvasMode, ReadoutLayout};
 
 pub use args::{FLAG_PATHS, ServeArgs, Stated, printed};
 pub use values::ImageSize;
@@ -49,11 +51,93 @@ pub use values::ImageSize;
 /// is unset.
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
-/// The tables of each model family: chat models, MiniMax-H3 video
-/// generation, and DiffusionGemma.
-const CHAT_TABLES: [&str; 2] = ["chat_config", "image_fetch_config"];
-const VIDEO_TABLES: [&str; 3] = ["video_config", "media_config", "video_job_config"];
-const DIFFUSION_GEMMA_TABLES: [&str; 2] = ["readout_config", "diffusion_generation_config"];
+/// Options that place ranks without a deployment file, refused beside one.
+const PLACEMENT_SHORTHAND: [&str; 4] = [
+    "tensor_parallel_size",
+    "placement_config.device",
+    "placement_config.worker_hosts",
+    "placement_config.queue_depth",
+];
+
+/// The model families whose behavior some options configure, with those
+/// options by configuration path.
+///
+/// Token models schedule token batches and render chat prompts, which a
+/// video pipeline does neither of; the video and DiffusionGemma tables
+/// configure behavior only their family has.
+const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
+    (
+        Family::TokenModels,
+        &[
+            "max_num_batched_tokens",
+            "scheduler_config.chunked_prefill_size",
+            "chat_config",
+            "image_fetch_config",
+        ],
+    ),
+    (
+        Family::MiniMaxH3,
+        &["video_config", "media_config", "video_job_config"],
+    ),
+    (
+        Family::DiffusionGemma,
+        &["readout_config", "diffusion_generation_config"],
+    ),
+];
+
+/// A group of model families some options belong to.
+#[derive(Debug, Clone, Copy)]
+enum Family {
+    TokenModels,
+    MiniMaxH3,
+    DiffusionGemma,
+}
+
+impl Family {
+    /// Whether `description` belongs to this family.
+    fn serves(self, description: ModelDescription) -> bool {
+        match self {
+            Self::TokenModels => !description.is_pipeline(),
+            Self::MiniMaxH3 => description == ModelDescription::MiniMaxH3,
+            Self::DiffusionGemma => description == ModelDescription::DiffusionGemma,
+        }
+    }
+
+    /// The family as the refusal names it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::TokenModels => "token models",
+            Self::MiniMaxH3 => "MiniMax-H3 video generation",
+            Self::DiffusionGemma => "DiffusionGemma",
+        }
+    }
+}
+
+impl Stated {
+    /// Refuses a stated option that configures a family other than the
+    /// served model's, rather than ignoring it.
+    ///
+    /// # Errors
+    ///
+    /// Fails, naming the first such option and the served model, when a
+    /// video pipeline states a token-model option, or another model states
+    /// a MiniMax-H3 or DiffusionGemma table.
+    pub fn refuse_foreign_options(&self, description: ModelDescription) -> anyhow::Result<()> {
+        for (family, paths) in FAMILY_OPTIONS {
+            if family.serves(description) {
+                continue;
+            }
+            if let Some(path) = paths.iter().find(|path| self.contains(path)) {
+                anyhow::bail!(
+                    "`{path}` configures {}, but the served checkpoint is a {} model; remove it",
+                    family.name(),
+                    description.id()
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// A positive count, for the defaults of non-zero options.
 const fn positive(count: usize) -> NonZeroUsize {
@@ -503,8 +587,9 @@ pub struct ImageFetchOptions {
 impl Default for ImageFetchOptions {
     fn default() -> Self {
         Self {
-            timeout: ImageFetchPolicy::DEFAULT_TIMEOUT,
-            max_bytes: ImageFetchPolicy::DEFAULT_MAX_BYTES,
+            timeout: Duration::from_secs(20),
+            // 20 MB.
+            max_bytes: 20_000_000,
             allow_private: false,
         }
     }
@@ -563,12 +648,27 @@ pub struct MediaOptions {
     pub ffmpeg: PathBuf,
 }
 
+impl MediaOptions {
+    /// The HTTP body limit of the video submission routes, in bytes.
+    ///
+    /// A `data:` URI carries its media base64 encoded, four bytes per three,
+    /// so a body holding `max_request_bytes` of media plus the request's own
+    /// fields fits; it never falls below the server-wide body limit.
+    pub fn body_limit(&self) -> usize {
+        let encoded = self.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
+        usize::try_from(encoded)
+            .unwrap_or(usize::MAX)
+            .max(crate::http::BODY_LIMIT)
+    }
+}
+
 impl Default for MediaOptions {
     fn default() -> Self {
         Self {
             directory: None,
             allow_remote: true,
-            max_request_bytes: VideoMediaSettings::DEFAULT_MAX_REQUEST_BYTES,
+            // 256 MiB.
+            max_request_bytes: 256 << 20,
             ffprobe: PathBuf::from("ffprobe"),
             ffmpeg: PathBuf::from(WorkerProcessArgs::DEFAULT_FFMPEG),
         }
@@ -590,14 +690,15 @@ pub struct VideoJobOptions {
 impl Default for VideoJobOptions {
     fn default() -> Self {
         Self {
-            retention: Duration::from_secs(VideoJobSettings::DEFAULT_RETENTION_SECONDS),
-            max_bytes: VideoJobSettings::DEFAULT_MAX_RETAINED_BYTES,
+            retention: Duration::from_secs(3600),
+            // 1 GiB.
+            max_bytes: 1 << 30,
         }
     }
 }
 
 /// DiffusionGemma System One readouts (`readout_config`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReadoutOptions {
     /// `joint` packs questions into shared canvases; `independent` gives
@@ -612,47 +713,95 @@ pub struct ReadoutOptions {
 }
 
 impl ServeConfig {
-    /// Lowers the configuration into the server configuration and validates
-    /// it.
+    /// The configured model: a local directory or a Hugging Face repository.
     ///
-    /// The deployment comes from the `workers` file, placed on this
-    /// process's `host_identity`, or else from `tensor_parallel_size`,
-    /// `data_parallel_size` and `placement_config`. `stated` records the
-    /// paths the operator set, so the placement shorthand can be refused
-    /// beside a deployment file and the model-family tables checked against
-    /// the served model at startup.
+    /// Empty while unstated; [`ServeConfig::validate`] refuses that.
+    pub fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or_default()
+    }
+
+    /// The single model name the API serves: `served_model_name`, else the
+    /// model.
+    pub fn served_model_name(&self) -> &str {
+        self.served_model_name
+            .as_deref()
+            .unwrap_or_else(|| self.model())
+    }
+
+    /// Checks the rules the option types cannot express on their own.
+    ///
+    /// `stated` records the paths the operator set, so the placement
+    /// shorthand is refused beside a deployment file. Rules that need the
+    /// served model's family run at startup instead
+    /// ([`Stated::refuse_foreign_options`]).
     ///
     /// # Errors
     ///
-    /// Fails when `model` is unset, a placement-shorthand option is stated
-    /// with `workers`, the deployment does not place, a capture list is not
-    /// strictly increasing or repeats a shape, a lane or the transfer edges
-    /// do not resolve, or [`Config::validate`] refuses the result.
-    pub fn into_config(self, stated: &Stated) -> anyhow::Result<Config> {
-        let model = self.model.clone().context(
-            "`model` is required: name MODEL on the command line or set `model` in --config",
-        )?;
+    /// Fails when `model` is unset, `mem_fraction_static` lies outside
+    /// (0, 1], a placement-shorthand option is stated with `workers`, the
+    /// server host or Unix socket path is blank, or
+    /// `video_config.max_seconds` lies outside the durations the video API
+    /// admits.
+    pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.model.is_some(),
+            "`model` is required: name MODEL on the command line or set `model` in --config"
+        );
         WorkerConfig::validate_mem_fraction_static(self.mem_fraction_static)
             .context("invalid `mem_fraction_static`")?;
+        if self.workers.is_some()
+            && let Some(option) = PLACEMENT_SHORTHAND
+                .iter()
+                .find(|option| stated.contains(option))
+        {
+            anyhow::bail!(
+                "`{option}` places ranks without a deployment file; the `workers` file \
+                 states its own placement"
+            );
+        }
+        let server = &self.server_config;
+        match &server.uds {
+            Some(path) => anyhow::ensure!(
+                !path.trim().is_empty(),
+                "`server_config.uds` must not be empty"
+            ),
+            None => anyhow::ensure!(
+                !server.host.trim().is_empty(),
+                "`server_config.host` must not be empty"
+            ),
+        }
+        // A smaller capacity admits no request and a larger one exceeds what
+        // the video API accepts.
+        let seconds = MIN_VIDEO_SECONDS..=MAX_VIDEO_SECONDS;
+        anyhow::ensure!(
+            seconds.contains(&self.video_config.max_seconds),
+            "`video_config.max_seconds` must lie in [{}, {}], got {}",
+            seconds.start(),
+            seconds.end(),
+            self.video_config.max_seconds
+        );
+        Ok(())
+    }
 
+    /// Derives the engine configuration these options state.
+    ///
+    /// The deployment comes from the `workers` file, placed on this
+    /// process's `host_identity`, or else from `tensor_parallel_size`,
+    /// `data_parallel_size` and `placement_config`. What the loaded model
+    /// determines keeps its neutral value for `Engine::start` to complete:
+    /// the generation limits and control tokens, and the worker launch
+    /// fields `max_model_len`, `canvas_sampling` and `prefill_outputs`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the deployment does not place, a capture list is not
+    /// strictly increasing or repeats a shape, a lane or the transfer edges
+    /// do not resolve, or a batch bound exceeds the worker's `u32` fields.
+    pub fn engine_config(&self) -> anyhow::Result<EngineConfig> {
         let workers = match &self.workers {
-            Some(path) => {
-                let shorthand = [
-                    "tensor_parallel_size",
-                    "placement_config.device",
-                    "placement_config.worker_hosts",
-                    "placement_config.queue_depth",
-                ];
-                if let Some(option) = shorthand.iter().find(|option| stated.contains(option)) {
-                    anyhow::bail!(
-                        "`{option}` places ranks without a deployment file; the `workers` file \
-                         states its own placement"
-                    );
-                }
-                Deployment::read(&path.to_string_lossy())?
-                    .workers(&self.host_identity)
-                    .context("invalid `workers` deployment")?
-            }
+            Some(path) => Deployment::read(&path.to_string_lossy())?
+                .workers(&self.host_identity)
+                .context("invalid `workers` deployment")?,
             None => {
                 let tensor_parallel_size = self.tensor_parallel_size.get();
                 WorkerConfig::replicated(
@@ -684,11 +833,14 @@ impl ServeConfig {
             .context("invalid `placement_config.transfer`")?
             .unwrap_or_default();
 
+        let max_num_batched_tokens = self
+            .max_num_batched_tokens
+            .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, NonZeroUsize::get);
         let graphs = &self.cuda_graph_config;
         let flashinfer = &self.flashinfer_config;
         let worker_process = WorkerProcessArgs {
             python: self.worker_config.python.clone(),
-            model: model.clone(),
+            model: self.model().to_owned(),
             host: self.host_identity.clone(),
             queue_depth: self.placement_config.queue_depth.get(),
             watchdog_timeout: self.worker_config.watchdog_timeout,
@@ -738,12 +890,28 @@ impl ServeConfig {
                 .prefill_split_tile_size
                 .map(NonZeroU32::get),
             flashinfer_split_kv: flashinfer.split_kv,
+            // Each forward batch is bounded by the scheduler's batch and token
+            // budgets, which the worker's launch descriptor carries as `u32`.
+            max_batch_calls: u32::try_from(self.scheduler_config.max_batch.get())
+                .context("`scheduler_config.max_batch` exceeds the worker field width")?,
+            max_batch_tokens: u32::try_from(max_num_batched_tokens)
+                .context("`max_num_batched_tokens` exceeds the worker field width")?,
+            // Video workers size resident media state for the longest
+            // duration served and provision only the frame counts the API
+            // admits, and prepare exactly the canvases these resolutions and
+            // aspect ratios name.
+            max_video_seconds: self.video_config.max_seconds,
+            min_video_seconds: Some(MIN_VIDEO_SECONDS),
+            max_condition_rows: self.video_config.max_condition_rows,
+            video_resolutions: self.video_config.resolutions.clone(),
+            video_aspect_ratios: self.video_config.aspect_ratios.clone(),
             ..WorkerProcessArgs::default()
         };
 
-        let engine = EngineSettings {
+        Ok(EngineConfig {
+            generation_limits: GenerationLimits::default(),
             max_batch: self.scheduler_config.max_batch.get(),
-            max_num_batched_tokens: self.max_num_batched_tokens.map(NonZeroUsize::get),
+            max_num_batched_tokens,
             max_running_requests: self.max_running_requests.get(),
             max_queued_requests: self
                 .scheduler_config
@@ -752,14 +920,9 @@ impl ServeConfig {
             chunked_prefill_size: self
                 .scheduler_config
                 .chunked_prefill_size
-                .map(NonZeroUsize::get),
+                .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, NonZeroUsize::get),
             prefix_cache: self.kv_cache_config.prefix_caching,
             schedule_policy: self.scheduler_config.policy,
-            max_model_len: self.max_model_len.map(NonZeroU32::get),
-            max_video_seconds: self.video_config.max_seconds,
-            video_resolutions: self.video_config.resolutions.clone(),
-            video_aspect_ratios: self.video_config.aspect_ratios.clone(),
-            max_condition_rows: self.video_config.max_condition_rows,
             workers,
             transfer,
             data_parallel_size: self.data_parallel_size.get(),
@@ -768,62 +931,10 @@ impl ServeConfig {
                 .expert_parallel
                 .then_some(self.moe_config.exchange),
             worker_process,
-        };
-
-        let server = &self.server_config;
-        let listener_mode = match &server.uds {
-            Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
-            None => HttpListenerMode::BindTcp {
-                host: server.host.clone(),
-                port: server.port,
-            },
-        };
-        let config = Config {
-            engine,
-            model,
-            served_model_name: self.served_model_name.clone(),
-            listener_mode,
-            chat_template: self.chat_config.template.clone(),
-            default_chat_template_kwargs: self.chat_config.template_kwargs.clone(),
-            chat_template_content_format: self.chat_config.template_content_format,
-            log_requests: self.logging_config.log_requests,
-            request_id_headers: server.request_id_headers,
-            log_stats: self.logging_config.log_stats,
-            api_key: configured_api_key(server.api_key.as_deref()),
-            request_timeout: server.request_timeout,
-            max_concurrent_requests: server.max_concurrent_requests.map(NonZeroU64::get),
-            shutdown_timeout: server.shutdown_timeout,
-            reasoning_parsing: self.chat_config.reasoning_parser == ReasoningParser::Auto,
-            video_media: VideoMediaSettings {
-                media_directory: self.media_config.directory.clone(),
-                remote_media: self.media_config.allow_remote,
-                max_request_bytes: self.media_config.max_request_bytes,
-                ffprobe: self.media_config.ffprobe.clone(),
-            },
-            video_jobs: VideoJobSettings {
-                retention: self.video_job_config.retention,
-                max_retained_bytes: self.video_job_config.max_bytes,
-            },
-            image_fetch: ImageFetchPolicy {
-                timeout: self.image_fetch_config.timeout,
-                max_bytes: self.image_fetch_config.max_bytes,
-                allow_private: self.image_fetch_config.allow_private,
-            },
-            readout: systemone::ReadoutOptions {
-                layout: self.readout_config.layout,
-                canvas: self.readout_config.canvas,
-                candidates: self.readout_config.candidates,
-            },
-            diffusion_generation: self.diffusion_generation_config,
-            mm_processor_kwargs: self.mm_processor_kwargs.clone(),
-            family_options: FamilyOptions {
-                chat: stated.tables(&CHAT_TABLES),
-                video: stated.tables(&VIDEO_TABLES),
-                diffusion_gemma: stated.tables(&DIFFUSION_GEMMA_TABLES),
-            },
-        };
-        config.validate()?;
-        Ok(config)
+            bos: 0,
+            eos: Vec::new(),
+            end_of_image: 0,
+        })
     }
 
     /// Returns the hosts the placement shorthand places ranks on, this host
@@ -849,11 +960,13 @@ impl ServeConfig {
 
 /// Returns the bearer token the server requires, if any.
 ///
+/// [`ServeArgs::resolve`] stores it in `server_config.api_key`.
+///
 /// The configured key takes precedence over the `UNISERVE_API_KEY`
 /// environment variable. Each source is trimmed, and a blank value counts as
 /// unset, so a blank configured key falls through to the environment
 /// variable.
-fn configured_api_key(configured: Option<&str>) -> Option<String> {
+pub(super) fn configured_api_key(configured: Option<&str>) -> Option<String> {
     non_empty_secret(configured).or_else(|| {
         std::env::var(API_KEY_ENV)
             .ok()

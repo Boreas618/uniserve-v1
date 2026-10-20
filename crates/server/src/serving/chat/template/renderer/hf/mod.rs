@@ -30,9 +30,10 @@ use self::format::{
 };
 use self::template::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
+use crate::options::ChatOptions;
 use crate::serving::chat::Error;
 use crate::serving::chat::Result;
-use crate::serving::chat::template::{ChatTemplateLoadOptions, Tool};
+use crate::serving::chat::template::Tool;
 use crate::serving::chat::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod error;
@@ -114,8 +115,8 @@ impl HfChatRenderer {
 
     /// Creates a renderer from the given model files and loading options.
     ///
-    /// Template precedence, highest first: `options.chat_template` (a file
-    /// path or inline Jinja, see `resolve_chat_template`), then a non-blank
+    /// Template precedence, highest first: `options.template` (a file path
+    /// or inline Jinja, see `resolve_chat_template`), then a non-blank
     /// standalone template file (`files.chat_template_path`), then the
     /// `chat_template` entry of `tokenizer_config.json`. Special tokens always
     /// come from the tokenizer config; when it defines none, templates see
@@ -128,7 +129,7 @@ impl HfChatRenderer {
     /// template does not compile.
     pub fn load(
         files: &ResolvedModelFiles,
-        options: ChatTemplateLoadOptions,
+        options: &ChatOptions,
         multimodal: Option<MultimodalRenderInfo>,
     ) -> Result<Self> {
         let HfTokenizerConfig {
@@ -139,7 +140,7 @@ impl HfChatRenderer {
         let mut template = chat_template;
         let special_tokens = (!special_tokens.is_empty()).then_some(special_tokens);
 
-        if let Some(configured_template) = options.chat_template.as_deref() {
+        if let Some(configured_template) = options.template.as_deref() {
             template = Some(
                 resolve_chat_template(configured_template)
                     .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
@@ -167,8 +168,8 @@ impl HfChatRenderer {
 
         Ok(Self::new(
             template,
-            options.default_chat_template_kwargs,
-            options.chat_template_content_format,
+            options.template_kwargs.clone().unwrap_or_default(),
+            options.template_content_format,
         )?
         .with_special_tokens(special_tokens)
         .with_multimodal(multimodal))

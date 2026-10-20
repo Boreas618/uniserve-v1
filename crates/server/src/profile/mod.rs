@@ -194,6 +194,9 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Context length of a model whose configuration declares none and for
+    /// which no `max_model_len` is configured.
+    pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
     ///
     /// The family comes from the `model_type` of `files.config_path`, which
@@ -204,7 +207,7 @@ impl ModelConfig {
     /// image, and sampler settings (see `DiffusionGemmaProfile::resolve`). A
     /// configured `max_model_len` takes precedence over the checkpoint's
     /// `max_position_embeddings`, and
-    /// `EngineSettings::DEFAULT_MAX_MODEL_LEN` applies when neither is set.
+    /// [`ModelConfig::DEFAULT_MAX_MODEL_LEN`] applies when neither is set.
     ///
     /// # Errors
     ///
@@ -270,7 +273,7 @@ impl ModelConfig {
             sampling_defaults: generation_defaults(&generation_config),
             max_model_len: max_model_len
                 .or(model_config.max_position_embeddings())
-                .unwrap_or(crate::EngineSettings::DEFAULT_MAX_MODEL_LEN),
+                .unwrap_or(Self::DEFAULT_MAX_MODEL_LEN),
             primary_eos_token_id,
             eos_token_ids,
         })

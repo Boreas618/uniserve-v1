@@ -43,7 +43,7 @@ impl AppState {
         Self {
             runtime,
             videos: Arc::new(crate::video_jobs::VideoJobs::new(
-                crate::config::VideoJobSettings::default(),
+                crate::options::VideoJobOptions::default(),
             )),
             enable_log_requests: false,
             enable_request_id_headers: false,
@@ -87,14 +87,14 @@ impl AppState {
     }
 
     /// Configures the retention and memory budget of asynchronous video jobs.
-    pub fn with_video_jobs(mut self, settings: crate::config::VideoJobSettings) -> Self {
+    pub fn with_video_jobs(mut self, settings: crate::options::VideoJobOptions) -> Self {
         self.videos = Arc::new(crate::video_jobs::VideoJobs::new(settings));
         self
     }
 
     /// Returns the serving runtime.
     /// Sets the HTTP body limit of the video submission routes, whose bodies
-    /// may carry condition media inline (`VideoMediaSettings::body_limit`).
+    /// may carry condition media inline (`MediaOptions::body_limit`).
     pub fn with_video_body_limit(mut self, bytes: usize) -> Self {
         self.video_body_limit = bytes;
         self

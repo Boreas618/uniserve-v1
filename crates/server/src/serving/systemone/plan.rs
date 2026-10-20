@@ -35,6 +35,7 @@
 //! on exactly one first letter. Option `X Y` then has probability
 //! `P(X) * P(Y | X)` from raw full-vocabulary probabilities.
 
+use crate::options::ReadoutOptions;
 use std::ops::Range;
 use std::str::FromStr;
 
@@ -48,8 +49,8 @@ use crate::profile::diffusion_gemma::{
 use crate::profile::tokenizer::{DynTokenizer, TokenizerError};
 use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
 use crate::serving::chat::{
-    ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatTemplateLoadOptions,
-    ChatToolChoice, HfChatRenderer,
+    ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatToolChoice,
+    HfChatRenderer,
 };
 use crate::serving::systemone::error::{LocItem, SystemOneError, ValidationIssue};
 use crate::serving::systemone::prompt::{
@@ -151,18 +152,6 @@ impl FromStr for CanvasMode {
     }
 }
 
-/// Server-wide readout settings, fixed at startup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadoutOptions {
-    /// Division of questions among prompts and canvases.
-    pub layout: ReadoutLayout,
-    /// Canvas length.
-    pub canvas: CanvasMode,
-    /// Candidate spellings contributing to the returned probabilities.
-    #[serde(default)]
-    pub candidates: CandidateTokens,
-}
-
 /// Pixel dimensions of one decoded request image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageSize {
@@ -233,7 +222,9 @@ impl ReadoutEncoder {
         })?;
         let renderer = HfChatRenderer::load(
             files,
-            ChatTemplateLoadOptions::default(),
+            // The readout renders with the checkpoint's own template, never
+            // the configured chat override.
+            &crate::options::ChatOptions::default(),
             Some(MultimodalRenderInfo {
                 placeholder_token: placeholder,
             }),

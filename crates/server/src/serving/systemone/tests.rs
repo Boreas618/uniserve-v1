@@ -7,6 +7,7 @@
 //! behave as in the served checkpoint. Token-exact prompts for the real
 //! checkpoints are covered by the `systemone_checkpoint` integration test.
 
+use crate::options::ReadoutOptions;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -17,8 +18,8 @@ use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use super::{
-    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutOptions,
-    ReadoutPlan, StartupError, SystemOneError, SystemOneRequest,
+    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutPlan,
+    StartupError, SystemOneError, SystemOneRequest,
 };
 use axum::http::StatusCode;
 use base64::Engine as _;

@@ -6,15 +6,15 @@
 //!
 //! - Only `http` and `https` are followed, for at most
 //!   [`ImageFetcher::MAX_REDIRECTS`] redirects.
-//! - Unless [`ImageFetchPolicy::allow_private`] is set, every destination
+//! - Unless [`ImageFetchOptions::allow_private`] is set, every destination
 //!   address must be public ([`is_public_address`]). A literal address in the
 //!   URL is checked before the request. A host name is checked inside the
 //!   client's DNS resolver, and the client connects only to the addresses that
 //!   resolver returned, so a host cannot pass the check with one DNS answer
 //!   and connect with another.
 //! - The whole fetch, redirects and body included, completes within
-//!   [`ImageFetchPolicy::timeout`].
-//! - The image may not exceed [`ImageFetchPolicy::max_bytes`]. A declared
+//!   [`ImageFetchOptions::timeout`].
+//! - The image may not exceed [`ImageFetchOptions::max_bytes`]. A declared
 //!   `Content-Length` over the limit fails before the body is read, and the
 //!   streamed byte count enforces the limit whatever the headers declare.
 //! - The response must declare an `image/*` `Content-Type` or begin with a
@@ -31,44 +31,11 @@ use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use reqwest::{StatusCode, Url};
-use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use super::ImageInput;
-
-/// Limits applied to every image reference a request supplies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ImageFetchPolicy {
-    /// Time allowed for one http(s) fetch: connecting, every redirect hop,
-    /// and reading the complete body. Waiting for a free fetch slot (see
-    /// [`ImageFetcher::MAX_CONCURRENT_FETCHES`]) is not counted.
-    pub timeout: Duration,
-    /// Largest accepted encoded image, in bytes, for fetched bodies and for
-    /// the decoded payload of data URLs alike.
-    pub max_bytes: u64,
-    /// Whether http(s) fetches may connect to addresses [`is_public_address`]
-    /// rejects. Scheme, redirect, time, size, and type limits still apply.
-    pub allow_private: bool,
-}
-
-impl ImageFetchPolicy {
-    /// Default [`Self::timeout`].
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
-    /// Default [`Self::max_bytes`] (20 MB).
-    pub const DEFAULT_MAX_BYTES: u64 = 20_000_000;
-}
-
-impl Default for ImageFetchPolicy {
-    /// Returns the default time and size limits with public destinations only.
-    fn default() -> Self {
-        Self {
-            timeout: Self::DEFAULT_TIMEOUT,
-            max_bytes: Self::DEFAULT_MAX_BYTES,
-            allow_private: false,
-        }
-    }
-}
+use crate::options::ImageFetchOptions;
 
 /// Failure to turn one image reference into an [`ImageInput`].
 ///
@@ -113,7 +80,7 @@ pub enum ImageFetchError {
         /// Response status code.
         status: u16,
     },
-    /// The image exceeds [`ImageFetchPolicy::max_bytes`].
+    /// The image exceeds [`ImageFetchOptions::max_bytes`].
     #[error("image exceeds the {limit}-byte size limit")]
     TooLarge {
         /// Configured size limit in bytes.
@@ -127,7 +94,7 @@ pub enum ImageFetchError {
     /// The bytes do not form a readable image of a supported format.
     #[error("image data cannot be decoded: {0}")]
     Undecodable(image::ImageError),
-    /// The fetch did not complete within [`ImageFetchPolicy::timeout`].
+    /// The fetch did not complete within [`ImageFetchOptions::timeout`].
     #[error("image URL fetch did not complete within {timeout:?}")]
     Timeout {
         /// Configured fetch time limit.
@@ -163,7 +130,7 @@ pub struct ImageListError {
 #[derive(Debug, Clone)]
 pub struct ImageFetcher {
     client: reqwest::Client,
-    policy: ImageFetchPolicy,
+    policy: ImageFetchOptions,
     slots: Arc<Semaphore>,
 }
 
@@ -178,13 +145,13 @@ impl ImageFetcher {
     /// fetches wait for a slot; data URLs never take one.
     pub const MAX_CONCURRENT_FETCHES: usize = 64;
 
-    /// Builds a fetcher enforcing `policy`.
+    /// Builds a fetcher enforcing the `image_fetch_config` limits.
     ///
     /// # Errors
     ///
     /// Fails when the HTTP client cannot be initialized, for example when the
     /// TLS backend cannot load its configuration.
-    pub fn new(policy: ImageFetchPolicy) -> anyhow::Result<Self> {
+    pub fn new(policy: &ImageFetchOptions) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             // Redirects are followed by `download` so each hop is validated
             // before it is requested.
@@ -197,7 +164,7 @@ impl ImageFetcher {
             .build()?;
         Ok(Self {
             client,
-            policy,
+            policy: policy.clone(),
             slots: Arc::new(Semaphore::new(Self::MAX_CONCURRENT_FETCHES)),
         })
     }
@@ -656,10 +623,10 @@ mod tests {
 
     /// Default limits with loopback destinations allowed, which the local
     /// test server needs.
-    fn loopback_policy() -> ImageFetchPolicy {
-        ImageFetchPolicy {
+    fn loopback_policy() -> ImageFetchOptions {
+        ImageFetchOptions {
             allow_private: true,
-            ..ImageFetchPolicy::default()
+            ..ImageFetchOptions::default()
         }
     }
 
@@ -850,7 +817,7 @@ mod tests {
         let png = encoded_image(ImageFormat::Png, 3, 2);
         let body = png.clone();
         let server = TestServer::start(move |_| ok("image/png", &body)).await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         let inline = fetcher.fetch(data_url(&png)).await.unwrap();
         assert_eq!(inline.bytes().as_ref(), png.as_slice());
@@ -871,7 +838,7 @@ mod tests {
         let wide = encoded_image(ImageFormat::Png, 4, 1);
         let tall = encoded_image(ImageFormat::Png, 1, 4);
         let server = TestServer::start(move |_| ok("image/png", &tall)).await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         let images = fetcher
             .fetch_all(vec![server.url("/tall.png"), data_url(&wide)])
@@ -909,7 +876,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         let server =
             TestServer::start(move |path| ok("application/octet-stream", &bodies[path])).await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         for (path, _) in formats {
             let image = fetcher.fetch(server.url(path)).await.unwrap();
@@ -929,7 +896,7 @@ mod tests {
             _ => ok("image/png", b"these bytes are not a PNG file"),
         })
         .await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         assert!(matches!(
             fetcher.fetch(server.url("/missing")).await,
@@ -981,7 +948,7 @@ mod tests {
         .await;
         let paths = ["/declared", "/close-delimited", "/chunked"];
 
-        let exact = ImageFetcher::new(ImageFetchPolicy {
+        let exact = ImageFetcher::new(&ImageFetchOptions {
             max_bytes: png.len() as u64,
             ..loopback_policy()
         })
@@ -992,7 +959,7 @@ mod tests {
         }
 
         let limit = png.len() as u64 - 1;
-        let smaller = ImageFetcher::new(ImageFetchPolicy {
+        let smaller = ImageFetcher::new(&ImageFetchOptions {
             max_bytes: limit,
             ..loopback_policy()
         })
@@ -1018,7 +985,7 @@ mod tests {
             )
         })
         .await;
-        let fetcher = ImageFetcher::new(ImageFetchPolicy {
+        let fetcher = ImageFetcher::new(&ImageFetchOptions {
             max_bytes: 1000,
             ..loopback_policy()
         })
@@ -1043,7 +1010,7 @@ mod tests {
         })
         .await;
         let timeout = Duration::from_millis(200);
-        let fetcher = ImageFetcher::new(ImageFetchPolicy {
+        let fetcher = ImageFetcher::new(&ImageFetchOptions {
             timeout,
             ..loopback_policy()
         })
@@ -1063,9 +1030,9 @@ mod tests {
     /// the size limit are refused.
     #[tokio::test]
     async fn unsupported_references_are_refused() {
-        let fetcher = ImageFetcher::new(ImageFetchPolicy {
+        let fetcher = ImageFetcher::new(&ImageFetchOptions {
             max_bytes: 256,
-            ..ImageFetchPolicy::default()
+            ..ImageFetchOptions::default()
         })
         .unwrap();
         let fetch = |reference: &str| fetcher.fetch(reference.to_owned());
@@ -1133,7 +1100,7 @@ mod tests {
             _ => Reply::Close(response("302 Found", &[], b"")),
         })
         .await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         let image = fetcher.fetch(server.url("/hop3")).await.unwrap();
         assert_eq!((image.width(), image.height()), (2, 2));
@@ -1166,7 +1133,7 @@ mod tests {
         let target_server = TestServer::start(|_| Reply::Close(Vec::new())).await;
         let target = target_server.url("/internal-target");
         let server = TestServer::start(move |_| redirect("302 Found", &target)).await;
-        let fetcher = ImageFetcher::new(loopback_policy()).unwrap();
+        let fetcher = ImageFetcher::new(&loopback_policy()).unwrap();
 
         let error = fetcher.fetch(server.url("/image.png")).await.unwrap_err();
         let message = error.to_string();
@@ -1189,7 +1156,7 @@ mod tests {
         let png = encoded_image(ImageFormat::Png, 1, 1);
         let server = TestServer::start(move |_| ok("image/png", &png)).await;
         let port = server.address.port();
-        let fetcher = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+        let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
 
         for host in [
             "127.0.0.1",
@@ -1211,7 +1178,7 @@ mod tests {
         }
         assert_eq!(server.connections(), 0);
 
-        ImageFetcher::new(loopback_policy())
+        ImageFetcher::new(&loopback_policy())
             .unwrap()
             .fetch(server.url("/image.png"))
             .await

@@ -28,8 +28,8 @@ use uniserve_engine::VideoDenoiserInfo;
 use super::probe::{MediaProber, ProbeConfig};
 use super::sources::{MediaFetcher, MediaLimits, MediaPolicy, RemoteMediaPolicy};
 use super::{ConditionInput, VideoInputs, VideoProcessor};
-use crate::config::VideoMediaSettings;
 use crate::openai::{ApiError, VideoCondition, VideoGenerationRequest};
+use crate::options::MediaOptions;
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::{ServeError, ServeRequestId};
 
@@ -61,7 +61,7 @@ pub struct VideoService {
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
     latent_encoding_lane: u32,
-    media: VideoMediaSettings,
+    media: MediaOptions,
     processor: VideoProcessor,
 }
 
@@ -81,7 +81,7 @@ impl VideoService {
         vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
-        media: &VideoMediaSettings,
+        media: &MediaOptions,
         references: ReferenceConfig,
         tokenizer: DynTokenizer,
     ) -> anyhow::Result<Self> {
@@ -104,9 +104,9 @@ impl VideoService {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let fetcher = MediaFetcher::new(MediaPolicy {
-            media_directory: media.media_directory.clone(),
+            media_directory: media.directory.clone(),
             remote: RemoteMediaPolicy {
-                enabled: media.remote_media,
+                enabled: media.allow_remote,
                 ..RemoteMediaPolicy::default()
             },
             limits: MediaLimits::new(media.max_request_bytes),
@@ -219,8 +219,8 @@ impl VideoService {
             "max_prompt_tokens": max_prompt_tokens,
             "media": {
                 "data": true,
-                "http": self.media.remote_media,
-                "file": self.media.media_directory.is_some(),
+                "http": self.media.allow_remote,
+                "file": self.media.directory.is_some(),
                 "max_request_bytes": limits.total_bytes,
             },
             "request_fields": REQUEST_FIELDS,
@@ -356,8 +356,8 @@ mod tests {
 
     use super::super::tests::{character_tokenizer, served_canvases, vision};
     use super::VideoService;
-    use crate::config::VideoMediaSettings;
     use crate::openai::VideoGenerationRequest;
+    use crate::options::MediaOptions;
     use crate::serving::ServeRequestId;
 
     /// A base denoiser serving every task, on a latent encoder of one rank,
@@ -390,7 +390,7 @@ mod tests {
             vision(),
             15.0,
             latent_encoding_lane,
-            &VideoMediaSettings::default(),
+            &MediaOptions::default(),
             references,
             Arc::new(character_tokenizer()),
         )

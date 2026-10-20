@@ -19,9 +19,10 @@ use uniserve_engine::{EngineConfig, SimEngine, SimExecutor};
 
 use crate::AppState;
 use crate::engine_client::EngineClient;
+use crate::options::ImageFetchOptions;
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use crate::serving::media::{ImageFetchPolicy, ImageFetcher};
+use crate::serving::media::ImageFetcher;
 use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime, WorkerCapabilities};
@@ -84,7 +85,7 @@ pub(crate) fn sim_runtime(parameters: ModelParameters) -> ServingRuntime {
     )
     .unwrap();
 
-    let images = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let images = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     ServingRuntime::new(processor, client, images, false)
 }
 
@@ -127,7 +128,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         },
         max_video_seconds,
         1,
-        &crate::VideoMediaSettings::default(),
+        &crate::options::MediaOptions::default(),
         // A text-to-video denoiser takes no references to size.
         uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
         configured_tokenizer(),

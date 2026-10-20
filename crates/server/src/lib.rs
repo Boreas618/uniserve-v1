@@ -1,16 +1,16 @@
 //! UniServe HTTP frontend, model profiles, request lowering, and output assembly.
 //!
-//! The crate resolves one configuration into shared application
-//! state and exposes OpenAI-compatible routes backed by the in-process engine.
+//! The crate serves one option tree (`options::ServeConfig`) as shared
+//! application state and exposes OpenAI-compatible routes backed by the
+//! in-process engine.
 //!
 //! [`build_state`] is the startup path: it resolves the model's assets into a
-//! `profile::ModelConfig`, a tokenizer, and a chat renderer, derives the
-//! engine and worker-process settings from the model and the configuration,
+//! `profile::ModelConfig`, a tokenizer, and a chat renderer, completes the
+//! engine configuration the options state with what the model determines,
 //! starts the engine (`engine_client`), and binds the model's input
 //! processing to the capabilities the engine reports (`serving`). The HTTP
 //! layer (`http`) serves requests from the resulting [`AppState`].
 
-mod config;
 /// Server-facing engine submission and health client.
 pub mod engine_client;
 /// HTTP listener, middleware, and route construction.
@@ -31,18 +31,16 @@ pub use crate::profile::ModelDescription;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::{ModelConfig, ModelParameters};
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
-pub use crate::serving::media::ImageFetchPolicy;
 use crate::serving::media::ImageFetcher;
 use crate::serving::systemone::ReadoutEncoder;
 use crate::serving::{InputProcessor, RequestRenderer, ServingRuntime};
 use crate::serving::{LoadedModel, LoadedRenderer};
 use anyhow::{Context as _, Result};
-pub use config::{
-    Config, EngineSettings, FamilyOptions, HttpListenerMode, VideoJobSettings, VideoMediaSettings,
-};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::{EngineConfig, SpecialTokenIds, WorkerProcessArgs};
+use uniserve_engine::SpecialTokenIds;
+
+use crate::options::{ReasoningParser, ServeConfig, Stated};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
@@ -80,109 +78,72 @@ fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
 /// Builds the shared application state for one resolved model and one engine client.
 ///
 /// Starts the engine and its worker processes as a side effect, so the
-/// returned state owns a running engine.
+/// returned state owns a running engine. `config` must have passed
+/// [`ServeConfig::validate`]; `stated` holds the paths the operator set.
 ///
 /// # Errors
 ///
-/// Fails when the model assets cannot be resolved, when the configuration
-/// states an option of another model family (`FamilyOptions::check`), when
-/// the per-run call bound (`max_batch`) or `max_num_batched_tokens` does not
-/// fit the worker's `u32` fields, when the engine fails to start, or
-/// when the model description cannot be bound to the capabilities the engine
+/// Fails when the model assets cannot be resolved, when an option of another
+/// model family was stated ([`Stated::refuse_foreign_options`]), when the
+/// options do not derive an engine configuration
+/// ([`ServeConfig::engine_config`]), when the engine fails to start, or when
+/// the model description cannot be bound to the capabilities the engine
 /// reports.
-pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
+pub async fn build_state(config: &ServeConfig, stated: &Stated) -> Result<Arc<AppState>> {
     let LoadedModel {
         config: mut model_config,
         tokenizer,
         renderer,
     } = ModelConfig::load(config)
         .await
-        .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+        .with_context(|| format!("failed to resolve model assets for `{}`", config.model()))?;
     // Options of another model family than the served one are refused
     // rather than ignored.
-    config.family_options.check(model_config.description())?;
+    stated.refuse_foreign_options(model_config.description())?;
     // The server's block-diffusion sampling replaces the checkpoint's
     // defaults once, before any request is lowered.
     if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
         profile.denoising = profile
             .denoising
-            .with_overrides(&config.diffusion_generation)
+            .with_overrides(&config.diffusion_generation_config)
             .map_err(|message| anyhow::anyhow!("invalid diffusion_generation_config: {message}"))?;
     }
     let max_model_len = model_config.max_model_len;
+
+    // The options state the scheduler and the placement; the loaded model
+    // completes what it determines.
+    let mut engine_config = config.engine_config()?;
+    engine_config.generation_limits =
+        model_config.generation_limits(engine_config.worker_process.dtype);
     let control_tokens = special_token_ids(&model_config);
-    let generation_limits = model_config.generation_limits(config.engine.worker_process.dtype);
+    engine_config.bos = control_tokens.bos;
+    engine_config.eos = control_tokens.eos;
+    engine_config.end_of_image = control_tokens.end_of_image;
+    let worker = &mut engine_config.worker_process;
+    worker.max_model_len = max_model_len;
+    // Video workers prepare exactly the canvases their denoiser names for
+    // the configured resolutions and aspect ratios, refusing a pair it does
+    // not generate, and report them back as the only canvases requests may
+    // target. Other models prepare none.
+    if !matches!(model_config.parameters, ModelParameters::MiniMaxH3) {
+        worker.video_resolutions.clear();
+        worker.video_aspect_ratios.clear();
+    }
+    // Every generated canvas uses the served sampling, which the worker
+    // sizes its canvas state for and prepares its canvas steps with.
+    worker.canvas_sampling = match &model_config.parameters {
+        ModelParameters::DiffusionGemma(profile) => Some(crate::serving::canvas_sampling(profile)),
+        _ => None,
+    };
+    // A DiffusionGemma prompt, image block or committed block only
+    // conditions canvases: its prefill writes the prefix cache alone.
+    worker.prefill_outputs = !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_));
 
     info!(
-        workers = ?config.engine.workers,
-        block_size = ?config.engine.worker_process.block_size,
+        workers = ?engine_config.workers,
+        block_size = ?engine_config.worker_process.block_size,
         "starting UniServe Rust engine"
     );
-
-    // Admission limits running requests, not the worker's execution capacity.
-    // Media workers keep the resident request slots their queue depth
-    // pipelines even when admission permits fewer requests. Keep their
-    // configured batch capacity independent.
-    let budgets = config
-        .engine
-        .token_budgets(model_config.description().is_pipeline())?;
-    let max_batch_calls = u32::try_from(config.engine.max_batch.max(1))
-        .context("max_batch exceeds the worker field width")?;
-    let max_batch_tokens = u32::try_from(budgets.max_num_batched_tokens)
-        .context("max_num_batched_tokens exceeds the worker field width")?;
-
-    let worker_process = WorkerProcessArgs {
-        model: config.model.clone(),
-        max_batch_calls,
-        max_batch_tokens,
-        max_model_len,
-        max_video_seconds: config.engine.max_video_seconds,
-        max_condition_rows: config.engine.max_condition_rows,
-        // Video workers provision only the frame counts the API admits.
-        min_video_seconds: Some(uniserve_core::video::plan::MIN_VIDEO_SECONDS),
-        // Video workers prepare exactly the canvases their denoiser names
-        // for the configured resolutions and aspect ratios, refusing a pair
-        // it does not generate, and report them back as the only canvases
-        // requests may target.
-        video_resolutions: match &model_config.parameters {
-            ModelParameters::MiniMaxH3 => config.engine.video_resolutions.clone(),
-            _ => Vec::new(),
-        },
-        video_aspect_ratios: match &model_config.parameters {
-            ModelParameters::MiniMaxH3 => config.engine.video_aspect_ratios.clone(),
-            _ => Vec::new(),
-        },
-        // Every generated canvas uses the served sampling, which the worker
-        // sizes its canvas state for and prepares its canvas steps with.
-        canvas_sampling: match &model_config.parameters {
-            ModelParameters::DiffusionGemma(profile) => {
-                Some(crate::serving::canvas_sampling(profile))
-            }
-            _ => None,
-        },
-        // A DiffusionGemma prompt, image block or committed block only
-        // conditions canvases: its prefill writes the prefix cache alone.
-        prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
-        ..config.engine.worker_process.clone()
-    };
-    let engine_config = EngineConfig {
-        generation_limits,
-        max_batch: config.engine.max_batch,
-        max_num_batched_tokens: budgets.max_num_batched_tokens,
-        max_running_requests: config.engine.max_running_requests,
-        max_queued_requests: config.engine.max_queued_requests,
-        chunked_prefill_size: budgets.chunked_prefill_size,
-        prefix_cache: config.engine.prefix_cache,
-        schedule_policy: config.engine.schedule_policy,
-        workers: config.engine.workers.clone(),
-        transfer: config.engine.transfer.clone(),
-        data_parallel_size: config.engine.data_parallel_size,
-        expert_parallel: config.engine.expert_parallel,
-        worker_process,
-        bos: control_tokens.bos,
-        eos: control_tokens.eos,
-        end_of_image: control_tokens.end_of_image,
-    };
     let client =
         EngineClient::connect(engine_config).context("failed to start the UniServe engine")?;
 
@@ -195,7 +156,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             anyhow::ensure!(
                 config.mm_processor_kwargs.is_empty(),
                 "invalid mm_processor_kwargs: the processor of `{}` takes no options",
-                config.model
+                config.model()
             );
             RequestRenderer::Chat(*renderer)
         }
@@ -220,9 +181,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 crate::serving::video::VideoService::new(
                     denoiser,
                     vision,
-                    config.engine.max_video_seconds,
+                    config.video_config.max_seconds,
                     latent_encoding_lane,
-                    &config.video_media,
+                    &config.media_config,
                     references,
                     Arc::clone(&tokenizer),
                 )
@@ -235,20 +196,20 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // encoder renders prompts with the checkpoint's own chat template.
     let readout = match &model_config.parameters {
         ModelParameters::DiffusionGemma(profile) => {
-            let files = ResolvedModelFiles::new(&config.model)
+            let files = ResolvedModelFiles::new(config.model())
                 .await
                 .context("failed to resolve the readout chat template")?;
             let encoder = ReadoutEncoder::load(
                 &files,
                 Arc::clone(&tokenizer),
                 profile,
-                config.readout,
+                config.readout_config,
                 max_model_len,
             )
             .context("failed to prepare the System One readout")?;
             info!(
-                layout = ?config.readout.layout,
-                canvas = ?config.readout.canvas,
+                layout = ?config.readout_config.layout,
+                canvas = ?config.readout_config.canvas,
                 "serving the System One readout"
             );
             Some(encoder)
@@ -263,24 +224,30 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         crate::serving::WorkerCapabilities {
             limits: engine.generation_limits(),
         },
-        config.reasoning_parsing,
+        config.chat_config.reasoning_parser == ReasoningParser::Auto,
     )
     .context("failed to bind the configured model description")?;
-    let images = ImageFetcher::new(config.image_fetch)
+    let images = ImageFetcher::new(&config.image_fetch_config)
         .context("failed to initialize the image URL fetcher")?;
-    let mut runtime = ServingRuntime::new(model, Arc::clone(&engine), images, config.log_stats);
+    let mut runtime = ServingRuntime::new(
+        model,
+        Arc::clone(&engine),
+        images,
+        config.logging_config.log_stats,
+    );
     if let Some(encoder) = readout {
         runtime = runtime.with_readout(encoder);
     }
 
+    let server = &config.server_config;
     Ok(Arc::new(
         AppState::new(runtime)
-            .with_log_requests(config.log_requests)
-            .with_request_id_headers(config.request_id_headers)
-            .with_api_key(config.api_key.clone())
-            .with_request_timeout(config.request_timeout)
-            .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_video_body_limit(config.video_media.body_limit())
-            .with_video_jobs(config.video_jobs),
+            .with_log_requests(config.logging_config.log_requests)
+            .with_request_id_headers(server.request_id_headers)
+            .with_api_key(server.api_key.clone())
+            .with_request_timeout(server.request_timeout)
+            .with_max_concurrent_requests(server.max_concurrent_requests.map(|limit| limit.get()))
+            .with_video_body_limit(config.media_config.body_limit())
+            .with_video_jobs(config.video_job_config.clone()),
     ))
 }

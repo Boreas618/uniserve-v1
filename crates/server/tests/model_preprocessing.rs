@@ -16,15 +16,13 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::video::plan::{ProcessorConfig, canvas};
 use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall, ServedCanvas};
 use uniserve_engine::VideoDenoiserInfo;
-use uniserve_server::VideoMediaSettings;
 use uniserve_server::openai::VideoGenerationRequest;
+use uniserve_server::options::{ImageFetchOptions, MediaOptions};
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::profile::{ModelConfig, ModelDescription};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use uniserve_server::serving::media::{
-    ImageFetchError, ImageFetchPolicy, ImageFetcher, ImageInput, ImageListError,
-};
+use uniserve_server::serving::media::{ImageFetchError, ImageFetcher, ImageInput, ImageListError};
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::{
     InputProcessor, RequestRenderer, ResponseOptions, ServeRequestId, chat_image_urls,
@@ -101,7 +99,7 @@ fn video_service(
         },
         max_video_seconds,
         1,
-        &VideoMediaSettings::default(),
+        &MediaOptions::default(),
         // A text-to-video denoiser takes no references to size.
         uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
         Arc::clone(tokenizer),
@@ -344,7 +342,7 @@ fn preprocess_image_chat(
     request_id: &str,
     request: uniserve_server::openai::ChatCompletionRequest,
 ) -> (GenerationRequest, ResponseOptions) {
-    let fetcher = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
     processor
         .preprocess_chat_request(ServeRequestId::new(request_id), request, images)
@@ -408,9 +406,9 @@ fn image_urls_prepare_the_same_image_input_as_data_urls() {
         .unwrap();
     let server = ImageServer::start(png);
     // The server is on loopback, which only the private-destination policy reaches.
-    let fetcher = ImageFetcher::new(ImageFetchPolicy {
+    let fetcher = ImageFetcher::new(&ImageFetchOptions {
         allow_private: true,
-        ..ImageFetchPolicy::default()
+        ..ImageFetchOptions::default()
     })
     .unwrap();
 
@@ -447,7 +445,7 @@ fn loopback_image_urls_are_refused_by_default() {
         .decode(PNG_1X1)
         .unwrap();
     let server = ImageServer::start(png);
-    let fetcher = ImageFetcher::new(ImageFetchPolicy::default()).unwrap();
+    let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     let port = server.address.port();
 
     for host in ["127.0.0.1", "localhost", "[::1]"] {

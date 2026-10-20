@@ -595,7 +595,7 @@ pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response
     value["video"] = state.runtime().model().video_capabilities();
     let jobs = state.videos.settings();
     value["video_jobs"] = serde_json::json!({
-        "max_retained_bytes": jobs.max_retained_bytes,
+        "max_retained_bytes": jobs.max_bytes,
         "retention_seconds": jobs.retention.as_secs(),
         "restart_behavior": "jobs and retained content are removed",
     });
