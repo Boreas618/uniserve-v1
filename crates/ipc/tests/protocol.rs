@@ -1483,6 +1483,35 @@ fn batch_rejects_two_calls_for_one_request() {
 }
 
 #[test]
+fn a_batch_may_carry_page_writes_alone() {
+    let mut batch = Batch {
+        batch_id: 1,
+        collective_seq: 1,
+        calls: Vec::new(),
+        block_tables: Vec::new(),
+        new_cache_units: Vec::new(),
+        forward: ForwardBatch::default(),
+        latent_params: Vec::new(),
+        decode_ranges: Vec::new(),
+        buffer_allocations: Vec::new(),
+        commands: Vec::new(),
+        input_products: Vec::new(),
+        cache_inputs: Vec::new(),
+        page_reads: Vec::new(),
+        page_writes: Vec::new(),
+    };
+    assert!(batch.validate().is_err());
+    batch.page_writes.push(PageCopy {
+        rank: 0,
+        pool: 1,
+        group_id: 0,
+        slot: 3,
+        units: vec![UnitId(5)],
+    });
+    batch.validate().unwrap();
+}
+
+#[test]
 fn token_inputs_preserve_order_and_enforce_capacity() {
     for tokens in [vec![], vec![42], vec![1, 2, 3, 4, 5], vec![u32::MAX, 0, 7]] {
         let mut call = ar_decode_call();

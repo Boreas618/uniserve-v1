@@ -320,7 +320,12 @@ pub(super) fn rank_projection(
             .enumerate()
             .filter_map(|(index, members)| members.contains(&rank).then_some(index))
             .collect::<Vec<_>>();
-        if indices.is_empty() && batch.commands.is_empty() {
+        // A rank also takes part to copy its share of the batch's pages.
+        let copies_pages = batch
+            .page_writes
+            .iter()
+            .any(|copy| copy.rank as usize == rank);
+        if indices.is_empty() && batch.commands.is_empty() && !copies_pages {
             continue;
         }
         // A rank receives the batch's projection onto the calls it owns,
@@ -412,7 +417,10 @@ pub(super) fn rank_projection(
             .filter(|span| span.rank as usize == rank && buffers.contains(&span.allocation.buffer))
             .map(|span| span.allocation)
             .collect();
-        if projection.calls.is_empty() && projection.commands.is_empty() {
+        if projection.calls.is_empty()
+            && projection.commands.is_empty()
+            && projection.page_writes.is_empty()
+        {
             continue;
         }
         projection.validate()?;

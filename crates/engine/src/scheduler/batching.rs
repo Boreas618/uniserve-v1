@@ -661,7 +661,10 @@ impl Scheduler {
             })
         {
             let worker = first.worker.clone();
-            batch.page_writes = tiers.take_writes(&worker, batch.id);
+            let pages = tiers.take_writes(&worker, batch.id);
+            if !pages.is_empty() {
+                batch.page_writes = Some(crate::executor::PageWrites { worker, pages });
+            }
         }
 
         // Snapshot scheduler gauges at the batch boundary before ownership moves

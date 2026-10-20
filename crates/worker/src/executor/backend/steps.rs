@@ -578,16 +578,15 @@ impl WorkerBackend {
         let fences = fences.into_iter().map(|(_, fence)| fence).collect();
 
         // The job holds no operation: its completion is posted once the
-        // fences completed. A batch without calls has none.
-        let Some(kind) = batch.route() else {
-            return Ok(None);
-        };
+        // fences completed. A batch without calls, which only writes pages,
+        // waits on the copy lane.
         let job = Job::new();
         job.after(device, fences);
-        self.jobs
-            .start(kind, job, true)
-            .map(Some)
-            .map_err(lane_lost)
+        let submitted = match batch.route() {
+            Some(kind) => self.jobs.start(kind, job, true),
+            None => self.jobs.start_copy(job, true),
+        };
+        submitted.map(Some).map_err(lane_lost)
     }
 
     pub(crate) fn outputs_ready(

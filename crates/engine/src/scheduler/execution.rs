@@ -300,8 +300,8 @@ impl Scheduler {
     /// nothing to schedule.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A paused scheduler lets what is in flight drain before it hands
-        // over.
-        if self.paused() {
+        // over, and a closing one before its workers close.
+        if self.paused() || self.closing {
             return Vec::new();
         }
         if self.prefer_media {

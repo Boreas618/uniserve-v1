@@ -37,9 +37,9 @@ pub use crate::deployment::Deployment;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorHandover, ExecutorInfo, ExecutorSubmitError,
-    ParallelConfig, PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend,
-    TransferConfig, TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure,
-    WorkerGroupId, WorkerResult,
+    PageWrites, ParallelConfig, PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel,
+    TransferBackend, TransferConfig, TransferConfigError, TransferEdge, WorkerExecError,
+    WorkerFailure, WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,

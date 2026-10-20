@@ -380,7 +380,7 @@ pub struct Batch {
     pub page_reads: Vec<PageCopy>,
     /// Published pages written to the host page tier, on the rank's copy
     /// lane as soon as the batch arrives; the batch's output reports them
-    /// complete.
+    /// complete. A batch may carry them alone.
     pub page_writes: Vec<PageCopy>,
 }
 
@@ -470,9 +470,11 @@ impl Batch {
     /// Validates the batch, and its buffer spans when `placed`.
     fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
+        // A batch of page writes alone writes a head's last published pages
+        // to the host page tier before it closes its workers.
         ensure_valid!(
-            !self.calls.is_empty() || !self.commands.is_empty(),
-            "a submission batch must carry at least one call or control"
+            !self.calls.is_empty() || !self.commands.is_empty() || !self.page_writes.is_empty(),
+            "a submission batch must carry at least one call, control or page write"
         );
         ensure_valid!(
             self.collective_seq > 0,

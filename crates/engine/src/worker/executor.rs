@@ -111,7 +111,7 @@ impl WorkerSubmission {
         commands: Vec<BatchCommand>,
         inputs: Vec<TensorExport>,
         cache_inputs: Vec<CacheTransfer>,
-        page_writes: Vec<uniserve_ipc::PageCopy>,
+        page_writes: Option<crate::executor::PageWrites>,
         dependencies: Vec<BufferId>,
     ) -> Self {
         let consumed = calls
@@ -1239,19 +1239,21 @@ impl Executor for WorkerExecutor {
             // A batch's page writes belong to the one worker group that
             // runs all of its calls (`ExecutionBatch::page_writes`).
             let mut page_writes = (0..self.workers.len())
-                .map(|_| Vec::new())
-                .collect::<Vec<Vec<uniserve_ipc::PageCopy>>>();
-            if !batch.page_writes.is_empty() {
-                let mut workers = batch
-                    .requests
-                    .iter()
-                    .map(|(call, _)| call_routes[&(call.request_key, call.call_id)])
-                    .collect::<HashSet<_>>()
-                    .into_iter();
-                let (Some(worker), None) = (workers.next(), workers.next()) else {
-                    anyhow::bail!("a batch carrying page writes spans several workers");
-                };
-                page_writes[worker] = std::mem::take(&mut batch.page_writes);
+                .map(|_| None)
+                .collect::<Vec<Option<crate::executor::PageWrites>>>();
+            if let Some(writes) = batch.page_writes.take() {
+                let worker = *self
+                    .routing
+                    .get(&writes.worker)
+                    .context("page writes name an unknown worker group")?;
+                anyhow::ensure!(
+                    batch
+                        .requests
+                        .iter()
+                        .all(|(call, _)| call_routes[&(call.request_key, call.call_id)] == worker),
+                    "a batch carrying page writes spans several workers"
+                );
+                page_writes[worker] = Some(writes);
             }
 
             for (call, placement) in batch.requests {
@@ -1290,8 +1292,9 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            // Queue one submission per worker that has calls or commands, and
-            // register the batch before dispatching any of them.
+            // Queue one submission per worker that has calls, commands or
+            // page writes, and register the batch before dispatching any of
+            // them.
             let mut pending_workers = HashMap::new();
             for (worker_index, (((calls, commands), input_products), dependencies)) in worker_ops
                 .into_iter()
@@ -1300,7 +1303,7 @@ impl Executor for WorkerExecutor {
                 .zip(worker_dependencies)
                 .enumerate()
             {
-                if calls.is_empty() && commands.is_empty() {
+                if calls.is_empty() && commands.is_empty() && page_writes[worker_index].is_none() {
                     anyhow::ensure!(
                         dependencies.is_empty(),
                         "product dependency has no consuming worker submission"

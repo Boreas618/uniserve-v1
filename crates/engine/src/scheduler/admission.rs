@@ -657,6 +657,10 @@ impl Scheduler {
     /// reserved, leaving it at the queue head. A broken scheduler invariant
     /// also requeues the request, latches engine-fatal, and stops.
     pub(super) fn admit_media(&mut self) {
+        // A closing scheduler admits nothing more.
+        if self.closing {
+            return;
+        }
         while self.running_request_count() < self.config.max_running_requests {
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
@@ -1027,8 +1031,9 @@ impl Scheduler {
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
-        // A quiescing scheduler hands its waiting token requests over.
-        if self.quiescing() {
+        // A quiescing scheduler hands its waiting token requests over, and a
+        // closing one admits nothing more.
+        if self.quiescing() || self.closing {
             return;
         }
         loop {
