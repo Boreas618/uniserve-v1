@@ -52,8 +52,8 @@ pub struct WorkerSpawn {
     /// The generation of the group's launch the rank belongs to, which the
     /// rank states when it registers and its exit report carries back.
     pub generation: u64,
-    /// Interpreter that runs the worker module.
-    pub python: String,
+    /// The `uniserve-worker` executable that runs the worker.
+    pub executable: String,
     /// The head's address as this host reaches it, which the rank connects
     /// to and registers at.
     pub head: String,

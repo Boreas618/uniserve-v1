@@ -1,6 +1,6 @@
 """Distributed routed experts: expert exchanges and distributed weights.
 
-The rank runtime owns the expert step protocol: agreement on each step's
+The worker runtime owns the expert step protocol: agreement on each step's
 per-rank token capacity over its host group, microbatch threads and their
 rotation, join graphs and close ordering. It reaches these functions by
 import path to construct the numerical side:

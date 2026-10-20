@@ -194,7 +194,7 @@ impl PendingWorker {
         let world_size = args.world_size();
 
         let mut cmd = uniserve_ipc::launch::worker_command(
-            &args.python,
+            &args.executable,
             head,
             &args.worker_id,
             rank,
@@ -239,7 +239,14 @@ impl PendingWorker {
         // have used. The head derives both once, here, for either path.
         let child = match remote {
             Some(remote) => {
-                remote.deliver(rank, &args.python, &args.worker_id, generation, head, &cmd)?;
+                remote.deliver(
+                    rank,
+                    &args.executable,
+                    &args.worker_id,
+                    generation,
+                    head,
+                    &cmd,
+                )?;
                 None
             }
             None => Some(WorkerChild::spawn(&mut cmd).context("spawning the rank process")?),

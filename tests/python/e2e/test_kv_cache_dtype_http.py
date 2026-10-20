@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import httpx
@@ -24,6 +23,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    worker_executable,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -64,8 +64,8 @@ def _generate(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--set",
         "dtype=bfloat16",
         "--set",

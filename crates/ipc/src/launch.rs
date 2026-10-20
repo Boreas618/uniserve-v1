@@ -27,24 +27,23 @@ use uniserve_core::{CanvasSampling, ComponentConfig};
 
 use crate::LaneConfig;
 
-/// The command that starts one rank with the interpreter `python`.
+/// The command that starts one worker with `executable`, the
+/// `uniserve-worker` executable of the environment it runs in.
 ///
-/// argv carries the address of the head the rank connects to and what its
+/// argv carries the address of the head the worker connects to and what its
 /// registration states: its worker group and its rank, and the `generation`
-/// of the group's launch it belongs to. They are the rank's only statement of
-/// its identity; the launch descriptor repeats none of them. The caller adds
-/// the environment and any inherited sockets.
+/// of the group's launch it belongs to. They are the worker's only statement
+/// of its identity; the launch descriptor repeats none of them. The caller
+/// adds the environment and any inherited sockets.
 pub fn worker_command(
-    python: impl AsRef<OsStr>,
+    executable: impl AsRef<OsStr>,
     head: &str,
     worker_id: &str,
     rank: u32,
     generation: u64,
 ) -> Command {
-    let mut command = Command::new(python);
+    let mut command = Command::new(executable);
     command
-        .arg("-m")
-        .arg("uniserve.worker")
         .arg("--head")
         .arg(head)
         .arg("--worker-id")

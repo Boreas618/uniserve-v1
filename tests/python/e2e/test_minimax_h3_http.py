@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import httpx
@@ -22,6 +21,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     t2va_request,
+    worker_executable,
 )
 from uniserve.models.minimax_h3.config import NAMED_CANVASES
 from uniserve_eval.transport.video import inspect_video_bytes
@@ -56,8 +56,8 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--served-model-name",
         "MiniMax-H3",
         "--port",

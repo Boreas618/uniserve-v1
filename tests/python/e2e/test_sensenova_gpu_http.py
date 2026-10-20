@@ -18,6 +18,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     tiny_input_png_b64,
+    worker_executable,
 )
 
 pytestmark = [
@@ -88,8 +89,8 @@ def production_server(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-python",
-        str(Path.cwd() / ".venv" / "bin" / "python"),
+        "--worker-executable",
+        str(worker_executable()),
         "--set",
         "kv_cache_config.max_tokens=65536",
         "--max-running-requests",

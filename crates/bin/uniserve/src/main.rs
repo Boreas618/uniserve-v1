@@ -136,7 +136,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             let (config, stated) = args.resolve()?;
             info!(model = %config.model(),
                 resident_requests = config.max_running_requests,
-                python = %config.worker_config.python.display(), "resolved serving options");
+                worker_executable = %config.worker_config.executable.display(), "resolved serving options");
             uniserve_server::serve(config, stated, shutdown_signal()).await
         }
     }

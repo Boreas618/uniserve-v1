@@ -309,13 +309,13 @@ def server_launch(
             are written against.
 
     Returns:
-        A launch whose executable and any `--worker-python` value are
+        A launch whose executable and any `--worker-executable` value are
         absolute paths, whose working directory is `root`, and whose
         environment is a copy of the profile's. Environment references are
         not checked here.
 
     Raises:
-        ValueError: If `--worker-python` is the last command element.
+        ValueError: If `--worker-executable` is the last command element.
     """
     command = list(server.command)
     selected_executable = (
@@ -325,7 +325,7 @@ def server_launch(
         selected_executable = root / selected_executable
     command[0] = str(selected_executable.absolute())
 
-    _resolve_command_path(command, "--worker-python", root)
+    _resolve_command_path(command, "--worker-executable", root)
     # A server runs in the tree its profile is written against, so a relative
     # path it was given -- a deployment configuration, a dataset -- resolves
     # the same way there as it reads in the file.

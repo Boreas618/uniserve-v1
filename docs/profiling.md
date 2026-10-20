@@ -52,7 +52,7 @@ Standard cProfile captures some Python/native calls and callbacks. Select the na
   --native "$NATIVE"
 ```
 
-`NATIVE` is a substring of the builtin's cProfile label, such as `torch._C`; repeat `--native` to select more. cProfile does not record TVM-FFI function calls, so the calls between the rank runtime and its Python numerical functions never appear in this report. Read those crossings from the `uniserve.worker.*` ranges of the CUDA timeline.
+`NATIVE` is a substring of the builtin's cProfile label, such as `torch._C`; repeat `--native` to select more. cProfile does not record TVM-FFI function calls, so the calls between the worker runtime and its Python numerical functions never appear in this report. Read those crossings from the `uniserve.worker.*` ranges of the CUDA timeline.
 
 The report shows repeated edges in both directions, call counts and inclusive time. Use it to locate repeated metadata conversion or per-row callbacks for further investigation. A repeated batch numerical call is expected. Inclusive time includes the callee's work and must not be summed or interpreted as FFI overhead.
 

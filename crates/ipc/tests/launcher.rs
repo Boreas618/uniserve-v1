@@ -19,7 +19,7 @@ fn every_instruction_round_trips_through_a_frame() {
         rank: 5,
         worker_id: "model".into(),
         generation: 2,
-        python: "python3".into(),
+        executable: "uniserve-worker".into(),
         head: "10.0.0.1:4100".into(),
         environment: HashMap::from([("RANK".to_owned(), "5".to_owned())]),
     }));

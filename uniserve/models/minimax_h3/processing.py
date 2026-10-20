@@ -8,7 +8,7 @@ checked against ``tests/python/fixtures/minimax_h3_plan.json``, which is
 generated from the diffusers reference pipeline.
 
 This module calls the parts of the same rules that the model package and its
-tools use, through the rank runtime library (``uniserve._worker``): the
+tools use, through the worker library (``uniserve._worker``): the
 tasks, the canvas rule, the largest references a request may bring, which a
 denoiser provisions its condition capacity for, the canvas a target names
 among the canvases a deployment serves, and the frame count of a duration.

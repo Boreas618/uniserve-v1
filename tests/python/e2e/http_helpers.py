@@ -7,6 +7,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -37,6 +38,19 @@ def require_uniserve_binary() -> Path:
             f"{path} does not exist; run `cargo build -p uniserve` first"
         )
     return path
+
+
+def worker_executable() -> Path:
+    """The `uniserve-worker` executable a test server's workers run.
+
+    `UNISERVE_WORKER_EXECUTABLE` names it; otherwise it is the one installed
+    beside the interpreter running the tests, which runs the workers in that
+    environment.
+    """
+    configured = os.environ.get("UNISERVE_WORKER_EXECUTABLE")
+    if configured:
+        return Path(configured)
+    return Path(sys.executable).parent / "uniserve-worker"
 
 
 def wait_health(

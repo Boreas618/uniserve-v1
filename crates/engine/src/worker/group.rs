@@ -529,7 +529,7 @@ impl WorkerGroup {
                     .join("; ");
                 self.finish_batch(batch_id);
                 anyhow::bail!(
-                    "worker ranks disagreed between success and failure for batch {batch_id}: {details}"
+                    "workers disagreed between success and failure for batch {batch_id}: {details}"
                 );
             }
             let canonical = errors[0].1.clone();

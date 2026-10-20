@@ -87,31 +87,36 @@ pub enum LoadFormat {
 }
 
 impl WorkerProcessArgs {
-    /// The interpreter that runs rank processes when none is configured: the
-    /// one installed next to the running binary (an environment's `bin/`),
-    /// then the active virtual environment's, then `python3` on `PATH`.
-    pub fn default_python() -> std::path::PathBuf {
+    /// The `uniserve-worker` executable that runs workers when none is
+    /// configured: the one installed next to the running binary, when that
+    /// directory is a Python environment's `bin/`; then the active virtual
+    /// environment's; then `uniserve-worker` on `PATH`.
+    ///
+    /// The executable runs workers in the environment it is installed in,
+    /// so a head built outside one, such as a development build, takes the
+    /// active environment's.
+    pub fn default_executable() -> std::path::PathBuf {
+        const EXECUTABLE: &str = "uniserve-worker";
+        let environment_bin = |directory: &std::path::Path| {
+            ["python", "python3"]
+                .iter()
+                .any(|name| directory.join(name).is_file())
+                .then(|| directory.join(EXECUTABLE))
+                .filter(|candidate| candidate.is_file())
+        };
+
         if let Ok(executable) = std::env::current_exe()
-            && let Some(directory) = executable.parent()
+            && let Some(candidate) = executable.parent().and_then(environment_bin)
         {
-            for name in ["python3", "python"] {
-                let candidate = directory.join(name);
-                if candidate.is_file() {
-                    return candidate;
-                }
-            }
+            return candidate;
         }
-
-        if let Some(environment) = std::env::var_os("VIRTUAL_ENV") {
-            let candidate = std::path::Path::new(&environment)
-                .join("bin")
-                .join("python");
-            if candidate.is_file() {
-                return candidate;
-            }
+        if let Some(environment) = std::env::var_os("VIRTUAL_ENV")
+            && let Some(candidate) =
+                environment_bin(&std::path::Path::new(&environment).join("bin"))
+        {
+            return candidate;
         }
-
-        "python3".into()
+        EXECUTABLE.into()
     }
 
     /// Parses a quantization policy as a command line states it: a JSON
@@ -166,7 +171,7 @@ impl Default for WorkerProcessArgs {
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
-            python: Self::default_python(),
+            executable: Self::default_executable(),
             launcher_timeout: std::time::Duration::from_secs(120),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),

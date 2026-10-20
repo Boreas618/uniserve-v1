@@ -10,7 +10,6 @@ that position.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     tiny_input_png_b64,
+    worker_executable,
     written_deployment,
 )
 
@@ -56,8 +56,8 @@ def _command(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--worker-groups",
         str(written_deployment(directory, [worker_config])),
         "--set",

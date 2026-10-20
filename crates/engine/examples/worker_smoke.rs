@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     };
     let engine = WorkerGroup::spawn(WorkerProcessArgs {
         worker_id: "local".into(),
-        python: "python3".into(),
+        executable: WorkerProcessArgs::default_executable(),
         model: String::new(),
         ranks: uniserve_engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],

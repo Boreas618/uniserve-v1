@@ -1,11 +1,12 @@
-//! The UniServe rank runtime.
+//! The UniServe worker runtime.
 //!
-//! A worker rank is a Rust process body hosted by a Python interpreter: the
-//! `uniserve.worker` entry loads this library through TVM-FFI and calls
-//! its exported `main` with the function that resolves import paths. Rust
-//! owns request state, storage, streams, graphs policy, transfers and the
-//! IPC service; Python computes through the library functions Rust imports
-//! by path.
+//! A worker is a Rust process that hosts the Python interpreter: the
+//! `uniserve-worker` executable loads this library and calls its exported
+//! [`worker_main`], which runs the control plane on the process's main
+//! thread and the interpreter on a Python thread of its own. Rust owns
+//! request state, storage, streams, graphs policy, transfers and the IPC
+//! service; Python computes through the library functions Rust imports by
+//! path.
 //!
 //! The library also exports the video request rules of `uniserve-core` to
 //! the Python library, which plans MiniMax-H3 requests with them.
@@ -15,7 +16,7 @@
 //! the launch configuration and registration, the interpreter and DLPack
 //! export, the storage owners, the transfer mechanisms, the host groups and
 //! collectives, and the image runners. Everything else is internal to the
-//! rank runtime.
+//! worker runtime.
 
 mod capacity;
 mod completion;
@@ -40,6 +41,8 @@ mod stream;
 pub mod transfer;
 mod warmup;
 mod worker;
+
+use std::os::unix::ffi::OsStrExt;
 
 pub use completion::{Completion, Outcome};
 pub use cuda_graph::GraphPool;
@@ -88,15 +91,39 @@ pub(crate) fn leak<T>(value: T) {
     std::mem::forget(value);
 }
 
-/// The library's exported entry point, `main(argv, import) -> int`.
+/// The worker's entry: the `uniserve-worker` executable calls it once, on
+/// the process's main thread, and exits with the status it returns, without
+/// Python finalization.
 ///
-/// The Python entry calls it once with the process arguments and the
-/// function that resolves an import path to a library callable
-/// (`uniserve.worker.import_path`); the returned value is the process exit
-/// status.
-fn main(argv: tvm_ffi::Array<tvm_ffi::String>, import: tvm_ffi::Function) -> tvm_ffi::Result<i64> {
-    let argv: Vec<String> = argv.iter().map(|value| value.as_str().to_owned()).collect();
-    Ok(launch::main(&argv, import))
+/// `argv` holds the `argc` process arguments after the program name, and
+/// `python` the path of the environment's interpreter, which the worker's
+/// interpreter takes as its executable. The executable has loaded that
+/// environment's shared `libpython` into the process's global scope.
+///
+/// # Safety
+///
+/// `argv` points to `argc` NUL-terminated strings and `python` to one, all
+/// valid for the duration of the call; the function is called at most once
+/// per process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn worker_main(
+    argc: std::ffi::c_int,
+    argv: *const *const std::ffi::c_char,
+    python: *const std::ffi::c_char,
+) -> std::ffi::c_int {
+    let text = |pointer: *const std::ffi::c_char| {
+        // SAFETY: the caller passes valid NUL-terminated strings.
+        unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let arguments: Vec<String> = (0..usize::try_from(argc).unwrap_or(0))
+        // SAFETY: `argv` holds `argc` pointers.
+        .map(|index| text(unsafe { *argv.add(index) }))
+        .collect();
+    // SAFETY: as above.
+    let python = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(unsafe {
+        std::ffi::CStr::from_ptr(python).to_bytes()
+    }));
+    launch::main(&arguments, std::path::Path::new(&python))
 }
-
-tvm_ffi::tvm_ffi_dll_export_typed_func!(main, main);

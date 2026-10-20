@@ -1,6 +1,6 @@
 //! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
 //!
-//! The engine drives GPU and host work through worker rank processes. A
+//! The engine drives GPU and host work through worker processes. A
 //! `WorkerGroup` (in `group`) is one worker group's cooperating workers: it projects
 //! each submitted `Batch` onto the ranks whose components own its calls, joins
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
@@ -40,13 +40,13 @@ pub enum BatchSubmitError {
     Failed(anyhow::Error),
 }
 
-/// Everything required to create or recreate one worker rank process.
+/// Everything required to create or recreate one worker process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkerProcessArgs {
     /// Worker group identity assigned by the engine.
     pub worker_id: String,
-    /// Python interpreter used to launch the worker entry point.
-    pub python: std::path::PathBuf,
+    /// The `uniserve-worker` executable each worker of the group runs.
+    pub executable: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
     /// Ordered physical members of this worker group.

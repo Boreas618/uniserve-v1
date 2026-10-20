@@ -33,7 +33,7 @@ uniserve serve --config fasth3.toml --print-config
 | `--max-model-len` | `max_model_len` |
 | `--mem-fraction-static` | `mem_fraction_static` |
 | `--host-identity` | `host_identity` |
-| `--worker-python` | `worker_config.python` |
+| `--worker-executable` | `worker_config.executable` |
 
 `--log-level` and `--log-level-http` set the log levels of the `uniserve` process; every subcommand takes them, before or after its name.
 
@@ -177,10 +177,10 @@ retention = "30m"
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `python` | The environment's interpreter | Python interpreter that runs the worker ranks |
-| `watchdog_timeout` | `"5m"` | Time a batch may run without rank progress before the worker group is replaced; a rank reports a stalled lane after half of it |
-| `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the rank's |
-| `distributed_backend` | Torch default | Torch process-group backend for the ranks' collectives |
+| `executable` | The `uniserve-worker` beside the head's executable when it is installed in a Python environment, else the active virtual environment's | The `uniserve-worker` executable that runs the workers; it runs them in the Python environment it is installed in |
+| `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled lane after half of it |
+| `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
+| `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
 
 ### `logging_config`
 

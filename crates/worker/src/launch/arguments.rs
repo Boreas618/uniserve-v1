@@ -1,26 +1,26 @@
-//! The rank's command line.
+//! The worker's command line.
 //!
-//! argv carries the head's address, the rank's identity and the launch it
-//! belongs to: the rank connects to the head, registers under that identity
-//! and launch, and receives every other launch value in the launch
+//! argv carries the head's address, the worker's identity and the launch it
+//! belongs to: the worker connects to the head, registers under that
+//! identity and launch, and receives every other launch value in the launch
 //! descriptor the head answers with.
 
 use crate::config::DescriptorError;
 
 /// Usage line printed with an argument or descriptor error.
 pub(crate) const USAGE: &str =
-    "usage: python -m uniserve.worker --head ADDRESS --worker-id ID --rank R --generation G";
+    "usage: uniserve-worker --head ADDRESS --worker-id ID --rank R --generation G";
 
 /// Parsed command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arguments {
     /// The head's address: `unix:<path>` or `<host>:<port>`.
     pub head: String,
-    /// Worker group the rank was started for.
+    /// Worker group the worker was started for.
     pub worker_id: String,
-    /// Rank within the group's process world.
+    /// The worker's rank within its group.
     pub rank: u32,
-    /// The generation of the group's launch the rank was started for.
+    /// The generation of the group's launch the worker was started for.
     pub generation: u64,
 }
 

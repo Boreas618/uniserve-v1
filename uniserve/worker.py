@@ -1,12 +1,11 @@
-"""Worker rank entry: load the Rust worker library and run it.
+"""The Python side of a worker: what the worker library calls first.
 
-The engine starts a rank as ``python -m uniserve.worker``. This entry
-configures logging and diagnostic dumps, loads the worker library through
-TVM-FFI and hands it :func:`import_path`, through which the library reaches
-every function of the numerical library by its import path. Everything
-after that is the library's: descriptor parsing, registration, model
-loading, serving and shutdown. The process exits with the status it
-returns.
+A worker is the ``uniserve-worker`` executable, which hosts the interpreter
+on a Python thread of its own and calls :func:`attach` once it is up.
+``attach`` configures logging and diagnostic dumps and registers
+:func:`import_path`, through which the library reaches every function of the
+numerical library by its import path. Everything else is the library's:
+descriptor parsing, registration, model loading, serving and shutdown.
 
 The same library exports the video request rules of ``uniserve-core``,
 which the numerical library plans MiniMax-H3 requests with
@@ -19,7 +18,6 @@ import faulthandler
 import functools
 import importlib.util
 import logging
-import os
 import pkgutil
 import signal
 import sys
@@ -35,7 +33,7 @@ from uniserve.errors import translate
 def import_path(path: str) -> Callable[..., Any]:
     """The callable at a dotted import path.
 
-    The rank runtime reaches the library by import path, for example
+    The worker runtime reaches the library by import path, for example
     ``uniserve.runner.causal_lm.CausalLMRunner.decode``: a function, a class
     (called to construct it) or a method (called with the object first).
     A torch tensor the callable returns crosses as an opaque Python object,
@@ -69,11 +67,12 @@ def import_path(path: str) -> Callable[..., Any]:
 
 @functools.cache
 def library() -> tvm_ffi.Module:
-    """The rank runtime library ``uniserve._worker``, loaded once.
+    """The worker library ``uniserve._worker``, loaded once.
 
-    Besides the rank entry ``main`` it exports the video canvas and
-    frame-count rules (``video_canvas`` and the functions beside it), which
-    any process may call: loading the library starts nothing.
+    Besides the worker entry it exports the video canvas and frame-count
+    rules (``video_canvas`` and the functions beside it), which any process
+    may call: loading the library starts nothing. In a worker process this
+    is the library the ``uniserve-worker`` executable already loaded.
 
     Raises:
         ImportError: The library is not installed.
@@ -86,34 +85,22 @@ def library() -> tvm_ffi.Module:
     return tvm_ffi.load_module(spec.origin)
 
 
-def main() -> None:
+def attach() -> None:
+    """Prepare the interpreter a worker hosts, before the library calls it.
+
+    Configures logging, dumps every thread's Python stack on SIGQUIT and
+    SIGUSR1 for a wedged worker (a C-level handler that runs while the
+    library holds no GIL), and registers :func:`import_path` as the TVM-FFI
+    global function ``uniserve.worker.import_path``, which the library looks
+    up. The interpreter installs no other signal handler: the library owns
+    SIGINT and SIGTERM.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Dump every thread's Python stack for a wedged rank. The handler is
-    # C-level and runs while the library holds no GIL.
     for name in ("SIGQUIT", "SIGUSR1"):
         number = getattr(signal, name, None)
         if number is not None:
             faulthandler.register(number, file=sys.stderr, all_threads=True)
-    # The library owns SIGINT and SIGTERM. Python's KeyboardInterrupt handler
-    # would otherwise raise inside a library call on this thread.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-    try:
-        entry = library()["main"]
-    except ImportError as error:
-        sys.stderr.write(f"uniserve-worker: error: {error}\n")
-        sys.stderr.flush()
-        os._exit(1)
-    code = int(entry(sys.argv[1:], import_path))
-    sys.stdout.flush()
-    sys.stderr.flush()
-    # Skip interpreter finalization: an aborted rank retains device
-    # resources, and finalizers could wait on a failed peer.
-    os._exit(code)
-
-
-if __name__ == "__main__":
-    main()
+    tvm_ffi.register_global_func("uniserve.worker.import_path", import_path)

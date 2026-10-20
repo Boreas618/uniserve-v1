@@ -1,6 +1,6 @@
 """A repeated layer stack moves its projections to host memory and slots.
 
-The rank runtime owns the page-locked host region, the device slots and
+The worker runtime owns the page-locked host region, the device slots and
 the copy schedule; the library states which modules stream, how a layer's
 projection matrices lie in a slot, and rebinds the parameters to slot views
 with hooks around every projection call.

@@ -494,12 +494,13 @@ impl Default for FlashInferOptions {
     }
 }
 
-/// The worker rank processes (`worker_config`).
+/// The worker processes (`worker_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerOptions {
-    /// Python interpreter that runs the ranks.
-    pub python: PathBuf,
+    /// The `uniserve-worker` executable that runs the workers, which runs
+    /// them in the Python environment it is installed in.
+    pub executable: PathBuf,
     /// Time a batch may run without rank progress before the worker group is
     /// replaced; a rank reports a stalled lane after half of it.
     #[serde(with = "values::duration")]
@@ -514,7 +515,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
-            python: WorkerProcessArgs::default_python(),
+            executable: WorkerProcessArgs::default_executable(),
             watchdog_timeout: WorkerProcessArgs::DEFAULT_WATCHDOG_TIMEOUT,
             mesh: None,
             distributed_backend: None,
@@ -838,7 +839,7 @@ impl ServeConfig {
         let graphs = &self.cuda_graph_config;
         let flashinfer = &self.flashinfer_config;
         let worker_process = WorkerProcessArgs {
-            python: self.worker_config.python.clone(),
+            executable: self.worker_config.executable.clone(),
             model: self.model().to_owned(),
             host: self.host_identity.clone(),
             queue_depth: self.placement_config.queue_depth.get(),

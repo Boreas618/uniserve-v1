@@ -5,7 +5,7 @@
 //! rows it adds. [`presentation`] lists and tokenizes what the conditioner
 //! reads. The rules exist once, here: the server plans requests with them
 //! before admission, and the model package reads the canvas rule and the
-//! frame counts from them through the rank runtime library.
+//! frame counts from them through the worker library.
 //!
 //! The server plans every condition before admission. A [`VideoCondition`]
 //! carries that plan to the engine and on to the workers: the shared-memory

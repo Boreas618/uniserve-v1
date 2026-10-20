@@ -13,7 +13,7 @@
 //! These are the only implementation of the rules: the server plans every
 //! request with them, and the model package
 //! (`uniserve.models.minimax_h3.processing`) reads the canvas rule and the
-//! frame counts from them through the rank runtime library. The model's own
+//! frame counts from them through the worker library. The model's own
 //! facts, such as its output frame rate, are the rules' parameters
 //! ([`PlanLimits`]), as the denoiser declares them. The rules are tested
 //! against `tests/python/fixtures/minimax_h3_plan.json`, vectors generated
