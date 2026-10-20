@@ -1,17 +1,18 @@
 //! Multimodal prompt preprocessing for SenseNova and Bagel profiles.
 //!
-//! `InputProcessor::preprocess_generation` in `serving::model` calls
-//! [`preprocess_sensenova`] or [`preprocess_bagel`] for the loaded profile.
-//! Each fills the model computation inputs of the `GenerationRequest`
+//! `InputProcessor::preprocess` in `serving::model` calls
+//! [`preprocess_omni`] with the loaded profile's [`OmniProfile`], which
+//! fills the model computation inputs of the `GenerationRequest`
 //! (`prompt_token_ids`, `negative_prompt_token_ids`, `multimodal_inputs`,
-//! `image`, and `image_generation`) and returns the output processor policy.
-//! [`prepare_generation_resources`] then resolves sampling, cache policy, and
-//! the cache budget for both profiles.
+//! `image`, and `image_generation`) and returns the request's chat output
+//! processor. [`prepare_generation_resources`] then resolves sampling, cache
+//! policy, and the cache budget.
 //!
 //! Input images arrive already resolved (`serving::media`), in
-//! `chat_image_urls` order, and are carried through chat rendering as
+//! `ChatRequest::image_urls` order, and are carried through chat rendering as
 //! request-scoped text placeholders. After the chat template renders, each
-//! placeholder is replaced (SenseNova) or removed (Bagel), and its byte
+//! placeholder becomes the profile's slot text (SenseNova's image markers, or
+//! nothing for Bagel), and its byte
 //! offset in the cleaned text is converted into a prompt-token position by
 //! tokenizing the text before it. The position becomes
 //! `ImageInput::position`, the prompt-token boundary at which the image's
@@ -20,145 +21,137 @@
 
 mod output;
 
-use thiserror::Error;
-
-use crate::profile::omni::bagel::BagelProfile;
-use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
-use crate::profile::omni::sensenova::SenseNovaProfile;
 use base64::Engine as _;
+
+use crate::profile::omni::OmniProfile;
+use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
 use uniserve_core::{
     GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, ImageParams,
-    MultimodalInputs, SamplingParams,
+    MultimodalInputs,
 };
 
+use crate::profile::tokenizer::DynTokenizer;
+use crate::serving::TokenizeError;
+use crate::serving::chat::ChatOutputProcessor;
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
-use crate::serving::input::{ModalitySelection, OutputProcessorPolicy, PromptInput};
-use crate::serving::text::tokenizer::DynTokenizer;
+use crate::serving::input::Prompt;
 
-pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
+pub(crate) use output::SenseNovaReasoningParser;
 
-type OmniResult<T> = std::result::Result<T, OmniError>;
-
-#[derive(Debug, Error)]
-/// Failure while preprocessing a multimodal generation request.
-pub enum OmniError {
-    #[error(transparent)]
-    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
-    #[error(transparent)]
-    Chat(#[from] crate::serving::chat::Error),
-    #[error(transparent)]
-    Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
-    #[error(transparent)]
-    Generation(#[from] uniserve_core::GenerationRequestError),
-    #[error(transparent)]
-    Sampling(#[from] uniserve_core::SamplingParamsError),
-    #[error(transparent)]
-    Assets(#[from] crate::profile::assets::Error),
-    #[error("{0}")]
-    Invalid(String),
-}
-
-impl From<String> for OmniError {
-    /// Wraps a free-form message as [`OmniError::Invalid`].
-    ///
-    /// Preprocessing helpers flatten profile errors with
-    /// `.map_err(|error| error.to_string())?`, which relies on this conversion.
-    fn from(message: String) -> Self {
-        Self::Invalid(message)
-    }
-}
-
-// Omni sampler defaults applied by `prepare_generation_resources` before
-// request controls. A zero temperature selects greedy decoding.
-const DEFAULT_TEMPERATURE: f32 = 0.0;
-const DEFAULT_TOP_P: f32 = 1.0;
-const DEFAULT_TOP_K: u32 = 0;
+type OmniResult<T> = std::result::Result<T, TokenizeError>;
 
 /// Input image whose prompt position is resolved but whose encoder inputs are not.
 #[derive(Debug, Clone)]
 struct RenderedImage {
     /// The resolved image. Its content hash starts the encoder-cache
-    /// identity: SenseNova preprocessing mixes in the image's pixel bound, and
-    /// `prepare_generation_resources` later mixes in the request's cache
-    /// isolation key when it has one.
+    /// identity: the profile's input-image salt and, in
+    /// `prepare_generation_resources`, the request's cache isolation key join
+    /// it.
     image: crate::serving::ImageInput,
     /// Prompt-token position with the meaning of `ImageInput::position`.
     position: u32,
 }
 
-/// Fills the SenseNova prompt, image inputs, and image-generation parameters.
+/// Fills a multimodal family's prompt, image inputs, and image-generation
+/// parameters, and returns the request's chat output processor.
 ///
 /// On success the request's prompt, negative prompt, multimodal inputs, image
-/// parameters, and image-generation policy are replaced; on error `generation`
-/// is left unmodified. The returned policy selects the SenseNova reasoning and
-/// visible-wrapper output filter.
+/// parameters, and image-generation policy are replaced; on error
+/// `generation` is left unmodified. A text prompt's negative prompt renders
+/// the classifier-free guidance context; a chat has none.
 ///
 /// # Errors
 ///
 /// Fails, among other conditions, when the processor has no chat template
 /// (checked for text prompts too), rendering or tokenization fails, rendering
 /// loses or reorders an image slot, a chat prompt's image parts do not match
-/// `images` one to one, the prompt is empty, image controls are invalid, or
-/// the profile cannot size the image encoders or the requested output
-/// resolution.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one request's prompt, media and generation controls"
-)]
-pub(super) fn preprocess_sensenova(
-    profile: &SenseNovaProfile,
+/// `images` one to one, the prompt is empty, image controls are invalid, the
+/// output filter cannot be built, or the profile cannot size the image
+/// encoders or the requested output resolution.
+pub(super) fn preprocess_omni(
+    profile: &dyn OmniProfile,
     processor: &crate::serving::InputProcessor,
-    request_id: &crate::serving::ServeRequestId,
-    prompt: PromptInput,
+    request_id: &str,
+    prompt: Prompt,
     images: Vec<crate::serving::ImageInput>,
-    negative_text: Option<String>,
-    image_gen: Option<crate::serving::ImageGenControls>,
+    image_params: Option<crate::serving::ImageSamplingParams>,
     generation: &mut GenerationRequest,
-) -> OmniResult<OutputProcessorPolicy> {
-    let (prompt_token_ids, images) = sensenova_prompt(
-        profile,
-        &processor.tokenizer,
-        processor
-            .chat_renderer()
-            .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
-        request_id,
-        prompt,
-        images,
-        generation.constraint,
-    )?;
+) -> OmniResult<ChatOutputProcessor> {
+    let negative_prompt = match &prompt {
+        Prompt::Text {
+            negative_prompt, ..
+        } => negative_prompt.clone(),
+        Prompt::Chat(_) => None,
+    };
+    let renderer = processor
+        .chat_renderer()
+        .ok_or(crate::serving::chat::Error::MissingChatTemplate)?;
+    let (prompt_token_ids, images) = match prompt {
+        Prompt::Text { prompt, .. } => (
+            profile.render_prompt_ids(&processor.tokenizer, generation.constraint, &prompt)?,
+            Vec::new(),
+        ),
+        Prompt::Chat(chat) => render_chat(
+            profile,
+            &processor.tokenizer,
+            renderer,
+            request_id,
+            chat,
+            images,
+            generation.constraint,
+        )?,
+    };
     validate_prompt(&prompt_token_ids)?;
+    let output = match profile.output_filter() {
+        Some(filter) => ChatOutputProcessor::new(
+            Some(Box::new(
+                SenseNovaReasoningParser::new(
+                    filter.clone(),
+                    std::sync::Arc::clone(&processor.tokenizer),
+                )
+                .map_err(|error| {
+                    crate::serving::chat::Error::ParserInitialization {
+                        kind: "reasoning",
+                        name: "delimited".to_owned(),
+                        error: Box::new(error),
+                    }
+                })?,
+            )),
+            None,
+        ),
+        None => ChatOutputProcessor::default(),
+    };
 
-    let negative_prompt_token_ids = profile
-        .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
-        .map_err(|error| error.to_string())?;
+    let negative_prompt_token_ids = profile.render_negative_prompt_ids(
+        &processor.tokenizer,
+        negative_prompt.as_deref().unwrap_or(""),
+    )?;
     let (image, max_images) = resolve_image_params(
-        &profile.image_defaults,
-        &profile.resolution_policy,
-        image_gen.unwrap_or_default(),
+        profile.image_defaults(),
+        profile.resolution_policy(),
+        image_params.unwrap_or_default(),
         generation.sampling.seed,
     )?;
     let mut multimodal_inputs = prepare_image_inputs(
         prompt_token_ids.len(),
         images,
-        profile.image_num_positions,
+        profile.image_num_positions(),
         |width, height, count| {
             profile
                 .image_encoders_for_dimensions(width, height, count)
-                .map_err(OmniError::from)
+                .map_err(TokenizeError::from)
         },
     )?;
-    // An input image's encoder product depends on its pixel bound, which the
-    // request's input image count sets, so the bound joins the image's
-    // encoder-cache identity.
-    let max_pixels = SenseNovaProfile::input_image_max_pixels(multimodal_inputs.images.len());
-    for image in &mut multimodal_inputs.images {
-        image.hash = combine_cache_keys(image.hash, max_pixels);
+    // An input image's encoder product may depend on the request's input
+    // image count, which then joins the image's encoder-cache identity.
+    if let Some(salt) = profile.input_image_cache_salt(multimodal_inputs.images.len()) {
+        for image in &mut multimodal_inputs.images {
+            image.hash = combine_cache_keys(image.hash, salt);
+        }
     }
-    let policy = profile
-        .image_generation_for_dimensions(image.width, image.height)
-        .map_err(|error| error.to_string())?;
+    let policy = profile.image_generation_for_dimensions(image.width, image.height)?;
 
     // Every fallible step is complete; publish the prepared inputs together.
     generation.prompt_token_ids = prompt_token_ids;
@@ -167,140 +160,23 @@ pub(super) fn preprocess_sensenova(
     generation.image = image;
     generation.max_images = max_images;
     generation.image_generation = policy;
-    Ok(OutputProcessorPolicy::SenseNova(
-        profile.output_filter.clone(),
-    ))
+    Ok(output)
 }
 
-/// Fills the Bagel prompt, image inputs, and image-generation parameters.
+/// Renders a multimodal chat while preserving one placeholder per input
+/// image, and resolves each image's prompt position.
 ///
-/// The negative prompt and image parameters resolve as [`preprocess_sensenova`]
-/// does. On error `generation` is left unmodified. The returned policy is
-/// always `OutputProcessorPolicy::None`, so Bagel text is emitted without
-/// output filtering.
-///
-/// # Errors
-///
-/// Fails under the same kinds of conditions as [`preprocess_sensenova`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one request's prompt, media and generation controls"
-)]
-pub(super) fn preprocess_bagel(
-    profile: &BagelProfile,
-    processor: &crate::serving::InputProcessor,
-    request_id: &crate::serving::ServeRequestId,
-    prompt: PromptInput,
-    images: Vec<crate::serving::ImageInput>,
-    negative_text: Option<String>,
-    image_gen: Option<crate::serving::ImageGenControls>,
-    generation: &mut GenerationRequest,
-) -> OmniResult<OutputProcessorPolicy> {
-    let (prompt_token_ids, images) = bagel_prompt(
-        profile,
-        &processor.tokenizer,
-        processor
-            .chat_renderer()
-            .ok_or(crate::serving::chat::Error::MissingChatTemplate)?,
-        request_id,
-        prompt,
-        images,
-        generation.constraint,
-    )?;
-    validate_prompt(&prompt_token_ids)?;
-
-    let negative_prompt_token_ids = profile
-        .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
-        .map_err(|error| error.to_string())?;
-    let (image, max_images) = resolve_image_params(
-        &profile.image_defaults,
-        &profile.resolution_policy,
-        image_gen.unwrap_or_default(),
-        generation.sampling.seed,
-    )?;
-    let multimodal_inputs = prepare_image_inputs(
-        prompt_token_ids.len(),
-        images,
-        profile.image_num_positions,
-        |width, height, count| {
-            profile
-                .image_encoders_for_dimensions(width, height, count)
-                .map_err(OmniError::from)
-        },
-    )?;
-    let policy = profile
-        .image_generation_for_dimensions(image.width, image.height)
-        .map_err(|error| error.to_string())?;
-
-    generation.prompt_token_ids = prompt_token_ids;
-    generation.negative_prompt_token_ids = negative_prompt_token_ids;
-    generation.multimodal_inputs = multimodal_inputs;
-    generation.image = image;
-    generation.max_images = max_images;
-    generation.image_generation = policy;
-    Ok(OutputProcessorPolicy::None)
-}
-
-/// Renders a SenseNova text or chat prompt and resolves positioned input images.
-///
-/// A text prompt carries no input images; chat images stay where their content
-/// parts appear.
-fn sensenova_prompt(
-    profile: &SenseNovaProfile,
-    tokenizer: &DynTokenizer,
-    renderer: &HfChatRenderer,
-    request_id: &str,
-    prompt: PromptInput,
-    images: Vec<crate::serving::ImageInput>,
-    constraint: GenerationConstraint,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    match prompt {
-        PromptInput::Text(prompt) => {
-            let prompt_ids = profile
-                .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
-                .map_err(|error| error.to_string())?;
-            Ok((prompt_ids, Vec::new()))
-        }
-        PromptInput::Chat(chat) => render_sensenova_chat(
-            profile, tokenizer, renderer, request_id, chat, images, constraint,
-        ),
-    }
-}
-
-/// Renders a Bagel text or chat prompt and resolves positioned input images.
-///
-/// A text prompt carries no input images; chat images stay where their content
-/// parts appear.
-fn bagel_prompt(
-    profile: &BagelProfile,
-    tokenizer: &DynTokenizer,
-    renderer: &HfChatRenderer,
-    request_id: &str,
-    prompt: PromptInput,
-    images: Vec<crate::serving::ImageInput>,
-    constraint: GenerationConstraint,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    match prompt {
-        PromptInput::Chat(chat) => {
-            render_bagel_chat(tokenizer, renderer, request_id, chat, images, constraint)
-        }
-        PromptInput::Text(prompt) => {
-            let prompt_ids = profile
-                .render_prompt_ids(tokenizer, constraint, &prompt, None, None)
-                .map_err(|error| error.to_string())?;
-            Ok((prompt_ids, Vec::new()))
-        }
-    }
-}
-
-/// Renders structured SenseNova chat while preserving one placeholder per input image.
-///
-/// Inserts `SenseNovaProfile::default_system_prompt` when the request has no
+/// Inserts the profile's default system prompt when the request has no
 /// system message and the constraint defines one. A non-empty assistant
 /// prefix for the constraint is appended as a final assistant message that
-/// the template continues instead of opening a new assistant turn.
-fn render_sensenova_chat(
-    profile: &SenseNovaProfile,
+/// the template continues instead of opening a new assistant turn. After
+/// rendering, each image placeholder becomes the profile's slot text; an
+/// image enters at the slot text's anchor token when the profile has one
+/// (checked by tokenizing the text through the slot), and after the text
+/// before the slot otherwise, which assumes that prefix encodes to a prefix
+/// of the prompt's tokens.
+fn render_chat(
+    profile: &dyn OmniProfile,
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
     request_id: &str,
@@ -312,119 +188,46 @@ fn render_sensenova_chat(
         .messages
         .iter()
         .any(|message| matches!(message, ChatMessage::System { .. }))
-        && let Some(system) = SenseNovaProfile::default_system_prompt(constraint)
+        && let Some(system) = profile.default_system_prompt(constraint)
     {
         chat.messages.insert(0, ChatMessage::system(system));
     }
-    let mut generation_prompt_mode = GenerationPromptMode::StartNewAssistant;
-    let assistant_prefix = SenseNovaProfile::assistant_prefix(constraint);
-    if !assistant_prefix.is_empty() {
+    let assistant_prefix = profile.assistant_prefix(constraint);
+    chat.chat_options.generation_prompt_mode = if assistant_prefix.is_empty() {
+        GenerationPromptMode::StartNewAssistant
+    } else {
         chat.messages
             .push(ChatMessage::assistant_text(assistant_prefix));
-        generation_prompt_mode = GenerationPromptMode::ContinueFinalAssistant;
-    }
+        GenerationPromptMode::ContinueFinalAssistant
+    };
     let placeholders = replace_chat_images(request_id, &mut chat.messages, images.len())?;
-    chat.chat_options.generation_prompt_mode = generation_prompt_mode;
-    let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
-    preprocess_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
-}
+    let rendered = renderer.render(&chat)?;
 
-/// Replaces SenseNova image slots and computes their positions in token space.
-///
-/// Each placeholder becomes the profile's start-of-image and end-of-image
-/// marker text. An image's position is the index of its end-of-image token,
-/// so the image fills the gap between the two markers. The position is
-/// found by tokenizing the text up to the end of the marker and requiring its
-/// last token to be `controls.end_of_image`, which fails if the marker text
-/// does not encode to that token.
-fn preprocess_sensenova_with_slots(
-    tokenizer: &DynTokenizer,
-    rendered: &str,
-    placeholders: &[String],
-    images: Vec<crate::serving::ImageInput>,
-    profile: &SenseNovaProfile,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    let marker = format!(
-        "{}{}",
-        profile.controls.start_of_image_text, profile.controls.end_of_image_text
-    );
-    let (clean, byte_offsets) = replace_rendered_slots(rendered, placeholders, &marker)?;
-    let prompt_ids = tokenizer
-        .encode(&clean, false)
-        .map_err(|error| format!("SenseNova prompt tokenization failed: {error}"))?;
+    let (slot_text, anchor) = profile.image_slot();
+    let (clean, byte_offsets) = replace_rendered_slots(&rendered, &placeholders, &slot_text)?;
+    let prompt_ids = tokenizer.encode(&clean, false)?;
     let images = images
         .into_iter()
         .zip(byte_offsets)
         .map(|(image, byte_offset)| -> OmniResult<RenderedImage> {
-            let prefix = tokenizer
-                .encode(&clean[..byte_offset], false)
-                .map_err(|error| format!("SenseNova image params tokenization failed: {error}"))?;
-            let position = prefix
-                .len()
-                .checked_sub(1)
-                .ok_or_else(|| "SenseNova image marker encodes to no tokens".to_string())?;
-            if prefix[position] != profile.controls.end_of_image {
-                return Err(OmniError::Invalid(
-                    "SenseNova image marker does not end at its configured token".to_string(),
-                ));
-            }
-            let position = position
-                .try_into()
-                .map_err(|_| "SenseNova image params exceeds the token range".to_string())?;
-            Ok(rendered_image(image, position))
-        })
-        .collect::<OmniResult<Vec<_>>>()?;
-    Ok((prompt_ids, images))
-}
-
-/// Renders structured Bagel chat while preserving one placeholder per input image.
-fn render_bagel_chat(
-    tokenizer: &DynTokenizer,
-    renderer: &HfChatRenderer,
-    request_id: &str,
-    mut chat: ChatRequest,
-    images: Vec<crate::serving::ImageInput>,
-    constraint: GenerationConstraint,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    if !chat
-        .messages
-        .iter()
-        .any(|message| matches!(message, ChatMessage::System { .. }))
-        && let Some(system) = BagelProfile::default_system_prompt(constraint)
-    {
-        chat.messages.insert(0, ChatMessage::system(system));
-    }
-    let placeholders = replace_chat_images(request_id, &mut chat.messages, images.len())?;
-    chat.chat_options.generation_prompt_mode = GenerationPromptMode::StartNewAssistant;
-    let rendered = renderer.render(&chat).map_err(|error| error.to_string())?;
-    tokenize_bagel_with_slots(tokenizer, &rendered, &placeholders, images)
-}
-
-/// Removes Bagel image slots and computes their positions in token space.
-///
-/// An image's position is the token count of the cleaned text before its
-/// slot. This assumes the prefix encodes to a prefix of the full prompt's
-/// tokens; unlike the SenseNova path, no marker token checks it.
-fn tokenize_bagel_with_slots(
-    tokenizer: &DynTokenizer,
-    rendered: &str,
-    placeholders: &[String],
-    images: Vec<crate::serving::ImageInput>,
-) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
-    let (clean, byte_offsets) = replace_rendered_slots(rendered, placeholders, "")?;
-    let prompt_ids = tokenizer
-        .encode(&clean, false)
-        .map_err(|error| format!("Bagel chat tokenization failed: {error}"))?;
-    let images = images
-        .into_iter()
-        .zip(byte_offsets)
-        .map(|(image, byte_offset)| {
-            let position = tokenizer
-                .encode(&clean[..byte_offset], false)
-                .map_err(|error| format!("Bagel image params tokenization failed: {error}"))?
-                .len()
-                .try_into()
-                .map_err(|_| "Bagel image params exceeds the token range".to_string())?;
+            let prefix = tokenizer.encode(&clean[..byte_offset], false)?;
+            let position = match anchor {
+                None => prefix.len(),
+                Some(anchor) => {
+                    let position = prefix.len().checked_sub(1).ok_or_else(|| {
+                        TokenizeError::Invalid("image slot encodes to no tokens".to_owned())
+                    })?;
+                    if prefix[position] != anchor {
+                        return Err(TokenizeError::Invalid(
+                            "image slot does not end at its configured token".to_owned(),
+                        ));
+                    }
+                    position
+                }
+            };
+            let position = u32::try_from(position).map_err(|_| {
+                TokenizeError::Invalid("image position exceeds the token range".to_owned())
+            })?;
             Ok(rendered_image(image, position))
         })
         .collect::<OmniResult<Vec<_>>>()?;
@@ -433,8 +236,9 @@ fn tokenize_bagel_with_slots(
 
 /// Resolves sampling and checks multimodal requirements against loaded model limits.
 ///
-/// Runs after [`preprocess_sensenova`] or [`preprocess_bagel`] has filled the
-/// prompt and image inputs. It replaces `generation.sampling`, sets
+/// Runs after [`preprocess_omni`] has filled the prompt and image inputs. It
+/// replaces `generation.sampling` with the model's sampling defaults under
+/// the request's controls, keeping its resolved seed, sets
 /// `max_und_tokens`, may clear `cache.read`, and rewrites each input image's
 /// `hash` into its cache-isolated form, so it must run exactly once per
 /// request. On error `generation` may be partially updated; the caller
@@ -450,46 +254,33 @@ fn tokenize_bagel_with_slots(
 /// the final request fails `GenerationRequest::validate`.
 pub(super) fn prepare_generation_resources(
     processor: &crate::serving::InputProcessor,
-    controls: &crate::serving::SamplingConfig,
-    stop: &crate::serving::StopConfig,
+    controls: &crate::serving::SamplingParams,
     generation: &mut GenerationRequest,
 ) -> OmniResult<()> {
-    // Omni profiles start from these fixed sampler defaults rather than the
-    // sampler values in the checkpoint's `sampling_defaults`; only its
-    // `max_output_tokens` applies, below. The seed already resolved by
-    // `preprocess_generation` (image seed first, then text seed) is kept.
-    generation.sampling = SamplingParams {
-        temperature: DEFAULT_TEMPERATURE,
-        top_p: DEFAULT_TOP_P,
-        top_k: DEFAULT_TOP_K,
-        seed: generation.sampling.seed,
-        ..SamplingParams::default()
-    };
+    generation.sampling = super::sampling::resolve_sampling(
+        &processor.tokenizer,
+        &processor.config.sampling_defaults,
+        controls,
+        generation.sampling.seed,
+    )?;
     // Resolve the autoregressive budget only for requests whose behavior can
     // enter text decoding.
-    let prompt_tokens = u32::try_from(generation.prompt_token_ids.len())
-        .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
+    let prompt_tokens = u32::try_from(generation.prompt_token_ids.len()).map_err(|_| {
+        TokenizeError::Invalid("generation prompt exceeds the supported token count".to_owned())
+    })?;
     generation.max_und_tokens = if generation.decodes_text() {
-        crate::serving::text::resolve_max_tokens(
+        crate::serving::sampling::resolve_max_tokens(
             controls.max_tokens,
             processor.config.sampling_defaults.max_output_tokens,
             Some(processor.config.max_model_len),
             prompt_tokens,
-        )
-        .map_err(|error| error.to_string())? as usize
+        )? as usize
     } else {
         0
     };
 
     // Sampling choices determine logprob delivery and whether prefix-cache
     // reads remain semantically valid for this request.
-    super::sampling::apply_sampling(
-        &processor.tokenizer,
-        controls,
-        stop,
-        &mut generation.sampling,
-    )
-    .map_err(|error| error.to_string())?;
     let prompt_logprobs_requested = generation.sampling.prompt_logprobs_requested();
     generation.cache.read &= !prompt_logprobs_requested;
     // Encoder-cache identity folds in the request's cache isolation key, so
@@ -500,12 +291,8 @@ pub(super) fn prepare_generation_resources(
 
     // Resolve conservative capacity before admission. Text output may shrink to
     // fit the model context, but non-text resource requirements remain fixed.
-    generation
-        .validate_resources(&processor.limits)
-        .map_err(|error| error.to_string())?;
-    let mut max_cache_tokens = generation
-        .max_cache_tokens(&processor.limits)
-        .map_err(|error| error.to_string())?;
+    generation.validate_resources(&processor.limits)?;
+    let mut max_cache_tokens = generation.max_cache_tokens(&processor.limits)?;
     // Shrink the text budget by the excess once; at least one text token must
     // remain. The check after this block covers requests that do not decode
     // text and so have no budget to shrink.
@@ -515,26 +302,23 @@ pub(super) fn prepare_generation_resources(
             .checked_sub(excess)
             .filter(|value| *value > 0)
             .ok_or_else(|| {
-                format!(
+                TokenizeError::Invalid(format!(
                     "generation context requires at least {} KV tokens, exceeding the {}-token runtime limit",
                     max_cache_tokens.saturating_sub(generation.max_und_tokens),
                     processor.config.max_model_len
-                )
+                ))
             })?;
-        max_cache_tokens = generation
-            .max_cache_tokens(&processor.limits)
-            .map_err(|error| error.to_string())?;
+        max_cache_tokens = generation.max_cache_tokens(&processor.limits)?;
     }
 
     if max_cache_tokens > processor.config.max_model_len as usize {
-        return Err(format!(
+        return Err(TokenizeError::Invalid(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
             max_cache_tokens, processor.config.max_model_len
-        )
-        .into());
+        )));
     }
 
-    generation.validate().map_err(|error| error.to_string())?;
+    generation.validate()?;
     Ok(())
 }
 
@@ -547,16 +331,15 @@ pub(super) fn prepare_generation_resources(
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
-    image: crate::serving::ImageGenControls,
+    image: crate::serving::ImageSamplingParams,
     sampling_seed: Option<u64>,
 ) -> OmniResult<(ImageParams, u16)> {
     let resolution = resolve_resolution(
         resolution_policy,
-        image.resolution.or(Some(defaults.resolution)),
+        image.resolution,
         image.width,
         image.height,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let cfg_interval = image
         .cfg_interval
         .map(|interval| (interval[0], interval[1]))
@@ -595,7 +378,7 @@ fn prepare_image_inputs(
         .into_iter()
         .map(|RenderedImage { image, position }| {
             if position as usize > num_prompt_tokens {
-                return Err(OmniError::Invalid(
+                return Err(TokenizeError::Invalid(
                     "image position exceeds the tokenized prompt".into(),
                 ));
             }
@@ -615,19 +398,10 @@ fn prepare_image_inputs(
     Ok(MultimodalInputs { images })
 }
 
-/// Resolves the generation constraint implied by requested modalities.
-pub(crate) fn generation_constraint(modalities: ModalitySelection) -> GenerationConstraint {
-    match modalities {
-        ModalitySelection::Text => GenerationConstraint::UndOnly,
-        ModalitySelection::Image => GenerationConstraint::GenOnly,
-        ModalitySelection::TextAndImage => GenerationConstraint::Default,
-    }
-}
-
 /// Replaces chat image parts with unique template placeholders.
 ///
 /// Returns the placeholders in message order, which is the
-/// `chat_image_urls` order of the resolved images. Assistant messages are
+/// `ChatRequest::image_urls` order of the resolved images. Assistant messages are
 /// skipped, so images in assistant content are not collected.
 ///
 /// # Errors
@@ -661,11 +435,10 @@ fn replace_chat_images(
         }
     }
     if placeholders.len() != image_count {
-        return Err(format!(
+        return Err(TokenizeError::Invalid(format!(
             "chat request has {} image parts but {image_count} resolved input images",
             placeholders.len()
-        )
-        .into());
+        )));
     }
     Ok(placeholders)
 }
@@ -676,7 +449,10 @@ fn replace_chat_images(
 /// `replace_rendered_slots` rejects a rendered prompt in which any placeholder
 /// does not occur exactly once, including when request text repeats it.
 fn image_placeholder(request_id: &str, index: usize) -> String {
-    format!("[IMAGE_SLOT_{:016x}_{index}]", fnv1a(request_id.as_bytes()))
+    format!(
+        "[IMAGE_SLOT_{:016x}_{index}]",
+        uniserve_core::Fnv1a::hash(request_id.as_bytes())
+    )
 }
 
 /// Replaces each rendered image placeholder exactly once and returns its byte offset.
@@ -693,13 +469,13 @@ fn replace_rendered_slots(
     let mut byte_offsets = Vec::with_capacity(placeholders.len());
     for placeholder in placeholders {
         if rendered.matches(placeholder).count() != 1 {
-            return Err(OmniError::Invalid(
+            return Err(TokenizeError::Invalid(
                 "chat rendering must preserve one slot per input image".to_string(),
             ));
         }
-        let relative = rendered[cursor..]
-            .find(placeholder)
-            .ok_or_else(|| "chat rendering changed input-image order".to_string())?;
+        let relative = rendered[cursor..].find(placeholder).ok_or_else(|| {
+            TokenizeError::Invalid("chat rendering changed input-image order".to_owned())
+        })?;
         let start = cursor + relative;
         clean.push_str(&rendered[cursor..start]);
         clean.push_str(replacement);
@@ -718,7 +494,7 @@ fn rendered_image(image: crate::serving::ImageInput, position: u32) -> RenderedI
 /// Rejects an empty prompt token sequence.
 fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     if prompt_ids.is_empty() {
-        Err(OmniError::Invalid(
+        Err(TokenizeError::Invalid(
             "generation requires a non-empty prompt".to_string(),
         ))
     } else {
@@ -742,15 +518,5 @@ fn combine_cache_keys(key: u64, value: u64) -> u64 {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&key.to_le_bytes());
     bytes[8..].copy_from_slice(&value.to_le_bytes());
-    fnv1a(&bytes)
-}
-
-/// Computes a 64-bit FNV-1a hash that is stable across processes and builds.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    uniserve_core::Fnv1a::hash(&bytes)
 }

@@ -190,7 +190,7 @@ pub(crate) struct OutputSender {
 impl OutputSender {
     /// Returns the number of retired requests still awaiting output delivery.
     ///
-    /// Admission counts these toward `max_num_waiting`, so undelivered
+    /// Admission counts these toward `max_queued_requests`, so undelivered
     /// terminal output applies backpressure to new submissions.
     pub(super) fn retained_len(&self) -> usize {
         self.retired.len()

@@ -387,7 +387,7 @@ pub struct LaunchDescriptor {
     pub products_cross_hosts: bool,
     /// Most requests outstanding on the rank's channel at once.
     pub queue_depth: usize,
-    /// The head's watchdog timeout in milliseconds (`--watchdog-timeout`):
+    /// The head's watchdog timeout in milliseconds (`worker_config.watchdog_timeout`):
     /// how long a batch may go without progress of the group's ranks before
     /// the head replaces them. The rank reports a lane stalled
     /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)) once one job has
@@ -449,7 +449,7 @@ pub struct LaunchDescriptor {
     pub mem_fraction_static: f64,
     /// Prefix cache capacity in tokens; `None` sizes it from memory.
     pub max_total_tokens: Option<u64>,
-    /// Attention provider name of the rank's model, as `--attention-backend`
+    /// Attention provider name of the rank's model, as `attention_backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)
     /// owns the names and refuses one it does not provide when the model
     /// loads; `auto` selects a native kernel per call.
@@ -470,17 +470,18 @@ pub struct LaunchDescriptor {
 
     /// `off`, `auto` or `full`.
     pub graph_policy: String,
-    /// Comma-separated strictly increasing bucket lists; `None` keeps the
-    /// worker's defaults.
-    pub decode_graph_batch_sizes: Option<String>,
+    /// Strictly increasing bucket lists; `None` keeps the rank's catalog.
+    pub decode_graph_batch_sizes: Option<Vec<u32>>,
     pub prefill_cuda_graph: bool,
     pub prefill_outputs: bool,
-    pub prefill_graph_token_sizes: Option<String>,
+    pub prefill_graph_token_sizes: Option<Vec<u32>>,
     pub flow_cuda_graph: bool,
-    pub flow_graph_batch_sizes: Option<String>,
-    /// Comma-separated `HEIGHTxWIDTH` image capture sizes.
-    pub flow_graph_shapes: Option<String>,
-    pub video_text_capacities: Option<String>,
+    pub flow_graph_batch_sizes: Option<Vec<u32>>,
+    /// Distinct `[height, width]` image capture sizes in pixels.
+    pub flow_graph_shapes: Option<Vec<[u32; 2]>>,
+    /// Strictly increasing prompt-token capacities of a video denoiser's
+    /// layouts; `None` keeps the rank's default steps.
+    pub video_text_capacities: Option<Vec<u32>>,
     /// Resolution classes (`768p`) a video deployment prepares, crossed
     /// with `video_aspect_ratios` resolution-major, in the order the
     /// deployment names them. The video denoiser names the canvas of each
@@ -493,8 +494,8 @@ pub struct LaunchDescriptor {
 
     /// FlashInfer attention options, in bytes and backend names.
     pub flashinfer_workspace_size: u64,
-    /// `true` or `false`; `None` lets the backend decide.
-    pub flashinfer_use_tensor_core: Option<String>,
+    /// `None` lets the backend decide.
+    pub flashinfer_use_tensor_core: Option<bool>,
     pub flashinfer_decode_backend: String,
     pub flashinfer_prefill_backend: String,
     pub flashinfer_decode_split_tile_size: Option<u32>,

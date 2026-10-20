@@ -1,0 +1,52 @@
+# FastH3 on four GPUs of each of two hosts, rank-0 and rank-1: one Ulysses4
+# denoiser replica and TP4 text encoder per host.
+
+[[workers]]
+id = "text"
+replicas = 2
+ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
+queue_depth = 6
+mem_fraction_static = 0.26
+
+[workers.components.text_encoder]
+tensor_parallel_size = 4
+
+[[workers]]
+id = "flow"
+replicas = 2
+ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
+queue_depth = 6
+mem_fraction_static = 0.73
+
+[workers.components.transformer]
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
+
+[workers.components.video_decoder]
+
+[workers.components.audio_decoder]
+distribution = "temporal_units"
+
+[workers.components.latent_encoder]
+distribution = "temporal_units"
+
+[[workers]]
+id = "encoder"
+replicas = 2
+ranks = ["rank-0/cpu*4", "rank-1/cpu*4"]
+queue_depth = 6
+
+[workers.components.video_codec]
+
+[[workers]]
+id = "reader"
+ranks = ["rank-0/cpu"]
+queue_depth = 6
+
+[workers.components.media_reader]
+
+[[workers]]
+id = "muxer"
+ranks = ["rank-0/cpu"]
+queue_depth = 12
+
+[workers.components.muxer]

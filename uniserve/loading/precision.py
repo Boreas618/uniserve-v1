@@ -67,7 +67,7 @@ def weight_config(
     if checkpoint_format is not None and numerical_overrides:
         raise ValueError(
             f"checkpoint format {checkpoint_format!r} owns its numerical "
-            "configuration; remove --quantization-config"
+            "configuration; remove quantization_config"
         )
 
     selected = options.get("mode", options.get("quant_method"))

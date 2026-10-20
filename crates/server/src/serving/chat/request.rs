@@ -1,18 +1,15 @@
 //! Internal chat messages, content parts, tools, and render options.
 //!
 //! The Chat Completions preprocessing converts API requests into these types.
-//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the chat
-//! output processors (`Qwen3ChatOutputProcessor`, `Gemma4ChatOutputProcessor`)
-//! read its tool configuration to decide whether generated text is parsed for
-//! tool calls.
+//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the
+//! request's `ChatOutputProcessor` reads its tool configuration to decide
+//! whether generated text is parsed for tool calls.
 
 pub use crate::profile::tools::Tool;
-use crate::serving::text::TextDecodeOptions;
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 
-use crate::serving::chat::error::{Error, Result};
-use crate::serving::chat::event::{AssistantContentBlock, AssistantMessage};
+use crate::serving::chat::{AssistantContentBlock, AssistantMessage, Error, Result};
 
 /// Role of one chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,8 +446,6 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     /// Tool-choice behavior for this request.
     pub tool_choice: ChatToolChoice,
-    /// Text decode options for incremental detokenization.
-    pub decode_options: TextDecodeOptions,
 }
 
 impl ChatRequest {
@@ -461,7 +456,6 @@ impl ChatRequest {
             chat_options: ChatOptions::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
-            decode_options: TextDecodeOptions::default(),
         }
     }
 
@@ -494,6 +488,33 @@ impl ChatRequest {
         self.messages.iter().any(ChatMessage::has_multimodal)
     }
 
+    /// Returns the URL of every input image, in prompt order: the
+    /// `image_url` parts of system, developer, user, and tool-response
+    /// messages, in message order and then part order. Assistant content
+    /// carries no input images. Preprocessing pairs the resolved images with
+    /// their parts in this order.
+    pub fn image_urls(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { content }
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::User { content }
+                | ChatMessage::ToolResponse { content, .. } => Some(content),
+                ChatMessage::Assistant { .. } => None,
+            })
+            .filter_map(|content| match content {
+                ChatContent::Parts(parts) => Some(parts),
+                ChatContent::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                ChatContentPart::ImageUrl { image_url, .. } => Some(image_url.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Returns true if this request should enable tool parsing based on the tool
     /// choice and tool list.
     ///
@@ -505,26 +526,12 @@ impl ChatRequest {
     }
 }
 
-impl ChatRole {
-    /// Returns the snake_case role label, matching this enum's serde
-    /// representation.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Developer => "developer",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::ToolResponse => "tool_response",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole};
-    use crate::serving::chat::event::AssistantContentBlock;
+    use crate::serving::chat::AssistantContentBlock;
 
     #[test]
     fn chat_content_deserializes_from_raw_string() {

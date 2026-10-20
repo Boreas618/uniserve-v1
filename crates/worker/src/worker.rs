@@ -901,7 +901,7 @@ fn graph_policy(
         && configured != "off"
     {
         return Err(Error::Unsupported(format!(
-            "component {name} keeps its weights in host memory, which requires --graph-policy off"
+            "component {name} keeps its weights in host memory, which requires cuda_graph_config.policy=off"
         )));
     }
     if model.attention_captures || configured == "off" {

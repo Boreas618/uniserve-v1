@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn decode_logprobs_decodes_every_candidate_token() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let tokenizer = crate::test_support::configured_tokenizer();
         let logprobs = vec![PositionLogprobs {
             entries: vec![
                 TokenLogprob {
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn decode_prompt_logprobs_separates_first_prompt_token() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let tokenizer = crate::test_support::configured_tokenizer();
         let logprobs = vec![PositionLogprobs {
             entries: vec![TokenLogprob {
                 token_id: b'x' as u32,

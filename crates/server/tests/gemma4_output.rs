@@ -32,18 +32,16 @@
 
 use std::sync::Arc;
 
-use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::Value;
-use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::serving::chat::output::AssistantEvent;
 use uniserve_server::serving::chat::{
-    AssistantBlockKind, ChatRequest, ChatToolChoice, Gemma4ChatOutputProcessor, Tool,
+    AssistantBlockKind, ChatOutputProcessor, ChatRequest, ChatToolChoice, Tool,
 };
-use uniserve_server::serving::text::{DecodedTextEvent, FinishReason, Finished};
+use uniserve_server::serving::text::TextDecodeOptions;
 
 /// DiffusionGemma commits generated tokens in blocks of this many tokens.
 const COMMITTED_BLOCK_TOKENS: usize = 256;
@@ -187,12 +185,8 @@ fn gemma4_tokenizer() -> DynTokenizer {
         .collect();
     tokenizer.add_special_tokens(&added);
 
-    // `HuggingFaceTokenizer` loads from a file; the loaded tokenizer outlives
-    // the temporary directory.
-    let directory = tempdir().expect("create tokenizer directory");
-    let path = directory.path().join("tokenizer.json");
-    tokenizer.save(&path, false).expect("save tokenizer");
-    Arc::new(HuggingFaceTokenizer::new(&path).expect("load tokenizer"))
+    let definition = serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
+    Arc::new(HuggingFaceTokenizer::from_json(definition).expect("load tokenizer"))
 }
 
 /// A request that declares the fixture's tools and lets the model call them.
@@ -209,51 +203,33 @@ fn request_with_tools() -> ChatRequest {
     request
 }
 
-/// Decoded events for `sample`, delivering its generated tokens in deltas of
-/// at most `tokens_per_delta` tokens; the last delta finishes the stream.
-fn decoded_events(
-    sample: &Sample,
-    tokens_per_delta: usize,
-) -> Vec<uniserve_server::serving::text::Result<DecodedTextEvent>> {
-    let chunks: Vec<&[(u32, String)]> = sample.output.chunks(tokens_per_delta).collect();
-    let last = chunks.len() - 1;
-
-    let mut events = vec![Ok(DecodedTextEvent::Start {
-        prompt_token_ids: sample.prompt_token_ids.clone().into(),
-        prompt_logprobs: None,
-        queued_at: None,
-        scheduled_at: None,
-    })];
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        events.push(Ok(DecodedTextEvent::TextDelta {
-            delta: chunk.iter().map(|(_, text)| text.as_str()).collect(),
-            token_ids: chunk.iter().map(|(id, _)| *id).collect(),
-            logprobs: None,
-            finished: (index == last).then(|| Finished {
-                prompt_token_count: sample.prompt_token_ids.len(),
-                output_token_count: sample.output.len(),
-                internal_token_count: 0,
-                finish_reason: FinishReason::stop_eos(),
-            }),
-        }));
-    }
-    events
+/// The decoded text of `sample`'s generated tokens, in deltas of at most
+/// `tokens_per_delta` tokens.
+fn deltas(sample: &Sample, tokens_per_delta: usize) -> Vec<String> {
+    sample
+        .output
+        .chunks(tokens_per_delta)
+        .map(|chunk| chunk.iter().map(|(_, text)| text.as_str()).collect())
+        .collect()
 }
 
-/// Runs `processor` over `events` and returns the assistant blocks, failing
-/// unless the stream ends with `Done`.
-async fn assistant_blocks(
-    processor: Gemma4ChatOutputProcessor,
-    events: Vec<uniserve_server::serving::text::Result<DecodedTextEvent>>,
+/// Runs `processor` over `sample`'s prompt and `deltas`, then finishes it,
+/// and returns the assistant blocks.
+fn assistant_blocks(
+    mut processor: ChatOutputProcessor,
+    sample: &Sample,
+    deltas: Vec<String>,
 ) -> Vec<Block> {
-    let output = processor.parse(stream::iter(events));
-    futures::pin_mut!(output);
+    processor.initialize(&sample.prompt_token_ids);
+    let mut events = Vec::new();
+    for delta in deltas {
+        events.extend(processor.push(delta).expect("processing succeeds"));
+    }
+    events.extend(processor.finish().expect("processing succeeds"));
 
     let mut blocks = Vec::new();
     let mut open_arguments: Option<(String, String)> = None;
-    let mut finished = false;
-    while let Some(event) = output.next().await {
-        let event = event.expect("processing succeeds");
+    for event in events {
         if !matches!(event, AssistantEvent::ToolCallArgumentsDelta { .. })
             && let Some((name, arguments)) = open_arguments.take()
         {
@@ -269,7 +245,6 @@ async fn assistant_blocks(
                 | (AssistantBlockKind::Text, Some(Block::Text(text))) => text.push_str(&delta),
                 (AssistantBlockKind::Reasoning, _) => blocks.push(Block::Reasoning(delta)),
                 (AssistantBlockKind::Text, _) => blocks.push(Block::Text(delta)),
-                (AssistantBlockKind::ToolCall, _) => panic!("tool calls are not text deltas"),
             },
             AssistantEvent::ToolCallStart { name, .. } => {
                 open_arguments = Some((name, String::new()));
@@ -281,12 +256,14 @@ async fn assistant_blocks(
                     .1
                     .push_str(&delta);
             }
-            AssistantEvent::Done { .. } => finished = true,
-            AssistantEvent::Start { .. } | AssistantEvent::SampleDelta { .. } => {}
         }
     }
-
-    assert!(finished, "stream ends with Done");
+    if let Some((name, arguments)) = open_arguments {
+        blocks.push(Block::Call(ToolCall {
+            name,
+            arguments: serde_json::from_str(&arguments).expect("arguments are JSON"),
+        }));
+    }
     blocks
 }
 
@@ -307,19 +284,21 @@ fn expected_blocks(sample: &Sample) -> Vec<Block> {
 /// Every fixture reply separates into its reasoning, tool calls, and
 /// visible text, both when tokens arrive one at a time and when each decoded
 /// delta carries a whole committed block.
-#[tokio::test]
-async fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block() {
+#[test]
+fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block() {
     let tokenizer = gemma4_tokenizer();
 
     for sample in fixture().samples {
         for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
-            let mut request = request_with_tools();
-            let processor =
-                Gemma4ChatOutputProcessor::new(&mut request, Arc::clone(&tokenizer), true)
-                    .expect("build processor");
+            let processor = ChatOutputProcessor::gemma4(
+                &request_with_tools(),
+                &mut TextDecodeOptions::default(),
+                Arc::clone(&tokenizer),
+                true,
+            )
+            .expect("build processor");
 
-            let blocks =
-                assistant_blocks(processor, decoded_events(&sample, tokens_per_delta)).await;
+            let blocks = assistant_blocks(processor, &sample, deltas(&sample, tokens_per_delta));
 
             assert_eq!(
                 blocks,
@@ -335,20 +314,23 @@ async fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block()
 /// parses as the reference serving system parses it, and as Transformers
 /// does when the reply follows the template's grammar, token by token and by
 /// committed block. No channel markup reaches the reasoning or the content.
-#[tokio::test]
-async fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
+#[test]
+fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
     let tokenizer = gemma4_tokenizer();
 
     for (serving, hf) in tool_replies() {
         for sample in std::iter::once(&serving).chain(hf.as_ref()) {
             for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
-                let mut request = request_with_tools();
-                let processor =
-                    Gemma4ChatOutputProcessor::new(&mut request, Arc::clone(&tokenizer), true)
-                        .expect("build processor");
+                let request = request_with_tools();
+                let processor = ChatOutputProcessor::gemma4(
+                    &request,
+                    &mut TextDecodeOptions::default(),
+                    Arc::clone(&tokenizer),
+                    true,
+                )
+                .expect("build processor");
 
-                let blocks =
-                    assistant_blocks(processor, decoded_events(sample, tokens_per_delta)).await;
+                let blocks = assistant_blocks(processor, sample, deltas(sample, tokens_per_delta));
 
                 assert_eq!(
                     blocks,
@@ -364,20 +346,25 @@ async fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
 /// The processor decodes with special tokens kept, so without reasoning or
 /// tool parsing the channel and tool-call delimiters stream verbatim as
 /// visible text.
-#[tokio::test]
-async fn gemma4_processor_without_parsers_streams_delimiters_as_text() {
+#[test]
+fn gemma4_processor_without_parsers_streams_delimiters_as_text() {
     let sample = fixture()
         .samples
         .into_iter()
         .find(|sample| sample.name == "tool_calls_after_reasoning")
         .expect("fixture has a tool-call sample");
-    let mut request = ChatRequest::for_test();
-    let processor = Gemma4ChatOutputProcessor::new(&mut request, gemma4_tokenizer(), false)
-        .expect("build processor");
+    let mut decode = TextDecodeOptions::default();
+    let processor = ChatOutputProcessor::gemma4(
+        &ChatRequest::for_test(),
+        &mut decode,
+        gemma4_tokenizer(),
+        false,
+    )
+    .expect("build processor");
 
-    let blocks = assistant_blocks(processor, decoded_events(&sample, 1)).await;
+    let blocks = assistant_blocks(processor, &sample, deltas(&sample, 1));
 
-    assert!(!request.decode_options.skip_special_tokens);
+    assert!(!decode.skip_special_tokens);
     let raw: String = sample
         .output
         .iter()

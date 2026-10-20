@@ -685,12 +685,12 @@ fn guidance_prefix_holder_progresses_while_older_images_wait() {
         SchedulerConfig {
             max_batch: 32,
             max_num_batched_tokens: 4096,
-            long_prefill_threshold: 64,
+            chunked_prefill_size: 64,
             ..Default::default()
         },
     )
     .unwrap();
-    assert_eq!(scheduler.config().max_num_seqs, 3);
+    assert_eq!(scheduler.config().max_running_requests, 3);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let thread = thread::spawn(move || scheduler.run(rx));
@@ -1478,7 +1478,7 @@ fn hybrid_groups_share_one_unit_pool() {
         ctrl(),
         SchedulerConfig {
             max_batch: 32,
-            long_prefill_threshold: 64,
+            chunked_prefill_size: 64,
             ..Default::default()
         },
     )
@@ -1588,7 +1588,7 @@ fn prefix_cache_configuration_controls_reuse() {
         let mut sim = SimEngine::new();
         sim.set_text_len(4);
         let config = EngineConfig {
-            prefix_reuse: enabled,
+            prefix_cache: enabled,
             ..EngineConfig::sim("sim-model")
         };
         let engine = EngineCore::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
@@ -1747,7 +1747,7 @@ fn chunked_prefill_progresses_with_decode() {
         SchedulerConfig {
             max_batch: 32,
             // Caps a prefill chunk at 64 tokens.
-            long_prefill_threshold: 64,
+            chunked_prefill_size: 64,
             // Leaves room for other decodes per step.
             max_num_batched_tokens: 256,
             ..Default::default()

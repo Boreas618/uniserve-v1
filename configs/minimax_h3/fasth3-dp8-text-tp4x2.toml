@@ -1,0 +1,51 @@
+# FastH3 on eight GPUs of one host: eight one-GPU denoiser replicas and two TP4
+# text encoders, one per four-GPU half.
+
+[[workers]]
+id = "text"
+replicas = 2
+ranks = ["cuda:0-7"]
+queue_depth = 12
+mem_fraction_static = 0.25
+
+[workers.components.text_encoder]
+tensor_parallel_size = 4
+
+[[workers]]
+id = "flow"
+replicas = 8
+ranks = ["cuda:0-7"]
+queue_depth = 6
+mem_fraction_static = 0.72
+
+[workers.components.transformer]
+
+[workers.components.video_decoder]
+
+[workers.components.audio_decoder]
+distribution = "temporal_units"
+
+[workers.components.latent_encoder]
+distribution = "temporal_units"
+
+[[workers]]
+id = "encoder"
+replicas = 8
+ranks = ["cpu*8"]
+queue_depth = 6
+
+[workers.components.video_codec]
+
+[[workers]]
+id = "reader"
+ranks = ["cpu"]
+queue_depth = 24
+
+[workers.components.media_reader]
+
+[[workers]]
+id = "muxer"
+ranks = ["cpu"]
+queue_depth = 24
+
+[workers.components.muxer]

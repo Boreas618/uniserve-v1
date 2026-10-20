@@ -4,19 +4,21 @@
 //! the Dynamo worker) waits for the same outcome: exactly one artifact
 //! followed by a normal finish. [`ArtifactCollector`] classifies the events
 //! once; each consumer keeps its own read loop, with its own cancellation and
-//! progress handling, and renders a [`VideoStreamError`] in its own error
-//! envelope.
+//! progress handling. A [`VideoStreamError`] has one message and one code,
+//! which the synchronous route renders as an OpenAI error, a job records as
+//! its failure, and the Dynamo worker returns as its error.
 
 use std::ops::ControlFlow;
 
 use uniserve_core::{ArtifactEvent, RejectionKind};
 
-use crate::serving::{FinishStatus, RequestOutput};
+use crate::serving::{FinishReason, RequestOutput};
 
 /// Why a video generation stream did not end in an artifact.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum VideoStreamError {
     /// The engine refused the request before executing it.
+    #[error("{message}")]
     Rejected {
         /// Whether the request is unservable or the engine is full.
         kind: RejectionKind,
@@ -24,25 +26,57 @@ pub enum VideoStreamError {
         message: String,
     },
     /// Generation failed.
+    #[error("{message}")]
     Failed {
         /// Description of the failure.
         message: String,
     },
     /// The request finished without completing normally.
+    #[error("video generation ended without an artifact: {}", reason.as_str())]
     Ended {
         /// How the request finished.
-        reason: FinishStatus,
+        reason: FinishReason,
     },
     /// The request was cancelled or aborted.
+    #[error("video generation was cancelled")]
     Cancelled,
     /// The request completed normally but produced no artifact.
+    #[error("video generation produced no artifact")]
     MissingArtifact,
     /// The runtime emitted a second artifact.
+    #[error("video generation produced more than one artifact")]
     MultipleArtifacts,
     /// The runtime emitted an event a video generation never carries.
+    #[error("the engine emitted an event a video generation does not carry")]
     Incompatible,
     /// The stream ended before the request finished.
+    #[error("the engine closed the video stream before the request finished")]
     Closed,
+}
+
+impl VideoStreamError {
+    /// Returns the stable machine-readable code of this outcome.
+    ///
+    /// A rejection has the code of the OpenAI error it answers as
+    /// (`invalid_request_error` or `server_overloaded`), so a job reports the
+    /// code the synchronous route answers the same rejection with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Rejected {
+                kind: RejectionKind::Invalid,
+                ..
+            } => "invalid_request_error",
+            Self::Rejected {
+                kind: RejectionKind::Overloaded,
+                ..
+            } => "server_overloaded",
+            Self::Failed { .. } => "generation_failed",
+            Self::Ended { .. } | Self::Cancelled => "generation_terminated",
+            Self::MissingArtifact => "missing_artifact",
+            Self::MultipleArtifacts | Self::Incompatible => "invalid_runtime_event",
+            Self::Closed => "generation_stopped",
+        }
+    }
 }
 
 /// Holds the artifact of a video generation while its events arrive.
@@ -54,9 +88,9 @@ pub struct ArtifactCollector {
 impl ArtifactCollector {
     /// Folds one stream event, `None` for the end of the stream.
     ///
-    /// Acceptance, usage, scheduling and progress events carry nothing the
-    /// outcome needs and continue. The first terminal event breaks with the
-    /// artifact of a normal finish, or the error that ended the request.
+    /// Scheduling and progress events carry nothing the outcome needs and
+    /// continue. The first terminal event breaks with the artifact of a
+    /// normal finish, or the error that ended the request.
     pub fn push(
         &mut self,
         event: Option<RequestOutput>,
@@ -70,28 +104,24 @@ impl ArtifactCollector {
                 }
             }
             Some(RequestOutput::Finished {
-                reason: FinishStatus::Stop { .. },
+                reason: FinishReason::Stop(_),
                 ..
             }) => self
                 .artifact
                 .take()
                 .ok_or(VideoStreamError::MissingArtifact),
+            Some(RequestOutput::Finished {
+                reason: FinishReason::Abort,
+                ..
+            }) => Err(VideoStreamError::Cancelled),
             Some(RequestOutput::Finished { reason, .. }) => Err(VideoStreamError::Ended { reason }),
-            Some(RequestOutput::Rejected { kind, message, .. }) => {
+            Some(RequestOutput::Rejected { kind, message }) => {
                 Err(VideoStreamError::Rejected { kind, message })
             }
-            Some(RequestOutput::Failed { message, .. }) => {
-                Err(VideoStreamError::Failed { message })
+            Some(RequestOutput::Failed { message }) => Err(VideoStreamError::Failed { message }),
+            Some(RequestOutput::Scheduled { .. } | RequestOutput::MediaProgress { .. }) => {
+                return ControlFlow::Continue(());
             }
-            Some(RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. }) => {
-                Err(VideoStreamError::Cancelled)
-            }
-            Some(
-                RequestOutput::Accepted { .. }
-                | RequestOutput::Usage { .. }
-                | RequestOutput::Scheduled { .. }
-                | RequestOutput::MediaProgress { .. },
-            ) => return ControlFlow::Continue(()),
             Some(_) => Err(VideoStreamError::Incompatible),
             None => Err(VideoStreamError::Closed),
         };
@@ -102,11 +132,7 @@ impl ArtifactCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serving::ServeRequestId;
-
-    fn id() -> ServeRequestId {
-        ServeRequestId::new("video")
-    }
+    use crate::serving::RequestUsage;
 
     fn outcome(event: Option<RequestOutput>) -> Result<ArtifactEvent, VideoStreamError> {
         match ArtifactCollector::default().push(event) {
@@ -115,14 +141,20 @@ mod tests {
         }
     }
 
+    fn finished(reason: FinishReason) -> Option<RequestOutput> {
+        Some(RequestOutput::Finished {
+            reason,
+            usage: RequestUsage::default(),
+        })
+    }
+
     #[test]
     fn lifecycle_and_progress_events_continue() {
         let mut collector = ArtifactCollector::default();
         for event in [
             RequestOutput::Scheduled {
-                request_id: id(),
-                queued_at: None,
-                scheduled_at: None,
+                queued_at: 1.0,
+                scheduled_at: 2.0,
             },
             RequestOutput::MediaProgress {
                 phase: "denoising".to_owned(),
@@ -135,31 +167,26 @@ mod tests {
 
     #[test]
     fn a_normal_finish_without_an_artifact_is_missing_one() {
-        let finished = RequestOutput::Finished {
-            reason: FinishStatus::Stop { cause: None },
-            finish_detail: None,
-        };
         assert_eq!(
-            outcome(Some(finished)).unwrap_err(),
+            outcome(finished(FinishReason::Stop(None))).unwrap_err(),
             VideoStreamError::MissingArtifact
         );
     }
 
     #[test]
     fn terminal_events_name_why_the_request_ended() {
-        let finished = RequestOutput::Finished {
-            reason: FinishStatus::Length,
-            finish_detail: None,
-        };
         assert_eq!(
-            outcome(Some(finished)).unwrap_err(),
+            outcome(finished(FinishReason::Length)).unwrap_err(),
             VideoStreamError::Ended {
-                reason: FinishStatus::Length
+                reason: FinishReason::Length
             }
+        );
+        assert_eq!(
+            outcome(finished(FinishReason::Abort)).unwrap_err(),
+            VideoStreamError::Cancelled
         );
 
         let rejected = RequestOutput::Rejected {
-            request_id: id(),
             kind: RejectionKind::Overloaded,
             message: "full".to_owned(),
         };
@@ -172,7 +199,6 @@ mod tests {
         );
 
         let failed = RequestOutput::Failed {
-            request_id: id(),
             message: "boom".to_owned(),
         };
         assert_eq!(
@@ -181,17 +207,6 @@ mod tests {
                 message: "boom".to_owned()
             }
         );
-
-        let cancelled = RequestOutput::Cancelled { request_id: id() };
-        assert_eq!(
-            outcome(Some(cancelled)).unwrap_err(),
-            VideoStreamError::Cancelled
-        );
-        let aborted = RequestOutput::Aborted { request_id: id() };
-        assert_eq!(
-            outcome(Some(aborted)).unwrap_err(),
-            VideoStreamError::Cancelled
-        );
     }
 
     #[test]
@@ -199,8 +214,6 @@ mod tests {
         assert_eq!(outcome(None).unwrap_err(), VideoStreamError::Closed);
         let text = RequestOutput::TextDelta {
             text: "hello".to_owned(),
-            token_ids: Vec::new(),
-            logprobs: None,
         };
         assert_eq!(
             outcome(Some(text)).unwrap_err(),

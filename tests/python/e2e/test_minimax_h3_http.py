@@ -46,7 +46,7 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         Path(__file__).resolve().parents[3]
         / "configs"
         / "minimax_h3"
-        / "ulysses4.json"
+        / "ulysses4.toml"
     )
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -64,10 +64,10 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         str(port),
         # Five seconds bound the layouts startup prepares: two frame counts
         # at each of the six canvases and one text capacity.
-        "--video-aspect-ratios",
-        ",".join(CANVASES),
-        "--max-video-seconds",
-        "5",
+        "--set",
+        f"video_config.aspect_ratios={','.join(CANVASES)}",
+        "--set",
+        "video_config.max_seconds=5",
         "--max-model-len",
         "1024",
     ]

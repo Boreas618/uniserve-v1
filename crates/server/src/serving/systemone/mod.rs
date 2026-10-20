@@ -19,7 +19,7 @@
 //!    [`ReadoutPlan::assemble`] turns into the official response, with the
 //!    `x_candidate_mass` extension on every answer.
 //!
-//! [`ServingRuntime::systemone`](crate::serving::ServingRuntime::systemone)
+//! [`Engine::systemone`](crate::engine::Engine::systemone)
 //! runs these steps for one request body.
 //!
 //! The readout matches the reference DJev encoder token for token for every
@@ -40,9 +40,8 @@ mod vocabulary;
 pub use answer::{Answer, OrderedMap, SystemOneResponse, Usage};
 pub use error::{LocItem, SystemOneError, ValidationIssue};
 pub use plan::{
-    CandidateTokens, CanvasMode, CanvasRow, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION,
-    ReadoutEncoder, ReadoutLayout, ReadoutOptions, ReadoutPlan, ReadoutPrompt, ReadoutSlot,
-    StartupError,
+    CandidateTokens, CanvasMode, ImageSize, MAX_REQUEST_CONTEXT, MAX_STATE_AND_QUESTION,
+    ReadoutEncoder, ReadoutLayout, ReadoutPlan, ReadoutPrompt, StartupError,
 };
 pub use request::{
     ChoiceOption, Criteria, MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, Question, SystemOneRequest,

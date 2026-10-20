@@ -14,6 +14,9 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use clap::Parser as _;
+use uniserve_server::options;
+
 use crate::cli::{Cli, Command};
 
 // mimalloc is built with `no_thp` (workspace `Cargo.toml`): its arenas carry
@@ -94,9 +97,22 @@ fn shutdown_signal() -> CancellationToken {
 }
 
 /// Starts the UniServe command-line process.
+///
+/// `serve --print-config` prints the resolved serving configuration, and
+/// nothing else, to stdout and exits before tracing or the runtime starts.
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    logging::init_tracing(cli.log_level.as_deref(), cli.log_level_http.as_deref());
+    let Command::Serve(args) = &cli.command;
+    if args.print_config {
+        let (config, _) = args.resolve()?;
+        print!("{}", options::printed(&config)?);
+        return Ok(());
+    }
+
+    logging::init_tracing(
+        cli.log.log_level.as_deref(),
+        cli.log.log_level_http.as_deref(),
+    );
 
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
@@ -116,19 +132,12 @@ fn main() -> Result<()> {
 /// Runs the UniServe command-line process.
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Serve(mut args) => {
-            args.runtime
-                .served_model_name
-                .get_or_insert_with(|| args.runtime.model.clone());
-            // Resolved here only for the log line; `to_uniserve_config` builds
-            // the same settings for the server. Without `--workers`, the
-            // deployment is one component over every rank, blocked across the
-            // rank hosts.
-            let settings = args.runtime.engine_settings();
-            info!(model = %args.runtime.model,
-                workers = ?settings.workers, resident_requests = settings.max_num_seqs,
-                python = %args.runtime.worker_python.display(), "resolved deployment");
-            uniserve_server::serve(args.to_uniserve_config(), shutdown_signal()).await
+        Command::Serve(args) => {
+            let (config, stated) = args.resolve()?;
+            info!(model = %config.model(),
+                resident_requests = config.max_running_requests,
+                python = %config.worker_config.python.display(), "resolved serving options");
+            uniserve_server::serve(config, stated, shutdown_signal()).await
         }
     }
 }
