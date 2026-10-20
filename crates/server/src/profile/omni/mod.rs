@@ -1,7 +1,8 @@
 //! Shared contracts and model-specific profiles for multimodal generation.
 //!
 //! The SenseNova and Bagel profiles fix each family's control tokens, prompt
-//! framing, output filters, image-generation defaults, and runtime sizing.
+//! framing, output filters, image-generation defaults, and runtime sizing,
+//! and expose what preprocessing needs of them as an [`OmniProfile`].
 //! They also compute the cache tokens an input or generated image occupies
 //! from its pixel dimensions, and the request carries that count as an exact
 //! `ImageEncoderInput::num_cache_tokens`. The engine plans from it before any
@@ -19,9 +20,70 @@ pub mod resolution;
 pub mod sensenova;
 
 use serde::{Deserialize, Serialize};
+use uniserve_core::{GenerationConstraint, ImageEncoderInput, ImageGenerationConfig};
 
 use crate::profile::assets::{self, Error as AssetError};
+use crate::profile::omni::resolution::ResolutionPolicy;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
+
+/// What one multimodal family contributes to its requests: prompt framing,
+/// image slots, encoder sizing, and output filtering. `serving::omni`
+/// preprocesses every family's requests through it.
+pub trait OmniProfile {
+    /// Special tokens that delimit multimodal generation.
+    fn controls(&self) -> &GenerationControls;
+    /// Image-generation defaults.
+    fn image_defaults(&self) -> &ImageGenerationDefaults;
+    /// Supported output dimensions and the default one.
+    fn resolution_policy(&self) -> &ResolutionPolicy;
+    /// Logical positions one input image contributes, independently of its
+    /// cache tokens.
+    fn image_num_positions(&self) -> u32;
+    /// The system instruction a chat without one takes under `constraint`.
+    fn default_system_prompt(&self, constraint: GenerationConstraint) -> Option<&'static str>;
+    /// The assistant text a chat under `constraint` continues; empty for an
+    /// open assistant turn.
+    fn assistant_prefix(&self, constraint: GenerationConstraint) -> &'static str;
+    /// The text an input image's rendered chat slot becomes, and the token
+    /// that text must encode to last: the image enters at that token when
+    /// there is one, and after the text before its slot otherwise.
+    fn image_slot(&self) -> (String, Option<u32>);
+    /// Renders and encodes a text prompt under `constraint`.
+    fn render_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        constraint: GenerationConstraint,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>>;
+    /// Renders and encodes the classifier-free guidance context of `prompt`.
+    fn render_negative_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt: &str,
+    ) -> crate::profile::tokenizer::Result<Vec<u32>>;
+    /// Builds the encoder inputs of an input image of the given dimensions
+    /// in a request that carries `image_count` input images.
+    fn image_encoders_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+        image_count: usize,
+    ) -> assets::Result<Vec<ImageEncoderInput>>;
+    /// A value that changes an input image's encoding with the request's
+    /// `image_count` and therefore joins its encoder-cache identity; `None`
+    /// when the count does not change it.
+    fn input_image_cache_salt(&self, image_count: usize) -> Option<u64>;
+    /// Resolves the generated-image feedback cache contribution for the
+    /// requested canvas.
+    fn image_generation_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> assets::Result<ImageGenerationConfig>;
+    /// The reasoning and visible-wrapper filter of the family's output; `None`
+    /// when its output is plain text.
+    fn output_filter(&self) -> Option<&OutputFilterPolicy>;
+}
 
 /// Returns the storage width in bytes for a model dtype.
 pub(super) const fn model_dtype_bytes(dtype: uniserve_core::ModelDtype) -> u64 {
@@ -51,10 +113,9 @@ pub struct GenerationControls {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// Profile-provided defaults for output image generation.
+/// Profile-provided defaults for output image generation; the default
+/// resolution is the resolution policy's.
 pub struct ImageGenerationDefaults {
-    /// Default named output resolution.
-    pub resolution: resolution::ResolutionName,
     /// Default diffusion step count.
     pub steps: u16,
     /// Default classifier-free guidance scale for text conditioning.

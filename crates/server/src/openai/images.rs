@@ -23,7 +23,7 @@ use crate::openai::{
     check_model_served,
 };
 use crate::serving::{
-    FinishReason, GenerateRequest, ImageGenControls, Prompt, RequestOutput, SamplingParams,
+    FinishReason, GenerateRequest, ImageSamplingParams, Prompt, RequestOutput, SamplingParams,
 };
 
 /// The image generation route.
@@ -92,7 +92,7 @@ pub fn lower_image_request(
         },
         constraint: GenerationConstraint::GenOnly,
         sampling_params: SamplingParams::default(),
-        image_params: Some(ImageGenControls {
+        image_params: Some(ImageSamplingParams {
             width,
             height,
             steps: request.steps,
@@ -103,7 +103,7 @@ pub fn lower_image_request(
             timestep_shift: request.timestep_shift,
             seed: request.seed,
             max_images: Some(1),
-            ..ImageGenControls::default()
+            ..ImageSamplingParams::default()
         }),
         priority: 0,
         cache_salt: None,

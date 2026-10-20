@@ -491,7 +491,9 @@ impl InputProcessor {
             multimodal_inputs: Default::default(),
             constraint,
             sampling: EngineSamplingParams {
-                // An image-generation seed takes precedence over the text sampling seed.
+                // The request's one seed: an image-generation seed takes
+                // precedence over the text sampling seed, whose signed bit
+                // pattern seeds the engine.
                 seed: image_params
                     .as_ref()
                     .and_then(|image| image.seed)
@@ -525,7 +527,7 @@ impl InputProcessor {
                     &mut generation,
                     &mut decode,
                 )?,
-                ModelParameters::SenseNova(profile) => crate::serving::omni::preprocess_sensenova(
+                ModelParameters::SenseNova(profile) => crate::serving::omni::preprocess_omni(
                     profile,
                     self,
                     &request_id,
@@ -534,7 +536,7 @@ impl InputProcessor {
                     image_params,
                     &mut generation,
                 )?,
-                ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_bagel(
+                ModelParameters::Bagel(profile) => crate::serving::omni::preprocess_omni(
                     profile,
                     self,
                     &request_id,
@@ -674,7 +676,7 @@ impl InputProcessor {
 
         let prompt_len = prompt_token_ids.len() as u32;
         let (sampling, max_tokens, stop_token_ids) =
-            self.resolve_sampling(sampling_params, prompt_len)?;
+            self.resolve_sampling(sampling_params, generation.sampling.seed, prompt_len)?;
 
         generation.prompt_token_ids = prompt_token_ids;
         generation.sampling = sampling;
@@ -687,10 +689,13 @@ impl InputProcessor {
         Ok(processor)
     }
 
-    /// Resolves model defaults and request controls into validated engine sampling parameters.
+    /// Resolves model defaults and request controls into validated engine
+    /// sampling parameters under the request's resolved `seed`, with the
+    /// generation length and the stop tokens.
     fn resolve_sampling(
         &self,
         sampling: &SamplingParams,
+        seed: Option<u64>,
         prompt_len: u32,
     ) -> std::result::Result<(EngineSamplingParams, u32, Vec<u32>), crate::serving::TokenizeError>
     {
@@ -727,15 +732,7 @@ impl InputProcessor {
             });
         }
 
-        let mut core = EngineSamplingParams {
-            temperature: defaults.temperature.unwrap_or(1.0),
-            top_k: defaults.top_k.unwrap_or(0),
-            top_p: defaults.top_p.unwrap_or(1.0),
-            min_p: defaults.min_p.unwrap_or(0.0),
-            repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
-            ..EngineSamplingParams::default()
-        };
-        super::sampling::apply_sampling(&self.tokenizer, sampling, &mut core)?;
+        let core = super::sampling::resolve_sampling(&self.tokenizer, defaults, sampling, seed)?;
 
         Ok((core, max_tokens, stop_token_ids))
     }

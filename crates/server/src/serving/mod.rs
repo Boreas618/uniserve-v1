@@ -34,7 +34,7 @@ use futures::Stream;
 use uniserve_engine::EventRx;
 
 pub use error::{ServeError, TokenizeError};
-pub use input::{GenerateRequest, ImageGenControls, OutputParams, Prompt, SamplingParams};
+pub use input::{GenerateRequest, ImageSamplingParams, OutputParams, Prompt, SamplingParams};
 pub use media::ImageInput;
 pub use model::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub(crate) use model::{LoadedModel, LoadedRenderer};

@@ -264,9 +264,26 @@ impl ModelConfig {
             }
         };
 
+        // The multimodal families sample greedily over the full vocabulary
+        // unless a request says otherwise; their checkpoints contribute only
+        // the default generation length.
+        let mut sampling_defaults = generation_defaults(&generation_config);
+        if matches!(
+            parameters,
+            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_)
+        ) {
+            sampling_defaults = SamplingDefaults {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                top_k: Some(0),
+                max_output_tokens: sampling_defaults.max_output_tokens,
+                ..SamplingDefaults::default()
+            };
+        }
+
         Ok(Self {
             parameters,
-            sampling_defaults: generation_defaults(&generation_config),
+            sampling_defaults,
             max_model_len: max_model_len
                 .or(model_config.max_position_embeddings())
                 .unwrap_or(Self::DEFAULT_MAX_MODEL_LEN),
@@ -378,6 +395,7 @@ mod tests {
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::profile::assets::ResolvedModelFiles;
     use crate::profile::assets::checkpoint::bf16_safetensors;
+    use crate::profile::omni::OmniProfile as _;
     use crate::profile::omni::sensenova::SenseNovaProfile;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
 
@@ -491,7 +509,7 @@ mod tests {
                 ModelParameters::SenseNova(profile) => {
                     assert_eq!(description, ModelDescription::SenseNova);
                     assert_eq!(
-                        profile.image_defaults.resolution,
+                        profile.resolution_policy.default.name,
                         crate::profile::omni::resolution::ResolutionName::Landscape16x9
                     );
                     assert_eq!(
@@ -581,8 +599,6 @@ mod tests {
                 &tokenizer,
                 GenerationConstraint::GenOnly,
                 "draw a lighthouse",
-                None,
-                None,
             )
             .unwrap();
         let rendered = tokenizer.decode(&prompt, false).unwrap();
@@ -625,8 +641,6 @@ mod tests {
                 &tokenizer,
                 GenerationConstraint::Default,
                 "draw a lighthouse",
-                None,
-                None,
             )
             .unwrap();
         let rendered = tokenizer.decode(&prompt, false).unwrap();

@@ -24,9 +24,15 @@ pub enum TokenizeError {
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
     Generation(#[from] uniserve_core::GenerationRequestError),
-    /// Multimodal request controls or geometry are invalid.
+    /// The requested output resolution is not served.
     #[error(transparent)]
-    Omni(#[from] crate::serving::omni::OmniError),
+    Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
+    /// The profile cannot size the request's images.
+    #[error(transparent)]
+    Assets(#[from] crate::profile::assets::Error),
+    /// The request exceeds the loaded workers' resource limits.
+    #[error(transparent)]
+    Resources(#[from] uniserve_core::GenerationResourceError),
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {

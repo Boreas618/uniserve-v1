@@ -1,23 +1,45 @@
-//! Shared normalization for token sampling; model callers supply numerical defaults.
-//!
-//! Two callers seed `SamplingParams` with model defaults and then apply the
-//! request controls here: `InputProcessor::resolve_sampling` for Qwen3 (from
-//! `ModelConfig::sampling_defaults`) and `omni::prepare_generation_resources`
-//! for SenseNova and Bagel (from fixed omni defaults).
+//! Token sampling resolution: the model's sampling defaults under a request's
+//! controls ([`resolve_sampling`]), and its generation length
+//! ([`resolve_max_tokens`]).
 
 use uniserve_core::SamplingParams as EngineSamplingParams;
 
 use super::{SamplingParams, TokenizeError};
+use crate::profile::SamplingDefaults;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
-/// Applies public controls once, preserving model biases and an explicit image seed.
+/// Resolves a request's engine sampling parameters: the model's `defaults`
+/// under the request's `controls`, with the request's resolved `seed`.
+///
+/// # Errors
+///
+/// As [`apply_sampling`].
+pub(super) fn resolve_sampling(
+    tokenizer: &HuggingFaceTokenizer,
+    defaults: &SamplingDefaults,
+    controls: &SamplingParams,
+    seed: Option<u64>,
+) -> Result<EngineSamplingParams, TokenizeError> {
+    let mut sampling = EngineSamplingParams {
+        temperature: defaults.temperature.unwrap_or(1.0),
+        top_k: defaults.top_k.unwrap_or(0),
+        top_p: defaults.top_p.unwrap_or(1.0),
+        min_p: defaults.min_p.unwrap_or(0.0),
+        repetition_penalty: defaults.repetition_penalty.unwrap_or(1.0),
+        seed,
+        ..EngineSamplingParams::default()
+    };
+    apply_sampling(tokenizer, controls, &mut sampling)?;
+    Ok(sampling)
+}
+
+/// Applies public controls once, preserving model biases.
 ///
 /// Temperature, top-k, top-p, min-p, and repetition penalty override the
 /// caller's defaults only when the request sets them. Frequency and presence
 /// penalties, `min_tokens`, `ignore_eos`, and every logprob, allowed-token, and
-/// bad-word field are replaced from the request. A seed already present in
-/// `sampling` wins over `controls.seed`. Biases already in `logit_bias` are
-/// summed per token with the request's biases.
+/// bad-word field are replaced from the request. Biases already in
+/// `logit_bias` are summed per token with the request's biases.
 ///
 /// Must be called once per request: a second call would add the request
 /// biases again.
@@ -26,7 +48,7 @@ use crate::profile::tokenizer::HuggingFaceTokenizer;
 ///
 /// Fails when a bad word cannot be tokenized or the result fails
 /// `SamplingParams::validate`. `sampling` may be partially updated on error.
-pub(super) fn apply_sampling(
+fn apply_sampling(
     tokenizer: &HuggingFaceTokenizer,
     controls: &SamplingParams,
     sampling: &mut EngineSamplingParams,
@@ -39,8 +61,6 @@ pub(super) fn apply_sampling(
         .repetition_penalty
         .unwrap_or(sampling.repetition_penalty);
     sampling.ignore_eos = controls.ignore_eos;
-    // Signed API seeds preserve their bit pattern for every model.
-    sampling.seed = sampling.seed.or(controls.seed.map(|seed| seed as u64));
     sampling.min_tokens = controls.min_tokens.unwrap_or(0) as usize;
     sampling.frequency_penalty = controls.frequency_penalty.unwrap_or(0.0);
     sampling.presence_penalty = controls.presence_penalty.unwrap_or(0.0);

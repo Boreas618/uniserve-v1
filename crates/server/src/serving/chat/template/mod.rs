@@ -2,10 +2,10 @@
 //!
 //! `ModelConfig::load` builds one [`HfChatRenderer`] from the checkpoint files
 //! and the server's template options for every model except a diffusers
-//! pipeline. For each chat prompt, `InputProcessor::preprocess_qwen3_input` or
-//! the omni chat preprocessors (`render_sensenova_chat`, `render_bagel_chat`)
-//! call [`HfChatRenderer::render`] and tokenize the rendered prompt (the omni
-//! paths first resolve their image placeholders in it).
+//! pipeline. For each chat prompt, the model's preprocessing (Qwen3,
+//! DiffusionGemma, or the multimodal families' `serving::omni`) calls
+//! [`HfChatRenderer::render`] and tokenizes the rendered prompt (the
+//! multimodal path first resolves its image placeholders in it).
 //!
 //! Rendering converts each `ChatMessage` into a `TemplateMessage`, the
 //! OpenAI-compatible JSON shape that Hugging Face templates inspect: assistant

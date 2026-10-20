@@ -130,7 +130,7 @@ pub struct GenerateRequest {
     /// How text is sampled and decoded.
     pub sampling_params: SamplingParams,
     /// How images are generated, for a request that generates them.
-    pub image_params: Option<ImageGenControls>,
+    pub image_params: Option<ImageSamplingParams>,
     /// Scheduling priority; lower is earlier.
     pub priority: i32,
     /// Salt that isolates the request's prefix-cache and encoder-cache
@@ -141,7 +141,7 @@ pub struct GenerateRequest {
 /// Image-generation controls: dimensions, denoise steps, guidance controls,
 /// seed, and image-count bounds.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ImageGenControls {
+pub struct ImageSamplingParams {
     /// Named output-resolution preset.
     pub resolution: Option<crate::profile::omni::resolution::ResolutionName>,
     /// Explicit output width in pixels.

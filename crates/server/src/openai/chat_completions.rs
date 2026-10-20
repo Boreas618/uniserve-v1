@@ -56,7 +56,7 @@ use crate::serving::text::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
 };
 use crate::serving::{
-    FinishReason, GenerateRequest, ImageGenControls, Prompt, RequestOutput, SamplingParams,
+    FinishReason, GenerateRequest, ImageSamplingParams, Prompt, RequestOutput, SamplingParams,
     StopReason,
 };
 
@@ -1204,8 +1204,8 @@ fn convert_modalities(modalities: &[ChatModality]) -> GenerationConstraint {
 /// Wire names differ from the serving names: `guidance_scale` and
 /// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
 /// renormalization type, and `num_images` is `max_images`.
-fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
-    ImageGenControls {
+fn convert_image_config(config: &ChatImageConfig) -> ImageSamplingParams {
+    ImageSamplingParams {
         resolution: config.resolution,
         width: config.width,
         height: config.height,
