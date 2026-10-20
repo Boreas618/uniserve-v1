@@ -28,13 +28,17 @@
 //!    modulation.
 //! 5. Each condition's media is published to shared memory for the worker's
 //!    media reader, and the request becomes one `DiffusionRequest`
-//!    describing every condition. The rank that denoises the request admits
+//!    describing every condition. The worker that denoises the request admits
 //!    its conditions into the condition capacity it provisioned, counting
 //!    their rows as its denoiser packs them.
 //!
+//! Stages 1 to 3 wait only on I/O and run on the async runtime; stages 4
+//! and 5 are CPU work, the planning, the tokenization and the copies into
+//! shared memory, and run on the blocking pool ([`Presenter`]).
+//!
 //! The request rules are `uniserve-core`'s ([`plan`], [`presentation`]); the
 //! model package reads the canvas rule and the frame counts from them through
-//! the rank runtime library, and plans no request.
+//! the worker library, and plans no request.
 //! [`VideoService::capabilities`] describes the same contract for
 //! `GET /v1/capabilities`.
 //!
@@ -63,7 +67,7 @@ use uniserve_engine::VideoDenoiserInfo;
 use crate::options::MediaOptions;
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::ServeError;
-use crate::serving::media::MediaConnector;
+use crate::serving::media::{FetchedMedia, MediaConnector};
 
 use probe::{MediaProber, ProbeConfig};
 
@@ -161,18 +165,41 @@ pub struct ProcessedVideo {
 /// `&self` and runs concurrently.
 pub struct VideoService {
     denoiser: VideoDenoiserInfo,
-    /// Condition units one latent encoding round covers while a request's
-    /// prompt is encoded, which reference images are banded to fill
-    /// (`RequestPlan::image_bands`).
-    latent_encoding_lane: u32,
     /// The media policy, which `capabilities` reports.
     media: MediaOptions,
     connector: MediaConnector,
     prober: MediaProber,
-    vision: ProcessorConfig,
+    /// What plans and presents a request, shared with the blocking pool.
+    presenter: Arc<Presenter>,
+}
+
+/// What plans and presents a fetched and probed request: the deployment's
+/// limits, the vision processor, the latent encoder's round width and the
+/// tokenizer. Its work is CPU-bound and runs on the blocking pool.
+struct Presenter {
     /// What the deployment serves, which every request is planned against.
     limits: PlanLimits,
+    vision: ProcessorConfig,
+    /// Condition units one latent encoding round covers while a request's
+    /// prompt is encoded, which reference images are banded to fill
+    /// (`RequestPlan::image_bands`).
+    latent_encoding_lane: u32,
     tokenizer: DynTokenizer,
+}
+
+/// The parts of a video request planning reads, owned so that the blocking
+/// pool can take them.
+struct Fetched {
+    request_id: String,
+    task: VideoTask,
+    short_edge: u32,
+    aspect_ratio: String,
+    duration_seconds: Option<f64>,
+    prompt: String,
+    seed: u64,
+    specs: Vec<ConditionSpec>,
+    probes: Vec<plan::MediaFacts>,
+    media: Vec<FetchedMedia>,
 }
 
 impl VideoService {
@@ -219,13 +246,15 @@ impl VideoService {
         };
         Ok(Self {
             denoiser,
-            latent_encoding_lane: latent_encoding_lane.max(1),
             media: media.clone(),
             connector,
             prober,
-            vision,
-            limits,
-            tokenizer,
+            presenter: Arc::new(Presenter {
+                limits,
+                vision,
+                latent_encoding_lane: latent_encoding_lane.max(1),
+                tokenizer,
+            }),
         })
     }
 
@@ -272,9 +301,9 @@ impl VideoService {
                 "height": served.canvas.height,
             }));
         }
-        let references = self.limits.references;
-        let conditions: serde_json::Map<String, Value> = self
-            .limits
+        let limits = &self.presenter.limits;
+        let references = limits.references;
+        let conditions: serde_json::Map<String, Value> = limits
             .tasks
             .iter()
             .map(|task| {
@@ -301,7 +330,7 @@ impl VideoService {
             "tasks": self.denoiser.tasks,
             "task_conditions": conditions,
             "canvas": {
-                "short_edges": self.limits.short_edges(),
+                "short_edges": limits.short_edges(),
                 "multiple": CANVAS_MULTIPLE,
                 "max_pixels": CANVAS_MAX_PIXELS,
                 "aspect_ratios": aspect_ratios,
@@ -312,7 +341,7 @@ impl VideoService {
             "audio_sample_rate": self.denoiser.audio_sample_rate,
             "frames": self.denoiser.frames,
             "min_seconds": MIN_VIDEO_SECONDS,
-            "max_seconds": self.limits.max_video_seconds,
+            "max_seconds": limits.max_video_seconds,
             "model_max_seconds": MAX_VIDEO_SECONDS,
             "schedule": {
                 "num_inference_steps": self.denoiser.schedule_points,
@@ -366,7 +395,7 @@ impl VideoService {
                 start_seconds: condition.start_time_seconds,
             })
             .collect();
-        plan::check_request(request.task, &target, &specs, &self.limits)?;
+        plan::check_request(request.task, &target, &specs, &self.presenter.limits)?;
 
         // Fetches and probes of different conditions run concurrently; the
         // first failure ends the request.
@@ -375,31 +404,69 @@ impl VideoService {
             .iter()
             .map(|condition| condition.uri.as_str())
             .collect();
-        let fetched =
+        let media =
             self.connector.fetch_all(&uris).await.map_err(|error| {
                 VideoInputError::condition(error.index, error.source.to_string())
             })?;
         let probes =
-            futures::future::try_join_all(fetched.iter().enumerate().map(|(index, media)| {
+            futures::future::try_join_all(media.iter().enumerate().map(|(index, media)| {
                 self.prober
                     .probe(index, specs[index].condition_type, &media.bytes)
             }))
             .await?;
 
+        let fetched = Fetched {
+            request_id: request_id.to_owned(),
+            task: request.task,
+            short_edge: request.target.short_edge,
+            aspect_ratio: request.target.aspect_ratio.clone(),
+            duration_seconds: request.target.duration_seconds,
+            prompt: request.prompt.clone(),
+            seed: request.seed,
+            specs,
+            probes,
+            media,
+        };
+        let presenter = Arc::clone(&self.presenter);
+        tokio::task::spawn_blocking(move || presenter.present(fetched, max_prompt_tokens))
+            .await
+            .unwrap_or_else(|error| {
+                Err(
+                    VideoInputError::Internal(format!("planning the request failed: {error}"))
+                        .into(),
+                )
+            })
+    }
+}
+
+impl Presenter {
+    /// Plans `fetched`, presents its prompt, which must fit
+    /// `max_prompt_tokens`, and publishes each condition's media to shared
+    /// memory, which the request holds until the engine retires it.
+    fn present(
+        &self,
+        fetched: Fetched,
+        max_prompt_tokens: u32,
+    ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
+        let target = Target {
+            short_edge: fetched.short_edge,
+            aspect_ratio: &fetched.aspect_ratio,
+            duration_seconds: fetched.duration_seconds,
+        };
         let plan = plan::plan_request(
-            request.task,
+            fetched.task,
             &target,
-            &specs,
-            &probes,
+            &fetched.specs,
+            &fetched.probes,
             &self.vision,
             &self.limits,
         )?;
-        let presentation = presentation::present(&*self.tokenizer, &plan, &request.prompt)?;
+        let presentation = presentation::present(&*self.tokenizer, &plan, &fetched.prompt)?;
 
         let prompt_token_ids = presentation.token_ids;
         if prompt_token_ids.len() > max_prompt_tokens as usize {
             return Err(ServeError::ContextLengthExceeded {
-                request_id: request_id.to_owned(),
+                request_id: fetched.request_id,
                 prompt_tokens: prompt_token_ids.len(),
                 max_tokens: max_prompt_tokens,
             });
@@ -408,9 +475,11 @@ impl VideoService {
         // Each condition's media reaches the worker's media reader through
         // shared memory on this host.
         let image_bands = plan.image_bands(self.latent_encoding_lane);
-        let mut media = Vec::with_capacity(fetched.len());
-        let mut conditions = Vec::with_capacity(fetched.len());
-        for ((condition, fetched), bands) in plan.conditions.iter().zip(&fetched).zip(image_bands) {
+        let mut media = Vec::with_capacity(fetched.media.len());
+        let mut conditions = Vec::with_capacity(fetched.media.len());
+        for ((condition, fetched), bands) in
+            plan.conditions.iter().zip(&fetched.media).zip(image_bands)
+        {
             let source = MediaSource::publish(&fetched.bytes).map_err(|error| {
                 VideoInputError::Internal(format!(
                     "publishing conditions[{}] for the worker failed: {error}",
@@ -431,15 +500,15 @@ impl VideoService {
             sampling: DiffusionSamplingParams {
                 num_frames: plan.num_frames,
                 // One decode unit per clip of the denoiser's frame rule.
-                video_units: self.denoiser.frames.units(plan.num_frames),
-                seed: request.seed,
+                video_units: self.limits.frames.units(plan.num_frames),
+                seed: fetched.seed,
                 width: plan.canvas.width,
                 height: plan.canvas.height,
             },
         };
         let video = ProcessedVideo {
             duration_seconds: plan.duration_seconds,
-            actual_seconds: f64::from(plan.num_frames) / f64::from(self.denoiser.frame_rate),
+            actual_seconds: f64::from(plan.num_frames) / f64::from(self.limits.frame_rate),
             num_frames: plan.num_frames,
             canvas: plan.canvas,
         };
