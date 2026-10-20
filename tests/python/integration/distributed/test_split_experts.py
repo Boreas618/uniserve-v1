@@ -31,7 +31,7 @@ def _peer_storage(nbytes: int, device: torch.device):
     """Map ``nbytes`` on every rank of the world and every rank's address.
 
     The split transport takes its peer-mapped storage from its caller; in
-    serving the rank runtime maps it (``PeerStorage``). Here torch's NCCL
+    serving the worker runtime maps it (``PeerStorage``). Here torch's NCCL
     symmetric memory maps it over the world group, whose ranks are the
     union's members in order. Collective: every rank calls it at the same
     point. Returns this rank's allocation, every rank's address of its

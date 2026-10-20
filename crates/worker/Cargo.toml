@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The cdylib is the library `uniserve.worker` loads through TVM-FFI;
-# the rlib serves Rust tests and benches.
+# The cdylib is the worker library `uniserve/_worker`, which the
+# `uniserve-worker` executable loads and calls and Python loads through
+# TVM-FFI for the video rules it exports; the rlib serves Rust tests and
+# benches.
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+# The process of one worker. It loads the cdylib rather than linking the
+# runtime, so the process holds the one instance Python also loads.
+[[bin]]
+name = "uniserve-worker"
+path = "src/bin/uniserve-worker.rs"
 
 [dependencies]
 base64.workspace = true
@@ -15,8 +23,13 @@ bytemuck.workspace = true
 crossbeam-channel.workspace = true
 indexmap.workspace = true
 libc.workspace = true
+libloading.workspace = true
 nvtx.workspace = true
 png.workspace = true
+# The C API types of the interpreter a worker hosts; its functions are
+# resolved from the process at run time (`launch::python`), so nothing links
+# libpython.
+pyo3-ffi = { version = "0.30.1", features = ["extension-module"] }
 rustix = { workspace = true, features = ["pipe", "fs", "system"] }
 serde_json.workspace = true
 signal-hook-registry.workspace = true

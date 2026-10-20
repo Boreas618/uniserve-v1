@@ -1,4 +1,4 @@
-//! Execution-lane settings shared by the launcher and rank runtime.
+//! Execution-lane settings shared by the head and the worker runtime.
 
 use std::collections::HashSet;
 

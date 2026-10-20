@@ -1,10 +1,10 @@
-//! The Python thread of a rank.
+//! The Python thread of a worker.
 //!
-//! Exactly one thread of a rank process executes Python, so no thread ever
-//! waits for the GIL. That thread is the one the Python entry called the
-//! library's `main` on: it becomes the [`Interpreter`] and serves the calls
-//! every other thread makes through [`super::Function`], one at a time, in
-//! arrival order. A caller waits for its call's result; while it waits, the
+//! Exactly one thread of a worker executes Python, so no thread ever waits
+//! for the GIL. That thread is the `python` thread the worker's entry
+//! spawns, which hosts the interpreter (`crate::launch`): it becomes the
+//! [`Interpreter`] and serves the calls every other thread makes through
+//! [`super::Function`], one at a time, in arrival order. A caller waits for its call's result; while it waits, the
 //! values it passed stay borrowed on its stack.
 //!
 //! The control thread does not wait: it submits work that owns what it uses
@@ -29,7 +29,7 @@
 //!   harnesses), where the caller's thread already is the Python thread.
 //!
 //! The library is reached by import path ([`Interpreter::import`]) through
-//! the one function the Python entry hands the rank,
+//! the one function `uniserve.worker.attach` registers,
 //! `uniserve.worker.import_path`. There is no table of entries.
 
 use std::cell::Cell;
@@ -71,10 +71,10 @@ pub struct Interpreter {
 
 impl Interpreter {
     /// Install the function through which every library function is
-    /// reached by its import path ([`Self::import`]): the rank's entry
-    /// installs the `import` argument of `main`, and a library loaded into
-    /// another Python process (a harness) installs the same function,
-    /// `uniserve.worker.import_path`. The first installation stays for the
+    /// reached by its import path ([`Self::import`]): the worker's Python
+    /// thread installs the global function `uniserve.worker.attach`
+    /// registers, and a library loaded into another Python process (a
+    /// harness) installs the same function, `uniserve.worker.import_path`. The first installation stays for the
     /// process; every later one names the same function.
     pub fn install_import(import: tvm_ffi::Function) {
         let _ = IMPORT.set(Function::new("uniserve.worker.import_path", import));
@@ -112,7 +112,7 @@ impl Interpreter {
 
     /// Serve calls until `finished` delivers a value, and return it.
     ///
-    /// The sender of `finished` is the thread that drives the rank: it sends
+    /// The sender of `finished` is the thread that drives the worker: it sends
     /// once, after its last call returned.
     #[expect(
         clippy::expect_used,
@@ -256,7 +256,7 @@ struct Handoff {
 
 // SAFETY: the pointers address the stack of the submitter, which stays
 // parked in `hand` until `done` is set and reads nothing before that. The
-// state the work captures has no thread affinity: the rank's owners hold
+// state the work captures has no thread affinity: the worker's owners hold
 // reference-counted TVM-FFI values with atomic counts, driver handles the
 // driver accepts from any thread, and locks they do not hold across a
 // handoff.

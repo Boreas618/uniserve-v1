@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import sys
 from itertools import zip_longest
 from pathlib import Path
 
@@ -21,6 +20,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     t2va_request,
+    worker_executable,
     written_deployment,
 )
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
@@ -381,8 +381,8 @@ def test_component_bindings_release_cancelled_requests(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--worker-groups",
         str(written_deployment(tmp_path, workers)),
         "--set",
@@ -529,8 +529,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--served-model-name",
         "FastH3",
         "--port",

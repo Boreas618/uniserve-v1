@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     t2va_request,
+    worker_executable,
 )
 from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
 from uniserve_eval.datasets.minimax_h3 import _PROMPT
@@ -115,8 +115,8 @@ def test_every_admitted_duration_and_prompt_length_replays(
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--served-model-name",
         "FastH3",
         "--port",

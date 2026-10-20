@@ -56,13 +56,24 @@ fn exit(head: &mut Channel) -> WorkerExit {
     }
 }
 
-/// The launch of one rank of `worker_id`, run by `python`.
-fn spawn(worker_id: &str, rank: u32, generation: u64, python: &str) -> WorkerSpawn {
+/// Writes `body` as an executable Python script `worker` in `directory`, a
+/// stand-in for the `uniserve-worker` executable, and returns its path.
+fn stand_in(directory: &std::path::Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join("worker");
+    std::fs::write(&path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The launch of one worker of `worker_id`, run by `executable`.
+fn spawn(worker_id: &str, rank: u32, generation: u64, executable: &str) -> WorkerSpawn {
     WorkerSpawn {
         rank,
         worker_id: worker_id.into(),
         generation,
-        python: python.into(),
+        executable: executable.into(),
         head: "127.0.0.1:1".into(),
         environment: HashMap::new(),
     }
@@ -171,34 +182,23 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
     .unwrap();
     let reserved = reservation(&mut head);
 
-    // The rank's module accepts one peer on the socket it inherits at the
-    // number the reservation reported, which is how a collective store serves
-    // on an inherited socket, and answers it with the launch generation its
-    // command line names, which a rank registers under. The head names the
-    // socket's number in the rank's launch descriptor; this stand-in is given
-    // it in its environment. The package is regular so it shadows any
-    // installed worker package.
-    let modules = tempfile::tempdir().unwrap();
-    let package = modules.path().join("uniserve");
-    std::fs::create_dir(&package).unwrap();
-    std::fs::write(package.join("__init__.py"), "").unwrap();
-    std::fs::write(
-        package.join("worker.py"),
+    // The stand-in worker accepts one peer on the socket it inherits at the
+    // number the reservation reported, which is how a collective store
+    // serves on an inherited socket, and answers it with the launch
+    // generation its command line names, which a worker registers under. The
+    // head names the socket's number in the worker's launch descriptor; this
+    // stand-in is given it in its environment.
+    let directory = tempfile::tempdir().unwrap();
+    let executable = stand_in(
+        directory.path(),
         "import os, socket, sys\n\
          store = socket.socket(fileno=int(os.environ['STORE_FD']))\n\
          peer, _ = store.accept()\n\
          generation = sys.argv[sys.argv.index('--generation') + 1]\n\
          peer.sendall(f'served {generation}\\n'.encode())\n",
-    )
-    .unwrap();
-    let mut rank = spawn("group", 0, 4, "python3");
-    rank.environment = HashMap::from([
-        (
-            "PYTHONPATH".to_owned(),
-            modules.path().to_str().unwrap().to_owned(),
-        ),
-        ("STORE_FD".to_owned(), reserved.listen_fd.to_string()),
-    ]);
+    );
+    let mut rank = spawn("group", 0, 4, executable.to_str().unwrap());
+    rank.environment = HashMap::from([("STORE_FD".to_owned(), reserved.listen_fd.to_string())]);
     head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
 
     // The reserved socket is already listening, so this connection waits in
@@ -246,8 +246,8 @@ impl StandIn {
     fn spawn(head: &mut Channel, group: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
-        // The launcher runs `<python> -m uniserve.worker ...`; the
-        // script ignores those arguments.
+        // The launcher runs `<executable> --head ...`; the script ignores
+        // those arguments.
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("rank");
         let pid_file = directory.path().join("rank.pid");
@@ -408,26 +408,21 @@ fn event_memory(pid: libc::pid_t) -> Vec<std::path::PathBuf> {
 }
 
 /// Has the launcher behind `head` spawn rank 0 of `group` as the
-/// [`EVENT_HOLDER`] module, and returns its process id once its event memory
-/// exists, with that memory.
+/// [`EVENT_HOLDER`] stand-in in `directory`, and returns its process id once
+/// its event memory exists, with that memory.
 #[cfg(target_os = "linux")]
 fn hold_event(
     head: &mut Channel,
     group: &str,
-    modules: &std::path::Path,
+    directory: &std::path::Path,
 ) -> (libc::pid_t, Vec<std::path::PathBuf>) {
-    let pid_file = modules.join(format!("{group}.pid"));
-    let mut rank = spawn(group, 0, 7, "python3");
-    rank.environment = HashMap::from([
-        (
-            "PYTHONPATH".to_owned(),
-            modules.to_str().unwrap().to_owned(),
-        ),
-        (
-            "WORKER_PID_FILE".to_owned(),
-            pid_file.to_str().unwrap().to_owned(),
-        ),
-    ]);
+    let pid_file = directory.join(format!("{group}.pid"));
+    let executable = directory.join("worker");
+    let mut rank = spawn(group, 0, 7, executable.to_str().unwrap());
+    rank.environment = HashMap::from([(
+        "WORKER_PID_FILE".to_owned(),
+        pid_file.to_str().unwrap().to_owned(),
+    )]);
     head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
 
     let mut held = None;
@@ -455,15 +450,11 @@ fn hold_event(
 #[ignore = "requires a CUDA device"]
 fn a_reaped_worker_leaves_no_event_memory() {
     let (_launcher, mut head) = start_launcher();
-    // The package is regular so it shadows any installed worker package.
-    let modules = tempfile::tempdir().unwrap();
-    let package = modules.path().join("uniserve");
-    std::fs::create_dir(&package).unwrap();
-    std::fs::write(package.join("__init__.py"), "").unwrap();
-    std::fs::write(package.join("worker.py"), EVENT_HOLDER).unwrap();
-    let (killed, killed_memory) = hold_event(&mut head, "killed", modules.path());
+    let directory = tempfile::tempdir().unwrap();
+    stand_in(directory.path(), EVENT_HOLDER);
+    let (killed, killed_memory) = hold_event(&mut head, "killed", directory.path());
     // Should the test fail, dropping the launcher kills both stand-ins.
-    let (_, live_memory) = hold_event(&mut head, "live", modules.path());
+    let (_, live_memory) = hold_event(&mut head, "live", directory.path());
 
     // SAFETY: signal delivery to a stand-in this test started.
     assert_eq!(unsafe { libc::kill(killed, libc::SIGKILL) }, 0);

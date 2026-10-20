@@ -1,4 +1,4 @@
-//! Exercises the event-driven engine loop against a worker rank process.
+//! Exercises the event-driven engine loop against a worker process.
 //!
 //! The engine parks on result, command, and worker-death events while the worker
 //! parks on request notifications. The flow includes idle wakeup and graceful
@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
     };
     let engine = WorkerGroup::spawn(uniserve_engine::WorkerProcessArgs {
         worker_id: "local".into(),
-        python: "python3".into(),
+        executable: WorkerProcessArgs::default_executable(),
         model: String::new(),
         ranks: uniserve_engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],

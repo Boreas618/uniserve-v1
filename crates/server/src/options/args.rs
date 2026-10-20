@@ -31,7 +31,7 @@ pub const FLAG_PATHS: [(&str, &str); 12] = [
     ("--max-model-len", "max_model_len"),
     ("--mem-fraction-static", "mem_fraction_static"),
     ("--host-identity", "host_identity"),
-    ("--worker-python", "worker_config.python"),
+    ("--worker-executable", "worker_config.executable"),
 ];
 
 /// The serving command line.
@@ -74,10 +74,10 @@ pub struct ServeArgs {
     /// (`host_identity`).
     #[arg(long)]
     pub host_identity: Option<String>,
-    /// Python interpreter that runs the worker ranks
-    /// (`worker_config.python`).
+    /// The `uniserve-worker` executable that runs the workers
+    /// (`worker_config.executable`).
     #[arg(long, value_name = "PATH")]
-    pub worker_python: Option<PathBuf>,
+    pub worker_executable: Option<PathBuf>,
     /// TOML file of serving options; the flags and `--set` override it.
     /// `--print-config` prints every option it may state.
     #[arg(long, value_name = "FILE")]
@@ -227,8 +227,8 @@ impl ServeArgs {
             ),
             ("host_identity", self.host_identity.as_deref().map(text)),
             (
-                "worker_config.python",
-                self.worker_python.as_ref().map(path),
+                "worker_config.executable",
+                self.worker_executable.as_ref().map(path),
             ),
         ]
         .into_iter()
@@ -539,8 +539,8 @@ mod tests {
             "0.5",
             "--host-identity",
             "rank-0",
-            "--worker-python",
-            "/usr/bin/python3",
+            "--worker-executable",
+            "/opt/env/bin/uniserve-worker",
             "--set",
             "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"] }]",
         ])
@@ -549,8 +549,8 @@ mod tests {
             assert!(stated.contains(path), "{path} is set by its flag");
         }
         assert_eq!(
-            config.worker_config.python,
-            PathBuf::from("/usr/bin/python3")
+            config.worker_config.executable,
+            PathBuf::from("/opt/env/bin/uniserve-worker")
         );
 
         let text = printed(&config).unwrap();

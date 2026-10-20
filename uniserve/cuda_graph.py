@@ -64,7 +64,7 @@ def _reuse_joined_cross_stream_blocks() -> None:
     receives into a fresh output each layer keeps every layer's output
     reserved until the capture ends. With this option the allocator reuses
     the block once the capture's dependency graph orders the new allocation
-    after those uses. The rank runtime's own collectives record no stream on
+    after those uses. The worker runtime's own collectives record no stream on
     any tensor, so serving captures allocate as before.
 
     The option is added to the process's current allocator settings, which

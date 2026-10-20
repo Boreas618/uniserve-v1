@@ -95,7 +95,8 @@ include = ["uniserve", "uniserve.*"]
 uniserve = ["backends/moe/tactics.json"]
 
 # Rust worker runtime. It is a TVM-FFI library rather than a Python extension
-# module: `uniserve.worker` loads it with `tvm_ffi.load_module`. Serving
+# module: the `uniserve-worker` executable loads it and calls its entry, and
+# Python loads the same file with `tvm_ffi.load_module`. Serving
 # runs these native targets, so they build with Cargo's release profile even
 # for an editable install, where setuptools-rust would otherwise choose a
 # debug build.
@@ -115,6 +116,13 @@ debug = false
 [[tool.setuptools-rust.bins]]
 target = "uniserve-launcher"
 path = "crates/bin/uniserve-launcher/Cargo.toml"
+debug = false
+
+# The process of one worker, installed beside the environment's interpreter as
+# `uniserve-worker`: it runs workers in this environment.
+[[tool.setuptools-rust.bins]]
+target = "uniserve-worker"
+path = "crates/worker/Cargo.toml"
 debug = false
 
 [tool.pytest.ini_options]

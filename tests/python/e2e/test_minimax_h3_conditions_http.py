@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import httpx
@@ -28,6 +27,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    worker_executable,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
@@ -96,8 +96,8 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
         model,
         "--worker-groups",
         str(ROOT / "configs" / "minimax_h3" / deployment),
-        "--worker-python",
-        sys.executable,
+        "--worker-executable",
+        str(worker_executable()),
         "--served-model-name",
         "MiniMax-H3",
         "--port",

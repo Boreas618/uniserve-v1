@@ -1,7 +1,7 @@
 //! Image understanding and generation through a native worker process.
 //!
-//! These tests run the engine (`EngineCore`) over one real rank process
-//! (`uniserve.worker` with the weightless stub model on CPU), so every
+//! These tests run the engine (`EngineCore`) over one real worker process
+//! (`uniserve-worker` with the weightless stub model on CPU), so every
 //! image call the engine plans executes in the worker's image and text
 //! runtimes: vision encoding of an inline image and the context prefill that
 //! places its features; and an image's generation: the conditioning prefill
@@ -9,8 +9,8 @@
 //! prefills, decoding to a PNG and the generated image's feedback encoding.
 //! The stub's denoiser predicts zero velocity, so a generated image is its
 //! seeded initial latent decoded: identical for one seed, different across
-//! seeds. The interpreter comes from `UNISERVE_WORKER_PYTHON` or the
-//! repository's `.venv/bin/python`.
+//! seeds. The executable comes from `UNISERVE_WORKER_EXECUTABLE` or the
+//! repository environment's `.venv/bin/uniserve-worker`.
 
 #![cfg(target_os = "linux")]
 #![cfg(test)]
@@ -34,13 +34,13 @@ const END_OF_IMAGE: u32 = 1007;
 /// A token that opens an image branch when sampled.
 const START_OF_IMAGE: u32 = 1000;
 
-fn worker_python() -> PathBuf {
-    std::env::var_os("UNISERVE_WORKER_PYTHON")
+fn worker_executable() -> PathBuf {
+    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join(".venv/bin/python")
+                .join(".venv/bin/uniserve-worker")
         })
 }
 
@@ -83,7 +83,7 @@ fn engine() -> anyhow::Result<EngineCore> {
         components.clone(),
     )];
     config.worker_process = WorkerProcessArgs {
-        python: worker_python(),
+        executable: worker_executable(),
         model: String::new(),
         stub: true,
         // The stub rank encodes many small images, so it keeps a larger

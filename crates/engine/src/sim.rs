@@ -6,7 +6,7 @@
 //! batches in flight by a queue depth, and tracks admitted requests and live
 //! products for `command_has_capacity`.
 //!
-//! [`SimEngine`] keeps the per-request progress a worker rank tracks:
+//! [`SimEngine`] keeps the per-request progress a worker tracks:
 //! positions, cache extent, denoising step, and predicate values. It enforces
 //! request identity, lifecycle, call coordinates, and predicate dependencies,
 //! and reports deterministic tokens, cache extents, denoising progress, and
@@ -1214,7 +1214,7 @@ impl SimEngine {
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
-                // A worker rank's image decoding releases the request's
+                // A worker's image decoding releases the request's
                 // latent and resets its denoising step to zero.
                 request.step_index = 0;
                 if let Some(image) = request.image().cloned() {
@@ -1565,7 +1565,7 @@ impl SimEngine {
                 })
                 .transpose()?;
 
-            // As on a worker rank, a chained call releases the products of
+            // As on a worker, a chained call releases the products of
             // the call it follows, and a predicate is released once its
             // consumer has read it. The predicate value is read above, before
             // these releases, because it may be a product of the predecessor.

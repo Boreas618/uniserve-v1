@@ -225,7 +225,7 @@ fn start_worker(
     store_listener: Option<TcpListener>,
 ) -> anyhow::Result<Worker> {
     let mut command = uniserve_ipc::launch::worker_command(
-        &spawn.python,
+        &spawn.executable,
         &spawn.head,
         &spawn.worker_id,
         spawn.rank,
@@ -240,7 +240,7 @@ fn start_worker(
     }
 
     let child = WorkerChild::spawn(&mut command)
-        .with_context(|| format!("spawning rank {} with {}", spawn.rank, spawn.python))?;
+        .with_context(|| format!("spawning rank {} with {}", spawn.rank, spawn.executable))?;
     tracing::debug!(rank = spawn.rank, host = %args.host_identity, "spawned");
     Ok(Worker {
         child,

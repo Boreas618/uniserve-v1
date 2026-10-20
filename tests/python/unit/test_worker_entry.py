@@ -1,4 +1,4 @@
-"""The function through which the rank runtime reaches the library."""
+"""The function through which the worker runtime reaches the library."""
 
 import subprocess
 import sys

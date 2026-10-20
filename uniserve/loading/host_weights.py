@@ -2,7 +2,7 @@
 
 A component placed with ``"weights": "host"`` keeps the dense projection
 weight matrices of its repeated layer stack in one page-locked host region
-the rank runtime owns. The device holds ``slots`` layer-sized buffers, and
+the worker runtime owns. The device holds ``slots`` layer-sized buffers, and
 layer ``i``'s projection parameters are fixed views of buffer ``i % slots``,
 so operators bound to those parameters read whichever layer was last copied
 there. The runtime copies the layers on its own stream and orders them by

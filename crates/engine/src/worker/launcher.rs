@@ -355,7 +355,7 @@ impl RemoteHost<'_> {
     pub(crate) fn deliver(
         &mut self,
         rank: u32,
-        python: &std::path::Path,
+        executable: &std::path::Path,
         worker_id: &str,
         generation: u64,
         head: &str,
@@ -373,9 +373,9 @@ impl RemoteHost<'_> {
                 ))
             })
             .collect();
-        let python = python
+        let executable = executable
             .to_str()
-            .context("the interpreter path is not valid text")?;
+            .context("the worker executable's path is not valid text")?;
         let mut registry = self
             .registry
             .lock()
@@ -386,7 +386,7 @@ impl RemoteHost<'_> {
                 rank,
                 worker_id: worker_id.to_owned(),
                 generation,
-                python: python.to_owned(),
+                executable: executable.to_owned(),
                 head: head.to_owned(),
                 environment,
             },
@@ -464,7 +464,7 @@ mod tests {
                     rank,
                     worker_id: worker_id.to_owned(),
                     generation,
-                    python: "python3".to_owned(),
+                    executable: "uniserve-worker".to_owned(),
                     head: "127.0.0.1:1".to_owned(),
                     environment: HashMap::new(),
                 },

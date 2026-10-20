@@ -1,17 +1,17 @@
 //! Multiprocess launch, request lifecycle, token execution, close and rank
 //! recovery.
 //!
-//! These tests launch real rank processes (`uniserve.worker` with the
+//! These tests launch real worker processes (`uniserve-worker` with the
 //! weightless stub model on CPU) and drive them through the engine's
 //! `WorkerGroup`, `WorkerExecutor` or `EngineCore`, or through a raw
 //! `Channel` when the worker's own protocol handling is under test.
 //! Lifecycle batches (Start, Finish, Free) exercise registration, startup,
 //! Info, admission, retirement, close and signals; token batches run the
 //! stub's text runtime (prefill, decode, verification, sampling, logprobs and
-//! device token relays). The interpreter comes from
-//! `UNISERVE_WORKER_PYTHON` or the repository's `.venv/bin/python`. Several
-//! tests replace that interpreter with a small wrapper script that records a
-//! rank's process id, exits a chosen rank, starts a relaunched rank as a
+//! device token relays). The executable comes from
+//! `UNISERVE_WORKER_EXECUTABLE` or the repository environment's
+//! `.venv/bin/uniserve-worker`. Several tests replace that executable with a
+//! small wrapper script that records a worker's process id, exits a chosen rank, starts a relaunched rank as a
 //! stand-in that reports changed worker info, registers under another build
 //! or for an earlier launch, or holds a rank's exit until its peers have
 //! closed.
@@ -107,8 +107,7 @@ impl RawHead {
         log: std::process::Stdio,
     ) -> anyhow::Result<(Self, std::process::Child)> {
         let listener = uniserve_ipc::Listener::bind(&[address])?;
-        let mut child = std::process::Command::new(worker_python())
-            .args(["-m", "uniserve.worker"])
+        let mut child = std::process::Command::new(worker_executable())
             .args(["--head", &listener.addresses()[0]])
             .args(["--worker-id", STUB_WORKER])
             .args(["--rank", &descriptor.rank.to_string()])
@@ -734,17 +733,17 @@ fn a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow
     // normally and waits for it in the group's rendezvous.
     use std::os::unix::fs::PermissionsExt as _;
     let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("python");
-    let python = serde_json::to_string(&worker_python())?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport os, sys\nif sys.argv[sys.argv.index('--rank') + 1] == '1':\n    sys.exit(47)\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+            "#!/usr/bin/env python3\nimport os, sys\nif sys.argv[sys.argv.index('--rank') + 1] == '1':\n    sys.exit(47)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut args = worker_group_args();
-    args.python = wrapper.clone();
+    args.executable = wrapper.clone();
     let startup = WorkerGroup::spawn(args);
     remove_file(wrapper)?;
     let Err(error) = startup else {
@@ -951,18 +950,18 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     let executable = serde_json::to_string(&std::env::current_exe()?)?;
     for (change, apply) in changes {
         let directory = tempfile::tempdir()?;
-        let wrapper = directory.path().join("python");
-        let python = serde_json::to_string(&worker_python())?;
+        let wrapper = directory.path().join("worker");
+        let worker = serde_json::to_string(&worker_executable())?;
         let state = serde_json::to_string(&directory.path())?;
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nstate = Path({state})\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(state / (rank + '.pid')).write_text(str(os.getpid()))\nchange = state / 'replacement.json'\nif change.exists():\n    env = dict(os.environ, {MEDIA_WORKER_ARGS}=json.dumps(sys.argv[3:]), {MEDIA_WORKER_INFO}=str(change), {MEDIA_WORKER_CASE}='none', {MEDIA_WORKER_NAME}=str(state / 'media-name'))\n    os.execve({executable}, [{executable}, '--exact', 'media_worker', '--ignored', '--nocapture', '--test-threads', '1'], env)\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+                "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nstate = Path({state})\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(state / (rank + '.pid')).write_text(str(os.getpid()))\nchange = state / 'replacement.json'\nif change.exists():\n    env = dict(os.environ, {MEDIA_WORKER_ARGS}=json.dumps(sys.argv[1:]), {MEDIA_WORKER_INFO}=str(change), {MEDIA_WORKER_CASE}='none', {MEDIA_WORKER_NAME}=str(state / 'media-name'))\n    os.execve({executable}, [{executable}, '--exact', 'media_worker', '--ignored', '--nocapture', '--test-threads', '1'], env)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
         let mut args = worker_group_args();
-        args.python = wrapper;
+        args.executable = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
 
         let mut changed = worker.info().clone();
@@ -1008,17 +1007,17 @@ fn closing_a_group_lets_every_worker_finish_a_collective_teardown() -> anyhow::R
     // completes on any rank only once every rank has been asked to close.
     let directory = tempfile::tempdir()?;
     let wrapper = directory.path().join("worker");
-    let python = serde_json::to_string(&worker_python())?;
+    let worker = serde_json::to_string(&worker_executable())?;
     let records = serde_json::to_string(&directory.path())?;
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport subprocess, sys, time\nfrom pathlib import Path\nrecords = Path({records})\nrank = sys.argv[sys.argv.index('--rank') + 1]\nstatus = subprocess.call([{python}, *sys.argv[1:]], close_fds=False)\n(records / (rank + '.served')).write_text(str(status))\ndeadline = time.monotonic() + 60\nwhile len(list(records.glob('*.served'))) < {WORLD_SIZE}:\n    if time.monotonic() > deadline:\n        sys.exit(3)\n    time.sleep(0.05)\n(records / (rank + '.closed')).write_text('')\nsys.exit(status)\n"
+            "#!/usr/bin/env python3\nimport subprocess, sys, time\nfrom pathlib import Path\nrecords = Path({records})\nrank = sys.argv[sys.argv.index('--rank') + 1]\nstatus = subprocess.call([{worker}, *sys.argv[1:]], close_fds=False)\n(records / (rank + '.served')).write_text(str(status))\ndeadline = time.monotonic() + 60\nwhile len(list(records.glob('*.served'))) < {WORLD_SIZE}:\n    if time.monotonic() > deadline:\n        sys.exit(3)\n    time.sleep(0.05)\n(records / (rank + '.closed')).write_text('')\nsys.exit(status)\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut args = worker_group_args();
-    args.python = wrapper;
+    args.executable = wrapper;
     let mut worker = WorkerGroup::spawn(args)?;
 
     // Close returns once every local rank process has exited, so each rank
@@ -1554,7 +1553,7 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
 
-    args.python = wrapper;
+    args.executable = wrapper;
     let reported = match WorkerGroup::spawn(args) {
         Ok(_) => anyhow::bail!("a rank of another build was accepted"),
         Err(error) => format!("{error:#}"),
@@ -1581,8 +1580,8 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
     // registration, it would have answered it instead of closing, and the
     // relaunch would have failed on a rank registered twice.
     let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("python");
-    let python = serde_json::to_string(&worker_python())?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
     let records = serde_json::to_string(&directory.path())?;
     let mut args = worker_group_args();
     let frames = registration_frames(&args, |rank| uniserve_ipc::Registration::Worker {
@@ -1594,11 +1593,11 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport os, socket, sys\nfrom pathlib import Path\nrecords = Path({records})\nframes = {frames:?}\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\nrank = argument('--rank')\n(records / (rank + '.pid')).write_text(str(os.getpid()))\nif argument('--generation') == '2':\n    stale = socket.socket(socket.AF_UNIX)\n    stale.connect(argument('--head').removeprefix('unix:'))\n    stale.sendall(bytes.fromhex(frames[int(rank)]))\n    stale.settimeout(60)\n    if stale.recv(4096) == b'':\n        (records / (rank + '.refused')).write_text('')\n    stale.close()\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+            "#!/usr/bin/env python3\nimport os, socket, sys\nfrom pathlib import Path\nrecords = Path({records})\nframes = {frames:?}\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\nrank = argument('--rank')\n(records / (rank + '.pid')).write_text(str(os.getpid()))\nif argument('--generation') == '2':\n    stale = socket.socket(socket.AF_UNIX)\n    stale.connect(argument('--head').removeprefix('unix:'))\n    stale.sendall(bytes.fromhex(frames[int(rank)]))\n    stale.settimeout(60)\n    if stale.recv(4096) == b'':\n        (records / (rank + '.refused')).write_text('')\n    stale.close()\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    args.python = wrapper;
+    args.executable = wrapper;
     let mut worker = WorkerGroup::spawn(args)?;
     let launched = worker.info().endpoint.incarnation.clone();
 
@@ -1634,15 +1633,15 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("python");
-    let python = serde_json::to_string(&worker_python())?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
     let records = serde_json::to_string(directory.path())?;
     // Record process identities at the launch boundary; the numerical
     // worker and the engine both execute their normal public paths.
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(Path({records}) / (rank + '.pid')).write_text(str(os.getpid()))\nos.execv({python}, [{python}, *sys.argv[1:]])\n"
+            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(Path({records}) / (rank + '.pid')).write_text(str(os.getpid()))\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1661,7 +1660,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
         WorkerGroupConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = worker_group_args();
-    config.worker_process.python = wrapper.clone();
+    config.worker_process.executable = wrapper.clone();
     let engine = EngineCore::new(config)?;
 
     // Removing the launch executable makes recovery fail at the same OS
@@ -1853,7 +1852,7 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
     // here, so the launch fails naming the host whose ranks never started
     // rather than waiting for them or starting them in the wrong place.
     let spawned = WorkerGroup::spawn(WorkerProcessArgs {
-        python: worker_python(),
+        executable: worker_executable(),
         model: String::new(),
         host: "compute-0".into(),
         ranks: WorkerGroupConfig::placed(
@@ -1976,10 +1975,10 @@ fn spawn_worker_group() -> anyhow::Result<WorkerGroup> {
 /// Launch arguments for a two-rank stub group on the local host's CPU.
 ///
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
-/// in flight. Tests adjust the returned value (for example components, interpreter or transfer edges)
+/// in flight. Tests adjust the returned value (for example components, executable or transfer edges)
 /// before spawning.
 fn worker_group_args() -> WorkerProcessArgs {
-    let worker = worker_python();
+    let executable = worker_executable();
     let config = WorkerProcessArgs {
         stub: true,
         // The stub rank encodes many small images, so it keeps a larger
@@ -1989,7 +1988,7 @@ fn worker_group_args() -> WorkerProcessArgs {
         ..WorkerProcessArgs::default()
     };
     WorkerProcessArgs {
-        python: worker,
+        executable,
         model: String::new(),
         ranks: WorkerGroupConfig::placed(
             &["localhost".to_owned()],
@@ -2090,13 +2089,13 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
     }
 }
 
-fn worker_python() -> PathBuf {
-    std::env::var_os("UNISERVE_WORKER_PYTHON")
+fn worker_executable() -> PathBuf {
+    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join(".venv/bin/python")
+                .join(".venv/bin/uniserve-worker")
         })
 }
 
@@ -2660,13 +2659,13 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     // source. The wrapper writes encoder-0's rank pid, which `execv`
     // preserves, so the test can pause that rank.
     let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("python");
+    let wrapper = directory.path().join("worker");
     let pid_file = directory.path().join("encoder-0.pid");
-    let python = serde_json::to_string(&worker_python())?;
+    let worker = serde_json::to_string(&worker_executable())?;
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport os, sys\nwith open({}, 'w') as output:\n    output.write(str(os.getpid()))\nos.execv({python}, [{python}, *sys.argv[1:]])\n",
+            "#!/usr/bin/env python3\nimport os, sys\nwith open({}, 'w') as output:\n    output.write(str(os.getpid()))\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n",
             serde_json::to_string(&pid_file)?,
         ),
     )?;
@@ -2678,7 +2677,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let spawn = |worker_id: &str, depth| -> anyhow::Result<WorkerGroup> {
         let mut args = single_worker_args(worker_id, depth);
         if worker_id == "encoder-0" {
-            args.python = wrapper.clone();
+            args.executable = wrapper.clone();
         }
         args.transfer = uniserve_engine::TransferConfig::parse(edges)?;
         WorkerGroup::spawn(args)
@@ -4324,20 +4323,19 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
         let directory = tempfile::tempdir()?;
         let wrapper = directory.path().join("worker");
         let name_path = directory.path().join("media-name");
-        // `WorkerGroup` runs `<python> -m uniserve.worker <args>`, so
-        // the wrapper drops its first two arguments and runs this test
-        // binary's `media_worker` with the rest.
+        // `WorkerGroup` runs `<executable> <args>`, so the wrapper runs
+        // this test binary's `media_worker` with those arguments.
         std::fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport json, os, sys\nenv = dict(os.environ, {MEDIA_WORKER_ARGS}=json.dumps(sys.argv[3:]), {MEDIA_WORKER_INFO}={info}, {MEDIA_WORKER_CASE}={case:?}, {MEDIA_WORKER_NAME}={name})\nos.execve({executable}, [{executable}, '--exact', 'media_worker', '--ignored', '--nocapture', '--test-threads', '1'], env)\n",
+                "#!/usr/bin/env python3\nimport json, os, sys\nenv = dict(os.environ, {MEDIA_WORKER_ARGS}=json.dumps(sys.argv[1:]), {MEDIA_WORKER_INFO}={info}, {MEDIA_WORKER_CASE}={case:?}, {MEDIA_WORKER_NAME}={name})\nos.execve({executable}, [{executable}, '--exact', 'media_worker', '--ignored', '--nocapture', '--test-threads', '1'], env)\n",
                 info = serde_json::to_string(&info_path)?,
                 name = serde_json::to_string(&name_path)?,
             ),
         )?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
         let mut args = worker_group_args();
-        args.python = wrapper;
+        args.executable = wrapper;
         let mut worker = WorkerGroup::spawn(args)?;
         let admission = text_admission(81, 1, 1)?;
         let batch = token_batch(
@@ -4419,7 +4417,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 }
 
 /// A rank process of `media_storage_is_owned_through_worker_result_validation`:
-/// it registers its channel endpoint like a worker rank, answers Info with
+/// it registers its channel endpoint like a worker, answers Info with
 /// the template worker info under its own identity, completes every call it
 /// receives as the stub's prefill of a request's first prompt tokens would,
 /// and attaches the case's media payload to a completion.

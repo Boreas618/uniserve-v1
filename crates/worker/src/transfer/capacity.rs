@@ -13,7 +13,7 @@ struct CapacityState {
     waiters: Vec<Notify>,
 }
 
-/// Shared byte reservations and physical read credits for one worker rank.
+/// Shared byte reservations and physical read credits for one worker.
 /// Waiters for returned credits are notified after the capacity lock is
 /// released.
 pub struct TransferCapacity {

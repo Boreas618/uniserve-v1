@@ -9,7 +9,7 @@
 //! is wrapped once as a torch tensor, which every call that takes the view
 //! receives (`crate::storage::memory::StorageView::handle`).
 //!
-//! One thread of a rank executes Python: the [`Interpreter`]. A [`Function`]
+//! One thread of a worker executes Python: the [`Interpreter`]. A [`Function`]
 //! may be called from any thread; the call is handed to the interpreter and
 //! the caller waits for its result, so no thread ever waits for the GIL.
 //! The control thread, which waits for no call while it serves, submits its

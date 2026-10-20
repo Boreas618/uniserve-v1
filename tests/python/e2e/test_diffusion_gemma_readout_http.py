@@ -20,8 +20,8 @@ back in the official shape. The tests check what a client observes:
 
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
-interpreter is ``UNISERVE_WORKER_PYTHON``, else the repository's
-``.venv/bin/python``. ``UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS`` adds
+executable is ``UNISERVE_WORKER_EXECUTABLE``, else the test environment's
+``uniserve-worker``. ``UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS`` adds
 ``uniserve serve`` arguments that select the deployment topology, such as
 ``--data-parallel-size 4``; every topology serves the same answers.
 """
@@ -45,6 +45,7 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
+    worker_executable,
 )
 from uniserve.models import registry as models
 
@@ -108,9 +109,6 @@ def _serve(
         pytest.fail(str(error))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    python = os.environ.get(
-        "UNISERVE_WORKER_PYTHON", str(Path.cwd() / ".venv" / "bin" / "python")
-    )
     args = [
         str(binary),
         "serve",
@@ -121,8 +119,8 @@ def _serve(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-python",
-        python,
+        "--worker-executable",
+        str(worker_executable()),
         "--max-model-len",
         "8192",
         *options,

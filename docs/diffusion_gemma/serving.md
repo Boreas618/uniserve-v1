@@ -114,7 +114,7 @@ artifact_root = "artifacts/benchmark/decisions"
 host = "127.0.0.1"
 port = 18085
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_DIFFUSION_GEMMA_MODEL}", "--served-model-name", "diffusiongemma", "--host", "127.0.0.1", "--port", "18085", "--worker-python", ".venv/bin/python", "--max-model-len", "4096"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_DIFFUSION_GEMMA_MODEL}", "--served-model-name", "diffusiongemma", "--host", "127.0.0.1", "--port", "18085", "--worker-executable", ".venv/bin/uniserve-worker", "--max-model-len", "4096"]
 
 [servers.diffusiongemma.environment]
 CUDA_VISIBLE_DEVICES = "0"

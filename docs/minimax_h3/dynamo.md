@@ -49,7 +49,7 @@ export DYN_DISCOVERY_BACKEND=file
 
 target/release/uniserve-dynamo "$H3_MODEL" \
   --namespace uniserve-fasth3 --served-model-name FastH3 \
-  --worker-python "$PWD/.venv/bin/python" \
+  --worker-executable "$PWD/.venv/bin/uniserve-worker" \
   --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-model-len 16384 --max-running-requests 2 \
   --set video_config.max_seconds=15 --set quantization_config.mode=quality
