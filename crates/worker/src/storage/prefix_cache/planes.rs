@@ -55,16 +55,22 @@ pub struct CachePlanes {
 }
 
 impl CachePlanes {
-    /// Allocate and reset a pool of `num_units` units (the sentinel
-    /// included): values and flags zero, scales one. On a device the resets
-    /// run on `stream`, which is synchronized before returning.
+    /// Allocate a pool of `num_units` units (the sentinel included), and
+    /// reset the planes whose memory is new: values and flags zero, scales
+    /// one. On a device the resets run on `stream`, which is synchronized
+    /// before returning.
     ///
     /// Device planes are exclusive storages `memory` provides, whose
-    /// contents outlive the worker. A dense cache export aliases the live
-    /// pages, so the values are exported where they lie, whatever the
-    /// pool's size, and every local peer device may address them, because
-    /// readers on those devices in this process copy from the pages
-    /// directly.
+    /// contents outlive the worker. Planes a predecessor left keep their
+    /// contents, which are finite whatever they hold: a standby worker's
+    /// predecessor serves from them, a successor head reads the pages its
+    /// predecessor handed over, and every unit is recycled for its next
+    /// owner.
+    ///
+    /// A dense cache export aliases the live pages, so the values are
+    /// exported where they lie, whatever the pool's size, and every local
+    /// peer device may address them, because readers on those devices in
+    /// this process copy from the pages directly.
     pub fn allocate(
         plan: Arc<CachePlan>,
         device: Option<DeviceId>,
@@ -84,6 +90,8 @@ impl CachePlanes {
         }
         let cells = plan.columns as usize * num_units as usize;
         let plane_bytes = cells * plan.plane_bytes as usize;
+        // Whether each field's storages (values, flags, scales) are new.
+        let mut created = [true; 3];
         let (values, initialized, scales) = match device {
             Some(device) => {
                 let peers = Storage::peers(device)?;
@@ -103,10 +111,19 @@ impl CachePlanes {
                     specs.push(spec("prefix_cache.key.scale", cells * 4));
                     specs.push(spec("prefix_cache.value.scale", cells * 4));
                 }
-                let mut taken = memory.exclusive(&specs)?.into_iter();
+                let taken = memory.exclusive(&specs)?;
+                for (index, created) in created.iter_mut().enumerate() {
+                    *created = taken
+                        .iter()
+                        .skip(2 * index)
+                        .take(2)
+                        .any(|storage| storage.created);
+                }
+                let mut taken = taken.into_iter();
                 let mut next = || {
                     taken
                         .next()
+                        .map(|taken| taken.storage)
                         .ok_or_else(|| Error::Invariant("an exclusive storage is missing".into()))
                 };
                 let values = [next()?, next()?];
@@ -145,13 +162,20 @@ impl CachePlanes {
             count,
             height: 1,
         };
+        let [values_created, flags_created, scales_created] = created;
         for field in 0..2 {
             // SAFETY: each allocation spans exactly the filled bytes and is
             // owned by `planes`; the stream is drained below.
             unsafe {
-                stream.memset_2d(whole(planes.values[field].address(), 0, 1, plane_bytes))?;
-                stream.memset_2d(whole(planes.initialized[field].address(), 0, 1, cells))?;
-                if let Some(scales) = &planes.scales {
+                if values_created {
+                    stream.memset_2d(whole(planes.values[field].address(), 0, 1, plane_bytes))?;
+                }
+                if flags_created {
+                    stream.memset_2d(whole(planes.initialized[field].address(), 0, 1, cells))?;
+                }
+                if let Some(scales) = &planes.scales
+                    && scales_created
+                {
                     stream.memset_2d(whole(scales[field].address(), UNIT_SCALE, 4, cells))?;
                 }
             }

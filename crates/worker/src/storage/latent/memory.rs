@@ -124,17 +124,18 @@ fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> 
 /// device banks are one exclusive storage `memory` provides, exported in
 /// place: a CUDA VMM export names the pages where they lie, whatever the
 /// pool's size. Every local peer device may address them, because readers
-/// on those devices in this process copy from the pages directly.
+/// on those devices in this process copy from the pages directly. Returns
+/// the banks and whether their memory is new.
 fn allocate_banks(
     device: Option<DeviceId>,
     bytes: usize,
     name: &str,
     memory: &mut dyn ExclusiveMemory,
-) -> Result<Arc<dyn Backing>> {
+) -> Result<(Arc<dyn Backing>, bool)> {
     Ok(match device {
         Some(device) => {
             let peers = Storage::peers(device)?;
-            memory
+            let taken = memory
                 .exclusive(&[ExclusiveSpec {
                     name,
                     device,
@@ -142,16 +143,18 @@ fn allocate_banks(
                     access: &peers,
                 }])?
                 .pop()
-                .ok_or_else(|| Error::Invariant("the latent banks' storage is missing".into()))?
+                .ok_or_else(|| Error::Invariant("the latent banks' storage is missing".into()))?;
+            (taken.storage, taken.created)
         }
-        None => Storage::host(bytes.max(1)),
+        None => (Storage::host(bytes.max(1)), true),
     })
 }
 
 impl LatentStorage {
-    /// Allocate the storage `plan` states, with zeroed banks (reset on
-    /// `stream`, which is synchronized before returning). Device banks are
-    /// the exclusive storage `name` of `memory`.
+    /// Allocate the storage `plan` states. New banks are zeroed (reset on
+    /// `stream`, which is synchronized before returning); banks a
+    /// predecessor left keep their contents. Device banks are the exclusive
+    /// storage `name` of `memory`.
     pub fn allocate(
         plan: &LatentPlan,
         device: Option<DeviceId>,
@@ -173,7 +176,7 @@ impl LatentStorage {
             |shape: &[i64], dtype: DType| shape.iter().product::<i64>() as usize * dtype.bytes();
         let bank_shape = plan.bank_shape();
         let page_bytes = bytes(&bank_shape, dtype);
-        let banks = allocate_banks(device, page_bytes, name, memory)?;
+        let (banks, created) = allocate_banks(device, page_bytes, name, memory)?;
         let pages = StorageView::contiguous(Arc::clone(&banks), 0, dtype, &bank_shape)?;
         let step = plan
             .step_shape()
@@ -190,13 +193,15 @@ impl LatentStorage {
             &timestep_shape,
         )?;
 
+        // New banks are zeroed. Banks a predecessor left keep their finite
+        // contents: a standby worker's predecessor still serves from them.
         match stream {
-            Some(stream) => {
+            Some(stream) if created => {
                 // SAFETY: the banks span `page_bytes`; the stream drains below.
                 unsafe { memset_d8(banks.address(), 0, page_bytes, stream) }?;
                 stream.synchronize()?;
             }
-            None => {
+            _ => {
                 // Fresh host memory is already zero.
             }
         }
