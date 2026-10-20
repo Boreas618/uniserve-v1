@@ -57,7 +57,7 @@ use crate::ffi::Interpreter;
 use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{
-    DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, HostWeights, PeerGroup,
+    DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, HostRetention, HostWeights, PeerGroup,
 };
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
@@ -222,8 +222,8 @@ impl Worker {
         // The weights the rank retained when it last loaded this model on
         // this placement bind instead of loading, when every rank that
         // loads with it found its own.
-        let keys = weight_keys(&launch, &description, &retained, host_only, &components)
-            .map_err(phase("load"))?;
+        let keys =
+            weight_keys(&launch, &description, &retained, host_only).map_err(phase("load"))?;
         let found = match &keys {
             Some(keys) => keys.find(&retained).map_err(phase("load"))?,
             None => None,
@@ -252,12 +252,24 @@ impl Worker {
         )
         .map_err(phase("load"))?;
         drop(binding);
-        let weight_storages = match (found, &keys) {
-            (Some(found), _) => found.into_storages(),
-            (None, Some(keys)) => keys
-                .publish(&retained, model.handle())
-                .map_err(phase("load"))?,
-            (None, None) => Vec::new(),
+        // A loading worker's weights are put once the host regions of the
+        // layers it streams from host memory joined them.
+        let host_paths: Vec<String> = components
+            .placed()
+            .iter()
+            .filter(|placed| placed.config.weights == ComponentWeights::Host)
+            .flat_map(|placed| model.declarations.roots(&placed.name))
+            .collect();
+        let (mut published, bound) = match (found, &keys) {
+            (Some(found), _) => (None, found.into_storages()),
+            (None, Some(keys)) => (
+                Some(
+                    keys.publish(model.handle(), &host_paths)
+                        .map_err(phase("load"))?,
+                ),
+                Vec::new(),
+            ),
+            (None, None) => (None, Vec::new()),
         };
         // Every later graph decision of the rank reads the resolved policy.
         let host_component = components
@@ -302,7 +314,17 @@ impl Worker {
             .map_err(phase("experts"))?;
         // Host-resident layer weights release their device storage before
         // capacity planning measures free memory.
-        let host_weights = HostWeights::start(&model, &components).map_err(phase("load"))?;
+        let mut retention = match &mut published {
+            Some(published) => HostRetention::Publish(published),
+            None if !bound.is_empty() => HostRetention::Bound(&bound),
+            None => HostRetention::None,
+        };
+        let host_weights =
+            HostWeights::start(&model, &components, &mut retention).map_err(phase("load"))?;
+        let weight_storages = match published {
+            Some(published) => published.put(&retained).map_err(phase("load"))?,
+            None => bound,
+        };
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(
@@ -908,24 +930,18 @@ impl Worker {
 /// when no text runner shares its pools on the microbatch streams.
 /// The keys of the rank's retained weights, or `None` when its weights are
 /// not retained: the stub model, a rank without CUDA weights, and a rank
-/// whose loaded weights move to memory of another owner after loading,
-/// host-resident layers (`weights = "host"`) and distributed expert weights
+/// whose expert weights move to memory of the expert union after loading
 /// (`dwdp`).
 fn weight_keys(
     launch: &WorkerLaunch,
     description: &crate::worker::loading::Description,
     retained: &Retained,
     host_only: bool,
-    components: &Components,
 ) -> Result<Option<WeightKeys>> {
-    let moved = components
-        .placed()
-        .iter()
-        .any(|placed| placed.config.weights == ComponentWeights::Host)
-        || launch
-            .expert_parallel
-            .as_ref()
-            .is_some_and(|union| union.exchange == "dwdp");
+    let moved = launch
+        .expert_parallel
+        .as_ref()
+        .is_some_and(|union| union.exchange == "dwdp");
     if host_only || moved || launch.device().cuda().is_none() {
         return Ok(None);
     }

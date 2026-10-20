@@ -16,6 +16,12 @@ stack (:func:`layer_stack`), how one layer's projection matrices lie in a
 layer buffer (:func:`layout`), and the rebinding of the parameters and the
 hooks that bracket each projection call (:func:`bind`). Biases, norms and
 every other parameter stay resident.
+
+The host region is memory the host's Storage Server retains. A worker that
+loaded the stack copies the matrices into it (their places in it are
+:func:`placements`); a restarted worker finds them there, bound to views of
+the region in place of their device tensors, and :func:`bind` rebinds them
+to the device slots without copying.
 """
 
 from __future__ import annotations
@@ -28,7 +34,15 @@ from torch import nn
 
 from uniserve.quantization import QuantizedTensor
 
-__all__ = ["bind", "layer_stack", "layout"]
+__all__ = [
+    "address",
+    "bind",
+    "layer_stack",
+    "layers",
+    "layout",
+    "placements",
+    "streamed",
+]
 
 # Byte alignment of every storage placed in a layer buffer.
 _ALIGNMENT = 256
@@ -163,6 +177,47 @@ def _stack(loaded, path: str):
     return projections, placements
 
 
+def layers(loaded, path: str) -> int:
+    """The number of layers of the stack under ``path``."""
+    return len(layer_stack(_module(loaded, path)))
+
+
+def address(loaded, path: str) -> int:
+    """The lowest address of the streamed matrices under ``path``.
+
+    After binding a worker's retained weights, the matrices are views of
+    the stack's retained host region, which this address lies in.
+    """
+    return min(parameter.data_ptr() for parameter in streamed(loaded, path))
+
+
+def streamed(loaded, path: str) -> list[nn.Parameter]:
+    """The projection weight matrices the stack under ``path`` streams."""
+    return [
+        parameter
+        for layer in layer_stack(_module(loaded, path))
+        for module in _projections(layer)
+        for parameter in module.parameters()
+        if parameter.ndim >= 2
+    ]
+
+
+def placements(loaded, path: str) -> list[tuple[nn.Parameter, int]]:
+    """Each streamed matrix with its byte offset in the host region.
+
+    Layer ``i``'s matrices lie in bytes ``[i * layer_bytes, (i + 1) *
+    layer_bytes)``, at their offsets in a layer buffer. Call before
+    :func:`bind`, which rebinds the matrices to the slots.
+    """
+    projections, placements = _stack(loaded, path)
+    layer_bytes = placements[0][2]
+    return [
+        (parameter, index * layer_bytes + offset)
+        for index, (parameters, _, _) in enumerate(placements)
+        for parameter, offset in parameters
+    ]
+
+
 def layout(loaded, path: str) -> list[int]:
     """The streamed stack under ``path``: ``[layers, layer_bytes]``.
 
@@ -184,6 +239,7 @@ def bind(
     path: str,
     before: Callable[..., Any],
     after: Callable[..., Any],
+    filled: bool,
     host: torch.Tensor,
     *buffers: torch.Tensor,
 ) -> None:
@@ -191,26 +247,55 @@ def bind(
 
     ``host`` is the runtime's page-locked byte region of ``layers *
     layer_bytes`` bytes (:func:`layout`) and ``buffers`` its device layer
-    buffers of ``layer_bytes`` bytes each. Every layer's projection matrices
-    are copied into its share of ``host``, and each parameter is rebound in
+    buffers of ``layer_bytes`` bytes each. Unless ``filled``, every layer's
+    projection matrices are copied into its share of ``host`` and the device
+    storage they held is released. A ``filled`` region already holds them:
+    the matrices are views of it at their :func:`placements`, as binding a
+    worker's retained weights leaves them. Each matrix is then rebound in
     place to a view of buffer ``layer % len(buffers)``: the parameter keeps
-    its identity, which operator bindings key on. The device storage the
-    matrices held is released. ``before(layer, stream)`` and ``after(layer,
-    stream)`` bracket every projection call of a layer on the calling CUDA
-    stream handle.
+    its identity, which operator bindings key on. ``before(layer, stream)``
+    and ``after(layer, stream)`` bracket every projection call of a layer on
+    the calling CUDA stream handle.
 
     Call this after loading and before any operator binds the layers'
     parameters: operators prepared earlier keep views of the released
     storage.
+
+    Raises:
+        ValueError: The region or the buffers disagree with the layout, or
+            a matrix of a filled region lies outside its layer's share.
     """
-    projections, placements = _stack(loaded, path)
-    layer_bytes = placements[0][2]
+    if filled:
+        projections = [
+            _projections(layer) for layer in layer_stack(_module(loaded, path))
+        ]
+        layer_bytes = host.numel() // len(projections)
+        base = host.data_ptr()
+        placements = []
+        for index, modules in enumerate(projections):
+            parameters = []
+            for module in modules:
+                for parameter in module.parameters():
+                    if parameter.ndim < 2:
+                        continue
+                    offset = parameter.data_ptr() - base - index * layer_bytes
+                    if not 0 <= offset < layer_bytes:
+                        raise ValueError(
+                            "a retained streamed matrix lies outside its "
+                            "layer's share of the host region"
+                        )
+                    parameters.append((parameter, offset))
+            placements.append((parameters, [], layer_bytes))
+        device = buffers[0].device
+    else:
+        projections, placements = _stack(loaded, path)
+        layer_bytes = placements[0][2]
+        device = placements[0][0][0][0].device
     if host.numel() != len(projections) * layer_bytes or any(
         buffer.numel() != layer_bytes for buffer in buffers
     ):
         raise ValueError("host weight storage disagrees with the layout")
 
-    device = placements[0][0][0][0].device
     for index, (modules, (parameters, stores, _)) in enumerate(
         zip(projections, placements, strict=True)
     ):

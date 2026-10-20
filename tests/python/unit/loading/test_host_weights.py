@@ -112,7 +112,7 @@ def test_bound_layers_compute_from_their_slots_between_the_hooks():
     def after(layer, stream):
         calls.append(("after", layer))
 
-    host_weights.bind(loaded, "body", before, after, host, *slots)
+    host_weights.bind(loaded, "body", before, after, False, host, *slots)
 
     assert torch.equal(_evaluate(loaded, value), expected)
     # Each layer's two projection calls are bracketed, in layer order.
@@ -126,3 +126,44 @@ def test_bound_layers_compute_from_their_slots_between_the_hooks():
     for index, layer in enumerate(loaded.module.body.layers):
         storage = slots[index % 5].untyped_storage().data_ptr()
         assert layer.down.weight.untyped_storage().data_ptr() == storage
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_a_filled_region_binds_the_matrices_it_holds_without_copying():
+    loaded = _loaded("cuda")
+    value = torch.randn(96, WIDTH, device="cuda", dtype=torch.bfloat16)
+    expected = _evaluate(loaded, value)
+    layers, layer_bytes = host_weights.layout(loaded, "body")
+    host = torch.empty(layers * layer_bytes, dtype=torch.uint8).pin_memory()
+
+    def slots():
+        return [
+            torch.empty(layer_bytes, dtype=torch.uint8, device="cuda")
+            for _ in range(5)
+        ]
+
+    def hooks(buffers):
+        def before(layer, stream):
+            start = layer * layer_bytes
+            buffers[layer % 5].copy_(host[start : start + layer_bytes])
+
+        return before, lambda layer, stream: None
+
+    # A model of other values whose matrices are views of the region at
+    # their places, as binding a worker's retained weights leaves them.
+    restarted = _loaded("cuda")
+    places = host_weights.placements(restarted, "body")
+    first = slots()
+    host_weights.bind(loaded, "body", *hooks(first), False, host, *first)
+    for parameter, offset in places:
+        parameter.data = torch.empty(0, dtype=parameter.dtype).set_(
+            host.untyped_storage(),
+            offset // parameter.element_size(),
+            parameter.shape,
+            parameter.stride(),
+        )
+
+    second = slots()
+    host_weights.bind(restarted, "body", *hooks(second), True, host, *second)
+    assert torch.equal(_evaluate(restarted, value), expected)
