@@ -2,7 +2,8 @@
 //! compiled-template rendering.
 //!
 //! [`load_chat_template`] and [`resolve_chat_template`] turn template files
-//! and configured values into template source. `CompiledChatTemplate` pairs
+//! and configured values into template source, failing with
+//! [`TemplateError`]. `CompiledChatTemplate` pairs
 //! one compiled MiniJinja environment with the content format resolved for it
 //! (detection lives in `format`), and `TemplateContext` is the set of global
 //! variables a render sees.
@@ -15,14 +16,39 @@ use crate::profile::assets::HfSpecialTokens;
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
+use thiserror::Error as ThisError;
 
-use super::error::TemplateError;
 use super::format::{
     ChatTemplateContentFormat, ChatTemplateContentFormatOption, detect_chat_template_content_format,
 };
 use super::tojson::hf_tojson_filter;
+use super::{TemplateMessage, TemplateTool};
 use crate::serving::chat::ReasoningEffort;
-use crate::serving::chat::template::renderer::hf::{TemplateMessage, TemplateTool};
+
+#[derive(Debug, ThisError)]
+/// Error returned while loading, detecting, or rendering a chat template.
+///
+/// `HfChatRenderer` converts these into `chat::Error::ChatTemplate` with the
+/// full error report as its message.
+pub enum TemplateError {
+    /// minijinja failed to compile or render the template.
+    #[error("failed to render jinja template")]
+    Jinja(#[from] minijinja::Error),
+    /// A template file could not be read.
+    #[error("failed to read chat template file")]
+    ReadTemplateFile(#[source] std::io::Error),
+    /// A configured template is neither an existing path nor recognizable as
+    /// inline Jinja (it contains no `{`, `}`, or newline).
+    #[error("chat template looks like a file path but does not exist")]
+    MissingTemplatePath,
+    /// A `.json` template file is not valid JSON.
+    #[error("failed to parse chat_template.json")]
+    ParseTemplateJson(#[source] serde_json::Error),
+    /// A `.json` template file is neither a JSON string nor an object with a
+    /// string `chat_template` field.
+    #[error("chat_template.json does not contain a valid template")]
+    InvalidTemplateJson,
+}
 
 type Result<T> = std::result::Result<T, TemplateError>;
 

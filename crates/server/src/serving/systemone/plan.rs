@@ -48,7 +48,7 @@ use crate::profile::diffusion_gemma::{
     ControlTokens, DiffusionGemmaProfile, ImagePlacement, ImageTokenMismatch, PatchBudget,
 };
 use crate::profile::tokenizer::{DynTokenizer, TokenizerError};
-use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
+use crate::serving::chat::template::MultimodalRenderInfo;
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatToolChoice,
     HfChatRenderer,

@@ -204,7 +204,7 @@ impl InputProcessor {
                  {prompt_len} tokens leave no room for one {canvas}-token canvas"
             )));
         }
-        let max_tokens = crate::serving::text::resolve_max_tokens(
+        let max_tokens = crate::serving::sampling::resolve_max_tokens(
             sampling.max_tokens,
             self.config.sampling_defaults.max_output_tokens,
             Some(prompt_len + room),

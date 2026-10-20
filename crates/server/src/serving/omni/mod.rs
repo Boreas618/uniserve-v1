@@ -477,7 +477,7 @@ pub(super) fn prepare_generation_resources(
     let prompt_tokens = u32::try_from(generation.prompt_token_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
     generation.max_und_tokens = if generation.decodes_text() {
-        crate::serving::text::resolve_max_tokens(
+        crate::serving::sampling::resolve_max_tokens(
             controls.max_tokens,
             processor.config.sampling_defaults.max_output_tokens,
             Some(processor.config.max_model_len),

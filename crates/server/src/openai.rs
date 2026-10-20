@@ -12,8 +12,6 @@
 pub mod chat_completions;
 pub(crate) mod error;
 pub mod images;
-/// Token log-probability response values.
-pub mod logprobs;
 mod protocol;
 pub(crate) mod video_jobs;
 pub mod videos;

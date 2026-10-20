@@ -29,10 +29,11 @@ use uniserve_core::{
     ImageGenerationConfig, ImageParams, RequestId, SamplingParams,
 };
 
-use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
+use crate::serving::chat::template::MultimodalRenderInfo;
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest, HfChatRenderer};
 use crate::serving::input::{OutputParams, PromptInput};
-use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
+use crate::serving::sampling::resolve_max_tokens;
+use crate::serving::text::TextDecodeOptions;
 use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{Result, ServeError};
 

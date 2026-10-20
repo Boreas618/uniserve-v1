@@ -10,8 +10,7 @@ use crate::serving::text::TextDecodeOptions;
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 
-use crate::serving::chat::error::{Error, Result};
-use crate::serving::chat::event::{AssistantContentBlock, AssistantMessage};
+use crate::serving::chat::{AssistantContentBlock, AssistantMessage, Error, Result};
 
 /// Role of one chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,7 +508,7 @@ mod tests {
     use serde_json::json;
 
     use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole};
-    use crate::serving::chat::event::AssistantContentBlock;
+    use crate::serving::chat::AssistantContentBlock;
 
     #[test]
     fn chat_content_deserializes_from_raw_string() {
