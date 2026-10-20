@@ -33,10 +33,10 @@ mod request;
 mod scheduler;
 
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
-pub use request::{FinishedReasonLabels, PromptTokenSourceLabels, RequestMetrics};
+pub use request::{FinishedReasonLabels, RequestMetrics};
 pub use scheduler::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics, WaitingReasonLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics,
 };
 
 /// Unsigned Prometheus counter used by metric families.

@@ -21,13 +21,11 @@ use tracing::info;
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
     EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, METRICS,
-    RequestMetrics, SchedulerMetrics, WaitingReasonLabels,
+    RequestMetrics, SchedulerMetrics,
 };
 
 use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage};
 use uniserve_core::codec::stats::SchedulerStats;
-
-const WAITING_REASON_CAPACITY: &str = "capacity";
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
 /// time.
@@ -57,17 +55,6 @@ pub(crate) fn record_scheduler_stats(
     metrics
         .scheduler_waiting
         .get_or_create(&labels)
-        .set(stats.num_waiting_reqs);
-    // `SchedulerStats` carries no per-reason breakdown, so every waiting
-    // request is published under the `capacity` reason and this family equals
-    // `scheduler_waiting`.
-    metrics
-        .scheduler_waiting_by_reason
-        .get_or_create(&WaitingReasonLabels {
-            model_name: model_name.clone(),
-            engine,
-            reason: WAITING_REASON_CAPACITY,
-        })
         .set(stats.num_waiting_reqs);
     metrics
         .prefix_cache_usage
