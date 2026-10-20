@@ -1,7 +1,7 @@
 //! Incremental assistant block assembly into the public request output.
 //!
-//! `assemble_chat_event_stream` feeds parsed assistant events into
-//! [`OutputProcessor`], which frames them as public events: text and reasoning
+//! `serving::assembly` feeds parsed assistant events into
+//! [`StructuredEventState`], which frames them as public events: text and reasoning
 //! become `OutputBlockStart`, deltas, and `OutputBlockEnd`; tool calls become
 //! `ToolCallStart`, `ToolCallArgumentsDelta`, and `ToolCallEnd`. Two index
 //! spaces are in use. Content-block indices count every closed block, tool
@@ -9,8 +9,11 @@
 //! content blocks. Tool-call indices are ordinals among tool calls only; the
 //! Chat Completions stream publishes them as the tool-call `index`.
 
+use super::AssistantEvent;
 use crate::serving::RequestOutput;
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, Error, Result};
+use crate::serving::chat::{
+    AssistantBlockKind, AssistantContentBlock, AssistantToolCall, Error, Result,
+};
 
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
@@ -41,7 +44,7 @@ struct OpenToolCall {
 /// closes an open tool call, a change of text kind closes the open text block,
 /// and a tool-call start closes whichever block is open. Deltas append to the
 /// open block until it closes or the stream terminates.
-pub(crate) struct OutputProcessor {
+pub(crate) struct StructuredEventState {
     /// Number of closed blocks, text-like and tool calls alike. The next
     /// opened text block takes this value as its content-block index.
     num_completed_blocks: usize,
@@ -53,7 +56,7 @@ pub(crate) struct OutputProcessor {
     next_tool_call_index: usize,
 }
 
-impl OutputProcessor {
+impl StructuredEventState {
     /// Creates one fresh assembly state for a new streamed response.
     pub(crate) fn new() -> Self {
         Self {
@@ -64,10 +67,26 @@ impl OutputProcessor {
         }
     }
 
+    /// Frames one parsed assistant event as public events.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ToolCallStreamInvariant` for tool-call arguments
+    /// without an open tool call.
+    pub(crate) fn push(&mut self, event: AssistantEvent) -> Result<Vec<RequestOutput>> {
+        match event {
+            AssistantEvent::TextDelta { kind, delta } => Ok(self.process_text_delta(kind, delta)),
+            AssistantEvent::ToolCallStart { id, name } => Ok(self.start_tool_call(id, name)),
+            AssistantEvent::ToolCallArgumentsDelta { delta } => {
+                self.push_tool_call_arguments(delta)
+            }
+        }
+    }
+
     /// Converts one parsed text delta into zero or more structured chat events.
     ///
     /// Any open tool call is closed first, even when `delta` is empty.
-    pub(crate) fn process_text_delta(
+    fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
         delta: String,
@@ -79,7 +98,7 @@ impl OutputProcessor {
     }
 
     /// Starts one new tool call, closing any incompatible open block first.
-    pub(crate) fn start_tool_call(&mut self, id: String, name: String) -> Vec<RequestOutput> {
+    fn start_tool_call(&mut self, id: String, name: String) -> Vec<RequestOutput> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
         self.close_open_tool_call(&mut events);
@@ -101,7 +120,7 @@ impl OutputProcessor {
     /// # Errors
     ///
     /// Returns `Error::ToolCallStreamInvariant` when no tool call is open.
-    pub(crate) fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<RequestOutput>> {
+    fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<RequestOutput>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
             return Err(Error::ToolCallStreamInvariant {
@@ -188,9 +207,11 @@ impl OutputProcessor {
         self.num_completed_blocks += 1;
         events.push(RequestOutput::ToolCallEnd {
             index: open_tool_call.index,
-            id: open_tool_call.id,
-            name: open_tool_call.name,
-            arguments: open_tool_call.arguments,
+            call: AssistantToolCall {
+                id: open_tool_call.id,
+                name: open_tool_call.name,
+                arguments: open_tool_call.arguments,
+            },
         });
     }
 }
@@ -201,11 +222,7 @@ impl OutputProcessor {
 /// by the opening and closing events.
 fn push_delta(events: &mut Vec<RequestOutput>, kind: AssistantBlockKind, text: String) {
     events.push(match kind {
-        AssistantBlockKind::Text => RequestOutput::TextDelta {
-            text,
-            token_ids: Vec::new(),
-            logprobs: None,
-        },
+        AssistantBlockKind::Text => RequestOutput::TextDelta { text },
         AssistantBlockKind::Reasoning => RequestOutput::ReasoningDelta { text },
     });
 }

@@ -1,6 +1,6 @@
 //! Serving errors: failures to resolve and tokenize a model input
-//! ([`TokenizeError`]), to interpret or assemble model output
-//! ([`OutputProcessingError`]), and the runtime's own ([`ServeError`]).
+//! ([`TokenizeError`]), and the runtime's own ([`ServeError`]), which
+//! include failures to decode or parse model output.
 
 use thiserror::Error;
 
@@ -42,26 +42,6 @@ pub enum TokenizeError {
     /// The blocking tokenization task cannot complete.
     #[error("tokenization task failed")]
     Task(#[source] tokio::task::JoinError),
-}
-
-#[derive(Debug, Error)]
-/// Failure while interpreting or assembling model output.
-pub enum OutputProcessingError {
-    /// Generated token identifiers cannot be decoded.
-    #[error(transparent)]
-    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
-    /// Structured chat output cannot be parsed or assembled.
-    #[error(transparent)]
-    Chat(#[from] crate::serving::chat::Error),
-    /// Text output cannot be decoded or collected.
-    #[error(transparent)]
-    Text(#[from] crate::serving::text::Error),
-    /// Reasoning delimiters cannot be parsed.
-    #[error(transparent)]
-    Reasoning(#[from] crate::profile::reasoning::ReasoningError),
-    /// Engine output violates a serving-layer invariant.
-    #[error("{0}")]
-    Malformed(String),
 }
 
 /// Runtime-local serving errors.
@@ -119,24 +99,14 @@ pub enum ServeError {
         #[source]
         source: TokenizeError,
     },
-    /// Engine output cannot be converted into serving events.
+    /// Engine output cannot be decoded or parsed into serving events, for
+    /// example because it violates the engine event protocol.
     #[error("request `{request_id}` output processing failed")]
     OutputProcessing {
         /// Identifier of the affected request.
         request_id: ServeRequestId,
-        /// Underlying output-processing failure.
+        /// Underlying decoding or parsing failure.
         #[source]
-        source: OutputProcessingError,
+        source: crate::serving::chat::Error,
     },
-}
-
-/// Builds an output-processing error for malformed engine output.
-pub(super) fn malformed_output(
-    request_id: impl Into<ServeRequestId>,
-    message: impl Into<String>,
-) -> ServeError {
-    ServeError::OutputProcessing {
-        request_id: request_id.into(),
-        source: OutputProcessingError::Malformed(message.into()),
-    }
 }

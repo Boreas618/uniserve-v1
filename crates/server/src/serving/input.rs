@@ -4,13 +4,13 @@
 //! [`ImageGenControls`], [`DecodeControls`]) are the protocol-neutral request
 //! vocabulary. `serving::preprocessing` lowers the OpenAI wire requests into
 //! them. `InputProcessor::preprocess_generation` consumes them and splits each
-//! request into a `GenerationRequest`, which moves into the engine, and a
-//! [`ResponseOptions`], which the frontend keeps to assemble the response
-//! stream.
+//! request into a `GenerationRequest`, which moves into the engine, and its
+//! [`OutputParams`], which the frontend keeps to decode and parse the output.
 
 use std::collections::HashMap;
 
 use crate::profile::tokenizer::DynTokenizer;
+use crate::serving::chat::ChatOutputProcessor;
 use crate::serving::text::TextDecodeOptions;
 
 /// The public prompt: the text of an image-generation request or a chat
@@ -131,18 +131,6 @@ pub struct ImageGenControls {
     pub max_images: Option<u16>,
 }
 
-/// Per-token detail included in the public output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputDetail {
-    /// Emits decoded user-visible text without token metadata.
-    #[default]
-    VisibleText,
-    /// Emits generated token identifiers in addition to visible text.
-    Tokens,
-    /// Emits generated token identifiers and candidate log probabilities.
-    Logprobs,
-}
-
 /// Decode controls applied to the response path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeControls {
@@ -162,42 +150,20 @@ impl Default for DecodeControls {
     }
 }
 
-/// Model-supplied committed-event processor selection, built by the per-model
-/// preprocessing that `InputProcessor::preprocess_generation` dispatches to.
-///
-/// `submit_and_stream` selects the response assembler (see
-/// `serving::assembly`) from this value.
-pub enum OutputProcessorPolicy {
-    /// Raw visible text.
-    None,
-    /// Chat reasoning and tool-call parsing over decoded text, selected for
-    /// the chat prompts of Qwen3 and DiffusionGemma. The processor parses
-    /// reasoning only when the server's
-    /// `reasoning_parsing` setting is on, and otherwise passes that text
-    /// through as visible text; it parses tool calls only when
-    /// `ChatRequest::tool_parsing_enabled` holds.
-    Chat(crate::serving::chat::ChatOutputProcessor),
-    /// SenseNova reasoning and visible-answer filtering over committed text.
-    SenseNova(crate::profile::omni::OutputFilterPolicy),
-}
-
-/// Tokenization resources and output requirements retained by the frontend.
-/// The corresponding generation request moves directly into the engine.
-pub struct ResponseOptions {
-    /// The model-bound tokenizer that owns decoding for this request.
+/// What the frontend keeps of a generation request to decode and parse its
+/// output once the request has moved into the engine.
+pub struct OutputParams {
+    /// The model's tokenizer.
     pub tokenizer: DynTokenizer,
-    /// Copy of the prompt token identifiers submitted to the engine, kept
-    /// because detokenization needs the prompt after the generation request
-    /// has moved into the engine.
+    /// The prompt token IDs submitted to the engine, which seed incremental
+    /// detokenization.
     pub prompt_token_ids: Vec<u32>,
-    /// Incremental detokenization behavior.
+    /// Incremental detokenization and stop strings.
     pub decode: TextDecodeOptions,
-    /// Whether generated token identifiers are included in public events.
-    pub emit_token_ids: bool,
-    /// Whether prompt log probabilities are requested.
-    pub prompt_logprobs_requested: bool,
-    /// Whether generated-token log probabilities are requested.
-    pub generated_logprobs_requested: bool,
-    /// Model-selected semantic output processor.
-    pub output_processor: OutputProcessorPolicy,
+    /// Whether prompt log-probabilities are requested.
+    pub prompt_logprobs: bool,
+    /// Whether generated-token log-probabilities are requested.
+    pub logprobs: bool,
+    /// The request's reasoning and tool-call parsers.
+    pub processor: ChatOutputProcessor,
 }

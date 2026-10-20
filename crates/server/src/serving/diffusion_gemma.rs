@@ -9,7 +9,7 @@
 //! (`DiffusionGemmaProfile::sampling`), which the engine and its ranks are
 //! launched with,
 //! and Gemma-4 parsers split its thought channel and tool calls
-//! ([`Gemma4ChatOutputProcessor`]). Token-sampling controls have no meaning
+//! (`ChatOutputProcessor::gemma4`). Token-sampling controls have no meaning
 //! for a denoised canvas, so a request that sets one is refused
 //! ([`refuse_token_sampling_controls`]).
 //!
@@ -23,11 +23,10 @@ use uniserve_core::{
 };
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
-use crate::serving::chat::{ChatOutputProcessor, ChatRequest, Gemma4ChatOutputProcessor};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
 use crate::serving::text::TextDecodeOptions;
 use crate::serving::{
-    InputProcessor, OutputProcessorPolicy, SamplingConfig, ServeError, ServeRequestId, StopConfig,
-    TokenizeError, media,
+    InputProcessor, SamplingConfig, ServeError, ServeRequestId, StopConfig, TokenizeError, media,
 };
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
@@ -168,10 +167,10 @@ impl InputProcessor {
         sampling: &SamplingConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
-    ) -> Result<OutputProcessorPolicy, TokenizeError> {
+    ) -> Result<ChatOutputProcessor, TokenizeError> {
         chat.decode_options = decode.clone();
         chat.validate()?;
-        let processor = Gemma4ChatOutputProcessor::new(
+        let processor = ChatOutputProcessor::gemma4(
             &mut chat,
             Arc::clone(&self.tokenizer),
             self.parse_reasoning,
@@ -224,9 +223,7 @@ impl InputProcessor {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().as_u64_pair().0),
         );
         decode.skip_special_tokens = chat.decode_options.skip_special_tokens;
-        Ok(OutputProcessorPolicy::Chat(ChatOutputProcessor::Gemma4(
-            processor,
-        )))
+        Ok(processor)
     }
 }
 
@@ -250,7 +247,7 @@ mod tests {
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
     use crate::serving::media::ImageFetcher;
-    use crate::serving::{FinishStatus, InputProcessor, RequestOutput, RequestRenderer};
+    use crate::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
@@ -368,8 +365,8 @@ mod tests {
         texts: Vec<String>,
         /// Token-id deltas, in order.
         token_ids: Vec<Vec<u32>>,
-        finish: FinishStatus,
-        /// Visible output tokens the usage reports.
+        finish: FinishReason,
+        /// Generated tokens the usage reports.
         tokens: u32,
     }
 
@@ -388,23 +385,17 @@ mod tests {
             (Vec::new(), Vec::new(), None, None);
         while let Some(event) = stream.next().await {
             match event.unwrap() {
-                RequestOutput::TextDelta {
-                    text,
-                    token_ids: ids,
-                    ..
-                } => {
-                    if !text.is_empty() {
-                        texts.push(text);
-                    }
-                    if !ids.is_empty() {
-                        token_ids.push(ids);
-                    }
+                RequestOutput::TextDelta { text } if !text.is_empty() => texts.push(text),
+                RequestOutput::TokenDelta { token_ids: ids, .. } if !ids.is_empty() => {
+                    token_ids.push(ids);
                 }
-                RequestOutput::Usage {
-                    visible_output_tokens,
-                    ..
-                } => usage = Some(visible_output_tokens),
-                RequestOutput::Finished { reason, .. } => finish = Some(reason),
+                RequestOutput::Finished {
+                    reason,
+                    usage: used,
+                } => {
+                    finish = Some(reason);
+                    usage = Some(used.output_tokens);
+                }
                 _ => {}
             }
         }
@@ -445,11 +436,13 @@ mod tests {
 
         assert_eq!(token_counts(&tokenizer, &reply), [16, 16, 8]);
         assert!(
-            matches!(reply.finish, FinishStatus::Stop { .. }),
+            matches!(reply.finish, FinishReason::Stop(_)),
             "{:?}",
             reply.finish
         );
-        assert_eq!(reply.tokens, TEXT_LEN as u32);
+        // The engine counts the EOS that ends the reply among its generated
+        // tokens, as OpenAI usage reports them.
+        assert_eq!(reply.tokens, TEXT_LEN as u32 + 1);
         runtime.shutdown().await.unwrap();
     }
 
@@ -460,7 +453,7 @@ mod tests {
         let reply = chat(&runtime, "truncated", 20).await;
 
         assert_eq!(token_counts(&tokenizer, &reply), [16, 4]);
-        assert_eq!(reply.finish, FinishStatus::Length);
+        assert_eq!(reply.finish, FinishReason::Length);
         assert_eq!(reply.tokens, 20);
         runtime.shutdown().await.unwrap();
     }

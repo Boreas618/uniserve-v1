@@ -1,36 +1,14 @@
 //! Text tokenization, decoding, and stream errors.
 //!
 //! `decoded_text_event_stream` reports engine-protocol violations as
-//! [`Error::MalformedOutput`], an engine admission rejection as
-//! [`Error::Rejected`], and an engine failure of the running request as
-//! [`Error::EngineFailed`]; `serving::assembly` turns the latter two into
-//! `Rejected` and `Failed` terminal events rather than output-processing
-//! failures.
+//! [`Error::MalformedOutput`]; an engine rejection or failure is a terminal
+//! event of its stream, not an error.
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 /// Text input, tokenization, decoding, or engine-stream failure.
 pub enum Error {
-    /// Admission rejected a validly framed request before model execution.
-    #[error("request `{request_id}` rejected: {message}")]
-    Rejected {
-        /// Identifier of the rejected request.
-        request_id: String,
-        /// Engine classification of the rejection.
-        kind: uniserve_core::RejectionKind,
-        /// Engine-supplied rejection detail.
-        message: String,
-    },
-    /// The engine failed the running request or could not deliver its
-    /// output (`EngineCoreOutput::Error` or `ArtifactUnavailable`).
-    #[error("text request `{request_id}` failed in the engine: {message}")]
-    EngineFailed {
-        /// Identifier of the failed request.
-        request_id: String,
-        /// Engine-supplied failure detail.
-        message: String,
-    },
     /// The tokenizer cannot encode or decode model text.
     #[error("tokenizer error: {0}")]
     Tokenizer(String),

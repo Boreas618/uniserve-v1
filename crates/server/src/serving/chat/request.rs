@@ -1,10 +1,9 @@
 //! Internal chat messages, content parts, tools, and render options.
 //!
 //! The Chat Completions preprocessing converts API requests into these types.
-//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the chat
-//! output processors (`Qwen3ChatOutputProcessor`, `Gemma4ChatOutputProcessor`)
-//! read its tool configuration to decide whether generated text is parsed for
-//! tool calls.
+//! `HfChatRenderer` renders a [`ChatRequest`] into the prompt, and the
+//! request's `ChatOutputProcessor` reads its tool configuration to decide
+//! whether generated text is parsed for tool calls.
 
 pub use crate::profile::tools::Tool;
 use crate::serving::text::TextDecodeOptions;

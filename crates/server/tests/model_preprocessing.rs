@@ -25,7 +25,7 @@ use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRend
 use uniserve_server::serving::media::{ImageFetchError, ImageFetcher, ImageInput, ImageListError};
 use uniserve_server::serving::video::VideoService;
 use uniserve_server::serving::{
-    InputProcessor, ModelResolutionError, RequestRenderer, ResponseOptions, ServeRequestId,
+    InputProcessor, ModelResolutionError, OutputParams, RequestRenderer, ServeRequestId,
     chat_image_urls,
 };
 
@@ -336,7 +336,7 @@ fn preprocess_image_chat(
     processor: &InputProcessor,
     request_id: &str,
     request: uniserve_server::openai::ChatCompletionRequest,
-) -> (GenerationRequest, ResponseOptions) {
+) -> (GenerationRequest, OutputParams) {
     let fetcher = ImageFetcher::new(&ImageFetchOptions::default()).unwrap();
     let images = resolve_images(&fetcher, chat_image_urls(&request)).unwrap();
     processor
@@ -1099,7 +1099,7 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
 
         let (logprobs, response) = preprocess(serde_json::json!({"prompt_logprobs": 0}));
         assert!(!logprobs.cache.read && logprobs.cache.write);
-        assert!(response.prompt_logprobs_requested);
+        assert!(response.prompt_logprobs);
     }
 }
 
@@ -1135,7 +1135,7 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
                 .unwrap();
 
             assert_eq!(
-                response.prompt_logprobs_requested, !stream,
+                response.prompt_logprobs, !stream,
                 "{model_type} stream={stream}"
             );
             assert_eq!(

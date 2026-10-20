@@ -12,13 +12,10 @@
 //!
 //! One decoded update from the engine becomes several events: semantic events
 //! (reasoning and text deltas, block and tool-call boundaries) followed by the
-//! update's token IDs and logprobs on a `TextDelta`. On the Qwen3 chat output
-//! path that metadata arrives as its own `TextDelta` with empty text; on the
-//! other generation paths it rides on the same `TextDelta` as the update's
-//! visible text, which may be empty. On the Qwen3 path, events flushed when
-//! generation finishes follow the final update's metadata. The streaming path
-//! relies on this order to attach metadata to the chunk of the same update and
-//! to drop the metadata of updates that contain hidden reasoning.
+//! update's `TokenDelta`. Events flushed when generation finishes follow the
+//! final update's tokens. The streaming path relies on this order to attach
+//! token metadata to the chunk of the same update and to drop the metadata of
+//! updates that contain hidden reasoning.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -49,7 +46,7 @@ use crate::openai::{
 };
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
 use crate::serving::text::DecodedLogprobs;
-use crate::serving::{FinishStatus, RequestOutput};
+use crate::serving::{FinishReason, RequestOutput, StopReason};
 
 /// The chat completions route.
 pub(crate) fn router(engine: Arc<Engine>) -> Router {
@@ -205,31 +202,6 @@ impl ChatResponseContext {
     }
 }
 
-/// Counts every generated token included in OpenAI completion usage,
-/// including tokens retained internally for reasoning or model control.
-///
-/// The sum saturates at `u32::MAX` instead of overflowing.
-fn completion_token_count(visible: u32, internal: u32) -> u32 {
-    visible.saturating_add(internal)
-}
-
-/// Converts a terminal serving event into its OpenAI representation.
-///
-/// `Cancelled` and `Aborted` become a normal `Finished` with
-/// `FinishStatus::Abort`, so the response carries `finish_reason: "abort"`.
-/// Every other event passes through unchanged.
-fn openai_terminal_event(event: RequestOutput) -> RequestOutput {
-    match event {
-        RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. } => {
-            RequestOutput::Finished {
-                reason: FinishStatus::Abort,
-                finish_detail: None,
-            }
-        }
-        event => event,
-    }
-}
-
 /// Collects a chat event stream into one non-streaming response.
 ///
 /// `context` holds the response options the request chose; `created` is the
@@ -243,10 +215,8 @@ fn openai_terminal_event(event: RequestOutput) -> RequestOutput {
 ///
 /// Returns `ApiError::rejected` for a `Rejected` event and a server error
 /// when the stream yields an error or a `Failed` event, closes without a
-/// terminal event, finishes with `FinishStatus::Error`, completes an image
-/// without an inline PNG, lacks output logprobs the response must include or
-/// prompt logprobs the request asked for, or fails to convert output
-/// logprobs.
+/// terminal event, lacks output logprobs the response must include or prompt
+/// logprobs the request asked for, or fails to convert output logprobs.
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
     context: ChatResponseContext,
@@ -266,27 +236,24 @@ pub async fn collect_chat_completion(
     let collected = collect_chat_events(stream).await?;
     let CollectedChatOutput {
         message,
-        prompt_token_count,
         prompt_token_ids,
         prompt_logprobs,
         logprobs,
         token_ids,
-        output_token_count,
         images,
-        image_count,
-        image_steps,
         image_steps_per_image,
-        finish_status,
+        reason,
+        usage,
     } = collected;
 
-    let stop_reason = finish_status_stop_reason(&finish_status);
+    let stop_reason = stop_reason_value(&reason);
     let saw_tool_calls = message.tool_calls().next().is_some();
     let reasoning = message.reasoning();
     // Output logprobs and token IDs cover the complete generated token stream.
     // When reasoning is hidden, omit them rather than leaking hidden reasoning
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
-    let finish_reason = chat_finish_status_to_openai(&finish_status, saw_tool_calls)?.to_string();
+    let finish_reason = openai_finish_reason(&reason, saw_tool_calls).to_string();
     let tool_calls = message
         .tool_calls()
         .map(|call| ToolCall {
@@ -321,10 +288,10 @@ pub async fn collect_chat_completion(
         None
     };
     let usage = Usage::new(
-        prompt_token_count as u32,
-        output_token_count as u32,
-        image_count,
-        image_steps,
+        usage.prompt_tokens,
+        usage.output_tokens,
+        usage.image_count,
+        usage.image_steps,
         image_steps_per_image,
     );
 
@@ -357,73 +324,47 @@ pub async fn collect_chat_completion(
 #[derive(Debug, Clone, PartialEq)]
 struct CollectedChatOutput {
     message: AssistantMessage,
-    /// Prompt tokens from `Accepted`, replaced by the final `Usage` count.
-    prompt_token_count: usize,
     prompt_token_ids: Vec<u32>,
     prompt_logprobs: Option<crate::serving::text::DecodedPromptLogprobs>,
-    /// Output logprobs concatenated across `TextDelta` updates; `None` when no
-    /// update carried any.
+    /// Output logprobs concatenated across `TokenDelta` updates; `None` when
+    /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
-    /// Visible plus internal generated tokens, as OpenAI usage counts them.
-    output_token_count: usize,
     images: Vec<ContentPart>,
-    image_count: u32,
-    image_steps: u32,
     /// `ImageStep` counts per completed image, in completion order. Images
     /// that began but never completed are not listed.
     image_steps_per_image: Vec<u32>,
-    finish_status: FinishStatus,
+    reason: FinishReason,
+    usage: crate::serving::RequestUsage,
 }
 
 /// Collects semantic serving events into one non-streaming chat response payload.
+///
+/// The closed content blocks and tool calls carry the complete message, so
+/// the deltas inside them are skipped.
 async fn collect_chat_events(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {
     pin_mut!(stream);
     let mut message = AssistantMessage::default();
-    let mut prompt_token_count = 0_usize;
     let mut prompt_token_ids = Vec::new();
     let mut prompt_logprobs = None;
     let mut logprobs: Option<DecodedLogprobs> = None;
     let mut token_ids = Vec::new();
-    let mut output_token_count = 0_usize;
     let mut images = Vec::new();
-    let mut image_count = 0_u32;
-    let mut image_steps = 0_u32;
-    let mut image_step_counts = HashMap::<String, u32>::new();
-    let mut completed_image_ids = Vec::<String>::new();
-    let mut finish_status = None;
-    // Structured processors finalize text through `OutputBlockEnd`, whose
-    // block carries the complete content, so deltas inside an open block are
-    // skipped. Deltas outside any block come from output processors that emit
-    // no structured blocks; they are appended after the stream ends, reasoning
-    // before text.
-    let mut loose_text = String::new();
-    let mut loose_reasoning = String::new();
-    let mut structured_text = false;
+    let mut image_step_counts = HashMap::<u32, u32>::new();
+    let mut completed_image_ids = Vec::<u32>::new();
 
     while let Some(next) = stream.next().await {
-        match next.map(openai_terminal_event) {
-            Ok(RequestOutput::Accepted {
-                prompt_token_count: accepted_prompt_token_count,
-                prompt_token_ids: accepted_prompt_token_ids,
-                prompt_logprobs: accepted_prompt_logprobs,
-                ..
-            }) => {
-                prompt_token_count = accepted_prompt_token_count;
-                prompt_token_ids = accepted_prompt_token_ids;
-                prompt_logprobs = accepted_prompt_logprobs;
+        match next {
+            Ok(RequestOutput::Accepted(prompt)) => {
+                prompt_token_ids = prompt.token_ids.to_vec();
+                prompt_logprobs = prompt.logprobs;
             }
-            Ok(RequestOutput::TextDelta {
-                text,
+            Ok(RequestOutput::TokenDelta {
                 token_ids: delta_token_ids,
                 logprobs: delta_logprobs,
-                ..
             }) => {
-                if !structured_text {
-                    loose_text.push_str(&text);
-                }
                 token_ids.extend(delta_token_ids);
                 if let Some(mut delta_logprobs) = delta_logprobs {
                     logprobs
@@ -434,75 +375,42 @@ async fn collect_chat_events(
                         .append(&mut delta_logprobs.positions);
                 }
             }
-            Ok(RequestOutput::ReasoningDelta { text, .. }) => {
-                if !structured_text {
-                    loose_reasoning.push_str(&text);
-                }
+            Ok(RequestOutput::OutputBlockEnd { block, .. }) => message.push_block(block),
+            Ok(RequestOutput::ToolCallEnd { call, .. }) => {
+                message.push_block(AssistantContentBlock::ToolCall(call));
             }
-            Ok(RequestOutput::OutputBlockStart { .. }) => structured_text = true,
-            Ok(RequestOutput::OutputBlockEnd { block, .. }) => {
-                structured_text = false;
-                message.push_block(block);
-            }
-            Ok(RequestOutput::ImageBegin { image_id, .. }) => {
-                image_step_counts.entry(image_id).or_default();
-            }
-            Ok(RequestOutput::ImageStep { image_id, .. }) => {
+            Ok(RequestOutput::ImageStep { image_id }) => {
                 *image_step_counts.entry(image_id).or_default() += 1;
             }
-            Ok(RequestOutput::ImageDone {
-                image_id,
-                pixels_png_b64,
-                ..
-            }) => {
-                let png_b64 = pixels_png_b64.ok_or_else(|| {
-                    server_error!("image completion ended without an inline PNG artifact")
-                })?;
-                images.push(image_content_part(png_b64));
-                image_step_counts.entry(image_id.clone()).or_default();
-                completed_image_ids.push(image_id);
+            Ok(RequestOutput::ImageDone(image)) => {
+                image_step_counts.entry(image.image_id).or_default();
+                completed_image_ids.push(image.image_id);
+                images.push(image_content_part(image.png_base64));
             }
-            Ok(RequestOutput::ToolCallEnd {
-                id,
-                name,
-                arguments,
-                ..
-            }) => {
-                message.push_block(AssistantContentBlock::ToolCall(
-                    crate::serving::chat::AssistantToolCall {
-                        id,
-                        name,
-                        arguments,
-                    },
-                ));
+            Ok(RequestOutput::Finished { reason, usage }) => {
+                return Ok(CollectedChatOutput {
+                    message,
+                    prompt_token_ids,
+                    prompt_logprobs,
+                    logprobs,
+                    token_ids,
+                    images,
+                    image_steps_per_image: completed_image_ids
+                        .iter()
+                        .map(|image_id| {
+                            image_step_counts.get(image_id).copied().unwrap_or_default()
+                        })
+                        .collect(),
+                    reason,
+                    usage,
+                });
             }
-            Ok(RequestOutput::Usage {
-                prompt_tokens,
-                visible_output_tokens,
-                internal_tokens,
-                image_count: generated_images,
-                image_steps: generated_steps,
-                ..
-            }) => {
-                prompt_token_count = prompt_tokens as usize;
-                output_token_count =
-                    completion_token_count(visible_output_tokens, internal_tokens) as usize;
-                image_count = generated_images;
-                image_steps = generated_steps;
-            }
-            Ok(RequestOutput::Finished { reason, .. }) => {
-                finish_status = Some(reason);
-                break;
-            }
-            Ok(RequestOutput::Rejected { kind, message, .. }) => {
+            Ok(RequestOutput::Rejected { kind, message }) => {
                 return Err(ApiError::rejected(kind, message));
             }
-            Ok(RequestOutput::Failed {
-                request_id,
-                message,
-            }) => {
+            Ok(RequestOutput::Failed { message }) => {
                 // The failure detail is logged but not returned to the client.
-                error!(%request_id, %message, "chat completion failed");
+                error!(%message, "chat completion failed");
                 bail_server_error!("Internal server error");
             }
             Ok(_) => {}
@@ -515,38 +423,9 @@ async fn collect_chat_events(
         }
     }
 
-    let Some(finish_status) = finish_status else {
-        return Err(server_error!(
-            "chat completion stream closed before terminal finish event"
-        ));
-    };
-
-    if !loose_reasoning.is_empty() {
-        message.push_block(AssistantContentBlock::Reasoning {
-            text: loose_reasoning,
-        });
-    }
-    if !loose_text.is_empty() {
-        message.push_block(AssistantContentBlock::Text { text: loose_text });
-    }
-
-    Ok(CollectedChatOutput {
-        message,
-        prompt_token_count,
-        prompt_token_ids,
-        prompt_logprobs,
-        logprobs,
-        token_ids,
-        output_token_count,
-        images,
-        image_count,
-        image_steps,
-        image_steps_per_image: completed_image_ids
-            .iter()
-            .map(|image_id| image_step_counts.get(image_id).copied().unwrap_or_default())
-            .collect(),
-        finish_status,
-    })
+    Err(server_error!(
+        "chat completion stream closed before terminal finish event"
+    ))
 }
 
 /// Converts one serving event stream into OpenAI chat-completion chunks.
@@ -566,9 +445,8 @@ async fn collect_chat_events(
 /// # Errors
 ///
 /// Yields `ApiError::rejected` for a `Rejected` event, and a server error for
-/// a stream error, a `Failed` event, a `FinishStatus::Error` finish, an image
-/// without an inline PNG, or a logprob conversion failure. The stream ends
-/// after the first error.
+/// a stream error, a `Failed` event, or a logprob conversion failure. The
+/// stream ends after the first error.
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
@@ -588,12 +466,8 @@ pub async fn chat_completion_chunk_stream(
     } = context;
     pin_mut!(stream);
     let mut saw_tool_calls = false;
-    let mut prompt_token_count = 0_usize;
-    let mut output_token_count = 0_usize;
-    let mut image_count = 0_u32;
-    let mut image_steps = 0_u32;
-    let mut image_step_counts = HashMap::<String, u32>::new();
-    let mut completed_image_ids = Vec::<String>::new();
+    let mut image_step_counts = HashMap::<u32, u32>::new();
+    let mut completed_image_ids = Vec::<u32>::new();
     // Token metadata arrives after all semantic deltas of one decoded update
     // (see the module docs). If that update contains hidden reasoning,
     // including a delimiter-only start or end of a hidden reasoning block,
@@ -606,30 +480,20 @@ pub async fn chat_completion_chunk_stream(
     let mut suppress_current_update_metadata = false;
 
     // With logprobs or token IDs requested, semantic deltas are buffered until
-    // the update's metadata `TextDelta` arrives, so one chunk carries both.
+    // the update's `TokenDelta` arrives, so one chunk carries both.
     let mut pending_chunk =
         (requested_logprobs || return_token_ids).then(PendingChatChunk::default);
 
     while let Some(next) = stream.next().await {
-        match next.map(openai_terminal_event) {
-            Ok(RequestOutput::Accepted {
-                prompt_token_count: accepted_prompt_token_count,
-                prompt_token_ids,
-                ..
-            }) => {
-                prompt_token_count = accepted_prompt_token_count;
+        match next {
+            Ok(RequestOutput::Accepted(prompt)) => {
                 let mut chunk = start_chunk(&request_id, &response_model, created);
                 if return_token_ids {
-                    chunk.prompt_token_ids = Some(prompt_token_ids);
+                    chunk.prompt_token_ids = Some(prompt.token_ids.to_vec());
                 }
                 y.yield_ok(chunk).await;
             }
-            Ok(RequestOutput::TextDelta {
-                text,
-                token_ids,
-                logprobs,
-                ..
-            }) => {
+            Ok(RequestOutput::TextDelta { text }) => {
                 if !text.is_empty() {
                     let kind = AssistantBlockKind::Text;
                     if let Some(pending_chunk) = pending_chunk.as_mut() {
@@ -640,44 +504,45 @@ pub async fn chat_completion_chunk_stream(
                         y.yield_ok(chunk).await;
                     }
                 }
-                if !token_ids.is_empty() || logprobs.is_some() {
-                    let include_metadata =
-                        !suppress_current_update_metadata && !inside_hidden_reasoning;
-                    suppress_current_update_metadata = false;
-                    let openai_logprobs = if include_metadata {
-                        logprobs
-                            .as_ref()
-                            .map(|lp| {
-                                decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids)
-                            })
-                            .transpose()?
-                    } else {
-                        None
-                    };
-                    let openai_token_ids = include_metadata
-                        .then_some(token_ids)
-                        .and_then(|token_ids| return_token_ids.then_some(token_ids))
-                        .filter(|t| !t.is_empty());
-                    if let Some(pending_chunk) = pending_chunk.as_mut() {
-                        pending_chunk.logprobs = openai_logprobs;
-                        pending_chunk.token_ids = openai_token_ids;
-                        if let Some(chunk) =
-                            pending_chunk.take_chunk(&request_id, &response_model, created)
-                        {
-                            y.yield_ok(chunk).await;
-                        }
-                    } else if let Some(logprobs) = openai_logprobs {
-                        y.yield_ok(logprobs_only_chunk(
-                            &request_id,
-                            &response_model,
-                            created,
-                            logprobs,
-                        ))
-                        .await;
+            }
+            Ok(RequestOutput::TokenDelta {
+                token_ids,
+                logprobs,
+            }) => {
+                let include_metadata =
+                    !suppress_current_update_metadata && !inside_hidden_reasoning;
+                suppress_current_update_metadata = false;
+                let openai_logprobs = if include_metadata {
+                    logprobs
+                        .as_ref()
+                        .map(|lp| decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids))
+                        .transpose()?
+                } else {
+                    None
+                };
+                let openai_token_ids = include_metadata
+                    .then_some(token_ids)
+                    .and_then(|token_ids| return_token_ids.then_some(token_ids))
+                    .filter(|t| !t.is_empty());
+                if let Some(pending_chunk) = pending_chunk.as_mut() {
+                    pending_chunk.logprobs = openai_logprobs;
+                    pending_chunk.token_ids = openai_token_ids;
+                    if let Some(chunk) =
+                        pending_chunk.take_chunk(&request_id, &response_model, created)
+                    {
+                        y.yield_ok(chunk).await;
                     }
+                } else if let Some(logprobs) = openai_logprobs {
+                    y.yield_ok(logprobs_only_chunk(
+                        &request_id,
+                        &response_model,
+                        created,
+                        logprobs,
+                    ))
+                    .await;
                 }
             }
-            Ok(RequestOutput::ReasoningDelta { text: delta, .. }) => {
+            Ok(RequestOutput::ReasoningDelta { text: delta }) => {
                 let kind = AssistantBlockKind::Reasoning;
                 let include_delta =
                     include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
@@ -751,17 +616,10 @@ pub async fn chat_completion_chunk_stream(
             Ok(RequestOutput::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
-            Ok(RequestOutput::ImageBegin { image_id, .. }) => {
-                image_step_counts.entry(image_id).or_default();
-            }
-            Ok(RequestOutput::ImageStep { image_id, .. }) => {
+            Ok(RequestOutput::ImageStep { image_id }) => {
                 *image_step_counts.entry(image_id).or_default() += 1;
             }
-            Ok(RequestOutput::ImageDone {
-                image_id,
-                pixels_png_b64,
-                ..
-            }) => {
+            Ok(RequestOutput::ImageDone(image)) => {
                 // Flush buffered deltas first so the image chunk keeps its
                 // position after the text generated before it.
                 if let Some(pending_chunk) = pending_chunk.as_mut()
@@ -770,29 +628,13 @@ pub async fn chat_completion_chunk_stream(
                 {
                     y.yield_ok(chunk).await;
                 }
-                let png_b64 = pixels_png_b64.ok_or_else(|| {
-                    server_error!("image completion ended without an inline PNG artifact")
-                })?;
-                let chunk = image_delta_chunk(&request_id, &response_model, created, png_b64);
+                let chunk =
+                    image_delta_chunk(&request_id, &response_model, created, image.png_base64);
                 y.yield_ok(chunk).await;
-                image_step_counts.entry(image_id.clone()).or_default();
-                completed_image_ids.push(image_id);
+                image_step_counts.entry(image.image_id).or_default();
+                completed_image_ids.push(image.image_id);
             }
-            Ok(RequestOutput::Usage {
-                prompt_tokens,
-                visible_output_tokens,
-                internal_tokens,
-                image_count: generated_images,
-                image_steps: generated_steps,
-                ..
-            }) => {
-                prompt_token_count = prompt_tokens as usize;
-                output_token_count =
-                    completion_token_count(visible_output_tokens, internal_tokens) as usize;
-                image_count = generated_images;
-                image_steps = generated_steps;
-            }
-            Ok(RequestOutput::Finished { reason, .. }) => {
+            Ok(RequestOutput::Finished { reason, usage }) => {
                 if let Some(pending_chunk) = pending_chunk.as_mut()
                     && let Some(chunk) =
                         pending_chunk.take_chunk(&request_id, &response_model, created)
@@ -800,22 +642,14 @@ pub async fn chat_completion_chunk_stream(
                     y.yield_ok(chunk).await;
                 }
 
-                match final_chunk(
+                y.yield_ok(final_chunk(
                     &request_id,
                     &response_model,
                     created,
                     &reason,
                     saw_tool_calls,
-                ) {
-                    Ok(chunk) => y.yield_ok(chunk).await,
-                    Err(error) => {
-                        error!(
-                            error = %error.to_error_response().error.message,
-                            "invalid terminal finish reason"
-                        );
-                        return Err(error);
-                    }
-                }
+                ))
+                .await;
 
                 if include_usage {
                     y.yield_ok(usage_chunk(
@@ -823,10 +657,10 @@ pub async fn chat_completion_chunk_stream(
                         &response_model,
                         created,
                         Usage::new(
-                            prompt_token_count as u32,
-                            output_token_count as u32,
-                            image_count,
-                            image_steps,
+                            usage.prompt_tokens,
+                            usage.output_tokens,
+                            usage.image_count,
+                            usage.image_steps,
                             completed_image_ids
                                 .iter()
                                 .map(|image_id| {
@@ -840,16 +674,13 @@ pub async fn chat_completion_chunk_stream(
 
                 return Ok(());
             }
-            Ok(RequestOutput::Rejected { kind, message, .. }) => {
+            Ok(RequestOutput::Rejected { kind, message }) => {
                 return Err(ApiError::rejected(kind, message));
             }
-            Ok(RequestOutput::Failed {
-                request_id,
-                message,
-            }) => {
+            Ok(RequestOutput::Failed { message }) => {
                 // As in `collect_chat_completion`, the failure detail is
                 // logged but not returned to the client.
-                error!(%request_id, %message, "chat completion failed");
+                error!(%message, "chat completion failed");
                 bail_server_error!("Internal server error");
             }
             Ok(_) => {}
@@ -909,7 +740,7 @@ fn image_content_part(png_b64: String) -> ContentPart {
 /// One in-flight chat-completions SSE chunk being assembled at the route layer.
 ///
 /// Serving output processing splits one decoded update into several semantic
-/// events and delivers the update's token IDs and logprobs on a `TextDelta`
+/// events and delivers the update's token IDs and logprobs on a `TokenDelta`
 /// after them (see the module docs). The OpenAI chat API, though, wants one
 /// streamed chunk to optionally carry both the delta and its logprobs.
 ///
@@ -1211,11 +1042,11 @@ fn final_chunk(
     request_id: &str,
     response_model: &str,
     created: u64,
-    finish_status: &FinishStatus,
+    reason: &FinishReason,
     saw_tool_calls: bool,
-) -> Result<ChatCompletionStreamResponse, ApiError> {
-    let stop_reason = finish_status_stop_reason(finish_status);
-    let finish_reason = chat_finish_status_to_openai(finish_status, saw_tool_calls)?;
+) -> ChatCompletionStreamResponse {
+    let stop_reason = stop_reason_value(reason);
+    let finish_reason = openai_finish_reason(reason, saw_tool_calls);
 
     debug!(
         finish_reason = %finish_reason,
@@ -1229,44 +1060,28 @@ fn final_chunk(
         stop_reason,
         ..Default::default()
     });
-    Ok(chunk)
+    chunk
 }
 
-/// Maps a finish status to the OpenAI `finish_reason` string.
+/// Maps a finish reason to the OpenAI `finish_reason` string.
 ///
 /// A stop after any tool call reports `tool_calls`, and a repetition stop
-/// reports `stop`. `FinishStatus::Error` returns a server error instead of a
-/// reason.
-fn chat_finish_status_to_openai(
-    finish_status: &FinishStatus,
-    saw_tool_calls: bool,
-) -> Result<&'static str, ApiError> {
-    match finish_status {
-        FinishStatus::Stop { .. } if saw_tool_calls => Ok("tool_calls"),
-        FinishStatus::Stop { .. } => Ok("stop"),
-        FinishStatus::Length => Ok("length"),
-        FinishStatus::Abort => Ok("abort"),
-        FinishStatus::Repetition => Ok("stop"),
-        FinishStatus::Error => {
-            bail_server_error!("Internal server error");
-        }
+/// reports `stop`.
+fn openai_finish_reason(reason: &FinishReason, saw_tool_calls: bool) -> &'static str {
+    match reason {
+        FinishReason::Stop(_) if saw_tool_calls => "tool_calls",
+        FinishReason::Stop(_) | FinishReason::Repetition => "stop",
+        reason => reason.as_str(),
     }
 }
 
 /// Returns the `stop_reason` response value: the matched stop token ID or
-/// stop string, or `None` for an EOS stop, a stop without a recorded cause,
-/// and every non-stop status.
-fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
-    match status {
-        FinishStatus::Stop { cause } => cause.as_ref().and_then(|cause| match cause {
-            crate::serving::StopCause::Eos => None,
-            crate::serving::StopCause::TokenId(id) => Some(serde_json::json!(id)),
-            crate::serving::StopCause::Text(text) => Some(serde_json::json!(text)),
-        }),
-        FinishStatus::Length
-        | FinishStatus::Abort
-        | FinishStatus::Error
-        | FinishStatus::Repetition => None,
+/// stop string, or `None` for a stop without one and every other reason.
+fn stop_reason_value(reason: &FinishReason) -> Option<Value> {
+    match reason {
+        FinishReason::Stop(Some(StopReason::Token(id))) => Some(serde_json::json!(id)),
+        FinishReason::Stop(Some(StopReason::String(text))) => Some(serde_json::json!(text)),
+        _ => None,
     }
 }
 
@@ -1278,7 +1093,7 @@ mod tests {
     use super::chat_completion_chunk_stream;
     use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
-    use crate::serving::{FinishStatus, RequestOutput};
+    use crate::serving::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
 
     /// Single-candidate logprobs for one generated token.
     fn logprobs(token_id: u32) -> Option<DecodedLogprobs> {
@@ -1294,19 +1109,16 @@ mod tests {
         })
     }
 
-    /// Serving events of a Qwen3 thinking response, in the order the chat
+    /// Serving events of a Qwen3 thinking response, in the order the
     /// assembler emits them: the update of token 10 produces reasoning, and
     /// the update of token 11 closes the reasoning block and starts the
-    /// answer before its metadata `TextDelta` arrives.
+    /// answer before its `TokenDelta` arrives.
     fn thinking_response() -> Vec<crate::serving::Result<RequestOutput>> {
         vec![
-            Ok(RequestOutput::Accepted {
-                request_id: "r".into(),
-                compile_duration_us: 0,
-                prompt_token_count: 1,
-                prompt_token_ids: vec![1],
-                prompt_logprobs: None,
-            }),
+            Ok(RequestOutput::Accepted(PromptInfo {
+                token_ids: vec![1].into(),
+                logprobs: None,
+            })),
             Ok(RequestOutput::OutputBlockStart {
                 index: 0,
                 kind: AssistantBlockKind::Reasoning,
@@ -1314,8 +1126,7 @@ mod tests {
             Ok(RequestOutput::ReasoningDelta {
                 text: "think".to_string(),
             }),
-            Ok(RequestOutput::TextDelta {
-                text: String::new(),
+            Ok(RequestOutput::TokenDelta {
                 token_ids: vec![10],
                 logprobs: logprobs(10),
             }),
@@ -1331,17 +1142,14 @@ mod tests {
             }),
             Ok(RequestOutput::TextDelta {
                 text: "Hi".to_string(),
-                token_ids: Vec::new(),
-                logprobs: None,
             }),
-            Ok(RequestOutput::TextDelta {
-                text: String::new(),
+            Ok(RequestOutput::TokenDelta {
                 token_ids: vec![11],
                 logprobs: logprobs(11),
             }),
             Ok(RequestOutput::Finished {
-                reason: FinishStatus::Stop { cause: None },
-                finish_detail: None,
+                reason: FinishReason::Stop(None),
+                usage: RequestUsage::default(),
             }),
         ]
     }

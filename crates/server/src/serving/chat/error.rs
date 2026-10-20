@@ -1,10 +1,9 @@
 //! Chat rendering, parsing, and output-processing errors.
 //!
-//! Request validation, template rendering, and the Qwen3 output-processing
-//! stages all report this one error type. `assemble_chat_event_stream` wraps
-//! output-time errors in `ServeError::OutputProcessing`, except an engine
-//! rejection or engine failure carried in [`Error::Text`], which it turns into
-//! a `Rejected` or `Failed` serving event.
+//! Request validation, template rendering, and output processing all report
+//! this one error type; output-time errors, decoding failures carried in
+//! [`Error::Text`] included, reach the caller as
+//! `ServeError::OutputProcessing`.
 
 use thiserror::Error;
 
@@ -54,7 +53,7 @@ pub enum Error {
     #[error(transparent)]
     ModelAssets(#[from] crate::profile::assets::Error),
     /// The text layer fails, for example in detokenization or engine output
-    /// validation, or reports an engine rejection or engine failure.
+    /// validation.
     #[error(transparent)]
     Text(#[from] crate::serving::text::Error),
 }

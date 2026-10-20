@@ -15,7 +15,7 @@ use crate::serving::chat::{
     ChatMessage as ServingChatMessage, ChatToolChoice,
 };
 use crate::serving::{
-    DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, PromptInput, SamplingConfig,
+    DecodeControls, ImageGenControls, ModalitySelection, PromptInput, SamplingConfig,
     ServeRequestId, StopConfig,
 };
 use itertools::Itertools as _;
@@ -86,7 +86,7 @@ impl crate::serving::InputProcessor {
     ) -> Result<
         (
             uniserve_core::GenerationRequest,
-            crate::serving::ResponseOptions,
+            crate::serving::OutputParams,
         ),
         ApiError,
     > {
@@ -96,16 +96,6 @@ impl crate::serving::InputProcessor {
         // it would score every prompt position and disable prefix-cache
         // reads for output the client never receives, so it is dropped here.
         let prompt_logprobs = request.prompt_logprobs.filter(|_| !request.stream);
-        let include_prompt_logprobs = prompt_logprobs.is_some();
-        let return_token_ids = request.return_token_ids.unwrap_or(false);
-        // Logprobs imply token IDs, so the richest requested detail wins.
-        let output = if requested_logprobs || include_prompt_logprobs {
-            OutputDetail::Logprobs
-        } else if return_token_ids {
-            OutputDetail::Tokens
-        } else {
-            OutputDetail::VisibleText
-        };
 
         // Template kwargs may not replace the variables the renderer derives
         // from the request itself.
@@ -176,7 +166,6 @@ impl crate::serving::InputProcessor {
                 ..CachePolicy::default()
             },
             request.priority.unwrap_or(0),
-            output,
             DecodeControls {
                 skip_special_tokens: request.skip_special_tokens,
                 include_stop_string_in_output: request.include_stop_str_in_output,
@@ -378,7 +367,7 @@ impl crate::serving::InputProcessor {
     ) -> Result<
         (
             uniserve_core::GenerationRequest,
-            crate::serving::ResponseOptions,
+            crate::serving::OutputParams,
         ),
         ApiError,
     > {
@@ -422,7 +411,6 @@ impl crate::serving::InputProcessor {
             }),
             CachePolicy::default(),
             0,
-            OutputDetail::VisibleText,
             DecodeControls::default(),
         )
         .map_err(crate::openai::ApiError::from)

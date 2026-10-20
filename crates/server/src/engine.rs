@@ -435,11 +435,11 @@ impl Engine {
         })?;
         let processor = Arc::clone(&self.processor);
         let id = request_id.clone();
-        let (request, response) = preprocess(&request_id, move || {
+        let (request, output) = preprocess(&request_id, move || {
             processor.preprocess_chat_request(id, request, images)
         })
         .await?;
-        self.generate(request_id, started, request, response)
+        self.generate(request_id, started, request, output)
             .map_err(ApiError::from)
     }
 
@@ -458,11 +458,11 @@ impl Engine {
         let started = Instant::now();
         let processor = Arc::clone(&self.processor);
         let id = request_id.clone();
-        let (request, response) = preprocess(&request_id, move || {
+        let (request, output) = preprocess(&request_id, move || {
             processor.preprocess_image_request(id, request)
         })
         .await?;
-        self.generate(request_id, started, request, response)
+        self.generate(request_id, started, request, output)
             .map_err(ApiError::from)
     }
 
@@ -506,17 +506,12 @@ impl Engine {
         request_id: ServeRequestId,
         started: Instant,
         request: uniserve_core::GenerationRequest,
-        response: serving::ResponseOptions,
+        output: serving::OutputParams,
     ) -> Result<RequestOutputStream, ServeError> {
-        let compile_duration_us = elapsed_us(started);
+        let compile_us = elapsed_us(started);
         let (events, rank) = self.submit(request.into())?;
-        let output = serving::generation_output(
-            request_id.clone(),
-            started,
-            compile_duration_us,
-            response,
-            events,
-        );
+        let output =
+            serving::generation_output(request_id.clone(), started, compile_us, output, events);
         Ok(self.stats(request_id, started, rank, output))
     }
 

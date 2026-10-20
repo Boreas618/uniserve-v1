@@ -17,7 +17,7 @@ use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
 use uniserve_server::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use uniserve_server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use uniserve_server::serving::media::ImageFetcher;
-use uniserve_server::serving::{FinishStatus, InputProcessor, RequestOutput, RequestRenderer};
+use uniserve_server::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
 
 /// Builds an engine over a default `SimEngine`.
 fn runtime() -> Engine {
@@ -180,8 +180,8 @@ fn successful_total_includes_time_waiting_for_preprocessing() {
         let mut stream = pending.await.unwrap();
         let mut timing = None;
         while let Some(event) = stream.next().await {
-            if let RequestOutput::Usage { timings, .. } = event.unwrap() {
-                timing = Some(timings);
+            if let RequestOutput::Finished { usage, .. } = event.unwrap() {
+                timing = Some(usage.timings);
             }
         }
         let timing = timing.unwrap();
@@ -206,18 +206,16 @@ async fn completed_request_is_recorded_in_request_metrics() {
     let mut usage = None;
     let mut finish = None;
     while let Some(event) = stream.next().await {
-        match event.unwrap() {
-            RequestOutput::Usage {
-                prompt_tokens,
-                visible_output_tokens,
-                internal_tokens,
-                ..
-            } => usage = Some((prompt_tokens, visible_output_tokens + internal_tokens)),
-            RequestOutput::Finished { reason, .. } => finish = Some(reason),
-            _ => {}
+        if let RequestOutput::Finished {
+            reason,
+            usage: used,
+        } = event.unwrap()
+        {
+            usage = Some((used.prompt_tokens, used.output_tokens));
+            finish = Some(reason);
         }
     }
-    assert_eq!(finish, Some(FinishStatus::Length));
+    assert_eq!(finish, Some(FinishReason::Length));
     let (prompt_tokens, generation_tokens) = usage.unwrap();
     assert_eq!(generation_tokens, 3);
 
@@ -258,7 +256,7 @@ async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
         .unwrap();
     loop {
         match stream.next().await.unwrap().unwrap() {
-            RequestOutput::TextDelta { text, .. } if !text.is_empty() => break,
+            RequestOutput::TextDelta { text } if !text.is_empty() => break,
             _ => {}
         }
     }

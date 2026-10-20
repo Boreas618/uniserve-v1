@@ -14,8 +14,8 @@ use uniserve_core::{
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
-    GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, encode, model_dtype_bytes,
-    required_token, required_token_id, stride_resize_tokens,
+    GenerationControls, ImageGenerationDefaults, encode, model_dtype_bytes, required_token,
+    required_token_id, stride_resize_tokens,
 };
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -33,8 +33,6 @@ pub struct BagelProfile {
     pub image_defaults: ImageGenerationDefaults,
     /// Supported image dimensions and default resolution.
     pub resolution_policy: ResolutionPolicy,
-    /// Filters applied to decoded assistant output.
-    pub output_filter: OutputFilterPolicy,
     /// Ordered encoders and their loaded cache requirements for input images.
     pub image_encoders: Vec<ImageEncoderInput>,
     /// Logical positions contributed by one input image, independently of cache tokens.
@@ -219,10 +217,6 @@ impl BagelProfile {
                 buckets: vec![default_resolution],
                 allow_custom: true,
                 max_side: Some(max_latent_size.saturating_mul(Self::LATENT_DOWNSAMPLE)),
-            },
-            output_filter: OutputFilterPolicy {
-                reasoning: None,
-                visible_wrappers: Vec::new(),
             },
             image_encoders,
             image_num_positions,

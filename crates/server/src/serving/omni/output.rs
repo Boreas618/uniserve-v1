@@ -1,37 +1,25 @@
-//! Multimodal output filters selected by model profiles.
+//! SenseNova's reasoning parser.
 //!
-//! `serving::assembly` builds a [`SenseNovaOutputProcessor`] when a SenseNova
-//! profile returns `OutputProcessorPolicy::SenseNova`, then pushes each decoded
-//! text fragment through it. The processor splits text into reasoning and
-//! visible output with a `DelimitedReasoningParser`, then strips the profile's
+//! A SenseNova profile's output filter splits text into reasoning and visible
+//! output with a `DelimitedReasoningParser`, then strips the profile's
 //! visible-wrapper delimiters from the visible part. Both stages match
 //! delimiters as text and hold back a trailing fragment that may begin a
-//! delimiter split across pushes; the assembler calls
-//! [`SenseNovaOutputProcessor::finish`] at the end of the stream to release
-//! it.
+//! delimiter split across pushes, which `finish` releases at the end of the
+//! stream. [`SenseNovaReasoningParser`] is the reasoning parser of a
+//! SenseNova request's `ChatOutputProcessor`.
 
 use crate::profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
-use crate::profile::reasoning::{DelimitedReasoningParser, ReasoningParser as _};
+use crate::profile::reasoning::{DelimitedReasoningParser, ReasoningDelta, ReasoningParser};
 use crate::profile::tokenizer::DynTokenizer;
 
-/// Stateful SenseNova reasoning and visible-wrapper filter for one request.
-pub(crate) struct SenseNovaOutputProcessor {
+/// SenseNova's reasoning and visible-wrapper filter for one request.
+pub(crate) struct SenseNovaReasoningParser {
     reasoning: Option<DelimitedReasoningParser>,
     visible_wrappers: VisibleWrapperFilter,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-/// Visible and reasoning text emitted by one filter update.
-pub(crate) struct SenseNovaTextDelta {
-    pub(crate) visible: String,
-    pub(crate) reasoning: String,
-}
-
-impl SenseNovaOutputProcessor {
-    /// Creates the output filter selected by a SenseNova profile.
-    ///
-    /// The prompt token IDs decide whether generation starts inside the
-    /// reasoning section (see `DelimitedReasoningParser::initialize`).
+impl SenseNovaReasoningParser {
+    /// Creates the parser of a SenseNova profile's output filter.
     ///
     /// # Errors
     ///
@@ -40,63 +28,70 @@ impl SenseNovaOutputProcessor {
     pub(crate) fn new(
         policy: OutputFilterPolicy,
         tokenizer: DynTokenizer,
-        prompt_token_ids: &[u32],
     ) -> crate::profile::reasoning::Result<Self> {
-        let reasoning = if let Some(reasoning) = policy.reasoning.clone() {
-            let mut parser =
-                DelimitedReasoningParser::new(tokenizer, reasoning.start, reasoning.end, false)?;
-            parser.initialize(prompt_token_ids);
-            Some(parser)
-        } else {
-            None
-        };
+        let reasoning = policy
+            .reasoning
+            .map(|reasoning| {
+                DelimitedReasoningParser::new(tokenizer, reasoning.start, reasoning.end, false)
+            })
+            .transpose()?;
         Ok(Self {
             reasoning,
             visible_wrappers: VisibleWrapperFilter::new(policy.visible_wrappers),
         })
     }
 
-    /// Applies one decoded text fragment and returns semantic deltas.
-    ///
-    /// Either part of the delta may be empty while a possible delimiter prefix
-    /// is held back until a later push or `finish` releases it.
-    pub(crate) fn push(&mut self, text: &str) -> SenseNovaTextDelta {
-        let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
-            let delta = parser.push(text);
-            (
-                delta.content.unwrap_or_default(),
-                delta.reasoning.unwrap_or_default(),
-            )
-        } else {
-            (text.to_string(), String::new())
-        };
-        SenseNovaTextDelta {
-            visible: self.visible_wrappers.push(&content),
-            reasoning,
+    /// Strips the visible wrappers from the visible part of `delta`; a held
+    /// partial wrapper delimiter is released with `release_held`.
+    fn filter(&mut self, delta: ReasoningDelta, release_held: bool) -> ReasoningDelta {
+        let mut visible = self
+            .visible_wrappers
+            .push(&delta.content.unwrap_or_default());
+        if release_held {
+            visible.push_str(&self.visible_wrappers.finish());
+        }
+        ReasoningDelta {
+            reasoning: delta.reasoning.filter(|text| !text.is_empty()),
+            content: Some(visible).filter(|text| !text.is_empty()),
+        }
+    }
+}
+
+impl ReasoningParser for SenseNovaReasoningParser {
+    /// The prompt token IDs decide whether generation starts inside the
+    /// reasoning section (see `DelimitedReasoningParser::initialize`).
+    fn initialize(&mut self, prompt_token_ids: &[u32]) {
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            reasoning.initialize(prompt_token_ids);
         }
     }
 
-    /// Releases every held-back fragment at the end of the stream.
-    ///
-    /// Call once, after the final `push`. No later text can complete a
-    /// delimiter, so a held fragment is ordinary text of its current region:
-    /// the reasoning parser's buffered partial delimiter becomes reasoning or
-    /// visible text (`DelimitedReasoningParser::finish`), visible text still
-    /// passes the wrapper filter, and the filter's held partial wrapper
-    /// delimiter is emitted as visible text.
-    pub(crate) fn finish(&mut self) -> SenseNovaTextDelta {
-        let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
-            let delta = parser.finish();
-            (
-                delta.content.unwrap_or_default(),
-                delta.reasoning.unwrap_or_default(),
-            )
-        } else {
-            (String::new(), String::new())
+    /// Either part of the delta may be empty while a possible delimiter
+    /// prefix is held back until a later push or `finish` releases it.
+    fn push(&mut self, text: &str) -> ReasoningDelta {
+        let delta = match self.reasoning.as_mut() {
+            Some(reasoning) => reasoning.push(text),
+            None => ReasoningDelta {
+                reasoning: None,
+                content: Some(text.to_owned()),
+            },
         };
-        let mut visible = self.visible_wrappers.push(&content);
-        visible.push_str(&self.visible_wrappers.finish());
-        SenseNovaTextDelta { visible, reasoning }
+        self.filter(delta, false)
+    }
+
+    /// No later text can complete a delimiter, so a held fragment is
+    /// ordinary text of its current region: the reasoning parser's buffered
+    /// partial delimiter becomes reasoning or visible text
+    /// (`DelimitedReasoningParser::finish`), visible text still passes the
+    /// wrapper filter, and the filter's held partial wrapper delimiter is
+    /// visible text.
+    fn finish(&mut self) -> ReasoningDelta {
+        let delta = self
+            .reasoning
+            .as_mut()
+            .map(|reasoning| reasoning.finish())
+            .unwrap_or_default();
+        self.filter(delta, true)
     }
 }
 

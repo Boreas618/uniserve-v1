@@ -10,7 +10,7 @@
 //!
 //! [`RequestStats`] wraps the output stream of every request an engine core
 //! accepted and records the request once into the `RequestMetrics` families:
-//! its outcome, and its token usage when its output reported final usage.
+//! its outcome, and its token usage when it finished.
 
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -24,9 +24,7 @@ use uniserve_observability::{
     RequestMetrics, SchedulerMetrics, WaitingReasonLabels,
 };
 
-use crate::serving::{
-    FinishStatus, RequestOutput, RequestOutputStream, RuntimeTimings, ServeRequestId,
-};
+use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage, ServeRequestId};
 use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
@@ -345,27 +343,16 @@ pub(crate) fn record_scheduler_stats(
         .inc_by(stats.batch_count);
 }
 
-/// Returns the `finished_reason` label value of a finish status.
-fn finished_reason_name(status: &FinishStatus) -> &'static str {
-    match status {
-        FinishStatus::Stop { .. } => "stop",
-        FinishStatus::Length => "length",
-        FinishStatus::Abort => "abort",
-        FinishStatus::Error => "error",
-        FinishStatus::Repetition => "repetition",
-    }
-}
-
 /// The output stream of one request an engine core accepted, recording the
 /// request into the request metric families once.
 ///
 /// Every event passes through unchanged. The request is recorded when its
-/// stream ends: under its finish status when it finished, under `abort` when
-/// it was cancelled or aborted or the stream was dropped before its terminal
-/// event (a client that disconnected), and under `error` when it failed, its
-/// stream yielded an error, or its stream ended without a terminal event. A
-/// rejected request, which consumed no engine work, is not recorded. The
-/// token metrics count only a request whose output reported final usage.
+/// stream ends: under its finish reason when it finished (`abort` for a
+/// cancelled or aborted request), under `abort` when the stream was dropped
+/// before its terminal event (a client that disconnected), and under `error`
+/// when it failed, its stream yielded an error, or its stream ended without a
+/// terminal event. A rejected request, which consumed no engine work, is not
+/// recorded. The token metrics count only a request that finished.
 pub(crate) struct RequestStats {
     inner: RequestOutputStream,
     labels: EngineLabels,
@@ -373,22 +360,10 @@ pub(crate) struct RequestStats {
     /// The request whose summary line is logged when it ends, when request
     /// logging is on.
     log: Option<ServeRequestId>,
-    /// Prompt and generated tokens and phase timings of the final `Usage`
-    /// event; `None` until it arrives.
-    usage: Option<Usage>,
     /// Queue time from the engine's scheduling timestamps, kept for a request
-    /// that ends before reporting usage.
+    /// that ends before it finishes.
     queue_us: Option<u64>,
     recorded: bool,
-}
-
-/// The final usage of one request.
-struct Usage {
-    prompt_tokens: u32,
-    /// Generated tokens, the visible and internal ones together, as the
-    /// engine counts its completion tokens.
-    generation_tokens: u32,
-    timings: RuntimeTimings,
 }
 
 impl RequestStats {
@@ -405,7 +380,6 @@ impl RequestStats {
             labels,
             started,
             log,
-            usage: None,
             queue_us: None,
             recorded: false,
         }
@@ -420,51 +394,29 @@ impl RequestStats {
             RequestOutput::Scheduled {
                 queued_at,
                 scheduled_at,
-                ..
             } => {
-                self.queue_us = queued_at
-                    .zip(*scheduled_at)
-                    .map(|(queued, scheduled)| ((scheduled - queued).max(0.0) * 1e6) as u64);
+                self.queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1e6) as u64);
             }
-            RequestOutput::Usage {
-                prompt_tokens,
-                visible_output_tokens,
-                internal_tokens,
-                timings,
-                ..
-            } => {
-                self.usage = Some(Usage {
-                    prompt_tokens: *prompt_tokens,
-                    generation_tokens: visible_output_tokens.saturating_add(*internal_tokens),
-                    timings: timings.clone(),
-                });
-            }
-            RequestOutput::Finished { reason, .. } => self.record(finished_reason_name(reason)),
-            RequestOutput::Cancelled { .. } | RequestOutput::Aborted { .. } => self.record("abort"),
-            RequestOutput::Failed { .. } => self.record("error"),
+            RequestOutput::Finished { reason, usage } => self.record(reason.as_str(), Some(usage)),
+            RequestOutput::Failed { .. } => self.record("error", None),
             RequestOutput::Rejected { .. } => self.recorded = true,
             _ => {}
         }
     }
 
-    /// Records the request under `finished_reason` unless it was recorded
-    /// already.
+    /// Records the request under `finished_reason`, with the usage of a
+    /// finished request, unless it was recorded already.
     ///
     /// The end-to-end latency is the larger of the reported total and the
     /// time since the request started.
-    fn record(&mut self, finished_reason: &'static str) {
+    fn record(&mut self, finished_reason: &'static str, usage: Option<&RequestUsage>) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
         let elapsed_us = self.started.elapsed().as_micros() as u64;
         let metrics = &METRICS.request;
-        let total_us = self
-            .usage
-            .as_ref()
-            .map_or(elapsed_us, |usage| usage.timings.total_us.max(elapsed_us));
-        let queue_us = self
-            .usage
-            .as_ref()
+        let total_us = usage.map_or(elapsed_us, |usage| usage.timings.total_us.max(elapsed_us));
+        let queue_us = usage
             .and_then(|usage| usage.timings.queue_us)
             .or(self.queue_us);
         metrics
@@ -485,15 +437,15 @@ impl RequestStats {
                 .get_or_create(&self.labels)
                 .observe(seconds(queue_us));
         }
-        if let Some(usage) = &self.usage {
+        if let Some(usage) = usage {
             record_usage(metrics, &self.labels, usage);
         }
         if let Some(request_id) = &self.log {
             info!(
                 %request_id,
                 finished_reason,
-                prompt_tokens = self.usage.as_ref().map_or(0, |usage| usage.prompt_tokens),
-                output_tokens = self.usage.as_ref().map_or(0, |usage| usage.generation_tokens),
+                prompt_tokens = usage.map_or(0, |usage| usage.prompt_tokens),
+                output_tokens = usage.map_or(0, |usage| usage.output_tokens),
                 latency_s = seconds(total_us),
                 "request finished"
             );
@@ -508,7 +460,7 @@ impl Stream for RequestStats {
         let next = ready!(self.inner.poll_next_unpin(cx));
         match &next {
             Some(Ok(event)) => self.observe(event),
-            Some(Err(_)) | None => self.record("error"),
+            Some(Err(_)) | None => self.record("error", None),
         }
         Poll::Ready(next)
     }
@@ -518,7 +470,7 @@ impl Drop for RequestStats {
     /// Records a request whose stream was dropped before its terminal event
     /// as aborted.
     fn drop(&mut self) {
-        self.record("abort");
+        self.record("abort", None);
     }
 }
 
@@ -529,9 +481,9 @@ impl Drop for RequestStats {
 /// measured from the request's start to its first visible output, and
 /// observed only for a request that generated tokens and produced visible
 /// output.
-fn record_usage(metrics: &RequestMetrics, labels: &EngineLabels, usage: &Usage) {
+fn record_usage(metrics: &RequestMetrics, labels: &EngineLabels, usage: &RequestUsage) {
     let prompt_tokens = u64::from(usage.prompt_tokens);
-    let generation_tokens = u64::from(usage.generation_tokens);
+    let generation_tokens = u64::from(usage.output_tokens);
 
     metrics
         .prompt_tokens

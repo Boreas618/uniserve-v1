@@ -3,7 +3,7 @@
 //! Requests follow one ownership chain:
 //! `HTTP schema -> InputProcessor -> GenerationRequest -> Engine::submit ->
 //! RequestOutput stream`. Video requests follow the same chain with a
-//! `DiffusionRequest` and `assembly::assemble_media_event_stream`.
+//! `DiffusionRequest` and [`media_output`].
 //!
 //! [`InputProcessor`] renders and tokenizes a request against the loaded
 //! model; [`generation_output`] and [`media_output`] assemble a submitted
@@ -34,32 +34,23 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::time::Instant;
 
-use asynk_strim_attr::{TryYielder, try_stream};
-use futures::{Stream, StreamExt as _};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use uniserve_core::EngineCoreOutput;
-use uniserve_engine::{EventRx, StreamCancelCause};
+use uniserve_engine::EventRx;
 
+pub use error::{ServeError, TokenizeError};
 pub use input::{
-    DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, OutputProcessorPolicy,
-    PromptInput, ResponseOptions, SamplingConfig, StopConfig,
+    DecodeControls, ImageGenControls, ModalitySelection, OutputParams, PromptInput, SamplingConfig,
+    StopConfig,
 };
 pub use media::ImageInput;
 pub use model::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub(crate) use model::{LoadedModel, LoadedRenderer};
-pub use preprocessing::chat_image_urls;
-
-use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
-use crate::serving::text::output::stop_string_holdback_bytes;
-use crate::serving::text::{
-    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, StopReason, TextDecodeOptions,
+pub use output::{
+    FinishReason, GeneratedImage, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings,
+    StopReason,
 };
-
-use assembly::{assemble_chat_event_stream, assemble_event_stream};
-
-use error::malformed_output;
-pub use error::{OutputProcessingError, ServeError, TokenizeError};
-pub use output::{FinishStatus, RequestOutput, RuntimeTimings, StopCause};
+pub use preprocessing::chat_image_urls;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -149,49 +140,18 @@ pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
 
 /// Builds the public event stream of one submitted generation request.
 ///
-/// `started` is when the request entered the server and `compile_duration_us`
-/// how long it took to reach the engine; both reach the stream's `Accepted`
-/// and `Usage` events. Chat output policies run through
-/// [`assemble_chat_event_stream`], every other policy through
-/// [`assemble_event_stream`].
+/// `started` is when the request entered the server and `compile_us` how
+/// long it took to reach the engine; both reach the terminal usage.
 pub(crate) fn generation_output(
     request_id: ServeRequestId,
     started: Instant,
-    compile_duration_us: u64,
-    response: ResponseOptions,
-    stream: EventRx,
+    compile_us: u64,
+    output: OutputParams,
+    events: EventRx,
 ) -> RequestOutputStream {
-    let ResponseOptions {
-        tokenizer,
-        prompt_token_ids,
-        decode,
-        emit_token_ids,
-        prompt_logprobs_requested,
-        generated_logprobs_requested,
-        output_processor,
-    } = response;
-    let assembly = StreamInput {
-        request_id,
-        event_context: EventContext {
-            started,
-            compile_duration_us,
-        },
-        prompt_token_ids,
-        tokenizer,
-        prompt_logprobs_requested,
-        generated_logprobs_requested,
-        emit_token_ids,
-        decode_options: decode,
-        stream,
-    };
-    match output_processor {
-        OutputProcessorPolicy::Chat(processor) => {
-            Box::pin(assemble_chat_event_stream(assembly, processor))
-        }
-        // `assemble_event_stream` applies the remaining policies as its output
-        // sink.
-        output_processor => Box::pin(assemble_event_stream(assembly, output_processor)),
-    }
+    Box::pin(assembly::generation_output(
+        request_id, started, compile_us, output, events,
+    ))
 }
 
 /// Builds the public event stream of one submitted media request, whose
@@ -199,129 +159,140 @@ pub(crate) fn generation_output(
 pub(crate) fn media_output(
     request_id: ServeRequestId,
     started: Instant,
-    compile_duration_us: u64,
+    compile_us: u64,
     prompt_tokens: usize,
-    stream: EventRx,
+    events: EventRx,
 ) -> RequestOutputStream {
-    Box::pin(assembly::assemble_media_event_stream(
+    Box::pin(assembly::media_output(
         request_id,
-        EventContext {
-            started,
-            compile_duration_us,
-        },
+        started,
+        compile_us,
         prompt_tokens,
-        stream,
+        events,
     ))
-}
-
-/// Request-scoped metadata the assemblers stamp onto public events and usage.
-#[derive(Debug, Clone)]
-struct EventContext {
-    started: Instant,
-    compile_duration_us: u64,
-}
-
-/// Engine receiver and the response options a generation assembler consumes.
-struct StreamInput {
-    request_id: ServeRequestId,
-    event_context: EventContext,
-    prompt_token_ids: Vec<u32>,
-    tokenizer: crate::profile::tokenizer::DynTokenizer,
-    prompt_logprobs_requested: bool,
-    generated_logprobs_requested: bool,
-    emit_token_ids: bool,
-    decode_options: TextDecodeOptions,
-    stream: EventRx,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use uniserve_core::TokenLogprob;
+    use futures::StreamExt as _;
+    use uniserve_core::{EngineCoreOutput, TokenLogprob};
     use uniserve_engine::EventRx;
 
-    fn event_context() -> EventContext {
-        EventContext {
-            started: Instant::now(),
-            compile_duration_us: 7,
-        }
+    use super::*;
+    use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
+    use crate::serving::text::TextDecodeOptions;
+
+    /// The output of a request whose prompt is `p`, decoded and parsed as
+    /// `processor` does, over the engine events `events`.
+    fn output(
+        processor: ChatOutputProcessor,
+        decode: TextDecodeOptions,
+        logprobs: bool,
+        events: EventRx,
+    ) -> RequestOutputStream {
+        generation_output(
+            "request".into(),
+            Instant::now(),
+            7,
+            OutputParams {
+                tokenizer: crate::serving::test_support::configured_tokenizer(),
+                prompt_token_ids: vec![u32::from(b'p')],
+                decode,
+                prompt_logprobs: false,
+                logprobs,
+                processor,
+            },
+            events,
+        )
     }
 
-    #[tokio::test]
-    async fn assembler_attaches_ranked_logprobs_to_text_delta() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
+    /// An engine stream of `events` after the request's scheduling.
+    fn engine_events(events: impl IntoIterator<Item = EngineCoreOutput>) -> EventRx {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         tx.try_send(EngineCoreOutput::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-        tx.try_send(EngineCoreOutput::TextToken {
-            id: b'a' as u32,
-            logprob: Some(-0.25),
-        })
-        .unwrap();
-        tx.try_send(EngineCoreOutput::TokenLogprobs {
-            id: b'a' as u32,
-            candidates: vec![TokenLogprob {
-                token_id: b'a' as u32,
-                logprob: -0.25,
-                rank: 3,
-            }],
-        })
-        .unwrap();
-        tx.try_send(EngineCoreOutput::Finished {
-            reason: uniserve_core::FinishReason::MaxTokens,
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        EventRx::from_receiver(rx)
+    }
+
+    fn text_token(byte: u8) -> EngineCoreOutput {
+        EngineCoreOutput::TextToken {
+            id: u32::from(byte),
+            logprob: None,
+        }
+    }
+
+    fn finished(reason: uniserve_core::FinishReason, completion_tokens: usize) -> EngineCoreOutput {
+        EngineCoreOutput::Finished {
+            reason,
             stop_reason: None,
             prompt_tokens: 1,
-            completion_tokens: 1,
+            completion_tokens,
             images: 0,
-        })
-        .unwrap();
-        drop(tx);
+        }
+    }
 
-        let events = assemble_event_stream(
-            StreamInput {
-                request_id: "req".into(),
-                event_context: event_context(),
-                prompt_token_ids: vec![b'p' as u32],
-                tokenizer,
-                prompt_logprobs_requested: false,
-                generated_logprobs_requested: true,
-                emit_token_ids: true,
-                decode_options: TextDecodeOptions::default(),
-                stream: EventRx::from_receiver(rx),
+    /// The visible text of `outputs`.
+    fn text(outputs: &[Result<RequestOutput>]) -> String {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                Ok(RequestOutput::TextDelta { text }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn token_deltas_carry_ranked_logprobs() {
+        let events = engine_events([
+            text_token(b'a'),
+            EngineCoreOutput::TokenLogprobs {
+                id: u32::from(b'a'),
+                candidates: vec![TokenLogprob {
+                    token_id: u32::from(b'a'),
+                    logprob: -0.25,
+                    rank: 3,
+                }],
             },
-            OutputProcessorPolicy::None,
+            finished(uniserve_core::FinishReason::MaxTokens, 1),
+        ]);
+        let outputs = output(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            true,
+            events,
         )
         .collect::<Vec<_>>()
         .await;
 
-        let delta = events
+        assert_eq!(text(&outputs), "a");
+        let (token_ids, logprobs) = outputs
             .iter()
-            .find_map(|event| match event {
-                Ok(RequestOutput::TextDelta {
-                    text,
+            .find_map(|output| match output {
+                Ok(RequestOutput::TokenDelta {
                     token_ids,
                     logprobs,
-                    ..
-                }) => Some((text, token_ids, logprobs.as_ref())),
+                }) => Some((token_ids, logprobs.as_ref())),
                 _ => None,
             })
-            .expect("text delta");
-        assert_eq!(delta.0, "a");
-        assert_eq!(delta.1, &[b'a' as u32]);
-        let candidate = &delta.2.expect("decoded logprobs").positions[0].entries[0];
-        assert_eq!(candidate.token_id, b'a' as u32);
-        assert_eq!(candidate.rank, 3);
-        assert!(events.iter().all(std::result::Result::is_ok));
+            .expect("a token delta");
+        assert_eq!(token_ids, &[u32::from(b'a')]);
+        let candidate = &logprobs.expect("decoded logprobs").positions[0].entries[0];
+        assert_eq!((candidate.token_id, candidate.rank), (u32::from(b'a'), 3));
         assert!(matches!(
-            events.last(),
+            outputs.last(),
             Some(Ok(RequestOutput::Finished {
-                reason: FinishStatus::Length,
-                ..
+                reason: FinishReason::Length,
+                usage: RequestUsage {
+                    output_tokens: 1,
+                    ..
+                },
             }))
         ));
     }
@@ -330,65 +301,35 @@ mod tests {
     /// withholds an EOS or excluded stop token, and image-only generation
     /// publishes none) returns no text. The prompt seeds decoding only.
     #[tokio::test]
-    async fn assembler_emits_no_text_when_no_token_was_generated() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(EngineCoreOutput::Scheduled {
-            queued_at: 1.0,
-            scheduled_at: 2.0,
-        })
-        .unwrap();
-        tx.try_send(EngineCoreOutput::Finished {
-            reason: uniserve_core::FinishReason::Eos,
-            stop_reason: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            images: 0,
-        })
-        .unwrap();
-        drop(tx);
-
-        let events = assemble_event_stream(
-            StreamInput {
-                request_id: "eos-first".into(),
-                event_context: event_context(),
-                prompt_token_ids: vec![b'p' as u32],
-                tokenizer,
-                prompt_logprobs_requested: false,
-                generated_logprobs_requested: false,
-                emit_token_ids: false,
-                decode_options: TextDecodeOptions::default(),
-                stream: EventRx::from_receiver(rx),
-            },
-            OutputProcessorPolicy::None,
+    async fn a_request_without_generated_tokens_has_no_text() {
+        let events = engine_events([finished(uniserve_core::FinishReason::Eos, 1)]);
+        let outputs = output(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            false,
+            events,
         )
         .collect::<Vec<_>>()
         .await;
 
-        assert!(events.iter().all(std::result::Result::is_ok));
-        let text: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Ok(RequestOutput::TextDelta { text, .. }) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "");
+        assert!(outputs.iter().all(std::result::Result::is_ok));
+        assert_eq!(text(&outputs), "");
         assert!(matches!(
-            events.last(),
+            outputs.last(),
             Some(Ok(RequestOutput::Finished {
-                reason: FinishStatus::Stop { .. },
+                reason: FinishReason::Stop(None),
                 ..
             }))
         ));
     }
 
-    /// SenseNova filtering holds back a trailing fragment that could begin a
-    /// `<think>`, `</think>`, `<answer>` or `</answer>` delimiter. At the end of
-    /// the stream no delimiter can complete, so the held fragment is visible
-    /// text, whether the engine finished the request or a stop string did.
+    /// SenseNova's parser holds back a trailing fragment that could begin a
+    /// `<think>`, `</think>`, `<answer>` or `</answer>` delimiter. At the end
+    /// of the stream no delimiter can complete, so the held fragment is
+    /// visible text, whether the engine finished the request or a stop string
+    /// did.
     #[tokio::test]
-    async fn sensenova_assembler_releases_a_trailing_delimiter_prefix_at_the_end() {
+    async fn sensenova_releases_a_trailing_delimiter_prefix_at_the_end() {
         let policy = crate::profile::omni::OutputFilterPolicy {
             reasoning: Some(crate::profile::omni::DelimitedTextPolicy {
                 start: "<think>".to_string(),
@@ -399,298 +340,174 @@ mod tests {
                 end: "</answer>".to_string(),
             }],
         };
-        let text_token = |byte: u8| EngineCoreOutput::TextToken {
-            id: u32::from(byte),
-            logprob: None,
-        };
-        let finished = EngineCoreOutput::Finished {
-            reason: uniserve_core::FinishReason::MaxTokens,
-            stop_reason: None,
-            prompt_tokens: 1,
-            completion_tokens: 3,
-            images: 0,
-        };
         let cases = [
             (
-                "engine-finished",
                 vec![
                     text_token(b'x'),
                     text_token(b' '),
                     text_token(b'<'),
-                    finished,
+                    finished(uniserve_core::FinishReason::MaxTokens, 3),
                 ],
                 None,
                 "x <",
             ),
             (
-                "stop-string",
                 vec![text_token(b'x'), text_token(b'<'), text_token(b'!')],
                 Some(vec!["!".to_string()]),
                 "x<",
             ),
         ];
 
-        for (request_id, events, stop_strings, expected) in cases {
-            let (tx, rx) = tokio::sync::mpsc::channel(8);
-            tx.try_send(EngineCoreOutput::Scheduled {
-                queued_at: 1.0,
-                scheduled_at: 2.0,
-            })
+        for (events, stop_strings, expected) in cases {
+            let parser = crate::serving::omni::SenseNovaReasoningParser::new(
+                policy.clone(),
+                crate::serving::test_support::configured_tokenizer(),
+            )
             .unwrap();
-            for event in events {
-                tx.try_send(event).unwrap();
-            }
-            drop(tx);
-
-            let outputs = assemble_event_stream(
-                StreamInput {
-                    request_id: request_id.into(),
-                    event_context: event_context(),
-                    prompt_token_ids: vec![b'p' as u32],
-                    tokenizer: crate::serving::test_support::configured_tokenizer(),
-                    prompt_logprobs_requested: false,
-                    generated_logprobs_requested: false,
-                    emit_token_ids: false,
-                    decode_options: TextDecodeOptions {
-                        stop_strings,
-                        ..TextDecodeOptions::default()
-                    },
-                    stream: EventRx::from_receiver(rx),
+            let outputs = output(
+                ChatOutputProcessor::new(Some(Box::new(parser)), None),
+                TextDecodeOptions {
+                    stop_strings,
+                    ..TextDecodeOptions::default()
                 },
-                OutputProcessorPolicy::SenseNova(policy.clone()),
+                false,
+                engine_events(events),
             )
             .collect::<Vec<_>>()
             .await;
 
-            assert!(
-                outputs.iter().all(std::result::Result::is_ok),
-                "{request_id}"
-            );
-            let visible: String = outputs
-                .iter()
-                .filter_map(|output| match output {
-                    Ok(RequestOutput::TextDelta { text, .. }) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(visible, expected, "{request_id}");
-            assert!(
-                matches!(outputs.last(), Some(Ok(RequestOutput::Finished { .. }))),
-                "{request_id}"
-            );
+            assert!(outputs.iter().all(std::result::Result::is_ok), "{expected}");
+            assert_eq!(text(&outputs), expected);
+            assert!(matches!(
+                outputs.last(),
+                Some(Ok(RequestOutput::Finished { .. }))
+            ));
         }
     }
 
-    /// An engine failure of a running request (`Error`, or `ArtifactUnavailable`
-    /// when its output cannot be delivered) is a `Failed` terminal carrying the
-    /// engine message on every generation assembler, including the Qwen3 chat
-    /// assembler, rather than an output-processing error.
+    /// An engine failure of a running request (`Error`, or
+    /// `ArtifactUnavailable` when its output cannot be delivered) is a
+    /// `Failed` terminal carrying the engine message rather than an
+    /// output-processing error.
     #[tokio::test]
-    async fn assemblers_report_an_engine_failure_as_a_failed_terminal() {
-        let failures = [
+    async fn an_engine_failure_is_a_failed_terminal() {
+        for failure in [
             EngineCoreOutput::Error {
                 message: "worker call failed".to_string(),
             },
             EngineCoreOutput::ArtifactUnavailable {
                 message: "worker call failed".to_string(),
             },
-        ];
-        for chat in [false, true] {
-            for failure in failures.clone() {
-                let tokenizer = crate::serving::test_support::configured_tokenizer();
-                let (tx, rx) = tokio::sync::mpsc::channel(8);
-                tx.try_send(EngineCoreOutput::Scheduled {
-                    queued_at: 1.0,
-                    scheduled_at: 2.0,
-                })
-                .unwrap();
-                tx.try_send(EngineCoreOutput::TextToken {
-                    id: b'a' as u32,
-                    logprob: None,
-                })
-                .unwrap();
-                tx.try_send(failure).unwrap();
-                drop(tx);
+        ] {
+            let outputs = output(
+                ChatOutputProcessor::default(),
+                TextDecodeOptions::default(),
+                false,
+                engine_events([text_token(b'a'), failure]),
+            )
+            .collect::<Vec<_>>()
+            .await;
 
-                let input = StreamInput {
-                    request_id: "engine-failure".into(),
-                    event_context: event_context(),
-                    prompt_token_ids: vec![b'p' as u32],
-                    tokenizer: Arc::clone(&tokenizer),
-                    prompt_logprobs_requested: false,
-                    generated_logprobs_requested: false,
-                    emit_token_ids: false,
-                    decode_options: TextDecodeOptions::default(),
-                    stream: EventRx::from_receiver(rx),
-                };
-                let events = if chat {
-                    let processor = crate::serving::chat::Qwen3ChatOutputProcessor::new(
-                        &mut crate::serving::chat::ChatRequest::for_test(),
-                        tokenizer,
-                        true,
-                    )
-                    .unwrap();
-                    // Boxed like the runtime boxes it, since the chat pipeline
-                    // is a large future.
-                    Box::pin(assemble_chat_event_stream(
-                        input,
-                        crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
-                    ))
-                    .collect::<Vec<_>>()
-                    .await
-                } else {
-                    assemble_event_stream(input, OutputProcessorPolicy::None)
-                        .collect::<Vec<_>>()
-                        .await
-                };
-
-                assert!(
-                    events.iter().all(std::result::Result::is_ok),
-                    "chat={chat}: {:?}",
-                    events.last()
-                );
-                assert!(
-                    matches!(
-                        events.last(),
-                        Some(Ok(RequestOutput::Failed { message, .. }))
-                            if message == "worker call failed"
-                    ),
-                    "chat={chat}: {:?}",
-                    events.last()
-                );
-            }
+            assert!(
+                matches!(
+                    outputs.last(),
+                    Some(Ok(RequestOutput::Failed { message })) if message == "worker call failed"
+                ),
+                "{:?}",
+                outputs.last()
+            );
         }
     }
 
-    /// Tokens committed together reach the chat stream as one text delta per block, and a
-    /// stop string inside a block ends the output at the match with the tokens through the
-    /// one that completed it.
+    /// Tokens committed together reach the stream as one text delta per
+    /// block, and a stop string inside a block ends the output at the match
+    /// with the tokens through the one that completed it.
     #[tokio::test]
-    async fn chat_output_publishes_each_committed_block_as_one_delta() {
+    async fn each_committed_block_is_one_delta() {
         let block = |text: &str| EngineCoreOutput::TextTokens {
             ids: text.bytes().map(u32::from).collect(),
         };
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(EngineCoreOutput::Scheduled {
-            queued_at: 1.0,
-            scheduled_at: 2.0,
-        })
-        .unwrap();
-        tx.try_send(block("first block, ")).unwrap();
-        tx.try_send(block("second one. END and more")).unwrap();
-        tx.try_send(block("never decoded")).unwrap();
-        drop(tx);
-
-        let mut request = crate::serving::chat::ChatRequest::for_test();
+        let mut request = ChatRequest::for_test();
         request.decode_options.stop_strings = Some(vec!["END".to_string()]);
-        let decode_options = request.decode_options.clone();
-        let processor = crate::serving::chat::Qwen3ChatOutputProcessor::new(
-            &mut request,
-            Arc::clone(&tokenizer),
+        let processor = ChatOutputProcessor::qwen3(
+            &request,
+            crate::serving::test_support::configured_tokenizer(),
             true,
         )
         .unwrap();
-        let input = StreamInput {
-            request_id: "canvas-blocks".into(),
-            event_context: event_context(),
-            prompt_token_ids: vec![b'p' as u32],
-            tokenizer,
-            prompt_logprobs_requested: false,
-            generated_logprobs_requested: false,
-            emit_token_ids: false,
-            decode_options,
-            stream: EventRx::from_receiver(rx),
-        };
-        let events = Box::pin(assemble_chat_event_stream(
-            input,
-            crate::serving::chat::ChatOutputProcessor::Qwen3(processor),
-        ))
+        let outputs = output(
+            processor,
+            request.decode_options.clone(),
+            false,
+            engine_events([
+                block("first block, "),
+                block("second one. END and more"),
+                block("never decoded"),
+            ]),
+        )
         .collect::<Vec<_>>()
         .await;
 
-        assert!(events.iter().all(std::result::Result::is_ok), "{events:?}");
-        let texts: Vec<_> = events
+        assert!(
+            outputs.iter().all(std::result::Result::is_ok),
+            "{outputs:?}"
+        );
+        let texts: Vec<_> = outputs
             .iter()
-            .filter_map(|event| match event {
-                Ok(RequestOutput::TextDelta { text, .. }) if !text.is_empty() => {
-                    Some(text.as_str())
-                }
+            .filter_map(|output| match output {
+                Ok(RequestOutput::TextDelta { text }) => Some(text.as_str()),
                 _ => None,
             })
             .collect();
         // The decoder holds back two bytes, one less than the stop string,
         // until the next block rules a match in or out.
         assert_eq!(texts, vec!["first block", ", second one. "]);
-        let usage = events.iter().find_map(|event| match event {
-            Ok(RequestOutput::Usage {
-                visible_output_tokens,
-                ..
-            }) => Some(*visible_output_tokens),
-            _ => None,
-        });
         // The first block and the second through the `D` that completes `END`.
-        assert_eq!(usage, Some(13 + 15));
         assert!(
             matches!(
-                events.last(),
+                outputs.last(),
                 Some(Ok(RequestOutput::Finished {
-                    reason: FinishStatus::Stop { .. },
-                    ..
-                }))
+                    reason: FinishReason::Stop(Some(StopReason::String(stop))),
+                    usage: RequestUsage { output_tokens: 28, .. },
+                })) if stop == "END"
             ),
             "{:?}",
-            events.last()
+            outputs.last()
         );
     }
 
-    /// Committed image events are held back and published immediately before the next text
-    /// token (or before a terminal event or the end of the engine stream), so they stay
-    /// ordered ahead of that token.
+    /// A completed image is held back and published immediately before the
+    /// next text token (or the terminal event), so it stays ordered ahead of
+    /// that token.
     #[tokio::test]
-    async fn assembler_publishes_an_image_with_its_next_text_token() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
+    async fn an_image_is_published_with_its_next_text_token() {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tx.try_send(EngineCoreOutput::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-
-        let events = assemble_event_stream(
-            StreamInput {
-                request_id: "feedback-output".into(),
-                event_context: event_context(),
-                prompt_token_ids: vec![b'p' as u32],
-                tokenizer,
-                prompt_logprobs_requested: false,
-                generated_logprobs_requested: false,
-                emit_token_ids: false,
-                decode_options: TextDecodeOptions::default(),
-                stream: EventRx::from_receiver(rx),
-            },
-            OutputProcessorPolicy::None,
+        let outputs = output(
+            ChatOutputProcessor::default(),
+            TextDecodeOptions::default(),
+            false,
+            EventRx::from_receiver(rx),
         );
-        tokio::pin!(events);
+        tokio::pin!(outputs);
         assert!(matches!(
-            events.next().await,
-            Some(Ok(RequestOutput::Accepted { .. }))
+            outputs.next().await,
+            Some(Ok(RequestOutput::Accepted(_)))
         ));
         assert!(matches!(
-            events.next().await,
+            outputs.next().await,
             Some(Ok(RequestOutput::Scheduled { .. }))
         ));
 
-        tx.send(EngineCoreOutput::TextToken {
-            id: b'a' as u32,
-            logprob: None,
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            events.next().await,
-            Some(Ok(RequestOutput::TextDelta { text, .. })) if text == "a"
-        ));
+        tx.send(text_token(b'a')).await.unwrap();
+        while !matches!(
+            outputs.next().await,
+            Some(Ok(RequestOutput::TokenDelta { .. }))
+        ) {}
 
         tx.send(EngineCoreOutput::ImageCommit { image_id: 0 })
             .await
@@ -705,25 +522,19 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), events.next())
+            tokio::time::timeout(std::time::Duration::from_millis(20), outputs.next())
                 .await
                 .is_err(),
             "the image became public before a continuation token arrived"
         );
 
-        tx.send(EngineCoreOutput::TextToken {
-            id: b'b' as u32,
-            logprob: None,
-        })
-        .await
-        .unwrap();
+        tx.send(text_token(b'b')).await.unwrap();
         assert!(matches!(
-            events.next().await,
-            Some(Ok(RequestOutput::ImageCommit { .. }))
-        ));
-        assert!(matches!(
-            events.next().await,
-            Some(Ok(RequestOutput::ImageDone { .. }))
+            outputs.next().await,
+            Some(Ok(RequestOutput::ImageDone(GeneratedImage {
+                image_id: 0,
+                ..
+            })))
         ));
     }
 }

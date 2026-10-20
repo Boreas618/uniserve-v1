@@ -32,12 +32,13 @@ use uniserve_core::{
 };
 
 use crate::profile::tokenizer::DynTokenizer;
+use crate::serving::chat::ChatOutputProcessor;
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
-use crate::serving::input::{ModalitySelection, OutputProcessorPolicy, PromptInput};
+use crate::serving::input::{ModalitySelection, PromptInput};
 
-pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
+pub(crate) use output::SenseNovaReasoningParser;
 
 type OmniResult<T> = std::result::Result<T, OmniError>;
 
@@ -116,7 +117,7 @@ pub(super) fn preprocess_sensenova(
     negative_text: Option<String>,
     image_gen: Option<crate::serving::ImageGenControls>,
     generation: &mut GenerationRequest,
-) -> OmniResult<OutputProcessorPolicy> {
+) -> OmniResult<ChatOutputProcessor> {
     let (prompt_token_ids, images) = sensenova_prompt(
         profile,
         &processor.tokenizer,
@@ -129,6 +130,15 @@ pub(super) fn preprocess_sensenova(
         generation.constraint,
     )?;
     validate_prompt(&prompt_token_ids)?;
+    let reasoning = SenseNovaReasoningParser::new(
+        profile.output_filter.clone(),
+        std::sync::Arc::clone(&processor.tokenizer),
+    )
+    .map_err(|error| crate::serving::chat::Error::ParserInitialization {
+        kind: "reasoning",
+        name: "sensenova".to_owned(),
+        error: Box::new(error),
+    })?;
 
     let negative_prompt_token_ids = profile
         .render_negative_prompt_ids(&processor.tokenizer, negative_text.as_deref().unwrap_or(""))
@@ -167,17 +177,14 @@ pub(super) fn preprocess_sensenova(
     generation.image = image;
     generation.max_images = max_images;
     generation.image_generation = policy;
-    Ok(OutputProcessorPolicy::SenseNova(
-        profile.output_filter.clone(),
-    ))
+    Ok(ChatOutputProcessor::new(Some(Box::new(reasoning)), None))
 }
 
 /// Fills the Bagel prompt, image inputs, and image-generation parameters.
 ///
 /// The negative prompt and image parameters resolve as [`preprocess_sensenova`]
-/// does. On error `generation` is left unmodified. The returned policy is
-/// always `OutputProcessorPolicy::None`, so Bagel text is emitted without
-/// output filtering.
+/// does. On error `generation` is left unmodified. Bagel output has no
+/// reasoning or tool-call parser.
 ///
 /// # Errors
 ///
@@ -195,7 +202,7 @@ pub(super) fn preprocess_bagel(
     negative_text: Option<String>,
     image_gen: Option<crate::serving::ImageGenControls>,
     generation: &mut GenerationRequest,
-) -> OmniResult<OutputProcessorPolicy> {
+) -> OmniResult<ChatOutputProcessor> {
     let (prompt_token_ids, images) = bagel_prompt(
         profile,
         &processor.tokenizer,
@@ -238,7 +245,7 @@ pub(super) fn preprocess_bagel(
     generation.image = image;
     generation.max_images = max_images;
     generation.image_generation = policy;
-    Ok(OutputProcessorPolicy::None)
+    Ok(ChatOutputProcessor::default())
 }
 
 /// Renders a SenseNova text or chat prompt and resolves positioned input images.

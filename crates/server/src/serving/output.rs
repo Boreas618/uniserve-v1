@@ -1,91 +1,169 @@
-//! The events of a serving stream ([`RequestOutput`]) with their terminal
-//! status and stop cause, and the timings they carry.
+//! The events of a serving stream ([`RequestOutput`]), why a request
+//! finished ([`FinishReason`]), and what it consumed ([`RequestUsage`]).
 
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use super::ServeRequestId;
-use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
-use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs, FinishReason, StopReason};
+use uniserve_core::{ArtifactEvent, RejectionKind};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-/// Queue, execution, and end-to-end duration totals.
+pub use uniserve_core::StopReason;
+
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantToolCall};
+use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs};
+
+/// The prompt the engine generates from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptInfo {
+    /// Prompt token IDs submitted to the engine.
+    pub token_ids: Arc<[u32]>,
+    /// Per-position prompt log-probabilities, when requested.
+    pub logprobs: Option<DecodedPromptLogprobs>,
+}
+
+/// Why a request finished, in vLLM's vocabulary.
+///
+/// A request the engine fails ends with [`RequestOutput::Failed`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// A normal stop: an end-of-sequence token, a stop token or string, or
+    /// the end of the model's own output. Carries the stop token or string
+    /// that matched, when one did.
+    Stop(Option<StopReason>),
+    /// The generation-length limit.
+    Length,
+    /// The request was cancelled or aborted before it finished.
+    Abort,
+    /// Repetition detection ended generation.
+    Repetition,
+}
+
+impl FinishReason {
+    /// Maps the engine's finish reason and stop cause; `None` for an engine
+    /// error, which fails the request.
+    pub fn from_engine(
+        reason: uniserve_core::FinishReason,
+        stop_reason: Option<StopReason>,
+    ) -> Option<Self> {
+        use uniserve_core::FinishReason as Engine;
+        Some(match reason {
+            Engine::Completed | Engine::Eos | Engine::Stop | Engine::ImageDone => {
+                Self::Stop(stop_reason)
+            }
+            Engine::MaxTokens => Self::Length,
+            Engine::Cancelled | Engine::Aborted => Self::Abort,
+            Engine::Repetition => Self::Repetition,
+            Engine::Error => return None,
+        })
+    }
+
+    /// The reason's name: `stop`, `length`, `abort`, or `repetition`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stop(_) => "stop",
+            Self::Length => "length",
+            Self::Abort => "abort",
+            Self::Repetition => "repetition",
+        }
+    }
+}
+
+/// Phase durations of one request, in microseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeTimings {
-    /// Request validation and tokenization duration in microseconds, including time queued
-    /// for the blocking pool.
+    /// Request validation and tokenization, including time queued for the
+    /// blocking pool.
     pub compile_us: u64,
-    /// Queue duration in microseconds, when scheduling timestamps are available.
+    /// Time in the engine's waiting queue, from its scheduling timestamps.
     pub queue_us: Option<u64>,
-    /// Time from request start to the first visible output in microseconds.
+    /// Time from request start to the first visible output.
     pub first_visible_output_us: Option<u64>,
-    /// End-to-end request duration in microseconds.
+    /// End-to-end request duration.
     pub total_us: u64,
 }
 
-/// Runtime event consumed by the HTTP response layer.
+/// What one finished request consumed and produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestUsage {
+    /// Prompt tokens submitted to the engine.
+    pub prompt_tokens: u32,
+    /// Generated tokens, as the engine counts its completion tokens:
+    /// visible text and the tokens of internal sections alike.
+    pub output_tokens: u32,
+    /// Generated images.
+    pub image_count: u32,
+    /// Image-generation steps completed, over every image.
+    pub image_steps: u32,
+    /// Phase durations.
+    pub timings: RuntimeTimings,
+}
+
+/// One generated image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedImage {
+    /// Request-local image identifier.
+    pub image_id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Encoded PNG size in bytes.
+    pub bytes: u64,
+    /// The base64-encoded PNG.
+    pub png_base64: String,
+}
+
+/// Event of a serving stream, consumed by the API layer.
 ///
 /// A stream returned by [`Engine`](crate::engine::Engine) yields at most one
-/// terminal variant (`Finished`, `Rejected`, `Cancelled`, `Aborted`, or `Failed`) or one
-/// error, and then ends.
+/// terminal event (`Finished`, `Rejected`, or `Failed`) or one error, and
+/// then ends. A generation stream yields, after `Accepted` and `Scheduled`,
+/// the output of each decoded update in order: its reasoning, text and
+/// tool-call events, then its `TokenDelta`.
 #[derive(Debug, Clone)]
 pub enum RequestOutput {
-    /// Immutable generated media retained through response delivery.
-    Artifact(uniserve_core::ArtifactEvent),
-    /// Latest diffusion progress: the engine-reported phase and the number of completed
-    /// denoising steps.
-    MediaProgress { phase: String, completed_steps: u32 },
-    /// The engine accepted a compiled request.
-    Accepted {
-        /// Caller-visible request identifier.
-        request_id: ServeRequestId,
-        /// Validation and tokenization duration in microseconds.
-        compile_duration_us: u64,
-        /// Number of prompt tokens submitted to the engine.
-        prompt_token_count: usize,
-        /// Prompt token identifiers submitted to the engine.
-        prompt_token_ids: Vec<u32>,
-        /// Per-position prompt log probabilities, when requested.
-        prompt_logprobs: Option<DecodedPromptLogprobs>,
-    },
+    /// The engine admitted the request and began it: its prompt.
+    Accepted(PromptInfo),
     /// The engine scheduled the request for model execution.
     Scheduled {
-        /// Caller-visible request identifier.
-        request_id: ServeRequestId,
-        /// Engine wall-clock time, in UNIX seconds, at which the request entered the
-        /// scheduler's waiting queue.
-        queued_at: Option<f64>,
-        /// Engine wall-clock time, in UNIX seconds, at which the scheduler admitted the
-        /// request for execution.
-        scheduled_at: Option<f64>,
+        /// Engine wall-clock time, in UNIX seconds, at which the request
+        /// entered the scheduler's waiting queue.
+        queued_at: f64,
+        /// Engine wall-clock time, in UNIX seconds, at which the scheduler
+        /// admitted the request for execution.
+        scheduled_at: f64,
     },
-    /// Newly decoded user-visible text.
+    /// Newly decoded visible text of the open text block.
     TextDelta {
-        /// Newly visible decoded text.
+        /// Visible text.
         text: String,
-        /// Token identifiers represented by this update.
+    },
+    /// Newly decoded reasoning text of the open reasoning block.
+    ReasoningDelta {
+        /// Reasoning text.
+        text: String,
+    },
+    /// The tokens of one decoded update, after its text, reasoning and
+    /// tool-call events.
+    TokenDelta {
+        /// Generated token IDs.
         token_ids: Vec<u32>,
-        /// Per-position candidate log probabilities, when requested.
+        /// Per-position candidate log-probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
     },
-    /// Newly decoded structured reasoning text.
-    ReasoningDelta {
-        /// Newly decoded reasoning text.
-        text: String,
-    },
-    /// A structured assistant output block has opened.
+    /// An assistant output block opened.
     OutputBlockStart {
         /// Zero-based content-block index.
         index: usize,
-        /// Semantic kind of the opened block.
+        /// Semantic kind of the block.
         kind: AssistantBlockKind,
     },
-    /// A structured assistant output block has closed.
+    /// An assistant output block closed.
     OutputBlockEnd {
         /// Zero-based content-block index.
         index: usize,
-        /// Complete normalized block content.
+        /// The complete block.
         block: AssistantContentBlock,
     },
-    /// A structured function-tool call has opened.
+    /// A function-tool call opened.
     ToolCallStart {
         /// Zero-based tool-call index.
         index: usize,
@@ -94,167 +172,54 @@ pub enum RequestOutput {
         /// Selected function name.
         name: String,
     },
-    /// Newly decoded serialized tool arguments.
+    /// Newly decoded arguments of the open tool call.
     ToolCallArgumentsDelta {
         /// Zero-based tool-call index.
         index: usize,
-        /// Newly decoded argument text.
+        /// Argument text.
         delta: String,
     },
-    /// A structured function-tool call has closed.
+    /// A function-tool call closed.
     ToolCallEnd {
         /// Zero-based tool-call index.
         index: usize,
-        /// Request-local tool-call identifier.
-        id: String,
-        /// Selected function name.
-        name: String,
-        /// Complete serialized function arguments.
-        arguments: String,
+        /// The complete call.
+        call: AssistantToolCall,
     },
-    /// Generation of one image has begun.
-    ImageBegin {
-        /// Request-local image identifier.
-        image_id: String,
-        /// Output width in pixels, when known.
-        width: Option<u32>,
-        /// Output height in pixels, when known.
-        height: Option<u32>,
-        /// Planned diffusion step count, when known.
-        steps: Option<u32>,
-        /// Elapsed request duration in microseconds.
-        elapsed_us: u64,
-    },
-    /// One image-generation step has completed.
+    /// One image-generation step completed.
     ImageStep {
         /// Request-local image identifier.
-        image_id: String,
-        /// Completed step number.
-        step: u32,
-        /// Elapsed request duration in microseconds.
-        elapsed_us: u64,
+        image_id: u32,
     },
-    /// Generated image state has been committed to the model context.
-    ImageCommit {
-        /// Request-local image identifier.
-        image_id: String,
-        /// Elapsed request duration in microseconds.
-        elapsed_us: u64,
+    /// One generated image is complete.
+    ImageDone(GeneratedImage),
+    /// Latest diffusion progress: the engine-reported phase and the number
+    /// of completed denoising steps.
+    MediaProgress {
+        /// Phase name.
+        phase: String,
+        /// Completed denoising steps.
+        completed_steps: u32,
     },
-    /// One generated image is complete and available to the response layer.
-    ImageDone {
-        /// Request-local image identifier.
-        image_id: String,
-        /// Output width in pixels, when reported.
-        width: Option<u32>,
-        /// Output height in pixels, when reported.
-        height: Option<u32>,
-        /// Encoded image size in bytes, when reported.
-        bytes: Option<u64>,
-        /// Base64-encoded PNG payload, when retained for transport.
-        pixels_png_b64: Option<String>,
-        /// Elapsed request duration in microseconds.
-        elapsed_us: u64,
-    },
-    /// Final request usage and timing totals.
-    Usage {
-        /// Number of prompt tokens submitted to the engine.
-        prompt_tokens: u32,
-        /// Number of generated tokens included in user-visible output.
-        visible_output_tokens: u32,
-        /// Number of generated tokens consumed by internal protocol sections.
-        internal_tokens: u32,
-        /// Number of generated images.
-        image_count: u32,
-        /// Total image-generation steps completed.
-        image_steps: u32,
-        /// Request phase durations.
-        timings: RuntimeTimings,
-    },
-    /// The output candidate reached a terminal condition.
+    /// Immutable generated media retained through response delivery.
+    Artifact(ArtifactEvent),
+    /// The request finished.
     Finished {
-        /// Semantic terminal status.
-        reason: FinishStatus,
-        /// Optional model- or engine-provided terminal detail.
-        finish_detail: Option<String>,
+        /// Why it finished.
+        reason: FinishReason,
+        /// What it consumed and produced.
+        usage: RequestUsage,
     },
-    /// The request was rejected before execution.
+    /// The engine refused the request before executing it.
     Rejected {
-        /// Identifier of the rejected request.
-        request_id: ServeRequestId,
         /// Whether the request is unservable or the engine is full.
-        kind: uniserve_core::RejectionKind,
+        kind: RejectionKind,
         /// Caller-visible rejection description.
         message: String,
     },
-    /// The request was cancelled.
-    Cancelled {
-        /// Identifier of the cancelled request.
-        request_id: ServeRequestId,
-    },
-    /// The request was forcibly aborted.
-    Aborted {
-        /// Identifier of the aborted request.
-        request_id: ServeRequestId,
-    },
-    /// The request failed.
+    /// The engine failed the request.
     Failed {
-        /// Identifier of the failed request.
-        request_id: ServeRequestId,
         /// Caller-visible failure description.
         message: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Semantic terminal status of a completed serving stream.
-pub enum FinishStatus {
-    /// Generation reached a normal stop condition.
-    Stop {
-        /// Concrete stop cause, when one was observed.
-        cause: Option<StopCause>,
-    },
-    /// The configured generation-length limit was reached.
-    Length,
-    /// The request was cancelled or aborted.
-    Abort,
-    /// Generation failed.
-    Error,
-    /// Repetition detection terminated generation.
-    Repetition,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-/// Concrete token or string that triggered a stop.
-pub enum StopCause {
-    /// The model emitted an end-of-sequence token.
-    Eos,
-    /// The sampler emitted a configured stop-token identifier.
-    TokenId(u32),
-    /// Decoded output matched a configured stop string.
-    Text(String),
-}
-
-impl From<&FinishReason> for FinishStatus {
-    /// Converts the source value into this type.
-    fn from(reason: &FinishReason) -> Self {
-        match reason.reason() {
-            uniserve_core::FinishReason::Eos
-            | uniserve_core::FinishReason::Completed
-            | uniserve_core::FinishReason::Stop
-            | uniserve_core::FinishReason::ImageDone => Self::Stop {
-                cause: reason.as_stop_reason().map(|value| match value {
-                    StopReason::Token(id) => StopCause::TokenId(*id),
-                    StopReason::String(text) => StopCause::Text(text.clone()),
-                }),
-            },
-            uniserve_core::FinishReason::MaxTokens => Self::Length,
-            uniserve_core::FinishReason::Cancelled | uniserve_core::FinishReason::Aborted => {
-                Self::Abort
-            }
-            uniserve_core::FinishReason::Error => Self::Error,
-            uniserve_core::FinishReason::Repetition => Self::Repetition,
-        }
-    }
 }

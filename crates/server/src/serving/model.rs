@@ -11,7 +11,7 @@
 //! [`InputProcessor`] binds tokenizer assets, generation limits, sampling policy, and
 //! output processing. The chat and image entry points in the sibling `preprocessing` module
 //! route through `InputProcessor::preprocess_generation`, which produces a [`GenerationRequest`]
-//! and the [`ResponseOptions`] retained by the frontend, and delegates SenseNova and Bagel
+//! and the [`OutputParams`] retained by the frontend, and delegates SenseNova and Bagel
 //! inputs to the sibling `omni` module; `omni` reads the `pub(super)` fields.
 //! [`InputProcessor::preprocess_video_request`] produces a `DiffusionRequest` for MiniMax H3
 //! through the deployment's `VideoService`.
@@ -30,10 +30,8 @@ use uniserve_core::{
 };
 
 use crate::serving::chat::template::renderer::hf::MultimodalRenderInfo;
-use crate::serving::chat::{
-    ChatOutputProcessor, ChatRequest, HfChatRenderer, Qwen3ChatOutputProcessor,
-};
-use crate::serving::input::{OutputDetail, OutputProcessorPolicy, PromptInput, ResponseOptions};
+use crate::serving::chat::{ChatOutputProcessor, ChatRequest, HfChatRenderer};
+use crate::serving::input::{OutputParams, PromptInput};
 use crate::serving::text::{TextDecodeOptions, resolve_max_tokens};
 use crate::serving::video::{ProcessedVideo, VideoService};
 use crate::serving::{Result, ServeError};
@@ -517,9 +515,8 @@ impl InputProcessor {
         image_gen: Option<crate::serving::ImageGenControls>,
         cache: CachePolicy,
         priority: i32,
-        output: OutputDetail,
         decode: crate::serving::DecodeControls,
-    ) -> Result<(GenerationRequest, ResponseOptions)> {
+    ) -> Result<(GenerationRequest, OutputParams)> {
         let has_input_image = !images.is_empty()
             || matches!(&prompt, PromptInput::Chat(chat) if chat.has_multimodal());
         self.validate_generation_features(&request_id, &prompt, has_input_image, modalities)?;
@@ -568,8 +565,8 @@ impl InputProcessor {
         // Each model fills its actual computation inputs in the same request.
         // No partially prepared request is exposed to the submission boundary.
         // The closure gathers every `TokenizeError` so it maps once to `ServeError::Tokenize`.
-        let output_processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
-            let output_processor = match &self.config.parameters {
+        let processor = (|| -> std::result::Result<_, crate::serving::TokenizeError> {
+            let processor = match &self.config.parameters {
                 ModelParameters::Qwen3 => self.preprocess_qwen3_input(
                     chat_only(prompt),
                     &sampling,
@@ -622,24 +619,23 @@ impl InputProcessor {
                     &mut generation,
                 )?;
             }
-            Ok(output_processor)
+            Ok(processor)
         })()
         .map_err(|source| ServeError::Tokenize {
             request_id: request_id.clone(),
             source,
         })?;
 
-        let response = ResponseOptions {
+        let output = OutputParams {
             tokenizer: Arc::clone(&self.tokenizer),
             // Detokenization needs the prompt after ownership moves to the engine.
             prompt_token_ids: generation.prompt_token_ids.clone(),
             decode,
-            emit_token_ids: matches!(output, OutputDetail::Tokens | OutputDetail::Logprobs),
-            prompt_logprobs_requested: generation.sampling.prompt_logprobs_requested(),
-            generated_logprobs_requested: generation.sampling.generated_logprobs_requested(),
-            output_processor,
+            prompt_logprobs: generation.sampling.prompt_logprobs_requested(),
+            logprobs: generation.sampling.generated_logprobs_requested(),
+            processor,
         };
-        Ok((generation, response))
+        Ok((generation, output))
     }
 }
 
@@ -718,11 +714,11 @@ impl InputProcessor {
         stop: &crate::serving::StopConfig,
         generation: &mut GenerationRequest,
         decode: &mut TextDecodeOptions,
-    ) -> std::result::Result<OutputProcessorPolicy, crate::serving::TokenizeError> {
+    ) -> std::result::Result<ChatOutputProcessor, crate::serving::TokenizeError> {
         chat_request.decode_options = decode.clone();
         chat_request.validate()?;
-        let processor = Qwen3ChatOutputProcessor::new(
-            &mut chat_request,
+        let processor = ChatOutputProcessor::qwen3(
+            &chat_request,
             std::sync::Arc::clone(&self.tokenizer),
             self.parse_reasoning,
         )?;
@@ -732,7 +728,6 @@ impl InputProcessor {
             .render(&chat_request)?;
         let prompt_token_ids = self.tokenizer.encode(&rendered_text, false)?;
         let skip_special_tokens = chat_request.decode_options.skip_special_tokens;
-        let output_processor = OutputProcessorPolicy::Chat(ChatOutputProcessor::Qwen3(processor));
 
         let prompt_len = prompt_token_ids.len() as u32;
         let (sampling, max_tokens, stop_token_ids) =
@@ -747,7 +742,7 @@ impl InputProcessor {
         // read would skip.
         generation.cache.read &= !generation.sampling.prompt_logprobs_requested();
         decode.skip_special_tokens = skip_special_tokens;
-        Ok(output_processor)
+        Ok(processor)
     }
 
     /// Resolves model defaults and request controls into validated engine sampling parameters.

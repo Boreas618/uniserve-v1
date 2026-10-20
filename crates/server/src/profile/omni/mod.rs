@@ -87,8 +87,8 @@ pub struct DelimitedTextPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Model-selected filters applied to generated assistant text.
 ///
-/// `SenseNovaOutputProcessor` in `serving::omni::output` applies the SenseNova
-/// profile's policy.
+/// `SenseNovaReasoningParser` in `serving::omni::output` applies the
+/// SenseNova profile's policy.
 pub struct OutputFilterPolicy {
     /// Optional section whose contents are exposed as reasoning.
     pub reasoning: Option<DelimitedTextPolicy>,

@@ -6,7 +6,7 @@
 pub use error::{Error, Result};
 pub use output::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTextEvent,
-    DecodedTokenLogprob, FinishReason, Finished, StopReason, TextDecodeOptions,
+    DecodedTokenLogprob, Finished, ImageEvent, TextDecodeOptions,
 };
 
 mod error;
