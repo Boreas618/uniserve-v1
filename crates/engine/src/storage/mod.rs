@@ -186,7 +186,7 @@ impl PrefixCacheManager {
         info.prefix_cache
             .as_ref()
             .map(|prefix_cache| PrefixCacheManager {
-                block_pool: BlockPool::new(prefix_cache.num_units),
+                block_pool: BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units),
                 coordinator: PrefixCacheCoordinator::new(
                     prefix_cache
                         .groups

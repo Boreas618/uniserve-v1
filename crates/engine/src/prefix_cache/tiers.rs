@@ -1197,6 +1197,7 @@ mod tests {
                 content: [3; 32],
                 endpoint: None,
             }],
+            scratch_units: 0,
         };
         let text = WorkerGroupId("text".into());
         assert!(tiers.add_worker(

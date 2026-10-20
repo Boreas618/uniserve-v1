@@ -757,6 +757,129 @@ fn a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow
     Ok(())
 }
 
+/// A child rank process: its pid, `--rank` and `--generation`.
+type LaunchedRank = (u32, u32, u64);
+
+/// The children of this thread started by `launch`: each with the value of
+/// its `--rank` and `--generation` arguments.
+fn launched_ranks(
+    launch: impl FnOnce() -> anyhow::Result<WorkerGroup>,
+) -> anyhow::Result<(WorkerGroup, Vec<LaunchedRank>)> {
+    let launch_guard = CHILD_LAUNCH_ENV_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("child launch lock poisoned"))?;
+    let child_ids = || -> anyhow::Result<Vec<u32>> {
+        Ok(std::fs::read_to_string("/proc/thread-self/children")?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?)
+    };
+    let before = child_ids()?;
+    let group = launch()?;
+    let mut ranks = Vec::new();
+    for pid in child_ids()? {
+        if before.contains(&pid) {
+            continue;
+        }
+        let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let args = args
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>();
+        let value = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .and_then(|index| args.get(index + 1))
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        if let (Some(rank), Some(generation)) = (value("--rank"), value("--generation")) {
+            ranks.push((pid, rank as u32, generation));
+        }
+    }
+    drop(launch_guard);
+    Ok((group, ranks))
+}
+
+/// A group that keeps a standby is replaced by promoting it: the lost
+/// group's resident requests fail, the standby's processes serve the next
+/// batch at once, and a new standby starts beside them.
+#[test]
+fn a_lost_worker_group_is_replaced_by_its_standby() -> anyhow::Result<()> {
+    let mut args = worker_group_args();
+    args.keep_standby = true;
+    let (mut executor, ranks) = launched_ranks(|| WorkerGroup::spawn(args))?;
+    // The serving ranks are the group's first launch, the standby's its
+    // second.
+    let rank_of = |rank: u32, generation: u64| {
+        ranks
+            .iter()
+            .find(|(_, r, g)| *r == rank && *g == generation)
+            .map(|(pid, _, _)| *pid)
+            .with_context(|| format!("rank {rank} of launch {generation} was not started"))
+    };
+    let victim = rank_of(1, 1)?;
+    let standby = rank_of(0, 2)?;
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !executor.standby_ready() {
+        anyhow::ensure!(
+            std::time::Instant::now() < ready_deadline,
+            "the standby did not park"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    execute(
+        &mut executor,
+        lifecycle_batch(1, vec![text_admission(31, 1, 1)?], Vec::new()),
+    )?;
+    let paused = PausedProcess::new(victim.try_into()?)?;
+    executor.submit_placed(lifecycle_batch(
+        2,
+        vec![text_admission(32, 1, 2)?],
+        Vec::new(),
+    ))?;
+    paused.terminate()?;
+    let loss = executor
+        .poll_batch(Duration::from_secs(30))
+        .expect_err("rank loss must be reported");
+    let loss = loss
+        .downcast_ref::<WorkerFailure>()
+        .context("expected scoped WorkerGroup loss")?;
+    let requests = loss
+        .requests
+        .iter()
+        .map(|request| request.request_id.0)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(requests, [31, 32].into_iter().collect());
+
+    // The promoted standby serves without a relaunch.
+    assert!(executor.is_ready());
+    let served = execute(
+        &mut executor,
+        lifecycle_batch(3, vec![text_admission(33, 1, 1)?], Vec::new()),
+    )?;
+    assert_eq!(served.batch_id, 3);
+    assert!(
+        executor
+            .info()
+            .endpoint
+            .address_space
+            .starts_with(&format!("{standby}:")),
+        "rank 0 serves from {} rather than the standby {standby}",
+        executor.info().endpoint.address_space
+    );
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !executor.standby_ready() {
+        anyhow::ensure!(
+            std::time::Instant::now() < ready_deadline,
+            "no new standby parked after the promotion"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    executor.close()?;
+    Ok(())
+}
+
 /// A rank whose startup fails reports its own error to the head, which
 /// names the rank and returns that error: here a checkpoint that does not
 /// exist.
@@ -2059,6 +2182,7 @@ fn stub_storage() -> uniserve_ipc::StorageLaunch {
                 claim: claim.0,
                 page_tier: false,
                 tcp: None,
+                standby: false,
             };
             (std::sync::Mutex::new(head), launch)
         })
@@ -2105,6 +2229,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         prefix_cache_dtype: None,
         mem_fraction_static: 0.7,
         max_total_tokens: Some(4096),
+        cache_units: None,
         attention_backend: "torch".into(),
         block_size: Some(16),
         max_batch_calls: 8,
@@ -4569,6 +4694,7 @@ fn media_worker() -> anyhow::Result<()> {
                 server.send(&WorkerResponse::Ok { message_id })?;
                 return Ok(());
             }
+            WorkerRequest::Promote { message_id } => WorkerResponse::Ok { message_id },
             WorkerRequest::Submit { message_id, batch } => {
                 let mut completions: Vec<CallOutput> = batch
                     .calls

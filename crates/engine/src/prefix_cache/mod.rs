@@ -305,13 +305,16 @@ pub(crate) struct BlockPool {
 
 impl BlockPool {
     /// Creates a pool of `num_units` units, including the unit-zero sentinel.
+    /// Units `1..=scratch` are never allocated: they are the workers' warmup
+    /// scratch, which a standby worker warms up on while the pool's units
+    /// serve (`PrefixCacheInfo::scratch_units`).
     ///
     /// # Panics
     ///
     /// Panics when the pool holds no allocatable unit.
-    pub(crate) fn new(num_units: u32) -> Self {
+    pub(crate) fn new(num_units: u32, scratch: u32) -> Self {
         assert!(
-            num_units > 1,
+            num_units > scratch + 1,
             "a cache unit pool requires an allocatable unit"
         );
         let mut inner = PoolInner {
@@ -322,13 +325,14 @@ impl BlockPool {
             pages: HashMap::new(),
             hash_to_pages: HashMap::new(),
             stats: BlockPoolStats {
-                total: num_units as usize - 1,
+                total: (num_units - 1 - scratch) as usize,
                 ..BlockPoolStats::default()
             },
         };
 
-        // Unit zero is the worker's padding sentinel and is never queued.
-        for unit in 1..num_units {
+        // Unit zero is the worker's padding sentinel and is never queued,
+        // nor are the scratch units after it.
+        for unit in scratch + 1..num_units {
             inner.fq_push_back(unit);
         }
         inner.stats.free = inner.free_count;
@@ -1419,7 +1423,7 @@ mod tests {
     #[test]
     fn pages_of_several_units_draw_from_one_pool_and_return_together() {
         // Nine allocatable units: a sliding page takes three, a full page one.
-        let pool = BlockPool::new(10);
+        let pool = BlockPool::new(10, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(8, 1), sliding(4, 3, 100)]);
         let mut allocation = coordinator.empty();
 
@@ -1454,11 +1458,35 @@ mod tests {
     }
 
     #[test]
+    fn the_warmup_scratch_units_are_never_allocated() {
+        // Units 1..=3 are scratch: six of ten units are allocatable.
+        let pool = BlockPool::new(10, 3);
+        assert_eq!((pool.usable_units(), pool.free_units()), (6, 6));
+        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let mut allocation = coordinator.empty();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 6)
+            .unwrap();
+        let units: Vec<u32> = allocation.tables[0]
+            .unit_ids()
+            .iter()
+            .map(|unit| unit.0)
+            .collect();
+        assert_eq!(units.len(), 6);
+        assert!(units.iter().all(|unit| *unit > 3));
+        assert!(
+            coordinator
+                .ensure_capacity(&pool, &mut allocation, 6, 7)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn admission_compares_the_sum_of_group_demand_with_free_units() {
         // Eight tokens need two units in one group and three in the other.
         // With one of five units taken, the four free units cover either
         // group alone, which a per-group minimum would accept, but not both.
-        let pool = BlockPool::new(6);
+        let pool = BlockPool::new(6, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), full(8, 3)]);
         let mut allocation = coordinator.empty();
         assert_eq!(coordinator.units_needed(&allocation, 0, 8), Some(5));
@@ -1477,7 +1505,7 @@ mod tests {
 
     #[test]
     fn sliding_pages_retire_only_behind_the_window_and_keep_published_copies() {
-        let pool = BlockPool::new(64);
+        let pool = BlockPool::new(64, 0);
         let source = endpoint();
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(4, 2, 6)]);
         let prompt = (1..=16).collect::<Vec<u32>>();
@@ -1516,7 +1544,7 @@ mod tests {
 
     #[test]
     fn unpublished_sliding_pages_return_free() {
-        let pool = BlockPool::new(16);
+        let pool = BlockPool::new(16, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4)]);
         let mut allocation = coordinator.empty();
         coordinator
@@ -1531,7 +1559,7 @@ mod tests {
 
     #[test]
     fn a_fresh_sliding_table_starts_at_the_first_page_its_read_needs() {
-        let pool = BlockPool::new(32);
+        let pool = BlockPool::new(32, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(4, 1, 5)]);
         let mut allocation = coordinator.empty();
 
@@ -1548,7 +1576,7 @@ mod tests {
 
     #[test]
     fn prefix_validation_iterates_until_every_sliding_window_holds() {
-        let pool = BlockPool::new(64);
+        let pool = BlockPool::new(64, 0);
         let source = endpoint();
         // A prefix of M tokens needs group 0 pages intersecting [M - 4, M)
         // (4-token pages) and group 1 pages intersecting [M - 8, M) (8-token
@@ -1581,7 +1609,7 @@ mod tests {
 
     #[test]
     fn full_groups_lock_the_whole_prefix_and_sliding_groups_only_their_window() {
-        let pool = BlockPool::new(128);
+        let pool = BlockPool::new(128, 0);
         let source = endpoint();
         // Full pages of 8 tokens and sliding pages of 4 with a 6-token window.
         let coordinator = PrefixCacheCoordinator::new(vec![full(8, 1), sliding(4, 2, 6)]);
@@ -1638,7 +1666,7 @@ mod tests {
 
     #[test]
     fn a_full_group_miss_limits_the_sliding_prefix() {
-        let pool = BlockPool::new(64);
+        let pool = BlockPool::new(64, 0);
         let source = endpoint();
         let coordinator = PrefixCacheCoordinator::new(vec![sliding(4, 1, 4), full(8, 1)]);
         let prompt = (1..=33).collect::<Vec<u32>>();
@@ -1659,7 +1687,7 @@ mod tests {
 
     #[test]
     fn prefix_copies_follow_worker_incarnations_without_releasing_active_pages() {
-        let pool = BlockPool::new(5);
+        let pool = BlockPool::new(5, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
@@ -1713,7 +1741,7 @@ mod tests {
 
     #[test]
     fn fresh_units_follow_the_allocation_serial_in_every_group() {
-        let pool = BlockPool::new(32);
+        let pool = BlockPool::new(32, 0);
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1), sliding(2, 2, 4)]);
         let mut allocation = coordinator.empty();
         coordinator

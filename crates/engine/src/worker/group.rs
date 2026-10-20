@@ -25,6 +25,7 @@ mod domain;
 mod reports;
 pub(crate) mod routing;
 mod spawn;
+mod standby;
 
 use crate::executor::WorkerResult;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -107,6 +108,9 @@ pub struct WorkerGroup {
     /// The deployment's storage claims, which a relaunch's workers start
     /// with and which hold while any group of the deployment lives.
     claims: super::storage::StorageClaims,
+    /// The rank group standing by to replace this one when it fails
+    /// (`worker_config.standby`), while it starts or parks.
+    standby: Option<standby::Standby>,
 }
 
 /// A call's identity across request epochs: engine identifier, request
@@ -331,6 +335,34 @@ impl WorkerGroup {
             .into();
         }
 
+        // A parked standby replaces the failed ranks within the step: it
+        // captured its graphs already and maps the group's storages.
+        match self.promote_standby() {
+            Some(Ok(())) => {
+                self.readiness_changed = true;
+                return WorkerFailure {
+                    worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
+                    endpoints,
+                    requests,
+                    refusals: HashMap::new(),
+                    retired: Vec::new(),
+                    buffers: Vec::new(),
+                    execution: cause.downcast_ref::<WorkerExecError>().cloned(),
+                    message: format!(
+                        "WorkerGroup {} lost its resident allocations; its standby replaced \
+                         it: {cause:#}",
+                        self.process_args.worker_id
+                    ),
+                }
+                .into();
+            }
+            Some(Err(error)) => tracing::warn!(
+                worker = %self.process_args.worker_id,
+                "the standby rank group could not be promoted; relaunching: {error:#}"
+            ),
+            None => {}
+        }
+
         let recovery = (|| -> anyhow::Result<()> {
             // The group's ranks on other hosts are stopped by their launchers
             // before the group is relaunched through the same registry, which
@@ -358,6 +390,7 @@ impl WorkerGroup {
                 worker.set_startup_cancel(None);
             }
             self.install_replacement(workers);
+            self.start_standby();
             Ok(())
         })();
 
@@ -985,6 +1018,7 @@ impl WorkerGroup {
 
     fn poll_progress(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
         let deadline = Instant::now() + timeout;
+        self.poll_standby();
         // A group waiting for its failure domain's relaunch makes no progress
         // until it installs the workers the domain posts.
         if self.awaiting.is_some() && !self.install_from_domain()? {
@@ -1055,6 +1089,7 @@ impl WorkerGroup {
     /// absorbed, so this returns `Ok`.
     pub fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
+        self.drop_standby();
         for worker in &self.workers {
             worker.cancel_startup();
         }

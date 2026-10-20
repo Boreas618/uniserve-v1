@@ -17,6 +17,7 @@ use uniserve_ipc::{Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, Wo
 
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBatch;
+use crate::storage::retained::Retained;
 use crate::{Batch, Error, Executor, Submission};
 
 const EXPERT_POLL: Duration = Duration::from_micros(200);
@@ -69,6 +70,9 @@ pub(crate) struct Service<'a> {
     /// The head's channel failed: it closed, or a send or receive on it
     /// did.
     channel_failed: Cell<bool>,
+    /// The Storage Server connection of a parked standby worker, which
+    /// promotion takes write access through; `None` once the rank serves.
+    standby: Option<Arc<Retained>>,
 }
 
 impl<'a> Service<'a> {
@@ -78,6 +82,7 @@ impl<'a> Service<'a> {
         info: WorkerInfo,
         experts: bool,
         stall_bound: Duration,
+        standby: Option<Arc<Retained>>,
     ) -> Self {
         executor.set_completion_wake(Some(channel.wake()));
         Self {
@@ -92,6 +97,7 @@ impl<'a> Service<'a> {
             stall_bound,
             stalled: false,
             channel_failed: Cell::new(false),
+            standby,
         }
     }
 
@@ -247,6 +253,22 @@ impl<'a> Service<'a> {
                     message_id,
                     info: self.info.clone(),
                 }))
+            }
+            WorkerRequest::Promote { message_id } => {
+                let promoted = match self.standby.take() {
+                    Some(retained) => retained.promote(),
+                    None => Err(Error::State("only a parked standby worker is promoted")),
+                };
+                PendingResponse::Ready(Box::new(match promoted {
+                    Ok(()) => WorkerResponse::Ok { message_id },
+                    Err(error) => self.error_response(message_id, WorkerError::from(error))?,
+                }))
+            }
+            WorkerRequest::Submit { message_id, .. } if self.standby.is_some() => {
+                PendingResponse::Ready(Box::new(self.error_response(
+                    message_id,
+                    WorkerError::from(Error::State("a standby worker serves once it is promoted")),
+                )?))
             }
             WorkerRequest::Submit { message_id, batch } => {
                 let batch = Arc::from(batch);
@@ -525,6 +547,7 @@ mod tests {
             info,
             false,
             Duration::from_secs(150),
+            None,
         )
         .run()
     }

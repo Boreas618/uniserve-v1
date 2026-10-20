@@ -185,6 +185,7 @@ retention = "30m"
 | `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled lane after half of it |
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
+| `standby` | `false` | Keep a standby rank group beside each worker group whose ranks all run on the head's host and that shares no expert world. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |
 
 ### `logging_config`
 

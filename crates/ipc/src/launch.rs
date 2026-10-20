@@ -400,6 +400,12 @@ pub struct StorageLaunch {
     /// page requests; `None` on the head's host, or when the server accepts
     /// no other host.
     pub tcp: Option<String>,
+    /// Whether the worker stands by for the worker of its scope: it maps
+    /// the exclusive storages that worker holds without taking write
+    /// access, warms up on scratch units, parks with the storages read-only
+    /// and serves once promoted (`WorkerRequest::Promote`).
+    #[serde(default)]
+    pub standby: bool,
 }
 
 /// Every value one rank process is launched with.
@@ -482,6 +488,10 @@ pub struct LaunchDescriptor {
     pub mem_fraction_static: f64,
     /// Prefix cache capacity in tokens; `None` sizes it from memory.
     pub max_total_tokens: Option<u64>,
+    /// The exact prefix cache units of a standby worker: those of the
+    /// worker it stands by for, whose cache planes it maps.
+    #[serde(default)]
+    pub cache_units: Option<u32>,
     /// Attention provider name of the rank's model, as `attention_backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)
     /// owns the names and refuses one it does not provide when the model

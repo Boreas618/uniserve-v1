@@ -113,6 +113,7 @@ impl Claims {
                     claim: claim.0,
                     page_tier: first.page_tier,
                     tcp: None,
+                    standby: false,
                 }
             } else {
                 let registry = launchers.with_context(|| {

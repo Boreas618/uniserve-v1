@@ -344,6 +344,7 @@ fn execution(
         expert_microbatches: descriptor.expert_microbatches as usize,
         block_size: descriptor.block_size.map(|size| size as usize),
         max_total_tokens: descriptor.max_total_tokens.map(|tokens| tokens as usize),
+        cache_units: descriptor.cache_units,
         attention_backend: descriptor.attention_backend.clone(),
         max_batch_calls: descriptor.max_batch_calls as usize,
         max_batch_tokens: descriptor.max_batch_tokens as usize,

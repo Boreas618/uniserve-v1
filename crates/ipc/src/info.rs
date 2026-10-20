@@ -31,6 +31,11 @@ pub struct PrefixCacheInfo {
     /// pages through; empty without a host page tier.
     #[serde(default)]
     pub page_pools: Vec<PagePoolInfo>,
+    /// Units `1..=scratch_units` the rank's warmup lends to its startup
+    /// forwards. A standby worker warms up on them while its predecessor
+    /// serves, so the engine never allocates them.
+    #[serde(default)]
+    pub scratch_units: u32,
 }
 
 /// The host page pool of one cache group on one rank: the Storage Server
@@ -121,6 +126,10 @@ impl PrefixCacheInfo {
             self.num_units > 1 && !self.groups.is_empty(),
             "worker info declare an incomplete cache unit pool"
         );
+        ensure_valid!(
+            self.scratch_units < self.num_units - 1,
+            "worker scratch units leave no cache unit to allocate"
+        );
 
         let largest = self.max_block_size();
         let mut layers = HashSet::new();
@@ -192,6 +201,8 @@ impl PrefixCacheInfo {
             // Each stage holds other layers of a page: its pages are its own
             // content, which the merged view does not name.
             page_pools: Vec::new(),
+            // A unit the warmup of any stage lends stays out of the pool.
+            scratch_units: self.scratch_units.max(other.scratch_units),
         };
         merged.validate()?;
         Ok(merged)
@@ -654,6 +665,7 @@ impl Default for WorkerInfo {
                     head_dim: 128,
                 }],
                 page_pools: Vec::new(),
+                scratch_units: 0,
             }),
             latent_page_units: 0,
             latent_pages: 0,

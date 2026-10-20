@@ -294,6 +294,8 @@ fn claim_storage(
         tcp: address
             .zip(port)
             .map(|(address, port)| std::net::SocketAddr::new(address, port).to_string()),
+        // The head states whether a group stands by.
+        standby: false,
     })
 }
 
