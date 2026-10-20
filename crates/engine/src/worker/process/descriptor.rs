@@ -189,6 +189,8 @@ impl Default for WorkerProcessArgs {
             // A launch the server does not name serves a deployment of its
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
+            page_tier: false,
+            storage_connector: None,
             launcher_timeout: std::time::Duration::from_secs(120),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
@@ -518,6 +520,8 @@ mod tests {
             socket: "/run/uniserve/storage.sock".into(),
             deployment: "model".into(),
             claim: [7; 16],
+            page_tier: true,
+            tcp: Some("10.0.0.2:4100".into()),
         }
     }
 

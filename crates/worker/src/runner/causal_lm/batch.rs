@@ -397,10 +397,18 @@ impl<'a> TokenBatch<'a> {
             .filter(|allocation| active.contains(&allocation.request_pool_idx))
             .flat_map(|allocation| allocation.unit_ids.iter().map(|unit| unit.0))
             .collect();
+        let lane = self.runtime.groups[self.group][0];
         if !units.is_empty() {
-            let lane = self.runtime.groups[self.group][0];
             prefix_cache.recycle(&units, &self.runtime.columns[lane], stream)?;
         }
+        // Pages of the host tier fill recycled units before the forward,
+        // and published pages are copied out behind earlier forwards.
+        prefix_cache.copy_pages(
+            &plan.page_reads,
+            &plan.page_writes,
+            &self.runtime.columns[lane],
+            stream,
+        )?;
 
         // Each active call has one forward row on its own slot; a context
         // prefill has one per prompt run and vision block (checked against

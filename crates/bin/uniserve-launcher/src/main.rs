@@ -216,8 +216,11 @@ fn supervise(
             }
             Instruction::Claim(claim) => {
                 let deployment = claim.deployment.clone();
-                let claimed =
-                    claim_storage(claim, &mut storage).map_err(|error| format!("{error:#}"));
+                // Other hosts reach this host's server at the address the
+                // head reaches this launcher from.
+                let address = head.local_addr().ok().flatten().map(|address| address.ip());
+                let claimed = claim_storage(claim, address, &mut storage)
+                    .map_err(|error| format!("{error:#}"));
                 if let Err(message) = &claimed {
                     tracing::warn!(deployment, message, "claiming this host's storage failed");
                 } else {
@@ -236,15 +239,22 @@ fn supervise(
 
 /// Claims the deployment at this host's Storage Server, starting the server
 /// when the host has none, and keeps the claiming connection in `storage`.
+/// A server this starts accepts the head's page requests over TCP, at
+/// `address` (this host's address toward the head) and the port it names,
+/// and takes the head's `claim.arguments`.
 fn claim_storage(
     claim: StorageClaim,
+    address: Option<std::net::IpAddr>,
     storage: &mut Option<uniserve_storage::Client>,
 ) -> anyhow::Result<uniserve_ipc::StorageLaunch> {
     let socket = uniserve_storage::socket::default_socket();
+    let mut arguments = claim.arguments.clone();
+    arguments.extend(["--tcp".to_owned(), "0.0.0.0:0".to_owned()]);
     uniserve_storage::socket::ensure(
         std::path::Path::new(&claim.server),
         &socket,
         STORAGE_START_TIMEOUT,
+        &arguments,
     )
     .context("starting this host's storage server")?;
     let mut client = uniserve_storage::Client::connect(
@@ -264,11 +274,26 @@ fn claim_storage(
             })
             .collect(),
     )?;
+    // A server another process started may accept no other host.
+    let port = match client
+        .call(&uniserve_storage::protocol::Request::Endpoint, &[])?
+        .reply
+    {
+        uniserve_storage::protocol::Reply::Endpoint { tcp: Some(bound) } => bound
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok()),
+        _ => None,
+    };
     *storage = Some(client);
     Ok(uniserve_ipc::StorageLaunch {
         socket: socket.to_string_lossy().into_owned(),
         deployment: claim.deployment,
         claim: token.0,
+        // The head states whether its workers use the host page tier.
+        page_tier: false,
+        tcp: address
+            .zip(port)
+            .map(|(address, port)| std::net::SocketAddr::new(address, port).to_string()),
     })
 }
 

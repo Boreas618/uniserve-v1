@@ -339,7 +339,7 @@ impl Executor for SimExecutor {
             }
         }
         if self.in_flight >= self.depth {
-            return Err(ExecutorSubmitError::WouldBlock(batch));
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
         }
         batch.validate().map_err(ExecutorSubmitError::Failed)?;
 
@@ -1743,6 +1743,7 @@ mod tests {
                     decode: None,
                     buffers: Vec::new(),
                     readers: Default::default(),
+                    page_reads: Vec::new(),
                 },
             )],
             vec![uniserve_ipc::BatchCommand::Start {

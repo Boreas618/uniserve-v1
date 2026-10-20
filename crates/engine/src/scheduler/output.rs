@@ -1618,6 +1618,7 @@ impl Scheduler {
         let prompt = std::mem::take(&mut state.req.prompt_token_ids);
         let hashes = std::mem::take(&mut state.prefix_page_hashes);
         let mut published = std::mem::take(&mut state.prefix_published);
+        let published_before = published.first().copied().unwrap_or(0);
         let computed = state.num_computed_prompt_tokens as usize;
         let visible = state.cache_visible_len as usize;
         let cache_write = state.req.cache.write;
@@ -1633,6 +1634,55 @@ impl Scheduler {
                 &source,
             ) && prefix_cache.coordinator.release_window(allocation, visible)
         });
+        if advanced
+            && let (Some(tiers), Some(worker)) = (
+                self.tiers.as_mut(),
+                self.placement
+                    .affinity
+                    .get(&(key, DEFAULT_COMPONENT.to_owned())),
+            )
+            && tiers.serves(worker)
+        {
+            // Pages published now are written to the host page tier, but
+            // for the tier's own hit, whose reads are now done.
+            let hit = tiers.hit_pages(id);
+            let end = published.first().copied().unwrap_or(0);
+            let mut keys = Vec::new();
+            let mut pages = Vec::new();
+            let page_keys = std::mem::take(&mut state.page_keys);
+            if let (Some(allocation), Some(group_hashes)) =
+                (state.prefix_cache_mut(), hashes.first())
+                && let Some(block_size) = tiers.block_size(worker)
+            {
+                let table = &allocation.tables[0];
+                for page in published_before..end {
+                    if hit.contains(&page) {
+                        continue;
+                    }
+                    let (Some(key), Some(reference), Some(hash)) = (
+                        page_keys.get(page),
+                        table.page(page),
+                        group_hashes.get(page),
+                    ) else {
+                        continue;
+                    };
+                    let tokens = &prompt[page * block_size..(page + 1) * block_size];
+                    if let Some(held) = prefix_cache.block_pool.acquire(
+                        reference.units()[0],
+                        *hash,
+                        0,
+                        tokens,
+                        &source,
+                    ) {
+                        keys.push(*key);
+                        pages.push(held);
+                    }
+                }
+            }
+            state.page_keys = page_keys;
+            tiers.write(worker, keys, pages);
+            tiers.read_done(id);
+        }
         state.req.prompt_token_ids = prompt;
         state.prefix_page_hashes = hashes;
         state.prefix_published = published;

@@ -27,6 +27,28 @@ pub struct PrefixCacheInfo {
     pub dtype: PrefixCacheDtype,
     /// Cache groups in table order.
     pub groups: Vec<CacheGroup>,
+    /// The host page pools this rank copies its full-attention groups'
+    /// pages through; empty without a host page tier.
+    #[serde(default)]
+    pub page_pools: Vec<PagePoolInfo>,
+}
+
+/// The host page pool of one cache group on one rank: the Storage Server
+/// pool its pages are copied to and from, and what the pages hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PagePoolInfo {
+    /// The cache group whose pages the pool holds.
+    pub group_id: u32,
+    /// The pool's identity at the rank's host's Storage Server.
+    pub pool: u64,
+    /// The digest of what determines the group's page encoding (the model
+    /// fingerprint, the page encoding version, the cache dtype, the block
+    /// size and the cache group list), which seeds the group's page keys;
+    /// equal on every rank of a group.
+    pub content: [u8; 32],
+    /// Where a head on another host reaches the pool's Storage Server
+    /// (`StorageLaunch::tcp`).
+    pub endpoint: Option<String>,
 }
 
 impl PrefixCacheInfo {
@@ -167,6 +189,9 @@ impl PrefixCacheInfo {
             num_units: self.num_units.min(other.num_units),
             dtype: self.dtype,
             groups,
+            // Each stage holds other layers of a page: its pages are its own
+            // content, which the merged view does not name.
+            page_pools: Vec::new(),
         };
         merged.validate()?;
         Ok(merged)
@@ -628,6 +653,7 @@ impl Default for WorkerInfo {
                     kv_head_offset: 0,
                     head_dim: 128,
                 }],
+                page_pools: Vec::new(),
             }),
             latent_page_units: 0,
             latent_pages: 0,

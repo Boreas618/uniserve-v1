@@ -55,14 +55,26 @@ pub struct Client {
     next: u64,
     /// Answers received and not yet taken, by request.
     answers: HashMap<u64, Answer>,
-    events: VecDeque<Event>,
+    /// Events received and not yet taken, with their descriptors.
+    events: VecDeque<(Event, Vec<OwnedFd>)>,
 }
 
 impl Client {
     /// Connect to the server at `socket` as `role`.
     pub fn connect(socket: &Path, role: Role) -> Result<Self> {
-        let stream = UnixStream::connect(socket)?;
-        let mut connection = Connection::new(stream);
+        Self::open(Connection::new(UnixStream::connect(socket)?), role)
+    }
+
+    /// Connect to the server of another host at `address` (`host:port`,
+    /// its `Endpoint`) as `role`. The connection carries page requests of
+    /// a head only, and no descriptors.
+    pub fn connect_tcp(address: &str, role: Role) -> Result<Self> {
+        let stream = std::net::TcpStream::connect(address)?;
+        stream.set_nodelay(true)?;
+        Self::open(Connection::new(stream), role)
+    }
+
+    fn open(mut connection: Connection, role: Role) -> Result<Self> {
         connection.send(
             &ClientMessage::Hello(Hello {
                 version: VERSION,
@@ -118,8 +130,8 @@ impl Client {
         self.answers.remove(&id)
     }
 
-    /// The next event received.
-    pub fn next_event(&mut self) -> Option<Event> {
+    /// The next event received, with the descriptors that came with it.
+    pub fn next_event(&mut self) -> Option<(Event, Vec<OwnedFd>)> {
         self.events.pop_front()
     }
 
@@ -159,7 +171,7 @@ impl Client {
             ServerMessage::Reply { id, reply } => {
                 self.answers.insert(id, Answer { reply, descriptors });
             }
-            ServerMessage::Event(event) => self.events.push_back(event),
+            ServerMessage::Event(event) => self.events.push_back((event, descriptors)),
             ServerMessage::Welcome(_) => {
                 return Err(Error::Protocol("a second welcome".into()));
             }

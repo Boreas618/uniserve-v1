@@ -76,6 +76,7 @@ use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
+use crate::storage::PageTier;
 use crate::storage::memory::Storage;
 use crate::storage::retained::Retained;
 use crate::storage::weights::{self, WeightKeys};
@@ -222,8 +223,10 @@ impl Worker {
         // The weights the rank retained when it last loaded this model on
         // this placement bind instead of loading, when every rank that
         // loads with it found its own.
+        let fingerprint =
+            model_fingerprint(&launch, &description, host_only).map_err(phase("load"))?;
         let keys =
-            weight_keys(&launch, &description, &retained, host_only).map_err(phase("load"))?;
+            weight_keys(&launch, fingerprint.as_deref(), &retained).map_err(phase("load"))?;
         let found = match &keys {
             Some(keys) => keys.find(&retained).map_err(phase("load"))?,
             None => None,
@@ -355,7 +358,7 @@ impl Worker {
                 .map_err(phase("capacity"))?;
         }
         drop(planning);
-        let info = plan.info.clone();
+        let mut info = plan.info.clone();
         info.validate()
             .map_err(|error| phase("capacity")(Error::Invariant(error.to_string())))?;
         log_capacity(&config, &plan);
@@ -374,8 +377,28 @@ impl Worker {
         let mut graphs = GraphStorage::new(budgets);
         let mut scratches = Scratches::default();
 
-        let storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
+        let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
+        // The head copies the cache's pages through the host page tier when
+        // it says so; pages are keyed by the model fingerprint.
+        if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
+            launch.storage.page_tier,
+            fingerprint.as_deref(),
+            storage.prefix_cache.as_mut(),
+            device.cuda(),
+            info.prefix_cache.as_mut(),
+        ) {
+            let (tier, pools) = PageTier::start(
+                &retained,
+                prefix_cache.plan(),
+                cuda,
+                fingerprint,
+                launch.storage.tcp.as_deref(),
+            )
+            .map_err(phase("storage"))?;
+            prefix_cache.set_page_tier(tier);
+            reported.page_pools = pools;
+        }
         let mut components = components;
         let preparation = device.cuda().and_then(|cuda| streams.preparation(cuda));
         let preparation = preparation
@@ -926,34 +949,43 @@ impl Worker {
     }
 }
 
-/// Graph pools for an expert union member's captured joins, one per microbatch,
-/// when no text runner shares its pools on the microbatch streams.
+/// The model fingerprint of a rank that holds CUDA weights
+/// (`uniserve.loading.retained.fingerprint`), which keys its retained
+/// weights and its cache pages; `None` for the stub model and a rank
+/// without CUDA weights.
+fn model_fingerprint(
+    launch: &WorkerLaunch,
+    description: &crate::worker::loading::Description,
+    host_only: bool,
+) -> Result<Option<String>> {
+    if host_only || launch.device().cuda().is_none() {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let fingerprint = LoadedModel::fingerprint(description, launch)?;
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "fingerprinted the model's weights"
+    );
+    Ok(Some(fingerprint).filter(|fingerprint| !fingerprint.is_empty()))
+}
+
 /// The keys of the rank's retained weights, or `None` when its weights are
-/// not retained: the stub model, a rank without CUDA weights, and a rank
-/// whose expert weights move to memory of the expert union after loading
+/// not retained: a rank without a model fingerprint, and a rank whose
+/// expert weights move to memory of the expert union after loading
 /// (`dwdp`).
 fn weight_keys(
     launch: &WorkerLaunch,
-    description: &crate::worker::loading::Description,
+    fingerprint: Option<&str>,
     retained: &Retained,
-    host_only: bool,
 ) -> Result<Option<WeightKeys>> {
     let moved = launch
         .expert_parallel
         .as_ref()
         .is_some_and(|union| union.exchange == "dwdp");
-    if host_only || moved || launch.device().cuda().is_none() {
+    let Some(fingerprint) = fingerprint.filter(|_| !moved) else {
         return Ok(None);
-    }
-    let started = std::time::Instant::now();
-    let fingerprint = LoadedModel::fingerprint(description, launch)?;
-    if fingerprint.is_empty() {
-        return Ok(None);
-    }
-    tracing::debug!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "fingerprinted the model's weights"
-    );
+    };
     let devices: Vec<DeviceId> = launch
         .execution
         .devices()
@@ -961,12 +993,14 @@ fn weight_keys(
         .collect();
     Ok(Some(WeightKeys::new(
         retained,
-        &fingerprint,
+        fingerprint,
         &weights::placement(launch)?,
         &devices,
     )?))
 }
 
+/// Graph pools for an expert union member's captured joins, one per microbatch,
+/// when no text runner shares its pools on the microbatch streams.
 fn reserve_join_pools(
     config: &WorkerConfig,
     experts: &mut ExpertUnion,

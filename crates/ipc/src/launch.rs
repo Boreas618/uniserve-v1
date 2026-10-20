@@ -392,6 +392,14 @@ pub struct StorageLaunch {
     /// worker states so that the server knows it belongs to the current
     /// head.
     pub claim: [u8; 16],
+    /// Whether the head copies the worker's cache pages through the host
+    /// page tier: the worker then maps a page pool per full-attention cache
+    /// group.
+    pub page_tier: bool,
+    /// Where a head on another host reaches the server (`host:port`), for
+    /// page requests; `None` on the head's host, or when the server accepts
+    /// no other host.
+    pub tcp: Option<String>,
 }
 
 /// Every value one rank process is launched with.

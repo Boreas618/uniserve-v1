@@ -1474,6 +1474,8 @@ fn batch_rejects_two_calls_for_one_request() {
         commands: Vec::new(),
         input_products: Vec::new(),
         cache_inputs: Vec::new(),
+        page_reads: Vec::new(),
+        page_writes: Vec::new(),
     };
     assert!(batch.validate().is_err());
 }

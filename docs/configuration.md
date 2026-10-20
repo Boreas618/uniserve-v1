@@ -41,6 +41,8 @@ A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode 
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
+Each host's Storage Server (`uniserve-storage-server`, see `architecture.md`) is started by the head or a launcher when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve-storage-server serve --page-pool-gib N` sizes each host page pool (64 GiB unless stated; a pool is one per KV head range of the host's workers, and is allocated and pinned whole when the first worker maps it), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve-storage-server list` prints what it holds, and `uniserve-storage-server retire --deployment NAME` releases the memory of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the memory it left under the same name.
+
 Some tables configure one model family: `chat_config` and `image_fetch_config` chat models (Qwen3, SenseNova, BAGEL, DiffusionGemma); `video_config`, `media_config` and `video_job_config` MiniMax-H3; `readout_config` and `diffusion_generation_config` DiffusionGemma. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
 
 ## Configuration file
@@ -120,6 +122,8 @@ retention = "30m"
 | `block_size` | Largest supported up to 64 | Tokens per page of the cache group with the widest token rows, a power of two |
 | `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |
+| `host_tier` | `true` | With `prefix_caching`, copy full prompt pages to the host page tier of each host's Storage Server and read them back when a later prompt's prefix continues past the device cache's match; serves worker groups whose cache is one full-attention group |
+| `mooncake` | None | With `host_tier`, keep every page of the host page tier in Mooncake, the distributed tier, and prefetch hits of at least 256 tokens back into the host page tier at admission: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host memory each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
 
 ### `scheduler_config`
 

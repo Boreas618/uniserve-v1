@@ -1,4 +1,5 @@
-//! Framed messages with file descriptors over a Unix stream socket.
+//! Framed messages with file descriptors over a Unix stream socket, or
+//! without descriptors over TCP between hosts.
 //!
 //! A frame is an 8-byte header, the payload's length and the number of
 //! descriptors that travel with it (both little-endian `u32`), the payload
@@ -13,6 +14,7 @@
 use std::collections::VecDeque;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
+use std::net::TcpStream;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -40,9 +42,47 @@ struct Segment {
     descriptors: Vec<OwnedFd>,
 }
 
+/// The stream a connection runs on: a Unix socket on the host, which
+/// carries descriptors, or a TCP socket from another host, which carries
+/// none.
+pub enum Socket {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl AsFd for Socket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Unix(stream) => stream.as_fd(),
+            Self::Tcp(stream) => stream.as_fd(),
+        }
+    }
+}
+
+impl Socket {
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.set_nonblocking(nonblocking),
+            Self::Tcp(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+}
+
+impl From<UnixStream> for Socket {
+    fn from(stream: UnixStream) -> Self {
+        Self::Unix(stream)
+    }
+}
+
+impl From<TcpStream> for Socket {
+    fn from(stream: TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+}
+
 /// One end of a framed connection.
 pub struct Connection {
-    stream: UnixStream,
+    stream: Socket,
     /// Received bytes not yet parsed into frames.
     inbox: Vec<u8>,
     /// Received descriptors not yet handed to a frame, in arrival order.
@@ -54,9 +94,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(stream: UnixStream) -> Self {
+    pub fn new(stream: impl Into<Socket>) -> Self {
         Self {
-            stream,
+            stream: stream.into(),
             inbox: Vec::new(),
             descriptors: VecDeque::new(),
             outbox: VecDeque::new(),
@@ -64,7 +104,7 @@ impl Connection {
         }
     }
 
-    pub fn stream(&self) -> &UnixStream {
+    pub fn stream(&self) -> &Socket {
         &self.stream
     }
 
@@ -87,6 +127,12 @@ impl Connection {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame exceeds 4 GiB"))?;
         let count = u32::try_from(descriptors.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
+        if count > 0 && matches!(self.stream, Socket::Tcp(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "descriptors cross only a Unix socket",
+            ));
+        }
         let owned = descriptors
             .iter()
             .map(|descriptor| descriptor.try_clone_to_owned())

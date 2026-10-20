@@ -782,6 +782,12 @@ impl EngineCore {
             config.generation_limits,
         )?;
         sched.set_prefix_reuse(config.prefix_cache);
+        if config.prefix_cache && config.worker_process.page_tier {
+            sched.enable_page_tier(
+                &config.worker_process.deployment,
+                &config.worker_process.host,
+            );
+        }
         let info = sched.info().clone();
         let model_dtype = config.worker_process.dtype;
         let generation_limits = sched.generation_limits().clone();

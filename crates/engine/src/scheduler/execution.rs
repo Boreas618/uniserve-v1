@@ -96,7 +96,7 @@ impl Scheduler {
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
-                    self.inflight.pending_submissions.push_back(batch);
+                    self.inflight.pending_submissions.push_back(*batch);
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
@@ -184,6 +184,7 @@ impl Scheduler {
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
+        progressed |= self.poll_page_tier();
 
         progressed |= self.refill_executor();
 
@@ -193,6 +194,24 @@ impl Scheduler {
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
         progressed
+    }
+
+    /// Takes the host page tier's answers, and ends the pins of requests
+    /// that left the scheduler. Returns whether admission pins were
+    /// answered.
+    fn poll_page_tier(&mut self) -> bool {
+        let Some(tiers) = self.tiers.as_mut() else {
+            return false;
+        };
+        let answered = tiers.poll();
+        let waiting: HashSet<RequestId> = self
+            .waiting
+            .iter()
+            .map(|state| state.req.request_id)
+            .collect();
+        let running = &self.running;
+        tiers.sweep(|request| waiting.contains(&request) || running.contains_key(&request));
+        answered
     }
 
     /// Dispatches queued batches, reaps cancellations, admits requests, and

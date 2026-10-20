@@ -1362,6 +1362,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             decode: None,
             buffers: on_every_rank(batch.buffer_allocations),
             readers: Default::default(),
+            page_reads: Vec::new(),
         };
         executor.submit(ExecutionBatch::new(
             batch_id,
@@ -2034,7 +2035,12 @@ fn stub_storage() -> uniserve_ipc::StorageLaunch {
             std::thread::spawn(move || {
                 let _lock = lock;
                 let (_keep, wake) = std::os::unix::net::UnixStream::pair().unwrap();
-                let mut server = uniserve_storage::Server::new(listener).unwrap();
+                let mut server = uniserve_storage::Server::new(
+                    listener,
+                    uniserve_storage::DEFAULT_POOL_BYTES,
+                    None,
+                )
+                .unwrap();
                 server
                     .run(std::os::fd::AsFd::as_fd(&wake), &|| false)
                     .unwrap();
@@ -2051,6 +2057,8 @@ fn stub_storage() -> uniserve_ipc::StorageLaunch {
                 socket: socket.to_string_lossy().into_owned(),
                 deployment: STUB_WORKER.into(),
                 claim: claim.0,
+                page_tier: false,
+                tcp: None,
             };
             (std::sync::Mutex::new(head), launch)
         })
@@ -2774,7 +2782,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let slow = poll_logical(&mut executor)?.context("released worker did not complete")?;
     assert_eq!(slow.batch_id, 1);
     assert_eq!(slow.results[0].output.status, CallStatus::Ok);
-    executor.submit(blocked)?;
+    executor.submit(*blocked)?;
     let resumed = poll_logical(&mut executor)?.context("capacity was not reusable")?;
     assert_eq!(resumed.batch_id, 2);
     assert_eq!(resumed.results[0].output.status, CallStatus::Ok);
@@ -4769,6 +4777,7 @@ fn place(
                 decode: batch.decode_ranges.into_iter().next(),
                 buffers: on_every_rank(batch.buffer_allocations),
                 readers: Default::default(),
+                page_reads: Vec::new(),
             },
         )],
         batch.commands,

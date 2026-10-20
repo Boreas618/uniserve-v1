@@ -81,6 +81,10 @@ pub struct StorageClaim {
     /// The `uniserve-storage-server` executable that starts the host's
     /// server when it has none.
     pub server: String,
+    /// The arguments a server the launcher starts is given beyond its socket
+    /// and its TCP address: the deployment's Mooncake connector settings.
+    #[serde(default)]
+    pub arguments: Vec<String>,
 }
 
 /// One message a launcher sends after its registration.

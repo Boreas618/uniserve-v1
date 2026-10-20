@@ -332,6 +332,13 @@ impl CachePlanes {
         )
     }
 
+    /// The address of one unit's plane of `field` in `column`: the
+    /// `plane_bytes` of one layer of the unit's page.
+    pub(crate) fn plane_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
+        self.require_unit(unit)?;
+        Ok(self.values[field].address() + self.cell(column, unit) * self.plan.plane_bytes)
+    }
+
     /// The address of one unit's FP8 scale of `field` in `column`.
     pub(crate) fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         Ok(self.scale(field, column, unit)?.address())

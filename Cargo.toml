@@ -73,6 +73,9 @@ llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev =
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
+# Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
+# with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
+mooncake_store = { git = "https://github.com/kvcache-ai/Mooncake", tag = "v0.3.13.post1", default-features = false, features = ["dlopen"] }
 proc-macro2 = "1.0.106"
 prometheus-client = "0.24.0"
 png = "0.18.1"

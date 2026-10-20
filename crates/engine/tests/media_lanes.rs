@@ -1398,7 +1398,7 @@ impl Executor for PooledExecutor {
         if hands_back {
             self.hand_back = None;
             self.handed_back.store(true, Ordering::SeqCst);
-            return Err(ExecutorSubmitError::WouldBlock(batch));
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
         }
 
         // Every input is a product of an accepted call or supplied with the

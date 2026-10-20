@@ -10,7 +10,8 @@
 //! - [`UnitAccesses`]: the physical accesses (executions, exports, imports)
 //!   that decide unit reuse;
 //! - the import lane: bounded workspaces whose host tasks copy other ranks'
-//!   exports into assigned pages.
+//!   exports into assigned pages;
+//! - [`PageTier`]: the host page pools the head copies pages through.
 //!
 //! Every device write runs on a stream the caller supplies; nothing reads a
 //! "current" stream. All validation precedes the first device write, and
@@ -19,6 +20,7 @@
 mod access;
 pub(super) mod block_tables;
 mod imports;
+pub(crate) mod pages;
 pub(super) mod plan;
 pub(super) mod planes;
 mod transfers;
@@ -37,6 +39,7 @@ use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, CacheTransfer, RequestKey, Wake};
 
 use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
+pub(crate) use self::pages::PageTier;
 use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
 use super::memory::StorageView;
@@ -62,6 +65,8 @@ pub struct PrefixCache {
     accesses: UnitAccesses,
     bases: TransferBases,
     imports: Imports,
+    /// The host page tier, when the head copies pages through it.
+    pages: Option<PageTier>,
 }
 
 impl PrefixCache {
@@ -139,7 +144,33 @@ impl PrefixCache {
                 lane,
                 retired,
             },
+            pages: None,
         })
+    }
+
+    /// Copy pages through `tier` from now on.
+    pub(crate) fn set_page_tier(&mut self, tier: PageTier) {
+        self.pages = Some(tier);
+    }
+
+    /// Fill the batch's units of `reads` from the host page tier and copy
+    /// the published pages of `writes` into it, in `stream` order: after the
+    /// batch's units were recycled (with `column`) and before its forward.
+    pub(crate) fn copy_pages(
+        &self,
+        reads: &[uniserve_ipc::PageCopy],
+        writes: &[uniserve_ipc::PageCopy],
+        column: &UnitColumn,
+        stream: impl Issue,
+    ) -> Result<()> {
+        if reads.is_empty() && writes.is_empty() {
+            return Ok(());
+        }
+        let tier = self.pages.as_ref().ok_or_else(|| {
+            Error::Invalid("a batch copies pages but the rank maps no page pool".into())
+        })?;
+        tier.read(&self.planes, reads, column, stream)?;
+        tier.write(&self.planes, writes, stream)
     }
 
     pub(crate) fn planes(&self) -> &Arc<CachePlanes> {

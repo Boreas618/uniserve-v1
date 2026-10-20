@@ -1449,6 +1449,9 @@ pub(crate) struct RequestState {
     /// Per group, the leading prompt pages already published to the prefix
     /// cache, or reused from it.
     pub(super) prefix_published: Vec<usize>,
+    /// The host page tier's keys of the request's reusable prompt pages,
+    /// when the tier serves its prefill worker (`Tiers::page_keys`).
+    pub(super) page_keys: Vec<uniserve_storage::Key>,
     /// Accepted text and control tokens used by penalties and trigger matching.
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.

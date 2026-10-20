@@ -364,6 +364,13 @@ pub(super) fn rank_projection(
         projection
             .new_cache_units
             .retain(|units| transfers_cache || slots.contains(&units.request_pool_idx));
+        // Each rank copies its own share of a page through its own pool.
+        projection
+            .page_reads
+            .retain(|copy| copy.rank as usize == rank);
+        projection
+            .page_writes
+            .retain(|copy| copy.rank as usize == rank);
         let identities = projection
             .calls
             .iter()

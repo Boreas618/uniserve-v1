@@ -111,6 +111,7 @@ impl WorkerSubmission {
         commands: Vec<BatchCommand>,
         inputs: Vec<TensorExport>,
         cache_inputs: Vec<CacheTransfer>,
+        page_writes: Vec<uniserve_ipc::PageCopy>,
         dependencies: Vec<BufferId>,
     ) -> Self {
         let consumed = calls
@@ -130,6 +131,7 @@ impl WorkerSubmission {
             .into_iter()
             .filter(|export| consumed.contains(&export.source))
             .collect();
+        batch.page_writes = page_writes;
         Self {
             batch,
             dependencies,
@@ -295,6 +297,17 @@ impl WorkerExecutor {
                     .map(|info| info.buffer_pool_bytes)
                     .collect();
                 (id.clone(), bytes)
+            })
+            .collect();
+        // Each rank reports its own prefix cache, with its host page pools.
+        executor_info.rank_caches = workers
+            .iter()
+            .map(|(id, worker)| {
+                let caches = (0..)
+                    .map_while(|rank| worker.worker_info(rank))
+                    .map(|info| (info.endpoint.host.clone(), info.prefix_cache.clone()))
+                    .collect();
+                (id.clone(), caches)
             })
             .collect();
         // The video graph may span workers, so each group learns the whole
@@ -709,6 +722,7 @@ impl WorkerExecutor {
             commands,
             input_transfers: inputs,
             cache_inputs,
+            page_writes: batch.page_writes.clone(),
         }
         .into_protocol(collective_seq)?;
 
@@ -982,17 +996,17 @@ impl Executor for WorkerExecutor {
     /// before the error, such as the admissions it carries, the routes,
     /// holders, and allocations of its calls, and submissions already queued,
     /// is not rolled back.
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         if self.closed {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "Executor is closed"
             )));
         }
         if self.pending_failure.is_some() {
-            return Err(ExecutorSubmitError::WouldBlock(batch));
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
         }
         if self.pending.len() >= self.depth {
-            return Err(ExecutorSubmitError::WouldBlock(batch));
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
         }
         batch.validate().map_err(ExecutorSubmitError::Failed)?;
         let mut targets = HashSet::new();
@@ -1012,7 +1026,7 @@ impl Executor for WorkerExecutor {
             .iter()
             .any(|&index| !self.has_capacity(&self.workers[index].0))
         {
-            return Err(ExecutorSubmitError::WouldBlock(batch));
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
         }
         let batch_id = batch.id;
         if self.pending.contains_key(&batch_id) {
@@ -1191,6 +1205,24 @@ impl Executor for WorkerExecutor {
                 }
             }
 
+            // A batch's page writes belong to the one worker group that
+            // runs all of its calls (`ExecutionBatch::page_writes`).
+            let mut page_writes = (0..self.workers.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<uniserve_ipc::PageCopy>>>();
+            if !batch.page_writes.is_empty() {
+                let mut workers = batch
+                    .requests
+                    .iter()
+                    .map(|(call, _)| call_routes[&(call.request_key, call.call_id)])
+                    .collect::<HashSet<_>>()
+                    .into_iter();
+                let (Some(worker), None) = (workers.next(), workers.next()) else {
+                    anyhow::bail!("a batch carrying page writes spans several workers");
+                };
+                page_writes[worker] = std::mem::take(&mut batch.page_writes);
+            }
+
             for (call, placement) in batch.requests {
                 let worker = call_routes[&(call.request_key, call.call_id)];
                 worker_ops[worker].push((call, placement));
@@ -1262,6 +1294,7 @@ impl Executor for WorkerExecutor {
                     commands,
                     input_products,
                     std::mem::take(&mut worker_cache_inputs[worker_index]),
+                    std::mem::take(&mut page_writes[worker_index]),
                     dependencies,
                 ));
             }

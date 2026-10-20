@@ -68,6 +68,9 @@ pub struct RequestPlacement {
     /// rank of the worker that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
+    /// Pages of the host page tier the call's new units are filled with
+    /// before its forward, on every rank of its worker group.
+    pub page_reads: Vec<uniserve_ipc::PageCopy>,
     /// For a video request's call, the worker routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
@@ -98,6 +101,9 @@ pub struct ExecutionBatch {
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
     pub cache_inputs: Vec<uniserve_ipc::CacheTransfer>,
+    /// Published pages the batch writes to the host page tier, for every
+    /// rank of the one worker group that runs it (`PageCopy::rank`).
+    pub page_writes: Vec<uniserve_ipc::PageCopy>,
 }
 
 impl ExecutionBatch {
@@ -114,6 +120,7 @@ impl ExecutionBatch {
             commands,
             input_transfers,
             cache_inputs: Vec::new(),
+            page_writes: Vec::new(),
         }
     }
 
@@ -261,12 +268,14 @@ impl ExecutionBatch {
             commands,
             input_transfers: input_products,
             cache_inputs,
+            page_writes,
         } = self;
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
         let mut forward = ForwardBatch::default();
         let mut latent_params = Vec::new();
         let mut decode_ranges = Vec::new();
+        let mut page_reads = Vec::new();
         let mut rank_buffers = Vec::new();
         let mut calls = Vec::with_capacity(requests.len());
 
@@ -276,6 +285,7 @@ impl ExecutionBatch {
             forward.append(placement.forward, call_index as u32)?;
             latent_params.extend(placement.latent);
             decode_ranges.extend(placement.decode);
+            page_reads.extend(placement.page_reads);
             rank_buffers.extend(placement.buffers);
             calls.push(call);
         }
@@ -293,6 +303,8 @@ impl ExecutionBatch {
             commands,
             input_products,
             cache_inputs,
+            page_reads,
+            page_writes,
         };
         batch.validate_unplaced()?;
         Ok((batch, rank_buffers))

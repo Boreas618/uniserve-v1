@@ -67,13 +67,24 @@ impl Claims {
             }
         }
 
+        // A server the deployment starts runs its Mooncake connector.
+        let server_arguments = first
+            .storage_connector
+            .as_ref()
+            .map(uniserve_storage::connector::Settings::arguments)
+            .unwrap_or_default();
         let mut local = None;
         let mut launches = BTreeMap::new();
         for (host, scopes) in scopes {
             let launch = if host == first.host {
                 let socket = uniserve_storage::socket::default_socket();
-                uniserve_storage::socket::ensure(&first.storage_server, &socket, START_TIMEOUT)
-                    .context("starting this host's storage server")?;
+                uniserve_storage::socket::ensure(
+                    &first.storage_server,
+                    &socket,
+                    START_TIMEOUT,
+                    &server_arguments,
+                )
+                .context("starting this host's storage server")?;
                 let mut client = Client::connect(
                     &socket,
                     Role::Head {
@@ -100,6 +111,8 @@ impl Claims {
                     socket: socket.to_string_lossy().into_owned(),
                     deployment: deployment.clone(),
                     claim: claim.0,
+                    page_tier: first.page_tier,
+                    tcp: None,
                 }
             } else {
                 let registry = launchers.with_context(|| {
@@ -111,10 +124,18 @@ impl Claims {
                         deployment: deployment.clone(),
                         scopes,
                         server: first.storage_server.to_string_lossy().into_owned(),
+                        arguments: server_arguments.clone(),
                     },
                 )?
             };
-            launches.insert(host.to_owned(), launch);
+            // The head decides whether its workers use the host page tier.
+            launches.insert(
+                host.to_owned(),
+                StorageLaunch {
+                    page_tier: first.page_tier,
+                    ..launch
+                },
+            );
         }
         tracing::info!(
             deployment,

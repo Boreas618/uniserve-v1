@@ -249,6 +249,7 @@ impl Scheduler {
             max_reserved_cache_tokens: max_cache_tokens,
             prefix_page_hashes: Vec::new(),
             prefix_published: Vec::new(),
+            page_keys: Vec::new(),
             generated_token_ids: Vec::new(),
             round_token_ids: Vec::new(),
             feedback_image_b64: None,
@@ -1102,10 +1103,36 @@ impl Scheduler {
                     .min(self.config.max_num_batched_tokens)
                     .max(1);
                 let cached_tokens = prefix_hit.cached_tokens.min(n);
-                let first_chunk = n.saturating_sub(cached_tokens).min(chunk_limit).max(1);
+                // The host page tier may hold the reusable pages that follow
+                // the device match; the head waits for its pins.
+                let mut tier_tokens = 0;
+                if let Some(tiers) = self.tiers.as_mut()
+                    && let Some(block) = tiers.block_size(&target.0)
+                    && head.req.cache.read
+                    && !head.has_context_images()
+                {
+                    // Reusable pages leave one prompt token to compute, as
+                    // in the device cache.
+                    let reusable = n.saturating_sub(1) / block;
+                    let device_pages = cached_tokens / block;
+                    if reusable > device_pages {
+                        let keys = tiers.page_keys(
+                            &target.0,
+                            &head.req.prompt_token_ids,
+                            head.req.cache.isolation_key,
+                            reusable,
+                        );
+                        match tiers.admission(head.req.request_id, &target.0, &keys, device_pages) {
+                            Some(pages) => tier_tokens = pages * block,
+                            None => break,
+                        }
+                    }
+                }
+                let prefix_tokens = cached_tokens + tier_tokens;
+                let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
                 let first_chunk_units = cache
                     .coordinator
-                    .units_after_prefix(cached_tokens, cached_tokens + first_chunk);
+                    .units_after_prefix(cached_tokens, prefix_tokens + first_chunk);
 
                 // The prompt alone must fit the pool: every full-attention page
                 // and each sliding-window group's pages of one chunk.
@@ -1142,7 +1169,10 @@ impl Scheduler {
                             break;
                         }
                     };
+                    let id = st.req.request_id;
+                    let worker = target.0.clone();
                     self.admit_running(st, target, reservation);
+                    self.admit_page_tier(id, &worker);
                     continue;
                 }
             }
@@ -1321,6 +1351,64 @@ impl Scheduler {
         if let Err(invariant) = acquired {
             self.invariant_broken(invariant);
         }
+    }
+}
+
+impl Scheduler {
+    /// Apply the host page tier to an admitted request on `worker`: record
+    /// the keys its published pages are written under, and extend its
+    /// cached prefix by the tier's hit, whose units are allocated now and
+    /// filled by its first call. A hit that no longer follows the device
+    /// prefix the request acquired is released.
+    fn admit_page_tier(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
+        let Some(tiers) = self.tiers.as_mut() else {
+            return;
+        };
+        let Some(block) = tiers.block_size(worker) else {
+            return;
+        };
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        if !state.req.cache.read || state.has_context_images() {
+            return;
+        }
+        let pages = state.req.prompt_token_ids.len() / block;
+        state.page_keys = tiers.page_keys(
+            worker,
+            &state.req.prompt_token_ids,
+            state.req.cache.isolation_key,
+            pages,
+        );
+        let Some((start, hit)) = tiers.admit(id) else {
+            return;
+        };
+        let computed = state.num_computed_prompt_tokens as usize;
+        if computed != start * block {
+            tiers.abandon(id);
+            return;
+        }
+        let end = (start + hit) * block;
+        if !self.ensure_request_capacity(id, computed, end) {
+            if let Some(tiers) = self.tiers.as_mut() {
+                tiers.abandon(id);
+            }
+            return;
+        }
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        // The hit's pages are computed once read: the first call starts
+        // after them, and they are published to the device cache when that
+        // call's result is accepted.
+        state.num_computed_prompt_tokens = end as u32;
+        state.logical_position = state.num_computed_prompt_tokens;
+        state.cache_visible_len = state.num_computed_prompt_tokens;
+        state.cache_computed_len = state.num_computed_prompt_tokens;
+        self.stats
+            .prefix
+            .hit_tokens
+            .fetch_add((hit * block) as u64, Ordering::Relaxed);
     }
 }
 

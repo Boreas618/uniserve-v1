@@ -4986,6 +4986,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mooncake_store"
+version = "0.1.0"
+source = "git+https://github.com/kvcache-ai/Mooncake?tag=v0.3.13.post1#719735896c86b56fabec6cf3e825fb2ea640597a"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9171,6 +9181,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9276,6 +9287,7 @@ dependencies = [
  "uniserve-engine",
  "uniserve-ipc",
  "uniserve-observability",
+ "uniserve-storage",
  "url",
  "uuid",
  "validator",
@@ -9288,6 +9300,7 @@ version = "2.0.0"
 dependencies = [
  "libc",
  "libloading 0.8.9",
+ "mooncake_store",
  "rmp-serde",
  "rustix 1.1.4",
  "serde",
@@ -9303,7 +9316,9 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "rustix 1.1.4",
  "signal-hook-registry",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "uniserve-storage",
