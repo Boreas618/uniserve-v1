@@ -5,7 +5,7 @@
 //! socket on the head's host and through TCP from any other host, and its
 //! first frame is its `Registration`: worker group, rank, launch generation
 //! and build version. [`WorkerRegistry::begin_launch`] numbers each launch of
-//! a group, and [`WorkerRegistry::collect`] gathers the registrations of the
+//! a group, and [`collect`] gathers the registrations of the
 //! group's current launch and hands each rank's connection to that launch,
 //! which answers with the rank's launch descriptor. The connection then
 //! serves the rank for its lifetime, and its close is the rank's death.
@@ -30,7 +30,7 @@ use anyhow::Context;
 use uniserve_ipc::{Channel, Listener, Registration, VERSION};
 
 /// Deadline for every rank of one launch to register, measured from the
-/// start of `WorkerRegistry::collect`, which runs after every rank of the group
+/// start of `collect`, which runs after every rank of the group
 /// has been launched.
 ///
 /// A rank registers before it builds its model, so this covers process start
@@ -149,64 +149,36 @@ impl WorkerRegistry {
         *generation
     }
 
-    /// Collects the connection of every rank of `worker_id`'s current launch,
-    /// ordered by rank.
+    /// Moves the registrations of `worker_id`'s current launch that have
+    /// arrived into `ranks`, by rank, and leaves the other groups'.
     ///
-    /// `alive` is consulted whenever the launch is still incomplete, so a
-    /// rank that dies before registering fails the launch by name instead of
-    /// consuming the deadline.
-    ///
-    /// Fails on an error from `alive`, when the deadline passes with ranks
-    /// unregistered (named in the error), when a registration states another
-    /// build than the head's, and when one names a rank outside
-    /// `0..expected` or one that already registered. Connections of other
-    /// worker groups are kept for their own launches, and a rank of an
-    /// earlier launch of this group is refused without failing this one.
-    pub(crate) fn collect(
+    /// Fails when a registration states another build than the head's, and
+    /// when one names a rank outside `0..expected` or one already in `ranks`.
+    fn take_registered(
         &mut self,
         worker_id: &str,
         expected: usize,
-        mut alive: impl FnMut() -> anyhow::Result<()>,
-    ) -> anyhow::Result<Vec<Channel>> {
-        let deadline = Instant::now() + REGISTRATION_TIMEOUT;
-        let mut ranks = BTreeMap::<usize, Channel>::new();
-        loop {
-            self.serve()?;
-
-            // Take this group's registrations and leave the other groups'.
-            let mut index = 0;
-            while index < self.ranks.len() {
-                if self.ranks[index].worker_id != worker_id {
-                    index += 1;
-                    continue;
-                }
-                let registered = self.ranks.swap_remove(index);
-                let rank = registered.rank as usize;
-                anyhow::ensure!(
-                    rank < expected,
-                    "rank {rank} registered for worker {worker_id}, which has {expected} ranks"
-                );
-                anyhow::ensure!(
-                    ranks.insert(rank, registered.channel).is_none(),
-                    "rank {rank} of worker {worker_id} registered twice"
-                );
+        ranks: &mut BTreeMap<usize, Channel>,
+    ) -> anyhow::Result<()> {
+        self.serve()?;
+        let mut index = 0;
+        while index < self.ranks.len() {
+            if self.ranks[index].worker_id != worker_id {
+                index += 1;
+                continue;
             }
-            if ranks.len() == expected {
-                return Ok(ranks.into_values().collect());
-            }
-
-            alive()?;
-            if Instant::now() >= deadline {
-                let missing: Vec<usize> = (0..expected)
-                    .filter(|rank| !ranks.contains_key(rank))
-                    .collect();
-                anyhow::bail!(
-                    "ranks {missing:?} of worker {worker_id} did not register within {}s",
-                    REGISTRATION_TIMEOUT.as_secs()
-                );
-            }
-            self.park()?;
+            let registered = self.ranks.swap_remove(index);
+            let rank = registered.rank as usize;
+            anyhow::ensure!(
+                rank < expected,
+                "rank {rank} registered for worker {worker_id}, which has {expected} ranks"
+            );
+            anyhow::ensure!(
+                ranks.insert(rank, registered.channel).is_none(),
+                "rank {rank} of worker {worker_id} registered twice"
+            );
         }
+        Ok(())
     }
 
     /// Takes the connection of every launcher that has registered since the
@@ -305,6 +277,59 @@ impl WorkerRegistry {
     }
 }
 
+/// Collects the connection of every rank of `worker_id`'s current launch,
+/// ordered by rank.
+///
+/// The registry is locked only to read what has arrived, never across the
+/// wait: other groups begin launches, start standbys and collect their own
+/// ranks meanwhile, from their own threads. The wait parks on the listener;
+/// a registration on a connection the registry has already accepted is read
+/// at the next interval.
+///
+/// `alive` is consulted whenever the launch is still incomplete, so a rank
+/// that dies before registering fails the launch by name instead of
+/// consuming the deadline.
+///
+/// Fails on an error from `alive`, when the deadline passes with ranks
+/// unregistered (named in the error), when a registration states another
+/// build than the head's, and when one names a rank outside `0..expected`
+/// or one that already registered. Connections of other worker groups are
+/// kept for their own launches, and a rank of an earlier launch of this
+/// group is refused without failing this one.
+pub(crate) fn collect(
+    registry: &Mutex<WorkerRegistry>,
+    worker_id: &str,
+    expected: usize,
+    mut alive: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<Channel>> {
+    let deadline = Instant::now() + REGISTRATION_TIMEOUT;
+    let mut ranks = BTreeMap::<usize, Channel>::new();
+    loop {
+        // The listener lives as long as the registry, which the caller
+        // holds, so its descriptors stay valid once the lock is released.
+        let descriptors = {
+            let mut head = lock(registry)?;
+            head.take_registered(worker_id, expected, &mut ranks)?;
+            head.listener.poll_fds()
+        };
+        if ranks.len() == expected {
+            return Ok(ranks.into_values().collect());
+        }
+
+        alive()?;
+        if Instant::now() >= deadline {
+            let missing: Vec<usize> = (0..expected)
+                .filter(|rank| !ranks.contains_key(rank))
+                .collect();
+            anyhow::bail!(
+                "ranks {missing:?} of worker {worker_id} did not register within {}s",
+                REGISTRATION_TIMEOUT.as_secs()
+            );
+        }
+        super::park_descriptors(&descriptors, ACCEPT_INTERVAL)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,20 +361,22 @@ mod tests {
 
     #[test]
     fn a_launch_collects_its_own_workers_over_both_addresses_in_rank_order() {
-        let registry = WorkerRegistry::bind(false).unwrap();
-        let mut registry = lock(&registry).unwrap();
-        let unix = registry.address(None).unwrap();
-        let tcp = registry.address(Some(Ipv4Addr::LOCALHOST.into())).unwrap();
+        let shared = WorkerRegistry::bind(false).unwrap();
+        let registry = || lock(&shared).unwrap();
+        let unix = registry().address(None).unwrap();
+        let tcp = registry()
+            .address(Some(Ipv4Addr::LOCALHOST.into()))
+            .unwrap();
         assert!(unix.starts_with("unix:") && !tcp.starts_with("unix:"));
 
-        let image = registry.begin_launch("image");
-        let text = registry.begin_launch("text");
+        let image = registry().begin_launch("image");
+        let text = registry().begin_launch("text");
         let _other = register(&unix, "image", 0, image, VERSION);
         let mut second = register(&tcp, "text", 1, text, VERSION);
         let mut first = register(&unix, "text", 0, text, VERSION);
 
         // Each collected connection answers the rank that registered on it.
-        let mut ranks = registry.collect("text", 2, || Ok(())).unwrap();
+        let mut ranks = collect(&shared, "text", 2, || Ok(())).unwrap();
         assert_eq!(ranks.len(), 2);
         for (rank, channel) in ranks.iter_mut().enumerate() {
             channel
@@ -371,7 +398,7 @@ mod tests {
         }
 
         // The other group's rank stayed for its own launch.
-        assert_eq!(registry.collect("image", 1, || Ok(())).unwrap().len(), 1);
+        assert_eq!(collect(&shared, "image", 1, || Ok(())).unwrap().len(), 1);
     }
 
     /// A relaunch takes only its own ranks. A rank of the launch it replaced
@@ -379,26 +406,26 @@ mod tests {
     /// and neither counts as a rank of the relaunch.
     #[test]
     fn a_worker_of_an_earlier_launch_is_refused_and_the_relaunch_completes() {
-        let registry = WorkerRegistry::bind(false).unwrap();
-        let mut registry = lock(&registry).unwrap();
-        let address = registry.address(None).unwrap();
+        let shared = WorkerRegistry::bind(false).unwrap();
+        let registry = || lock(&shared).unwrap();
+        let address = registry().address(None).unwrap();
 
         // A rank of the first launch registers and is read while that launch
         // is current, here by another group's launch, which reads every
         // registration that has arrived.
-        let first = registry.begin_launch("text");
-        let image = registry.begin_launch("image");
+        let first = registry().begin_launch("text");
+        let image = registry().begin_launch("image");
         let mut early = register(&address, "text", 0, first, VERSION);
         let _image = register(&address, "image", 0, image, VERSION);
-        assert_eq!(registry.collect("image", 1, || Ok(())).unwrap().len(), 1);
+        assert_eq!(collect(&shared, "image", 1, || Ok(())).unwrap().len(), 1);
 
-        let relaunch = registry.begin_launch("text");
+        let relaunch = registry().begin_launch("text");
         let mut late = register(&address, "text", 1, first, VERSION);
         let _current = [
             register(&address, "text", 0, relaunch, VERSION),
             register(&address, "text", 1, relaunch, VERSION),
         ];
-        assert_eq!(registry.collect("text", 2, || Ok(())).unwrap().len(), 2);
+        assert_eq!(collect(&shared, "text", 2, || Ok(())).unwrap().len(), 2);
         assert!(
             closed(&mut early),
             "a rank of the ended launch kept its connection"
@@ -411,24 +438,23 @@ mod tests {
 
     #[test]
     fn a_worker_or_a_launcher_of_another_build_fails_the_wait_by_name() {
-        let registry = WorkerRegistry::bind(true).unwrap();
-        let mut registry = lock(&registry).unwrap();
+        let shared = WorkerRegistry::bind(true).unwrap();
+        let registry = || lock(&shared).unwrap();
 
         // Another build of the same package version.
         let package = VERSION.split_once('+').unwrap().0;
         let other = format!("{package}+0123456789abcdef");
         assert_ne!(other, VERSION);
 
-        let generation = registry.begin_launch("text");
+        let generation = registry().begin_launch("text");
         let _foreign = register(
-            &registry.address(None).unwrap(),
+            &registry().address(None).unwrap(),
             "text",
             0,
             generation,
             &other,
         );
-        let error = registry
-            .collect("text", 1, || Ok(()))
+        let error = collect(&shared, "text", 1, || Ok(()))
             .err()
             .expect("a rank of another build fails the launch")
             .to_string();
@@ -439,7 +465,7 @@ mod tests {
             "{error}"
         );
 
-        let port = registry
+        let port = registry()
             .tcp_address()
             .rsplit_once(':')
             .unwrap()
@@ -454,10 +480,11 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let error = loop {
-            match registry.take_launchers() {
+            let taken = registry().take_launchers();
+            match taken {
                 Ok(_) => {
                     assert!(Instant::now() < deadline, "the launcher was not refused");
-                    registry.park().unwrap();
+                    registry().park().unwrap();
                 }
                 Err(error) => break error.to_string(),
             }
@@ -470,9 +497,9 @@ mod tests {
 
     #[test]
     fn a_launcher_registers_on_the_tcp_port() {
-        let registry = WorkerRegistry::bind(true).unwrap();
-        let mut registry = lock(&registry).unwrap();
-        let port = registry
+        let shared = WorkerRegistry::bind(true).unwrap();
+        let registry = || lock(&shared).unwrap();
+        let port = registry()
             .tcp_address()
             .rsplit_once(':')
             .unwrap()
@@ -489,8 +516,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut presented = Vec::new();
         while presented.is_empty() && Instant::now() < deadline {
-            presented = registry.take_launchers().unwrap();
-            registry.park().unwrap();
+            presented = registry().take_launchers().unwrap();
+            registry().park().unwrap();
         }
         assert_eq!(presented.len(), 1);
         assert_eq!(presented[0].0, "b");
@@ -498,24 +525,22 @@ mod tests {
 
     #[test]
     fn a_worker_outside_the_group_and_a_worker_registered_twice_fail_the_launch() {
-        let registry = WorkerRegistry::bind(false).unwrap();
-        let mut registry = lock(&registry).unwrap();
-        let address = registry.address(None).unwrap();
+        let shared = WorkerRegistry::bind(false).unwrap();
+        let registry = || lock(&shared).unwrap();
+        let address = registry().address(None).unwrap();
 
-        let text = registry.begin_launch("text");
+        let text = registry().begin_launch("text");
         let _outside = register(&address, "text", 2, text, VERSION);
-        let error = registry
-            .collect("text", 2, || Ok(()))
+        let error = collect(&shared, "text", 2, || Ok(()))
             .err()
             .expect("a rank outside the group fails the launch")
             .to_string();
         assert!(error.contains("rank 2"), "{error}");
 
-        let image = registry.begin_launch("image");
+        let image = registry().begin_launch("image");
         let _first = register(&address, "image", 0, image, VERSION);
         let _again = register(&address, "image", 0, image, VERSION);
-        let error = registry
-            .collect("image", 2, || Ok(()))
+        let error = collect(&shared, "image", 2, || Ok(()))
             .err()
             .expect("a rank registered twice fails the launch")
             .to_string();
@@ -526,28 +551,27 @@ mod tests {
     /// is not a registration, do not keep a launch from completing.
     #[test]
     fn a_launch_completes_beside_connections_that_never_register() {
-        let registry = WorkerRegistry::bind(false).unwrap();
-        let mut registry = lock(&registry).unwrap();
-        let address = registry.address(None).unwrap();
+        let shared = WorkerRegistry::bind(false).unwrap();
+        let registry = || lock(&shared).unwrap();
+        let address = registry().address(None).unwrap();
 
         let _silent = Channel::connect(&address).unwrap();
         let mut stray = Channel::connect(&address).unwrap();
         stray.send(&uniserve_ipc::WorkerRequest::info()).unwrap();
 
-        let generation = registry.begin_launch("text");
+        let generation = registry().begin_launch("text");
         let _rank = register(&address, "text", 0, generation, VERSION);
-        assert_eq!(registry.collect("text", 1, || Ok(())).unwrap().len(), 1);
+        assert_eq!(collect(&shared, "text", 1, || Ok(())).unwrap().len(), 1);
         assert!(closed(&mut stray), "the stray connection stayed open");
     }
 
     #[test]
     fn a_worker_that_dies_before_registering_fails_the_launch() {
-        let registry = WorkerRegistry::bind(false).unwrap();
-        let mut registry = lock(&registry).unwrap();
+        let shared = WorkerRegistry::bind(false).unwrap();
+        let registry = || lock(&shared).unwrap();
 
-        registry.begin_launch("text");
-        let error = registry
-            .collect("text", 1, || anyhow::bail!("rank 0 exited"))
+        registry().begin_launch("text");
+        let error = collect(&shared, "text", 1, || anyhow::bail!("rank 0 exited"))
             .err()
             .expect("the liveness check fails the launch")
             .to_string();

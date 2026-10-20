@@ -37,30 +37,6 @@ pub(crate) struct LaunchedWorkers {
 }
 
 impl WorkerProcessArgs {
-    /// Launches and connects every rank in one physical worker group.
-    ///
-    /// `registry` is the deployment's listener, which the ranks connect to.
-    /// `launchers` is the deployment's registry, which owns the launcher of
-    /// every host this process does not run on; a group placing a rank on
-    /// such a host requires it.
-    ///
-    /// A group of an expert-parallel world is relaunched with its failure
-    /// domain instead ([`super::domain::FailureDomain`]).
-    pub(super) fn launch(
-        &self,
-        cancel: Option<Arc<AtomicBool>>,
-        registry: &Registry,
-        launchers: Option<crate::worker::launcher::Launchers>,
-        claims: &StorageClaims,
-    ) -> anyhow::Result<LaunchedGroup> {
-        anyhow::ensure!(
-            self.expert_parallel.is_none(),
-            "worker {} shares an expert world and is relaunched with its failure domain",
-            self.worker_id
-        );
-        self.adopt_workers(self.spawn_workers(cancel, registry, launchers, claims, None)?)
-    }
-
     /// Starts every rank of one group without waiting for it to register.
     ///
     /// Spawning is separated from adoption so several groups start their
@@ -232,7 +208,7 @@ impl WorkerProcessArgs {
                 .try_for_each(|pending| pending.check_alive())
         };
         let channels =
-            crate::worker::registry::lock(&registry)?.collect(&self.worker_id, expected, alive)?;
+            crate::worker::registry::collect(&registry, &self.worker_id, expected, alive)?;
 
         // `collect` orders the connections by rank, as `ranks` is.
         ranks
@@ -257,11 +233,17 @@ impl WorkerProcessArgs {
 /// overlap, and they are awaited together, so the loss of any one ends the
 /// wait of all. Returns each group's workers and launchers, in argument
 /// order.
+///
+/// `startup_cancel` is the startup cancellation every launched rank shares
+/// until the launch is ready: the teardown of any rank sets it, and so may
+/// the caller from another thread, which ends the launch at its next
+/// liveness check and terminates its ranks.
 pub(super) fn launch_all(
     arguments: &mut [WorkerProcessArgs],
     registry: &Registry,
     launchers: Option<crate::worker::launcher::Launchers>,
     claims: &StorageClaims,
+    startup_cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<Vec<LaunchedGroup>> {
     let mut expert_store = None;
     if arguments.iter().any(|args| args.expert_parallel.is_some()) {
@@ -289,7 +271,6 @@ pub(super) fn launch_all(
         expert_store = rendezvous.listener;
     }
 
-    let startup_cancel = Arc::new(AtomicBool::new(false));
     let launched = arguments
         .iter()
         .map(|args| {
@@ -391,37 +372,53 @@ impl WorkerGroup {
             Some(claim) => Claims::adopt(&arguments, claim)?,
             None => Claims::claim(&arguments, launchers.as_ref())?,
         };
-        let groups = launch_all(&mut arguments, &registry, launchers.clone(), &claims)?;
+        let groups = launch_all(
+            &mut arguments,
+            &registry,
+            launchers.clone(),
+            &claims,
+            Arc::new(AtomicBool::new(false)),
+        )?;
+
+        // Groups that share an expert world fail and are replaced together;
+        // every other group is its own failure domain.
+        let wakes = (0..groups.len())
+            .map(|_| crate::handle::WakeSignal::new())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let domain = |wakes: &[crate::handle::WakeSignal]| {
+            Arc::new(FailureDomain::new(
+                Arc::clone(&registry),
+                launchers.clone(),
+                Arc::clone(&claims),
+                wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
+            ))
+        };
+        let domains: Vec<(Arc<FailureDomain>, usize)> =
+            if arguments.iter().any(|args| args.expert_parallel.is_some()) {
+                let shared = domain(&wakes);
+                (0..wakes.len())
+                    .map(|index| (Arc::clone(&shared), index))
+                    .collect()
+            } else {
+                wakes
+                    .iter()
+                    .map(|wake| (domain(std::slice::from_ref(wake)), 0))
+                    .collect()
+            };
 
         let mut workers = Vec::with_capacity(groups.len());
-        for ((ranks, launchers), args) in groups.into_iter().zip(arguments.iter().cloned()) {
+        for ((((ranks, launchers), args), failure_domain), failure_wake) in
+            groups.into_iter().zip(arguments).zip(domains).zip(wakes)
+        {
             workers.push(Self::from_ranks(
                 args,
                 ranks,
                 launchers,
                 Arc::clone(&registry),
                 Arc::clone(&claims),
+                failure_domain,
+                failure_wake,
             )?);
-        }
-        // Groups that share an expert world fail and are replaced together.
-        if workers
-            .iter()
-            .any(|worker| worker.process_args.expert_parallel.is_some())
-        {
-            let wakes = (0..workers.len())
-                .map(|_| crate::handle::WakeSignal::new())
-                .collect::<std::io::Result<Vec<_>>>()?;
-            let domain = Arc::new(FailureDomain::new(
-                arguments,
-                Arc::clone(&registry),
-                launchers,
-                Arc::clone(&claims),
-                wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
-            ));
-            for (index, (worker, wake)) in workers.iter_mut().zip(wakes).enumerate() {
-                worker.failure_domain = Some((Arc::clone(&domain), index));
-                worker.failure_wake = Some(wake);
-            }
         }
         // Groups that keep a standby start it once every group serves; a
         // successor's groups serve once promoted.
@@ -433,7 +430,8 @@ impl WorkerGroup {
         Ok(workers)
     }
 
-    /// Checks that the ranks' startup reports describe one group and builds it.
+    /// Checks that the ranks' startup reports describe one group and builds
+    /// it, replaced with `failure_domain` and woken by `failure_wake`.
     ///
     /// Each rank validated the report it built; the group registers each
     /// rank's incarnation as the rank it launched. The group takes rank 0's report:
@@ -449,6 +447,8 @@ impl WorkerGroup {
         launchers: Option<crate::worker::launcher::Launchers>,
         registry: Registry,
         claims: StorageClaims,
+        failure_domain: (Arc<FailureDomain>, usize),
+        failure_wake: crate::handle::WakeSignal,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
@@ -620,8 +620,8 @@ impl WorkerGroup {
             readiness_changed: false,
             closed: false,
             failure: None,
-            failure_domain: None,
-            failure_wake: None,
+            failure_domain,
+            failure_wake,
             awaiting: None,
             standby: None,
             handing_over: false,
