@@ -8,6 +8,7 @@ use crate::{DeviceId, Error, HandleType, PrimaryContext, Result, ShareableHandle
 
 const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
 const CU_MEMHOSTREGISTER_PORTABLE: u32 = 1;
+const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
 
 /// Device memory owned by the worker.
 ///
@@ -363,6 +364,36 @@ impl HostRegistration {
     /// The range must be mapped and stay mapped until the registration is
     /// unregistered or dropped.
     pub unsafe fn new(device: DeviceId, pointer: *mut u8, bytes: usize) -> Result<Self> {
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::register(device, pointer, bytes, CU_MEMHOSTREGISTER_PORTABLE) }
+    }
+
+    /// Registers `[pointer, pointer + bytes)` in `device`'s primary context
+    /// as memory devices only read (`CU_MEMHOSTREGISTER_READ_ONLY`), such as
+    /// a read-only mapping of retained host storage.
+    ///
+    /// # Safety
+    /// As for [`HostRegistration::new`].
+    pub unsafe fn read_only(device: DeviceId, pointer: *mut u8, bytes: usize) -> Result<Self> {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            Self::register(
+                device,
+                pointer,
+                bytes,
+                CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_READ_ONLY,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`HostRegistration::new`].
+    unsafe fn register(
+        device: DeviceId,
+        pointer: *mut u8,
+        bytes: usize,
+        flags: u32,
+    ) -> Result<Self> {
         require_bytes(bytes)?;
         let pointer = NonNull::new(pointer)
             .ok_or_else(|| Error::invalid("cannot register a null host range"))?;
@@ -373,13 +404,7 @@ impl HostRegistration {
         driver.check(
             // SAFETY: the caller guarantees the range is mapped and stays mapped
             // until it is unregistered.
-            unsafe {
-                (driver.mem_host_register)(
-                    pointer.as_ptr().cast(),
-                    bytes,
-                    CU_MEMHOSTREGISTER_PORTABLE,
-                )
-            },
+            unsafe { (driver.mem_host_register)(pointer.as_ptr().cast(), bytes, flags) },
             "cuMemHostRegister_v2",
         )?;
 

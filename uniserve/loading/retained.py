@@ -276,6 +276,11 @@ class Layout:
     retained memory for each storage on its device, and calls
     :meth:`publish` once per storage, in order. Lists over fields run
     storage by storage.
+
+    The projection matrices of a stack streamed from host memory
+    (``uniserve.loading.host_weights``) are manifest entries whose data
+    lies in the stack's host region instead of a device storage:
+    :meth:`host_fields` lists them for each stack.
     """
 
     entries: list[_Entry]
@@ -288,12 +293,18 @@ class Layout:
     # Bytes freed into the torch allocator cache since it last returned
     # memory to the driver.
     _cached: int = 0
+    # The entries of host-streamed matrices, by parameter identity.
+    _host: dict[int, _Entry] = field(default_factory=dict)
 
     @classmethod
-    def describe(cls, module: nn.Module) -> Layout:
+    def describe(
+        cls, module: nn.Module, host: frozenset[int] = frozenset()
+    ) -> Layout:
         """The layout of ``module``'s parameters and buffers.
 
         Meta tensors (modules this rank does not hold) are left out.
+        ``host`` names the parameters (by object identity) a stack streams
+        from host memory, which no device storage holds.
 
         Raises:
             ValueError: A tensor lies outside CUDA memory, which retention
@@ -311,6 +322,9 @@ class Layout:
                 )
             entry = _entry(identity, tensor)
             layout.entries.append(entry)
+            if id(tensor) in host:
+                layout._host[id(tensor)] = entry
+                continue
             for name, value in entry.fields.items():
                 storage = value.untyped_storage()
                 key = (str(value.device), storage.data_ptr())
@@ -431,10 +445,50 @@ class Layout:
             torch.cuda.empty_cache()
             self._cached = 0
 
+    def host_fields(self, loaded, path: str) -> list[Any]:
+        """The fields of the stack under ``path`` in its host region.
 
-def describe(loaded) -> Layout:
-    """The publish layout of a rank's loaded model (``rank.Loaded``)."""
-    return Layout.describe(loaded.root)
+        Returns ``[ids, offsets, dtypes, ranks, shapes, strides]``, each a
+        flat list as the ``field_*`` methods return them, with byte offsets
+        in the region (``host_weights.placements``). Call before the stack
+        is bound to its slots.
+
+        Raises:
+            ValueError: A streamed matrix is not a dense host-streamed entry
+                of this layout.
+        """
+        from uniserve.loading import host_weights
+
+        ids, offsets, dtypes, ranks, shapes, strides = [], [], [], [], [], []
+        for parameter, offset in host_weights.placements(loaded, str(path)):
+            entry = self._host.get(id(parameter))
+            if entry is None or entry.representation["kind"] != "dense":
+                raise ValueError(
+                    "a streamed matrix is not a dense host entry of the layout"
+                )
+            ids.append(f"{entry.id}/{_DATA}")
+            offsets.append(offset)
+            dtypes.append(str(parameter.dtype).removeprefix("torch."))
+            ranks.append(parameter.dim())
+            shapes.extend(parameter.shape)
+            strides.extend(parameter.stride())
+        return [ids, offsets, dtypes, ranks, shapes, strides]
+
+
+def describe(loaded, host_paths: Sequence[str] = ()) -> Layout:
+    """The publish layout of a rank's loaded model (``rank.Loaded``).
+
+    ``host_paths`` are the module paths whose layer stacks stream from host
+    memory (``uniserve.loading.host_weights``).
+    """
+    from uniserve.loading import host_weights
+
+    host = {
+        id(parameter)
+        for path in host_paths
+        for parameter in host_weights.streamed(loaded, str(path))
+    }
+    return Layout.describe(loaded.root, frozenset(host))
 
 
 @dataclass

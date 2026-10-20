@@ -47,10 +47,25 @@ const RETAINED: &str = "uniserve.loading.retained";
 const PACK_ALIGNMENT: usize = 512;
 
 /// The keys of one worker's retained weights.
+#[derive(Clone)]
 pub(crate) struct WeightKeys {
     key: Key,
     /// The GPU UUID of each device ordinal the worker addresses.
     gpus: BTreeMap<i32, [u8; 16]>,
+}
+
+/// Weights a worker moved into retained memory and has not put yet: the
+/// host regions of layers streamed from host memory join them
+/// ([`Published::add_host`]) before [`Published::put`].
+pub(crate) struct Published {
+    keys: WeightKeys,
+    /// The library's layout of the loaded model.
+    layout: Handle,
+    manifest: String,
+    /// One record per field, naming its storage by index into `storages`.
+    tensors: Vec<TensorRecord>,
+    /// The retained storages, with their descriptors and placements.
+    storages: Vec<(Arc<Storage>, OwnedFd, Placement)>,
 }
 
 /// Retained weights a worker found, mapped read-only.
@@ -116,6 +131,14 @@ impl WeightKeys {
                     "a retained weight lies on a GPU the worker does not address".into(),
                 )
             })
+    }
+
+    fn first_device(&self) -> Result<DeviceId> {
+        self.gpus
+            .keys()
+            .next()
+            .map(|device| DeviceId(*device))
+            .ok_or_else(|| Error::Invariant("a worker retaining weights addresses a GPU".into()))
     }
 
     fn gpu(&self, device: i64) -> Result<[u8; 16]> {
@@ -185,9 +208,11 @@ impl WeightKeys {
                     &[],
                     Protection::ReadOnly,
                 ),
-                Placement::Host { .. } => Err(Error::Interface(
-                    "a retained weight lies in host memory".into(),
-                )),
+                // The host region of a layer stack streamed from host
+                // memory, registered with the worker's first device.
+                Placement::Host { .. } => {
+                    Storage::import_host(descriptor, record.bytes as usize, self.first_device()?)
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         retained.use_keys(
@@ -209,13 +234,14 @@ impl WeightKeys {
         }))
     }
 
-    /// Publish a loaded model's weights (`model` is `rank.Loaded`): move
-    /// them into retained memory, put them, and downgrade the mappings to
-    /// read-only. Returns the retained storages, which the worker holds
-    /// for its lifetime.
-    pub(crate) fn publish(&self, retained: &Retained, model: &Handle) -> Result<Vec<Arc<Storage>>> {
+    /// Move a loaded model's device weights into retained memory (`model`
+    /// is `rank.Loaded`). The projection matrices of the stacks under
+    /// `host_paths` stream from host memory: their host regions join the
+    /// published weights once allocated ([`Published::add_host`]).
+    pub(crate) fn publish(&self, model: &Handle, host_paths: &[String]) -> Result<Published> {
         let layout = Handle::new(
-            Interpreter::import(&format!("{RETAINED}.describe"))?.call_values(&[model.to_any()])?,
+            Interpreter::import(&format!("{RETAINED}.describe"))?
+                .call_values(&[model.to_any(), Any::from(strings(host_paths))])?,
         )?;
         let method = |name: &str| Interpreter::import(&format!("{RETAINED}.Layout.{name}"));
         let numbers = |name: &str| -> Result<Vec<i64>> {
@@ -293,7 +319,6 @@ impl WeightKeys {
             ])?;
             placed.push((allocation, offset));
         }
-        drop(layout);
 
         // One record per field, naming its allocation and byte offset there.
         let mut tensors = Vec::with_capacity(ids.len() + 1);
@@ -319,39 +344,119 @@ impl WeightKeys {
             });
             position += rank;
         }
-        let manifest_bytes = manifest.as_str().as_bytes();
+        let storages = allocations
+            .into_iter()
+            .map(|(storage, descriptor, _)| {
+                let crate::ffi::MemoryKind::Cuda(device) = storage.device() else {
+                    return Err(Error::Invariant(
+                        "retained weights are device memory".into(),
+                    ));
+                };
+                let gpu = self.gpu(i64::from(device.0))?;
+                Ok((storage, descriptor, Placement::Device { gpu }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Published {
+            keys: self.clone(),
+            layout,
+            manifest: manifest.as_str().to_owned(),
+            tensors,
+            storages,
+        })
+    }
+}
+
+impl Published {
+    /// Add the host region of the layer stack under `path`, which
+    /// `storage` holds, before the stack is bound to its slots (`model` is
+    /// `rank.Loaded`).
+    pub(crate) fn add_host(
+        &mut self,
+        model: &Handle,
+        path: &str,
+        storage: Arc<Storage>,
+        descriptor: OwnedFd,
+    ) -> Result<()> {
+        let function = format!("{RETAINED}.Layout.host_fields");
+        let invalid = |error: tvm_ffi::Error| Error::numerical(&function, &error);
+        let fields = Interpreter::import(&function)?.call_values(&[
+            self.layout.to_any(),
+            model.to_any(),
+            Any::from(tvm_ffi::String::from(path)),
+        ])?;
+        let columns: tvm_ffi::Array<Any> = tvm_ffi::Array::try_from(fields).map_err(invalid)?;
+        let column = |index: usize| columns.get(index).map_err(invalid);
+        let ids = texts(column(0)?).map_err(invalid)?;
+        let offsets = integers(column(1)?).map_err(invalid)?;
+        let dtypes = texts(column(2)?).map_err(invalid)?;
+        let ranks = integers(column(3)?).map_err(invalid)?;
+        let shapes = integers(column(4)?).map_err(invalid)?;
+        let strides = integers(column(5)?).map_err(invalid)?;
+
+        let index = self.storages.len() as u32;
+        let mut position = 0;
+        for (field, id) in ids.iter().enumerate() {
+            let rank = ranks[field] as usize;
+            self.tensors.push(TensorRecord {
+                key: self.keys.field(id),
+                name: format!("weights {id}"),
+                storage: index,
+                offset: offsets[field] as u64,
+                dtype: dtypes[field].clone(),
+                shape: shapes[position..position + rank]
+                    .iter()
+                    .map(|&extent| extent as u64)
+                    .collect(),
+                strides: strides[position..position + rank]
+                    .iter()
+                    .map(|&stride| stride as u64)
+                    .collect(),
+                access: Access::ReadOnly,
+            });
+            position += rank;
+        }
+        self.storages
+            .push((storage, descriptor, Placement::Host { numa_node: None }));
+        Ok(())
+    }
+
+    /// Put the weights and their manifest, and make every retained mapping
+    /// read-only: no worker writes the weights again. Returns the retained
+    /// storages, which the worker holds for its lifetime.
+    pub(crate) fn put(self, retained: &Retained) -> Result<Vec<Arc<Storage>>> {
+        let Self {
+            keys,
+            layout,
+            manifest,
+            mut tensors,
+            storages,
+        } = self;
+        drop(layout);
+        let manifest_bytes = manifest.as_bytes();
         let manifest_memory = host_bytes(manifest_bytes)?;
         tensors.push(TensorRecord {
-            key: self.manifest(),
+            key: keys.manifest(),
             name: "weights manifest".into(),
-            storage: allocations.len() as u32,
+            storage: storages.len() as u32,
             offset: 0,
             dtype: "uint8".into(),
             shape: vec![manifest_bytes.len() as u64],
             strides: vec![1],
             access: Access::ReadOnly,
         });
-        let mut storages = Vec::with_capacity(allocations.len() + 1);
-        for (storage, descriptor, _) in &allocations {
-            let device = match storage.device() {
-                crate::ffi::MemoryKind::Cuda(device) => device,
-                _ => {
-                    return Err(Error::Invariant(
-                        "retained weights are device memory".into(),
-                    ));
-                }
-            };
-            storages.push((
-                StorageRecord {
-                    placement: Placement::Device {
-                        gpu: self.gpu(i64::from(device.0))?,
+        let mut records: Vec<(StorageRecord, std::os::fd::BorrowedFd<'_>)> = storages
+            .iter()
+            .map(|(storage, descriptor, placement)| {
+                (
+                    StorageRecord {
+                        placement: *placement,
+                        bytes: storage.bytes() as u64,
                     },
-                    bytes: storage.bytes() as u64,
-                },
-                descriptor.as_fd(),
-            ));
-        }
-        storages.push((
+                    descriptor.as_fd(),
+                )
+            })
+            .collect();
+        records.push((
             StorageRecord {
                 placement: Placement::Host { numa_node: None },
                 bytes: manifest_bytes.len() as u64,
@@ -359,25 +464,27 @@ impl WeightKeys {
             manifest_memory.as_fd(),
         ));
         let keys: Vec<Key> = tensors.iter().map(|tensor| tensor.key).collect();
-        retained.call("publishing weights", |client| {
-            client.put(tensors, &storages)
-        })?;
+        retained.call("publishing weights", |client| client.put(tensors, &records))?;
         retained.use_keys(keys);
+        drop(records);
 
-        // Published: no worker writes the weights again.
-        let mut retained_storages = Vec::with_capacity(allocations.len());
-        let mut total = 0;
-        for (storage, _, _) in allocations {
+        let mut published = Vec::with_capacity(storages.len());
+        let (mut device_bytes, mut host_bytes) = (0, 0);
+        for (storage, _, placement) in storages {
             storage.protect(Protection::ReadOnly)?;
-            total += storage.bytes();
-            retained_storages.push(storage);
+            match placement {
+                Placement::Device { .. } => device_bytes += storage.bytes(),
+                Placement::Host { .. } => host_bytes += storage.bytes(),
+            }
+            published.push(storage);
         }
         tracing::info!(
-            storages = retained_storages.len(),
-            bytes = total,
+            storages = published.len(),
+            device_bytes,
+            host_bytes,
             "published the loaded weights"
         );
-        Ok(retained_storages)
+        Ok(published)
     }
 }
 

@@ -25,8 +25,8 @@ use std::os::fd::OwnedFd;
 
 use tvm_ffi::{Any, AnyView};
 use uniserve_cuda::{
-    CopyBatch, DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Protection, ShareableHandle,
-    SourceOrder, Strided,
+    CopyBatch, DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
+    ShareableHandle, SourceOrder, Strided,
 };
 
 use crate::ffi::{
@@ -53,6 +53,103 @@ enum Kind {
         mapping: PeerMapping,
         descriptor: Option<OwnedFd>,
     },
+    /// Host memory the Storage Server retains: a memfd mapped into this
+    /// process and registered for device copies.
+    Retained(HostMapping),
+}
+
+/// A shared mapping of a host memfd, registered with CUDA so device copies
+/// read it directly. Read-only once published: mapped `PROT_READ` and
+/// registered `CU_MEMHOSTREGISTER_READ_ONLY`.
+struct HostMapping {
+    address: usize,
+    bytes: usize,
+    device: DeviceId,
+    registration: Mutex<Option<HostRegistration>>,
+}
+
+impl HostMapping {
+    /// Map `bytes` of `descriptor` from its start, writable or not, and
+    /// register the mapping in `device`'s context.
+    fn map(descriptor: &OwnedFd, bytes: usize, device: DeviceId, writable: bool) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let protection = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        // SAFETY: a new shared mapping of a descriptor this call borrows; the
+        // mapping keeps the memory alive after the descriptor closes.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                protection,
+                libc::MAP_SHARED,
+                descriptor.as_raw_fd(),
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(Error::transport_source(
+                "mapping retained host memory",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut mapping = Self {
+            address: address as usize,
+            bytes,
+            device,
+            registration: Mutex::new(None),
+        };
+        mapping.register(writable)?;
+        Ok(mapping)
+    }
+
+    fn register(&mut self, writable: bool) -> Result<()> {
+        let pointer = self.address as *mut u8;
+        // SAFETY: the range is this mapping, which outlives the registration
+        // (`Drop` unregisters before unmapping).
+        let registration = unsafe {
+            if writable {
+                HostRegistration::new(self.device, pointer, self.bytes)
+            } else {
+                HostRegistration::read_only(self.device, pointer, self.bytes)
+            }
+        }?;
+        *lock(&self.registration) = Some(registration);
+        Ok(())
+    }
+
+    /// Make the mapping read-only for the host and the devices. No copy may
+    /// use the range meanwhile.
+    fn seal(&self) -> Result<()> {
+        let mut registration = lock(&self.registration);
+        if let Some(registered) = registration.take() {
+            registered.unregister()?;
+        }
+        // SAFETY: the range is this live mapping.
+        if unsafe { libc::mprotect(self.address as *mut _, self.bytes, libc::PROT_READ) } != 0 {
+            return Err(Error::transport_source(
+                "protecting retained host memory",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: as in `register`.
+        *registration = Some(unsafe {
+            HostRegistration::read_only(self.device, self.address as *mut u8, self.bytes)
+        }?);
+        Ok(())
+    }
+}
+
+impl Drop for HostMapping {
+    fn drop(&mut self) {
+        drop(lock(&self.registration).take());
+        // SAFETY: the last owner of this live mapping, unregistered above.
+        unsafe { libc::munmap(self.address as *mut _, self.bytes) };
+    }
 }
 
 /// How long an exportable allocation lives, which its exports state so a
@@ -204,6 +301,43 @@ impl Storage {
         Ok((storage, descriptor))
     }
 
+    /// New host memory for the Storage Server to retain, of `bytes`, mapped
+    /// writable and registered in `device`'s context, and the descriptor
+    /// that publishes it. Contents are zero.
+    pub(crate) fn host_retainable(device: DeviceId, bytes: usize) -> Result<(Arc<Self>, OwnedFd)> {
+        let descriptor =
+            rustix::fs::memfd_create("uniserve-retained", rustix::fs::MemfdFlags::CLOEXEC)
+                .map_err(|error| {
+                    Error::transport_source(
+                        "creating retained host memory",
+                        std::io::Error::from(error),
+                    )
+                })?;
+        rustix::fs::ftruncate(&descriptor, bytes as u64).map_err(|error| {
+            Error::transport_source("sizing retained host memory", std::io::Error::from(error))
+        })?;
+        let mapping = HostMapping::map(&descriptor, bytes, device, true)?;
+        Ok((
+            Arc::new(Self {
+                kind: Kind::Retained(mapping),
+            }),
+            descriptor,
+        ))
+    }
+
+    /// Map retained host memory, `bytes` long, read-only through its
+    /// `descriptor`, registered in `device`'s context.
+    pub(crate) fn import_host(
+        descriptor: OwnedFd,
+        bytes: usize,
+        device: DeviceId,
+    ) -> Result<Arc<Self>> {
+        let mapping = HostMapping::map(&descriptor, bytes, device, false)?;
+        Ok(Arc::new(Self {
+            kind: Kind::Retained(mapping),
+        }))
+    }
+
     /// A handle that exports the whole allocation in place to other
     /// processes: an exportable allocation's own handle, or the descriptor
     /// of retained memory, which reaches readers on this host only (an
@@ -231,8 +365,11 @@ impl Storage {
         match &self.kind {
             Kind::Device(allocation) => Ok(allocation.protect(protection)?),
             Kind::Mapped { mapping, .. } => Ok(mapping.protect(protection)?),
-            Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
-                "only device memory changes its protection".into(),
+            Kind::Retained(mapping) if protection == Protection::ReadOnly => mapping.seal(),
+            Kind::Retained(_) | Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
+                "only device memory changes its protection, and retained host memory \
+                 only to read-only"
+                    .into(),
             )),
         }
     }
@@ -269,6 +406,11 @@ impl Storage {
                 Some(unsafe { std::slice::from_raw_parts(buffer.as_ptr(), buffer.len()) })
             }
             Kind::Host(bytes) => Some(bytes),
+            // SAFETY: the mapping spans `bytes` and is owned by `self`; the
+            // caller excludes concurrent writers.
+            Kind::Retained(mapping) => Some(unsafe {
+                std::slice::from_raw_parts(mapping.address as *const u8, mapping.bytes)
+            }),
         }
     }
 }
@@ -304,7 +446,7 @@ impl Backing for Storage {
         match &self.kind {
             Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
             Kind::Mapped { mapping, .. } => MemoryKind::Cuda(mapping.device()),
-            Kind::Pinned(_) => MemoryKind::PinnedHost,
+            Kind::Pinned(_) | Kind::Retained(_) => MemoryKind::PinnedHost,
             Kind::Host(_) => MemoryKind::Host,
         }
     }
@@ -315,6 +457,7 @@ impl Backing for Storage {
             Kind::Mapped { mapping, .. } => mapping.address(),
             Kind::Pinned(buffer) => buffer.address(),
             Kind::Host(bytes) => bytes.as_ptr() as u64,
+            Kind::Retained(mapping) => mapping.address as u64,
         }
     }
 
@@ -324,6 +467,7 @@ impl Backing for Storage {
             Kind::Mapped { mapping, .. } => mapping.len(),
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),
+            Kind::Retained(mapping) => mapping.bytes,
         }
     }
 }

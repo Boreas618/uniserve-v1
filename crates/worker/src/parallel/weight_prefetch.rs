@@ -962,6 +962,20 @@ impl Ring {
     }
 }
 
+/// Where the host regions of host-weight stacks come from when the
+/// worker's weights are retained at the Storage Server.
+pub(crate) enum HostRetention<'a> {
+    /// The worker's weights are not retained: each region is page-locked
+    /// memory of the worker's own.
+    None,
+    /// The worker loaded: each region is new retained host memory that joins
+    /// its published weights, filled by binding.
+    Publish(&'a mut crate::storage::weights::Published),
+    /// The worker bound retained weights: each region is a retained host
+    /// storage among these, already holding the matrices.
+    Bound(&'a [Arc<Storage>]),
+}
+
 /// What the copies of a host-weight stack address: its page-locked host
 /// copy of every layer and the device slots.
 struct HostStorage {
@@ -1027,7 +1041,11 @@ impl HostWeights {
     /// # Errors
     /// [`Error::Unsupported`] when a component off CUDA keeps host weights or
     /// a module cannot stream its layers.
-    pub(crate) fn start(model: &LoadedModel, components: &Components) -> Result<Vec<Arc<Self>>> {
+    pub(crate) fn start(
+        model: &LoadedModel,
+        components: &Components,
+        retention: &mut HostRetention<'_>,
+    ) -> Result<Vec<Arc<Self>>> {
         let mut owners = Vec::new();
         for placed in components.placed() {
             if placed.config.weights != ComponentWeights::Host {
@@ -1040,7 +1058,7 @@ impl HostWeights {
                 )));
             };
             for path in model.declarations.roots(&placed.name) {
-                let owner = Self::stream(model, device, &path).map_err(|error| {
+                let owner = Self::stream(model, device, &path, retention).map_err(|error| {
                     Error::Unsupported(format!(
                         "component {} cannot stream {path:?} from host memory: {error}",
                         placed.name
@@ -1052,29 +1070,85 @@ impl HostWeights {
         Ok(owners)
     }
 
-    fn stream(model: &LoadedModel, device: DeviceId, path: &str) -> Result<Arc<Self>> {
-        let function = format!("{HOST_WEIGHTS}.layout");
-        let layout = crate::ffi::integers(Interpreter::import(&function)?.call_values(&[
-            model.handle().to_any(),
-            Any::from(tvm_ffi::String::from(path)),
-        ])?)
-        .map_err(|error| Error::numerical(&function, &error))?;
-        let [layers, layer_bytes] = layout[..] else {
-            return Err(Error::Interface(
-                "a streamed stack's layout names its layers and layer bytes".into(),
-            ));
+    fn stream(
+        model: &LoadedModel,
+        device: DeviceId,
+        path: &str,
+        retention: &mut HostRetention<'_>,
+    ) -> Result<Arc<Self>> {
+        let call = |name: &str| -> Result<Vec<i64>> {
+            let function = format!("{HOST_WEIGHTS}.{name}");
+            let value = Interpreter::import(&function)?.call_values(&[
+                model.handle().to_any(),
+                Any::from(tvm_ffi::String::from(path)),
+            ])?;
+            if name == "layers" {
+                let layers: i64 = value
+                    .try_into()
+                    .map_err(|error| Error::numerical(&function, &error))?;
+                return Ok(vec![layers]);
+            }
+            crate::ffi::integers(value).map_err(|error| Error::numerical(&function, &error))
         };
-        let (layers, layer_bytes) = (
-            usize::try_from(layers)
-                .map_err(|_| Error::Interface("streamed layers are a count".into()))?,
-            usize::try_from(layer_bytes)
-                .map_err(|_| Error::Interface("streamed layer bytes are a count".into()))?,
-        );
+        let count = |value: i64| {
+            usize::try_from(value)
+                .map_err(|_| Error::Interface("a streamed stack's layout holds counts".into()))
+        };
+
+        // One page-locked region of exactly every layer's bytes: retained
+        // at the Storage Server when the worker's weights are, and then
+        // already holding the matrices when the worker bound them.
+        let (host, layers, layer_bytes, filled) = match retention {
+            HostRetention::Bound(storages) => {
+                let layers = count(call("layers")?[0])?;
+                let address = call("address")?[0] as u64;
+                let host = storages
+                    .iter()
+                    .find(|storage| {
+                        storage.address() <= address
+                            && address < storage.address() + storage.bytes() as u64
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Interface(
+                            "no retained host region holds the bound streamed matrices".into(),
+                        )
+                    })?;
+                if layers == 0 || host.bytes() % layers != 0 {
+                    return Err(Error::Interface(
+                        "a retained host region disagrees with its layer count".into(),
+                    ));
+                }
+                let layer_bytes = host.bytes() / layers;
+                (host, layers, layer_bytes, true)
+            }
+            HostRetention::Publish(published) => {
+                let layout = call("layout")?;
+                let [layers, layer_bytes] = layout[..] else {
+                    return Err(Error::Interface(
+                        "a streamed stack's layout names its layers and layer bytes".into(),
+                    ));
+                };
+                let (layers, layer_bytes) = (count(layers)?, count(layer_bytes)?);
+                let (host, descriptor) = Storage::host_retainable(device, layers * layer_bytes)?;
+                published.add_host(model.handle(), path, Arc::clone(&host), descriptor)?;
+                (host, layers, layer_bytes, false)
+            }
+            HostRetention::None => {
+                let layout = call("layout")?;
+                let [layers, layer_bytes] = layout[..] else {
+                    return Err(Error::Interface(
+                        "a streamed stack's layout names its layers and layer bytes".into(),
+                    ));
+                };
+                let (layers, layer_bytes) = (count(layers)?, count(layer_bytes)?);
+                let host = Storage::pinned(device, layers * layer_bytes)?;
+                (host, layers, layer_bytes, false)
+            }
+        };
         let ring = Ring::new(layers)?;
 
-        // One page-locked region of exactly every layer's bytes, and one
-        // device slot per ring position.
-        let host = Storage::pinned(device, layers * layer_bytes)?;
+        // One device slot per ring position.
         let slots = (0..ring.slots)
             .map(|_| Storage::device(device, layer_bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -1117,6 +1191,7 @@ impl HostWeights {
                 Any::from(tvm_ffi::String::from(path)),
                 before,
                 after,
+                Any::from(filled),
                 host_view.handle()?.to_any(),
             ];
             for slot in &slot_views {
