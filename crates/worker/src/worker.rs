@@ -32,6 +32,8 @@ mod storage;
 pub(crate) use loading::LoadedModel;
 pub(crate) use storage::WorkerStorage;
 
+use std::sync::Arc;
+
 use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
@@ -74,6 +76,7 @@ use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
+use crate::storage::retained::Retained;
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
@@ -133,6 +136,8 @@ pub(crate) struct Worker {
     /// Retained for the rank's lifetime: torch, the driver owners and the
     /// reclaimer all use the device's primary context.
     context: Option<PrimaryContext>,
+    /// The worker's connection to its host's Storage Server.
+    retained: Arc<Retained>,
     warmed: bool,
 }
 
@@ -154,6 +159,16 @@ impl Worker {
             }
             Device::Cpu => None,
         };
+        // The worker's memory that outlives it is kept at the host's
+        // Storage Server, which first shoots down a predecessor still
+        // holding it.
+        let retained = Retained::connect(
+            &launch.storage,
+            &launch.group,
+            launch.execution.rank as u32,
+            launch.generation,
+        )
+        .map_err(phase("storage"))?;
 
         let describing = range(c"uniserve.worker.describe", None);
         let description = Description::describe(&launch).map_err(phase("describe"))?;
@@ -250,6 +265,7 @@ impl Worker {
                 DeviceBudget::new(
                     Interpreter::import("torch.cuda.synchronize").map_err(phase("capacity"))?,
                     Interpreter::import("torch.cuda.empty_cache").map_err(phase("capacity"))?,
+                    Arc::clone(&retained),
                 )
                 .map_err(phase("capacity"))?,
             ),
@@ -293,8 +309,8 @@ impl Worker {
         let mut graphs = GraphStorage::new(budgets);
         let mut scratches = Scratches::default();
 
-        let storage =
-            allocate_storage(&launch, &config, &plan, &streams).map_err(phase("storage"))?;
+        let storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
+            .map_err(phase("storage"))?;
         let mut components = components;
         let preparation = device.cuda().and_then(|cuda| streams.preparation(cuda));
         let preparation = preparation
@@ -349,6 +365,7 @@ impl Worker {
                 scratches: &mut scratches,
                 graphs: &mut graphs,
                 preparation,
+                memory: &mut &*retained,
             })
             .map_err(phase("bind"))?
         };
@@ -391,6 +408,7 @@ impl Worker {
                         streams: &mut streams,
                         graphs: &mut graphs,
                         attention: model.attention_backend.clone(),
+                        memory: &mut &*retained,
                     },
                     &components,
                 )
@@ -522,6 +540,9 @@ impl Worker {
             hooks.push(Box::new(ExpertWarmup));
         }
 
+        // Every owner took its memory: retained storages of the scope that
+        // none took any more are released.
+        retained.retain_used().map_err(phase("storage"))?;
         tracing::info!("loaded numerical model");
         Ok(Self {
             config,
@@ -536,6 +557,7 @@ impl Worker {
             executor,
             hooks,
             context,
+            retained,
             warmed: false,
         })
     }
@@ -673,6 +695,11 @@ impl Worker {
             Interpreter::synchronize();
         }
         record(self.streams.close(aborted).map_err(WorkerError::from));
+        if !aborted {
+            // Every stream that wrote the exclusive storages is drained: a
+            // successor takes them without a shoot-down.
+            record(self.retained.release().map_err(WorkerError::from));
+        }
         let mut world = self.world;
         record(world.close(aborted).map_err(WorkerError::from));
         drop(world);

@@ -4,6 +4,7 @@ use uniserve_core::{CallId, RequestId};
 use uniserve_ipc::{BufferAllocation, BufferId, RequestKey};
 use uniserve_worker::ffi::{Backing, MemoryKind};
 use uniserve_worker::storage::BufferPool;
+use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::{Error, Result};
 
 const HOST: MemoryKind = MemoryKind::Host;
@@ -23,7 +24,7 @@ fn allocation(output_index: u16, offset: u64, bytes: u64) -> BufferAllocation {
 
 #[test]
 fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
-    let mut pool = BufferPool::allocate(32, &[HOST])?;
+    let mut pool = BufferPool::allocate(32, &[HOST], &mut LocalMemory)?;
 
     let first = allocation(0, 0, 16);
     let (binding, arena) = pool.bind(first, HOST, 8, 4)?;
@@ -50,8 +51,8 @@ fn fixed_ranges_reserve_their_padding_until_released() -> Result<()> {
 
 #[test]
 fn released_ranges_rebind_without_accepting_stale_or_foreign_handles() -> Result<()> {
-    let mut pool = BufferPool::allocate(1024, &[HOST])?;
-    let mut other = BufferPool::allocate(1024, &[HOST])?;
+    let mut pool = BufferPool::allocate(1024, &[HOST], &mut LocalMemory)?;
+    let mut other = BufferPool::allocate(1024, &[HOST], &mut LocalMemory)?;
     let first = allocation(0, 0, 512);
     let second = allocation(1, 512, 512);
     let (binding, _) = pool.bind(first, HOST, 128, 4)?;

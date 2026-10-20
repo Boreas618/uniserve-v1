@@ -9,6 +9,7 @@ mod pinned_pool;
 mod prefix_cache;
 pub(crate) mod products;
 mod request_slots;
+pub mod retained;
 
 // The storage owners the integration tests and the storage harness drive.
 pub use buffer::{BufferBinding, BufferPool};
@@ -24,6 +25,7 @@ pub use prefix_cache::{PendingImport, PrefixCache};
 pub use products::{
     Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, ValueRange,
 };
+pub use retained::{ExclusiveMemory, ExclusiveSpec, LocalMemory};
 
 pub(crate) use latent::{LatentCache, Scratch};
 pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};

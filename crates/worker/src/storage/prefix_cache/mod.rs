@@ -95,6 +95,10 @@ impl PrefixCache {
     ///
     /// Every import workspace constructs the library's unit resets and
     /// page conversion on its own stream.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pool's shape, its device and stream, and where its planes are taken"
+    )]
     pub fn new(
         plan: Arc<CachePlan>,
         num_units: u32,
@@ -103,9 +107,12 @@ impl PrefixCache {
         import_capacity: usize,
         device: Option<DeviceId>,
         stream: Option<&Stream>,
+        memory: &mut dyn crate::storage::retained::ExclusiveMemory,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
-        let planes = Arc::new(CachePlanes::allocate(plan, device, num_units, stream)?);
+        let planes = Arc::new(CachePlanes::allocate(
+            plan, device, num_units, stream, memory,
+        )?);
         let storage =
             BlockTableStorage::allocate(&shapes, request_pool_size, width, device, stream)?;
         let tables = BlockTables::new(shapes, request_pool_size, width as usize, num_units)?;

@@ -84,6 +84,7 @@ fn engine() -> anyhow::Result<EngineCore> {
     )];
     config.worker_process = WorkerProcessArgs {
         executable: worker_executable(),
+        storage_server: WorkerProcessArgs::storage_server_beside(&worker_executable()),
         model: String::new(),
         stub: true,
         // The stub rank encodes many small images, so it keeps a larger

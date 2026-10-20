@@ -19,6 +19,8 @@ thiserror.workspace = true
 tracing.workspace = true
 uniserve-core.workspace = true
 uniserve-ipc.workspace = true
+uniserve-storage.workspace = true
+uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

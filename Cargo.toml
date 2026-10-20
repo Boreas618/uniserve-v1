@@ -14,6 +14,7 @@ members = [
     "crates/bin/uniserve-launcher",
     "crates/bin/dynamo",
     "crates/bin/uniserve-storage-server",
+    "crates/bin/uniserve-worker",
 ]
 
 [workspace.package]

@@ -6,6 +6,9 @@
 //! starter's session and process tree, writes its log beside its socket and
 //! signals its starter once it listens, so restarting a head or a launcher
 //! never ends it.
+//!
+//! `list` prints what a running server holds, and `retire` releases the
+//! memory of a deployment that is no longer served.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -17,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use uniserve_storage::{Server, socket};
+use uniserve_storage::{Client, Role, Server, socket};
 
 #[derive(Parser)]
 #[command(
@@ -41,10 +44,66 @@ enum Commands {
         #[arg(long)]
         daemon: bool,
     },
+    /// Print the tensors, bytes and deployments the running server holds.
+    List {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Release the memory of a deployment that is no longer served; refused
+    /// while its head is connected.
+    Retire {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        deployment: String,
+    },
 }
 
 fn main() -> ExitCode {
-    let Commands::Serve { socket, daemon } = Arguments::parse().command;
+    let (socket, daemon) = match Arguments::parse().command {
+        Commands::Serve { socket, daemon } => (socket, daemon),
+        Commands::List { socket } => {
+            return operate(socket, |client| {
+                let listing = client.list()?;
+                for tensor in &listing.tensors {
+                    let scopes: Vec<String> =
+                        tensor.scopes.iter().map(ToString::to_string).collect();
+                    println!(
+                        "{} {:?} {} bytes {:?} {} [{}]{}",
+                        tensor.key.hex(),
+                        tensor.placement,
+                        tensor.storage_bytes,
+                        tensor.access,
+                        tensor.name,
+                        scopes.join(", "),
+                        tensor
+                            .writer
+                            .map(|pid| format!(" writer {pid}"))
+                            .unwrap_or_default()
+                    );
+                }
+                for deployment in &listing.deployments {
+                    println!(
+                        "deployment {} head {}",
+                        deployment.deployment,
+                        if deployment.head_connected {
+                            "connected"
+                        } else {
+                            "gone"
+                        }
+                    );
+                }
+                Ok(())
+            });
+        }
+        Commands::Retire { socket, deployment } => {
+            return operate(socket, |client| {
+                let released = client.retire(deployment.clone())?;
+                println!("released {released} tensors of {deployment}");
+                Ok(())
+            });
+        }
+    };
     let socket = socket.unwrap_or_else(socket::default_socket);
     // Forked before any thread exists.
     let ready = if daemon {
@@ -70,6 +129,23 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("storage server failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run an operator's request against the server on `socket`.
+fn operate(
+    socket: Option<PathBuf>,
+    request: impl FnOnce(&mut Client) -> uniserve_storage::Result<()>,
+) -> ExitCode {
+    let socket = socket.unwrap_or_else(socket::default_socket);
+    let result =
+        Client::connect(&socket, Role::Operator).and_then(|mut client| request(&mut client));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("uniserve-storage-server: error: {error}");
             ExitCode::FAILURE
         }
     }

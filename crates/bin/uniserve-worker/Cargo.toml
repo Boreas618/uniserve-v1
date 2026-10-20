@@ -1,0 +1,19 @@
+[package]
+name = "uniserve-worker-main"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The process of one worker. It loads the worker library, the cdylib of
+# `uniserve-worker`, rather than linking the runtime, so the process holds
+# the one instance Python also loads.
+[[bin]]
+name = "uniserve-worker"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+libloading.workspace = true
+
+[lints]
+workspace = true

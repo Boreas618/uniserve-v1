@@ -75,6 +75,7 @@ pub(crate) struct MemAccessDesc {
     pub(crate) flags: i32,
 }
 
+pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READ: i32 = 1;
 pub(crate) const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: i32 = 3;
 
 /// `CUmemcpyAttributes` (v1).

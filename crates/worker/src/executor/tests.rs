@@ -196,7 +196,7 @@ fn cpu_worker(capacity: usize) -> Result<Executor> {
         vec![MemoryKind::Host],
         0,
         0,
-        BufferPool::allocate(1024, &[MemoryKind::Host])?,
+        BufferPool::allocate(1024, &[MemoryKind::Host], &mut crate::storage::LocalMemory)?,
         Arc::clone(&events),
     )?;
     let options = TransportOptions {

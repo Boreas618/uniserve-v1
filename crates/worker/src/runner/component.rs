@@ -95,6 +95,8 @@ pub(crate) struct VideoSetup<'a> {
     pub(crate) graphs: &'a mut GraphStorage,
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
+    /// Where the latent banks are taken.
+    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
 }
 
 impl VideoSetup<'_> {

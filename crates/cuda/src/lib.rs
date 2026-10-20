@@ -53,7 +53,7 @@ pub use green::GreenContext;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use nvml::{Nvml, NvmlMemory};
 pub use stream::{CaptureStatus, Stream};
-pub use vmm::{HandleType, PeerMapping, ShareableHandle};
+pub use vmm::{HandleType, PeerMapping, Protection, ShareableHandle};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///

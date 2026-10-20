@@ -18,6 +18,12 @@ fn defaults() -> Value {
         "queue_depth": 2,
         "watchdog_timeout_ms": 300000,
         "model": "model",
+        "storage": {
+            "socket": "/run/uniserve/storage.sock",
+            "deployment": "model",
+            "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        "host": "localhost",
         "device": "cpu",
         "rank": 0,
         "local_rank": 0,
@@ -90,7 +96,7 @@ fn resolved(overrides: Value) -> Result<WorkerLaunch, String> {
 /// head sends it.
 fn resolve_text(text: &str) -> Result<WorkerLaunch, String> {
     let descriptor = serde_json::from_str(text).map_err(|error| error.to_string())?;
-    resolve(descriptor).map_err(|error| error.to_string())
+    resolve(descriptor, "worker", 1).map_err(|error| error.to_string())
 }
 
 fn two_rank_model() -> Value {

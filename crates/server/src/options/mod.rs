@@ -840,6 +840,13 @@ impl ServeConfig {
         let flashinfer = &self.flashinfer_config;
         let worker_process = WorkerProcessArgs {
             executable: self.worker_config.executable.clone(),
+            // The Storage Server is installed beside the worker executable,
+            // in the environment the workers run in.
+            storage_server: WorkerProcessArgs::storage_server_beside(
+                &self.worker_config.executable,
+            ),
+            // A deployment is what one head serves under its served name.
+            deployment: self.served_model_name().to_owned(),
             model: self.model().to_owned(),
             host: self.host_identity.clone(),
             queue_depth: self.placement_config.queue_depth.get(),

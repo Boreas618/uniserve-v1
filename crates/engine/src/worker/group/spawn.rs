@@ -5,16 +5,18 @@
 //! group waits for its own.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context;
 
+use super::WorkerGroup;
+use super::domain::FailureDomain;
 use super::routing::refuse_shared_storage_off_head;
-use super::{FailureDomain, WorkerGroup};
 use crate::worker::WorkerProcessArgs;
 use crate::worker::registry::Registry;
+use crate::worker::storage::{Claims, StorageClaims};
 use crate::worker::{IncarnationRegistry, PendingWorker, WorkerProcess};
 
 /// Every rank of one group, with the launchers that started the remote ones.
@@ -41,22 +43,21 @@ impl WorkerProcessArgs {
     /// every host this process does not run on; a group placing a rank on
     /// such a host requires it.
     ///
-    /// A replica of an expert-parallel world is not relaunched: its peers
-    /// hold that world's communicators and exchange tokens with it at every
-    /// expert layer, so a replacement rank cannot join them alone.
+    /// A group of an expert-parallel world is relaunched with its failure
+    /// domain instead ([`super::domain::FailureDomain`]).
     pub(super) fn launch(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         registry: &Registry,
         launchers: Option<crate::worker::launcher::Launchers>,
+        claims: &StorageClaims,
     ) -> anyhow::Result<LaunchedGroup> {
         anyhow::ensure!(
             self.expert_parallel.is_none(),
-            "worker {} shares its experts with other replicas and cannot rejoin their \
-             expert-parallel world",
+            "worker {} shares an expert world and is relaunched with its failure domain",
             self.worker_id
         );
-        self.adopt_workers(self.spawn_workers(cancel, registry, launchers, None)?)
+        self.adopt_workers(self.spawn_workers(cancel, registry, launchers, claims, None)?)
     }
 
     /// Starts every rank of one group without waiting for it to register.
@@ -65,13 +66,16 @@ impl WorkerProcessArgs {
     /// processes concurrently and then wait for all of their registrations
     /// together.
     ///
-    /// `expert_store` is the socket the group's first rank serves its
-    /// expert-parallel world's store on, when that rank is the world's rank 0.
+    /// `claims` names the Storage Server and claim each worker's host
+    /// holds for the deployment. `expert_store` is the socket the group's
+    /// first rank serves its expert-parallel world's store on, when that
+    /// rank is the world's rank 0.
     fn spawn_workers(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         registry: &Registry,
         launchers: Option<crate::worker::launcher::Launchers>,
+        claims: &StorageClaims,
         mut expert_store: Option<std::net::TcpListener>,
     ) -> anyhow::Result<LaunchedWorkers> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -172,6 +176,7 @@ impl WorkerProcessArgs {
             ranks.push(PendingWorker::spawn(
                 self,
                 rank as u32,
+                claims.launch(&self.ranks[rank].host)?,
                 rendezvous
                     .as_ref()
                     .map(|rendezvous| rendezvous.address.as_str()),
@@ -235,6 +240,90 @@ impl WorkerProcessArgs {
     }
 }
 
+/// Starts every group of `arguments` and waits until each of their workers
+/// is ready: for a deployment's first launch, and for the relaunch of a
+/// failure domain, whose groups form their communicators again together.
+///
+/// Groups that share an expert world meet at a new rendezvous, which the
+/// world's rank 0 serves on a socket the head binds here, routable when some
+/// worker runs on another host, and which that rank inherits, so the port is
+/// held from the reservation until it serves on it. `arguments` take the
+/// rendezvous's address. Every group's processes start before any group
+/// waits for registrations, so their interpreters and library imports
+/// overlap, and they are awaited together, so the loss of any one ends the
+/// wait of all. Returns each group's workers and launchers, in argument
+/// order.
+pub(super) fn launch_all(
+    arguments: &mut [WorkerProcessArgs],
+    registry: &Registry,
+    launchers: Option<crate::worker::launcher::Launchers>,
+    claims: &StorageClaims,
+) -> anyhow::Result<Vec<LaunchedGroup>> {
+    let mut expert_store = None;
+    if arguments.iter().any(|args| args.expert_parallel.is_some()) {
+        let reachable = match launchers.as_ref() {
+            Some(registry) => Some(crate::worker::launcher::lock(registry)?.reachable_host()?),
+            None => None,
+        };
+        let rendezvous = crate::worker::rendezvous::reserve_rendezvous(reachable)?;
+        for args in arguments.iter_mut() {
+            let placement = args.expert_parallel.as_mut().with_context(|| {
+                format!(
+                    "worker {} does not join the deployment's expert-parallel world",
+                    args.worker_id
+                )
+            })?;
+            placement.address = Some(rendezvous.address.clone());
+            if placement.rank == 0 {
+                anyhow::ensure!(
+                    args.ranks[0].host == args.host,
+                    "expert-parallel rank 0 ({}) must run on the head's host",
+                    args.worker_id
+                );
+            }
+        }
+        expert_store = rendezvous.listener;
+    }
+
+    let startup_cancel = Arc::new(AtomicBool::new(false));
+    let launched = arguments
+        .iter()
+        .map(|args| {
+            let store = match &args.expert_parallel {
+                Some(placement) if placement.rank == 0 => expert_store.take(),
+                _ => None,
+            };
+            args.spawn_workers(
+                Some(Arc::clone(&startup_cancel)),
+                registry,
+                launchers.clone(),
+                claims,
+                store,
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut groups = arguments
+        .iter()
+        .zip(launched)
+        .map(|(args, ranks)| args.adopt_workers(ranks))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut starting: Vec<&mut WorkerProcess> = groups
+        .iter_mut()
+        .flat_map(|(ranks, _)| ranks.iter_mut())
+        .collect();
+    crate::worker::process::finish_startup(&mut starting)?;
+    // Detach cancellation only after every group is ready. A later startup
+    // failure must still terminate already prepared peers.
+    for worker in groups.iter_mut().flat_map(|(ranks, _)| ranks.iter_mut()) {
+        worker.check_worker("deployment readiness")?;
+    }
+    for worker in groups.iter_mut().flat_map(|(ranks, _)| ranks.iter_mut()) {
+        worker.set_startup_cancel(None);
+    }
+    Ok(groups)
+}
+
 impl WorkerGroup {
     /// Launches every configured worker and exposes the group after capability agreement.
     pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
@@ -268,79 +357,23 @@ impl WorkerGroup {
             )?,
             None => None,
         };
-
-        // Replicas sharing their experts form one expert-parallel world at a
-        // TCP store its rank 0 serves. The head binds the store's socket here,
-        // routable when some rank runs on another host, and the world's rank
-        // 0, which must run on this host, inherits it, so the port is held
-        // from the reservation until that rank serves on it.
-        let mut expert_store = None;
-        if arguments.iter().any(|args| args.expert_parallel.is_some()) {
-            let reachable = match launchers.as_ref() {
-                Some(registry) => Some(crate::worker::launcher::lock(registry)?.reachable_host()?),
-                None => None,
-            };
-            let rendezvous = crate::worker::rendezvous::reserve_rendezvous(reachable)?;
-            for args in &mut arguments {
-                let placement = args.expert_parallel.as_mut().with_context(|| {
-                    format!(
-                        "worker {} does not join the deployment's expert-parallel world",
-                        args.worker_id
-                    )
-                })?;
-                placement.address = Some(rendezvous.address.clone());
-                if placement.rank == 0 {
-                    anyhow::ensure!(
-                        args.ranks[0].host == args.host,
-                        "expert-parallel rank 0 ({}) must run on the head's host",
-                        args.worker_id
-                    );
-                }
-            }
-            expert_store = rendezvous.listener;
-        }
-
-        // Every group's processes start before any group waits for
-        // registrations, so their interpreter and library import overlap.
-        let startup_cancel = Arc::new(AtomicBool::new(false));
-        let launched = arguments
-            .iter()
-            .map(|args| {
-                let store = match &args.expert_parallel {
-                    Some(placement) if placement.rank == 0 => expert_store.take(),
-                    _ => None,
-                };
-                args.spawn_workers(
-                    Some(Arc::clone(&startup_cancel)),
-                    &registry,
-                    launchers.clone(),
-                    store,
-                )
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut groups = arguments
-            .iter()
-            .zip(launched)
-            .map(|(args, ranks)| args.adopt_workers(ranks))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        // The ranks of every group are awaited together, so the loss of any
-        // one of them ends the wait of all.
-        let mut starting: Vec<&mut WorkerProcess> = groups
-            .iter_mut()
-            .flat_map(|(ranks, _)| ranks.iter_mut())
-            .collect();
-        crate::worker::process::finish_startup(&mut starting)?;
+        // Every host's Storage Server holds the deployment's claim before a
+        // worker starts there, so the workers find their retained memory
+        // and the server shoots down processes of a previous head first.
+        let claims = Claims::claim(&arguments, launchers.as_ref())?;
+        let groups = launch_all(&mut arguments, &registry, launchers.clone(), &claims)?;
 
         let mut workers = Vec::with_capacity(groups.len());
-        for ((ranks, launchers), args) in groups.into_iter().zip(arguments) {
+        for ((ranks, launchers), args) in groups.into_iter().zip(arguments.iter().cloned()) {
             workers.push(Self::from_ranks(
                 args,
                 ranks,
                 launchers,
                 Arc::clone(&registry),
+                Arc::clone(&claims),
             )?);
         }
+        // Groups that share an expert world fail and are replaced together.
         if workers
             .iter()
             .any(|worker| worker.process_args.expert_parallel.is_some())
@@ -348,25 +381,16 @@ impl WorkerGroup {
             let wakes = (0..workers.len())
                 .map(|_| crate::handle::WakeSignal::new())
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let domain = Arc::new(FailureDomain {
-                cause: OnceLock::new(),
-                wakers: wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
-            });
-            for (worker, wake) in workers.iter_mut().zip(wakes) {
-                worker.failure_domain = Some(Arc::clone(&domain));
+            let domain = Arc::new(FailureDomain::new(
+                arguments,
+                Arc::clone(&registry),
+                launchers,
+                Arc::clone(&claims),
+                wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
+            ));
+            for (index, (worker, wake)) in workers.iter_mut().zip(wakes).enumerate() {
+                worker.failure_domain = Some((Arc::clone(&domain), index));
                 worker.failure_wake = Some(wake);
-            }
-        }
-        // Detach cancellation only after every group is ready. A later
-        // startup failure must still terminate already prepared peers.
-        for group in &mut workers {
-            for rank in &mut group.workers {
-                rank.check_worker("deployment readiness")?;
-            }
-        }
-        for group in &mut workers {
-            for rank in &mut group.workers {
-                rank.set_startup_cancel(None);
             }
         }
         Ok(workers)
@@ -387,6 +411,7 @@ impl WorkerGroup {
         mut workers: Vec<WorkerProcess>,
         launchers: Option<crate::worker::launcher::Launchers>,
         registry: Registry,
+        claims: StorageClaims,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
@@ -543,6 +568,7 @@ impl WorkerGroup {
         Ok(Self {
             launchers,
             registry,
+            claims,
             workers,
             buffers,
             depth,
@@ -559,6 +585,7 @@ impl WorkerGroup {
             failure: None,
             failure_domain: None,
             failure_wake: None,
+            awaiting: None,
         })
     }
 }

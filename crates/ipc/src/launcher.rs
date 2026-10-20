@@ -7,8 +7,9 @@
 //!
 //! - the launcher sends its [`Registration`](crate::Registration) once, then
 //!   [`Report`]s: a [`Reservation`] answering each [`Instruction::Reserve`],
-//!   and a [`WorkerExit`] for each rank it still supervises that exits, which
-//!   excludes ranks an [`Instruction::Stop`] ended;
+//!   the claim answering [`Instruction::Claim`], and a [`WorkerExit`] for
+//!   each worker it still supervises that exits, which excludes workers an
+//!   [`Instruction::Stop`] ended;
 //! - the head sends [`Instruction`]s.
 //!
 //! Each launch of a worker group has a generation, which every [`WorkerSpawn`]
@@ -38,6 +39,11 @@ pub enum Instruction {
     /// group is relaunched under its next generation. The stopped ranks'
     /// exits are not reported.
     Stop { worker_id: String },
+    /// Claim the deployment at the host's Storage Server on the head's
+    /// behalf, starting the server when the host has none, and hold the
+    /// claim while the head's connection lasts. The launcher answers with
+    /// [`Report::Claim`].
+    Claim(StorageClaim),
     /// Stop every rank the launcher owns and end supervision.
     Terminate,
 }
@@ -64,12 +70,28 @@ pub struct WorkerSpawn {
     pub environment: HashMap<String, String>,
 }
 
+/// What a launcher claims at its host's Storage Server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageClaim {
+    /// The deployment: the served model name.
+    pub deployment: String,
+    /// The `(worker group, rank)` scopes the deployment places on the host;
+    /// the server releases every other scope of the deployment.
+    pub scopes: Vec<(String, u32)>,
+    /// The `uniserve-storage-server` executable that starts the host's
+    /// server when it has none.
+    pub server: String,
+}
+
 /// One message a launcher sends after its registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Report {
     Reservation(Reservation),
     Exit(WorkerExit),
+    /// The host's Storage Server and the claim held there, or why the claim
+    /// failed.
+    Claim(Result<crate::StorageLaunch, String>),
 }
 
 /// A launcher's answer to the [`Instruction::Reserve`] the head sent last.

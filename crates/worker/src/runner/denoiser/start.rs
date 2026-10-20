@@ -92,6 +92,7 @@ impl DenoiserRunners {
             scratch,
             graph_pool,
             transient_layouts: config.max_request_pool_size,
+            memory: &mut *setup.memory,
         })?;
         self.video = Some(Component {
             name: placed.name.clone(),

@@ -87,7 +87,7 @@ pub mod registration;
 pub use channel::{Channel, Listener, Wake};
 pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;
-pub use launch::{ExpertParallelDescriptor, LaunchDescriptor};
+pub use launch::{ExpertParallelDescriptor, LaunchDescriptor, StorageLaunch};
 pub use registration::{Registration, VERSION};
 
 // Message types are split by concern and re-exported flat at the crate root;

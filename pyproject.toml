@@ -122,7 +122,7 @@ debug = false
 # `uniserve-worker`: it runs workers in this environment.
 [[tool.setuptools-rust.bins]]
 target = "uniserve-worker"
-path = "crates/worker/Cargo.toml"
+path = "crates/bin/uniserve-worker/Cargo.toml"
 debug = false
 
 # The Storage Server of one host, which the head and the launchers start when

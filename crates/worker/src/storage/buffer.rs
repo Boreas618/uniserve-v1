@@ -137,17 +137,31 @@ impl BufferPool {
 
 impl BufferPool {
     /// Allocate one arena of `byte_capacity` bytes per memory in `devices`.
-    /// Device arenas are exportable
-    /// allocations, so CUDA VMM exports of persistent products are made in
-    /// place; host arenas serve CPU lanes. Contents are uninitialized.
-    pub fn allocate(byte_capacity: u64, devices: &[MemoryKind]) -> Result<Self> {
+    /// Device arenas are exclusive storages `memory` provides, exportable in
+    /// place, so CUDA VMM exports of persistent products are made in place;
+    /// host arenas serve CPU lanes. Contents are uninitialized.
+    pub fn allocate(
+        byte_capacity: u64,
+        devices: &[MemoryKind],
+        memory: &mut dyn crate::storage::retained::ExclusiveMemory,
+    ) -> Result<Self> {
         let bytes = usize::try_from(byte_capacity)
             .map_err(|_| Error::Invalid("buffer pool capacity overflows".into()))?;
         let arenas = devices
             .iter()
             .map(|&device| {
                 let arena = match device {
-                    MemoryKind::Cuda(index) => Storage::exportable(index, bytes, &[])?,
+                    MemoryKind::Cuda(index) => memory
+                        .exclusive(&[crate::storage::retained::ExclusiveSpec {
+                            name: "buffer_pool",
+                            device: index,
+                            bytes,
+                            access: &[],
+                        }])?
+                        .pop()
+                        .ok_or_else(|| {
+                            Error::Invariant("the buffer pool's storage is missing".into())
+                        })?,
                     MemoryKind::Host | MemoryKind::PinnedHost => Storage::host(bytes),
                 };
                 Ok((device, arena))
