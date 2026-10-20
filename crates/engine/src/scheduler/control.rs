@@ -234,11 +234,11 @@ impl Scheduler {
     /// (`crate::handover`); other requests are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
         let running = self.running.contains_key(&id);
-        let Some(state) = self
-            .running
-            .get_mut(&id)
-            .or_else(|| self.waiting.iter_mut().find(|state| state.req.request_id == id))
-        else {
+        let Some(state) = self.running.get_mut(&id).or_else(|| {
+            self.waiting
+                .iter_mut()
+                .find(|state| state.req.request_id == id)
+        }) else {
             return;
         };
         while state
@@ -269,13 +269,17 @@ impl Scheduler {
             return;
         }
         if let Some(state) = self.remove_waiting(id) {
-            let _ = state.output.events.event_tx.send(EngineCoreOutput::Finished {
-                reason: FinishReason::Stop,
-                stop_reason: None,
-                prompt_tokens: state.prompt_tokens(),
-                completion_tokens: state.num_generated_tokens,
-                images: 0,
-            });
+            let _ = state
+                .output
+                .events
+                .event_tx
+                .send(EngineCoreOutput::Finished {
+                    reason: FinishReason::Stop,
+                    stop_reason: None,
+                    prompt_tokens: state.prompt_tokens(),
+                    completion_tokens: state.num_generated_tokens,
+                    images: 0,
+                });
         }
     }
 }
