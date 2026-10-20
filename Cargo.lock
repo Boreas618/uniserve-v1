@@ -9280,6 +9280,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-storage"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "rmp-serde",
+ "rustix 1.1.4",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "uniserve-storage-server"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "signal-hook-registry",
+ "tracing",
+ "tracing-subscriber",
+ "uniserve-storage",
+]
+
+[[package]]
 name = "uniserve-worker"
 version = "2.0.0"
 dependencies = [
