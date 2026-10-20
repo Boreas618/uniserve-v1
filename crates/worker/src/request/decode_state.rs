@@ -248,6 +248,39 @@ impl DecodeState {
         Ok(())
     }
 
+    /// Count `tokens` in slot `slot`'s penalty counts on `stream`, after
+    /// `reset` zeroed them: the tokens its request generated on a
+    /// predecessor engine (`GenerationParams::generated_token_ids`), which
+    /// its penalties count as generated. Fails for a token outside the
+    /// vocabulary.
+    pub(crate) fn count_generated(
+        &self,
+        slot: usize,
+        tokens: &[u32],
+        stream: impl Issue,
+    ) -> Result<()> {
+        self.require_slot(slot)?;
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let mut counts = vec![0_i32; self.vocab];
+        for &token in tokens {
+            let count = counts.get_mut(token as usize).ok_or_else(|| {
+                Error::Invalid("a generated token is outside the vocabulary".into())
+            })?;
+            *count = count.saturating_add(1);
+        }
+
+        // The slot's whole row is written from the host counts.
+        let row = self.penalty_counts.address() + (4 * self.vocab * slot) as u64;
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(row, counts.as_ptr() as u64, 4 * self.vocab);
+        // SAFETY: the destination is one row of this state; the source is
+        // read during the call.
+        unsafe { stream.copy(&batch) }?;
+        Ok(())
+    }
+
     /// Set `slots`' continuation flags to `value` on `stream` (warmup graph
     /// capture runs its decode rows as active continuations).
     pub(crate) fn set_predicates(
@@ -313,6 +346,28 @@ mod tests {
         assert_eq!(counts[5], 3);
         assert_eq!(counts[10], 0);
         assert!(state.reset(&[4], None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_resumed_request_counts_its_generated_tokens() -> Result<()> {
+        let lengths = StorageView::contiguous(
+            Storage::host(4 * 4) as Arc<dyn Backing>,
+            0,
+            DType::I32,
+            &[4],
+        )?;
+        let state = DecodeState::allocate(3, 5, DType::BF16, lengths, None, None)?;
+        state.count_generated(2, &[4, 1, 4], None)?;
+        let counts = read::<i32>(&state.penalty_counts);
+        assert_eq!(&counts[10..15], &[0, 1, 0, 0, 2]);
+        assert!(
+            counts[..10]
+                .iter()
+                .chain(&counts[15..])
+                .all(|count| *count == 0)
+        );
+        assert!(state.count_generated(1, &[5], None).is_err());
         Ok(())
     }
 }

@@ -56,7 +56,7 @@ use super::image::ImageParts;
 use super::inputs::{Inputs, component_device};
 use super::products::Publications;
 use crate::error::WorkerError;
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
 use crate::lock;
@@ -131,7 +131,7 @@ impl TransferRuntime {
 }
 
 impl RequestStorage for TransferRuntime {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         Ok(())
     }
 

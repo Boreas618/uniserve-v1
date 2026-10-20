@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use uniserve_ipc::{Batch, BatchCommand, BufferId, CallKind, RequestKey};
+use uniserve_ipc::{Batch, BatchCommand, BufferId, CallKind, NewRequest, RequestKey};
 
 use super::backend::Runtimes;
 use crate::lane::Job;
@@ -97,12 +97,18 @@ impl LaneJobs {
     }
 }
 
+/// A request slot a batch's `Start` admitted, and the admission it holds.
+pub(crate) struct AdmittedSlot<'a> {
+    pub(crate) slot: usize,
+    pub(crate) request: &'a NewRequest,
+}
+
 /// Storage that request epochs and products own, driven by lifecycle
 /// commands. Methods run on the executor thread.
 pub(crate) trait RequestStorage {
     /// Reset per-slot state of newly admitted request slots; the resets a
     /// device makes are recorded into `jobs`.
-    fn admit_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()>;
+    fn admit_slots(&mut self, admitted: &[AdmittedSlot<'_>], jobs: &LaneJobs) -> Result<()>;
 
     /// Revoke explicitly freed products and those of finished requests.
     /// Existing readers keep their physical leases. What follows a

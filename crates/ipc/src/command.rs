@@ -90,6 +90,10 @@ pub struct GenerationParams {
     pub finish_token_ids: Vec<u32>,
     /// Logical position assigned to the first request token.
     pub initial_position: u32,
+    /// Tokens the request generated on a predecessor engine before it
+    /// resumed on this one (a control-plane handover), in order. They end
+    /// its prompt, and its penalties count them as generated tokens.
+    pub generated_token_ids: Vec<u32>,
 }
 
 pub use uniserve_core::{CanvasSampling, DiffusionSamplingParams};

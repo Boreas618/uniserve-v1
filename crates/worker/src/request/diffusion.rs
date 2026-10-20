@@ -426,11 +426,12 @@ impl Trajectories {
 impl crate::executor::lifecycle::RequestStorage for Trajectories {
     fn admit_slots(
         &mut self,
-        slots: &[usize],
+        admitted: &[crate::executor::lifecycle::AdmittedSlot<'_>],
         _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         // A reused slot never continues an earlier request's trajectory.
-        self.release(slots);
+        let slots: Vec<usize> = admitted.iter().map(|admitted| admitted.slot).collect();
+        self.release(&slots);
         Ok(())
     }
 

@@ -299,6 +299,11 @@ impl Scheduler {
     /// cleared after a media pass does; either kind runs when the other has
     /// nothing to schedule.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
+        // A paused scheduler lets what is in flight drain before it hands
+        // over.
+        if self.paused() {
+            return Vec::new();
+        }
         if self.prefer_media {
             let batches = self.prepare_media_batches();
             if !batches.is_empty() {

@@ -793,7 +793,7 @@ impl OutputPool {
 impl crate::executor::lifecycle::RequestStorage for OutputPool {
     fn admit_slots(
         &mut self,
-        _slots: &[usize],
+        _admitted: &[crate::executor::lifecycle::AdmittedSlot<'_>],
         _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())

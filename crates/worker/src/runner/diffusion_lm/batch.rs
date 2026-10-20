@@ -45,7 +45,7 @@ use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::batch::{
     Batch, Failure, Launched, Opening, Stage, StreamOrder, fail, unsupported,
 };
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{Completion, Job};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
@@ -268,7 +268,7 @@ impl Committing {
 }
 
 impl RequestStorage for DiffusionLMRunner {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         // A request's first denoising step starts its block in the banks
         // before any step reads them; admission resets nothing.
         Ok(())

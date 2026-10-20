@@ -22,7 +22,7 @@ use uniserve_ipc::{
 };
 
 use super::image::ImageParts;
-use super::lifecycle::{LaneJobs, RequestStorage};
+use super::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
 use crate::host::HostLane;
@@ -662,8 +662,16 @@ impl WorkerBackend {
         })();
         // Reset every admitted slot even when a later Start failed.
         if !admitted.is_empty() {
+            let slots: Vec<AdmittedSlot<'_>> = admitted
+                .iter()
+                .zip(&installed)
+                .map(|(&slot, request)| AdmittedSlot {
+                    slot,
+                    request: request.as_ref(),
+                })
+                .collect();
             for owner in self.runtimes.owners() {
-                owner.admit_slots(&admitted, &self.lifecycle)?;
+                owner.admit_slots(&slots, &self.lifecycle)?;
             }
             self.perform_lifecycle()?;
         }

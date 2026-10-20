@@ -111,6 +111,9 @@ pub struct WorkerGroup {
     /// The rank group standing by to replace this one when it fails
     /// (`worker_config.standby`), while it starts or parks.
     standby: Option<standby::Standby>,
+    /// Set while a control-plane handover prepares: the successor's
+    /// workers stand by for the group, which keeps no standby of its own.
+    handing_over: bool,
 }
 
 /// A call's identity across request epochs: engine identifier, request

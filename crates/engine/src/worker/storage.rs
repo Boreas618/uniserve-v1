@@ -8,6 +8,11 @@
 //! the head, or with the launcher that holds it for the head. Each worker
 //! starts with its host's socket and claim token ([`StorageLaunch`]), by
 //! which the server tells it belongs to the current head.
+//!
+//! A successor head of a control-plane handover claims nothing at first: it
+//! connects as the deployment's next head, and its standby workers start
+//! under the predecessor's claim ([`Claims::adopt`]). Once the predecessor's
+//! workers have closed, it takes that claim over ([`Claims::take_over`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -16,7 +21,7 @@ use std::time::Duration;
 use anyhow::Context;
 use uniserve_ipc::StorageLaunch;
 use uniserve_ipc::launcher::StorageClaim;
-use uniserve_storage::{Client, Role, Scope};
+use uniserve_storage::{Claim, Client, Role, Scope};
 
 use crate::worker::WorkerProcessArgs;
 use crate::worker::launcher::Launchers;
@@ -30,9 +35,12 @@ pub(crate) type StorageClaims = Arc<Claims>;
 pub(crate) struct Claims {
     /// The connection that holds the claim at this host's server, when the
     /// deployment places a worker here.
-    _local: Option<Mutex<Client>>,
+    local: Option<Mutex<Client>>,
     /// The storage launch of each host's workers.
     launches: BTreeMap<String, StorageLaunch>,
+    /// A successor's scopes and the predecessor's claim it adopted, until
+    /// `take_over` takes the claim over.
+    adopted: Mutex<Option<(Vec<Scope>, Claim)>>,
 }
 
 impl Claims {
@@ -48,8 +56,9 @@ impl Claims {
     ) -> anyhow::Result<StorageClaims> {
         let Some(first) = arguments.first() else {
             return Ok(Arc::new(Self {
-                _local: None,
+                local: None,
                 launches: BTreeMap::new(),
+                adopted: Mutex::new(None),
             }));
         };
         let deployment = &first.deployment;
@@ -144,9 +153,84 @@ impl Claims {
             "claimed the deployment's storage"
         );
         Ok(Arc::new(Self {
-            _local: local,
+            local,
             launches,
+            adopted: Mutex::new(None),
         }))
+    }
+
+    /// A successor's claims: connect to this host's server as the next head
+    /// of `arguments`' deployment, whose current head holds `claim`, and
+    /// launch the workers under that claim, standing by. Every group must
+    /// place its ranks on this host.
+    ///
+    /// Fails when the server cannot be reached or a rank runs on another
+    /// host.
+    pub(crate) fn adopt(
+        arguments: &[WorkerProcessArgs],
+        claim: [u8; 16],
+    ) -> anyhow::Result<StorageClaims> {
+        let first = arguments
+            .first()
+            .context("a successor adopts the claim of at least one worker group")?;
+        let deployment = &first.deployment;
+        let mut scopes = Vec::new();
+        for args in arguments {
+            for (rank, placed) in args.ranks.iter().enumerate() {
+                anyhow::ensure!(
+                    placed.host == first.host,
+                    "worker {} places a rank on host {}, but a successor takes over only \
+                     the workers of its own host",
+                    args.worker_id,
+                    placed.host
+                );
+                scopes.push(Scope {
+                    deployment: deployment.clone(),
+                    group: args.worker_id.clone(),
+                    rank: rank as u32,
+                });
+            }
+        }
+        let socket = uniserve_storage::socket::default_socket();
+        let client = Client::connect(
+            &socket,
+            Role::Head {
+                deployment: deployment.clone(),
+            },
+        )
+        .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
+        let launch = StorageLaunch {
+            socket: socket.to_string_lossy().into_owned(),
+            deployment: deployment.clone(),
+            claim,
+            page_tier: first.page_tier,
+            tcp: None,
+            standby: true,
+        };
+        Ok(Arc::new(Self {
+            local: Some(Mutex::new(client)),
+            launches: BTreeMap::from([(first.host.clone(), launch)]),
+            adopted: Mutex::new(Some((scopes, Claim(claim)))),
+        }))
+    }
+
+    /// Take the adopted claim over from the predecessor head, keeping the
+    /// successor's scopes. Does nothing once taken over, or for claims that
+    /// adopted none.
+    pub(crate) fn take_over(&self) -> anyhow::Result<()> {
+        let mut adopted = crate::lock(&self.adopted);
+        let Some((scopes, claim)) = adopted.take() else {
+            return Ok(());
+        };
+        let local = self
+            .local
+            .as_ref()
+            .context("an adopted claim holds a connection to this host's server")?;
+        crate::lock(local)
+            .take_over(scopes, claim)
+            .context("taking the deployment's claim over")?;
+        tracing::info!("took the deployment's storage claim over");
+        Ok(())
     }
 
     /// The storage launch of the workers on `host`.

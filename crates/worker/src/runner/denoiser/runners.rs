@@ -8,7 +8,7 @@ use uniserve_ipc::{BufferId, CallKind, MediaCall, RequestKey};
 use super::image::{ConditionRow, DenoiseRow};
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
-use crate::executor::lifecycle::{LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
@@ -425,7 +425,7 @@ impl DenoiserRunners {
 }
 
 impl RequestStorage for DenoiserRunners {
-    fn admit_slots(&mut self, _slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
         // A slot's layout is held when its request's admission is installed.
         Ok(())
     }

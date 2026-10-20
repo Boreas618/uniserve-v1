@@ -232,6 +232,7 @@ impl Scheduler {
             config,
             fatal: false,
             tiers: None,
+            quiesce: None,
             stats,
         })
     }
@@ -350,9 +351,10 @@ impl Scheduler {
     ///
     /// Returns `true` if the engine died (executor or worker failure) rather
     /// than shutting down on a `Shutdown` command or command-channel
-    /// disconnect. Either way, every queued or running request is finished with
-    /// `Aborted`, every receiver still open can read its complete event stream
-    /// through its terminal event, and the executor is closed before
+    /// disconnect, or handing over after a `Quiesce` command. Either way, every
+    /// queued or running request is finished with `Aborted` or handed over,
+    /// every receiver still open can read its complete event stream through
+    /// its terminal event or its relay, and the executor is closed before
     /// returning.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
@@ -366,6 +368,12 @@ impl Scheduler {
                 self.abort_all_requests();
                 let _ = self.executor.close();
                 return true;
+            }
+            // A quiescing scheduler hands over at its first quiescent step
+            // boundary, and its loop ends.
+            if self.quiescing() && self.quiescent() {
+                self.hand_over(&rx);
+                return false;
             }
 
             if !progressed {

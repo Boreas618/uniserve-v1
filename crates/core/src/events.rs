@@ -65,7 +65,11 @@ pub struct PositionLogprobs {
 }
 
 /// Typed event stream the engine emits for each request, of either kind.
-#[derive(Debug, Clone)]
+///
+/// Every event but an `Artifact`, whose media is a mapping of this process,
+/// serializes, so a control-plane handover relays a token request's events
+/// between processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineCoreOutput {
     /// Reports scheduler admission timing.
     Scheduled {
@@ -168,6 +172,7 @@ pub enum EngineCoreOutput {
         completed_steps: u32,
     },
     /// Publishes a transport-backed media artifact.
+    #[serde(skip)]
     Artifact(ArtifactEvent),
     /// Generated media could not be acquired from its published storage.
     ///

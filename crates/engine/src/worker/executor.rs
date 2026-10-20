@@ -959,6 +959,37 @@ impl WorkerExecutor {
     }
 }
 
+impl crate::executor::ExecutorHandover for WorkerExecutor {
+    fn prepare(&mut self) -> anyhow::Result<crate::handover::Adoption> {
+        let mut claim = None;
+        let mut cache_units = std::collections::BTreeMap::new();
+        for (id, group) in &mut self.workers {
+            let (units, group_claim) = group.prepare_handover()?;
+            claim = Some(group_claim);
+            cache_units.insert(id.to_string(), units);
+        }
+        Ok(crate::handover::Adoption {
+            claim: claim.context("an executor hands over at least one worker group")?,
+            cache_units,
+        })
+    }
+
+    fn abandon(&mut self) {
+        for (_, group) in &mut self.workers {
+            group.abandon_handover();
+        }
+    }
+
+    fn promote(&mut self) -> anyhow::Result<()> {
+        for (id, group) in &mut self.workers {
+            group
+                .promote_workers()
+                .with_context(|| format!("promoting worker group {id}"))?;
+        }
+        Ok(())
+    }
+}
+
 impl Executor for WorkerExecutor {
     fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         // Submissions already queued for the worker claim its free group slots.
@@ -1402,6 +1433,10 @@ impl Executor for WorkerExecutor {
     /// Groups can share expert communicators, so each must receive shutdown
     /// before another waits for collective retirement. Every group is joined
     /// even when one fails; the first error is returned.
+    fn handover(&mut self) -> Option<&mut dyn crate::executor::ExecutorHandover> {
+        Some(self)
+    }
+
     fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
         std::thread::scope(|scope| {

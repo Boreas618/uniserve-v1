@@ -341,7 +341,28 @@ impl WorkerGroup {
     /// Groups are returned in argument order. A failure of any group fails the
     /// whole launch; ranks already spawned are shut down as the values that
     /// own them, and the launcher registry, drop.
-    pub fn spawn_all(mut arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+    pub fn spawn_all(arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+        Self::launch_groups(arguments, None)
+    }
+
+    /// Launches a successor's rank groups in a control-plane handover
+    /// (`crate::handover`), as `spawn_all` does but standing by: `arguments`
+    /// state standby workers and the cache units they adopt, and the workers
+    /// start under the predecessor head's `claim`, which the groups take
+    /// over when they promote their workers (`promote_workers`). Every rank
+    /// must run on this host. The groups start no standby of their own until
+    /// they are promoted.
+    pub(crate) fn spawn_successors(
+        arguments: Vec<WorkerProcessArgs>,
+        claim: [u8; 16],
+    ) -> anyhow::Result<Vec<Self>> {
+        Self::launch_groups(arguments, Some(claim))
+    }
+
+    fn launch_groups(
+        mut arguments: Vec<WorkerProcessArgs>,
+        adopted: Option<[u8; 16]>,
+    ) -> anyhow::Result<Vec<Self>> {
         // One launcher per host serves every group of the deployment, so the
         // registry is bound and its hosts awaited once, before any group
         // sends a rank to them.
@@ -363,8 +384,13 @@ impl WorkerGroup {
         };
         // Every host's Storage Server holds the deployment's claim before a
         // worker starts there, so the workers find their retained memory
-        // and the server shoots down processes of a previous head first.
-        let claims = Claims::claim(&arguments, launchers.as_ref())?;
+        // and the server shoots down processes of a previous head first. A
+        // successor's workers start under the claim of the head they
+        // succeed.
+        let claims = match adopted {
+            Some(claim) => Claims::adopt(&arguments, claim)?,
+            None => Claims::claim(&arguments, launchers.as_ref())?,
+        };
         let groups = launch_all(&mut arguments, &registry, launchers.clone(), &claims)?;
 
         let mut workers = Vec::with_capacity(groups.len());
@@ -397,9 +423,12 @@ impl WorkerGroup {
                 worker.failure_wake = Some(wake);
             }
         }
-        // Groups that keep a standby start it once every group serves.
-        for worker in &mut workers {
-            worker.start_standby();
+        // Groups that keep a standby start it once every group serves; a
+        // successor's groups serve once promoted.
+        if adopted.is_none() {
+            for worker in &mut workers {
+                worker.start_standby();
+            }
         }
         Ok(workers)
     }
@@ -595,6 +624,7 @@ impl WorkerGroup {
             failure_wake: None,
             awaiting: None,
             standby: None,
+            handing_over: false,
         })
     }
 }
