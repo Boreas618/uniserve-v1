@@ -1,6 +1,5 @@
 //! JSON extractor that combines deserialization with `validator` checks.
 
-use crate::openai::Normalizable;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
@@ -9,11 +8,9 @@ use validator::Validate;
 
 use crate::openai::ApiError;
 
-/// A JSON extractor that automatically normalizes and validates the request
-/// body.
+/// A JSON extractor that validates the request body.
 ///
-/// After deserialization the extractor first calls
-/// [`Normalizable::normalize`] and then `Validate::validate`. The amount of
+/// After deserialization the extractor calls `Validate::validate`. The amount of
 /// checking performed by the latter is entirely determined by `T`'s `Validate`
 /// impl. Request types declare `#[validate(...)]` constraints for ranges and
 /// cross-parameter checks, while fallible request lowering enforces the
@@ -28,17 +25,15 @@ pub(crate) struct ValidatedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
-    T: DeserializeOwned + Validate + Normalizable + Send,
+    T: DeserializeOwned + Validate + Send,
     S: Send + Sync,
 {
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let Json(mut data) = Json::<T>::from_request(req, state)
+        let Json(data) = Json::<T>::from_request(req, state)
             .await
             .map_err(|err: JsonRejection| ApiError::json_parse_error(err.body_text()))?;
-
-        data.normalize();
 
         data.validate().map_err(|validation_errors| {
             ApiError::invalid_request(validation_errors.to_string(), None)

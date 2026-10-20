@@ -12,7 +12,7 @@
 
 use crate::profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 use crate::profile::reasoning::{DelimitedReasoningParser, ReasoningParser as _};
-use crate::serving::text::tokenizer::DynTokenizer;
+use crate::profile::tokenizer::DynTokenizer;
 
 /// Stateful SenseNova reasoning and visible-wrapper filter for one request.
 pub(crate) struct SenseNovaOutputProcessor {

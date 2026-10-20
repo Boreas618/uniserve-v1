@@ -26,6 +26,6 @@ pub use config::{
     load_tokenizer_config, read_json,
 };
 pub use error::{Error, Result};
-pub use model_files::{ResolvedModelFiles, resolve_model_file};
+pub use model_files::ResolvedModelFiles;
 pub use pipeline::PipelineCheckpoint;
 pub use pipeline_index::{PipelineIndex, resolve_pipeline_index};

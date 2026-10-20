@@ -66,11 +66,6 @@ pub enum RequestOutput {
         /// Per-position candidate log probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
     },
-    /// Newly decoded text consumed by a model protocol rather than exposed as output.
-    InternalTextDelta {
-        /// Newly decoded internal text.
-        text: String,
-    },
     /// Newly decoded structured reasoning text.
     ReasoningDelta {
         /// Newly decoded reasoning text.

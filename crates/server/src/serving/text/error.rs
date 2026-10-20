@@ -7,7 +7,6 @@
 //! `Rejected` and `Failed` terminal events rather than output-processing
 //! failures.
 
-use crate::engine_client::Error as GatewayError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,26 +34,12 @@ pub enum Error {
     /// The tokenizer cannot encode or decode model text.
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
-    /// Sampling controls violate the engine sampling contract.
-    #[error("invalid sampling parameters: {0}")]
-    InvalidSampling(#[from] uniserve_core::SamplingParamsError),
-    /// The minimum generation length exceeds the maximum generation length.
-    #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
-    MinTokensExceedsMaximum {
-        /// Requested minimum generated-token count.
-        min_tokens: u32,
-        /// Effective maximum generated-token count.
-        max_tokens: u32,
-    },
     /// A tokenized text request contains an empty prompt.
     #[error("text request `{request_id}` must contain at least one prompt token ID")]
     EmptyPromptTokenIds {
         /// Identifier of the rejected request.
         request_id: String,
     },
-    /// The lowered request violates the canonical engine request contract.
-    #[error("invalid canonical generation request: {0}")]
-    InvalidGenerationRequest(String),
     /// The tokenized prompt fills or exceeds the model context window, leaving
     /// no room for a generated token.
     #[error(
@@ -81,12 +66,6 @@ pub enum Error {
         /// Description of the violated output invariant.
         message: String,
     },
-    /// Model profile assets cannot be resolved.
-    #[error(transparent)]
-    ModelAssets(#[from] crate::profile::assets::Error),
-    /// The engine gateway rejects the request or fails its stream.
-    #[error(transparent)]
-    Gateway(#[from] GatewayError),
 }
 
 /// Result type returned by text serving calls.

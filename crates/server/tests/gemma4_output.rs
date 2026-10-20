@@ -269,7 +269,6 @@ async fn assistant_blocks(
                 | (AssistantBlockKind::Text, Some(Block::Text(text))) => text.push_str(&delta),
                 (AssistantBlockKind::Reasoning, _) => blocks.push(Block::Reasoning(delta)),
                 (AssistantBlockKind::Text, _) => blocks.push(Block::Text(delta)),
-                (AssistantBlockKind::ToolCall, _) => panic!("tool calls are not text deltas"),
             },
             AssistantEvent::ToolCallStart { name, .. } => {
                 open_arguments = Some((name, String::new()));

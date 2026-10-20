@@ -8,8 +8,6 @@ use axum::extract::State;
 
 use crate::AppState;
 
-use crate::http::utils::unix_timestamp;
-
 /// Returns the served model in OpenAI `list models` format.
 ///
 /// A server serves exactly one model, so the list always has one entry, named
@@ -17,7 +15,7 @@ use crate::http::utils::unix_timestamp;
 pub(crate) async fn list_models(State(state): State<Arc<AppState>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; the listing
     // reports the time it was produced.
-    let created = unix_timestamp() as i64;
+    let created = uniserve_core::now_unix_secs_u64() as i64;
     Json(ListModelsResponse {
         object: "list".to_string(),
         data: vec![ModelObject {

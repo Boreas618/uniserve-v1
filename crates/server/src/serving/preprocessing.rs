@@ -12,7 +12,7 @@
 use crate::profile::tools;
 use crate::serving::chat::{
     AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart,
-    ChatMessage as ServingChatMessage, ChatToolChoice, ReasoningEffort as ServingReasoningEffort,
+    ChatMessage as ServingChatMessage, ChatToolChoice,
 };
 use crate::serving::{
     DecodeControls, ImageGenControls, ModalitySelection, OutputDetail, PromptInput, SamplingConfig,
@@ -25,7 +25,7 @@ use crate::openai::error::{ApiError, bail_invalid_request};
 use crate::openai::utils::convert_logit_bias;
 use crate::openai::{
     ChatCompletionRequest, ChatImageConfig, ChatMessage, ChatModality, ContentPart, MessageContent,
-    ReasoningEffort, Tool, ToolCall, ToolChoice, ToolChoiceValue,
+    Tool, ToolCall,
 };
 
 /// Returns the URL of every input image in a chat request, in prompt order.
@@ -132,9 +132,10 @@ impl crate::serving::InputProcessor {
         let prompt = PromptInput::Chat(crate::serving::chat::ChatRequest {
             messages,
             tools: convert_tools(request.tools)?,
-            tool_choice: convert_tool_choice(request.tool_choice),
+            // An absent choice lets the model decide, as OpenAI's default does.
+            tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
             chat_options: crate::serving::chat::ChatOptions {
-                reasoning_effort: request.reasoning_effort.map(convert_reasoning_effort),
+                reasoning_effort: request.reasoning_effort,
                 template_kwargs,
                 ..Default::default()
             },
@@ -219,19 +220,6 @@ fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
         timestep_shift: config.timestep_shift,
         seed: config.seed,
         max_images: config.num_images,
-    }
-}
-
-/// Maps the wire reasoning effort onto the serving enum variant of the same name.
-fn convert_reasoning_effort(value: ReasoningEffort) -> ServingReasoningEffort {
-    match value {
-        ReasoningEffort::None => ServingReasoningEffort::None,
-        ReasoningEffort::Minimal => ServingReasoningEffort::Minimal,
-        ReasoningEffort::Low => ServingReasoningEffort::Low,
-        ReasoningEffort::Medium => ServingReasoningEffort::Medium,
-        ReasoningEffort::High => ServingReasoningEffort::High,
-        ReasoningEffort::XHigh => ServingReasoningEffort::XHigh,
-        ReasoningEffort::Max => ServingReasoningEffort::Max,
     }
 }
 
@@ -369,14 +357,6 @@ fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError>
 fn convert_message_tools(tools: Option<Vec<Tool>>) -> Result<Option<Vec<tools::Tool>>, ApiError> {
     let tools = convert_tools(tools)?;
     Ok((!tools.is_empty()).then_some(tools))
-}
-
-/// Converts the tool choice; an absent choice means `auto`.
-fn convert_tool_choice(tool_choice: Option<ToolChoice>) -> ChatToolChoice {
-    match tool_choice.map(|choice| choice.0) {
-        None | Some(ToolChoiceValue::Auto) => ChatToolChoice::Auto,
-        Some(ToolChoiceValue::None) => ChatToolChoice::None,
-    }
 }
 
 impl crate::serving::InputProcessor {

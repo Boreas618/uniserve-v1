@@ -139,7 +139,7 @@ impl PipelineCheckpoint {
     /// Resolves the pipeline checkpoint `model_id` names.
     ///
     /// `model_id` is a local directory or a Hub repository, as for
-    /// [`resolve_model_file`](super::resolve_model_file). Returns `None` for
+    /// `ModelSource::file`. Returns `None` for
     /// a checkpoint that publishes no pipeline index.
     ///
     /// # Errors
@@ -179,7 +179,7 @@ impl PipelineCheckpoint {
     /// # Errors
     ///
     /// Returns [`Error::Invalid`] for a component the index does not declare,
-    /// and the errors of [`resolve_model_file`](super::resolve_model_file)
+    /// and the errors of `ModelSource::file`
     /// for the file, including [`Error::MissingFile`] when neither source
     /// holds it.
     pub async fn component_file(&self, component: &str, filename: &str) -> Result<PathBuf> {

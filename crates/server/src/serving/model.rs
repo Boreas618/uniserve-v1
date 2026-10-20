@@ -240,16 +240,13 @@ impl ModelConfig {
         model_dtype: uniserve_core::ModelDtype,
     ) -> uniserve_core::GenerationLimits {
         match &self.parameters {
-            ModelParameters::Qwen3 => uniserve_core::GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
-            ModelParameters::MiniMaxH3 => uniserve_core::GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
+            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
+                uniserve_core::GenerationLimits {
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                }
+            }
             ModelParameters::SenseNova(profile) => profile.runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
             // A readout prefills text and encoded images and denoises its

@@ -7,9 +7,7 @@
 //! every field not listed here, at every level.
 
 use serde::Deserialize;
-use validator::Validate;
 
-use super::common::Normalizable;
 use uniserve_core::VideoTask;
 use uniserve_core::video::plan::{ConditionType, Role};
 
@@ -57,7 +55,7 @@ pub struct VideoTarget {
 /// MiniMax-H3 video-and-audio generation request for the `/v1/videos`
 /// routes. The served checkpoint fixes the schedule, and every request
 /// generates one video.
-#[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VideoGenerationRequest {
     /// Served model name.
@@ -79,5 +77,3 @@ pub struct VideoGenerationRequest {
 const fn default_seed() -> u64 {
     DEFAULT_VIDEO_SEED
 }
-
-impl Normalizable for VideoGenerationRequest {}

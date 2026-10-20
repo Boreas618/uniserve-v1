@@ -223,20 +223,16 @@ pub struct ImageEncoderInput {
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
 pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: MediaCall) -> u64 {
+    use std::hash::Hasher as _;
+
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the encoder index distinguishes repeated encoder kinds within one image
     // input.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in image_hash
-        .to_le_bytes()
-        .into_iter()
-        .chain((encoder_index as u64).to_le_bytes())
-        .chain([encoder as u8])
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    let mut hasher = crate::Fnv1a::default();
+    hasher.write(&image_hash.to_le_bytes());
+    hasher.write(&(encoder_index as u64).to_le_bytes());
+    hasher.write(&[encoder as u8]);
+    hasher.finish()
 }
 
 /// Product channel through which a materialized image reaches feedback encode.

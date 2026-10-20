@@ -98,11 +98,6 @@ impl Metrics {
         encode(&mut output, &self.registry)?;
         Ok(output)
     }
-
-    /// Returns the registry owned by this metrics object.
-    pub fn registry(&self) -> &Registry {
-        &self.registry
-    }
 }
 
 impl Default for Metrics {

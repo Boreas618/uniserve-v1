@@ -13,11 +13,8 @@
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use uniserve_server::profile::tools::test_utils::{split_by_chars, test_tools};
+use uniserve_server::profile::tools::test_utils::{collect_stream, split_by_chars, test_tools};
 use uniserve_server::profile::tools::{Qwen25ToolParser, Tool};
-
-mod utils;
-use utils::feed_parser;
 
 /// Unicode scalar values per streamed chunk.
 const CHUNK_CHARS: usize = 7;
@@ -40,8 +37,13 @@ fn long_normal_text_fixture() -> String {
     line.repeat(LONG_NORMAL_TEXT_REPEATS)
 }
 
-fn native_parser(tools: &[Tool]) -> Qwen25ToolParser {
-    Qwen25ToolParser::new(tools)
+/// Feeds chunks into a parser and returns visible text plus parsed-call count.
+///
+/// The stream is finished after the last chunk, which resets `parser` for the
+/// next stream. A parser error panics inside `collect_stream`.
+fn feed_parser(parser: &mut Qwen25ToolParser, chunks: &[&str]) -> (String, usize) {
+    let result = collect_stream(parser, chunks);
+    (result.normal_text(), result.calls().count())
 }
 
 fn run_stream_group(
@@ -64,7 +66,7 @@ fn run_stream_group(
     // One parser serves every iteration; this relies on `finish`, called at
     // the end of each stream by `collect_stream`, resetting parser state.
     group.bench_function("native_reuse_parser", |b| {
-        let mut parser = native_parser(tools);
+        let mut parser = Qwen25ToolParser::new(tools);
         b.iter(|| {
             let result = feed_parser(&mut parser, black_box(&chunks));
             debug_assert_eq!(result.0, expected_normal_text);
@@ -77,7 +79,7 @@ fn run_stream_group(
     // runs in the untimed `iter_batched` setup closure.
     group.bench_function("native_create_parser", |b| {
         b.iter_batched(
-            || native_parser(tools),
+            || Qwen25ToolParser::new(tools),
             |mut parser| {
                 let result = feed_parser(&mut parser, black_box(&chunks));
                 debug_assert_eq!(result.0, expected_normal_text);

@@ -48,7 +48,7 @@ enum OutputSink {
 fn build_output_sink(
     request_id: &ServeRequestId,
     policy: OutputProcessorPolicy,
-    tokenizer: &crate::serving::text::tokenizer::DynTokenizer,
+    tokenizer: &crate::profile::tokenizer::DynTokenizer,
     prompt_token_ids: &[u32],
 ) -> Result<OutputSink> {
     match policy {

@@ -16,9 +16,6 @@
 //! the server's `reasoning_parsing` setting decides whether Qwen3 `<think>`
 //! sections become reasoning blocks.
 
-pub use crate::profile::reasoning::{ReasoningDelta, ReasoningError};
-pub use crate::profile::tools::ToolParserError;
-pub use crate::serving::text::{FinishReason, StopReason};
 pub use error::{Error, Result};
 pub use event::{AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall};
 pub use output::{ChatOutputProcessor, Gemma4ChatOutputProcessor, Qwen3ChatOutputProcessor};

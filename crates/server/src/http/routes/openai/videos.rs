@@ -266,7 +266,7 @@ pub(crate) async fn videos_create(
     Extension(RequestId(base_id)): Extension<RequestId>,
     VideoBody(body): VideoBody,
 ) -> Response {
-    use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
+    use crate::video_jobs::{VideoFailure, VideoJob};
 
     let request_id = crate::serving::ServeRequestId::new(format!("vid-{base_id}"));
 
@@ -290,7 +290,7 @@ pub(crate) async fn videos_create(
         id: id.clone(),
         object: "video",
         model: state.served_model_name().to_owned(),
-        created_at: timestamp(),
+        created_at: uniserve_core::now_unix_secs_u64(),
         completed_at: None,
         expires_at: None,
         seconds: prepared.duration_seconds,

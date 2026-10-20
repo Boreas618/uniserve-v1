@@ -31,8 +31,6 @@ pub enum AssistantBlockKind {
     Text,
     /// Extracted reasoning content.
     Reasoning,
-    /// One finalized tool call.
-    ToolCall,
 }
 
 /// One structured assistant output block.
@@ -53,42 +51,12 @@ pub enum AssistantContentBlock {
 }
 
 impl AssistantContentBlock {
-    /// Returns the semantic kind of this block.
-    pub fn kind(&self) -> AssistantBlockKind {
-        match self {
-            Self::Text { .. } => AssistantBlockKind::Text,
-            Self::Reasoning { .. } => AssistantBlockKind::Reasoning,
-            Self::ToolCall(..) => AssistantBlockKind::ToolCall,
-        }
-    }
-
     /// Returns this block as one finalized tool call, if applicable.
     pub fn as_tool_call(&self) -> Option<&AssistantToolCall> {
         match self {
             Self::ToolCall(call) => Some(call),
             _ => None,
         }
-    }
-
-    /// Returns this block with leading and trailing whitespace trimmed from all text
-    /// fields and tool call arguments, or `None` if the resulting text would be empty.
-    ///
-    /// Tool-call blocks are always kept, even with empty arguments.
-    pub fn trim(mut self) -> Option<Self> {
-        match &mut self {
-            Self::Text { text } | Self::Reasoning { text } => {
-                let trimmed_text = text.trim();
-                if trimmed_text.is_empty() {
-                    return None;
-                } else {
-                    *text = trimmed_text.to_string();
-                }
-            }
-            Self::ToolCall(call) => {
-                call.arguments = call.arguments.trim().to_string();
-            }
-        }
-        Some(self)
     }
 }
 
@@ -152,16 +120,5 @@ impl AssistantMessage {
     /// Pushes one new block to the end of the message content.
     pub fn push_block(&mut self, block: AssistantContentBlock) {
         self.content.push(block);
-    }
-
-    /// Returns this message with leading and trailing whitespace trimmed from all text
-    /// fields and tool call arguments, and with any blocks that are empty after trimming removed.
-    pub fn trim(mut self) -> Self {
-        self.content = self
-            .content
-            .into_iter()
-            .filter_map(|block| block.trim())
-            .collect();
-        self
     }
 }

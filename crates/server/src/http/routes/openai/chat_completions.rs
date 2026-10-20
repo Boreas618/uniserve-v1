@@ -17,7 +17,6 @@ use tracing_futures::Instrument as _;
 use crate::AppState;
 use crate::http::middleware::RequestId;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
-use crate::http::utils::unix_timestamp;
 
 /// Validates one chat completion request and runs it through the serving runtime.
 ///
@@ -43,7 +42,7 @@ pub(crate) async fn chat_completions(
     );
 
     // One timestamp for the whole response, shared by every streamed chunk.
-    let created = unix_timestamp();
+    let created = uniserve_core::now_unix_secs_u64();
     let log_request = state.enable_log_requests();
 
     let serve_stream = match state
@@ -81,7 +80,7 @@ pub(crate) async fn chat_completions(
                 parent: &request_span,
                 model = %response.model,
                 prompt_tokens = usage.map_or(0, |u| u.prompt_tokens),
-                output_tokens = usage.and_then(|u| u.completion_tokens).unwrap_or(0),
+                output_tokens = usage.map_or(0, |u| u.completion_tokens),
                 finish_reason = response.choices.first().and_then(|c| c.finish_reason.as_deref()).unwrap_or("unknown"),
                 "chat completion finished"
             );

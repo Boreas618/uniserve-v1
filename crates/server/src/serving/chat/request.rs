@@ -505,20 +505,6 @@ impl ChatRequest {
     }
 }
 
-impl ChatRole {
-    /// Returns the snake_case role label, matching this enum's serde
-    /// representation.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Developer => "developer",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::ToolResponse => "tool_response",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

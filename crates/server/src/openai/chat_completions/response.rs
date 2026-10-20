@@ -159,13 +159,13 @@ pub async fn collect_chat_completion(
     } else {
         None
     };
-    let usage = Usage::from_generation_counts(
+    let usage = Usage::new(
         prompt_token_count as u32,
         output_token_count as u32,
         image_count,
         image_steps,
-    )
-    .with_image_steps_per_image(image_steps_per_image);
+        image_steps_per_image,
+    );
 
     Ok(ChatCompletionResponse {
         id: request_id,
@@ -187,7 +187,6 @@ pub async fn collect_chat_completion(
             token_ids: (return_token_ids && include_output_metadata).then_some(token_ids),
         }],
         usage: Some(usage),
-        system_fingerprint: None,
         prompt_logprobs,
         prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
     })
@@ -675,13 +674,11 @@ pub async fn chat_completion_chunk_stream(
                         &request_id,
                         &response_model,
                         created,
-                        Usage::from_generation_counts(
+                        Usage::new(
                             prompt_token_count as u32,
                             output_token_count as u32,
                             image_count,
                             image_steps,
-                        )
-                        .with_image_steps_per_image(
                             completed_image_ids
                                 .iter()
                                 .map(|image_id| {
@@ -792,13 +789,6 @@ impl PendingChatChunk {
         match kind {
             AssistantBlockKind::Text => append_delta_text(&mut self.delta.content, delta),
             AssistantBlockKind::Reasoning => append_delta_text(&mut self.delta.reasoning, delta),
-            // Callers pass only `Text` and `Reasoning`; tool calls use
-            // `push_tool_call_start` and `push_tool_call_arguments`. A stray
-            // tool-call kind is logged and dropped instead of panicking inside
-            // a live stream.
-            AssistantBlockKind::ToolCall => {
-                error!("unexpected tool-call block delta on chunk path; dropping");
-            }
         }
     }
 
@@ -988,14 +978,6 @@ fn block_delta_chunk(
             reasoning: Some(delta),
             ..Default::default()
         },
-        // Callers pass only `Text` and `Reasoning`; tool calls use
-        // `tool_call_start_chunk` and `tool_call_arguments_chunk`. A stray
-        // tool-call kind yields an empty delta and an error log instead of
-        // panicking inside a live stream.
-        AssistantBlockKind::ToolCall => {
-            error!("unexpected tool-call block delta on chunk path; emitting empty delta");
-            ChatMessageDelta::default()
-        }
     };
 
     let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);

@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -137,14 +136,6 @@ pub(crate) struct VideoJobs {
     settings: VideoJobSettings,
 }
 
-/// Current Unix time in whole seconds, or `0` if the clock is before the epoch.
-pub(crate) fn timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 impl VideoJobs {
     /// Creates an empty store under `settings`.
     pub(crate) fn new(settings: VideoJobSettings) -> Self {
@@ -253,7 +244,7 @@ impl VideoJobs {
             return;
         };
 
-        let now = timestamp();
+        let now = uniserve_core::now_unix_secs_u64();
         job.record.completed_at = Some(now);
         job.record.expires_at = Some(now + self.settings.retention.as_secs());
         match result {
@@ -334,7 +325,7 @@ mod tests {
             id: id.to_owned(),
             object: "video",
             model: "FastH3".to_owned(),
-            created_at: timestamp(),
+            created_at: uniserve_core::now_unix_secs_u64(),
             completed_at: None,
             expires_at: None,
             seconds: 5.0,

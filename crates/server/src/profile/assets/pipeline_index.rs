@@ -81,7 +81,7 @@ impl PipelineIndex {
 
     /// Returns the checkpoint-relative path of `filename` inside `component`'s folder.
     ///
-    /// The result is suitable for `resolve_model_file`. An undeclared
+    /// The result is suitable for `ModelSource::file`. An undeclared
     /// component is [`Error::Invalid`].
     pub fn component_file(&self, component: &str, filename: &str) -> Result<String> {
         let folder = self.components.get(component).ok_or_else(|| {

@@ -27,16 +27,10 @@ pub enum Error {
     /// arguments that are not valid JSON).
     #[error("chat template error: {0}")]
     ChatTemplate(String),
-    /// The selected renderer cannot represent multimodal content.
-    #[error("multimodal input is not supported by this chat renderer")]
-    UnsupportedMultimodalRenderer,
     /// Multimodal content reached a text-only conversion or a renderer
     /// configured without multimodal support.
     #[error("unsupported multimodal content: {0}")]
     UnsupportedMultimodalContent(&'static str),
-    /// Multimodal content cannot be converted into model inputs.
-    #[error("multimodal preprocessing error: {0}")]
-    Multimodal(String),
     /// A reasoning or tool-call output parser cannot be initialized.
     #[error("failed to initialize {kind} parser `{name}`")]
     ParserInitialization {
@@ -47,23 +41,6 @@ pub enum Error {
         /// Parser-specific initialization error.
         #[source]
         error: BoxedError,
-    },
-    /// The rendered prompt exceeds the model context limit.
-    #[error(
-        "this model's maximum context length is {max_model_len} tokens, \
-         but the prompt contains {prompt_len} input tokens"
-    )]
-    PromptTooLong {
-        /// Maximum prompt length accepted by the model.
-        max_model_len: u32,
-        /// Rendered prompt length in tokens.
-        prompt_len: u32,
-    },
-    /// The engine stream ends without a terminal event.
-    #[error("chat request stream `{request_id}` closed before terminal output")]
-    StreamClosedBeforeTerminalOutput {
-        /// Identifier of the incomplete request.
-        request_id: String,
     },
     /// Incremental tool-call events violate the assembler state contract:
     /// arguments arrive with no open tool call, or for a tool index other than

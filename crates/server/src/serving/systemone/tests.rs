@@ -133,7 +133,6 @@ impl Checkpoint {
             tokenizer_path,
             tokenizer_config_path: Some(tokenizer_config_path),
             generation_config_path: None,
-            preprocessor_config_path: None,
             chat_template_path: None,
             config_path: None,
         };

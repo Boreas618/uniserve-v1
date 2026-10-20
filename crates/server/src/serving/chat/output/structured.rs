@@ -171,9 +171,6 @@ impl OutputProcessor {
             AssistantBlockKind::Reasoning => AssistantContentBlock::Reasoning {
                 text: open_block.text,
             },
-            AssistantBlockKind::ToolCall => {
-                unreachable!("tool calls must not be assembled as text blocks")
-            }
         };
         self.num_completed_blocks += 1;
         events.push(RequestOutput::OutputBlockEnd {
@@ -210,6 +207,5 @@ fn push_delta(events: &mut Vec<RequestOutput>, kind: AssistantBlockKind, text: S
             logprobs: None,
         },
         AssistantBlockKind::Reasoning => RequestOutput::ReasoningDelta { text },
-        AssistantBlockKind::ToolCall => unreachable!("tool calls use argument deltas"),
     });
 }

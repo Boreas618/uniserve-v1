@@ -134,29 +134,6 @@ impl ModelDescription {
     }
 }
 
-impl std::str::FromStr for ModelDescription {
-    type Err = ModelDescriptionParseError;
-
-    /// Parses a profile identifier as returned by [`ModelDescription::id`],
-    /// also accepting the hyphenated spellings `minimax-h3` and
-    /// `diffusion-gemma`.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "qwen3" => Ok(Self::Qwen3),
-            "sensenova" => Ok(Self::SenseNova),
-            "bagel" => Ok(Self::Bagel),
-            "minimax-h3" | "minimax_h3" => Ok(Self::MiniMaxH3),
-            "diffusion-gemma" | "diffusion_gemma" => Ok(Self::DiffusionGemma),
-            _ => Err(ModelDescriptionParseError(value.to_owned())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unsupported model description {0:?}")]
-/// Error returned for an unsupported model-description name.
-pub struct ModelDescriptionParseError(String);
-
 /// Model-provided sampling defaults. `None` remains distinct from an explicit zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SamplingDefaults {
@@ -468,7 +445,6 @@ mod tests {
             tokenizer_path,
             tokenizer_config_path: Some(tokenizer_config_path),
             generation_config_path: Some(generation_config_path),
-            preprocessor_config_path: None,
             chat_template_path: None,
             config_path: Some(config_path),
         };

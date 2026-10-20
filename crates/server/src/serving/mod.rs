@@ -164,13 +164,7 @@ pub type Result<T> = std::result::Result<T, ServeError>;
 /// partition. Otherwise the key is the 64-bit FNV-1a hash of the salt, which is
 /// deterministic across processes.
 pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
-    salt.map(|salt| {
-        salt.as_bytes()
-            .iter()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            })
-    })
+    salt.map(|salt| uniserve_core::Fnv1a::hash(salt.as_bytes()))
 }
 
 /// Tokenized input retains only the response processing its computation needs.
@@ -633,7 +627,7 @@ struct StreamInput {
     request_id: ServeRequestId,
     event_context: EventContext,
     prompt_token_ids: Vec<u32>,
-    tokenizer: crate::serving::text::tokenizer::DynTokenizer,
+    tokenizer: crate::profile::tokenizer::DynTokenizer,
     prompt_logprobs_requested: bool,
     generated_logprobs_requested: bool,
     emit_token_ids: bool,

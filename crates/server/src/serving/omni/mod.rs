@@ -31,11 +31,11 @@ use uniserve_core::{
     MultimodalInputs, SamplingParams,
 };
 
+use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
 use crate::serving::input::{ModalitySelection, OutputProcessorPolicy, PromptInput};
-use crate::serving::text::tokenizer::DynTokenizer;
 
 pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 
@@ -676,7 +676,10 @@ fn replace_chat_images(
 /// `replace_rendered_slots` rejects a rendered prompt in which any placeholder
 /// does not occur exactly once, including when request text repeats it.
 fn image_placeholder(request_id: &str, index: usize) -> String {
-    format!("[IMAGE_SLOT_{:016x}_{index}]", fnv1a(request_id.as_bytes()))
+    format!(
+        "[IMAGE_SLOT_{:016x}_{index}]",
+        uniserve_core::Fnv1a::hash(request_id.as_bytes())
+    )
 }
 
 /// Replaces each rendered image placeholder exactly once and returns its byte offset.
@@ -742,15 +745,5 @@ fn combine_cache_keys(key: u64, value: u64) -> u64 {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&key.to_le_bytes());
     bytes[8..].copy_from_slice(&value.to_le_bytes());
-    fnv1a(&bytes)
-}
-
-/// Computes a 64-bit FNV-1a hash that is stable across processes and builds.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    uniserve_core::Fnv1a::hash(&bytes)
 }

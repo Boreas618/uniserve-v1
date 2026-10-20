@@ -8,13 +8,13 @@
 use super::reasoning::reasoning_event_stream;
 use super::tool::tool_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
+use crate::profile::tokenizer::DynTokenizer;
 use crate::profile::tools::Qwen25ToolParser;
 use crate::profile::tools::Tool;
 use crate::serving::chat::{
     ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice, HfChatRenderer,
 };
 use crate::serving::chat::{Error, Result as ChatResult};
-use crate::serving::text::tokenizer::DynTokenizer;
 
 /// The tool-call instruction of Qwen3 chat templates: one JSON object with
 /// `name` and `arguments` inside `<tool_call>` lines, the format

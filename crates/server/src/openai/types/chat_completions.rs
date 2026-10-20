@@ -9,23 +9,22 @@ use serde_with::SerializeDisplay;
 use validator::Validate;
 
 use super::common::{
-    ChatLogProbs, ChatMessage, ContentPart, MessageContent, Normalizable, ReasoningEffort,
-    StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
-    Usage, default_true, validate_stop, validate_top_p_value,
+    ChatLogProbs, ChatMessage, ContentPart, MessageContent, StreamOptions, StringOrArray, Tool,
+    ToolCall, ToolCallDelta, Usage, default_true, validate_stop, validate_top_p_value,
 };
+use crate::serving::chat::{ChatToolChoice, ReasoningEffort};
 
 /// The configured OpenAI-compatible chat request.
 ///
 /// The route's `ValidatedJson` extractor deserializes it (unknown fields are
-/// rejected), calls [`Normalizable::normalize`], and then runs the field
-/// validators below and `validate_chat_cross_parameters`. The served-model
+/// rejected) and then runs the field validators below and
+/// `validate_chat_cross_parameters`. The served-model
 /// and `prompt_logprobs` checks run later in `validate_request_compat`, and
 /// `InputProcessor::preprocess_chat_request` lowers the request into serving
 /// inputs. Besides the OpenAI fields, the schema accepts sampling and output
 /// extensions such as `top_k`, `min_p`, `prompt_logprobs`, and
 /// `return_token_ids`.
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
 pub struct ChatCompletionRequest {
@@ -85,7 +84,7 @@ pub struct ChatCompletionRequest {
     /// Function tools available to the assistant.
     pub tools: Option<Vec<Tool>>,
     /// Policy controlling whether the assistant may call a tool.
-    pub tool_choice: Option<ToolChoice>,
+    pub tool_choice: Option<ChatToolChoice>,
     /// Requested reasoning budget.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Extra chat-template variables, such as `enable_thinking`, which
@@ -177,25 +176,6 @@ pub struct ChatImageConfig {
     pub timestep_shift: Option<f32>,
 }
 
-impl Normalizable for ChatCompletionRequest {
-    /// Defaults `tool_choice` when `tools` is present: `none` for an empty
-    /// list and `auto` otherwise.
-    ///
-    /// `ValidatedJson` calls this before validation, so
-    /// `validate_chat_cross_parameters` sees the defaulted value.
-    fn normalize(&mut self) {
-        if self.tool_choice.is_none()
-            && let Some(tools) = &self.tools
-        {
-            self.tool_choice = Some(ToolChoice(if tools.is_empty() {
-                ToolChoiceValue::None
-            } else {
-                ToolChoiceValue::Auto
-            }));
-        }
-    }
-}
-
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 /// Non-streaming chat-completion response body.
@@ -212,8 +192,6 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<ChatCompletionChoice>,
     /// Request usage accounting, when available.
     pub usage: Option<Usage>,
-    /// Backend fingerprint, when reported.
-    pub system_fingerprint: Option<String>,
     /// Prompt logprobs aligned to prompt positions, when requested. The
     /// first entry is `null` because the first prompt token is not scored.
     pub prompt_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
@@ -422,10 +400,9 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // After normalization, an explicit `auto` without a non-empty tool list
-    // is the only failing combination.
-    if let Some(ToolChoice(choice)) = &request.tool_choice
-        && *choice != ToolChoiceValue::None
+    // An explicit `auto` without a non-empty tool list is refused; an absent
+    // choice defaults to `auto`, which serves no tools when the list is empty.
+    if request.tool_choice == Some(ChatToolChoice::Auto)
         && !request
             .tools
             .as_ref()

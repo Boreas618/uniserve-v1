@@ -5,7 +5,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::serving::chat::AssistantBlockKind;
-use crate::serving::chat::output::FinishReason;
+use crate::serving::text::FinishReason;
 use crate::serving::text::output::{DecodedLogprobs, DecodedPromptLogprobs};
 
 #[derive(Debug, Clone, PartialEq)]

@@ -4,8 +4,8 @@
 //! transport responses; this module remains independent of routing.
 //!
 //! A chat request is deserialized into the strict schemas in `types`
-//! (unknown fields are rejected), normalized and checked by the route's
-//! `ValidatedJson` extractor, and checked against the served configuration by
+//! (unknown fields are rejected), validated by the route's `ValidatedJson`
+//! extractor, and checked against the served configuration by
 //! `chat_completions::validate_request_compat`. Lowering into serving inputs
 //! lives in `crate::serving` (`InputProcessor::preprocess_chat_request`); the
 //! resulting `RequestOutput` stream comes back here for response assembly.

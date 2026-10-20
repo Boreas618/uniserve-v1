@@ -46,7 +46,6 @@ pub async fn collect_image_generation(
                 ..
             } => data.push(GeneratedImageData {
                 b64_json: required_image_field(pixels_png_b64, "PNG artifact")?,
-                revised_prompt: None,
                 height: required_image_field(height, "height")?,
                 width: required_image_field(width, "width")?,
                 bytes: required_image_field(bytes, "byte count")?,
@@ -83,7 +82,6 @@ pub async fn collect_image_generation(
             RequestOutput::Accepted { .. }
             | RequestOutput::Scheduled { .. }
             | RequestOutput::TextDelta { .. }
-            | RequestOutput::InternalTextDelta { .. }
             | RequestOutput::ReasoningDelta { .. }
             | RequestOutput::OutputBlockStart { .. }
             | RequestOutput::OutputBlockEnd { .. }

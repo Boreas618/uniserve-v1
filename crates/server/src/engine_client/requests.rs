@@ -420,13 +420,6 @@ impl RequestRegistry {
                     .first_visible_output_us
                     .get_or_insert(elapsed_us);
             }
-            // Internal tokens affect usage but never establish visible-output
-            // latency. The event carries no token identifiers, so this counts
-            // events until a `Usage` event overwrites the total.
-            RequestOutput::InternalTextDelta { .. } => {
-                stats.state = RequestLifecycleState::Streaming;
-                stats.internal_tokens = stats.internal_tokens.saturating_add(1);
-            }
             RequestOutput::Artifact(_) => {
                 stats.state = RequestLifecycleState::Streaming;
                 stats

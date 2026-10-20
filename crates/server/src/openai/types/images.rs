@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::common::Normalizable;
-
 /// Configured OpenAI-compatible image-generation request for
 /// `/v1/images/generations`.
 ///
@@ -51,8 +49,6 @@ pub struct ImageGenerationRequest {
     pub timestep_shift: Option<f32>,
 }
 
-impl Normalizable for ImageGenerationRequest {}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// Completed OpenAI-compatible image-generation response.
 pub struct ImageGenerationResponse {
@@ -67,9 +63,6 @@ pub struct ImageGenerationResponse {
 pub struct GeneratedImageData {
     /// Base64-encoded PNG image bytes.
     pub b64_json: String,
-    /// Model-revised prompt, when produced.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revised_prompt: Option<String>,
     /// Image height in pixels.
     pub height: u32,
     /// Image width in pixels.

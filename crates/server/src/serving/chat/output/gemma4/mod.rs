@@ -13,10 +13,10 @@
 use super::reasoning::reasoning_event_stream;
 use super::tool::tool_event_stream;
 use crate::profile::reasoning::Gemma4ReasoningParser;
+use crate::profile::tokenizer::DynTokenizer;
 use crate::profile::tools::Gemma4ToolParser;
 use crate::serving::chat::ChatRequest;
 use crate::serving::chat::{Error, Result as ChatResult};
-use crate::serving::text::tokenizer::DynTokenizer;
 
 /// Request-scoped Gemma-4 reasoning and tool-call processor.
 pub struct Gemma4ChatOutputProcessor {

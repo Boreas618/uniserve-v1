@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 
+use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::text::TextDecodeOptions;
-use crate::serving::text::tokenizer::DynTokenizer;
 
 /// The public prompt: the text of an image-generation request or a chat
 /// conversation. Input images live inside the parts of a chat conversation.

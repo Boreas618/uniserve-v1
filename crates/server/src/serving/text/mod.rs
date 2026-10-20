@@ -5,14 +5,13 @@
 
 pub use error::{Error, Result};
 pub use output::{
-    CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,
-    DecodedTextEvent, DecodedTokenLogprob, FinishReason, Finished, StopReason, TextDecodeOptions,
+    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTextEvent,
+    DecodedTokenLogprob, FinishReason, Finished, StopReason, TextDecodeOptions,
 };
 
 mod error;
 /// Incremental decoded-text and log-probability output values.
 pub mod output;
-pub use crate::profile::tokenizer;
 
 /// Resolves the effective `max_tokens` for generation.
 ///

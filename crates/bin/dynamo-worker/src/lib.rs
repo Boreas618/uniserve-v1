@@ -68,7 +68,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -888,7 +888,7 @@ fn video_response(
         "model": model,
         "status": "completed",
         "progress": 100,
-        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+        "created": uniserve_core::now_unix_secs_u64() as i64,
         "data": [{
             "output_format": "mp4",
             "url": url,

@@ -12,7 +12,6 @@ mod middleware;
 mod routes;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod utils;
 
 use std::sync::{Arc, OnceLock};
 
