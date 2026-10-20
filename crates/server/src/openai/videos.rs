@@ -448,8 +448,8 @@ async fn capabilities(State(state): State<JobState>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
     use crate::profile::ModelParameters;
+    use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 
     fn video_router() -> Router {
         router(sim_engine(ModelParameters::MiniMaxH3))

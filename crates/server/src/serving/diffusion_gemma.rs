@@ -233,22 +233,21 @@ mod tests {
     //! `TEXT_LEN` tokens. The tokenizer decodes every synthetic token to its own
     //! word, so each delta's text follows from its token ids.
 
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use crate::engine::Engine;
-    use crate::options::{ImageFetchOptions, LoggingOptions};
-    use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
-    use crate::profile::tokenizer::HuggingFaceTokenizer;
-    use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
-    use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-    use crate::serving::media::MediaConnector;
-    use crate::serving::{FinishReason, InputProcessor, RequestOutput, RequestRenderer};
     use futures::StreamExt;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
     use uniserve_core::{CanvasSampling, ModelDtype};
-    use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
+    use uniserve_engine::{EngineConfig, SimEngine};
+
+    use crate::engine::Engine;
+    use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
+    use crate::profile::tokenizer::HuggingFaceTokenizer;
+    use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
+    use crate::serving::{FinishReason, RequestOutput};
+    use crate::test_support::{SERVED_MODEL, engine_over, load_tokenizer, sim_core};
 
     /// Tokens of one canvas.
     const CANVAS: u32 = 16;
@@ -280,10 +279,7 @@ mod tests {
         tokenizer.add_special_tokens(
             &["<|image>", "<|image|>", "<image|>"].map(|token| AddedToken::from(token, true)),
         );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("tokenizer.json");
-        tokenizer.save(&path, false).unwrap();
-        let tokenizer = Arc::new(HuggingFaceTokenizer::new(&path).unwrap());
+        let tokenizer = Arc::new(load_tokenizer(&tokenizer));
         let id = |token: &str| tokenizer.token_to_id(token).unwrap();
 
         let profile = DiffusionGemmaProfile {
@@ -323,43 +319,12 @@ mod tests {
         let mut worker = SimEngine::new();
         worker.set_text_len(TEXT_LEN);
         worker.set_canvas_sampling(sampling);
-        let mut config = EngineConfig::sim("sim-model");
+        let mut config = EngineConfig::sim(SERVED_MODEL);
         config.worker_process.canvas_sampling = Some(sampling);
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-        let core = EngineCore::with_executor(config, Box::new(SimExecutor::new(worker))).unwrap();
-        let processor = InputProcessor::new(
-            model,
-            Arc::clone(&tokenizer),
-            RequestRenderer::Chat(
-                HfChatRenderer::new(
-                    Some("{{ messages[0].content }}".to_string()),
-                    HashMap::new(),
-                    ChatTemplateContentFormatOption::String,
-                )
-                .unwrap(),
-            ),
-            core.generation_limits(),
-            false,
-        )
-        .unwrap();
-
-        let images = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
-        let logging = LoggingOptions {
-            log_requests: false,
-            log_stats: false,
-        };
-        (
-            Engine::new(
-                "sim-model".to_owned(),
-                vec![core],
-                processor,
-                images,
-                None,
-                &logging,
-            )
-            .unwrap(),
-            tokenizer,
-        )
+        let core = sim_core(config, worker);
+        let engine = engine_over(model, Arc::clone(&tokenizer) as _, vec![core], None);
+        (engine, tokenizer)
     }
 
     /// One chat reply as the chat stream published it.

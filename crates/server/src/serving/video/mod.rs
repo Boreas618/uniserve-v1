@@ -562,10 +562,7 @@ mod tests {
                 .map(|(token, _)| AddedToken::from(*token, true))
                 .collect::<Vec<_>>(),
         );
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("tokenizer.json");
-        tokenizer.save(&path, false).unwrap();
-        HuggingFaceTokenizer::new(&path).unwrap()
+        crate::test_support::load_tokenizer(&tokenizer)
     }
 
     /// A base denoiser serving every task, on a latent encoder of one rank,

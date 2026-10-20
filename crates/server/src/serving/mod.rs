@@ -21,8 +21,6 @@ mod omni;
 mod output;
 mod sampling;
 pub mod systemone;
-#[cfg(test)]
-pub(crate) mod test_support;
 /// Text tokenization, decoding, and sampling utilities.
 pub mod text;
 pub mod video;
@@ -114,7 +112,7 @@ mod tests {
             Instant::now(),
             7,
             OutputParams {
-                tokenizer: crate::serving::test_support::configured_tokenizer(),
+                tokenizer: crate::test_support::configured_tokenizer(),
                 prompt_token_ids: vec![u32::from(b'p')],
                 decode,
                 prompt_logprobs: false,
@@ -280,7 +278,7 @@ mod tests {
         for (events, stop_strings, expected) in cases {
             let parser = crate::serving::omni::SenseNovaReasoningParser::new(
                 policy.clone(),
-                crate::serving::test_support::configured_tokenizer(),
+                crate::test_support::configured_tokenizer(),
             )
             .unwrap();
             let outputs = output(
@@ -351,12 +349,9 @@ mod tests {
             stop_strings: Some(vec!["END".to_string()]),
             ..TextDecodeOptions::default()
         };
-        let processor = ChatOutputProcessor::qwen3(
-            &request,
-            crate::serving::test_support::configured_tokenizer(),
-            true,
-        )
-        .unwrap();
+        let processor =
+            ChatOutputProcessor::qwen3(&request, crate::test_support::configured_tokenizer(), true)
+                .unwrap();
         let outputs = output(
             processor,
             decode,

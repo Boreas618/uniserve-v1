@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -186,12 +185,8 @@ fn gemma4_tokenizer() -> DynTokenizer {
         .collect();
     tokenizer.add_special_tokens(&added);
 
-    // `HuggingFaceTokenizer` loads from a file; the loaded tokenizer outlives
-    // the temporary directory.
-    let directory = tempdir().expect("create tokenizer directory");
-    let path = directory.path().join("tokenizer.json");
-    tokenizer.save(&path, false).expect("save tokenizer");
-    Arc::new(HuggingFaceTokenizer::new(&path).expect("load tokenizer"))
+    let definition = serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
+    Arc::new(HuggingFaceTokenizer::from_json(definition).expect("load tokenizer"))
 }
 
 /// A request that declares the fixture's tools and lets the model call them.

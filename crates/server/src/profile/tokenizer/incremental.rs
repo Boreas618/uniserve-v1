@@ -261,7 +261,7 @@ mod tests {
     /// covered because prompt seeding treats them differently.
     #[test]
     fn flush_without_generated_tokens_emits_nothing() {
-        let tokenizer = crate::serving::test_support::configured_tokenizer();
+        let tokenizer = crate::test_support::configured_tokenizer();
         for prompt in ["p", "a longer prompt"] {
             let prompt_token_ids: Vec<u32> = prompt.bytes().map(u32::from).collect();
             let mut decoder = tokenizer.create_decode_stream(&prompt_token_ids, true, 0);

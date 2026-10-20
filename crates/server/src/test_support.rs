@@ -1,8 +1,9 @@
-//! Engines over the in-process engine simulator, and their routers, for
-//! HTTP route tests.
+//! Simulated components shared by the crate's tests, one fixture each: the
+//! byte tokenizer, in-memory tokenizer loading, the engine over simulated
+//! engine cores, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
-//! `Engine`, whose engine core drives `SimEngine` through `SimExecutor`. The
+//! `Engine`, whose engine cores drive `SimEngine` through `SimExecutor`. The
 //! default simulator provides no video media components, so the engine
 //! refuses every video submission as an invalid request.
 
@@ -13,24 +14,82 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
+use tokenizers::models::bpe::{BPE, Vocab};
+use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 use uniserve_core::ModelDtype;
+use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
 use crate::engine::Engine;
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
+use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
 use crate::serving::media::MediaConnector;
-use crate::serving::test_support::configured_tokenizer;
 use crate::serving::video::VideoService;
 use crate::serving::{InputProcessor, RequestRenderer};
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 
-/// Served model name the simulated state answers to.
+/// Served model name the simulated engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
+
+/// Loads a `tokenizers` definition in memory, as the server loads a
+/// checkpoint's `tokenizer.json`.
+pub(crate) fn load_tokenizer(definition: &TokenizerBuilder) -> HuggingFaceTokenizer {
+    let json = definition.to_string(false).expect("serialize tokenizer");
+    HuggingFaceTokenizer::from_json(serde_json::from_str(&json).expect("parse tokenizer"))
+        .expect("load tokenizer")
+}
+
+/// Builds a deterministic byte-oriented tokenizer for serving tests.
+///
+/// Every printable ASCII character encodes to the token whose ID equals its
+/// code point, so tests write IDs as `b'a' as u32`. ID 0 is the `<unk>`
+/// token, and IDs 1 through 6 (control characters) are replaced by the chat,
+/// vision, and thinking special tokens, which encode atomically. The BPE model
+/// has no merges, so encoding is one token per character.
+pub(crate) fn configured_tokenizer() -> DynTokenizer {
+    let mut vocab = (0_u32..=127)
+        .map(|id| {
+            let token = if id == 0 {
+                "<unk>".to_string()
+            } else {
+                char::from_u32(id).expect("ASCII code point").to_string()
+            };
+            (token, id)
+        })
+        .collect::<Vocab>();
+    for (id, token) in [
+        (1, "<|im_start|>"),
+        (2, "<|im_end|>"),
+        (3, "<|vision_start|>"),
+        (4, "<|vision_end|>"),
+        (5, "<think>"),
+        (6, "</think>"),
+        (97, "a"),
+        (98, "b"),
+    ] {
+        vocab.retain(|_, existing_id| *existing_id != id);
+        vocab.insert(token.to_string(), id);
+    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .unk_token("<unk>".to_string())
+        .build()
+        .expect("build configured tokenizer model");
+    let mut tokenizer = TokenizerBuilder::new(model);
+    tokenizer.add_special_tokens(&[
+        AddedToken::from("<|im_start|>", true),
+        AddedToken::from("<|im_end|>", true),
+        AddedToken::from("<|vision_start|>", true),
+        AddedToken::from("<|vision_end|>", true),
+        AddedToken::from("<think>", true),
+        AddedToken::from("</think>", true),
+    ]);
+    Arc::new(load_tokenizer(&tokenizer))
+}
 
 /// The server's router over `engine` under the default server options.
 pub(crate) fn router(engine: Engine) -> Router {
@@ -41,13 +100,18 @@ pub(crate) fn router(engine: Engine) -> Router {
 /// for the video submission routes and default video job options.
 pub(crate) fn router_with(engine: Engine, server: &ServerOptions) -> Router {
     let jobs = VideoJobs::new(VideoJobOptions::default(), CancellationToken::new());
-    super::router(Arc::new(engine), Arc::new(jobs), server, super::BODY_LIMIT)
+    crate::http::router(
+        Arc::new(engine),
+        Arc::new(jobs),
+        server,
+        crate::http::BODY_LIMIT,
+    )
 }
 
 /// Builds an engine for a model with `parameters` over one default
 /// `SimEngine`.
 ///
-/// The tokenizer is `serving::test_support::configured_tokenizer`, whose
+/// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does, and a
@@ -68,15 +132,20 @@ pub(crate) fn sim_readout_engine(
     if let ModelParameters::DiffusionGemma(_) = model.parameters {
         config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
     }
-    let core = EngineCore::with_executor(config, Box::new(SimExecutor::new(SimEngine::new())))
-        .expect("start a sim engine core");
-    engine_over(model, vec![core], readout)
+    let core = sim_core(config, SimEngine::new());
+    engine_over(model, configured_tokenizer(), vec![core], readout)
+}
+
+/// Starts an engine core under `config` that drives `worker` in process.
+pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> EngineCore {
+    EngineCore::with_executor(config, Box::new(SimExecutor::new(worker)))
+        .expect("start a sim engine core")
 }
 
 /// Builds an engine for a model with `parameters` over started engine cores,
 /// one per data-parallel rank; see [`sim_engine`].
 pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<EngineCore>) -> Engine {
-    engine_over(sim_model(parameters), cores, None)
+    engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
 }
 
 /// The simulated model's facts.
@@ -90,9 +159,13 @@ fn sim_model(parameters: ModelParameters) -> ModelConfig {
     }
 }
 
-/// Serves `model` over `cores` without request or stats logging.
-fn engine_over(
+/// Serves `model` with `tokenizer` over `cores` without request or stats
+/// logging. A MiniMax H3 model serves [`sim_video_service`]; any other
+/// model renders chat requests with a template of the first message's
+/// content.
+pub(crate) fn engine_over(
     model: ModelConfig,
+    tokenizer: DynTokenizer,
     cores: Vec<EngineCore>,
     readout: Option<crate::serving::systemone::ReadoutEncoder>,
 ) -> Engine {
@@ -109,7 +182,7 @@ fn engine_over(
     };
     let processor = InputProcessor::new(
         model,
-        configured_tokenizer(),
+        tokenizer,
         renderer,
         cores[0].generation_limits(),
         false,

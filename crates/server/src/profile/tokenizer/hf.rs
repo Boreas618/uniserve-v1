@@ -103,6 +103,13 @@ impl HuggingFaceTokenizer {
         );
         let mut definition = read_json(path)?;
         register_declared_tokens(&mut definition, &read_json(config)?)?;
+        Self::from_json(definition)
+    }
+
+    /// Builds a tokenizer from a parsed `tokenizer.json` definition.
+    ///
+    /// Returns a tokenizer error when `fastokens` cannot build the definition.
+    pub fn from_json(definition: serde_json::Value) -> Result<Self> {
         let tokenizer = FastokensTokenizer::from_json(definition)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
         Ok(Self::from_fastokens(tokenizer))

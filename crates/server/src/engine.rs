@@ -644,14 +644,72 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use futures::{StreamExt as _, poll};
     use uniserve_core::{
         EngineCoreOutput, GenerationConstraint, GenerationRequest, ImageGenerationConfig,
         ImageParams, Request, SamplingParams,
     };
     use uniserve_engine::{EngineConfig, EngineCore, Executor, SimEngine, SimExecutor};
+    use uniserve_observability::METRICS;
 
-    use crate::http::test_support::sim_engine_over;
+    use super::Engine;
+    use crate::openai::ChatCompletionRequest;
+    use crate::openai::chat_completions::{
+        ChatResponseContext, collect_chat_completion, lower_chat_request,
+    };
     use crate::profile::ModelParameters;
+    use crate::serving::{FinishReason, GenerateRequest, RequestOutput};
+    use crate::test_support::{SERVED_MODEL, sim_core, sim_engine_over};
+
+    /// A Qwen3 engine over one engine core, named `engine_model`, that drives
+    /// `worker`.
+    ///
+    /// The engine core's model name labels the process-wide request metrics,
+    /// so a test that reads them names its own engine.
+    fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Engine {
+        let core = sim_core(EngineConfig::sim(engine_model), worker);
+        sim_engine_over(ModelParameters::Qwen3, vec![core])
+    }
+
+    /// `request` as the chat route lowers it for the served model.
+    fn lowered(id: &str, request: ChatCompletionRequest) -> GenerateRequest {
+        lower_chat_request(id.to_owned(), SERVED_MODEL, request)
+            .unwrap()
+            .0
+    }
+
+    /// Greedy chat request of at most `max_completion_tokens` tokens that may
+    /// sample only `a`, stopping on each of `stop`.
+    fn chat_request(max_completion_tokens: u32, stop: &[&str]) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": [{"role": "user", "content": "prompt"}],
+            "max_completion_tokens": max_completion_tokens,
+            "temperature": 0.0,
+            "allowed_token_ids": [u32::from(b'a')],
+            "stop": stop,
+        }))
+        .unwrap()
+    }
+
+    /// Reads `stream` to its end and returns its terminal reason and usage.
+    async fn finish(
+        mut stream: crate::serving::RequestOutputStream,
+    ) -> (FinishReason, crate::serving::RequestUsage) {
+        let mut finished = None;
+        while let Some(event) = stream.next().await {
+            if let RequestOutput::Finished { reason, usage } = event.unwrap() {
+                finished = Some((reason, usage));
+            }
+        }
+        finished.expect("the request finishes")
+    }
+
+    /// Returns whether the rendered process-wide metrics hold `line`.
+    fn rendered_metrics_hold(line: &str) -> bool {
+        let rendered = METRICS.render().unwrap();
+        rendered.lines().any(|rendered| rendered == line)
+    }
 
     /// A text request that generates until the simulator's EOS.
     fn text_request() -> Request {
@@ -806,5 +864,191 @@ mod tests {
             released.load(Ordering::SeqCst),
             "executor teardown held the runtime thread"
         );
+    }
+
+    /// A chat prompt that exceeds the total capacity of a two-unit prefix
+    /// cache is returned as a stream and then rejected by engine admission.
+    /// Collecting the completion must report that rejection as HTTP 400.
+    #[tokio::test]
+    async fn chat_admission_rejection_remains_a_bad_request() {
+        let mut worker = SimEngine::new();
+        // Unit zero is the sentinel: two allocatable 64-token pages remain.
+        worker.set_num_units(3);
+        let engine = qwen3_engine(worker, SERVED_MODEL);
+        let request = serde_json::from_value(serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": [{"role": "user", "content": "a".repeat(1024)}],
+            "max_completion_tokens": 8
+        }))
+        .unwrap();
+
+        let stream = engine
+            .generate(lowered("rejected-chat", request))
+            .await
+            .unwrap();
+        let context = ChatResponseContext {
+            request_id: "rejected-chat".to_string(),
+            response_model: SERVED_MODEL.to_string(),
+            include_usage: false,
+            requested_logprobs: false,
+            include_prompt_logprobs: false,
+            include_reasoning: false,
+            return_token_ids: false,
+            return_tokens_as_token_ids: false,
+        };
+        let error = collect_chat_completion(stream, context, 0)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A request's reported latency covers the time it waited for the
+    /// blocking pool before preprocessing ran.
+    #[test]
+    fn reported_latency_includes_time_waiting_for_preprocessing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let engine = qwen3_engine(SimEngine::new(), SERVED_MODEL);
+
+            // Hold the only blocking thread so preprocessing waits in the
+            // queue for a measurable interval before it runs.
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.await.unwrap();
+            let wait = Duration::from_millis(25);
+            let mut pending = Box::pin(engine.generate(lowered("timed", chat_request(8, &["aa"]))));
+            assert!(poll!(pending.as_mut()).is_pending());
+            tokio::time::sleep(wait).await;
+            release_tx.send(()).unwrap();
+            occupied.await.unwrap();
+
+            let (_, usage) = finish(pending.await.unwrap()).await;
+            assert!(
+                usage.timings.total_us >= wait.as_micros() as u64,
+                "{:?}",
+                usage.timings
+            );
+            engine.shutdown().await.unwrap();
+        });
+    }
+
+    /// A completed request is recorded once in the request metrics under its
+    /// engine's model name: the token counters and token histograms carry the
+    /// counts of its usage report, its finish reason is counted, and each
+    /// latency histogram whose input it carries holds one observation.
+    #[tokio::test]
+    async fn completed_request_is_recorded_in_request_metrics() {
+        let engine_model = "request-metrics-model";
+        let engine = qwen3_engine(SimEngine::new(), engine_model);
+
+        let stream = engine
+            .generate(lowered("metrics", chat_request(3, &[])))
+            .await
+            .unwrap();
+        let (reason, usage) = finish(stream).await;
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(usage.output_tokens, 3);
+
+        let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
+        for expected in [
+            format!("uniserve:request_success_total{{{labels},finished_reason=\"length\"}} 1"),
+            format!(
+                "uniserve:prompt_tokens_total{{{labels}}} {}",
+                usage.prompt_tokens
+            ),
+            format!("uniserve:generation_tokens_total{{{labels}}} 3"),
+            format!("uniserve:request_prompt_tokens_count{{{labels}}} 1"),
+            format!("uniserve:request_generation_tokens_count{{{labels}}} 1"),
+            format!("uniserve:request_max_num_generation_tokens_count{{{labels}}} 1"),
+            format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
+            format!("uniserve:request_queue_time_seconds_count{{{labels}}} 1"),
+            format!("uniserve:time_to_first_token_seconds_count{{{labels}}} 1"),
+        ] {
+            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    /// Each request is recorded under the data-parallel rank that served it.
+    #[tokio::test]
+    async fn request_metrics_name_the_rank_that_served_each_request() {
+        let engine_model = "rank-metrics-model";
+        let cores = (0..2)
+            .map(|_| sim_core(EngineConfig::sim(engine_model), SimEngine::new()))
+            .collect();
+        let engine = sim_engine_over(ModelParameters::Qwen3, cores);
+
+        // Both requests are submitted before either stream is read, so the
+        // first is still in flight when the second is routed.
+        let mut streams = Vec::new();
+        for id in ["rank-a", "rank-b"] {
+            let request = lowered(id, chat_request(3, &[]));
+            streams.push(engine.generate(request).await.unwrap());
+        }
+        for stream in streams {
+            assert_eq!(finish(stream).await.0, FinishReason::Length);
+        }
+
+        for rank in 0..2 {
+            let expected = format!(
+                "uniserve:request_success_total{{model_name=\"{engine_model}\",\
+                 engine=\"{rank}\",finished_reason=\"length\"}} 1"
+            );
+            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A client that disconnects mid-generation is counted as an aborted
+    /// request with its latency, while its partial output, which never
+    /// reached a usage report, adds nothing to the token metrics.
+    #[tokio::test]
+    async fn disconnected_request_is_recorded_as_aborted_without_token_usage() {
+        let engine_model = "disconnect-metrics-model";
+        let mut worker = SimEngine::new();
+        worker.set_text_len(1_000_000);
+        let engine = qwen3_engine(worker, engine_model);
+
+        let mut stream = engine
+            .generate(lowered("disconnect", chat_request(1_000, &[])))
+            .await
+            .unwrap();
+        loop {
+            match stream.next().await.unwrap().unwrap() {
+                RequestOutput::TextDelta { text } if !text.is_empty() => break,
+                _ => {}
+            }
+        }
+        drop(stream);
+
+        let labels = format!("model_name=\"{engine_model}\",engine=\"0\"");
+        for expected in [
+            format!("uniserve:request_success_total{{{labels},finished_reason=\"abort\"}} 1"),
+            format!("uniserve:e2e_request_latency_seconds_count{{{labels}}} 1"),
+        ] {
+            assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
+        }
+        let rendered = METRICS.render().unwrap();
+        for family in [
+            "uniserve:generation_tokens_total",
+            "uniserve:request_generation_tokens_count",
+        ] {
+            let series = format!("{family}{{{labels}}}");
+            assert!(
+                !rendered.lines().any(|line| line.starts_with(&series)),
+                "unexpected `{series}` in:\n{rendered}"
+            );
+        }
+        engine.shutdown().await.unwrap();
     }
 }

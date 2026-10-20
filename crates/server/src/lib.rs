@@ -16,6 +16,8 @@ pub mod openai;
 pub mod options;
 pub mod profile;
 pub mod serving;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use crate::engine::{Engine, Task};
 pub use crate::http::serve;

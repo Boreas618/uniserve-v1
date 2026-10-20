@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use tempfile::tempdir;
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -15,9 +14,6 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
 /// that `Qwen3ReasoningParser` requires and the `<|im_end|>` turn delimiter.
-///
-/// The tokenizer is loaded into memory, so the temporary directory holding
-/// its JSON file can be dropped on return.
 fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + Sync>> {
     let model = BPE::builder()
         .vocab_and_merges([("<unk>".to_string(), 0), ("a".to_string(), 1)], Vec::new())
@@ -29,10 +25,8 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
         AddedToken::from("</think>", true),
         AddedToken::from("<|im_end|>", true),
     ]);
-    let directory = tempdir()?;
-    let path = directory.path().join("tokenizer.json");
-    tokenizer.save(&path, false)?;
-    Ok(Arc::new(HuggingFaceTokenizer::new(&path)?))
+    let definition = serde_json::from_str(&tokenizer.to_string(false)?)?;
+    Ok(Arc::new(HuggingFaceTokenizer::from_json(definition)?))
 }
 
 /// A chat request that declares the `lookup` tool with `Auto` tool choice,

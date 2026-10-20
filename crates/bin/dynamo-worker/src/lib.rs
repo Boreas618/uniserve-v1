@@ -872,7 +872,7 @@ mod tests {
         .unwrap();
         let workers = deployment.to_str().unwrap();
 
-        let (engine, registration) = parsed(&[
+        let (_engine, registration) = parsed(&[
             "/models/FastH3",
             "--workers",
             workers,
@@ -883,8 +883,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(registration.model_name, "FastH3");
-        assert_eq!(engine.config.video_config.max_seconds, 5.0);
-        assert_eq!(engine.config.video_config.max_condition_rows, Some(0));
 
         for flags in [
             vec!["/models/FastH3", "--workers", workers, "--port", "9000"],

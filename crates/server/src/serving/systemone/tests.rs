@@ -24,11 +24,11 @@ use super::{
 use axum::http::StatusCode;
 use base64::Engine as _;
 
-use crate::http::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 use crate::profile::ModelParameters;
 use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 use uniserve_core::CanvasSampling;
 
 const SPECIAL_TOKENS: [&str; 11] = [
@@ -842,7 +842,7 @@ fn a_tokenizer_that_merges_two_letter_labels_is_refused_at_startup() {
 /// The router serving `checkpoint`'s readout over the engine simulator,
 /// which answers every candidate with a fixed log-probability.
 fn readout_router(checkpoint: &Checkpoint, options: ReadoutOptions) -> axum::Router {
-    let engine = crate::http::test_support::sim_readout_engine(
+    let engine = crate::test_support::sim_readout_engine(
         ModelParameters::DiffusionGemma(checkpoint.profile.clone()),
         Some(checkpoint.encoder(options, 4096)),
     );

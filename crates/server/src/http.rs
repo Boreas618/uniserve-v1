@@ -9,8 +9,6 @@
 
 mod listener;
 mod middleware;
-#[cfg(test)]
-pub(crate) mod test_support;
 
 use std::sync::Arc;
 
@@ -308,10 +306,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::http::test_support::{
-        SERVED_MODEL, post_json, router, router_with, send, sim_engine,
-    };
     use crate::profile::ModelParameters;
+    use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, sim_engine};
 
     /// A `GET` request to `path`.
     fn get_request(path: &str) -> Request<Body> {
