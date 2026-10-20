@@ -22,6 +22,11 @@ use uniserve_storage::{
     TensorRecord, socket,
 };
 
+/// Held by a test while it starts a child process, and by a test whose
+/// server must see its dropped connections close: a child forked from this
+/// process holds every connection open until it executes its program.
+static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A server on its own socket, stopped when dropped.
 struct Running {
     socket: PathBuf,
@@ -304,6 +309,11 @@ fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
 
 #[test]
 fn a_new_head_is_refused_while_the_previous_one_is_connected_and_drops_unlisted_scopes() {
+    // The new claim shoots down every worker still connected, which the
+    // workers below, of this process, must not be.
+    let _forking = FORKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let server = Running::start();
     let mut first = head(&server.socket);
     let claim = first
@@ -381,6 +391,9 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     let server = Running::start();
     let claim = head(&server.socket).claim(vec![scope("flow", 0)]).unwrap();
     let encoded: Vec<String> = claim.0.iter().map(u8::to_string).collect();
+    let forking = FORKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "stand_in_writer", "--ignored", "--nocapture"])
         .env("STORAGE_TEST_SOCKET", &server.socket)
@@ -390,6 +403,7 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
         .process_group(0)
         .spawn()
         .unwrap();
+    drop(forking);
     let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     while !line.contains("holding") {
