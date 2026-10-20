@@ -26,7 +26,7 @@ pub use prefix_cache::{PendingImport, PrefixCache};
 pub use products::{
     Metadata, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore, ValueRange,
 };
-pub use retained::{ExclusiveMemory, ExclusiveSpec, LocalMemory};
+pub use retained::{Exclusive, ExclusiveMemory, ExclusiveSpec, LocalMemory};
 
 pub(crate) use latent::{LatentCache, Scratch};
 pub(crate) use latent::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};

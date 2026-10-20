@@ -159,6 +159,7 @@ impl BufferPool {
                             access: &[],
                         }])?
                         .pop()
+                        .map(|taken| taken.storage)
                         .ok_or_else(|| {
                             Error::Invariant("the buffer pool's storage is missing".into())
                         })?,

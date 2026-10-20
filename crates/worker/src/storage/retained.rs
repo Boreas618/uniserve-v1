@@ -38,12 +38,21 @@ pub struct ExclusiveSpec<'a> {
     pub access: &'a [DeviceId],
 }
 
+/// An exclusive storage an owner took.
+pub struct Exclusive {
+    pub storage: Arc<Storage>,
+    /// Whether the memory was created for the owner: its contents are
+    /// uninitialized, and the owner resets them. A storage a predecessor
+    /// left holds the finite values it last wrote, which its owner keeps:
+    /// a standby worker's predecessor still serves from them, and a
+    /// successor head of a handover reads the pages they hold.
+    pub created: bool,
+}
+
 /// Where an owner of exclusive device memory takes it.
 pub trait ExclusiveMemory {
-    /// One storage per spec, in order, mapped read-write. Contents are
-    /// whatever the storage last held, or uninitialized: the owner resets
-    /// them as it would fresh memory.
-    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Arc<Storage>>>;
+    /// One storage per spec, in order, mapped read-write.
+    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Exclusive>>;
 }
 
 /// The device bytes a worker's scope retains on one GPU.
@@ -63,10 +72,15 @@ pub(crate) struct ScopeBytes {
 pub struct LocalMemory;
 
 impl ExclusiveMemory for LocalMemory {
-    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Arc<Storage>>> {
+    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Exclusive>> {
         specs
             .iter()
-            .map(|spec| Storage::exportable(spec.device, spec.bytes, spec.access))
+            .map(|spec| {
+                Ok(Exclusive {
+                    storage: Storage::exportable(spec.device, spec.bytes, spec.access)?,
+                    created: true,
+                })
+            })
             .collect()
     }
 }
@@ -375,7 +389,7 @@ impl Retained {
 impl ExclusiveMemory for &Retained {
     /// Map the specs the scope retains, with write access, and create and
     /// publish the others.
-    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Arc<Storage>>> {
+    fn exclusive(&mut self, specs: &[ExclusiveSpec<'_>]) -> Result<Vec<Exclusive>> {
         let retained: &Retained = self;
         let mut state = lock(&retained.state);
         let mut keyed = Vec::with_capacity(specs.len());
@@ -421,6 +435,7 @@ impl ExclusiveMemory for &Retained {
 
         let mut mapped = Vec::with_capacity(specs.len());
         for (spec, (name, key, gpu)) in specs.iter().zip(&keyed) {
+            let created = !found.contains_key(key);
             let storage = match found.remove(key) {
                 Some((record, descriptor)) => Storage::import(
                     descriptor,
@@ -467,7 +482,7 @@ impl ExclusiveMemory for &Retained {
                     state.written.insert(*key);
                 }
             }
-            mapped.push(storage);
+            mapped.push(Exclusive { storage, created });
         }
         tracing::debug!(
             reused = specs.len() - got.missing.len(),
