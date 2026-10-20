@@ -37,15 +37,17 @@ impl Scheduler {
                 tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
-            // Worker recovery completes before its loss is reported. Keep
-            // independent ready workers usable, but an expert-only group
-            // cannot serve requests after all model workers have retired.
+            // A lost group is replaced before its loss is reported, by its
+            // standby, or later by its failure domain's relaunch, and its
+            // requests wait for it meanwhile. Keep independent workers
+            // usable, but an expert-only group cannot serve requests once
+            // every model worker has closed.
             if !self
                 .executor
                 .info()
                 .workers
                 .iter()
-                .any(|(id, info)| !info.supported_calls.is_empty() && self.executor.is_ready(id))
+                .any(|(id, info)| !info.supported_calls.is_empty() && !self.executor.is_closed(id))
             {
                 self.fatal = true;
             }

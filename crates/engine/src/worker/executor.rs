@@ -1010,6 +1010,12 @@ impl Executor for WorkerExecutor {
             .is_some_and(|&index| self.workers[index].1.is_ready())
     }
 
+    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+        self.routing
+            .get(worker)
+            .is_none_or(|&index| self.workers[index].1.is_closed())
+    }
+
     /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info

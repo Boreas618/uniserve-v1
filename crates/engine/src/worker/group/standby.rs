@@ -42,7 +42,7 @@ impl WorkerGroup {
     /// Whether ranks can stand by for the group: it is its own failure
     /// domain on the head's host.
     fn stands_by(&self) -> bool {
-        self.failure_domain.is_none()
+        self.failure_domain.0.groups() == 1
             && self
                 .process_args
                 .ranks
@@ -59,6 +59,13 @@ impl WorkerGroup {
             self.stands_by(),
             "worker group {} cannot be handed over: its ranks run on another host or share \
              an expert world",
+            self.process_args.worker_id
+        );
+        // The successor's workers adopt the group's storages and claim; a
+        // relaunch in progress would start ranks of its own under them.
+        anyhow::ensure!(
+            self.awaiting.is_none() && !self.failure_domain.0.failing(),
+            "worker group {} is being relaunched and cannot be handed over",
             self.process_args.worker_id
         );
         let claim = self.claims.launch(&self.process_args.host)?.claim;
@@ -178,6 +185,11 @@ impl WorkerGroup {
     /// startup is followed to the present.
     pub fn standby_ready(&mut self) -> bool {
         self.poll_standby();
+        self.standby_parked()
+    }
+
+    /// Whether a standby has parked, as last followed.
+    pub(super) fn standby_parked(&self) -> bool {
         self.standby.as_ref().is_some_and(|standby| standby.ready)
     }
 
@@ -195,7 +207,7 @@ impl WorkerGroup {
     /// parked standby; otherwise whether the promotion succeeded, after
     /// which the standby's ranks serve as the group's.
     pub(super) fn promote_standby(&mut self) -> Option<anyhow::Result<()>> {
-        if !self.standby.as_ref().is_some_and(|standby| standby.ready) {
+        if !self.standby_parked() {
             return None;
         }
         let mut standby = self.standby.take()?;

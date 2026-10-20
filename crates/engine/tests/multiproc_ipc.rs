@@ -1102,9 +1102,27 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
         // SAFETY: kill takes only integer arguments and touches no memory of this process.
         anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
 
-        let failure = worker
+        let loss = worker
             .poll_batch(Duration::from_secs(60))
-            .expect_err("rank loss must report replacement rejection");
+            .expect_err("rank loss must be reported");
+        assert!(
+            loss.downcast_ref::<WorkerFailure>()
+                .is_some_and(|loss| !loss.endpoints.is_empty()),
+            "unexpected loss for {change}: {loss:#}",
+        );
+        // The group's failure domain relaunches it on a thread of its own;
+        // installing ranks that describe another capacity closes the group
+        // with a failure that says why.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let failure = loop {
+            match worker.poll_batch(Duration::from_millis(100)) {
+                Ok(_) => anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "the relaunch for {change} was not refused"
+                ),
+                Err(failure) => break failure,
+            }
+        };
         assert!(
             format!("{failure:#}").contains("worker info changed"),
             "unexpected failure for {change}: {failure:#}",
@@ -1732,10 +1750,16 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
     let failure = worker
         .poll_batch(Duration::from_secs(60))
         .expect_err("rank loss must be reported");
-    assert!(
-        worker.is_ready(),
-        "the relaunch did not recover the group: {failure:#}"
-    );
+    // The relaunch runs on the failure domain's thread; a poll installs its
+    // ranks once they are ready.
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !worker.is_ready() {
+        anyhow::ensure!(
+            std::time::Instant::now() < ready_deadline,
+            "the relaunch did not recover the group: {failure:#}"
+        );
+        worker.poll_batch(Duration::from_millis(100))?;
+    }
     assert_ne!(worker.info().endpoint.incarnation, launched);
     for rank in 0..WORLD_SIZE {
         assert!(
@@ -1749,6 +1773,105 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
     )?;
     assert_eq!(served.batch_id, 1);
     worker.close()?;
+    Ok(())
+}
+
+/// A group's relaunch runs on its failure domain's thread: while the
+/// relaunched ranks start, the executor serves its other groups, and the
+/// relaunched group serves again once its ranks are installed.
+#[test]
+fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use uniserve_engine::{WorkerExecutor, WorkerGroupId};
+
+    // The wrapper records each launch's process id. A relaunched rank
+    // (launch 2) waits for `release` before it starts, which holds the
+    // relaunch in its ranks' registration until the test lets it go.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
+    let state = serde_json::to_string(directory.path())?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys, time\nfrom pathlib import Path\nstate = Path({state})\ngeneration = sys.argv[sys.argv.index('--generation') + 1]\n(state / (generation + '.pid')).write_text(str(os.getpid()))\nwhile generation == '2' and not (state / 'release').exists():\n    time.sleep(0.05)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let relaunched = WorkerGroupId("relaunched".into());
+    let serving = WorkerGroupId("serving".into());
+    let spawn = |worker_id: &WorkerGroupId| -> anyhow::Result<WorkerGroup> {
+        let mut args = single_worker_args(&worker_id.0, 1);
+        if *worker_id == relaunched {
+            args.executable = wrapper.clone();
+        }
+        WorkerGroup::spawn(args)
+    };
+    let mut executor = WorkerExecutor::try_new(
+        vec![
+            (relaunched.clone(), spawn(&relaunched)?),
+            (serving.clone(), spawn(&serving)?),
+        ],
+        uniserve_engine::TransferConfig::default(),
+    )?;
+    let prefill = |batch_id, request_id| -> anyhow::Result<Batch> {
+        let admission = text_admission(request_id, 1, 1)?;
+        Ok(token_batch(
+            batch_id,
+            batch_id,
+            admission.request_key,
+            Some(admission),
+            CallId::new(batch_id, 0),
+            CallKind::Forward(ForwardMode::Prefill),
+            &[7],
+            UnitId(1),
+            0,
+        ))
+    };
+
+    let pid = std::fs::read_to_string(directory.path().join("1.pid"))?.parse::<libc::pid_t>()?;
+    // SAFETY: kill takes only integer arguments and touches no memory of this process.
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let loss = loop {
+        match executor.poll(Duration::from_millis(100)) {
+            Ok(None) => anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the loss was not reported"
+            ),
+            Ok(Some(result)) => anyhow::bail!("an idle group returned {result:?}"),
+            Err(loss) => break loss,
+        }
+    };
+    let loss = loss
+        .downcast_ref::<WorkerFailure>()
+        .context("expected the group's loss")?;
+    assert_eq!(loss.worker_id, relaunched);
+
+    // The relaunch waits for its held rank while the other group serves.
+    executor.submit(place(prefill(1, 61)?, &serving.0, Vec::new()))?;
+    let served = poll_logical(&mut executor)?.context("the other group did not serve")?;
+    assert_eq!(served.batch_id, 1);
+    assert_eq!(served.results[0].output.status, CallStatus::Ok);
+    assert!(
+        !executor.has_capacity(&relaunched),
+        "the relaunching group accepts work"
+    );
+
+    std::fs::write(directory.path().join("release"), "")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !executor.has_capacity(&relaunched) {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the relaunched group did not become ready"
+        );
+        executor.poll(Duration::from_millis(100))?;
+    }
+    executor.submit(place(prefill(2, 62)?, &relaunched.0, Vec::new()))?;
+    let recovered = poll_logical(&mut executor)?.context("the relaunched group did not serve")?;
+    assert_eq!(recovered.batch_id, 2);
+    assert_eq!(recovered.results[0].output.status, CallStatus::Ok);
+    executor.close()?;
     Ok(())
 }
 
@@ -1803,6 +1926,112 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
         dead,
         "an engine without execution workers kept accepting work"
     );
+    Ok(())
+}
+
+/// An engine whose only group is lost stays alive while the group's failure
+/// domain relaunches it: a request submitted meanwhile waits for the
+/// relaunched ranks and completes on them.
+#[test]
+fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The wrapper records each launch's process ids by generation and rank.
+    // A relaunched rank (launch 2) waits for `release` before it starts.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
+    let state = serde_json::to_string(directory.path())?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys, time\nfrom pathlib import Path\nstate = Path({state})\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\ngeneration = argument('--generation')\n(state / (generation + '-' + argument('--rank') + '.pid')).write_text(str(os.getpid()))\nwhile generation == '2' and not (state / 'release').exists():\n    time.sleep(0.05)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut config = EngineConfig::sim("stub");
+    config.generation_limits = uniserve_core::GenerationLimits {
+        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..Default::default()
+    };
+    config.worker_groups = vec![WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+    )];
+    config.worker_process = worker_group_args();
+    config.worker_process.executable = wrapper;
+    let engine = EngineCore::new(config)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+
+    let result = (|| -> anyhow::Result<()> {
+        let pid =
+            std::fs::read_to_string(directory.path().join("1-0.pid"))?.parse::<libc::pid_t>()?;
+        // SAFETY: kill takes only integer arguments and touches no memory of this process.
+        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+        // The relaunch has started once its first rank recorded itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !directory.path().join("2-0.pid").exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the group was not relaunched"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut events = engine.submit(Request::from(uniserve_core::GenerationRequest {
+            request_id: RequestId(81),
+            prompt_token_ids: vec![7, 8],
+            negative_prompt_token_ids: Vec::new(),
+            multimodal_inputs: Default::default(),
+            constraint: uniserve_core::GenerationConstraint::Default,
+            sampling: SamplingParams::default(),
+            image: Default::default(),
+            max_images: 1,
+            max_und_tokens: 2,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            cache: Default::default(),
+            include_stop_token: false,
+            image_generation: Default::default(),
+            readout: Vec::new(),
+        }))?;
+        std::fs::write(directory.path().join("release"), "")?;
+        runtime.block_on(async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(60), events.recv())
+                    .await
+                    .context("the request did not finish after the relaunch")?
+                    .context("the request's events ended without a terminal event")?;
+                match event {
+                    EngineCoreOutput::Finished {
+                        completion_tokens, ..
+                    } => {
+                        anyhow::ensure!(completion_tokens == 2, "{completion_tokens} tokens");
+                        return Ok(());
+                    }
+                    EngineCoreOutput::Rejected { message, .. }
+                    | EngineCoreOutput::Error { message } => {
+                        anyhow::bail!("the request failed: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+    })();
+
+    // The dead latch is set only when the scheduler thread exits with a fatal
+    // status, so `shutdown` joins that thread before `is_dead` is read.
+    engine.shutdown();
+    result?;
+    assert!(!engine.is_dead(), "the relaunch killed the engine");
     Ok(())
 }
 

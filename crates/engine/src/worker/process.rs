@@ -267,12 +267,19 @@ impl PendingWorker {
         })
     }
 
-    /// Fails by name when the rank exited before registering.
+    /// Fails by name when the rank exited before registering, and when its
+    /// launch's startup was cancelled.
     ///
-    /// `WorkerRegistry::collect` calls this, through the `alive` callback `adopt_workers`
+    /// `registry::collect` calls this, through the `alive` callback `adopt_workers`
     /// passes it, while the launch is incomplete. Reaps the process when it
     /// has exited.
     pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
+        if self
+            .startup_abort
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            bail!("rank {} was cancelled before registering", self.rank);
+        }
         // A rank started by another host's launcher has no process here. Its
         // exit before registration reaches the head as a report from the
         // launcher that owns it, which `adopt_workers` checks separately.

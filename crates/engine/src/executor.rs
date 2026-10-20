@@ -1386,6 +1386,14 @@ pub trait Executor: Send {
     fn info(&self) -> &ExecutorInfo;
     /// Whether every worker of group `worker` is ready to accept execution.
     fn is_ready(&self, worker: &WorkerGroupId) -> bool;
+    /// Whether group `worker` executes nothing further: it is closed, or
+    /// could not be replaced. A group whose replacement is starting is not
+    /// ready but not closed either. The default suits an executor that
+    /// replaces no group in the background: a group that is not ready is
+    /// closed.
+    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+        !self.is_ready(worker)
+    }
     /// Whether group `worker` has an unclaimed destination submission slot.
     fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
     /// Whether every physical owner of a lifecycle command can accept its submission.
