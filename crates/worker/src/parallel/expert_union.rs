@@ -307,7 +307,7 @@ pub(crate) struct ExpertStart<'a> {
     /// bound instead.
     pub(crate) max_tokens: usize,
     /// The host's name, which identifies descriptor-shared peer storage.
-    pub(crate) node: &'a str,
+    pub(crate) host: &'a str,
 }
 
 /// The stream the rank's forwards (and the first microbatch) run on: its
@@ -457,7 +457,7 @@ impl ExpertUnion {
                 Some(PeerStorage::allocate(
                     device,
                     bytes as usize,
-                    start.node,
+                    start.host,
                     &lock(&host),
                 )?)
             } else {

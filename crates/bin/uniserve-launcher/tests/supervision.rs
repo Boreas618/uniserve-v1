@@ -2,7 +2,7 @@
 //! processes.
 //!
 //! Each test binds a listener that stands in for the head, starts the built
-//! `uniserve-host` binary against it, and exchanges the launcher's frames:
+//! `uniserve-launcher` binary against it, and exchanges the launcher's frames:
 //! its registration, instructions to the launcher, and reservation replies
 //! and rank exit reports back.
 
@@ -13,7 +13,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::launcher::{Instruction, Report, Reservation, WorkerExit, WorkerSpawn};
 use uniserve_ipc::{Channel, Listener, Registration, VERSION};
 
 /// Kills and reaps the launcher process when a test ends, including when it
@@ -49,7 +49,7 @@ fn reservation(head: &mut Channel) -> Reservation {
 }
 
 /// Waits for the launcher's report of a rank's exit.
-fn exit(head: &mut Channel) -> RankExit {
+fn exit(head: &mut Channel) -> WorkerExit {
     match receive(head) {
         Report::Exit(exit) => exit,
         other => panic!("expected an exit, received {other:?}"),
@@ -57,8 +57,8 @@ fn exit(head: &mut Channel) -> RankExit {
 }
 
 /// The launch of one rank of `worker_id`, run by `python`.
-fn spawn(worker_id: &str, rank: u32, generation: u64, python: &str) -> RankSpawn {
-    RankSpawn {
+fn spawn(worker_id: &str, rank: u32, generation: u64, python: &str) -> WorkerSpawn {
+    WorkerSpawn {
         rank,
         worker_id: worker_id.into(),
         generation,
@@ -80,7 +80,7 @@ fn start_launcher() -> (Launcher, Channel) {
 fn start_launcher_with(stdout: Stdio, stderr: Stdio) -> (Launcher, Channel) {
     let listener = Listener::bind(&["127.0.0.1:0"]).unwrap();
     let launcher = Launcher(
-        Command::new(env!("CARGO_BIN_EXE_uniserve-host"))
+        Command::new(env!("CARGO_BIN_EXE_uniserve-launcher"))
             .args([
                 "--head",
                 &listener.addresses()[0],
@@ -153,7 +153,7 @@ fn groups_reserve_distinct_ports_and_exits_arrive_without_another_instruction() 
     // the same rank before its group was relaunched.
     assert_eq!(
         exit(&mut head),
-        RankExit {
+        WorkerExit {
             worker_id: "first".into(),
             generation: 3,
             rank: 0,
@@ -213,7 +213,7 @@ fn the_first_rank_serves_its_store_on_the_reserved_port() {
 
     assert_eq!(
         exit(&mut head),
-        RankExit {
+        WorkerExit {
             worker_id: "group".into(),
             generation: 4,
             rank: 0,
@@ -253,13 +253,13 @@ impl StandIn {
         let pid_file = directory.path().join("rank.pid");
         std::fs::write(
             &script,
-            "#!/bin/sh\necho $$ > \"$RANK_PID_FILE\"\nexec sleep 600\n",
+            "#!/bin/sh\necho $$ > \"$WORKER_PID_FILE\"\nexec sleep 600\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut rank = spawn(group, 1, 0, script.to_str().unwrap());
         rank.environment = HashMap::from([(
-            "RANK_PID_FILE".to_owned(),
+            "WORKER_PID_FILE".to_owned(),
             pid_file.to_str().unwrap().to_owned(),
         )]);
         head.send(&Instruction::Spawn(Box::new(rank))).unwrap();
@@ -317,7 +317,7 @@ fn eventually(mut condition: impl FnMut() -> bool) -> bool {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_killed_launcher_takes_its_ranks_with_it() {
+fn a_killed_launcher_takes_its_workers_with_it() {
     let (mut launcher, mut head) = start_launcher();
     let rank = StandIn::spawn(&mut head, "group");
     assert!(rank.alive());
@@ -372,7 +372,7 @@ fn a_closed_log_pipe_does_not_end_supervision() {
     );
 }
 
-/// The stand-in rank module of `a_reaped_rank_leaves_no_event_memory`: it
+/// The stand-in rank module of `a_reaped_worker_leaves_no_event_memory`: it
 /// creates an interprocess event, as a rank does when it exports a device
 /// product, which makes the CUDA driver create shared memory named for this
 /// process, records its process id and waits to be killed.
@@ -387,9 +387,9 @@ assert cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device) == 0
 assert cuda.cuCtxPushCurrent_v2(context) == 0
 # CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS
 assert cuda.cuEventCreate(ctypes.byref(event), 2 | 4) == 0
-with open(os.environ['RANK_PID_FILE'] + '.tmp', 'w') as file:
+with open(os.environ['WORKER_PID_FILE'] + '.tmp', 'w') as file:
     file.write(str(os.getpid()))
-os.rename(os.environ['RANK_PID_FILE'] + '.tmp', os.environ['RANK_PID_FILE'])
+os.rename(os.environ['WORKER_PID_FILE'] + '.tmp', os.environ['WORKER_PID_FILE'])
 time.sleep(600)
 ";
 
@@ -424,7 +424,7 @@ fn hold_event(
             modules.to_str().unwrap().to_owned(),
         ),
         (
-            "RANK_PID_FILE".to_owned(),
+            "WORKER_PID_FILE".to_owned(),
             pid_file.to_str().unwrap().to_owned(),
         ),
     ]);
@@ -453,7 +453,7 @@ fn hold_event(
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires a CUDA device"]
-fn a_reaped_rank_leaves_no_event_memory() {
+fn a_reaped_worker_leaves_no_event_memory() {
     let (_launcher, mut head) = start_launcher();
     // The package is regular so it shadows any installed worker package.
     let modules = tempfile::tempdir().unwrap();

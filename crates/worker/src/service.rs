@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_head_that_closes_after_its_answer_orphans_the_rank() -> Result<()> {
+    fn a_head_that_closes_after_its_answer_orphans_the_worker() -> Result<()> {
         // The head's batch was answered, so nothing is in flight when it
         // goes away.
         let head = |mut channel: Channel| -> Result<()> {

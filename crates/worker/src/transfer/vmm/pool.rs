@@ -8,7 +8,7 @@ use uniserve_cuda::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
 };
 
-use crate::storage::memory::Memory;
+use crate::storage::memory::Storage;
 use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 
@@ -64,7 +64,7 @@ impl Drop for Allocation {
 /// Reader words are copied on a private stream. Polling observes a completed
 /// snapshot and never waits for device work on the host.
 pub(crate) struct VmmPool {
-    backing: Option<Arc<Memory>>,
+    backing: Option<Arc<Storage>>,
     device: DeviceId,
     address: usize,
     capacity: usize,
@@ -88,7 +88,7 @@ impl VmmPool {
     /// # Safety
     /// `address` must identify that mapping.
     pub(crate) unsafe fn new(
-        backing: Arc<Memory>,
+        backing: Arc<Storage>,
         device: DeviceId,
         address: usize,
         capacity: usize,
@@ -110,7 +110,7 @@ impl VmmPool {
         })
     }
 
-    pub(crate) fn backing(&self) -> Result<&Arc<Memory>> {
+    pub(crate) fn backing(&self) -> Result<&Arc<Storage>> {
         self.backing
             .as_ref()
             .ok_or(Error::State("VMM pool is closed"))
@@ -383,7 +383,7 @@ impl VmmPool {
 
     /// The caller ends all local and remote uses before closing the pool.
     /// Drain owned readback and return numerical backing outside owner locks.
-    pub(crate) fn close(&mut self) -> Result<Option<Arc<Memory>>> {
+    pub(crate) fn close(&mut self) -> Result<Option<Arc<Storage>>> {
         if self.backing.is_none() {
             return Ok(None);
         }

@@ -1,7 +1,7 @@
 //! The head's registry of per-host launchers.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-host` launcher that connects to the head and registers
+//! runs one `uniserve-launcher` launcher that connects to the head and registers
 //! its host identity; the head then sends that launcher the launches of the
 //! ranks the placement put on its host, of every worker group, and the
 //! launcher spawns them. The registry is built once per deployment and shared
@@ -9,12 +9,12 @@
 //! ranks on it; a rank is named to its launcher by worker and rank.
 //!
 //! A launcher's connection is its liveness signal in both directions. Closing
-//! it terminates that host's ranks, which is how an instance stops a host it
+//! it terminates that host's ranks, which is how a head stops a host it
 //! can no longer reach without adding a heartbeat.
 //!
-//! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-host`
+//! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-launcher`
 //! binary shares, carried as frames on the connection the launcher registered
-//! on (`registry::RankRegistry`). Each rank's launch names the generation of
+//! on (`registry::WorkerRegistry`). Each rank's launch names the generation of
 //! its group's launch, which the rank registry numbers. A `Stop` ends a
 //! group's launch before the group is relaunched under the next generation.
 //! A launcher may report an exit of a stopped rank before it reads the
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use uniserve_ipc::Channel;
-use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report};
+use uniserve_ipc::launcher::{Instruction, Report, WorkerExit, WorkerSpawn};
 
 /// Longest a launcher may take to answer a reservation.
 const RESERVATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -64,7 +64,7 @@ struct ExitReports {
     running: HashMap<String, u64>,
     /// Exits of each group's running launch, with the host that reported
     /// each, by worker group.
-    reported: HashMap<String, Vec<(String, RankExit)>>,
+    reported: HashMap<String, Vec<(String, WorkerExit)>>,
 }
 
 impl ExitReports {
@@ -80,7 +80,7 @@ impl ExitReports {
     /// Keeps one exit a launcher on `host` reported for its group, or
     /// discards it when it names another launch than the group's running
     /// one.
-    fn file(&mut self, host: &str, exit: RankExit) {
+    fn file(&mut self, host: &str, exit: WorkerExit) {
         if self.running.get(&exit.worker_id) != Some(&exit.generation) {
             tracing::debug!(
                 host,
@@ -98,7 +98,7 @@ impl ExitReports {
     }
 
     /// Takes every kept exit of `worker_id`.
-    fn take(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
+    fn take(&mut self, worker_id: &str) -> Vec<(String, WorkerExit)> {
         self.reported.remove(worker_id).unwrap_or_default()
     }
 
@@ -137,8 +137,8 @@ impl LauncherRegistry {
                 ranks
                     .as_ref()
                     .iter()
-                    .filter(|rank| rank.node != host)
-                    .map(|rank| rank.node.clone())
+                    .filter(|rank| rank.host != host)
+                    .map(|rank| rank.host.clone())
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -155,7 +155,7 @@ impl LauncherRegistry {
         tracing::info!(
             address = super::registry::lock(registry)?.tcp_address(),
             hosts = ?remote_hosts,
-            "awaiting a launcher for each host this instance does not run on"
+            "awaiting a launcher for each host this head does not run on"
         );
         launchers.await_hosts(registry, &remote_hosts, timeout)?;
         Ok(Some(Arc::new(Mutex::new(launchers))))
@@ -185,7 +185,7 @@ impl LauncherRegistry {
     /// Waits until every named host has registered a launcher.
     ///
     /// A host that never registers fails the launch by name rather than
-    /// leaving the instance waiting for ranks that were never started. A
+    /// leaving the head waiting for workers that were never started. A
     /// launcher of another build than the head's fails the wait by name.
     pub(crate) fn await_hosts(
         &mut self,
@@ -270,7 +270,7 @@ impl LauncherRegistry {
     /// Sends one rank's launch to the launcher that owns its host. The
     /// spawn's generation becomes the one its group's exits are attributed
     /// to.
-    pub(crate) fn spawn_remote(&mut self, host: &str, spawn: RankSpawn) -> anyhow::Result<()> {
+    pub(crate) fn spawn_remote(&mut self, host: &str, spawn: WorkerSpawn) -> anyhow::Result<()> {
         self.exits.launch(&spawn.worker_id, spawn.generation);
         let launcher = self
             .hosts
@@ -289,7 +289,7 @@ impl LauncherRegistry {
     /// connection holds, discards exits of a launch a stop has ended, and
     /// moves on from a launcher at its first receive error or close. A closed
     /// launcher connection is therefore not reported here.
-    pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, RankExit)> {
+    pub(crate) fn drain_exits(&mut self, worker_id: &str) -> Vec<(String, WorkerExit)> {
         for (host, launcher) in self.hosts.iter_mut() {
             while let Ok(Some(report)) = launcher.channel.try_recv::<Report>() {
                 if let Report::Exit(exit) = report {
@@ -325,7 +325,7 @@ impl LauncherRegistry {
 }
 
 impl Drop for LauncherRegistry {
-    /// Stops every host's ranks when the instance stops.
+    /// Stops every host's workers when the head stops.
     ///
     /// A launcher terminates its ranks when this connection closes, so the
     /// instruction is a courtesy that lets a reachable host stop cleanly; the
@@ -382,7 +382,7 @@ impl RemoteHost<'_> {
             .map_err(|_| anyhow::anyhow!("the launcher registry is poisoned"))?;
         registry.spawn_remote(
             self.host,
-            RankSpawn {
+            WorkerSpawn {
                 rank,
                 worker_id: worker_id.to_owned(),
                 generation,
@@ -396,16 +396,16 @@ impl RemoteHost<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LauncherRegistry, RankSpawn};
-    use crate::worker::registry::{RankRegistry, Registry, lock};
+    use super::{LauncherRegistry, WorkerSpawn};
+    use crate::worker::registry::{Registry, WorkerRegistry, lock};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
-    use uniserve_ipc::launcher::{Instruction, RankExit, Report};
+    use uniserve_ipc::launcher::{Instruction, Report, WorkerExit};
     use uniserve_ipc::{Channel, Registration, VERSION};
 
     /// Binds a head and connects a launcher of host `b` to its TCP port.
     fn head_and_launcher() -> (Registry, Channel) {
-        let head = RankRegistry::bind(true).expect("the head binds");
+        let head = WorkerRegistry::bind(true).expect("the head binds");
         let port = lock(&head)
             .expect("the head locks")
             .tcp_address()
@@ -430,7 +430,7 @@ mod tests {
             head,
             "a",
             [[crate::WorkerRank {
-                node: "b".into(),
+                host: "b".into(),
                 device: "cpu".into(),
             }]],
             Duration::from_secs(5),
@@ -460,7 +460,7 @@ mod tests {
         registry
             .spawn_remote(
                 "b",
-                RankSpawn {
+                WorkerSpawn {
                     rank,
                     worker_id: worker_id.to_owned(),
                     generation,
@@ -473,8 +473,8 @@ mod tests {
     }
 
     /// An exit of the rank `spawn` launched.
-    fn exit(spawn: &RankSpawn, status: &str) -> Report {
-        Report::Exit(RankExit {
+    fn exit(spawn: &WorkerSpawn, status: &str) -> Report {
+        Report::Exit(WorkerExit {
             worker_id: spawn.worker_id.clone(),
             generation: spawn.generation,
             rank: spawn.rank,

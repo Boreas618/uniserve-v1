@@ -1,7 +1,7 @@
 //! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
 //!
 //! The engine drives GPU and host work through worker rank processes. A
-//! `WorkerGroup` (in `instance`) is one worker's cooperating ranks: it projects
+//! `WorkerGroup` (in `group`) is one worker group's cooperating workers: it projects
 //! each submitted `Batch` onto the ranks whose components own its calls, joins
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
 //! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
@@ -11,25 +11,25 @@
 //! `launcher` the per-host launchers that start ranks placed on other hosts.
 
 mod executor;
+mod group;
 mod incarnations;
-mod instance;
 mod launcher;
 mod process;
 mod registry;
 mod rendezvous;
 
 pub use executor::WorkerExecutor;
+pub use group::{CallReaders, WorkerGroup};
 pub(crate) use incarnations::IncarnationRegistry;
-pub use instance::{CallReaders, WorkerGroup};
 pub use process::{
     FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
 };
-use process::{PendingRank, RankProcess};
+use process::{PendingWorker, WorkerProcess};
 
 /// Backpressure and terminal failures returned by a WorkerGroup batch submission.
 #[derive(Debug, thiserror::Error)]
 pub enum BatchSubmitError {
-    /// Returns the unaccepted physical submission when the instance has no capacity.
+    /// Returns the unaccepted physical submission when the group has no capacity.
     ///
     /// The batch is handed back unchanged so the caller can resubmit it
     /// later; nothing was recorded or sent for it.
@@ -43,20 +43,20 @@ pub enum BatchSubmitError {
 /// Everything required to create or recreate one worker rank process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkerProcessArgs {
-    /// Logical instance identity assigned by the engine.
+    /// Worker group identity assigned by the engine.
     pub worker_id: String,
     /// Python interpreter used to launch the worker entry point.
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Ordered physical members of this WorkerGroup instance.
+    /// Ordered physical members of this worker group.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks
-    /// whose placement node matches it, so a placement may name its host
+    /// whose placement host matches it, so a placement may name its host
     /// explicitly instead of relying on a reserved local name.
     pub host: String,
     /// Whether this group owns model capabilities or shared routed experts.
-    pub role: crate::WorkerRole,
+    pub role: crate::WorkerGroupRole,
     /// Component membership and parallel geometry.
     pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Every worker's component membership, keyed by worker identity, this
@@ -126,7 +126,7 @@ pub struct WorkerProcessArgs {
     pub kv_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
     /// Each rank's share of its device's total memory, which bounds the
     /// process's static allocations, weights and KV cache;
-    /// `WorkerConfig::validate_mem_fraction_static` states its range.
+    /// `WorkerGroupConfig::validate_mem_fraction_static` states its range.
     pub mem_fraction_static: f64,
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's; the rank parses it.

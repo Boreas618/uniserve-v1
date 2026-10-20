@@ -51,7 +51,7 @@ use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::storage::{PrefixCache, ProductBuffer, ProductStore};
 use crate::stream::EventPool;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result, lock};
 
 /// What a batch borrows from the rank.
@@ -684,7 +684,7 @@ fn context<'a>(
             None,
         ));
     };
-    let Some(RankStorage {
+    let Some(WorkerStorage {
         prefix_cache: Some(prefix_cache),
         tensors,
         events,

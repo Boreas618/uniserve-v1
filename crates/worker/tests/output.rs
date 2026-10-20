@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use uniserve_core::TokenLogprob;
 use uniserve_worker::ffi::{Backing, DType};
-use uniserve_worker::storage::{LogprobLayout, Memory, OutputBuffer, OutputStorage, StorageView};
+use uniserve_worker::storage::{LogprobLayout, OutputBuffer, OutputStorage, Storage, StorageView};
 use uniserve_worker::{EventPool, Result};
 
 /// A host column holding `values`, as a CPU lane's sampler produces it.
 fn column<T: Copy>(values: &[T], dtype: DType) -> Result<StorageView> {
-    let memory = Memory::host(size_of_val(values));
+    let memory = Storage::host(size_of_val(values));
     // SAFETY: fresh host memory of exactly this size, owned by the test.
     unsafe {
         std::ptr::copy_nonoverlapping(values.as_ptr(), memory.address() as *mut T, values.len());

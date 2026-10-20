@@ -29,7 +29,7 @@ use crate::lane::{Capture, Completion, Job};
 use crate::runner::RunnerSetup;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
 use crate::storage::PinnedPool;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// A condition encoding was recorded before the job that constructs its
@@ -458,7 +458,7 @@ impl Conditions {
                     let posterior = if elements == 0 {
                         Posterior::None
                     } else {
-                        let memory = Memory::pinned(self.device, elements as usize * 4)?;
+                        let memory = Storage::pinned(self.device, elements as usize * 4)?;
                         Posterior::Undrawn(StorageView::contiguous(
                             memory as Arc<dyn Backing>,
                             0,

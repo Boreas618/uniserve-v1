@@ -691,8 +691,8 @@ impl Scheduler {
             .feedback_next_token;
         match next {
             uniserve_core::FeedbackNextToken::None => None,
-            uniserve_core::FeedbackNextToken::Bos => Some(self.ctrl.bos),
-            uniserve_core::FeedbackNextToken::EndOfImage => Some(self.ctrl.end_of_image),
+            uniserve_core::FeedbackNextToken::Bos => Some(self.special_tokens.bos),
+            uniserve_core::FeedbackNextToken::EndOfImage => Some(self.special_tokens.end_of_image),
             uniserve_core::FeedbackNextToken::Token { token_id } => Some(token_id),
         }
     }

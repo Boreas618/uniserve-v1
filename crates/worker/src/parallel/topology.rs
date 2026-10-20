@@ -177,7 +177,7 @@ pub(crate) struct GroupPlan {
 pub(crate) struct PlanInputs<'a> {
     /// This rank's world rank.
     pub rank: usize,
-    /// Physical rank of each world rank (the torch ranks of this instance).
+    /// Physical rank of each world rank (the torch ranks of this worker group).
     pub physical: &'a [usize],
     /// Synchronize group creation locally (expert union present).
     pub local_sync: bool,

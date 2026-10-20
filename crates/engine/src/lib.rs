@@ -28,13 +28,13 @@ pub mod storage;
 mod warmup;
 mod worker;
 
-pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank, WorkerRole};
+pub use crate::core::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::deployment::Deployment;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, ParallelConfig,
     PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend, TransferConfig,
-    TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure, WorkerId, WorkerResult,
+    TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure, WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,

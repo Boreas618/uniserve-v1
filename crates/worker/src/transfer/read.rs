@@ -28,7 +28,7 @@ use super::{
 };
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result, lock};
 
@@ -389,7 +389,7 @@ impl std::ops::Deref for ReadRef {
 pub(crate) struct ReadContext {
     pub(crate) events: Arc<EventPool>,
     streams: Mutex<HashMap<(ThreadId, DeviceId), Arc<Stream>>>,
-    staging: Mutex<HashMap<(ThreadId, DeviceId), Arc<Memory>>>,
+    staging: Mutex<HashMap<(ThreadId, DeviceId), Arc<Storage>>>,
 }
 
 impl ReadContext {
@@ -416,7 +416,7 @@ impl ReadContext {
     /// The calling thread's page-locked staging of at least `bytes` for
     /// `device` copies. A read drains its stream before returning, so the
     /// thread's next read may reuse it; an undrained read takes it over.
-    fn staging(&self, device: DeviceId, bytes: usize) -> Result<Arc<Memory>> {
+    fn staging(&self, device: DeviceId, bytes: usize) -> Result<Arc<Storage>> {
         let key = (std::thread::current().id(), device);
         let mut staging = lock(&self.staging);
         if let Some(memory) = staging.get(&key)
@@ -424,7 +424,7 @@ impl ReadContext {
         {
             return Ok(Arc::clone(memory));
         }
-        let memory = Memory::pinned(device, bytes.max(1).next_power_of_two())?;
+        let memory = Storage::pinned(device, bytes.max(1).next_power_of_two())?;
         staging.insert(key, Arc::clone(&memory));
         Ok(memory)
     }

@@ -1,27 +1,27 @@
 //! Deployment files: the worker groups a server launches, stated in TOML.
 //!
-//! A deployment file lists worker groups as `[[workers]]` tables. Each group
+//! A deployment file lists worker groups as `[[worker_groups]]` tables. Each group
 //! names its ranks compactly and the components placed on them:
 //!
 //! ```toml
-//! [[workers]]
+//! [[worker_groups]]
 //! id = "flow"
 //! replicas = 2              # flow-0 on cuda:0-3, flow-1 on cuda:4-7
 //! ranks = ["cuda:0-7"]
 //! queue_depth = 6
 //!
-//! [workers.components.transformer]
+//! [worker_groups.components.transformer]
 //! sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 //!
-//! [workers.components.audio_decoder]
+//! [worker_groups.components.audio_decoder]
 //! distribution = "temporal_units"
 //! ```
 //!
-//! [`Deployment::read`] parses a file; [`Deployment::workers`] places its
-//! ranks on hosts and expands it into the engine's [`WorkerConfig`] list,
+//! [`Deployment::read`] parses a file; [`Deployment::worker_groups`] places its
+//! ranks on hosts and expands it into the engine's [`WorkerGroupConfig`] list,
 //! which every launch path consumes. Reading checks the file's syntax and
 //! schema; placement validates the expanded groups with
-//! [`WorkerConfig::validate_all`], so a file that names no host can be
+//! [`WorkerGroupConfig::validate_all`], so a file that names no host can be
 //! checked only once the head's own host identity is known.
 
 use std::collections::BTreeMap;
@@ -33,8 +33,8 @@ use uniserve_core::{
 };
 use uniserve_ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
 
-use crate::core::{WorkerConfig, WorkerRank, WorkerRole};
-use crate::executor::WorkerId;
+use crate::core::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
+use crate::executor::WorkerGroupId;
 
 /// Serde default for a degree, a replica count and `units_per_rank`.
 const fn one() -> usize {
@@ -46,17 +46,17 @@ const fn one() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
     /// Worker groups in file order; a replicated group expands in place.
-    workers: Vec<WorkerEntry>,
+    worker_groups: Vec<GroupEntry>,
 }
 
-/// One `[[workers]]` table.
+/// One `[[worker_groups]]` table.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerEntry {
+struct GroupEntry {
     /// Group identity; replica `i` of a replicated group is `<id>-<i>`.
     id: String,
     #[serde(default)]
-    role: WorkerRole,
+    role: WorkerGroupRole,
     /// Copies of the group, each over an equal consecutive block of `ranks`.
     /// The copies' components are replicas of the same numerical components
     /// under one scheduler, which binds each request to one copy.
@@ -74,7 +74,7 @@ struct WorkerEntry {
     components: BTreeMap<String, ComponentEntry>,
 }
 
-/// One `[workers.components.<name>]` table: a [`ComponentConfig`] whose
+/// One `[worker_groups.components.<name>]` table: a [`ComponentConfig`] whose
 /// parallel degrees are stated beside its membership.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,15 +97,15 @@ struct ComponentEntry {
     weights: ComponentWeights,
 }
 
-/// One `ranks` entry, `[NODE/]DEVICE`, naming one or more consecutive ranks.
+/// One `ranks` entry, `[HOST/]DEVICE`, naming one or more consecutive ranks.
 ///
 /// `DEVICE` is a single device (`cuda:0`, `cpu`), an inclusive index range
-/// (`cuda:0-3`) or a repeated device (`cpu*4`). Without `NODE` the ranks run
+/// (`cuda:0-3`) or a repeated device (`cpu*4`). Without `HOST` the ranks run
 /// on the head's own host.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 struct RankRange {
-    node: Option<String>,
+    host: Option<String>,
     devices: Vec<String>,
 }
 
@@ -115,12 +115,12 @@ impl TryFrom<String> for RankRange {
     fn try_from(text: String) -> Result<Self, Self::Error> {
         let invalid = |reason: &str| format!("rank entry {text:?}: {reason}");
 
-        let (node, device) = match text.split_once('/') {
-            Some((node, device)) => (Some(node.to_owned()), device),
+        let (host, device) = match text.split_once('/') {
+            Some((host, device)) => (Some(host.to_owned()), device),
             None => (None, text.as_str()),
         };
-        if node.as_deref().is_some_and(str::is_empty) {
-            return Err(invalid("the node before `/` is empty"));
+        if host.as_deref().is_some_and(str::is_empty) {
+            return Err(invalid("the host before `/` is empty"));
         }
 
         let devices = if let Some((device, count)) = device.split_once('*') {
@@ -149,7 +149,7 @@ impl TryFrom<String> for RankRange {
             return Err(invalid("the device is empty"));
         }
 
-        Ok(Self { node, devices })
+        Ok(Self { host, devices })
     }
 }
 
@@ -169,15 +169,15 @@ impl Deployment {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let deployment: Self = toml::from_str(text)?;
         anyhow::ensure!(
-            !deployment.workers.is_empty(),
-            "a deployment lists at least one [[workers]] group"
+            !deployment.worker_groups.is_empty(),
+            "a deployment lists at least one [[worker_groups]] group"
         );
         Ok(deployment)
     }
 
     /// Places the deployment's ranks and returns its worker groups.
     ///
-    /// A rank entry without a node runs on `head`, the launching process's
+    /// A rank entry without a host runs on `head`, the launching process's
     /// own host identity. A group with `replicas = N` becomes `N` groups
     /// named `<id>-0` through `<id>-<N-1>`, each over the next equal block
     /// of its ranks; a component without `ranks` spans every rank of its
@@ -189,29 +189,29 @@ impl Deployment {
     ///
     /// Fails when a group's replica count is zero or does not divide its
     /// ranks, when the decoder or codec states another unit count, or when
-    /// [`WorkerConfig::validate_all`] refuses the expanded groups.
-    pub fn workers(&self, head: &str) -> anyhow::Result<Vec<WorkerConfig>> {
+    /// [`WorkerGroupConfig::validate_all`] refuses the expanded groups.
+    pub fn worker_groups(&self, head: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
         let mut workers = Vec::new();
-        for entry in &self.workers {
+        for entry in &self.worker_groups {
             entry
                 .expand(head, &mut workers)
                 .with_context(|| format!("worker {}", entry.id))?;
         }
-        WorkerConfig::validate_all(&workers)?;
+        WorkerGroupConfig::validate_all(&workers)?;
         Ok(workers)
     }
 }
 
-impl WorkerEntry {
+impl GroupEntry {
     /// Appends this group's replicas to `workers`.
-    fn expand(&self, head: &str, workers: &mut Vec<WorkerConfig>) -> anyhow::Result<()> {
+    fn expand(&self, head: &str, workers: &mut Vec<WorkerGroupConfig>) -> anyhow::Result<()> {
         let ranks = self
             .ranks
             .iter()
             .flat_map(|range| {
-                let node = range.node.as_deref().unwrap_or(head);
+                let host = range.host.as_deref().unwrap_or(head);
                 range.devices.iter().map(move |device| WorkerRank {
-                    node: node.to_owned(),
+                    host: host.to_owned(),
                     device: device.clone(),
                 })
             })
@@ -241,8 +241,8 @@ impl WorkerEntry {
             } else {
                 format!("{}-{index}", self.id)
             };
-            workers.push(WorkerConfig {
-                id: WorkerId(id),
+            workers.push(WorkerGroupConfig {
+                id: WorkerGroupId(id),
                 role: self.role,
                 ranks: block.to_vec(),
                 components: components.clone(),
@@ -257,7 +257,7 @@ impl WorkerEntry {
 impl ComponentEntry {
     /// The component's placement within one replica of `rank_count` ranks.
     fn resolve(&self, name: &str, rank_count: usize) -> anyhow::Result<ComponentConfig> {
-        // The video decoder and codec run one local instance per member rank
+        // The video decoder and codec run one local copy per member rank
         // and take one independent media unit per rank per round, the only
         // placement a rank accepts for them.
         let mut distribution = self.distribution;
@@ -291,13 +291,13 @@ impl ComponentEntry {
 mod tests {
     use super::*;
 
-    fn workers(text: &str) -> anyhow::Result<Vec<WorkerConfig>> {
-        Deployment::parse(text)?.workers("head")
+    fn workers(text: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+        Deployment::parse(text)?.worker_groups("head")
     }
 
-    fn rank(node: &str, device: &str) -> WorkerRank {
+    fn rank(host: &str, device: &str) -> WorkerRank {
         WorkerRank {
-            node: node.into(),
+            host: host.into(),
             device: device.into(),
         }
     }
@@ -308,14 +308,14 @@ mod tests {
     fn replicas_split_the_ranks_into_named_blocks() {
         let placed = workers(
             r#"
-            [[workers]]
+            [[worker_groups]]
             id = "flow"
             replicas = 2
             ranks = ["cuda:0-3"]
             queue_depth = 6
             mem_fraction_static = 0.5
 
-            [workers.components.transformer]
+            [worker_groups.components.transformer]
             sequence_parallel = { kind = "ulysses", ulysses_degree = 2 }
             "#,
         )
@@ -337,24 +337,24 @@ mod tests {
         }
     }
 
-    /// An entry without a node runs on the head's host; a named node, a
+    /// An entry without a host runs on the head's host; a named host, a
     /// repeated host device and a single device each place as written.
     #[test]
-    fn rank_entries_place_on_the_head_or_a_named_node() {
+    fn rank_entries_place_on_the_head_or_a_named_host() {
         let placed = workers(
             r#"
-            [[workers]]
-            id = "host"
+            [[worker_groups]]
+            id = "media"
             ranks = ["cpu*2", "rank-1/cpu", "rank-1/cuda:1"]
             queue_depth = 2
 
-            [workers.components.muxer]
+            [worker_groups.components.muxer]
             ranks = [0]
             "#,
         )
         .unwrap();
 
-        assert_eq!(placed[0].id.0, "host");
+        assert_eq!(placed[0].id.0, "media");
         assert_eq!(
             placed[0].ranks,
             vec![
@@ -373,8 +373,8 @@ mod tests {
     fn the_video_decoder_and_codec_take_one_unit_per_rank() {
         let decoder = |table: &str| {
             workers(&format!(
-                "[[workers]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
-                 [workers.components.video_decoder]\n{table}"
+                "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
+                 [worker_groups.components.video_decoder]\n{table}"
             ))
         };
 
@@ -390,11 +390,12 @@ mod tests {
 
     #[test]
     fn malformed_deployments_are_refused() {
-        let group = |body: &str| format!("[[workers]]\nid = \"model\"\nqueue_depth = 2\n{body}");
+        let group =
+            |body: &str| format!("[[worker_groups]]\nid = \"model\"\nqueue_depth = 2\n{body}");
         for refused in [
             // Unknown keys, at the group and the component.
             group("ranks = [\"cuda:0\"]\nreplica = 2"),
-            group("ranks = [\"cuda:0\"]\n[workers.components.model]\ntensor_parallel = 1"),
+            group("ranks = [\"cuda:0\"]\n[worker_groups.components.model]\ntensor_parallel = 1"),
             // Rank entries that name no devices.
             group("ranks = [\"cuda:3-1\"]"),
             group("ranks = [\"cpu*0\"]"),
@@ -402,7 +403,9 @@ mod tests {
             // Replicas that do not divide the ranks.
             group("ranks = [\"cuda:0-2\"]\nreplicas = 2"),
             // A component whose degrees do not match its ranks.
-            group("ranks = [\"cuda:0-1\"]\n[workers.components.model]\ntensor_parallel_size = 4"),
+            group(
+                "ranks = [\"cuda:0-1\"]\n[worker_groups.components.model]\ntensor_parallel_size = 4",
+            ),
             // No groups at all.
             String::new(),
         ] {
@@ -410,7 +413,7 @@ mod tests {
         }
     }
 
-    /// Every deployment the repository publishes for `--workers` places.
+    /// Every deployment the repository publishes for `--worker-groups` places.
     #[test]
     fn published_deployments_place() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs");
@@ -420,7 +423,7 @@ mod tests {
                 let path = entry.unwrap().path();
                 let deployment = Deployment::read(path.to_str().unwrap()).unwrap();
                 deployment
-                    .workers("localhost")
+                    .worker_groups("localhost")
                     .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
                 files += 1;
             }

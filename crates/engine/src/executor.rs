@@ -57,13 +57,13 @@ pub struct PoolPlacement {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
-    pub workers: Vec<(WorkerId, WorkerInfo)>,
+    pub workers: Vec<(WorkerGroupId, WorkerInfo)>,
     /// For each pool, what the engine launched it with. A pool absent from
     /// the map is placed with no components and a queue depth of one.
     ///
     /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
     /// launch; `from_workers` leaves it empty.
-    pub placements: BTreeMap<WorkerId, PoolPlacement>,
+    pub placements: BTreeMap<WorkerGroupId, PoolPlacement>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
@@ -71,7 +71,7 @@ pub struct ExecutorInfo {
     /// `WorkerExecutor::try_new` fills this from the placement;
     /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
-    pub video_codecs: BTreeMap<WorkerId, BTreeSet<WorkerId>>,
+    pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
     /// in rank order, as the ranks reported them. Each rank has its own
     /// buffer pool, sized to the products of the components it executes and
@@ -82,7 +82,7 @@ pub struct ExecutorInfo {
     /// from it, as `from_workers` and `SimExecutor` leave every pool, has
     /// its launched ranks (`PoolPlacement::ranks`, one when it has no
     /// placement), each backing its reported `buffer_pool_bytes`.
-    pub rank_buffer_bytes: BTreeMap<WorkerId, Vec<u64>>,
+    pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
 }
 
 impl ExecutorInfo {
@@ -91,7 +91,7 @@ impl ExecutorInfo {
     /// Each rank validated the report it built, so the records are taken as
     /// they are. Fails when `pools` is empty, repeats a pool id, or holds
     /// replicas of one component that expose different numerical outputs.
-    pub fn from_workers(pools: Vec<(WorkerId, WorkerInfo)>) -> anyhow::Result<Self> {
+    pub fn from_workers(pools: Vec<(WorkerGroupId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
             "executor info must contain at least one pool"
@@ -120,13 +120,13 @@ impl ExecutorInfo {
 
     /// Returns the configuration the engine placed component `name` with on
     /// `worker`, or `None` when the pool was launched with no such component.
-    pub fn component_config(&self, worker: &WorkerId, name: &str) -> Option<&ComponentConfig> {
+    pub fn component_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&ComponentConfig> {
         self.placements.get(worker)?.components.get(name)
     }
 
     /// The persistent buffer bytes each rank of `worker` backs, in rank
     /// order; empty for a pool this info does not hold.
-    pub fn rank_buffer_bytes(&self, worker: &WorkerId) -> Vec<u64> {
+    pub fn rank_buffer_bytes(&self, worker: &WorkerGroupId) -> Vec<u64> {
         if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
             return bytes.clone();
         }
@@ -142,7 +142,7 @@ impl ExecutorInfo {
     }
 
     /// The ranks `worker` holds; one for a pool this info does not hold.
-    pub fn rank_count(&self, worker: &WorkerId) -> usize {
+    pub fn rank_count(&self, worker: &WorkerGroupId) -> usize {
         self.rank_buffer_bytes(worker).len().max(1)
     }
 
@@ -155,7 +155,7 @@ impl ExecutorInfo {
     pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
         // The first worker seen serving a call is kept only to name it if
         // another worker routes that call to a different component.
-        let mut routing: BTreeMap<MediaCall, (String, &WorkerId)> = BTreeMap::new();
+        let mut routing: BTreeMap<MediaCall, (String, &WorkerGroupId)> = BTreeMap::new();
         for (id, info) in &self.workers {
             for (call, component) in &info.media_components {
                 if let Some((other, owner)) = routing.get(call) {
@@ -200,7 +200,7 @@ impl ExecutorInfo {
     ///
     /// Returns `None` when no worker serves `call`, or the width does not
     /// fit in `u32`.
-    pub fn media_lane_units(&self, call: MediaCall) -> Option<u32> {
+    pub fn media_units(&self, call: MediaCall) -> Option<u32> {
         self.workers
             .iter()
             .filter_map(|(worker, info)| {
@@ -650,9 +650,9 @@ pub enum ExecutorSubmitError {
 /// Stable identity of one explicitly configured physical worker pool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct WorkerId(pub String);
+pub struct WorkerGroupId(pub String);
 
-impl WorkerId {
+impl WorkerGroupId {
     /// Validates and constructs a stable pool identifier.
     ///
     /// An identifier is nonempty ASCII alphanumerics, `-`, and `_`. Only this
@@ -670,7 +670,7 @@ impl WorkerId {
     }
 }
 
-impl std::fmt::Display for WorkerId {
+impl std::fmt::Display for WorkerGroupId {
     /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
@@ -743,11 +743,11 @@ impl FromStr for TransferBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
-    pub source_worker: WorkerId,
+    pub source_worker: WorkerGroupId,
     /// One source member, or all members when omitted.
     pub source_rank: Option<u32>,
     /// Pool that consumes the transferred product.
-    pub destination_worker: WorkerId,
+    pub destination_worker: WorkerGroupId,
     /// One consumer member, or all members when omitted.
     pub destination_rank: Option<u32>,
     /// Mechanism carrying device products across this edge.
@@ -807,15 +807,18 @@ impl TransferConfig {
     ///
     /// # Errors
     ///
-    /// Fails when `WorkerConfig::validate_all` rejects `workers`.
-    pub fn with_worker_defaults(mut self, workers: &[crate::WorkerConfig]) -> anyhow::Result<Self> {
-        crate::WorkerConfig::validate_all(workers)?;
+    /// Fails when `WorkerGroupConfig::validate_all` rejects `workers`.
+    pub fn with_worker_defaults(
+        mut self,
+        workers: &[crate::WorkerGroupConfig],
+    ) -> anyhow::Result<Self> {
+        crate::WorkerGroupConfig::validate_all(workers)?;
         for worker in workers {
             self.worker_ranks
                 .insert(worker.id.0.clone(), worker.ranks.len() as u32);
             self.worker_hosts.insert(
                 worker.id.0.clone(),
-                worker.ranks.iter().map(|rank| rank.node.clone()).collect(),
+                worker.ranks.iter().map(|rank| rank.host.clone()).collect(),
             );
         }
         // Products flow between the components of one worker and between
@@ -851,7 +854,7 @@ impl TransferConfig {
                                 // A shared-storage segment is named in one host's
                                 // namespace, so a host product that leaves its host
                                 // travels on the rank channel's data path.
-                                let host = if source.node == destination.node {
+                                let host = if source.host == destination.host {
                                     TransferBackend::PosixShm
                                 } else {
                                     TransferBackend::Channel
@@ -912,13 +915,13 @@ impl TransferConfig {
         (backends, exports)
     }
 
-    /// Returns the instance-wide acknowledgment slot of one rank.
+    /// Returns the acknowledgment slot of one rank across the engine core's groups.
     ///
     /// Each published chunk or segment carries one acknowledgment word per
-    /// instance rank. A consumer claims the word at its own slot when it
+    /// rank of the engine core's groups. A consumer claims the word at its own slot when it
     /// begins reading and acknowledges it once its reads are done, so the
     /// producer can tell a consumer still reading from one that has finished
-    /// or never began. Slots are dense across the instance. A worker absent
+    /// or never began. Slots are dense across the groups. A worker group absent
     /// from `worker_ranks` yields a slot past every placed worker's run.
     pub fn acknowledgment_slot(&self, worker: &str, rank: u32) -> u32 {
         // Workers are keyed in a BTreeMap, so their order is the same in every
@@ -1121,7 +1124,7 @@ impl TransferConfig {
         incarnations: &crate::worker::IncarnationRegistry,
         tensor: &mut uniserve_ipc::TensorTransfer,
         destination: &uniserve_ipc::WorkerEndpoint,
-        destination_position: Option<&(WorkerId, u32)>,
+        destination_position: Option<&(WorkerGroupId, u32)>,
     ) -> bool {
         use uniserve_ipc::TransferTransport;
 
@@ -1178,7 +1181,7 @@ impl TransferConfig {
     pub fn parse(s: &str) -> Result<Self, TransferConfigError> {
         let mut edges = Vec::new();
 
-        let endpoint = |text: &str| -> Result<(WorkerId, Option<u32>), TransferConfigError> {
+        let endpoint = |text: &str| -> Result<(WorkerGroupId, Option<u32>), TransferConfigError> {
             let (worker, rank) = match text.trim().split_once(':') {
                 Some((worker, rank)) => (
                     worker,
@@ -1188,7 +1191,7 @@ impl TransferConfig {
                 ),
                 None => (text.trim(), None),
             };
-            let worker = WorkerId::new(worker).map_err(|error| {
+            let worker = WorkerGroupId::new(worker).map_err(|error| {
                 TransferConfigError::message(format!("invalid transfer worker: {error}"))
             })?;
             Ok((worker, rank))
@@ -1292,7 +1295,7 @@ impl FromStr for TransferConfig {
 /// Every published location of these products travels on a mechanism that no
 /// configured edge to the consumer carries, so the requests reading them can
 /// never run there. `WorkerExecutor` fails those requests alone: the refusal
-/// says nothing about the rest of the batch or the health of either instance.
+/// says nothing about the rest of the batch or the health of either group.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("input products have no location on a configured transfer edge to {destination}")]
 pub(crate) struct UnroutableInputs {
@@ -1344,9 +1347,9 @@ pub struct WorkerExecError {
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct WorkerFailure {
-    /// Logical instance reporting the failure.
-    pub worker_id: WorkerId,
-    /// Invalidated incarnations; empty when the instance retains its allocations.
+    /// Worker group reporting the failure.
+    pub worker_id: WorkerGroupId,
+    /// Invalidated incarnations; empty when the group retains its allocations.
     pub endpoints: Vec<uniserve_ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
@@ -1374,10 +1377,10 @@ pub struct WorkerFailure {
 pub trait Executor: Send {
     /// Returns the executor's concrete pool capabilities.
     fn info(&self) -> &ExecutorInfo;
-    /// Whether `worker`'s complete instance is ready to accept execution.
-    fn is_ready(&self, worker: &WorkerId) -> bool;
-    /// Whether this instance has an unclaimed destination submission slot.
-    fn has_capacity(&self, worker: &WorkerId) -> bool;
+    /// Whether every worker of group `worker` is ready to accept execution.
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool;
+    /// Whether group `worker` has an unclaimed destination submission slot.
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
     /// Whether every physical owner of a lifecycle command can accept its submission.
     fn command_has_capacity(&self, command: &BatchCommand) -> bool;
     /// Submits one logical batch without blocking for capacity.
@@ -1436,7 +1439,7 @@ mod tests {
         id: &str,
         routes: &[(MediaCall, &str)],
         request_slots: u32,
-    ) -> (WorkerId, WorkerInfo) {
+    ) -> (WorkerGroupId, WorkerInfo) {
         let mut info = media_info(routes);
         info.request_slots = request_slots;
         info.components = routes
@@ -1449,10 +1452,10 @@ mod tests {
                 outputs: Vec::new(),
             })
             .collect();
-        (WorkerId(id.to_owned()), info)
+        (WorkerGroupId(id.to_owned()), info)
     }
 
-    fn media_replica(id: &str, request_slots: u32) -> (WorkerId, WorkerInfo) {
+    fn media_replica(id: &str, request_slots: u32) -> (WorkerGroupId, WorkerInfo) {
         media_pool(
             id,
             &[
@@ -1529,8 +1532,8 @@ mod tests {
         ]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerId("model".to_owned()), model),
-                (WorkerId("host".to_owned()), host),
+                (WorkerGroupId("model".to_owned()), model),
+                (WorkerGroupId("host".to_owned()), host),
             ],
             ..ExecutorInfo::default()
         };
@@ -1545,7 +1548,7 @@ mod tests {
     /// a call no worker serves has no lane. A latent encoder's lane leaves
     /// out the ranks its worker's text encoder takes.
     #[test]
-    fn media_lanes_count_the_units_one_call_covers() {
+    fn media_units_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
         let temporal = |ranks: Vec<usize>, units_per_rank: usize| ComponentConfig {
             distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
@@ -1573,14 +1576,14 @@ mod tests {
                 vec![("latent_encoder", config)],
             )
         };
-        let lanes = |pools: Vec<((WorkerId, WorkerInfo), (WorkerId, PoolPlacement))>| {
+        let lanes = |pools: Vec<((WorkerGroupId, WorkerInfo), (WorkerGroupId, PoolPlacement))>| {
             let (workers, placements) = pools.into_iter().unzip();
             ExecutorInfo {
                 workers,
                 placements,
                 ..ExecutorInfo::default()
             }
-            .media_lane_units(MediaCall::LatentEncoding)
+            .media_units(MediaCall::LatentEncoding)
         };
 
         assert_eq!(
@@ -1673,7 +1676,7 @@ mod tests {
                 references: uniserve_core::ReferenceLimits::default(),
             });
             ExecutorInfo {
-                workers: vec![(WorkerId("model".to_owned()), info)],
+                workers: vec![(WorkerGroupId("model".to_owned()), info)],
                 ..ExecutorInfo::default()
             }
         };
@@ -1703,8 +1706,8 @@ mod tests {
         let host = media_info(&[(MediaCall::Muxing, "muxer")]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerId("model".to_owned()), model.clone()),
-                (WorkerId("host".to_owned()), host),
+                (WorkerGroupId("model".to_owned()), model.clone()),
+                (WorkerGroupId("host".to_owned()), host),
             ],
             ..ExecutorInfo::default()
         };
@@ -1717,8 +1720,8 @@ mod tests {
         let other = media_info(&[(MediaCall::VideoDecoding, "decoder")]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerId("model".to_owned()), model),
-                (WorkerId("other".to_owned()), other),
+                (WorkerGroupId("model".to_owned()), model),
+                (WorkerGroupId("other".to_owned()), other),
             ],
             ..ExecutorInfo::default()
         };
@@ -1737,17 +1740,17 @@ mod tests {
         let mut transfer = TransferConfig {
             edges: vec![
                 TransferEdge {
-                    source_worker: WorkerId("encoder".to_owned()),
+                    source_worker: WorkerGroupId("encoder".to_owned()),
                     source_rank: Some(0),
-                    destination_worker: WorkerId("decode".to_owned()),
+                    destination_worker: WorkerGroupId("decode".to_owned()),
                     destination_rank: None,
                     device: Some(TransferBackend::CudaVmm),
                     host: Some(TransferBackend::PosixShm),
                 },
                 TransferEdge {
-                    source_worker: WorkerId("encoder".to_owned()),
+                    source_worker: WorkerGroupId("encoder".to_owned()),
                     source_rank: Some(0),
-                    destination_worker: WorkerId("encoder".to_owned()),
+                    destination_worker: WorkerGroupId("encoder".to_owned()),
                     destination_rank: Some(0),
                     device: Some(TransferBackend::Local),
                     host: Some(TransferBackend::Local),
@@ -1759,7 +1762,7 @@ mod tests {
         transfer.worker_ranks.insert("decode".to_owned(), 2);
         transfer.worker_ranks.insert("encoder".to_owned(), 3);
 
-        // Slots are dense across the instance: workers take contiguous runs in
+        // Slots are dense across the groups: groups take contiguous runs in
         // the order the placement keys them.
         assert_eq!(transfer.acknowledgment_slot("decode", 0), 0);
         assert_eq!(transfer.acknowledgment_slot("decode", 1), 1);
@@ -1814,7 +1817,7 @@ mod tests {
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
         let endpoint = |worker: &str| Endpoint {
-            node: "host".to_owned(),
+            host: "host".to_owned(),
             address_space: format!("{worker}-process"),
             incarnation: format!("{worker}-incarnation"),
         };
@@ -1862,8 +1865,8 @@ mod tests {
 
         let incarnations = crate::worker::IncarnationRegistry::default();
         let decoder = endpoint("decoder");
-        incarnations.assign(&WorkerId("denoiser".to_owned()), [&producer]);
-        incarnations.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), [&producer]);
+        incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
 
         let refusal = transfer
             .bind_inputs(&incarnations, &mut products, &mut [], &decoder)
@@ -1877,7 +1880,7 @@ mod tests {
     /// incarnation's publication binds to nothing and the replacement takes
     /// the same edge.
     #[test]
-    fn a_replaced_rank_incarnation_no_longer_binds_to_its_edge() {
+    fn a_replaced_worker_incarnation_no_longer_binds_to_its_edge() {
         use uniserve_ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
             TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
@@ -1887,15 +1890,15 @@ mod tests {
         // and no other rank of the denoiser has an edge.
         let transfer = TransferConfig::parse("denoiser:1->decoder=posix_shm").unwrap();
         let endpoint = |incarnation: &str| Endpoint {
-            node: "host".to_owned(),
+            host: "host".to_owned(),
             address_space: format!("{incarnation}-process"),
             incarnation: incarnation.to_owned(),
         };
         let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
         let decoder = endpoint("decoder-0");
         let incarnations = crate::worker::IncarnationRegistry::default();
-        incarnations.assign(&WorkerId("denoiser".to_owned()), &denoiser);
-        incarnations.assign(&WorkerId("decoder".to_owned()), [&decoder]);
+        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), &denoiser);
+        incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
 
         let product = TensorRef {
             request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
@@ -1947,7 +1950,7 @@ mod tests {
         // The denoiser replaces both of its ranks. The old rank 1 incarnation
         // is retired, and its replacement takes the same edge.
         let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
-        incarnations.assign(&WorkerId("denoiser".to_owned()), &replacement);
+        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), &replacement);
 
         let mut retired = vec![published_by(&denoiser[1])];
         assert!(
@@ -1968,9 +1971,9 @@ mod tests {
         assert_eq!(
             t.edges[0],
             TransferEdge {
-                source_worker: WorkerId("encoder".to_owned()),
+                source_worker: WorkerGroupId("encoder".to_owned()),
                 source_rank: None,
-                destination_worker: WorkerId("prefill".to_owned()),
+                destination_worker: WorkerGroupId("prefill".to_owned()),
                 destination_rank: None,
                 device: Some(TransferBackend::CudaVmm),
                 host: None,
@@ -2011,7 +2014,7 @@ mod tests {
                 "b".to_owned(),
             ],
         );
-        // Model rank 3 is on host b with host rank 1 and model rank 2.
+        // Model rank 3 is on host b with CPU worker 1 and model rank 2.
         let slots = transfer.host_slots("model", 3);
         let expected = [
             transfer.acknowledgment_slot("host", 1),

@@ -213,7 +213,7 @@ impl TryFrom<DType> for uniserve_ipc::DType {
     }
 }
 
-/// Memory a view can borrow. Implementors keep the bytes valid and unmoved
+/// Storage a view can borrow. Implementors keep the bytes valid and unmoved
 /// for as long as the value is alive.
 pub trait Backing: Send + Sync + 'static {
     fn device(&self) -> MemoryKind;

@@ -48,15 +48,15 @@ pub(crate) fn refuse_shared_storage_off_head(
             format!("component {component} serves {work} but the placement binds no such component")
         })?;
         for &rank in &placement.ranks {
-            let node = ranks
+            let host = ranks
                 .get(rank)
-                .map(|placed| placed.node.as_str())
+                .map(|placed| placed.host.as_str())
                 .with_context(|| {
                     format!("component {component} names rank {rank} outside the placement")
                 })?;
             anyhow::ensure!(
-                node == head,
-                "component {component} serves {work} on rank {rank} on host {node}, but the head \
+                host == head,
+                "component {component} serves {work} on rank {rank} on host {host}, but the head \
                  is on host {head}, and {object} named in one host's namespace"
             );
         }
@@ -98,7 +98,7 @@ pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Opti
 pub(crate) fn media_consumer_slots(
     consuming: &[uniserve_ipc::MediaCall],
     routing: &BTreeMap<uniserve_ipc::MediaCall, String>,
-    routed: &BTreeMap<String, crate::WorkerId>,
+    routed: &BTreeMap<String, crate::WorkerGroupId>,
     worker: &str,
     components: &BTreeMap<String, crate::ComponentConfig>,
     peers: &BTreeMap<String, BTreeMap<String, crate::ComponentConfig>>,
@@ -174,7 +174,7 @@ impl WorkerGroup {
     pub(super) fn consumer_slots(
         &self,
         call: &uniserve_ipc::Call,
-        routed: Option<&BTreeMap<String, crate::WorkerId>>,
+        routed: Option<&BTreeMap<String, crate::WorkerGroupId>>,
         members: &[usize],
         rank: usize,
     ) -> Vec<u32> {
@@ -243,7 +243,7 @@ impl WorkerGroup {
     /// incarnations, which every group of the deployment then shares.
     pub(crate) fn share_incarnations(&mut self, incarnations: IncarnationRegistry) {
         incarnations.assign(
-            &crate::WorkerId(self.process_args.worker_id.clone()),
+            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
             self.workers.iter().map(|worker| &worker.info().endpoint),
         );
         self.incarnations = incarnations;
@@ -283,7 +283,7 @@ pub(super) fn rank_projection(
             // at a time to the ranks the call names, or to its ranks in
             // configured order when the call names none, so only the ranks
             // the call's `max_units` reach take part.
-            // `WorkerConfig::validate_members`, which `spawn_ranks` calls,
+            // `WorkerGroupConfig::validate_members`, which `spawn_workers` calls,
             // rejects a zero `units_per_rank`.
             if entry.distribution.is_none() {
                 return Ok(entry.ranks.clone());
@@ -435,12 +435,12 @@ mod tests {
         assert_eq!(output_owner(&ranks, &[]), None);
     }
 
-    fn placement(nodes: &[&str]) -> Vec<WorkerRank> {
-        nodes
+    fn placement(hosts: &[&str]) -> Vec<WorkerRank> {
+        hosts
             .iter()
             .enumerate()
-            .map(|(index, node)| WorkerRank {
-                node: (*node).to_owned(),
+            .map(|(index, host)| WorkerRank {
+                host: (*host).to_owned(),
                 device: format!("cuda:{index}"),
             })
             .collect()

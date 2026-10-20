@@ -23,7 +23,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     Command, EngineHandle, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup,
-    WorkerId, WorkerProcessArgs,
+    WorkerGroupId, WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -101,12 +101,15 @@ fn main() -> anyhow::Result<()> {
         worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
-        ranks: uniserve_engine::WorkerConfig::placed(
+        ranks: uniserve_engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerConfig::single_component(uniserve_engine::DEFAULT_COMPONENT, 1),
+            uniserve_engine::WorkerGroupConfig::single_component(
+                uniserve_engine::DEFAULT_COMPONENT,
+                1,
+            ),
         )
         .ranks,
         queue_depth: 2,
@@ -120,8 +123,10 @@ fn main() -> anyhow::Result<()> {
     })?;
     // The binding identity must equal the `worker_id` the group launched with,
     // which `WorkerExecutor::try_new` checks.
-    let engine =
-        WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
+    let engine = WorkerExecutor::try_new(
+        vec![(WorkerGroupId("local".into()), engine)],
+        Default::default(),
+    )?;
     // Commands sent through a handle built with this waker interrupt the
     // executor's idle park, which round 2 exercises.
     let waker = engine.command_waker();

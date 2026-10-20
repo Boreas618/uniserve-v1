@@ -39,7 +39,7 @@ use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepReques
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::sampling::RowSampling;
 use crate::storage::PrefixCache;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
@@ -367,8 +367,8 @@ impl CausalLMRunners {
             // encoder's: their values do not choose kernels.
             let bytes = FEATURES * dimensions.hidden * dimensions.dtype.bytes();
             let memory: Arc<dyn Backing> = match self.runners[index].device() {
-                Some(device) => Memory::device(device, bytes)?,
-                None => Memory::host(bytes),
+                Some(device) => Storage::device(device, bytes)?,
+                None => Storage::host(bytes),
             };
             let features = StorageView::contiguous(
                 memory,

@@ -13,7 +13,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra dev --extra test --extra b
 .venv/bin/hf download google/diffusiongemma-26B-A4B-it --local-dir /models/diffusiongemma-26B-A4B-it
 ```
 
-Start one independent model replica on each of four GPUs:
+Start one independent engine core on each of four GPUs:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve /models/diffusiongemma-26B-A4B-it \
@@ -24,13 +24,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/uniserve serve /models/diffusiongemma-26B
 
 For one GPU, omit `--data-parallel-size` and expose that GPU alone. For NVFP4, download and supply the NVFP4 checkpoint directory; loading interprets its quantization metadata. BF16 and NVFP4 are distinct precision configurations and can return different distributions and generated text.
 
-Each independent replica owns its scheduler and KV cache. The frontend sends a request to the replica with the fewest requests in flight. `moe_config.expert_parallel` partitions the routed experts across the replicas; attention and dense layers remain replicated. Its default `alltoall` transport exchanges tokens at every expert layer over NVLink. This changes the communication and numerical batching, so compare it with independent replicas on the intended workload. `--set moe_config.exchange=megamoe` selects the fused NVFP4 expert exchange. Tensor parallelism is not supported for this checkpoint's attention partition.
+Each engine core owns its scheduler and KV cache. The frontend sends a request to the engine core with the fewest requests in flight. `moe_config.expert_parallel` partitions the routed experts across the engine cores; attention and dense layers remain replicated. Its default `alltoall` transport exchanges tokens at every expert layer over NVLink. This changes the communication and numerical batching, so compare it with independent engine cores on the intended workload. `--set moe_config.exchange=megamoe` selects the fused NVFP4 expert exchange. Tensor parallelism is not supported for this checkpoint's attention partition.
 
-`--set moe_config.expert_parallel=true --set moe_config.exchange=dwdp` selects distributed weight data parallelism. Each replica retains its expert shard and asynchronously reads missing weights over NVLink into two reusable buffers. Replicas advance independently; an idle replica keeps its immutable weights available without joining inference collectives. The runtime maps resident and prefetched pages into contiguous weight views consumed by the same CuTeDSL BF16 or NVFP4 kernels, preserving the checkpoint's precision and activation calibration. This mode requires one execution lane and peer-accessible CUDA devices on one host. Its weight transfers trade memory capacity for bandwidth; measure it against full-weight replicas on the intended workload.
+`--set moe_config.expert_parallel=true --set moe_config.exchange=dwdp` selects distributed weight data parallelism. Each engine core's worker retains its expert shard and asynchronously reads missing weights over NVLink into two reusable buffers. Engine cores advance independently; an idle one keeps its immutable weights available without joining inference collectives. The runtime maps resident and prefetched pages into contiguous weight views consumed by the same CuTeDSL BF16 or NVFP4 kernels, preserving the checkpoint's precision and activation calibration. This mode requires one execution lane and peer-accessible CUDA devices on one host. Its weight transfers trade memory capacity for bandwidth; measure it against full-weight engine cores on the intended workload.
 
 Startup loads weights, prepares native kernels, and captures execution graphs. Wait for serving readiness before sending measured traffic. Use `GET /health`, `GET /v1/models`, and `GET /metrics` for readiness, model identity, and serving counters. Keep the default native attention selection and graph policy for normal serving.
 
-Prefix caching is enabled by default. Add `--set kv_cache_config.prefix_caching=false` to recompute each request's prompt and avoid retaining reusable prompt KV pages across requests. Active requests still retain the KV state required for generation. The option applies to every data-parallel replica; it does not disable the separate image-encoder cache. Treat cache-on and cache-off measurements as distinct deployment configurations.
+Prefix caching is enabled by default. Add `--set kv_cache_config.prefix_caching=false` to recompute each request's prompt and avoid retaining reusable prompt KV pages across requests. Active requests still retain the KV state required for generation. The option applies to every engine core; it does not disable the separate image-encoder cache. Treat cache-on and cache-off measurements as distinct deployment configurations.
 
 ## Decision readout
 
@@ -76,7 +76,7 @@ Readout settings are fixed for the deployment:
 | `readout_config.candidates` | `variants` | Sum supported token spellings; `primary` reads only the primary space-prefixed spelling |
 | `readout_config.layout` | `joint` | Pack complete questions together; `independent` conditions each question separately |
 
-For applications whose readout contract specifies 64-token canvases and primary candidates, append `--set readout_config.canvas=64 --set readout_config.candidates=primary` to the serving command. Short canvases use graphs sized for their numerical length on independent replicas. These options change the model's input or answer projection, so qualify their accuracy and calibration on the application's data before choosing them. They do not change the canvas length used for chat generation.
+For applications whose readout contract specifies 64-token canvases and primary candidates, append `--set readout_config.canvas=64 --set readout_config.candidates=primary` to the serving command. Short canvases use graphs sized for their numerical length on independent engine cores. These options change the model's input or answer projection, so qualify their accuracy and calibration on the application's data before choosing them. They do not change the canvas length used for chat generation.
 
 Attach images with `x_images`, an ordered list of one or more data URLs or HTTP(S) URLs, as many as the context holds. The prompt identifies them as Image 1, Image 2, and so on. Remote images follow the server's image-fetch limits and public-address policy, documented in the [main README](../../README.md#serving-options).
 
@@ -100,7 +100,7 @@ Generation denoises a 256-token block, commits it to the prefix cache, and start
 
 The checkpoint's generation configuration controls denoising steps, entropy acceptance, temperature schedule, confidence, and stability. Change these for the deployment in `diffusion_generation_config`, for example `--set diffusion_generation_config.max_denoising_steps=48`. Autoregressive controls such as request-level `temperature`, `top_p`, token penalties, and log-probability requests are rejected because they do not define this block-diffusion sampler.
 
-`seed` selects the request's random stream. Independent replicas return the same response for the same isolated seeded request. Different batch compositions, including expert-parallel steps whose capacities depend on other ranks, can change floating-point rounding and the resulting response.
+`seed` selects the request's random stream. Independent engine cores return the same response for the same isolated seeded request. Different batch compositions, including expert-parallel steps whose capacities depend on other ranks, can change floating-point rounding and the resulting response.
 
 ## Reproducible measurement
 

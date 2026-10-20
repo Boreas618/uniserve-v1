@@ -1,51 +1,51 @@
 # FastH3 on eight GPUs of one host: eight one-GPU denoiser replicas and two TP4
 # text encoders, one per four-GPU half.
 
-[[workers]]
+[[worker_groups]]
 id = "text"
 replicas = 2
 ranks = ["cuda:0-7"]
 queue_depth = 12
 mem_fraction_static = 0.25
 
-[workers.components.text_encoder]
+[worker_groups.components.text_encoder]
 tensor_parallel_size = 4
 
-[[workers]]
+[[worker_groups]]
 id = "flow"
 replicas = 8
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.72
 
-[workers.components.transformer]
+[worker_groups.components.transformer]
 
-[workers.components.video_decoder]
+[worker_groups.components.video_decoder]
 
-[workers.components.audio_decoder]
+[worker_groups.components.audio_decoder]
 distribution = "temporal_units"
 
-[workers.components.latent_encoder]
+[worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[workers]]
+[[worker_groups]]
 id = "encoder"
 replicas = 8
 ranks = ["cpu*8"]
 queue_depth = 6
 
-[workers.components.video_codec]
+[worker_groups.components.video_codec]
 
-[[workers]]
+[[worker_groups]]
 id = "reader"
 ranks = ["cpu"]
 queue_depth = 24
 
-[workers.components.media_reader]
+[worker_groups.components.media_reader]
 
-[[workers]]
+[[worker_groups]]
 id = "muxer"
 ranks = ["cpu"]
 queue_depth = 24
 
-[workers.components.muxer]
+[worker_groups.components.muxer]

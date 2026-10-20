@@ -365,7 +365,7 @@ mod tests {
     fn transports() -> Result<Transports> {
         let options = TransportOptions {
             source: WorkerEndpoint {
-                node: "node".into(),
+                host: "host".into(),
                 address_space: "process".into(),
                 incarnation: "incarnation".into(),
             },

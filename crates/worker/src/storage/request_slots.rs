@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use uniserve_cuda::DeviceId;
 
-use super::memory::{Memory, StorageView};
+use super::memory::{Storage, StorageView};
 use crate::ffi::{Backing, DType};
 use crate::{Error, Result};
 
@@ -80,9 +80,9 @@ impl RequestSlots {
             .map(|field| {
                 let bytes = (rows as usize) * field.slot_bytes()?;
                 let memory = match (device, field.host) {
-                    (Some(device), false) => Memory::device(device, bytes.max(1))?,
-                    (Some(device), true) => Memory::pinned(device, bytes.max(1))?,
-                    (None, _) => Memory::host(bytes.max(1)),
+                    (Some(device), false) => Storage::device(device, bytes.max(1))?,
+                    (Some(device), true) => Storage::pinned(device, bytes.max(1))?,
+                    (None, _) => Storage::host(bytes.max(1)),
                 };
                 let mut shape = vec![rows];
                 shape.extend(&field.shape);

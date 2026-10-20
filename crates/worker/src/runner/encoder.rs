@@ -90,7 +90,7 @@ use crate::profiling::kernels::KernelRecord;
 use crate::runner::ImageSetup;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
 use crate::storage::PinnedPool;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 pub(crate) use image::{EncodeResume, ImageFacts, ImagePixels, image_placement};
@@ -513,8 +513,8 @@ pub struct EncoderRunner {
 fn allocate(device: Device, dtype: DType, shape: &[i64]) -> Result<StorageView> {
     let bytes = (shape.iter().product::<i64>().max(1) as usize) * dtype.bytes();
     let memory: Arc<dyn Backing> = match device {
-        Device::Cuda(index) => Memory::device(index, bytes)?,
-        Device::Cpu => Memory::host(bytes),
+        Device::Cuda(index) => Storage::device(index, bytes)?,
+        Device::Cpu => Storage::host(bytes),
     };
     StorageView::contiguous(memory, 0, dtype, shape)
 }

@@ -1,4 +1,4 @@
-//! Submission of explicitly targeted calls to WorkerGroup instances.
+//! Submission of explicitly targeted calls to worker groups.
 //!
 //! `WorkerExecutor` is the `Executor` the scheduler drives over a set of
 //! `WorkerGroup`s. It splits each logical `ExecutionBatch` into one
@@ -30,7 +30,7 @@ use std::time::Duration;
 use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerId,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerGroupId,
 };
 use anyhow::Context;
 use uniserve_core::CommandWaker;
@@ -42,7 +42,7 @@ use uniserve_ipc::{
 pub(crate) use codecs::video_unit_codecs;
 
 /// One worker's outstanding submission; returned calls leave this record.
-struct PendingWorker {
+struct PendingGroup {
     /// Whether the `WorkerGroup` accepted the submission and still owes its
     /// report. False while the submission waits in
     /// `WorkerExecutor::worker_submissions`, and cleared by failure
@@ -58,7 +58,7 @@ struct PendingWorker {
 struct PendingBatch {
     /// Workers, by index into `WorkerExecutor::workers`, that have not yet
     /// finished their part of the batch. The batch is terminal when empty.
-    workers: HashMap<usize, PendingWorker>,
+    workers: HashMap<usize, PendingGroup>,
     /// The batch's lifecycle commands without `Start` admissions, so a
     /// position here is a `CommandResult::command_index`.
     commands: Vec<BatchCommand>,
@@ -167,8 +167,8 @@ struct BufferRoute {
 /// Worker indices used throughout are positions in `workers`.
 pub struct WorkerExecutor {
     /// Worker identity to its index in `workers`.
-    routing: HashMap<WorkerId, usize>,
-    workers: Vec<(WorkerId, WorkerGroup)>,
+    routing: HashMap<WorkerGroupId, usize>,
+    workers: Vec<(WorkerGroupId, WorkerGroup)>,
     /// The worker and rank of every live rank incarnation, which the groups
     /// keep current as they replace ranks.
     incarnations: IncarnationRegistry,
@@ -260,7 +260,7 @@ impl WorkerExecutor {
     /// endpoints, or no runtime capacity view can be derived from the workers.
     /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
-        mut workers: Vec<(WorkerId, WorkerGroup)>,
+        mut workers: Vec<(WorkerGroupId, WorkerGroup)>,
         transfer: TransferConfig,
     ) -> anyhow::Result<Self> {
         let command_wake = crate::handle::WakeSignal::new()?;
@@ -291,7 +291,7 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let bytes = (0..)
-                    .map_while(|rank| worker.rank_info(rank))
+                    .map_while(|rank| worker.worker_info(rank))
                     .map(|info| info.buffer_pool_bytes)
                     .collect();
                 (id.clone(), bytes)
@@ -348,7 +348,7 @@ impl WorkerExecutor {
                 (edge.destination_rank, destination),
             ] {
                 anyhow::ensure!(
-                    rank.is_none_or(|rank| worker.rank_info(rank as usize).is_some()),
+                    rank.is_none_or(|rank| worker.worker_info(rank as usize).is_some()),
                     "transfer edge names an unbound rank"
                 );
             }
@@ -357,7 +357,7 @@ impl WorkerExecutor {
                     continue;
                 }
                 let source_on_cuda = source.rank_on_cuda(source_rank as usize);
-                let source = source.rank_info(source_rank as usize).with_context(|| {
+                let source = source.worker_info(source_rank as usize).with_context(|| {
                     format!("transfer edge source has no rank {source_rank} in its world")
                 })?;
                 for destination_rank in 0..destination.world_size() as u32 {
@@ -369,7 +369,7 @@ impl WorkerExecutor {
                     }
                     let destination_on_cuda = destination.rank_on_cuda(destination_rank as usize);
                     let destination = destination
-                        .rank_info(destination_rank as usize)
+                        .worker_info(destination_rank as usize)
                         .with_context(|| {
                             format!(
                                 "transfer edge destination has no rank {destination_rank} in its world"
@@ -389,7 +389,7 @@ impl WorkerExecutor {
                         // An edge it cannot serve would fail on its first
                         // export, so it is refused here by name instead.
                         let (source_host, destination_host) =
-                            (&source.endpoint.node, &destination.endpoint.node);
+                            (&source.endpoint.host, &destination.endpoint.host);
                         let crosses_hosts = source_host != destination_host;
                         match mechanism {
                             crate::executor::TransferBackend::Local => anyhow::ensure!(
@@ -431,7 +431,7 @@ impl WorkerExecutor {
                                 edge.destination_worker.0,
                             ),
                             // A product on the rank channel reaches wherever the
-                            // channel does, which is every host of the instance.
+                            // channel does, which is every host of the group.
                             crate::executor::TransferBackend::Channel => {}
                         }
                     }
@@ -468,7 +468,7 @@ impl WorkerExecutor {
         })
     }
 
-    /// Refreshes physical discovery after replacement; other instance counters remain intact.
+    /// Refreshes physical discovery after replacement; other group counters remain intact.
     fn refresh_worker(&mut self, index: usize) {
         self.executor_info.workers[index].1 = self.workers[index].1.info().clone();
     }
@@ -744,7 +744,7 @@ impl WorkerExecutor {
                 .map(|route| held(route.worker_index))
                 .unwrap_or_default();
             let ranks = (0..)
-                .map_while(|rank| self.workers[worker_index].1.rank_info(rank))
+                .map_while(|rank| self.workers[worker_index].1.worker_info(rank))
                 .count();
             let spans = dependency_spans(held(worker_index), produced, ranks as u32);
             anyhow::ensure!(
@@ -825,7 +825,7 @@ impl WorkerExecutor {
     /// A product with no location on an edge to its consumer is a property of
     /// that product and that edge, such as a device product that fell back to
     /// host bytes crossing an edge that carries only a device mechanism. It
-    /// leaves both instances and the batch's other calls intact, so the
+    /// leaves both groups and the batch's other calls intact, so the
     /// failure invalidates no endpoint or buffer and names only the requests
     /// reading the refused products. Reconciliation retires those requests'
     /// calls from the requeued submission, whose remaining calls and
@@ -946,7 +946,7 @@ impl WorkerExecutor {
 }
 
 impl Executor for WorkerExecutor {
-    fn has_capacity(&self, worker: &WorkerId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         // Submissions already queued for the worker claim its free group slots.
         self.routing.get(worker).is_some_and(|&index| {
             self.workers[index].1.available_slots() > self.worker_submissions[index].len()
@@ -959,7 +959,7 @@ impl Executor for WorkerExecutor {
             .all(|index| self.has_capacity(&self.workers[index].0))
     }
 
-    fn is_ready(&self, worker: &WorkerId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.routing
             .get(worker)
             .is_some_and(|&index| self.workers[index].1.is_ready())
@@ -1246,7 +1246,7 @@ impl Executor for WorkerExecutor {
                 }
                 pending_workers.insert(
                     worker_index,
-                    PendingWorker {
+                    PendingGroup {
                         submitted: false,
                         calls: calls
                             .iter()

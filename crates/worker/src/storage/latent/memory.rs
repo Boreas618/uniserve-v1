@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uniserve_cuda::{DeviceId, Stream, memset_d8};
 
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::transfer::Spans;
 use crate::{Error, Result};
@@ -113,8 +113,8 @@ pub struct LatentStorage {
 
 fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> {
     Ok(match device {
-        Some(device) => Memory::device(device, bytes.max(1))?,
-        None => Memory::host(bytes.max(1)),
+        Some(device) => Storage::device(device, bytes.max(1))?,
+        None => Storage::host(bytes.max(1)),
     })
 }
 
@@ -125,8 +125,8 @@ fn allocate(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> 
 /// devices in this process copy from the pages directly.
 fn allocate_banks(device: Option<DeviceId>, bytes: usize) -> Result<Arc<dyn Backing>> {
     Ok(match device {
-        Some(device) => Memory::exportable(device, bytes.max(1), &Memory::peers(device)?)?,
-        None => Memory::host(bytes.max(1)),
+        Some(device) => Storage::exportable(device, bytes.max(1), &Storage::peers(device)?)?,
+        None => Storage::host(bytes.max(1)),
     })
 }
 

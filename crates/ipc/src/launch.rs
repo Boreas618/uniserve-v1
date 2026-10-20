@@ -11,9 +11,9 @@
 //! source of defaults and validates the values it owns, and the rank never
 //! re-derives or re-checks one.
 //!
-//! Both launching sides, the head and a host's `uniserve-host` launcher, start
-//! a rank with [`rank_command`], hand it the sockets it serves with
-//! [`inherit_listener`] and own its process as a [`RankChild`].
+//! Both launching sides, the head and a host's `uniserve-launcher` launcher, start
+//! a rank with [`worker_command`], hand it the sockets it serves with
+//! [`inherit_listener`] and own its process as a [`WorkerChild`].
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -34,7 +34,7 @@ use crate::LaneConfig;
 /// of the group's launch it belongs to. They are the rank's only statement of
 /// its identity; the launch descriptor repeats none of them. The caller adds
 /// the environment and any inherited sockets.
-pub fn rank_command(
+pub fn worker_command(
     python: impl AsRef<OsStr>,
     head: &str,
     worker_id: &str,
@@ -102,7 +102,7 @@ pub fn inherit_listener(command: &mut Command, listener: TcpListener) -> RawFd {
 /// the exit first without reaping it, removes the memory named for the rank
 /// while its zombie still holds the process id, so that no live process can
 /// own those names, and the noted NCCL names, and then reaps it.
-pub struct RankChild {
+pub struct WorkerChild {
     child: Child,
     /// The exit status once the process was reaped; its id may name another
     /// process from then on, so it is never waited on again.
@@ -112,7 +112,7 @@ pub struct RankChild {
     segments: NcclSegments,
 }
 
-impl RankChild {
+impl WorkerChild {
     /// Spawns the rank `command` describes.
     pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
         Ok(Self {
@@ -232,7 +232,7 @@ const SHARED_MEMORY: &str = "/dev/shm";
 /// that name and creates none of its own. The driver unlinks the object only
 /// when the context is destroyed (`uniserve_cuda::PrimaryContext::reset_all`),
 /// which a process that is killed or crashes never does, so the parent that
-/// reaps such a process removes it instead ([`RankChild`]).
+/// reaps such a process removes it instead ([`WorkerChild`]).
 ///
 /// The caller calls this after `pid` exited and before reaping it: until the
 /// process is reaped its zombie holds the process id, so no live process can
@@ -397,6 +397,10 @@ pub struct LaunchDescriptor {
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
+    /// The deployment's name of the host the worker runs on: the head's
+    /// `host_identity` or a launcher's. Peers compare it to tell whether a
+    /// product or a peer allocation is on their own host.
+    pub host: String,
     /// Torch device name of the rank's primary device (`cpu`, `cuda`, `cuda:N`).
     pub device: String,
     /// Global rank within the worker.

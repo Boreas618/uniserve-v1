@@ -13,7 +13,7 @@ use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 use super::grants::{DescriptorGrants, EXPORT_NAME_BYTES};
 use super::handle::AllocationHandle;
 use crate::parallel::host::HostGroup;
-use crate::storage::memory::Memory;
+use crate::storage::memory::Storage;
 use crate::{Error, Result};
 
 /// The export name under which a rank serves its peer allocation; a grant
@@ -21,12 +21,12 @@ use crate::{Error, Result};
 const PEER_EXPORT: &str = "uniserve-peer-storage-allocation";
 const _: () = assert!(PEER_EXPORT.len() == EXPORT_NAME_BYTES);
 
-/// A member's published handle: `node \0 endpoint \0 handle`, the
+/// A member's published handle: `host \0 endpoint \0 handle`, the
 /// member's host, the grant socket serving its descriptor, and its
 /// [`AllocationHandle`] (last, since a fabric handle may contain zeros).
-fn encode(node: &str, handle: &ShareableHandle, endpoint: &str) -> Vec<u8> {
+fn encode(host: &str, handle: &ShareableHandle, endpoint: &str) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend_from_slice(node.as_bytes());
+    payload.extend_from_slice(host.as_bytes());
     payload.push(0);
     payload.extend_from_slice(endpoint.as_bytes());
     payload.push(0);
@@ -34,15 +34,16 @@ fn encode(node: &str, handle: &ShareableHandle, endpoint: &str) -> Vec<u8> {
     payload
 }
 
-/// Import a member's published handle on host `node`.
-fn decode(node: &str, payload: &[u8]) -> Result<ShareableHandle> {
+/// Import a member's published handle on host `host`.
+fn decode(host: &str, payload: &[u8]) -> Result<ShareableHandle> {
     let mut fields = payload.splitn(3, |&byte| byte == 0);
-    let (Some(host), Some(endpoint), Some(handle)) = (fields.next(), fields.next(), fields.next())
+    let (Some(member_host), Some(endpoint), Some(handle)) =
+        (fields.next(), fields.next(), fields.next())
     else {
         return Err(Error::Invalid("a peer handle payload is malformed".into()));
     };
     let handle = AllocationHandle::decode(handle)?;
-    if host != node.as_bytes() && !handle.crosses_hosts() {
+    if member_host != host.as_bytes() && !handle.crosses_hosts() {
         return Err(Error::Unsupported(
             "peer storage across hosts requires fabric handles".into(),
         ));
@@ -73,23 +74,23 @@ fn serve(handle: &ShareableHandle) -> Result<(String, Option<DescriptorGrants>)>
 
 /// This rank's exportable allocation and the mapping of every member's.
 pub(crate) struct PeerStorage {
-    local: Arc<Memory>,
-    peers: Arc<Memory>,
+    local: Arc<Storage>,
+    peers: Arc<Storage>,
     bytes: usize,
 }
 
 impl PeerStorage {
     /// Allocate `bytes` (rounded up to the allocation granularity) on
     /// `device` and map every member's allocation, collectively over the
-    /// host `group`, whose connections carry the handles. `node`
+    /// host `group`, whose connections carry the handles. `host`
     /// identifies this host.
     pub(crate) fn allocate(
         device: DeviceId,
         bytes: usize,
-        node: &str,
+        host: &str,
         group: &HostGroup,
     ) -> Result<Self> {
-        let local = Memory::exportable(device, bytes, &[])?;
+        let local = Storage::exportable(device, bytes, &[])?;
         let allocation: &DeviceAllocation = local
             .allocation()
             .ok_or_else(|| Error::Invariant("peer storage is device memory".into()))?;
@@ -101,7 +102,7 @@ impl PeerStorage {
         // Serve a descriptor until every member imported it.
         let (endpoint, grants) = serve(&handle)?;
 
-        let payloads = group.all_gather_bytes(&encode(node, &handle, &endpoint))?;
+        let payloads = group.all_gather_bytes(&encode(host, &handle, &endpoint))?;
         let handles = payloads
             .iter()
             .enumerate()
@@ -118,7 +119,7 @@ impl PeerStorage {
                             }),
                     };
                 }
-                decode(node, payload)
+                decode(host, payload)
             })
             .collect::<Result<Vec<_>>>();
         // Every member fetched its descriptors before any grant closes.
@@ -131,7 +132,7 @@ impl PeerStorage {
         let handles = handles?;
         barrier?;
 
-        let peers = Memory::mapped(PeerMapping::peers(device, &handles, rounded)?);
+        let peers = Storage::mapped(PeerMapping::peers(device, &handles, rounded)?);
         Ok(Self {
             local,
             peers,
@@ -140,12 +141,12 @@ impl PeerStorage {
     }
 
     /// This rank's allocation.
-    pub(crate) fn local(&self) -> &Arc<Memory> {
+    pub(crate) fn local(&self) -> &Arc<Storage> {
         &self.local
     }
 
     /// Every member's allocation, `bytes_each()` apart in rank order.
-    pub(crate) fn peers(&self) -> &Arc<Memory> {
+    pub(crate) fn peers(&self) -> &Arc<Storage> {
         &self.peers
     }
 
@@ -164,22 +165,22 @@ mod tests {
         let mut bytes = [7; 64];
         bytes[3] = 0;
         let fabric = ShareableHandle::Fabric(bytes);
-        let payload = encode("node-a", &fabric, "uniserve-peer-x");
+        let payload = encode("host-a", &fabric, "uniserve-peer-x");
         assert!(
-            matches!(decode("node-b", &payload)?, ShareableHandle::Fabric(imported) if imported == bytes)
+            matches!(decode("host-b", &payload)?, ShareableHandle::Fabric(imported) if imported == bytes)
         );
 
         let file = std::fs::File::open("/dev/null")
             .map_err(|error| Error::transport_source("opening a stand-in descriptor", error))?;
         let descriptor = ShareableHandle::Descriptor(file.into());
-        let payload = encode("node-a", &descriptor, "uniserve-peer-x");
+        let payload = encode("host-a", &descriptor, "uniserve-peer-x");
         assert!(matches!(
-            decode("node-b", &payload),
+            decode("host-b", &payload),
             Err(Error::Unsupported(_))
         ));
 
-        assert!(decode("node-a", b"node-a\0uniserve-peer-x").is_err());
-        assert!(decode("node-a", b"node-a\0uniserve-peer-x\0abc").is_err());
+        assert!(decode("host-a", b"host-a\0uniserve-peer-x").is_err());
+        assert!(decode("host-a", b"host-a\0uniserve-peer-x\0abc").is_err());
         Ok(())
     }
 
@@ -200,7 +201,7 @@ mod tests {
 
         // A member of the same host imports the descriptor from the grant.
         let ShareableHandle::Descriptor(received) =
-            decode("node-a", &encode("node-a", &handle, &endpoint))?
+            decode("host-a", &encode("host-a", &handle, &endpoint))?
         else {
             return Err(Error::State(
                 "a descriptor payload imported as a fabric handle",

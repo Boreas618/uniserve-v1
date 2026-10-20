@@ -1,4 +1,4 @@
-//! Reading a video request's condition media on a host rank.
+//! Reading a video request's condition media on a CPU worker.
 //!
 //! The server publishes every condition's fetched bytes to POSIX shared
 //! memory on the head host and plans how each is prepared
@@ -36,7 +36,7 @@ use uniserve_core::{
 };
 
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// The model functions condition reading calls.
@@ -125,7 +125,7 @@ fn missing_rows() -> Error {
 /// A host view over `bytes`.
 fn host_bytes(bytes: Vec<u8>) -> Result<StorageView> {
     let length = bytes.len() as i64;
-    let memory = Memory::host(bytes.len().max(1));
+    let memory = Storage::host(bytes.len().max(1));
     if !bytes.is_empty() {
         // SAFETY: the allocation was just created with at least this length
         // and has no other reference.
@@ -410,7 +410,7 @@ impl ConditionReader {
 
         let frame_bytes = u64::from(canvas.height) * u64::from(canvas.width) * 3;
         let length = frame_bytes * u64::from(clip.frames);
-        let memory = Memory::host(length as usize);
+        let memory = Storage::host(length as usize);
         let mut filled = 0usize;
         let mut trailing = 0usize;
         if let Some(mut stdout) = process.stdout.take() {
@@ -501,7 +501,7 @@ mod tests {
     fn product(rows: i64, width: i64, dtype: DType) -> StorageView {
         let bytes = (rows * width) as usize * dtype.bytes();
         StorageView::contiguous(
-            Memory::host(bytes) as Arc<dyn Backing>,
+            Storage::host(bytes) as Arc<dyn Backing>,
             0,
             dtype,
             &[rows, width],

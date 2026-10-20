@@ -51,7 +51,7 @@ use crate::lane::{Completion, Job};
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{MethodCall, kernels_call, list_kernels};
 use crate::runner::{ImageSetup, RunnerSetup};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -197,8 +197,8 @@ impl DecoderRunner {
             |_, pixels| {
                 let bytes = pixels.nbytes() as usize;
                 let memory: Arc<dyn crate::ffi::Backing> = match device {
-                    Device::Cuda(index) => Memory::pinned(index, bytes)?,
-                    Device::Cpu => Memory::host(bytes),
+                    Device::Cuda(index) => Storage::pinned(index, bytes)?,
+                    Device::Cpu => Storage::host(bytes),
                 };
                 let copy = StorageView::contiguous(memory, 0, DType::U8, pixels.shape())?;
                 let mut out = CopyBatch::new(SourceOrder::Stream);

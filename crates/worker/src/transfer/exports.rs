@@ -238,7 +238,7 @@ mod tests {
     use crate::EventPool;
     use crate::ffi::{Backing, DType};
     use crate::lane::Job;
-    use crate::storage::memory::{Memory, StorageView};
+    use crate::storage::memory::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, TransportOptions};
 
     /// A rank whose only mechanism towards slot 1 is the rank channel.
@@ -250,7 +250,7 @@ mod tests {
             EventPool::new(),
             &TransportOptions {
                 source: WorkerEndpoint {
-                    node: "node".into(),
+                    host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
                 },
@@ -275,7 +275,7 @@ mod tests {
             EventPool::new(),
             &TransportOptions {
                 source: WorkerEndpoint {
-                    node: "node".into(),
+                    host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
                 },
@@ -287,7 +287,7 @@ mod tests {
         )?;
         let product = || {
             Spans::single(StorageView::contiguous(
-                Memory::host(64) as Arc<dyn Backing>,
+                Storage::host(64) as Arc<dyn Backing>,
                 0,
                 DType::F32,
                 &[16],
@@ -342,7 +342,7 @@ mod tests {
             EventPool::new(),
             &TransportOptions {
                 source: WorkerEndpoint {
-                    node: "node".into(),
+                    host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
                 },
@@ -353,7 +353,7 @@ mod tests {
             },
         )?;
         let source = Spans::single(StorageView::contiguous(
-            Memory::device(DeviceId(0), 512)? as Arc<dyn Backing>,
+            Storage::device(DeviceId(0), 512)? as Arc<dyn Backing>,
             0,
             DType::F32,
             &[16, 8],
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn a_recorded_channel_export_carries_what_its_job_copied() -> Result<()> {
         let transports = channel()?;
-        let memory = Memory::host(4);
+        let memory = Storage::host(4);
         let source = Spans::single(StorageView::contiguous(
             Arc::clone(&memory) as Arc<dyn Backing>,
             0,

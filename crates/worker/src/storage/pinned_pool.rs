@@ -15,7 +15,7 @@ use uniserve_cuda::DeviceId;
 use crate::Result;
 use crate::ffi::{Backing, MemoryKind};
 use crate::lock;
-use crate::storage::memory::Memory;
+use crate::storage::memory::Storage;
 
 /// The smallest block, so that small inputs share block sizes.
 const MIN_BLOCK: usize = 1 << 16;
@@ -26,7 +26,7 @@ pub struct PinnedPool {
     /// memory.
     device: Option<DeviceId>,
     /// Blocks no user holds.
-    free: Mutex<Vec<Arc<Memory>>>,
+    free: Mutex<Vec<Arc<Storage>>>,
 }
 
 impl PinnedPool {
@@ -37,7 +37,7 @@ impl PinnedPool {
         })
     }
 
-    fn free(&self) -> MutexGuard<'_, Vec<Arc<Memory>>> {
+    fn free(&self) -> MutexGuard<'_, Vec<Arc<Storage>>> {
         lock(&self.free)
     }
 
@@ -59,8 +59,8 @@ impl PinnedPool {
             None => {
                 let size = bytes.max(MIN_BLOCK).next_power_of_two();
                 match self.device {
-                    Some(device) => Memory::pinned(device, size)?,
-                    None => Memory::host(size),
+                    Some(device) => Storage::pinned(device, size)?,
+                    None => Storage::host(size),
                 }
             }
         };
@@ -77,7 +77,7 @@ impl PinnedPool {
 pub(crate) struct PinnedBlock {
     pool: Weak<PinnedPool>,
     /// Taken back by the pool on drop.
-    memory: Option<Arc<Memory>>,
+    memory: Option<Arc<Storage>>,
     bytes: usize,
 }
 

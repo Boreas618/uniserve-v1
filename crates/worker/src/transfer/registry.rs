@@ -177,7 +177,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Memory, StorageView};
+    use crate::storage::memory::{Storage, StorageView};
     use crate::transfer::backing::TransportBuffer;
     use crate::transfer::{ByteReservation, Spans, TransferCapacity};
 
@@ -186,8 +186,8 @@ mod tests {
     fn source(
         key: u64,
         capacity: &Arc<TransferCapacity>,
-    ) -> Result<(SourceKey, Source, Weak<Memory>)> {
-        let memory = Memory::host(4);
+    ) -> Result<(SourceKey, Source, Weak<Storage>)> {
+        let memory = Storage::host(4);
         let retained = Arc::downgrade(&memory);
         let spans = Spans::single(StorageView::contiguous(
             memory as Arc<dyn Backing>,

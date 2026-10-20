@@ -78,11 +78,11 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Memory, StorageView};
+    use crate::storage::memory::{Storage, StorageView};
 
     #[test]
     fn a_tvm_ffi_tensor_is_refused_as_an_opaque_handle() -> Result<()> {
-        let memory: Arc<dyn Backing> = Memory::host(16);
+        let memory: Arc<dyn Backing> = Storage::host(16);
         let tensor = StorageView::contiguous(memory, 0, DType::F32, &[4])?.to_tensor()?;
 
         assert!(matches!(

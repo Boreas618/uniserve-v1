@@ -17,7 +17,7 @@ use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
 use uniserve_ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, MemoryKind};
 use uniserve_worker::storage::{
-    CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentPlan, LatentStorage, Memory,
+    CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentPlan, LatentStorage, Storage,
     StorageView,
 };
 use uniserve_worker::transfer::exports::{self, Location};
@@ -65,7 +65,7 @@ fn fetch(
 
 fn endpoint(address_space: &str) -> WorkerEndpoint {
     WorkerEndpoint {
-        node: "node".into(),
+        host: "host".into(),
         address_space: address_space.into(),
         incarnation: "incarnation".into(),
     }
@@ -120,7 +120,7 @@ fn settle(transports: &Transports, capacity: &TransferCapacity, events: &EventPo
 /// A host tensor of `shape` holding `0, 1, 2, ...` as f32.
 fn counting(shape: &[i64]) -> Result<Spans> {
     let elements: i64 = shape.iter().product();
-    let memory = Memory::host(elements as usize * 4);
+    let memory = Storage::host(elements as usize * 4);
     for index in 0..elements {
         // SAFETY: fresh host memory of `elements` floats owned by the test.
         unsafe {
@@ -140,7 +140,7 @@ fn counting(shape: &[i64]) -> Result<Spans> {
 fn zeros(shape: &[i64]) -> Result<Spans> {
     let elements: i64 = shape.iter().product();
     Spans::single(StorageView::contiguous(
-        Memory::host(elements as usize * 4) as Arc<dyn Backing>,
+        Storage::host(elements as usize * 4) as Arc<dyn Backing>,
         0,
         DType::F32,
         shape,
@@ -569,7 +569,7 @@ fn block(stream: &Stream) -> Result<mpsc::Sender<()>> {
 /// Copy a device view's bytes to the host (drains `stream`).
 fn download(view: &StorageView, stream: &Stream) -> Result<Vec<u8>> {
     let bytes = view.byte_len()?;
-    let host = Memory::pinned(DEVICE, bytes.max(1))?;
+    let host = Storage::pinned(DEVICE, bytes.max(1))?;
     let mut batch = CopyBatch::new(SourceOrder::Stream);
     batch.push(host.address(), view.address(), bytes);
     // SAFETY: both ranges hold `bytes`; the stream drains below.
@@ -596,7 +596,7 @@ fn device_counting(shape: &[i64], stream: &Stream) -> Result<StorageView> {
 /// A device f32 tensor of `shape` holding `first, first + 1, ...`.
 fn device_counting_from(shape: &[i64], first: i64, stream: &Stream) -> Result<StorageView> {
     let elements: i64 = shape.iter().product();
-    let memory = Memory::device(DEVICE, elements as usize * 4)?;
+    let memory = Storage::device(DEVICE, elements as usize * 4)?;
     let values: Vec<f32> = (first..first + elements)
         .map(|value| value as f32)
         .collect();
@@ -613,7 +613,7 @@ fn device_counting_from(shape: &[i64], first: i64, stream: &Stream) -> Result<St
 fn device_destination(shape: &[i64]) -> Result<Spans> {
     let elements: i64 = shape.iter().product();
     Spans::single(StorageView::contiguous(
-        Memory::device(DEVICE, elements as usize * 4)? as Arc<dyn Backing>,
+        Storage::device(DEVICE, elements as usize * 4)? as Arc<dyn Backing>,
         0,
         DType::F32,
         shape,

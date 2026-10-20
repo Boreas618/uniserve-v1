@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use uniserve_ipc::launcher::{Instruction, RankExit, RankSpawn, Report, Reservation};
+use uniserve_ipc::launcher::{Instruction, Report, Reservation, WorkerExit, WorkerSpawn};
 use uniserve_ipc::{Frame, Registration, VERSION};
 
 /// Returns `message` as a receiver decodes it from the frame a sender made.
@@ -15,7 +15,7 @@ fn round_trip<M: serde::Serialize + serde::de::DeserializeOwned>(message: &M) ->
 
 #[test]
 fn every_instruction_round_trips_through_a_frame() {
-    let spawn = Instruction::Spawn(Box::new(RankSpawn {
+    let spawn = Instruction::Spawn(Box::new(WorkerSpawn {
         rank: 5,
         worker_id: "model".into(),
         generation: 2,
@@ -42,7 +42,7 @@ fn every_report_round_trips_through_a_frame() {
         port: 4100,
         listen_fd: 7,
     });
-    let exit = Report::Exit(RankExit {
+    let exit = Report::Exit(WorkerExit {
         worker_id: "model".into(),
         generation: 2,
         rank: 5,
@@ -54,8 +54,8 @@ fn every_report_round_trips_through_a_frame() {
 }
 
 #[test]
-fn a_rank_and_a_launcher_register_with_the_same_first_frame() {
-    let rank = Registration::Rank {
+fn a_worker_and_a_launcher_register_with_the_same_first_frame() {
+    let rank = Registration::Worker {
         worker_id: "model".into(),
         rank: 5,
         generation: 2,

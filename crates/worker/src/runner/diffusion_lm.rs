@@ -70,7 +70,7 @@ use crate::lane::{
 };
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::storage::{AttentionRow, OutputPool, PrefixCache, TablePages};
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
@@ -204,7 +204,7 @@ struct Recorded {
     /// Storage of the forward's own that the job's copies read. The job
     /// ends with a read of it, which waits for those copies, so it is
     /// returned with this value at completion.
-    own: Option<Arc<Memory>>,
+    own: Option<Arc<Storage>>,
     tokens: usize,
     padded_tokens: usize,
 }
@@ -702,8 +702,8 @@ impl DiffusionLMRunner {
             // hold selects into storage of its own.
             let larger = if total > CANDIDATES {
                 let memory = match device {
-                    Some(device) => Memory::device(device, total * 12)?,
-                    None => Memory::host(total * 12),
+                    Some(device) => Storage::device(device, total * 12)?,
+                    None => Storage::host(total * 12),
                 };
                 let backing = Arc::clone(&memory) as Arc<dyn Backing>;
                 let shape = [total as i64];

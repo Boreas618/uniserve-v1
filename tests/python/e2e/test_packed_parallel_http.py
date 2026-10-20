@@ -58,7 +58,7 @@ def _command(
         str(port),
         "--worker-python",
         sys.executable,
-        "--workers",
+        "--worker-groups",
         str(written_deployment(directory, [worker_config])),
         "--set",
         "dtype=bfloat16",

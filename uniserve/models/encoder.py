@@ -356,7 +356,7 @@ class PatchEncoder(Encoder[VisionInput]):
         width)`` patch grid they are resized to. The result is the sample
         ``encode`` takes with ``grid`` as its host shape. An encoder whose
         network reads packed patch rows defines this conversion; it reads no
-        parameter, so a host rank holding the module's description runs it.
+        parameter, so a CPU worker holding the module's description runs it.
         """
         raise NotImplementedError
 

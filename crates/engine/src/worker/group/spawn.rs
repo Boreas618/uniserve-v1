@@ -15,17 +15,20 @@ use super::routing::refuse_shared_storage_off_head;
 use super::{FailureDomain, WorkerGroup};
 use crate::worker::WorkerProcessArgs;
 use crate::worker::registry::Registry;
-use crate::worker::{IncarnationRegistry, PendingRank, RankProcess};
+use crate::worker::{IncarnationRegistry, PendingWorker, WorkerProcess};
 
 /// Every rank of one group, with the launchers that started the remote ones.
-type LaunchedGroup = (Vec<RankProcess>, Option<crate::worker::launcher::Launchers>);
+type LaunchedGroup = (
+    Vec<WorkerProcess>,
+    Option<crate::worker::launcher::Launchers>,
+);
 
 /// One worker group's spawned ranks and the launch they register for.
-pub(crate) struct LaunchedRanks {
+pub(crate) struct LaunchedWorkers {
     /// The registry the ranks register with.
     registry: Registry,
-    ranks: Vec<PendingRank>,
-    /// Retained so this instance's launchers stay connected; closing a
+    ranks: Vec<PendingWorker>,
+    /// Retained so this head's launchers stay connected; closing a
     /// launcher connection terminates the ranks it started.
     launchers: Option<crate::worker::launcher::Launchers>,
 }
@@ -53,7 +56,7 @@ impl WorkerProcessArgs {
              expert-parallel world",
             self.worker_id
         );
-        self.adopt_ranks(self.spawn_ranks(cancel, registry, launchers, None)?)
+        self.adopt_workers(self.spawn_workers(cancel, registry, launchers, None)?)
     }
 
     /// Starts every rank of one group without waiting for it to register.
@@ -64,20 +67,20 @@ impl WorkerProcessArgs {
     ///
     /// `expert_store` is the socket the group's first rank serves its
     /// expert-parallel world's store on, when that rank is the world's rank 0.
-    fn spawn_ranks(
+    fn spawn_workers(
         &self,
         cancel: Option<Arc<AtomicBool>>,
         registry: &Registry,
         launchers: Option<crate::worker::launcher::Launchers>,
         mut expert_store: Option<std::net::TcpListener>,
-    ) -> anyhow::Result<LaunchedRanks> {
+    ) -> anyhow::Result<LaunchedWorkers> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        crate::WorkerConfig::validate_members(&self.ranks, &self.components)?;
+        crate::WorkerGroupConfig::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
-            self.components.is_empty() == (self.role == crate::WorkerRole::Experts),
+            self.components.is_empty() == (self.role == crate::WorkerGroupRole::Experts),
             "worker role disagrees with request component placement"
         );
-        if self.role == crate::WorkerRole::Experts {
+        if self.role == crate::WorkerGroupRole::Experts {
             anyhow::ensure!(
                 self.expert_parallel.as_ref().is_some_and(|placement| {
                     placement.attention_ranks > 0 && placement.rank >= placement.attention_ranks
@@ -88,7 +91,7 @@ impl WorkerProcessArgs {
         // This process spawns exactly the ranks placed on its own host. A rank
         // placed elsewhere is started by that host's launcher, which presented
         // to the deployment's registry before any rank is sent to it.
-        let places_remotely = self.ranks.iter().any(|rank| rank.node != self.host);
+        let places_remotely = self.ranks.iter().any(|rank| rank.host != self.host);
         let launchers = match launchers {
             Some(registry) if places_remotely => Some(registry),
             None if places_remotely => anyhow::bail!(
@@ -112,7 +115,7 @@ impl WorkerProcessArgs {
             None => None,
         };
         let mut rendezvous = if self.ranks.len() > 1 && self.expert_parallel.is_none() {
-            let first = &self.ranks[0].node;
+            let first = &self.ranks[0].host;
             Some(match launchers.as_ref() {
                 Some(registry) if *first != self.host => crate::worker::launcher::lock(registry)?
                     .rendezvous_on(first, &self.worker_id)?,
@@ -139,10 +142,10 @@ impl WorkerProcessArgs {
         for rank in 0..self.ranks.len() {
             // A rank placed elsewhere is delivered to the launcher that owns
             // its host; a rank placed here is spawned by this process.
-            let mut remote = match (&launchers, self.ranks[rank].node == self.host) {
+            let mut remote = match (&launchers, self.ranks[rank].host == self.host) {
                 (Some(registry), false) => Some(crate::worker::launcher::RemoteHost {
                     registry: registry.as_ref(),
-                    host: &self.ranks[rank].node,
+                    host: &self.ranks[rank].host,
                 }),
                 _ => None,
             };
@@ -152,7 +155,7 @@ impl WorkerProcessArgs {
                 Some(rendezvous) if rank == 0 => rendezvous.listener.take(),
                 _ => None,
             };
-            let sockets = crate::worker::process::RankSockets {
+            let sockets = crate::worker::process::WorkerSockets {
                 group: store_listener,
                 experts: if rank == 0 { expert_store.take() } else { None },
             };
@@ -166,7 +169,7 @@ impl WorkerProcessArgs {
                 (Some(_), Some(address)) => address.as_str(),
                 _ => local_address.as_str(),
             };
-            ranks.push(PendingRank::spawn_rank(
+            ranks.push(PendingWorker::spawn(
                 self,
                 rank as u32,
                 rendezvous
@@ -181,7 +184,7 @@ impl WorkerProcessArgs {
             )?);
         }
 
-        Ok(LaunchedRanks {
+        Ok(LaunchedWorkers {
             registry: Arc::clone(registry),
             ranks,
             launchers,
@@ -190,8 +193,8 @@ impl WorkerProcessArgs {
 
     /// Takes the connection each rank registered on and answers it with the
     /// rank's launch descriptor.
-    fn adopt_ranks(&self, launched: LaunchedRanks) -> anyhow::Result<LaunchedGroup> {
-        let LaunchedRanks {
+    fn adopt_workers(&self, launched: LaunchedWorkers) -> anyhow::Result<LaunchedGroup> {
+        let LaunchedWorkers {
             registry,
             mut ranks,
             mut launchers,
@@ -233,11 +236,11 @@ impl WorkerProcessArgs {
 }
 
 impl WorkerGroup {
-    /// Launches every configured rank and exposes the instance after capability agreement.
+    /// Launches every configured worker and exposes the group after capability agreement.
     pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
         Self::spawn_all(vec![process_args])?
             .pop()
-            .context("WorkerGroup launch produced no instance")
+            .context("the worker group launch produced no group")
     }
 
     /// Launches the configured static rank groups and waits for loaded capabilities.
@@ -254,8 +257,8 @@ impl WorkerGroup {
         // runs on another host.
         let remote = arguments
             .iter()
-            .any(|args| args.ranks.iter().any(|rank| rank.node != args.host));
-        let registry = crate::worker::registry::RankRegistry::bind(remote)?;
+            .any(|args| args.ranks.iter().any(|rank| rank.host != args.host));
+        let registry = crate::worker::registry::WorkerRegistry::bind(remote)?;
         let launchers = match arguments.first() {
             Some(first) => crate::worker::launcher::LauncherRegistry::for_hosts(
                 &registry,
@@ -288,7 +291,7 @@ impl WorkerGroup {
                 placement.address = Some(rendezvous.address.clone());
                 if placement.rank == 0 {
                     anyhow::ensure!(
-                        args.ranks[0].node == args.host,
+                        args.ranks[0].host == args.host,
                         "expert-parallel rank 0 ({}) must run on the head's host",
                         args.worker_id
                     );
@@ -307,7 +310,7 @@ impl WorkerGroup {
                     Some(placement) if placement.rank == 0 => expert_store.take(),
                     _ => None,
                 };
-                args.spawn_ranks(
+                args.spawn_workers(
                     Some(Arc::clone(&startup_cancel)),
                     &registry,
                     launchers.clone(),
@@ -318,12 +321,12 @@ impl WorkerGroup {
         let mut groups = arguments
             .iter()
             .zip(launched)
-            .map(|(args, ranks)| args.adopt_ranks(ranks))
+            .map(|(args, ranks)| args.adopt_workers(ranks))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         // The ranks of every group are awaited together, so the loss of any
         // one of them ends the wait of all.
-        let mut starting: Vec<&mut RankProcess> = groups
+        let mut starting: Vec<&mut WorkerProcess> = groups
             .iter_mut()
             .flat_map(|(ranks, _)| ranks.iter_mut())
             .collect();
@@ -381,7 +384,7 @@ impl WorkerGroup {
     /// cancelled and every rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
-        mut workers: Vec<RankProcess>,
+        mut workers: Vec<WorkerProcess>,
         launchers: Option<crate::worker::launcher::Launchers>,
         registry: Registry,
     ) -> anyhow::Result<Self> {
@@ -534,7 +537,7 @@ impl WorkerGroup {
         // Each process serves the rank the group launched it as.
         let incarnations = IncarnationRegistry::default();
         incarnations.assign(
-            &crate::WorkerId(process_args.worker_id.clone()),
+            &crate::WorkerGroupId(process_args.worker_id.clone()),
             workers.iter().map(|worker| &worker.info().endpoint),
         );
         Ok(Self {

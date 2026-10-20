@@ -1,19 +1,19 @@
 //! The messages between the head's engine and a host's launcher.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-host` launcher, which connects to the head and keeps
+//! runs one `uniserve-launcher` launcher, which connects to the head and keeps
 //! that connection for the deployment's lifetime. The connection carries
 //! frames in both directions:
 //!
 //! - the launcher sends its [`Registration`](crate::Registration) once, then
 //!   [`Report`]s: a [`Reservation`] answering each [`Instruction::Reserve`],
-//!   and a [`RankExit`] for each rank it still supervises that exits, which
+//!   and a [`WorkerExit`] for each rank it still supervises that exits, which
 //!   excludes ranks an [`Instruction::Stop`] ended;
 //! - the head sends [`Instruction`]s.
 //!
-//! Each launch of a worker group has a generation, which every [`RankSpawn`]
+//! Each launch of a worker group has a generation, which every [`WorkerSpawn`]
 //! names: the launcher starts the rank with it, the rank states it in its
-//! registration, and the launcher echoes it in that rank's [`RankExit`]. The
+//! registration, and the launcher echoes it in that rank's [`WorkerExit`]. The
 //! head ends a group's launch with a stop before it relaunches the group
 //! under the next generation, so an exit the launcher reported just before it
 //! read the stop is recognized as the stopped launch's rather than the
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 pub enum Instruction {
     /// Start one rank, as a member of its group's current generation. The
     /// rank connects to the head and receives its launch descriptor there.
-    Spawn(Box<RankSpawn>),
+    Spawn(Box<WorkerSpawn>),
     /// Bind and hold a collective store socket for one worker group, which
     /// the launcher hands to that group's first rank when it spawns it. The
     /// launcher answers with a [`Reservation`].
@@ -44,7 +44,7 @@ pub enum Instruction {
 
 /// Everything a launcher needs to start one rank.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RankSpawn {
+pub struct WorkerSpawn {
     /// Rank within its worker group's process world, not host-relative.
     pub rank: u32,
     /// Worker group the rank belongs to.
@@ -69,7 +69,7 @@ pub struct RankSpawn {
 #[serde(rename_all = "snake_case")]
 pub enum Report {
     Reservation(Reservation),
-    Exit(RankExit),
+    Exit(WorkerExit),
 }
 
 /// A launcher's answer to the [`Instruction::Reserve`] the head sent last.
@@ -89,7 +89,7 @@ pub struct Reservation {
 
 /// What a launcher says when one of its ranks exits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RankExit {
+pub struct WorkerExit {
     /// Worker group of the process that exited.
     pub worker_id: String,
     /// The group generation the rank's spawn named.

@@ -208,7 +208,7 @@ impl Scheduler {
         // Multimodal requests reserve their configured bounded cache envelope at
         // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
-        let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
+        let finish_token_ids = finish_token_ids(&req, &self.special_tokens.eos);
         let st = RequestState {
             finish_token_ids,
             allocations: None,
@@ -405,7 +405,7 @@ impl Scheduler {
     /// a free request row. When the executor reports admissible video
     /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
-    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerId>> {
+    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerGroupId>> {
         use uniserve_ipc::MediaCall;
 
         let mut required = graph
@@ -597,7 +597,7 @@ impl Scheduler {
     /// on known workers.
     fn reserve_media(
         &mut self,
-        route_workers: &HashSet<crate::WorkerId>,
+        route_workers: &HashSet<crate::WorkerGroupId>,
         request_key: RequestKey,
         outputs: &[MediaOutput],
     ) -> Result<Option<MediaAllocations>, UnknownMediaWorker> {
@@ -1165,7 +1165,10 @@ impl Scheduler {
     fn prefill_target(
         &self,
         state: &RequestState,
-    ) -> Option<((crate::WorkerId, String), crate::prefix_cache::PrefixHit)> {
+    ) -> Option<(
+        (crate::WorkerGroupId, String),
+        crate::prefix_cache::PrefixHit,
+    )> {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
@@ -1216,7 +1219,7 @@ impl Scheduler {
     /// stays reserved on error.
     fn reserve_admission(
         &mut self,
-        target: &crate::WorkerId,
+        target: &crate::WorkerGroupId,
     ) -> Result<AdmissionReservation, &'static str> {
         let source = self
             .executor
@@ -1260,7 +1263,7 @@ impl Scheduler {
     pub(super) fn admit_running(
         &mut self,
         mut st: RequestState,
-        target: (crate::WorkerId, String),
+        target: (crate::WorkerGroupId, String),
         reservation: AdmissionReservation,
     ) {
         let id = st.req.request_id;

@@ -36,7 +36,7 @@ use uniserve_engine::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
     ExpertExchange, FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
-    SchedulingPolicy, TransferConfig, WorkerConfig, WorkerProcessArgs,
+    SchedulingPolicy, TransferConfig, WorkerGroupConfig, WorkerProcessArgs,
 };
 
 use crate::profile::ModelDescription;
@@ -179,15 +179,15 @@ pub struct ServeConfig {
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
     pub mem_fraction_static: f64,
-    /// Tensor-parallel ranks of each replica when no `workers` file is
-    /// given.
+    /// Tensor-parallel workers of each engine core's group when no
+    /// `worker_groups` file is given.
     pub tensor_parallel_size: NonZeroUsize,
-    /// Independent replicas, each with its own scheduler, KV cache and
-    /// ranks. With a `workers` file, its groups form the replicas as equal
-    /// consecutive blocks.
+    /// Engine cores, each with its own scheduler, KV cache and worker
+    /// groups. With a `worker_groups` file, its model groups form the engine
+    /// cores as equal consecutive blocks.
     pub data_parallel_size: NonZeroUsize,
     /// Deployment file placing worker groups and their components.
-    pub workers: Option<PathBuf>,
+    pub worker_groups: Option<PathBuf>,
     /// This process's host name; it runs the ranks placed on this host, and
     /// a deployment rank entry without a host names it.
     pub host_identity: String,
@@ -227,7 +227,7 @@ impl Default for ServeConfig {
             mem_fraction_static: WorkerProcessArgs::DEFAULT_MEM_FRACTION_STATIC,
             tensor_parallel_size: NonZeroUsize::MIN,
             data_parallel_size: NonZeroUsize::MIN,
-            workers: None,
+            worker_groups: None,
             host_identity: "localhost".to_owned(),
             lanes: Vec::new(),
             server_config: ServerOptions::default(),
@@ -396,7 +396,7 @@ impl Default for PlacementOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeOptions {
-    /// Shard routed experts across the data-parallel replicas or the
+    /// Shard routed experts across the engine cores or the
     /// deployment's expert workers.
     pub expert_parallel: bool,
     /// How sharded experts are reached: `alltoall`, `megamoe`, `deepep` or
@@ -737,7 +737,7 @@ impl ServeConfig {
     /// # Errors
     ///
     /// Fails when `model` is unset, `mem_fraction_static` lies outside
-    /// (0, 1], a placement-shorthand option is stated with `workers`, the
+    /// (0, 1], a placement-shorthand option is stated with `worker_groups`, the
     /// server host or Unix socket path is blank, or
     /// `video_config.max_seconds` lies outside the durations the video API
     /// admits.
@@ -746,15 +746,15 @@ impl ServeConfig {
             self.model.is_some(),
             "`model` is required: name MODEL on the command line or set `model` in --config"
         );
-        WorkerConfig::validate_mem_fraction_static(self.mem_fraction_static)
+        WorkerGroupConfig::validate_mem_fraction_static(self.mem_fraction_static)
             .context("invalid `mem_fraction_static`")?;
-        if self.workers.is_some()
+        if self.worker_groups.is_some()
             && let Some(option) = PLACEMENT_SHORTHAND
                 .iter()
                 .find(|option| stated.contains(option))
         {
             anyhow::bail!(
-                "`{option}` places ranks without a deployment file; the `workers` file \
+                "`{option}` places ranks without a deployment file; the `worker_groups` file \
                  states its own placement"
             );
         }
@@ -784,7 +784,7 @@ impl ServeConfig {
 
     /// Derives the engine configuration these options state.
     ///
-    /// The deployment comes from the `workers` file, placed on this
+    /// The deployment comes from the `worker_groups` file, placed on this
     /// process's `host_identity`, or else from `tensor_parallel_size`,
     /// `data_parallel_size` and `placement_config`. What the loaded model
     /// determines keeps its neutral value for `Engine::start` to complete:
@@ -797,19 +797,19 @@ impl ServeConfig {
     /// strictly increasing or repeats a shape, a lane or the transfer edges
     /// do not resolve, or a batch bound exceeds the worker's `u32` fields.
     pub fn engine_config(&self) -> anyhow::Result<EngineConfig> {
-        let workers = match &self.workers {
+        let worker_groups = match &self.worker_groups {
             Some(path) => Deployment::read(&path.to_string_lossy())?
-                .workers(&self.host_identity)
-                .context("invalid `workers` deployment")?,
+                .worker_groups(&self.host_identity)
+                .context("invalid `worker_groups` deployment")?,
             None => {
                 let tensor_parallel_size = self.tensor_parallel_size.get();
-                WorkerConfig::replicated(
+                WorkerGroupConfig::data_parallel(
                     &self.rank_hosts(),
                     &self.placement_config.device,
                     self.data_parallel_size.get(),
                     tensor_parallel_size,
                     self.placement_config.queue_depth.get(),
-                    WorkerConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
+                    WorkerGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
                 )
             }
         };
@@ -922,7 +922,7 @@ impl ServeConfig {
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, NonZeroUsize::get),
             prefix_cache: self.kv_cache_config.prefix_caching,
             schedule_policy: self.scheduler_config.policy,
-            workers,
+            worker_groups,
             transfer,
             data_parallel_size: self.data_parallel_size.get(),
             expert_parallel: self
@@ -939,10 +939,10 @@ impl ServeConfig {
     /// Returns the hosts the placement shorthand places ranks on, this host
     /// first.
     ///
-    /// `WorkerConfig::placed` assigns ranks to these hosts in contiguous
-    /// blocks in list order, so leading with this instance's own identity
+    /// `WorkerGroupConfig::placed` assigns ranks to these hosts in contiguous
+    /// blocks in list order, so leading with this head's own identity
     /// keeps rank zero and the other lowest ranks on the head's host.
-    /// Entries of `worker_hosts` that are empty or repeat this instance's
+    /// Entries of `worker_hosts` that are empty or repeat this head's
     /// identity are dropped; other repeated names are kept as given.
     fn rank_hosts(&self) -> Vec<String> {
         let mut hosts = vec![self.host_identity.clone()];

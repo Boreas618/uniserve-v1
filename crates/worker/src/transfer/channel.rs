@@ -14,7 +14,7 @@ use super::read::{NativeRead, ReadCall, payload};
 use super::transport::{ExportView, Staged, Transport, producer, read_destination};
 use super::{Spans, copy_planner};
 use crate::ffi::{Backing, MemoryKind};
-use crate::storage::memory::{Memory, StorageView};
+use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -29,8 +29,8 @@ impl Transport {
         let bytes = view.nbytes as usize;
         let producer = producer(view.spans, stream.stream())?.map(|(device, _)| device);
         let staging = match producer {
-            Some(device) => Memory::pinned(device, bytes.max(1))?,
-            None => Memory::host(bytes.max(1)),
+            Some(device) => Storage::pinned(device, bytes.max(1))?,
+            None => Storage::host(bytes.max(1)),
         };
         let target = Spans::single(StorageView::contiguous(
             Arc::clone(&staging) as Arc<dyn Backing>,
@@ -72,7 +72,7 @@ impl Transport {
 
 /// Complete a staged channel export: its location with the bytes its copy
 /// staged, once that copy and the wait behind it were performed.
-pub(super) fn locate(mut locator: Locator, staging: &Memory, bytes: usize) -> Result<Locator> {
+pub(super) fn locate(mut locator: Locator, staging: &Storage, bytes: usize) -> Result<Locator> {
     // SAFETY: the export's copy and the wait behind it were performed, so
     // nothing writes the staging any more.
     let payload = unsafe { staging.host_bytes() }

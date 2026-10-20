@@ -4,8 +4,8 @@
 //! deployment. A rank connects to the head when it starts, through the Unix
 //! socket on the head's host and through TCP from any other host, and its
 //! first frame is its `Registration`: worker group, rank, launch generation
-//! and build version. [`RankRegistry::begin_launch`] numbers each launch of
-//! a group, and [`RankRegistry::collect`] gathers the registrations of the
+//! and build version. [`WorkerRegistry::begin_launch`] numbers each launch of
+//! a group, and [`WorkerRegistry::collect`] gathers the registrations of the
 //! group's current launch and hands each rank's connection to that launch,
 //! which answers with the rank's launch descriptor. The connection then
 //! serves the rank for its lifetime, and its close is the rank's death.
@@ -16,7 +16,7 @@
 //! connection, which ends it; the relaunch goes on.
 //!
 //! The launcher of another host connects to the same TCP port and registers
-//! its host identity; [`RankRegistry::take_launchers`] hands its connection
+//! its host identity; [`WorkerRegistry::take_launchers`] hands its connection
 //! to the launcher registry (`launcher`).
 //!
 //! A host that runs ranks therefore accepts no inbound connection.
@@ -30,7 +30,7 @@ use anyhow::Context;
 use uniserve_ipc::{Channel, Listener, Registration, VERSION};
 
 /// Deadline for every rank of one launch to register, measured from the
-/// start of `RankRegistry::collect`, which runs after every rank of the group
+/// start of `WorkerRegistry::collect`, which runs after every rank of the group
 /// has been launched.
 ///
 /// A rank registers before it builds its model, so this covers process start
@@ -42,12 +42,12 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The deployment's registry, shared by its worker groups.
-pub(crate) type Registry = Arc<Mutex<RankRegistry>>;
+pub(crate) type Registry = Arc<Mutex<WorkerRegistry>>;
 
 /// Locks the registry, reporting a poisoned lock as an error.
 pub(crate) fn lock(
-    registry: &Mutex<RankRegistry>,
-) -> anyhow::Result<std::sync::MutexGuard<'_, RankRegistry>> {
+    registry: &Mutex<WorkerRegistry>,
+) -> anyhow::Result<std::sync::MutexGuard<'_, WorkerRegistry>> {
     registry
         .lock()
         .map_err(|_| anyhow::anyhow!("the rank registry is poisoned"))
@@ -55,7 +55,7 @@ pub(crate) fn lock(
 
 /// A rank of a group's current launch that has registered and that the
 /// launch has not taken yet.
-struct RegisteredRank {
+struct RegisteredWorker {
     worker_id: String,
     rank: u32,
     channel: Channel,
@@ -63,7 +63,7 @@ struct RegisteredRank {
 
 /// The address ranks and launchers connect to, and those that have
 /// registered there.
-pub(crate) struct RankRegistry {
+pub(crate) struct WorkerRegistry {
     listener: Listener,
     /// Holds the Unix socket's path; dropping it removes the directory.
     _directory: tempfile::TempDir,
@@ -74,12 +74,12 @@ pub(crate) struct RankRegistry {
     connecting: Vec<Channel>,
     /// Registered ranks of the groups' current launches that the launches
     /// have not taken yet.
-    ranks: Vec<RegisteredRank>,
+    ranks: Vec<RegisteredWorker>,
     /// Registered launchers the launcher registry has not taken yet, by host.
     launchers: Vec<(String, Channel)>,
 }
 
-impl RankRegistry {
+impl WorkerRegistry {
     /// Binds the Unix socket path and the TCP port ranks and launchers
     /// connect to.
     ///
@@ -261,7 +261,7 @@ impl RankRegistry {
             let channel = self.connecting.swap_remove(index);
             if registration.version() != VERSION {
                 let who = match &registration {
-                    Registration::Rank {
+                    Registration::Worker {
                         worker_id, rank, ..
                     } => format!("rank {rank} of worker {worker_id}"),
                     Registration::Launcher { host, .. } => format!("the launcher of host {host}"),
@@ -273,7 +273,7 @@ impl RankRegistry {
                 );
             }
             match registration {
-                Registration::Rank {
+                Registration::Worker {
                     worker_id,
                     rank,
                     generation,
@@ -292,7 +292,7 @@ impl RankRegistry {
                         );
                         continue;
                     }
-                    self.ranks.push(RegisteredRank {
+                    self.ranks.push(RegisteredWorker {
                         worker_id,
                         rank,
                         channel,
@@ -313,7 +313,7 @@ mod tests {
     fn register(address: &str, worker: &str, rank: u32, generation: u64, version: &str) -> Channel {
         let mut channel = Channel::connect(address).unwrap();
         channel
-            .send(&Registration::Rank {
+            .send(&Registration::Worker {
                 worker_id: worker.into(),
                 rank,
                 generation,
@@ -335,8 +335,8 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_collects_its_own_ranks_over_both_addresses_in_rank_order() {
-        let registry = RankRegistry::bind(false).unwrap();
+    fn a_launch_collects_its_own_workers_over_both_addresses_in_rank_order() {
+        let registry = WorkerRegistry::bind(false).unwrap();
         let mut registry = lock(&registry).unwrap();
         let unix = registry.address(None).unwrap();
         let tcp = registry.address(Some(Ipv4Addr::LOCALHOST.into())).unwrap();
@@ -378,8 +378,8 @@ mod tests {
     /// is refused whether it registered before the relaunch began or after,
     /// and neither counts as a rank of the relaunch.
     #[test]
-    fn a_rank_of_an_earlier_launch_is_refused_and_the_relaunch_completes() {
-        let registry = RankRegistry::bind(false).unwrap();
+    fn a_worker_of_an_earlier_launch_is_refused_and_the_relaunch_completes() {
+        let registry = WorkerRegistry::bind(false).unwrap();
         let mut registry = lock(&registry).unwrap();
         let address = registry.address(None).unwrap();
 
@@ -410,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn a_rank_or_a_launcher_of_another_build_fails_the_wait_by_name() {
-        let registry = RankRegistry::bind(true).unwrap();
+    fn a_worker_or_a_launcher_of_another_build_fails_the_wait_by_name() {
+        let registry = WorkerRegistry::bind(true).unwrap();
         let mut registry = lock(&registry).unwrap();
 
         // Another build of the same package version.
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn a_launcher_registers_on_the_tcp_port() {
-        let registry = RankRegistry::bind(true).unwrap();
+        let registry = WorkerRegistry::bind(true).unwrap();
         let mut registry = lock(&registry).unwrap();
         let port = registry
             .tcp_address()
@@ -497,8 +497,8 @@ mod tests {
     }
 
     #[test]
-    fn a_rank_outside_the_group_and_a_rank_registered_twice_fail_the_launch() {
-        let registry = RankRegistry::bind(false).unwrap();
+    fn a_worker_outside_the_group_and_a_worker_registered_twice_fail_the_launch() {
+        let registry = WorkerRegistry::bind(false).unwrap();
         let mut registry = lock(&registry).unwrap();
         let address = registry.address(None).unwrap();
 
@@ -526,7 +526,7 @@ mod tests {
     /// is not a registration, do not keep a launch from completing.
     #[test]
     fn a_launch_completes_beside_connections_that_never_register() {
-        let registry = RankRegistry::bind(false).unwrap();
+        let registry = WorkerRegistry::bind(false).unwrap();
         let mut registry = lock(&registry).unwrap();
         let address = registry.address(None).unwrap();
 
@@ -541,8 +541,8 @@ mod tests {
     }
 
     #[test]
-    fn a_rank_that_dies_before_registering_fails_the_launch() {
-        let registry = RankRegistry::bind(false).unwrap();
+    fn a_worker_that_dies_before_registering_fails_the_launch() {
+        let registry = WorkerRegistry::bind(false).unwrap();
         let mut registry = lock(&registry).unwrap();
 
         registry.begin_launch("text");

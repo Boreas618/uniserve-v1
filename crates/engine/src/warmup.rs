@@ -56,7 +56,7 @@ const IMAGE_STEPS: u16 = 2;
 /// worker has no kernels or graphs to warm.
 pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<()> {
     let on_cuda = config
-        .workers
+        .worker_groups
         .iter()
         .flat_map(|worker| &worker.ranks)
         .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
@@ -306,7 +306,7 @@ mod tests {
         let mut executor = SimExecutor::new(sim);
         let boundary = executor.observe();
         let mut config = EngineConfig::sim("warmup");
-        config.workers[0].ranks[0].device = "cuda:0".to_owned();
+        config.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
         deployment(&mut config);
         let core = EngineCore::with_executor(config.clone(), Box::new(executor)).unwrap();
 

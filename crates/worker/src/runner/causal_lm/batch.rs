@@ -37,7 +37,7 @@ use crate::runner::vision::PositionLayout;
 use crate::sampling::SamplingControls;
 use crate::storage::Metadata;
 use crate::storage::{OutputPlacement, ProductBuffer};
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
 /// What a call contributes to its token batch's forward, beside the state
@@ -108,7 +108,7 @@ pub(super) struct Owners<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     /// The image runtime, for prompts placing image features.
     pub(super) image: Option<ImageParts<'a>>,
-    pub(super) storage: &'a mut RankStorage,
+    pub(super) storage: &'a mut WorkerStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     /// The rank's expert union, when its forwards are expert steps.
@@ -147,7 +147,7 @@ impl Parked {
 pub(super) struct TokenBatch<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     pub(super) image: Option<ImageParts<'a>>,
-    pub(super) storage: &'a mut RankStorage,
+    pub(super) storage: &'a mut WorkerStorage,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     pub(super) experts: Option<Arc<ExpertUnion>>,

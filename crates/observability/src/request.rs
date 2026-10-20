@@ -66,7 +66,7 @@ fn request_token_count_histogram() -> Histogram {
 pub struct FinishedReasonLabels {
     /// Served model identity.
     pub model_name: String,
-    /// Engine instance index.
+    /// Engine core index.
     pub engine: u32,
     /// Stable terminal reason name.
     pub finished_reason: &'static str,

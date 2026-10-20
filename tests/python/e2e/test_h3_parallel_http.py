@@ -335,14 +335,14 @@ def test_component_bindings_release_cancelled_requests(
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
-    # Media units are encoded and the artifact assembled on a host worker, as
-    # in the shipped deployments: each host rank is one codec slot encoding
-    # one unit of a round, a further rank muxes and the last reads condition
-    # media.
+    # Media units are encoded and the artifact assembled on the CPU workers
+    # of the media group, as in the shipped deployments: each CPU worker is
+    # one codec slot encoding one unit of a round, a further worker muxes and
+    # the last reads condition media.
     decoder_units = len(worker_config["video_decoder"]["ranks"])
     workers.append(
         {
-            "id": "host",
+            "id": "media",
             "ranks": [f"cpu*{decoder_units + 2}"],
             "queue_depth": 6,
             "components": {
@@ -355,7 +355,7 @@ def test_component_bindings_release_cancelled_requests(
         }
     )
     owners.update(
-        dict.fromkeys(("video_codec", "muxer", "media_reader"), "host")
+        dict.fromkeys(("video_codec", "muxer", "media_reader"), "media")
     )
     edges = {
         (owners[source], owners[destination])
@@ -383,19 +383,19 @@ def test_component_bindings_release_cancelled_requests(
         str(port),
         "--worker-python",
         sys.executable,
-        "--workers",
+        "--worker-groups",
         str(written_deployment(tmp_path, workers)),
         "--set",
         "placement_config.transfer="
         + ",".join(
             # Device products cross workers over VMM handles where the
-            # devices can map one another; the host worker's ranks have no
-            # device, so their edges carry host products over shared storage
-            # only.
+            # devices can map one another; the media group's CPU workers have
+            # no device, so their edges carry host products over shared
+            # storage only.
             f"{source}->{destination}="
             + (
                 "posix_shm"
-                if "host" in (source, destination) or not device_products
+                if "media" in (source, destination) or not device_products
                 else "cuda_vmm+posix_shm"
             )
             for source, destination in sorted(edges)
@@ -500,8 +500,8 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     """Exercise async ownership and reuse through the HTTP contract.
 
     The exercise runs on the documented four-device deployment, whose numerical
-    components share one worker and whose media units are encoded and muxed on
-    a host worker.
+    components share one worker group and whose media units are encoded and
+    muxed on the CPU workers of the media group.
     """
     import time
 
@@ -527,7 +527,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         str(require_uniserve_binary()),
         "serve",
         model,
-        "--workers",
+        "--worker-groups",
         str(deployment),
         "--worker-python",
         sys.executable,

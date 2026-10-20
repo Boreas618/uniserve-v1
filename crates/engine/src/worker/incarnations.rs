@@ -5,7 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use uniserve_ipc::WorkerEndpoint;
 
-use crate::WorkerId;
+use crate::WorkerGroupId;
 
 /// The worker and rank each live rank incarnation was launched as.
 ///
@@ -20,7 +20,7 @@ use crate::WorkerId;
 /// Clones share one table.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IncarnationRegistry {
-    positions: Arc<RwLock<HashMap<String, (WorkerId, u32)>>>,
+    positions: Arc<RwLock<HashMap<String, (WorkerGroupId, u32)>>>,
 }
 
 impl IncarnationRegistry {
@@ -29,7 +29,7 @@ impl IncarnationRegistry {
     /// Every incarnation `worker` held before is retired.
     pub(crate) fn assign<'a>(
         &self,
-        worker: &WorkerId,
+        worker: &WorkerGroupId,
         endpoints: impl IntoIterator<Item = &'a WorkerEndpoint>,
     ) {
         let mut positions = self
@@ -44,7 +44,7 @@ impl IncarnationRegistry {
 
     /// Returns the worker and rank `endpoint`'s incarnation serves, or `None`
     /// when it is not a live incarnation of this deployment.
-    pub(crate) fn position(&self, endpoint: &WorkerEndpoint) -> Option<(WorkerId, u32)> {
+    pub(crate) fn position(&self, endpoint: &WorkerEndpoint) -> Option<(WorkerGroupId, u32)> {
         self.positions
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -59,7 +59,7 @@ mod tests {
 
     fn endpoint(incarnation: &str) -> WorkerEndpoint {
         WorkerEndpoint {
-            node: "host".to_owned(),
+            host: "host".to_owned(),
             address_space: format!("{incarnation}-process"),
             incarnation: incarnation.to_owned(),
         }
@@ -70,8 +70,8 @@ mod tests {
     #[test]
     fn replacement_retires_the_replaced_incarnations_of_that_worker_only() {
         let incarnations = IncarnationRegistry::default();
-        let text = WorkerId("text".to_owned());
-        let decoder = WorkerId("decoder".to_owned());
+        let text = WorkerGroupId("text".to_owned());
+        let decoder = WorkerGroupId("decoder".to_owned());
         let before = [endpoint("text-0"), endpoint("text-1")];
         let other = endpoint("decoder-0");
         incarnations.assign(&text, &before);

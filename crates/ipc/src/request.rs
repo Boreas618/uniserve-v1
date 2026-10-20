@@ -34,7 +34,7 @@ impl RequestKind {
     }
 }
 
-/// Host-to-worker request envelope.
+/// Head-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRequest {
@@ -185,7 +185,7 @@ pub struct Stall {
     pub running_ms: u64,
 }
 
-/// Worker-to-host response envelope.
+/// Worker-to-head response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerResponse {

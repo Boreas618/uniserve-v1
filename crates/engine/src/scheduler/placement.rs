@@ -17,7 +17,7 @@ pub(super) struct Placement {
     /// `DEFAULT_COMPONENT` rather than the requested name).
     /// `Scheduler::refill_executor` prunes entries of requests that are no
     /// longer running or retiring.
-    pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerId>,
+    pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
 }
 
 impl Placement {
@@ -33,7 +33,7 @@ impl Placement {
         executor: &'a dyn Executor,
         info: &'a WorkerInfo,
         kind: CallKind,
-    ) -> impl Iterator<Item = (&'a crate::WorkerId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -56,7 +56,7 @@ impl Placement {
         executor: &'a dyn Executor,
         kind: CallKind,
         component: &'a str,
-    ) -> impl Iterator<Item = (&'a crate::WorkerId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
         executor
             .info()
             .workers
@@ -99,7 +99,7 @@ impl Placement {
         request: RequestKey,
         kind: CallKind,
         component: &'a str,
-    ) -> Option<(&'a crate::WorkerId, &'a str)> {
+    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         let candidates = self
             .component_candidates(executor, kind, component)
             .collect::<Vec<_>>();
@@ -155,7 +155,7 @@ impl Placement {
         info: &'a WorkerInfo,
         request: RequestKey,
         kind: CallKind,
-    ) -> Option<(&'a crate::WorkerId, &'a str)> {
+    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -175,7 +175,7 @@ impl Placement {
         executor: &dyn Executor,
         info: &WorkerInfo,
         call: &Call,
-    ) -> Option<(crate::WorkerId, String)> {
+    ) -> Option<(crate::WorkerGroupId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
             self.worker_target(executor, info, call.request_key, call.kind)
         } else {
@@ -192,7 +192,7 @@ impl Placement {
     /// Returns each call's placed worker plus every worker holding residency
     /// for a command's request. `Scheduler::dispatch_submissions` uses this
     /// set to hold back later batches that share a blocked destination.
-    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerId> {
+    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerGroupId> {
         let mut targets = batch
             .requests
             .iter()

@@ -265,13 +265,13 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Memory, StorageView};
+    use crate::storage::memory::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, notify};
 
     /// A host value of `elements` bytes.
     fn value(elements: i64) -> Result<Spans> {
         Spans::single(StorageView::contiguous(
-            Memory::host(elements as usize) as Arc<dyn Backing>,
+            Storage::host(elements as usize) as Arc<dyn Backing>,
             0,
             DType::U8,
             &[elements],

@@ -24,7 +24,7 @@ pub const FLAG_PATHS: [(&str, &str); 12] = [
     ("--host", "server_config.host"),
     ("--port", "server_config.port"),
     ("--served-model-name", "served_model_name"),
-    ("--workers", "workers"),
+    ("--worker-groups", "worker_groups"),
     ("--tensor-parallel-size", "tensor_parallel_size"),
     ("--data-parallel-size", "data_parallel_size"),
     ("--max-running-requests", "max_running_requests"),
@@ -50,14 +50,14 @@ pub struct ServeArgs {
     #[arg(long)]
     pub served_model_name: Option<String>,
     /// Deployment file placing worker groups and their components
-    /// (`workers`).
+    /// (`worker_groups`).
     #[arg(long, value_name = "FILE")]
-    pub workers: Option<PathBuf>,
-    /// Tensor-parallel ranks of each replica without a deployment file
+    pub worker_groups: Option<PathBuf>,
+    /// Tensor-parallel workers of each engine core without a deployment file
     /// (`tensor_parallel_size`).
     #[arg(long)]
     pub tensor_parallel_size: Option<NonZeroUsize>,
-    /// Independent replicas (`data_parallel_size`).
+    /// Engine cores (`data_parallel_size`).
     #[arg(long)]
     pub data_parallel_size: Option<NonZeroUsize>,
     /// Concurrently resident requests (`max_running_requests`).
@@ -201,7 +201,7 @@ impl ServeArgs {
                 "served_model_name",
                 self.served_model_name.as_deref().map(text),
             ),
-            ("workers", self.workers.as_ref().map(path)),
+            ("worker_groups", self.worker_groups.as_ref().map(path)),
             (
                 "tensor_parallel_size",
                 self.tensor_parallel_size
@@ -525,7 +525,7 @@ mod tests {
             "9000",
             "--served-model-name",
             "served",
-            "--workers",
+            "--worker-groups",
             "deployment.toml",
             "--tensor-parallel-size",
             "2",
@@ -581,11 +581,11 @@ mod tests {
         assert_eq!(config.model(), "/models/file");
     }
 
-    /// Without a deployment file each replica runs one component
-    /// tensor-parallel over its ranks; the placement shorthand is refused
+    /// Without a deployment file each engine core's group runs one component
+    /// tensor-parallel over its workers; the placement shorthand is refused
     /// beside a file.
     #[test]
-    fn the_shorthand_places_replicas_and_is_refused_beside_a_file() {
+    fn the_shorthand_places_engine_cores_and_is_refused_beside_a_file() {
         let (_, engine) = lowered(&[
             "m",
             "--tensor-parallel-size",
@@ -596,17 +596,26 @@ mod tests {
             "placement_config.device=cpu",
         ])
         .unwrap();
-        assert_eq!(engine.workers.len(), 2);
-        assert!(engine.workers.iter().all(|worker| worker.ranks.len() == 2));
+        assert_eq!(engine.worker_groups.len(), 2);
+        assert!(
+            engine
+                .worker_groups
+                .iter()
+                .all(|worker| worker.ranks.len() == 2)
+        );
 
         let deployment = written(
             "deployment",
-            "[[workers]]\nid = \"model\"\nranks = [\"cpu*2\"]\nqueue_depth = 2\n\
-             [workers.components.model]\ntensor_parallel_size = 2\n",
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu*2\"]\nqueue_depth = 2\n\
+             [worker_groups.components.model]\ntensor_parallel_size = 2\n",
         );
         let path = deployment.to_str().unwrap();
         assert_eq!(
-            lowered(&["m", "--workers", path]).unwrap().1.workers.len(),
+            lowered(&["m", "--worker-groups", path])
+                .unwrap()
+                .1
+                .worker_groups
+                .len(),
             1
         );
         for shorthand in [
@@ -614,7 +623,7 @@ mod tests {
             ["--set", "placement_config.device=cpu"],
             ["--set", "placement_config.queue_depth=3"],
         ] {
-            let mut args = vec!["m", "--workers", path];
+            let mut args = vec!["m", "--worker-groups", path];
             args.extend(shorthand);
             let error = lowered(&args).unwrap_err();
             assert!(
@@ -629,24 +638,24 @@ mod tests {
     fn a_deployment_places_unnamed_ranks_on_this_host() {
         let deployment = written(
             "head-deployment",
-            "[[workers]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
-             [workers.components.model]\ntensor_parallel_size = 2\n",
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
+             [worker_groups.components.model]\ntensor_parallel_size = 2\n",
         );
         let (_, engine) = lowered(&[
             "m",
-            "--workers",
+            "--worker-groups",
             deployment.to_str().unwrap(),
             "--host-identity",
             "rank-0",
         ])
         .unwrap();
-        let nodes = engine.workers[0]
+        let hosts = engine.worker_groups[0]
             .ranks
             .iter()
-            .map(|rank| rank.node.as_str())
+            .map(|rank| rank.host.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(nodes, ["rank-0", "rank-1"]);
-        assert!(lowered(&["m", "--workers", "/nonexistent/deployment.toml"]).is_err());
+        assert_eq!(hosts, ["rank-0", "rank-1"]);
+        assert!(lowered(&["m", "--worker-groups", "/nonexistent/deployment.toml"]).is_err());
     }
 
     /// Capture lists and capacities are checked before any rank starts.

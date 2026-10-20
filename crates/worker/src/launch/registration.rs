@@ -32,7 +32,7 @@ pub fn register(arguments: &Arguments) -> Result<(Channel, LaunchDescriptor)> {
         |error| Error::transport_source(format!("registering with {}", arguments.head), error);
     let mut channel = Channel::connect(&arguments.head).map_err(failed)?;
     channel
-        .send(&Registration::Rank {
+        .send(&Registration::Worker {
             worker_id: arguments.worker_id.clone(),
             rank: arguments.rank,
             generation: arguments.generation,

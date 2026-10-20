@@ -1,6 +1,6 @@
 //! MP4 assembly of a video request's independently encoded media units.
 //!
-//! A video request's frames are encoded unit by unit on the host ranks of
+//! A video request's frames are encoded unit by unit on the CPU workers of
 //! its video codec component: each unit becomes a self-contained MP4 that
 //! starts at a keyframe, written into its row of the round's `encoded_units`
 //! product behind a native-endian `u64` length ([`frame_unit`]). The muxer

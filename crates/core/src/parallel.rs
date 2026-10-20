@@ -1,9 +1,9 @@
 //! Rank membership and logical model-parallel degrees of worker components.
 //!
 //! A worker group names each numerical component it runs and the ordered
-//! ranks that run it (`WorkerConfig::components` in the engine). A
+//! ranks that run it (`WorkerGroupConfig::components` in the engine). A
 //! [`ComponentConfig`] either forms one model-parallel group over its ranks
-//! or, with a [`ComponentDistribution`], runs an independent local instance on
+//! or, with a [`ComponentDistribution`], runs an independent local copy on
 //! every rank and deals independent units among them.
 //!
 //! [`ComponentConfig::validate`] checks membership and parallel degrees for
@@ -190,7 +190,7 @@ impl ParallelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentDistribution {
-    /// Every member rank runs its own local instance, and independent media
+    /// Every member rank runs its own local copy, and independent media
     /// units are dealt to the ranks in `ranks` order, `units_per_rank`
     /// consecutive units each.
     TemporalUnits,

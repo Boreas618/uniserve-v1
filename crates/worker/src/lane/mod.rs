@@ -360,7 +360,7 @@ impl JobQueues {
     /// A completion, here as anywhere, says that the lane performed the
     /// job: it issued the job's stream work in order, ran its calls and
     /// made its reads and waits. It does not say that the device finished
-    /// the work issued. Memory the job's device work addresses may be read
+    /// the work issued. Storage the job's device work addresses may be read
     /// on the host, written again outside the stream's order or released
     /// after the completion only behind something that waited for the
     /// device: a read of the job (which waits for its stream), a wait for

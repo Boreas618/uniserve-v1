@@ -65,7 +65,7 @@ fn the_wait_for_the_descriptor_ends_when_the_head_closes() {
 
     assert_eq!(
         head.join().unwrap(),
-        Registration::Rank {
+        Registration::Worker {
             worker_id: "text".into(),
             rank: 3,
             generation: 2,

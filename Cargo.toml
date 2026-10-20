@@ -10,8 +10,8 @@ members = [
     "crates/engine",
     "crates/server",
     "crates/bin/uniserve",
-    "crates/bin/uniserve-host",
-    "crates/bin/dynamo-worker",
+    "crates/bin/uniserve-launcher",
+    "crates/bin/dynamo",
 ]
 
 [workspace.package]

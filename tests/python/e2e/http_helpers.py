@@ -159,20 +159,21 @@ def tiny_input_png_b64() -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def written_deployment(directory: Path, workers: list[dict[str, Any]]) -> Path:
+def written_deployment(directory: Path, groups: list[dict[str, Any]]) -> Path:
     """Write the deployment file a serve invocation is given.
 
-    `--workers` names a TOML file because a deployment states every worker
-    group's ranks and the components placed on them; a test states one the
-    same way a deployment does. Each entry of `workers` is one `[[workers]]`
-    table, such as `{"id": "model", "ranks": ["cuda:0-1"], "queue_depth": 2,
-    "components": {"model": {"tensor_parallel_size": 2}}}`.
+    `--worker-groups` names a TOML file because a deployment states every
+    worker group's ranks and the components placed on them; a test states
+    one the same way a deployment does. Each entry of `groups` is one
+    `[[worker_groups]]` table, such as `{"id": "model", "ranks":
+    ["cuda:0-1"], "queue_depth": 2, "components": {"model":
+    {"tensor_parallel_size": 2}}}`.
     """
     path = directory / "deployment.toml"
     tables = (
-        "[[workers]]\n"
-        + "".join(f"{key} = {_toml(item)}\n" for key, item in worker.items())
-        for worker in workers
+        "[[worker_groups]]\n"
+        + "".join(f"{key} = {_toml(item)}\n" for key, item in group.items())
+        for group in groups
     )
     path.write_text("".join(tables))
     return path

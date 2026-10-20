@@ -7,7 +7,7 @@
 //! the per-call placement fields into the flat, call-indexed arrays of the
 //! wire `Batch` and the persistent spans of each rank's own buffer pool.
 
-use super::WorkerId;
+use super::WorkerGroupId;
 use std::collections::BTreeMap;
 use uniserve_ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
@@ -50,7 +50,7 @@ impl RankBuffer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestPlacement {
     /// Worker routing stays outside the call sent across IPC.
-    pub worker: WorkerId,
+    pub worker: WorkerGroupId,
     /// Worker-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
     /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
@@ -75,7 +75,7 @@ pub struct RequestPlacement {
     /// only toward the replicas that read it. `None` for calls outside a
     /// video graph, whose readers follow from their call kind
     /// (`generation_consuming_calls`) or their transfer edges.
-    pub readers: Option<BTreeMap<String, WorkerId>>,
+    pub readers: Option<BTreeMap<String, WorkerGroupId>>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
@@ -188,9 +188,9 @@ impl ExecutionBatch {
                 "call identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
-            // `WorkerId`'s public field admits any string; only its
+            // `WorkerGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
-            WorkerId::new(placement.worker.0.clone())?;
+            WorkerGroupId::new(placement.worker.0.clone())?;
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),

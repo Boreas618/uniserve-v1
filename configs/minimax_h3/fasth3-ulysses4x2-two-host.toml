@@ -1,52 +1,52 @@
 # FastH3 on four GPUs of each of two hosts, rank-0 and rank-1: one Ulysses4
 # denoiser replica and TP4 text encoder per host.
 
-[[workers]]
+[[worker_groups]]
 id = "text"
 replicas = 2
 ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.26
 
-[workers.components.text_encoder]
+[worker_groups.components.text_encoder]
 tensor_parallel_size = 4
 
-[[workers]]
+[[worker_groups]]
 id = "flow"
 replicas = 2
 ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
 queue_depth = 6
 mem_fraction_static = 0.73
 
-[workers.components.transformer]
+[worker_groups.components.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
-[workers.components.video_decoder]
+[worker_groups.components.video_decoder]
 
-[workers.components.audio_decoder]
+[worker_groups.components.audio_decoder]
 distribution = "temporal_units"
 
-[workers.components.latent_encoder]
+[worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[workers]]
+[[worker_groups]]
 id = "encoder"
 replicas = 2
 ranks = ["rank-0/cpu*4", "rank-1/cpu*4"]
 queue_depth = 6
 
-[workers.components.video_codec]
+[worker_groups.components.video_codec]
 
-[[workers]]
+[[worker_groups]]
 id = "reader"
 ranks = ["rank-0/cpu"]
 queue_depth = 6
 
-[workers.components.media_reader]
+[worker_groups.components.media_reader]
 
-[[workers]]
+[[worker_groups]]
 id = "muxer"
 ranks = ["rank-0/cpu"]
 queue_depth = 12
 
-[workers.components.muxer]
+[worker_groups.components.muxer]

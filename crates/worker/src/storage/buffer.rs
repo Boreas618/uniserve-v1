@@ -6,7 +6,7 @@ use std::sync::Arc;
 use uniserve_ipc::{BufferAllocation, BufferId};
 
 use crate::ffi::MemoryKind;
-use crate::storage::memory::Memory;
+use crate::storage::memory::Storage;
 use crate::{Error, Result};
 
 /// One pool-issued physical range. Views retain their allocation; this
@@ -25,7 +25,7 @@ impl BufferBinding {
 }
 
 struct Arena {
-    backing: Arc<Memory>,
+    backing: Arc<Storage>,
     active: HashMap<BufferId, Arc<BufferBinding>>,
 }
 
@@ -38,7 +38,7 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    fn new(byte_capacity: u64, arenas: HashMap<MemoryKind, Arc<Memory>>) -> Self {
+    fn new(byte_capacity: u64, arenas: HashMap<MemoryKind, Arc<Storage>>) -> Self {
         Self {
             byte_capacity,
             arenas: arenas
@@ -64,7 +64,7 @@ impl BufferPool {
         device: MemoryKind,
         required: u64,
         element_bytes: u64,
-    ) -> Result<(Arc<BufferBinding>, &Arc<Memory>)> {
+    ) -> Result<(Arc<BufferBinding>, &Arc<Storage>)> {
         if required == 0 || element_bytes == 0 {
             return Err(Error::Invalid(
                 "buffer tensor has an invalid byte extent".into(),
@@ -147,8 +147,8 @@ impl BufferPool {
             .iter()
             .map(|&device| {
                 let arena = match device {
-                    MemoryKind::Cuda(index) => Memory::exportable(index, bytes, &[])?,
-                    MemoryKind::Host | MemoryKind::PinnedHost => Memory::host(bytes),
+                    MemoryKind::Cuda(index) => Storage::exportable(index, bytes, &[])?,
+                    MemoryKind::Host | MemoryKind::PinnedHost => Storage::host(bytes),
                 };
                 Ok((device, arena))
             })

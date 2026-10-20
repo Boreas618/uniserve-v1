@@ -17,7 +17,7 @@ use uniserve_core::{
     ModelDtype, RequestId, SamplingParams,
 };
 use uniserve_engine::{
-    Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerId,
+    Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerGroupId,
     WorkerProcessArgs,
 };
 
@@ -43,12 +43,15 @@ fn main() -> anyhow::Result<()> {
         worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
-        ranks: uniserve_engine::WorkerConfig::placed(
+        ranks: uniserve_engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerConfig::single_component(uniserve_engine::DEFAULT_COMPONENT, 1),
+            uniserve_engine::WorkerGroupConfig::single_component(
+                uniserve_engine::DEFAULT_COMPONENT,
+                1,
+            ),
         )
         .ranks,
         // Allows two physical runs in flight on the rank at once.
@@ -61,8 +64,10 @@ fn main() -> anyhow::Result<()> {
         transfer: Default::default(),
         ..worker_config
     })?;
-    let engine =
-        WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
+    let engine = WorkerExecutor::try_new(
+        vec![(WorkerGroupId("local".into()), engine)],
+        Default::default(),
+    )?;
     println!("info from worker: {:?}", engine.info());
 
     let mut sched = Scheduler::new(

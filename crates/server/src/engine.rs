@@ -1,11 +1,11 @@
 //! The serving engine: one model's input processing, its engine cores, and
 //! the output processing of every request.
 //!
-//! An [`Engine`] owns the model's [`InputProcessor`] and one [`EngineCore`]
-//! per data-parallel rank, as vLLM's `AsyncLLM` owns its input and output
-//! processors over its engine cores and SGLang's `Engine` its tokenizer
-//! manager over one scheduler per data-parallel rank. Every request takes one
-//! path:
+//! An [`Engine`] owns the model's [`InputProcessor`] and its
+//! [`EngineCore`]s, one per data-parallel copy of scheduling, as vLLM's
+//! `AsyncLLM` owns its input and output processors over its engine cores and
+//! SGLang's `Engine` its tokenizer manager over one scheduler per
+//! data-parallel rank. Every request takes one path:
 //!
 //! 1. its images are fetched on the async runtime and its prompt rendered and
 //!    tokenized on the blocking pool ([`InputProcessor`]);
@@ -54,12 +54,12 @@ pub struct Engine {
     /// The single model name the API serves.
     served_model_name: String,
     processor: Arc<InputProcessor>,
-    /// One engine core per data-parallel rank; every rank serves the same
-    /// model with the same limits.
-    replicas: Box<[Replica]>,
-    /// The rank a load scan starts from, advanced by every pick so that equal
-    /// loads rotate across the ranks.
-    next_replica: AtomicUsize,
+    /// The engine cores; every engine core serves the same model with the
+    /// same limits.
+    cores: Box<[Core]>,
+    /// The engine core a load scan starts from, advanced by every pick so
+    /// that equal loads rotate across the engine cores.
+    next_core: AtomicUsize,
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
@@ -87,12 +87,13 @@ pub enum Task {
     Readout,
 }
 
-/// One data-parallel rank: its engine core and the requests in flight on it.
-struct Replica {
-    /// Data-parallel rank, the `engine` label of the rank's metrics.
-    rank: u32,
-    core: Arc<EngineCore>,
-    /// Requests submitted to this rank whose event stream has not ended.
+/// One engine core and the requests in flight on it.
+struct Core {
+    /// The engine core's index, the `engine` label of its metrics.
+    index: u32,
+    engine: Arc<EngineCore>,
+    /// Requests submitted to this engine core whose event stream has not
+    /// ended.
     in_flight: Arc<AtomicUsize>,
 }
 
@@ -166,11 +167,11 @@ impl Engine {
             !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_));
 
         info!(
-            workers = ?engine_config.workers,
+            worker_groups = ?engine_config.worker_groups,
             block_size = ?engine_config.worker_process.block_size,
             "starting UniServe Rust engine"
         );
-        let cores = tokio::task::spawn_blocking(move || EngineCore::replicas(engine_config))
+        let cores = tokio::task::spawn_blocking(move || EngineCore::start_all(engine_config))
             .await
             .context("the engine startup task did not complete")?
             .context("failed to start the UniServe engine")?;
@@ -201,7 +202,7 @@ impl Engine {
                 // encoding round covers on the deployment's latent encoder
                 // while a request's prompt is encoded.
                 let latent_encoding_lane = first
-                    .media_lane_units(uniserve_engine::MediaCall::LatentEncoding)
+                    .media_units(uniserve_engine::MediaCall::LatentEncoding)
                     .unwrap_or(1);
                 // The video processor's options are its reference sizing,
                 // within what the denoiser declares.
@@ -268,18 +269,18 @@ impl Engine {
     }
 
     /// Serves `processor`'s model under `served_model_name` over started
-    /// engine cores, one per data-parallel rank.
+    /// engine cores.
     ///
     /// `images` resolves the image references of every request, and
     /// `readout` serves `POST /v1/systemone` for a model that has one. One
     /// task per core publishes a scheduler-stats snapshot every second under
-    /// the core's rank.
+    /// the core's index.
     ///
     /// # Errors
     ///
     /// Fails when there is no core, or when the cores report different
     /// generation limits: a request is prepared once against them and may
-    /// land on any rank.
+    /// land on any engine core.
     pub fn new(
         served_model_name: String,
         cores: Vec<EngineCore>,
@@ -294,27 +295,27 @@ impl Engine {
             .generation_limits();
         anyhow::ensure!(
             cores.iter().all(|core| core.generation_limits() == limits),
-            "data-parallel ranks report different generation limits"
+            "engine cores report different generation limits"
         );
 
-        let replicas: Box<[Replica]> = (0u32..)
+        let cores: Box<[Core]> = (0u32..)
             .zip(cores)
-            .map(|(rank, core)| Replica {
-                rank,
-                core: Arc::new(core),
+            .map(|(index, engine)| Core {
+                index,
+                engine: Arc::new(engine),
                 in_flight: Arc::default(),
             })
             .collect();
-        let model_name = replicas[0].core.model_name().to_owned();
-        let stats_export = replicas
+        let model_name = cores[0].engine.model_name().to_owned();
+        let stats_export = cores
             .iter()
-            .map(|replica| {
-                let stats = Arc::clone(replica.core.stats());
+            .map(|core| {
+                let stats = Arc::clone(core.engine.stats());
                 let model_name = model_name.clone();
-                let rank = replica.rank;
+                let index = core.index;
                 AbortOnDropHandle::new(tokio::spawn(async move {
                     // The reporter turns cumulative scheduler counters into
-                    // per-snapshot increments, so one instance lives across
+                    // per-snapshot increments, so one reporter lives across
                     // ticks.
                     let mut reporter = uniserve_engine::SchedulerStatsReporter::default();
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -325,7 +326,7 @@ impl Engine {
                         metrics::record_scheduler_stats(
                             &METRICS.scheduler,
                             &model_name,
-                            rank,
+                            index,
                             &snapshot,
                         );
                     }
@@ -334,13 +335,13 @@ impl Engine {
             .collect();
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(model_name, replicas.len()));
+            .then(|| StatsLogger::start(model_name, cores.len()));
 
         Ok(Self {
             served_model_name,
             processor: Arc::new(processor),
-            replicas,
-            next_replica: AtomicUsize::new(0),
+            cores,
+            next_core: AtomicUsize::new(0),
             images,
             readout: readout.map(Arc::new),
             log_requests: logging.log_requests,
@@ -361,7 +362,7 @@ impl Engine {
 
     /// The generation limits every engine core serves.
     pub fn generation_limits(&self) -> GenerationLimits {
-        self.replicas[0].core.generation_limits()
+        self.cores[0].engine.generation_limits()
     }
 
     /// The video denoiser this deployment serves; `None` for a model that
@@ -391,10 +392,10 @@ impl Engine {
         tasks
     }
 
-    /// Whether the engine can accept requests: whether any data-parallel
-    /// rank's core is alive. Requests go only to live ranks.
+    /// Whether the engine can accept requests: whether any engine core is
+    /// alive. Requests go only to live engine cores.
     pub fn is_healthy(&self) -> bool {
-        self.replicas.iter().any(|replica| !replica.core.is_dead())
+        self.cores.iter().any(|core| !core.engine.is_dead())
     }
 
     /// The connector every request's image references go through.
@@ -445,10 +446,10 @@ impl Engine {
             preprocess(&request_id, move || processor.preprocess(request, images)).await?;
 
         let compile_us = elapsed_us(started);
-        let (events, rank) = self.submit(request.into())?;
+        let (events, core) = self.submit(request.into())?;
         let output =
             serving::generation_output(request_id.clone(), started, compile_us, output, events);
-        Ok(self.stats(request_id, started, rank, output))
+        Ok(self.stats(request_id, started, core, output))
     }
 
     /// Fetches, probes and plans a video request's media, presents its
@@ -478,7 +479,7 @@ impl Engine {
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, rank) = self.submit(Request::Diffusion(request))?;
+        let (events, core) = self.submit(Request::Diffusion(request))?;
         let output = serving::media_output(
             request_id.clone(),
             started,
@@ -486,20 +487,21 @@ impl Engine {
             prompt_tokens,
             events,
         );
-        Ok((processed, self.stats(request_id, started, rank, output)))
+        Ok((processed, self.stats(request_id, started, core, output)))
     }
 
-    /// Records `output`'s request metrics under the rank that serves it.
+    /// Records `output`'s request metrics under the engine core that serves
+    /// it.
     fn stats(
         &self,
         request_id: String,
         started: Instant,
-        rank: u32,
+        core: u32,
         output: RequestOutputStream,
     ) -> RequestOutputStream {
         let labels = EngineLabels {
-            model_name: self.replicas[0].core.model_name().to_owned(),
-            engine: rank,
+            model_name: self.cores[0].engine.model_name().to_owned(),
+            engine: core,
         };
         let log = self.log_requests.then_some(request_id);
         Box::pin(RequestStats::new(output, labels, started, log))
@@ -507,60 +509,61 @@ impl Engine {
 
     /// Submits one tokenized request to the least loaded live engine core.
     ///
-    /// Returns the request's event stream and the data-parallel rank that
-    /// serves it. The engine request identifier comes from the first core's
-    /// allocator alone, so identifiers are unique across the ranks. Dropping
-    /// the stream before its terminal event cancels the request.
+    /// Returns the request's event stream and the index of the engine core
+    /// that serves it. The engine request identifier comes from the first
+    /// core's allocator alone, so identifiers are unique across the engine
+    /// cores. Dropping the stream before its terminal event cancels the
+    /// request.
     ///
     /// # Errors
     ///
     /// Fails with [`SubmitError::Dead`] when no core is alive, and with the
     /// chosen core's submission error.
     pub(crate) fn submit(&self, mut request: Request) -> Result<(EventRx, u32), SubmitError> {
-        let replica = self.least_loaded().ok_or(SubmitError::Dead)?;
-        let request_id = self.replicas[0].core.next_request_id();
+        let core = self.least_loaded().ok_or(SubmitError::Dead)?;
+        let request_id = self.cores[0].engine.next_request_id();
         match &mut request {
             Request::Generation(request) => request.request_id = request_id,
             Request::Diffusion(request) => request.request_id = request_id,
         }
         // Counted before submission, so that a pick racing this one already
         // sees the request.
-        replica.in_flight.fetch_add(1, Ordering::Relaxed);
-        let mut events = replica.core.submit(request).inspect_err(|_| {
-            replica.in_flight.fetch_sub(1, Ordering::Relaxed);
+        core.in_flight.fetch_add(1, Ordering::Relaxed);
+        let mut events = core.engine.submit(request).inspect_err(|_| {
+            core.in_flight.fetch_sub(1, Ordering::Relaxed);
         })?;
-        let in_flight = Arc::clone(&replica.in_flight);
+        let in_flight = Arc::clone(&core.in_flight);
         events.set_on_finish(move || {
             in_flight.fetch_sub(1, Ordering::Relaxed);
         });
-        Ok((events, replica.rank))
+        Ok((events, core.index))
     }
 
-    /// The live data-parallel rank with the fewest requests in flight.
+    /// The live engine core with the fewest requests in flight.
     ///
-    /// The scan starts one rank later after every pick, so equal loads rotate
-    /// across the ranks. This is SGLang's `total_requests` data-parallel
+    /// The scan starts one engine core later after every pick, so equal
+    /// loads rotate across the engine cores. This is SGLang's `total_requests` data-parallel
     /// balancing (the argmin of running plus waiting requests,
     /// `data_parallel_controller.py`) and vLLM's data-parallel client score
     /// with equal waiting and running weights and a rotating start
     /// (`v1/engine/core_client.py`). Both read load snapshots the ranks
     /// publish; the cores here share the engine's process, so the counts are
     /// exact at every pick. Returns `None` when every core is dead.
-    fn least_loaded(&self) -> Option<&Replica> {
-        let count = self.replicas.len();
-        let start = self.next_replica.fetch_add(1, Ordering::Relaxed) % count;
+    fn least_loaded(&self) -> Option<&Core> {
+        let count = self.cores.len();
+        let start = self.next_core.fetch_add(1, Ordering::Relaxed) % count;
         (0..count)
-            .map(|offset| &self.replicas[(start + offset) % count])
-            .filter(|replica| !replica.core.is_dead())
-            .min_by_key(|replica| replica.in_flight.load(Ordering::Relaxed))
+            .map(|offset| &self.cores[(start + offset) % count])
+            .filter(|core| !core.engine.is_dead())
+            .min_by_key(|core| core.in_flight.load(Ordering::Relaxed))
     }
 
     /// Shuts every engine core down and waits until their scheduler threads
     /// have exited.
     ///
     /// Each scheduler finishes its outstanding requests as aborted and closes
-    /// its executor, which on a multi-rank deployment waits for every rank to
-    /// drain and exit. The cores shut down concurrently on the blocking pool,
+    /// its executor, which on a multi-worker deployment waits for every
+    /// worker to drain and exit. The cores shut down concurrently on the blocking pool,
     /// leaving the calling runtime thread free. Repeated calls are harmless.
     ///
     /// # Errors
@@ -569,10 +572,10 @@ impl Engine {
     /// only if it panics or its runtime is shutting down.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let tasks = self
-            .replicas
+            .cores
             .iter()
-            .map(|replica| {
-                let core = Arc::clone(&replica.core);
+            .map(|core| {
+                let core = Arc::clone(&core.engine);
                 tokio::task::spawn_blocking(move || core.shutdown())
             })
             .collect::<Vec<_>>();
@@ -734,10 +737,10 @@ mod tests {
         .into()
     }
 
-    /// Two requests in flight together land on different data-parallel
-    /// ranks, each served entirely by its own rank.
+    /// Two requests in flight together land on different engine cores, each
+    /// served entirely by its own engine core.
     #[tokio::test]
-    async fn concurrent_requests_spread_over_data_parallel_ranks() {
+    async fn concurrent_requests_spread_over_engine_cores() {
         let mut cores = Vec::new();
         let mut observers = Vec::new();
         for _ in 0..2 {
@@ -753,13 +756,13 @@ mod tests {
         // Both requests are submitted before either stream is read, so the
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
-        let mut ranks = Vec::new();
+        let mut serving = Vec::new();
         for _ in 0..2 {
-            let (stream, rank) = engine.submit(text_request()).expect("submit request");
+            let (stream, core) = engine.submit(text_request()).expect("submit request");
             streams.push(stream);
-            ranks.push(rank);
+            serving.push(core);
         }
-        assert_ne!(ranks[0], ranks[1]);
+        assert_ne!(serving[0], serving[1]);
         for stream in &mut streams {
             while let Some(event) = stream.next().await {
                 if let EngineCoreOutput::Finished { reason, .. } = event {
@@ -801,11 +804,11 @@ mod tests {
             self.inner.info()
         }
 
-        fn is_ready(&self, worker: &uniserve_engine::WorkerId) -> bool {
+        fn is_ready(&self, worker: &uniserve_engine::WorkerGroupId) -> bool {
             self.inner.is_ready(worker)
         }
 
-        fn has_capacity(&self, worker: &uniserve_engine::WorkerId) -> bool {
+        fn has_capacity(&self, worker: &uniserve_engine::WorkerGroupId) -> bool {
             self.inner.has_capacity(worker)
         }
 
@@ -979,10 +982,10 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Each request is recorded under the data-parallel rank that served it.
+    /// Each request is recorded under the engine core that served it.
     #[tokio::test]
-    async fn request_metrics_name_the_rank_that_served_each_request() {
-        let engine_model = "rank-metrics-model";
+    async fn request_metrics_name_the_engine_core_that_served_each_request() {
+        let engine_model = "core-metrics-model";
         let cores = (0..2)
             .map(|_| sim_core(EngineConfig::sim(engine_model), SimEngine::new()))
             .collect();
@@ -991,7 +994,7 @@ mod tests {
         // Both requests are submitted before either stream is read, so the
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
-        for id in ["rank-a", "rank-b"] {
+        for id in ["core-a", "core-b"] {
             let request = lowered(id, chat_request(3, &[]));
             streams.push(engine.generate(request).await.unwrap());
         }
@@ -999,10 +1002,10 @@ mod tests {
             assert_eq!(finish(stream).await.0, FinishReason::Length);
         }
 
-        for rank in 0..2 {
+        for core in 0..2 {
             let expected = format!(
                 "uniserve:request_success_total{{model_name=\"{engine_model}\",\
-                 engine=\"{rank}\",finished_reason=\"length\"}} 1"
+                 engine=\"{core}\",finished_reason=\"length\"}} 1"
             );
             assert!(rendered_metrics_hold(&expected), "missing `{expected}`");
         }

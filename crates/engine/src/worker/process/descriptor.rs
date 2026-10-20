@@ -171,14 +171,14 @@ impl Default for WorkerProcessArgs {
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
             ranks: vec![crate::WorkerRank {
-                node: "localhost".into(),
+                host: "localhost".into(),
                 device: "cuda:0".into(),
             }],
             host: "localhost".into(),
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
-            components: crate::WorkerConfig::single_component(DEFAULT_COMPONENT, 1),
-            role: crate::WorkerRole::Model,
+            components: crate::WorkerGroupConfig::single_component(DEFAULT_COMPONENT, 1),
+            role: crate::WorkerGroupRole::Model,
             peers: Default::default(),
             stub: false,
             queue_depth: Self::DEFAULT_QUEUE_DEPTH,
@@ -240,15 +240,15 @@ impl WorkerProcessArgs {
     ///
     /// These are the host-relative `LOCAL_RANK` and `LOCAL_WORLD_SIZE`
     /// values: a rank's position among the ranks the placement puts on the
-    /// same node, and how many ranks that node holds. They coincide with the
-    /// global values while an instance occupies one host. `rank` must index
+    /// same host, and how many ranks that host holds. They coincide with the
+    /// global values while a group occupies one host. `rank` must index
     /// `self.ranks`.
     pub(super) fn host_slot(&self, rank: u32) -> anyhow::Result<(u32, u32)> {
         let rank = rank as usize;
-        let node = &self.ranks[rank].node;
-        let resident = |placed: &&crate::WorkerRank| &placed.node == node;
+        let host = &self.ranks[rank].host;
+        let resident = |placed: &&crate::WorkerRank| &placed.host == host;
 
-        // The rank's host index counts the ranks placed before it on its node.
+        // The rank's host index counts the ranks placed before it on its host.
         let index = self.ranks[..rank].iter().filter(resident).count();
         let count = self.ranks.iter().filter(resident).count();
         Ok((
@@ -323,6 +323,7 @@ impl WorkerProcessArgs {
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
+            host: self.ranks[rank as usize].host.clone(),
             device: self.ranks[rank as usize].device.clone(),
             rank,
             local_rank: self.host_slot(rank)?.0,
@@ -556,7 +557,7 @@ mod tests {
     /// variable, since a remote launch carries only the variables its
     /// command sets.
     #[test]
-    fn ranks_run_with_the_heads_allocator_configuration() {
+    fn workers_run_with_the_heads_allocator_configuration() {
         let resolve = |head: &[(&'static str, &str)]| {
             let head: BTreeMap<_, _> = head.iter().copied().collect();
             worker_environment(|name| head.get(name).map(OsString::from))

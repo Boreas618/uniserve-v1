@@ -716,10 +716,10 @@ mod tests {
     /// `accepted` accepted drafts.
     fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
         use crate::ffi::{Backing, DType};
-        use crate::storage::{Memory, OutputStorage, StorageView};
+        use crate::storage::{OutputStorage, Storage, StorageView};
 
         let words = [1_i64, 1, token, accepted];
-        let memory = Memory::host(size_of_val(&words));
+        let memory = Storage::host(size_of_val(&words));
         // SAFETY: fresh host memory of exactly these words, owned here.
         unsafe {
             std::ptr::copy_nonoverlapping(

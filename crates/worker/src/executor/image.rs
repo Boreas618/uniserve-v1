@@ -51,7 +51,7 @@ use crate::storage::{
     LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
 };
 use crate::stream::Issue;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Outcome, Result};
 
 /// A decoded image's encoding, run once its pixels reached the host.
@@ -160,7 +160,7 @@ pub(crate) enum Pending {
 /// the skeleton.
 pub(crate) struct ImageBatch<'a> {
     pub(crate) parts: ImageParts<'a>,
-    pub(crate) storage: &'a mut RankStorage,
+    pub(crate) storage: &'a mut WorkerStorage,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) plan: &'a BatchPlan,
     /// What the batch's own steps issue on its stream: the start of its
@@ -204,7 +204,7 @@ impl<'a> ImageBatch<'a> {
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(crate) fn open(
         parts: ImageParts<'a>,
-        storage: &'a mut RankStorage,
+        storage: &'a mut WorkerStorage,
         requests: &'a mut RequestPool,
         plan: &'a BatchPlan,
         opening: Opening,
@@ -291,7 +291,7 @@ impl<'a> ImageBatch<'a> {
     /// The parked batch on the owners it borrows again, with an empty job.
     pub(crate) fn resume(
         parts: ImageParts<'a>,
-        storage: &'a mut RankStorage,
+        storage: &'a mut WorkerStorage,
         requests: &'a mut RequestPool,
         plan: &'a BatchPlan,
         parked: Parked,

@@ -34,7 +34,7 @@ use crate::runner::scratch::Scratches;
 use crate::storage::{LatentCache, LatentPlan, LatentPool, LatentStorage, OutputPool};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
-use crate::worker::RankStorage;
+use crate::worker::WorkerStorage;
 use crate::{Error, Result};
 
 /// The configured denoising steps that fit the denoiser's columns and the
@@ -98,7 +98,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) host_capacity: usize,
     pub(crate) model: &'a LoadedModel,
     pub(crate) streams: &'a Streams,
-    pub(crate) storage: &'a RankStorage,
+    pub(crate) storage: &'a WorkerStorage,
     pub(crate) latent: Option<LatentPlan>,
     pub(crate) components: &'a Components,
     /// The shared work areas of the rank's streams.

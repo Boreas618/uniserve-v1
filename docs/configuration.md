@@ -1,6 +1,6 @@
 # Configuration
 
-A UniServe server is configured by one tree of serving options and, for a placement other than one tensor-parallel group per replica, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure. `uniserve serve` and the Dynamo worker (`uniserve-dynamo-worker`) read the same tree.
+A UniServe server is configured by one tree of serving options and, for a placement other than one tensor-parallel worker group per engine core, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure. `uniserve serve` and the Dynamo worker (`uniserve-dynamo`) read the same tree.
 
 ## Command line
 
@@ -13,7 +13,7 @@ A UniServe server is configured by one tree of serving options and, for a placem
 Options none of them states keep their defaults. `--print-config` prints the resolved tree, defaults included, and exits; options unset by default are left out of the printout.
 
 ```bash
-uniserve serve "$H3_MODEL" --workers configs/minimax_h3/ulysses4.toml \
+uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 \
   --set cuda_graph_config.policy=off \
   --set video_config.text_capacities=1024,10240
@@ -27,7 +27,7 @@ uniserve serve --config fasth3.toml --print-config
 | `MODEL` (positional) | `model` |
 | `--host`, `--port` | `server_config.host`, `server_config.port` |
 | `--served-model-name` | `served_model_name` |
-| `--workers` | `workers` |
+| `--worker-groups` | `worker_groups` |
 | `--tensor-parallel-size`, `--data-parallel-size` | `tensor_parallel_size`, `data_parallel_size` |
 | `--max-running-requests` | `max_running_requests` |
 | `--max-model-len` | `max_model_len` |
@@ -50,7 +50,7 @@ A configuration file is the tree in TOML, as `--print-config` prints it:
 ```toml
 model = "/workspace/models/FastVideo-FastH3-8-Step-V2"
 served_model_name = "FastH3"
-workers = "configs/minimax_h3/ulysses4.toml"
+worker_groups = "configs/minimax_h3/ulysses4.toml"
 max_running_requests = 2
 
 [server_config]
@@ -85,9 +85,9 @@ retention = "30m"
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
 | `mem_fraction_static` | `0.7` | Each rank's share of its device's memory for weights, static allocations and the KV cache, in (0, 1]; a deployment group's `mem_fraction_static` overrides it |
-| `tensor_parallel_size` | `1` | Tensor-parallel ranks of each replica without `workers` |
-| `data_parallel_size` | `1` | Independent replicas, each with its own scheduler, KV cache and ranks; requests go to the replica with the fewest in flight. With `workers`, the file's groups form the replicas as equal consecutive blocks |
-| `workers` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
+| `tensor_parallel_size` | `1` | Tensor-parallel workers of each engine core's group without `worker_groups` |
+| `data_parallel_size` | `1` | Engine cores, each with its own scheduler, KV cache and worker groups; requests go to the engine core with the fewest in flight. With `worker_groups`, the file's model groups form the engine cores as equal consecutive blocks |
+| `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
 | `host_identity` | `"localhost"` | This process's host name; it runs the ranks placed on this host, and a deployment rank entry without a host names it |
 | `lanes` | Unset, no SM partition | Execution lanes, each `{ lane_id, sm_budget, domains }` with optional `max_batch_calls`, `max_batch_tokens` and `max_inflight`; `domains` are `prefill`, `decode` and `flow` |
 
@@ -132,7 +132,7 @@ retention = "30m"
 
 ### `placement_config`
 
-`device`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `workers`, as is `tensor_parallel_size`.
+`device`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -147,7 +147,7 @@ retention = "30m"
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `expert_parallel` | `false` | Shard routed experts across the data-parallel replicas or the deployment's expert workers |
+| `expert_parallel` | `false` | Shard routed experts across the engine cores or the deployment's expert workers |
 | `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp` |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 
@@ -250,64 +250,64 @@ DiffusionGemma's block-diffusion sampling of every generated reply; each option 
 
 ## Deployment files
 
-A deployment file, the `workers` option, places worker groups on devices and hosts and names the components each runs. It is TOML: one `[[workers]]` table per group and one `[workers.components.<name>]` table per component of the group, as in `configs/minimax_h3/fasth3-ulysses4x2.toml`:
+A deployment file, the `worker_groups` option, places worker groups on devices and hosts and names the components each runs. It is TOML: one `[[worker_groups]]` table per group and one `[worker_groups.components.<name>]` table per component of the group, as in `configs/minimax_h3/fasth3-ulysses4x2.toml`:
 
 ```toml
 # FastH3 on eight GPUs of one host: two Ulysses4 denoiser replicas, each with
 # its own TP4 text encoder.
 
-[[workers]]
+[[worker_groups]]
 id = "text"
 replicas = 2
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.26
 
-[workers.components.text_encoder]
+[worker_groups.components.text_encoder]
 tensor_parallel_size = 4
 
-[[workers]]
+[[worker_groups]]
 id = "flow"
 replicas = 2
 ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.73
 
-[workers.components.transformer]
+[worker_groups.components.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
-[workers.components.video_decoder]
+[worker_groups.components.video_decoder]
 
-[workers.components.audio_decoder]
+[worker_groups.components.audio_decoder]
 distribution = "temporal_units"
 
-[workers.components.latent_encoder]
+[worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[workers]]
+[[worker_groups]]
 id = "encoder"
 replicas = 2
 ranks = ["cpu*8"]
 queue_depth = 6
 
-[workers.components.video_codec]
+[worker_groups.components.video_codec]
 
-[[workers]]
+[[worker_groups]]
 id = "reader"
 ranks = ["cpu"]
 queue_depth = 6
 
-[workers.components.media_reader]
+[worker_groups.components.media_reader]
 
-[[workers]]
+[[worker_groups]]
 id = "muxer"
 ranks = ["cpu"]
 queue_depth = 12
 
-[workers.components.muxer]
+[worker_groups.components.muxer]
 ```
 
-A `[[workers]]` table takes:
+A `[[worker_groups]]` table takes:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -318,7 +318,7 @@ A `[[workers]]` table takes:
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-memory share for this group |
 
-A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for host ranks (`cpu*4`). Without `HOST` the ranks run on the head's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the host whose launcher starts with `--host-identity rank-1`.
+A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the head's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the host whose launcher starts with `--host-identity rank-1`.
 
 A component table takes:
 
@@ -327,7 +327,7 @@ A component table takes:
 | `ranks` | Every rank of the replica | Indices into one replica's ranks; their order assigns each rank its position in the parallel degrees or the unit schedule |
 | `tensor_parallel_size`, `pipeline_parallel_size` | `1` | Model-parallel degrees |
 | `sequence_parallel` | `{ kind = "local" }` | `{ kind = "ulysses", ulysses_degree = N }` with optional `projection` and `projection_rows`, `{ kind = "allgather", allgather_degree = N }`, or `{ kind = "hybrid", ulysses_degree = N, allgather_degree = M }` |
-| `distribution` | Unset | `temporal_units` runs a local instance on every rank and deals independent media units among them; the video decoder and codec always take it |
+| `distribution` | Unset | `temporal_units` runs its own copy of the component on every rank and deals independent media units among them; the video decoder and codec always take it |
 | `units_per_rank` | `1` | Consecutive units each rank takes under `distribution` |
 | `weights` | `device` | `host` keeps the dense projection weights of the component's repeated layer stack in page-locked host memory and serves it without CUDA graphs |
 

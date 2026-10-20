@@ -304,7 +304,7 @@ fn borrow_unit(
         .iter()
         .find(|location| {
             matches!(location.transport, TransferTransport::PosixShm { .. })
-                && location.source.node == parts.info.endpoint.node
+                && location.source.host == parts.info.endpoint.host
                 && location.offset[0] <= row
                 && row < location.offset[0] + location.shape[0]
         })
@@ -487,7 +487,7 @@ fn read_rows(parts: &Parts<'_>, plan: &BatchPlan, product: &TensorRef) -> Result
         let bytes: Vec<u8> = match &location.transport {
             TransferTransport::Channel { payload, .. } => payload.clone(),
             TransferTransport::PosixShm { .. }
-                if location.source.node == parts.info.endpoint.node =>
+                if location.source.host == parts.info.endpoint.host =>
             {
                 let Some(transport) = parts.storage.transports.get(TransportKind::PosixShm) else {
                     continue;
