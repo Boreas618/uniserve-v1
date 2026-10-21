@@ -195,7 +195,7 @@ uniserve_kernels/   Triton, CuTe and CUDA kernels, and the vendored DeepEP and D
 uniserve_eval/      HTTP evaluation client
 ```
 
-Dependency direction: `models <- ipc <- {engine, worker}`, `proto <- {daemon, engine}`, `{proto, storage, cuda} <- daemon`, `{storage, cuda} <- storage-server`, `cuda <- worker`, `{models, ipc, engine, daemon, observability} <- server <- uniserve`, `{storage, storage-server} <- uniserve`. The daemon knows engines only through `proto`; the worker never depends on the engine or server, and the engine never links CUDA.
+Dependency direction: `ipc <- {engine, worker}`, `models <- {worker, server}`, `proto <- {daemon, engine}`, `{proto, storage, cuda} <- daemon`, `{storage, cuda} <- storage-server`, `cuda <- worker`, `{models, ipc, engine, daemon, observability} <- server <- uniserve`, `{storage, storage-server} <- uniserve`. The daemon knows engines only through `proto`; the engine knows no model family: what a video request asks of its model (its conditions, the denoiser's description) crosses the engine as bytes the model family encodes (`models::video::Conditioning`, `models::video::DenoiserInfo`) beside the sizes the engine schedules by. The worker never depends on the engine or server, and the engine never links CUDA.
 
 | Worker runtime module (`crates/worker/src`) | Responsibility |
 | --- | --- |

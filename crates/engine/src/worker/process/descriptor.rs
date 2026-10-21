@@ -139,6 +139,9 @@ impl WorkerProcessArgs {
     pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
+    /// The longest video duration, in seconds, the video API admits; the
+    /// frontend states a deployment's own bound.
+    pub const DEFAULT_MAX_VIDEO_SECONDS: f64 = 15.0;
     /// Independent microbatches of attention and remote experts.
     pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
     /// Numeric data type of model parameters and activations.
@@ -222,7 +225,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_split_kv: true,
             max_model_len: 8192,
-            max_video_seconds: models::video::plan::MAX_VIDEO_SECONDS,
+            max_video_seconds: Self::DEFAULT_MAX_VIDEO_SECONDS,
             max_condition_rows: None,
             encoder_cache_entries: 256,
             ffmpeg: Self::DEFAULT_FFMPEG.into(),

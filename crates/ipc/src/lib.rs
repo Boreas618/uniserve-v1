@@ -118,7 +118,7 @@ pub use config::{LaneConfig, LaneConfigError, LaneSpec};
 pub use identity::*;
 pub use image::*;
 pub use info::*;
-pub use media::{MediaSource, SharedMedia, SharedMediaError};
+pub use media::{MediaLocator, MediaSource, SharedMedia, SharedMediaError};
 pub use output::*;
 pub use parallel::{
     ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,

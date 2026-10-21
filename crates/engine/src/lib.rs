@@ -59,8 +59,8 @@ pub use crate::handle::{
     StreamCancelCause, Submission, SubmitError, Wake,
 };
 pub use crate::request::{
-    ArtifactEvent, DiffusionRequest, DiffusionRequestError, Event, FinishReason, MediaKind,
-    PositionLogprobs, RejectionKind, Request, StopReason,
+    ArtifactEvent, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event, FinishReason,
+    MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
@@ -78,7 +78,7 @@ pub use crate::worker::{
     FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat, WorkerExecutor,
     WorkerGroup, WorkerProcessArgs,
 };
-pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo};
+pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///

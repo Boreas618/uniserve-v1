@@ -20,18 +20,15 @@ use crossbeam_channel::Receiver;
 use engine::{
     BatchEvent, BatchResult, CommandSender, ComponentConfig, ComponentDistribution, ExecutionBatch,
     Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PoolPlacement, RequestPlacement,
-    SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerGroupId,
+    SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, VideoTaskInfo, WorkerGroupId,
 };
-use engine::{DiffusionRequest, Event, FinishReason, RejectionKind, Request};
+use engine::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
     ShapeBound,
 };
 use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
-use models::video::{
-    AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
-    VideoCondition, VideoTask, VisionGrid,
-};
+use models::video::Canvas;
 
 /// Denoising steps the simulated model advertises and every request follows.
 const STEPS: u32 = 3;
@@ -147,24 +144,14 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         .map(|call| CallKind::Media(*call))
         .collect();
     info.video_denoiser = Some(VideoDenoiserInfo {
-        tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
-        schedule_points: STEPS + 1,
-        video_shift: 12.0,
-        audio_shift: 3.0,
-        frame_rate: 24,
-        audio_sample_rate: 32_000,
-        frames: models::video::FrameClips {
-            min_frames: 22,
-            clip_frames: 17,
-            clip_latent_frames: 5,
-            tail_latent_frames: 2,
-        },
-        canvases: vec![models::video::ServedCanvas {
-            short_edge: MAX_RASTER.height,
-            aspect_ratio: "1:1".to_owned(),
-            canvas: MAX_RASTER,
-        }],
-        references: models::video::ReferenceLimits::default(),
+        tasks: [("t2va", false), ("fl2va", true), ("ref2va", true)]
+            .map(|(name, conditioned)| VideoTaskInfo {
+                name: name.to_owned(),
+                conditioned,
+            })
+            .to_vec(),
+        denoise_steps: STEPS,
+        description: b"{}".to_vec(),
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.
@@ -269,9 +256,9 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
 fn video_request(id: u64, video_units: u32) -> Request {
     Request::Diffusion(DiffusionRequest {
         request_id: RequestId(id),
-        task: VideoTask::T2va,
+        task: "t2va".to_owned(),
         prompt_token_ids: PROMPT.to_vec(),
-        text_tags: vec![1; PROMPT.len()],
+        conditioning: b"{}".to_vec(),
         conditions: Vec::new(),
         media: Vec::new(),
         priority: 0,
@@ -407,9 +394,9 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut stream = handle
         .submit(Request::Diffusion(DiffusionRequest {
             request_id: RequestId(90),
-            task: VideoTask::T2va,
+            task: "t2va".to_owned(),
             prompt_token_ids: PROMPT.to_vec(),
-            text_tags: vec![1; PROMPT.len()],
+            conditioning: b"{}".to_vec(),
             conditions: Vec::new(),
             media: Vec::new(),
             priority: 0,
@@ -872,68 +859,42 @@ const CONDITION_CANVAS: Canvas = Canvas {
 /// with its soundtrack and an audio reference. `media` keeps the published
 /// bytes alive as the server's exports would.
 fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
-    let fit = ImageFit {
-        resized: CONDITION_CANVAS,
-        left: 0,
-        top: 0,
-        size: CONDITION_CANVAS,
-    };
-    let track = AudioClip {
-        sample_rate: 48_000,
-        start_sample: 0,
-        source_samples: 24_000,
-        samples: 16_000,
-    };
+    let pixels =
+        |frames: u64| frames * u64::from(CONDITION_CANVAS.width * CONDITION_CANVAS.height) * 3;
     let conditions = vec![
-        VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Image(fit),
-            vision: Some(ConditionVision {
-                grid: VisionGrid { t: 1, h: 2, w: 4 },
-                tokens: 2,
-                frame_indices: Vec::new(),
-            }),
+        // The image, one frame the conditioner reads as one 2x4 grid.
+        ConditionExtent {
+            pixel_bytes: pixels(1),
+            vision_patches: 8,
+            vision_tokens: 2,
             latent_units: vec![2],
-            audio_rows: 0,
+            ..ConditionExtent::default()
         },
-        VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Video {
-                clip: VideoClip {
-                    canvas: CONDITION_CANVAS,
-                    start_frame: 0,
-                    frames: 40,
-                    vae_frames: 39,
-                },
-                soundtrack: Some(track),
-            },
-            vision: Some(ConditionVision {
-                grid: VisionGrid { t: 2, h: 2, w: 4 },
-                tokens: 4,
-                frame_indices: vec![0, 12, 24, 36],
-            }),
+        // 40 frames encoded in three units, read by the conditioner as a
+        // 2x2x4 grid, with a 16000-sample soundtrack.
+        ConditionExtent {
+            pixel_bytes: pixels(40),
+            audio_samples: 16_000,
+            vision_patches: 16,
+            vision_tokens: 4,
             latent_units: vec![10, 10, 4],
             audio_rows: 40,
         },
-        VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Audio(track),
-            vision: None,
-            latent_units: Vec::new(),
+        // The same track as an audio reference.
+        ConditionExtent {
+            audio_samples: 16_000,
             audio_rows: 40,
+            ..ConditionExtent::default()
         },
     ];
     // Labels, then one image block and two video blocks with their markers,
     // then the prompt.
-    let text_tags = [vec![1; 3], vec![0; 4], vec![1; 2], vec![0; 8], vec![1; 3]].concat();
+    let prompt_tokens = 3 + 4 + 2 + 8 + 3;
     Request::Diffusion(DiffusionRequest {
         request_id: RequestId(id),
-        task: VideoTask::Ref2va,
-        prompt_token_ids: (0..text_tags.len() as u32).collect(),
-        text_tags,
+        task: "ref2va".to_owned(),
+        prompt_token_ids: (0..prompt_tokens).collect(),
+        conditioning: b"{}".to_vec(),
         media: vec![Arc::clone(media); conditions.len()],
         conditions,
         priority: 0,
@@ -1149,7 +1110,7 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
 
     let mut sim = video_worker(2, 2);
     if let Some(denoiser) = sim.mut_info_for_test().video_denoiser.as_mut() {
-        denoiser.tasks = vec!["t2va".to_owned()];
+        denoiser.tasks.retain(|task| task.name == "t2va");
     }
     let served = serve(sim, vec![reference_request(1, &media)]);
     let message = rejected(&served, 1);

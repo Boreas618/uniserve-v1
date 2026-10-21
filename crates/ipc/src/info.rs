@@ -296,113 +296,63 @@ impl WorkerEndpoint {
     }
 }
 
-/// What the video denoiser a deployment places serves.
+/// What the video denoiser a deployment places serves, as far as the engine
+/// schedules it.
 ///
-/// The denoiser fixes its schedule, and with it every request's step count;
-/// the tasks, canvases and reference limits bound what a request may ask
-/// for.
-/// The worker that denoises a request admits its conditions into the
-/// condition capacity it provisioned.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The denoiser fixes its schedule, and with it every request's step count.
+/// What else bounds a request (its canvases, frame counts and reference
+/// limits) is the model family's, and reaches the frontend in `description`
+/// for it to plan requests with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
-    /// Task names the denoiser serves, in canonical order.
-    pub tasks: Vec<String>,
-    /// Sigma points of the fixed schedule, the clean endpoint included: one
-    /// more than the network evaluations ([`Self::denoise_steps`]).
-    pub schedule_points: u32,
-    /// Shift of the video schedule.
-    pub video_shift: f64,
-    /// Shift of the audio schedule.
-    pub audio_shift: f64,
-    /// Frame rate, in frames per second, of every video the deployment
-    /// generates: the output clock durations and reference videos are
-    /// counted on.
-    pub frame_rate: u32,
-    /// Sample rate, in Hz, of the audio track generated with each video.
-    pub audio_sample_rate: u32,
-    /// How the VAE divides a video's frames into clips, which counts the
-    /// frames the deployment generates and their decode units.
-    pub frames: models::video::FrameClips,
-    /// The only canvases the deployment serves: those it prepares, each
-    /// with the `(short_edge, aspect_ratio)` its model names it by, in the
-    /// order the deployment names them.
-    pub canvases: Vec<models::video::ServedCanvas>,
-    /// The references one request may carry and the largest short edge an
-    /// image reference is encoded at; zeros for a denoiser that takes none.
-    pub references: models::video::ReferenceLimits,
+    /// The tasks the denoiser serves, in canonical order.
+    pub tasks: Vec<VideoTaskInfo>,
+    /// The network evaluations of the fixed schedule: the step count of
+    /// every request.
+    pub denoise_steps: u32,
+    /// The denoiser as its model family describes it to the frontend
+    /// (`models::video::DenoiserInfo`, JSON); the engine reads none of it.
+    pub description: Vec<u8>,
+}
+
+/// One task a video denoiser serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoTaskInfo {
+    /// The task's request name.
+    pub name: String,
+    /// Whether the task's requests carry conditions, which a host component
+    /// reads and the condition encoders encode before denoising.
+    pub conditioned: bool,
 }
 
 impl VideoDenoiserInfo {
-    /// The network evaluations of the fixed schedule: one fewer than its
-    /// sigma points, and the step count of every request.
-    pub fn denoise_steps(&self) -> u32 {
-        self.schedule_points.saturating_sub(1)
+    /// The task named `name`, when the denoiser serves it.
+    pub fn task(&self, name: &str) -> Option<&VideoTaskInfo> {
+        self.tasks.iter().find(|task| task.name == name)
     }
 
-    /// Checks that tasks are named once each, the schedule has an endpoint
-    /// and positive finite shifts, the frame and audio sample rates and the
-    /// frame rule are declared, at least one canvas is prepared and each is a
-    /// positive raster named by its own `(short_edge, aspect_ratio)` pair,
-    /// and the reference limits
-    /// bound each kind within the total, with an image edge where images
-    /// are taken.
+    /// Checks that tasks are named once each, the schedule takes a step and
+    /// the model family described the denoiser.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             !self.tasks.is_empty()
-                && self.tasks.iter().all(|task| !task.is_empty())
-                && self.tasks.iter().collect::<HashSet<_>>().len() == self.tasks.len(),
+                && self.tasks.iter().all(|task| !task.name.is_empty())
+                && self
+                    .tasks
+                    .iter()
+                    .map(|task| &task.name)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == self.tasks.len(),
             "a video denoiser names each of its tasks once"
         );
         ensure_valid!(
-            self.schedule_points >= 2
-                && [self.video_shift, self.audio_shift]
-                    .iter()
-                    .all(|shift| shift.is_finite() && *shift > 0.0),
-            "a video denoiser schedule needs points and positive shifts"
+            self.denoise_steps > 0,
+            "a video denoiser schedule takes no step"
         );
         ensure_valid!(
-            self.frame_rate > 0,
-            "a video denoiser declares no frame rate"
-        );
-        ensure_valid!(
-            self.audio_sample_rate > 0,
-            "a video denoiser declares no audio sample rate"
-        );
-        ensure_valid!(
-            self.frames.is_valid(),
-            "a video denoiser declares an empty frame rule"
-        );
-        let references = &self.references;
-        ensure_valid!(
-            references
-                .images
-                .max(references.videos)
-                .max(references.audios)
-                <= references.total
-                && (references.images == 0 || references.image_short_edge > 0),
-            "a video denoiser declares reference limits beyond their total or images without an edge"
-        );
-        ensure_valid!(
-            !self.canvases.is_empty(),
-            "a video denoiser prepared no canvas"
-        );
-        ensure_valid!(
-            self.canvases.iter().all(|served| {
-                served.short_edge > 0
-                    && !served.aspect_ratio.is_empty()
-                    && served.canvas.width > 0
-                    && served.canvas.height > 0
-            }),
-            "a video denoiser declares an empty canvas"
-        );
-        ensure_valid!(
-            self.canvases
-                .iter()
-                .map(|served| (served.short_edge, served.aspect_ratio.as_str()))
-                .collect::<HashSet<_>>()
-                .len()
-                == self.canvases.len(),
-            "a video denoiser declares a canvas name twice"
+            !self.description.is_empty(),
+            "a video denoiser carries no description"
         );
         Ok(())
     }

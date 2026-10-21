@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 
 use ipc::{DiffusionSamplingParams, MediaSource, RequestId, SharedMedia, TokenLogprob};
-use models::video::{VideoCondition, VideoTask};
 use std::sync::Arc;
 
 /// Terminal cause for one generation request.
@@ -231,23 +230,30 @@ pub struct ArtifactEvent {
 }
 
 /// A video request. Final media bytes are returned through shared storage.
+///
+/// What the request asks of the model family (its task's semantics, its
+/// presentation tags and its conditions) travels opaque in `conditioning`
+/// to the workers; the engine schedules it by the task's name and by the
+/// sizes of its conditions (`conditions`) alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequest {
     /// Engine request identity.
     pub request_id: RequestId,
-    /// The task the request runs.
-    pub task: VideoTask,
+    /// The task the request runs, by its request name; the deployment's
+    /// denoiser must serve it.
+    pub task: String,
     /// The conditioner's presentation (condition labels, vision placeholders
     /// and the prompt), tokenized.
     pub prompt_token_ids: Vec<u32>,
-    /// The denoiser's AdaLN tag of each presentation token: 0 for a vision
-    /// token or vision marker, 1 for text.
-    pub text_tags: Vec<u8>,
-    /// The conditions in request order; empty for `t2va`.
-    pub conditions: Vec<VideoCondition>,
+    /// The request's task, presentation tags and conditions as the model
+    /// family plans them, which the workers decode.
+    pub conditioning: Vec<u8>,
+    /// The sizes of each condition, in request order; empty for a task
+    /// without conditions.
+    pub conditions: Vec<ConditionExtent>,
     /// The shared-memory export of each condition's media, in request
-    /// order; `conditions[i].source` names `media[i]`. The request holds
-    /// them, and so keeps their bytes readable, until the engine retires it.
+    /// order. The request holds them, and so keeps their bytes readable,
+    /// until the engine retires it.
     #[serde(skip)]
     pub media: Vec<Arc<MediaSource>>,
     /// Scheduler priority.
@@ -256,26 +262,48 @@ pub struct DiffusionRequest {
     pub sampling: DiffusionSamplingParams,
 }
 
+/// The sizes of one condition of a video request, which size the products of
+/// the calls that read and encode it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConditionExtent {
+    /// Bytes of the RGB24 pixels the video encoder encodes; zero for a
+    /// condition without pixels.
+    pub pixel_bytes: u64,
+    /// Samples of the condition's audio track; zero without one.
+    pub audio_samples: u64,
+    /// Patches the conditioner reads; zero for a condition it does not read.
+    pub vision_patches: u64,
+    /// Vision tokens the condition occupies in the presentation.
+    pub vision_tokens: u32,
+    /// Denoiser rows each temporal unit of the condition's pixels encodes
+    /// to, in unit order; empty without pixels.
+    pub latent_units: Vec<u32>,
+    /// Denoiser audio rows of the condition's audio track; zero without one.
+    pub audio_rows: u32,
+}
+
+impl ConditionExtent {
+    /// Denoiser video rows of the condition.
+    pub fn video_rows(&self) -> u64 {
+        self.latent_units.iter().map(|rows| u64::from(*rows)).sum()
+    }
+}
+
 impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
-    /// The prompt is nonempty, its token count fits in `u32` and every token
-    /// has a tag; the frame and media-unit counts and the canvas are
-    /// positive; `t2va` has no conditions, `fl2va` only keyframes and
-    /// `ref2va` at least one condition; every condition is consistent
-    /// ([`VideoCondition::validate`]) and its media is published in `media`
-    /// under its locator.
+    /// The prompt is nonempty and its token count fits in `u32`; the frame
+    /// and media-unit counts and the canvas are positive; the task is named
+    /// and the conditioning present; and every condition has its media
+    /// published in `media`.
     ///
     /// The engine's media admission rejects a failing request with
-    /// `RejectionKind::Invalid`.
+    /// `RejectionKind::Invalid`; it also refuses a task the deployment's
+    /// denoiser does not serve, or conditions the task does not take.
     pub fn validate(&self) -> Result<(), DiffusionRequestError> {
         if self.prompt_token_ids.is_empty() {
             return Err(DiffusionRequestError::EmptyPromptTokens);
         }
-        if self.text_tags.len() != self.prompt_token_ids.len() {
-            return Err(DiffusionRequestError::TextTags);
-        }
-
         if self.sampling.num_frames == 0
             || self.sampling.video_units == 0
             || self.sampling.width == 0
@@ -284,32 +312,15 @@ impl DiffusionRequest {
         {
             return Err(DiffusionRequestError::InvalidSampling);
         }
-
-        let served = self.conditions.iter().all(|condition| match self.task {
-            VideoTask::T2va => false,
-            VideoTask::Fl2va => condition.role.is_keyframe(),
-            VideoTask::Ref2va => true,
-        });
-        if !served || (self.task != VideoTask::T2va && self.conditions.is_empty()) {
+        if self.task.is_empty() || self.conditioning.is_empty() {
             return Err(DiffusionRequestError::Conditions(
-                "the conditions do not fit the task",
+                "the request names no task or carries no conditioning",
             ));
         }
-        if self.media.len() != self.conditions.len()
-            || self
-                .media
-                .iter()
-                .zip(&self.conditions)
-                .any(|(media, condition)| media.locator() != condition.source)
-        {
+        if self.media.len() != self.conditions.len() {
             return Err(DiffusionRequestError::Conditions(
-                "a condition's media is not published under its locator",
+                "a condition's media is not published",
             ));
-        }
-        for condition in &self.conditions {
-            condition
-                .validate()
-                .map_err(DiffusionRequestError::Conditions)?;
         }
         Ok(())
     }
@@ -321,14 +332,11 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// The presentation tags do not cover the prompt tokens one to one.
-    #[error("every media prompt token requires one tag")]
-    TextTags,
     /// A frame, media-unit, or step count or a canvas side is zero, or the
     /// prompt token count exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
-    /// The conditions do not fit the task or are inconsistent.
+    /// The task, conditioning or condition media are missing.
     #[error("video conditions are invalid: {0}")]
     Conditions(&'static str),
 }

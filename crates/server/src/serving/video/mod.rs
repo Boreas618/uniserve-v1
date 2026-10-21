@@ -52,8 +52,7 @@ pub mod probe;
 
 use std::sync::Arc;
 
-use engine::DiffusionRequest;
-use engine::VideoDenoiserInfo;
+use engine::{ConditionExtent, DiffusionRequest};
 use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 use models::video::plan;
 use models::video::plan::{
@@ -61,7 +60,7 @@ use models::video::plan::{
     MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig, Role, Target, VideoInputError,
 };
 use models::video::presentation;
-use models::video::{Canvas, VideoTask};
+use models::video::{Canvas, Conditioning, DenoiserInfo, VideoTask};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -165,7 +164,7 @@ pub struct ProcessedVideo {
 /// One instance is shared by all requests; [`VideoService::process`] takes
 /// `&self` and runs concurrently.
 pub struct VideoService {
-    denoiser: VideoDenoiserInfo,
+    denoiser: DenoiserInfo,
     /// The media policy, which `capabilities` reports.
     media: MediaOptions,
     connector: MediaConnector,
@@ -209,7 +208,7 @@ impl VideoService {
     /// encoder covers in one round, its media policy, how it sizes
     /// references, and the tokenizer.
     ///
-    /// `denoiser` is the worker handshake the engine validated, and
+    /// `denoiser` is the description the denoising worker reported, and
     /// `references` a sizing `ReferenceConfig::from_kwargs` validated against
     /// it.
     ///
@@ -218,7 +217,7 @@ impl VideoService {
     /// Fails when the handshake names a task this server does not know, or
     /// when the media connector cannot be built.
     pub fn new(
-        denoiser: VideoDenoiserInfo,
+        denoiser: DenoiserInfo,
         vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_lane: u32,
@@ -259,8 +258,8 @@ impl VideoService {
         })
     }
 
-    /// The served video denoiser, as the engine's handshake validated it.
-    pub fn denoiser(&self) -> &VideoDenoiserInfo {
+    /// The served video denoiser, as the denoising worker described it.
+    pub fn denoiser(&self) -> &DenoiserInfo {
         &self.denoiser
     }
 
@@ -440,6 +439,22 @@ impl VideoService {
     }
 }
 
+/// The sizes of `condition` the engine schedules its reading and encoding
+/// by.
+fn condition_extent(condition: &models::video::VideoCondition) -> ConditionExtent {
+    ConditionExtent {
+        pixel_bytes: condition.pixel_bytes(),
+        audio_samples: condition.media.audio().map_or(0, |track| track.samples),
+        vision_patches: condition
+            .vision
+            .as_ref()
+            .map_or(0, |vision| vision.grid.patches()),
+        vision_tokens: condition.vision.as_ref().map_or(0, |vision| vision.tokens),
+        latent_units: condition.latent_units.clone(),
+        audio_rows: condition.audio_rows,
+    }
+}
+
 impl Presenter {
     /// Plans `fetched`, presents its prompt, which must fit
     /// `max_prompt_tokens`, and publishes each condition's media to shared
@@ -487,15 +502,31 @@ impl Presenter {
                     condition.index
                 ))
             })?;
-            conditions.push(condition.describe(plan.canvas, source.locator(), bands));
+            let locator = source.locator();
+            let locator = models::video::MediaLocator {
+                name: locator.name,
+                bytes: locator.bytes,
+            };
+            conditions.push(condition.describe(plan.canvas, locator, bands));
             media.push(Arc::new(source));
         }
-        let request = DiffusionRequest {
-            request_id: RequestId::default(),
+        let conditioning = Conditioning {
             task: plan.task,
-            prompt_token_ids,
             text_tags: presentation.tags,
             conditions,
+        };
+        let request = DiffusionRequest {
+            request_id: RequestId::default(),
+            task: plan.task.as_str().to_owned(),
+            prompt_token_ids,
+            conditions: conditioning
+                .conditions
+                .iter()
+                .map(condition_extent)
+                .collect(),
+            conditioning: conditioning.encode().map_err(|error| {
+                VideoInputError::Internal(format!("encoding the conditioning failed: {error}"))
+            })?,
             media,
             priority: 0,
             sampling: DiffusionSamplingParams {
@@ -522,7 +553,6 @@ mod tests {
     use std::sync::Arc;
 
     use base64::Engine as _;
-    use engine::VideoDenoiserInfo;
     use image::ImageEncoder as _;
     use models::video::plan::{ProcessorConfig, ReferenceConfig, RequestField};
     use models::video::presentation::{TEXT_TAG, VIDEO_TAG};
@@ -534,7 +564,9 @@ mod tests {
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use super::{VideoGenerationRequest, VideoService};
+    use super::{
+        Conditioning, DenoiserInfo, DiffusionRequest, VideoGenerationRequest, VideoService,
+    };
     use crate::options::MediaOptions;
     use crate::profile::assets::PipelineCheckpoint;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -635,6 +667,11 @@ mod tests {
         crate::test_support::load_tokenizer(&tokenizer)
     }
 
+    /// The conditioning a planned request carries to the workers.
+    fn planned(request: &DiffusionRequest) -> Conditioning {
+        Conditioning::decode(&request.conditioning).unwrap()
+    }
+
     /// A base denoiser serving every task, on a latent encoder of one rank,
     /// in a deployment that sizes references as the released pipeline does.
     fn service() -> VideoService {
@@ -646,7 +683,7 @@ mod tests {
     /// that sizes references as `references` states.
     fn encoding_service(latent_encoding_lane: u32, references: ReferenceConfig) -> VideoService {
         VideoService::new(
-            VideoDenoiserInfo {
+            DenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
                 schedule_points: 50,
                 video_shift: 12.0,
@@ -739,7 +776,7 @@ mod tests {
             height: 96,
         };
         assert_eq!(
-            unenlarged.conditions[0].media,
+            planned(&unenlarged).conditions[0].media,
             ConditionMedia::Image(ImageFit {
                 resized: own,
                 left: 0,
@@ -752,7 +789,9 @@ mod tests {
             .process("reference", &request(body), 1 << 16)
             .await
             .unwrap();
-        assert_eq!(request.task, VideoTask::Ref2va);
+        let planned_request = planned(&request);
+        assert_eq!(request.task, "ref2va");
+        assert_eq!(planned_request.task, VideoTask::Ref2va);
         assert_eq!(request.validate(), Ok(()));
         assert_eq!((video.canvas.width, video.canvas.height), (1344, 768));
         assert_eq!(video.num_frames, 124);
@@ -760,7 +799,7 @@ mod tests {
         // The image block's label is text; its 7296 vision tokens and their
         // two markers are video; the prompt after it is text.
         let label = "<Picture 1>: ".chars().count();
-        let tags = &request.text_tags;
+        let tags = &planned_request.text_tags;
         assert_eq!(tags.len(), request.prompt_token_ids.len());
         assert_eq!(tags.len(), label + 7296 + 2 + "a fox".len());
         assert!(tags[..label].iter().all(|&tag| tag == TEXT_TAG));
@@ -771,7 +810,7 @@ mod tests {
         );
         assert!(tags[label + 7298..].iter().all(|&tag| tag == TEXT_TAG));
 
-        let [condition] = request.conditions.as_slice() else {
+        let [condition] = planned_request.conditions.as_slice() else {
             panic!("one condition");
         };
         let size = Canvas {
@@ -839,7 +878,7 @@ mod tests {
             )
             .await
             .unwrap();
-            for (index, condition) in request.conditions.iter().enumerate() {
+            for (index, condition) in planned(&request).conditions.iter().enumerate() {
                 let expected = if index < count - split {
                     vec![64 * 64]
                 } else {
@@ -877,7 +916,8 @@ mod tests {
             .await
             .unwrap();
         let canvas = processed.canvas;
-        let [first, last] = request.conditions.as_slice() else {
+        let planned_request = planned(&request);
+        let [first, last] = planned_request.conditions.as_slice() else {
             panic!("two keyframes");
         };
         assert_eq!(first.role, ConditionRole::FirstFrame);
@@ -922,7 +962,7 @@ mod tests {
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         }));
         let (request, _) = service().process("rows", &body, 1 << 16).await.unwrap();
-        assert_eq!(request.conditions[0].latent_units, [7296]);
+        assert_eq!(planned(&request).conditions[0].latent_units, [7296]);
     }
 
     /// A request that breaks a request-only rule is rejected before any of

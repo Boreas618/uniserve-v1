@@ -534,17 +534,17 @@ impl Scheduler {
             );
             return;
         };
-        if !denoiser
-            .tasks
-            .iter()
-            .any(|task| task == request.task.as_str())
-        {
+        let Some(task) = denoiser.task(&request.task) else {
             reject(
                 RejectionKind::Invalid,
-                format!(
-                    "the deployment's denoiser does not serve {}",
-                    request.task.as_str()
-                ),
+                format!("the deployment's denoiser does not serve {}", request.task),
+            );
+            return;
+        };
+        if task.conditioned == request.conditions.is_empty() {
+            reject(
+                RejectionKind::Invalid,
+                format!("the conditions do not fit the task {}", request.task),
             );
             return;
         }
@@ -669,7 +669,7 @@ impl Scheduler {
                 .info
                 .video_denoiser
                 .as_ref()
-                .map(|video| video.denoise_steps())
+                .map(|video| video.denoise_steps)
             else {
                 self.waiting_media.push_front(submission);
                 self.invariant_broken("a queued media request has a video denoiser");
@@ -716,9 +716,7 @@ impl Scheduler {
                 submission.request.prompt_token_ids.clone(),
                 submission.request.sampling,
                 ipc::VideoAdmission {
-                    task: submission.request.task,
-                    text_tags: submission.request.text_tags.clone(),
-                    conditions: submission.request.conditions.clone(),
+                    conditioning: submission.request.conditioning.clone(),
                 },
             ) {
                 Ok(admission) => admission,

@@ -214,7 +214,9 @@ pub struct WorkerProcessArgs {
     pub flashinfer_split_kv: bool,
     /// Maximum model context length in tokens.
     pub max_model_len: u32,
-    /// Maximum accepted video duration in seconds.
+    /// Maximum accepted video duration in seconds. The frontend states it
+    /// from the serving options; the default is the longest the video API
+    /// admits.
     pub max_video_seconds: f64,
     /// Most denoiser rows a video request's conditions may take, which bounds
     /// the condition products a video worker provisions; `None` provisions
