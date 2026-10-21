@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -183,6 +183,38 @@ pub struct PageShape {
     pub page_bytes: u64,
 }
 
+/// Where a `lookup` found one page key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageLevel {
+    /// Committed in the pool, the host KV cache (L2).
+    Host,
+    /// Not in the pool, but in the KV storage (L3), which a prefetch reads
+    /// it from.
+    Storage,
+    /// Neither.
+    Absent,
+}
+
+/// The pages of one sliding window of attention, which a `reserve` names:
+/// a window missing one page is useless, so the pool evicts the window
+/// whole. Its pages are the reservation's keys, those the pool reserves and
+/// those it holds already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageWindow {
+    /// The page the window follows in another pool of the server: the last
+    /// full-attention page before the window's boundary. A reuse at the
+    /// boundary needs it, so the window is evicted with it.
+    pub anchor: Option<PageAnchor>,
+}
+
+/// A page of a pool: the anchor of a [`PageWindow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageAnchor {
+    pub pool: u64,
+    pub key: Key,
+}
+
 /// What a `reserve` made of one page key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -252,15 +284,18 @@ pub enum Request {
         shape: PageShape,
         numa_node: Option<u32>,
     },
-    /// The lengths of the leading runs of `keys` committed in the pool
-    /// (L2), and committed in the pool or in the KV storage (L3).
+    /// Where each page of `keys` is: committed in the pool (L2), in the KV
+    /// storage (L3), or absent. The pages the pool holds become its most
+    /// recently used.
     Lookup { pool: u64, keys: Vec<Key> },
     /// A slot for each key the pool holds no page of, to be written by the
-    /// worker of `writer`.
+    /// worker of `writer`. With `window`, the keys are the pages of one
+    /// sliding window, which the pool evicts whole.
     Reserve {
         pool: u64,
         writer: Scope,
         keys: Vec<Key>,
+        window: Option<PageWindow>,
     },
     /// The reserved pages are written: they become readable.
     Commit { pool: u64, keys: Vec<Key> },
@@ -282,8 +317,8 @@ pub enum Request {
     },
     /// Where the server accepts connections from other hosts.
     Endpoint,
-    /// Read the pages of `keys` the pool does not hold from the distributed
-    /// tier into slots reserved for them. Answered at once; the event
+    /// Read the pages of `keys` the pool does not hold from the KV storage
+    /// into slots reserved for them. Answered at once; the event
     /// [`Event::Prefetched`] with the same `tag` follows when the reads
     /// end.
     Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
@@ -342,9 +377,9 @@ pub enum Reply {
         slots: u64,
         page_bytes: u64,
     },
+    /// One level per key of the lookup.
     Lookup {
-        l2: u32,
-        l3: u32,
+        levels: Vec<PageLevel>,
     },
     Reserved {
         slots: Vec<PageSlot>,

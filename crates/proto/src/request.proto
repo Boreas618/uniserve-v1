@@ -646,6 +646,10 @@ message KvCache {
   bool host_tier = 5;
   // Absent when the deployment keeps no KV storage.
   Mooncake mooncake = 6;
+  // The pages of the largest block size between the aligned boundaries a
+  // long prompt offloads its sliding windows before; absent for the
+  // engine's default.
+  optional uint32 boundary_interval = 7;
 }
 
 message Mooncake {

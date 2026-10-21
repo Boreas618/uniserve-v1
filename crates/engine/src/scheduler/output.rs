@@ -15,6 +15,9 @@
 use super::*;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
+use crate::kv_cache::manager::AttentionManager;
+use crate::kv_cache::{KvOffloadManager, OffloadKind, PageRef};
+
 /// How one understanding token ends or continues its request
 /// (`Scheduler::und_token_outcome`).
 enum TokenOutcome {
@@ -1608,20 +1611,25 @@ impl Scheduler {
     /// First publishes the prompt pages the request has now computed, keyed
     /// by the loaded prefill worker that holds them, so every page of a
     /// sliding-window group enters the prefix cache while its table still
-    /// holds it. Then retires the sliding-window pages no later reader needs:
-    /// calls apply in submission order, so every earlier reader has
-    /// completed, and later calls read no history before the accepted extent
-    /// minus the window. A request without its prefill worker or prefix cache
-    /// breaks a scheduler invariant.
+    /// holds it. Then, when the host KV cache serves the worker, reserves the
+    /// pages to offload ([`offloads`]) while the tables still hold them.
+    /// Last retires the sliding-window pages no later reader needs: calls
+    /// apply in submission order, so every earlier reader has completed, and
+    /// later calls read no history before the accepted extent minus the
+    /// window. A request without its prefill worker or prefix cache breaks a
+    /// scheduler invariant.
     pub(super) fn advance_request_cache(&mut self, id: RequestId) {
         let Some(state) = self.running.get(&id) else {
             return;
         };
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
-        let source = self
+        let worker = self
             .placement
             .affinity
             .get(&(key, DEFAULT_COMPONENT.to_owned()))
+            .cloned();
+        let source = worker
+            .as_ref()
             .and_then(|worker| {
                 self.executor
                     .info()
@@ -1641,17 +1649,28 @@ impl Scheduler {
             return;
         };
 
-        // The request's prompt, hashes and export progress are borrowed
-        // beside its tables for the duration of the update.
+        // The request's prompt, hashes, page keys and export progress are
+        // borrowed beside its tables for the duration of the update.
         let prompt = std::mem::take(&mut state.req.prompt_token_ids);
         let hashes = std::mem::take(&mut state.prefix_page_hashes);
+        let page_keys = std::mem::take(&mut state.page_keys);
         let mut published = std::mem::take(&mut state.prefix_published);
-        let published_before = published.first().copied().unwrap_or(0);
+        let published_before = published.clone();
         let computed = state.num_computed_prompt_tokens as usize;
         let visible = state.cache_visible_len as usize;
         let cache_write = state.req.cache.write;
+        let offload_from = state.offload_boundary;
+        let offload_to = computed.min(prompt.len()).max(offload_from);
+        state.offload_boundary = offload_to;
+        let kv_offload = self
+            .kv_offload
+            .as_mut()
+            .zip(worker.as_ref())
+            .filter(|(kv_offload, worker)| kv_offload.serves(worker));
+
+        let mut reserved = Vec::new();
         let advanced = state.prefix_cache_mut().is_some_and(|allocation| {
-            prefix_cache.coordinator.publish_prompt(
+            let published_now = prefix_cache.coordinator.publish_prompt(
                 &prefix_cache.block_pool,
                 allocation,
                 &prompt,
@@ -1660,62 +1679,147 @@ impl Scheduler {
                 &mut published,
                 cache_write,
                 &source,
-            ) && prefix_cache.coordinator.release_window(allocation, visible)
-        });
-        if advanced
-            && let (Some(kv_offload), Some(worker)) = (
-                self.kv_offload.as_mut(),
-                self.placement
-                    .affinity
-                    .get(&(key, DEFAULT_COMPONENT.to_owned())),
-            )
-            && kv_offload.serves(worker)
-        {
-            // Pages published now are written to the host KV cache, but
-            // for the host KV cache's own hit, whose reads are now done.
-            let hit = kv_offload.hit_pages(id);
-            let end = published.first().copied().unwrap_or(0);
-            let mut keys = Vec::new();
-            let mut pages = Vec::new();
-            let page_keys = std::mem::take(&mut state.page_keys);
-            if let (Some(allocation), Some(group_hashes)) =
-                (state.prefix_cache_mut(), hashes.first())
-                && let Some(block_size) = kv_offload.block_size(worker)
-            {
-                let table = &allocation.tables[0];
-                for page in published_before..end {
-                    if hit.contains(&page) {
-                        continue;
-                    }
-                    let (Some(key), Some(reference), Some(hash)) = (
-                        page_keys.get(page),
-                        table.page(page),
-                        group_hashes.get(page),
-                    ) else {
-                        continue;
-                    };
-                    let tokens = &prompt[page * block_size..(page + 1) * block_size];
-                    if let Some(held) = prefix_cache.block_pool.acquire(
-                        reference.units()[0],
-                        *hash,
-                        0,
-                        tokens,
-                        &source,
-                    ) {
-                        keys.push(*key);
-                        pages.push(held);
-                    }
-                }
+            );
+            if published_now && let Some((kv_offload, worker)) = kv_offload.as_ref() {
+                reserved = offloads(
+                    kv_offload,
+                    worker,
+                    id,
+                    &prefix_cache.block_pool,
+                    allocation,
+                    PublishedPrompt {
+                        prompt: &prompt,
+                        hashes: &hashes,
+                        page_keys: &page_keys,
+                        before: &published_before,
+                        after: &published,
+                    },
+                    offload_from..offload_to,
+                    &source,
+                );
             }
-            state.page_keys = page_keys;
-            kv_offload.offload(worker, keys, pages);
+            published_now && prefix_cache.coordinator.release_window(allocation, visible)
+        });
+        if let Some((kv_offload, worker)) = kv_offload {
+            // Pages published now are offloaded to the host KV cache, but
+            // for the host KV cache's own hit, whose loads are now done.
+            for (group, keys, pages, kind) in reserved {
+                kv_offload.offload(worker, group, keys, pages, kind);
+            }
             kv_offload.loaded(id);
         }
         state.req.prompt_token_ids = prompt;
         state.prefix_page_hashes = hashes;
+        state.page_keys = page_keys;
         state.prefix_published = published;
         if !advanced {
             self.invariant_broken("an admitted request's cache tables match the cache groups");
         }
     }
+}
+
+/// A request's prompt as its cache tables publish it: the prompt, its page
+/// hashes of the device cache and its page keys of the host KV cache by
+/// cache group, and the leading pages of each group published before and
+/// after the call just accepted.
+struct PublishedPrompt<'a> {
+    prompt: &'a [u32],
+    hashes: &'a [Vec<u64>],
+    page_keys: &'a [Vec<storage::Key>],
+    before: &'a [usize],
+    after: &'a [usize],
+}
+
+/// The pages of `request`'s tables in `allocation` that the host KV cache
+/// offloads after a call on `worker`, by cache group, each with a reference
+/// that keeps its units until the offload settles.
+///
+/// A full-attention group offloads every page published by the call, but
+/// for the host KV cache's own hit. A sliding-window group offloads the
+/// window before each aligned boundary in `boundaries`
+/// ([`KvOffloadManager::offload_boundaries`]), whole or not at all, anchored
+/// to the last full-attention page before the boundary. The tables must
+/// still hold the windows: the caller runs this before releasing them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request's tables, published prompt and offload range"
+)]
+fn offloads(
+    kv_offload: &KvOffloadManager,
+    worker: &crate::WorkerGroupId,
+    request: RequestId,
+    pool: &BlockPool,
+    allocation: &CacheAllocation,
+    published: PublishedPrompt<'_>,
+    boundaries: std::ops::Range<usize>,
+    source: &Arc<ipc::WorkerEndpoint>,
+) -> Vec<(usize, Vec<storage::Key>, Vec<PageRef>, OffloadKind)> {
+    let managers = kv_offload.managers(worker);
+    let hit = kv_offload.hit_pages(request);
+    let anchor_group = kv_offload.anchor_group(worker);
+    let boundaries = kv_offload.offload_boundaries(
+        worker,
+        published.prompt.len(),
+        boundaries.start,
+        boundaries.end,
+    );
+    let mut offloads = Vec::new();
+    for (group, manager) in managers.iter().enumerate() {
+        let (Some(table), Some(hashes), Some(keys)) = (
+            allocation.tables.get(group),
+            published.hashes.get(group),
+            published.page_keys.get(group),
+        ) else {
+            continue;
+        };
+        let block = manager.block_size();
+        // A reference on a published page of the table, which keeps its
+        // units while it is copied.
+        let held = |page: usize| {
+            let reference = table.page(page)?;
+            let tokens = published.prompt.get(page * block..(page + 1) * block)?;
+            pool.acquire(
+                *reference.units().first()?,
+                *hashes.get(page)?,
+                group as u32,
+                tokens,
+                source,
+            )
+        };
+        match manager {
+            AttentionManager::Full(_) => {
+                let hit = hit.get(group).cloned().unwrap_or(0..0);
+                let before = published.before.get(group).copied().unwrap_or(0);
+                let after = published.after.get(group).copied().unwrap_or(0);
+                let (keys, pages): (Vec<_>, Vec<_>) = (before..after)
+                    .filter(|page| !hit.contains(page))
+                    .filter_map(|page| Some((*keys.get(page)?, held(page)?)))
+                    .unzip();
+                if !keys.is_empty() {
+                    offloads.push((group, keys, pages, OffloadKind::Pages));
+                }
+            }
+            AttentionManager::SlidingWindow(window) => {
+                for &boundary in &boundaries {
+                    let needed = window.needed_pages(boundary);
+                    if needed.is_empty() {
+                        continue;
+                    }
+                    let Some(pages) = needed
+                        .map(|page| Some((*keys.get(page)?, held(page)?)))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    let (keys, pages): (Vec<_>, Vec<_>) = pages.into_iter().unzip();
+                    let anchor = anchor_group.and_then(|full| {
+                        let page = (boundary / managers[full].block_size()).checked_sub(1)?;
+                        Some((full, *published.page_keys.get(full)?.get(page)?))
+                    });
+                    offloads.push((group, keys, pages, OffloadKind::Window { anchor }));
+                }
+            }
+        }
+    }
+    offloads
 }

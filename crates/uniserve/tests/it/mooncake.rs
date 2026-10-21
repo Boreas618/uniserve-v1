@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use storage::protocol::{Event, PageShape, PageSlot, Reply, Request};
+use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
 use storage::{Client, Key, Role, Scope, socket};
 
 const PAGE_BYTES: u64 = 4096;
@@ -201,6 +201,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
             pool,
             writer: scope(),
             keys: vec![key],
+            window: None,
         },
     ) else {
         panic!("the reservation was refused");
@@ -237,7 +238,9 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
                 keys: vec![key, missing],
             },
         ),
-        Reply::Lookup { l2: 0, l3: 1 }
+        Reply::Lookup {
+            levels: vec![PageLevel::Storage, PageLevel::Absent]
+        }
     );
     assert_eq!(
         reply(

@@ -260,12 +260,16 @@ impl Scheduler {
                     });
                 }
             }
-            // The first call after admission fills the units of the
-            // host KV cache's hit from their slots before its forward.
+            // The first call after admission loads the units of the host KV
+            // cache's hit, in every cache group, from their slots before its
+            // forward.
             if admitted && let Some(kv_offload) = self.kv_offload.as_mut() {
-                let table = &allocation.tables[0];
-                call_page_loads = kv_offload.loads(request_id, |page| {
-                    table.page(page).map(|page| page.units().to_vec())
+                let tables = &allocation.tables;
+                call_page_loads = kv_offload.loads(request_id, |group, page| {
+                    tables
+                        .get(group)
+                        .and_then(|table| table.page(page))
+                        .map(|page| page.units().to_vec())
                 });
             }
             // A context prefill with vision blocks appends one forward row per

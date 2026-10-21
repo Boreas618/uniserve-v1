@@ -1,57 +1,87 @@
-//! The host KV cache (L2) of the prefix cache, and the KV storage
-//! (L3) behind it, as the scheduler drives them.
+//! The host KV cache (L2) of the prefix cache, and the KV storage (L3)
+//! behind it, as the scheduler drives them.
 //!
 //! Every host's Storage Server keeps page pools of host memory; each rank
-//! of a worker group maps one for its cache group and reports it
+//! of a worker group maps one for each of its cache groups and reports them
 //! (`PrefixCacheInfo::page_pools`). The server's Mooncake connector, when it
-//! runs one, writes every committed page to Mooncake (L3) and reads pages
-//! back into the pool on request. The scheduler decides which pages move:
+//! runs one, keeps every committed page in the KV storage and reads pages
+//! back into the pools on request. The scheduler decides which pages move,
+//! with the reuse rules of each group's attention type ([`super::manager`]),
+//! the rules of the device cache (L1):
 //!
-//! - **Reads.** At admission, after the device prefix (L1) match, the pages
-//!   that follow it are pinned in every rank's pool, and looked up in L2
-//!   and L3. When L3 extends the run every rank's pool holds by at least
-//!   [`PREFETCH_MIN_TOKENS`] tokens, those pages are prefetched into the
-//!   pools; admission waits for them at most [`prefetch_wait`], then pins
-//!   the pages that arrived. The leading run every rank holds is the host KV cache's
-//!   hit: admission allocates units for it, the request's first prefill
-//!   batch reads the pages into them (`Batch::page_loads`) and computes from
-//!   the end of the hit, and the pins end once that call's result is
+//! - **Loads.** At admission, after the device prefix match ends at token
+//!   `d`, each group's pages from `d` on are pinned in every rank's pool and
+//!   looked up, which tells for each page key whether the page is in L2, in
+//!   L3 or absent. The hit is the deepest boundary every group's manager
+//!   accepts with the pages before `d` on the device and the pages after it
+//!   pinned in every rank's pool. When the pages L3 holds would deepen the
+//!   hit by at least [`PREFETCH_MIN_TOKENS`] tokens, they are prefetched into
+//!   the pools; admission waits for them at most [`prefetch_wait`], then pins
+//!   the pages that arrived and takes the hit again. Admission allocates
+//!   units for the hit's pages: a full-attention group's pages from `d` to
+//!   the boundary, and a sliding-window group's pages of the window before
+//!   the boundary that the device does not hold. A sliding window's table
+//!   starts at its window, so it maps no earlier position, which no reader
+//!   touches: the null block of vLLM. The request's first prefill batch
+//!   loads the pages into those units (`Batch::page_loads`) and computes
+//!   from the boundary, and the pins end once that call's result is
 //!   accepted. Pages that did not arrive in time are computed.
-//! - **Writes.** Once a prompt page is published in L1, a slot is reserved
+//! - **Offloads.** Once a prompt page is published in L1, a slot is reserved
 //!   for it in every rank's pool, while the scheduler holds a reference to
-//!   its units. The next text batch the worker group runs copies the page
-//!   (`Batch::page_offloads`), and the batch's output commits it, or aborts it
-//!   when the batch failed. Every published page is written (write
-//!   threshold one).
+//!   its units. Full attention offloads every published page. A sliding
+//!   window offloads only the window before an aligned boundary
+//!   ([`KvOffloadManager::offload_boundaries`]): every `boundary_interval`
+//!   pages of the largest block size, the last boundary a reissue of the
+//!   prompt can reuse, and the last boundary of the published prompt. A page
+//!   that falls out of the window before reaching such a window is never
+//!   offloaded. The window's pages are reserved as one window (`PageWindow`),
+//!   which the pool evicts whole and with the last full-attention page before
+//!   its boundary, its anchor; they are reserved while the request's table
+//!   still holds them, so the reference keeps their units from being
+//!   recycled until the copy commits. The next text batch the worker group
+//!   runs copies the pages (`Batch::page_offloads`), and the batch's output
+//!   commits them, or aborts them when the batch failed.
 //!
-//! A page's key chains the page keys before it: `h_i = SHA-256(h_{i-1} ||
-//! group || modality || tokens)` over full pages, each token a little-endian
-//! `u32`, from `h_{-1} = SHA-256("uniserve-page" || content || isolation
-//! key)`, where the content is what the ranks report for the group and the
-//! isolation key keeps tenants' prefixes apart as L1 does.
+//! A page's key chains the keys of its group's pages before it: `h_i =
+//! SHA-256(h_{i-1} || group || modality || tokens)` over full pages, each
+//! token a little-endian `u32`, from `h_{-1} = SHA-256("uniserve-page" ||
+//! content || isolation key)`, where the content is what the ranks report
+//! for the group and the isolation key keeps tenants' prefixes apart as L1
+//! does. The keys of every group form one key space: for each key, the
+//! lookups say where its page is.
 //!
-//! The host KV cache serves worker groups whose cache is one full-attention group.
 //! A rank's pool is reached through its host's Storage Server: on the
 //! engine's host through the server's socket, on another host over the TCP
 //! address the rank reports for it. Requests to the servers never block
-//! the scheduler:
-//! they are submitted, and their answers are taken by [`KvOffloadManager::poll`] at
-//! every step; while answers are awaited, a parked scheduler wakes after a
-//! millisecond to take them.
+//! the scheduler: they are submitted, and their answers are taken by
+//! [`KvOffloadManager::poll`] at every step; while answers are awaited, a
+//! parked scheduler wakes after a millisecond to take them.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipc::{PageCopy, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
 use sha2::{Digest, Sha256};
-use storage::protocol::{Event, PageSlot, Reply, Request};
+use storage::protocol::{Event, PageAnchor, PageLevel, PageSlot, PageWindow, Reply, Request};
 use storage::{Client, Key, Role, Scope};
 
-/// The fewest tokens an L3 hit must add to the pools' run to be prefetched:
+use super::manager::{self, AttentionManager};
+use super::{GroupShape, PageRef};
+use crate::executor::WorkerGroupId;
+
+/// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
 /// a shorter hit is computed faster than it is fetched.
 pub(crate) const PREFETCH_MIN_TOKENS: usize = 256;
+
+/// The pages of the largest block size between the aligned boundaries a
+/// long prompt offloads its sliding windows before, unless the deployment
+/// sets another (`kv_cache_config.boundary_interval`). A sliding window of a
+/// thousand tokens in pages of 64 tokens is a quarter of this interval, so
+/// the windows offloaded hold at most a quarter of the group's pages.
+pub(crate) const DEFAULT_BOUNDARY_INTERVAL: usize = 64;
 
 /// How long admission waits for a prefetch of `tokens` tokens: one second,
 /// and a quarter second per 1024 tokens.
@@ -59,44 +89,70 @@ pub(crate) fn prefetch_wait(tokens: usize) -> Duration {
     Duration::from_secs(1) + Duration::from_millis(250 * tokens as u64 / 1024)
 }
 
-use super::PageRef;
-use crate::executor::WorkerGroupId;
-
-/// One rank's page pool.
+/// One rank's page pool of one cache group.
 #[derive(Clone)]
 struct RankPool {
-    /// The connection to the rank's host's server, in `KvOffloadManager::clients`.
+    /// The connection to the rank's host's server, in
+    /// `KvOffloadManager::clients`.
     client: usize,
     scope: Scope,
     pool: u64,
 }
 
-/// The page pools of one worker group.
+/// The page pools of one cache group of a worker group, one per rank.
 #[derive(Clone)]
-struct GroupPools {
+struct CachePools {
     ranks: Vec<RankPool>,
     content: [u8; 32],
-    block_size: usize,
+    manager: AttentionManager,
+}
+
+/// The cache groups of one worker group.
+#[derive(Clone)]
+struct WorkerPools {
+    groups: Vec<CachePools>,
+    /// The largest block size of the groups: every reuse boundary is a
+    /// multiple of it.
+    step: usize,
+}
+
+impl WorkerPools {
+    fn managers(&self) -> Vec<AttentionManager> {
+        self.groups.iter().map(|group| group.manager).collect()
+    }
+
+    fn ranks(&self) -> usize {
+        self.groups.first().map_or(0, |group| group.ranks.len())
+    }
 }
 
 /// What a submitted request was for.
 enum Purpose {
-    /// Admission pins of `request` in `rank`'s pool.
-    Pin { request: RequestId, rank: usize },
-    /// The L2 and L3 lookup of `request`'s pages in `rank`'s pool.
-    Lookup { request: RequestId, rank: usize },
-    /// Pins of `request`'s prefetched pages in `rank`'s pool, at these
-    /// positions of its keys.
+    /// Admission pins of `request`'s pages of `group` in `rank`'s pool.
+    Pin {
+        request: RequestId,
+        group: usize,
+        rank: usize,
+    },
+    /// The lookup of `request`'s pages of `group` in `rank`'s pool.
+    Lookup {
+        request: RequestId,
+        group: usize,
+        rank: usize,
+    },
+    /// Pins of `request`'s prefetched pages of `group` in `rank`'s pool, at
+    /// these positions of the group's pinned keys.
     Repin {
         request: RequestId,
+        group: usize,
         rank: usize,
         positions: Vec<usize>,
     },
     /// Pins of `keys` in `pool` for a request that no longer wants them:
     /// the pages they pinned are unpinned when the answer arrives.
     Orphan { pool: RankPool, keys: Vec<Key> },
-    /// The reservation of `write` in `rank`'s pool.
-    Reserve { write: u64, rank: usize },
+    /// The reservation of offload `offload` in `rank`'s pool.
+    Reserve { offload: u64, rank: usize },
     /// A request whose answer changes nothing here: commit, abort, unpin,
     /// prefetch.
     Settle,
@@ -107,63 +163,117 @@ enum Purpose {
 enum Stage {
     /// Pins and lookups are in flight.
     Pinning,
-    /// The pages `from..to` are being prefetched; `arrived` ranks have
+    /// Pages are being prefetched; `arrived` of `expected` prefetches have
     /// reported.
     Fetching {
-        from: usize,
-        to: usize,
         deadline: Instant,
         arrived: usize,
+        expected: usize,
     },
-    /// The prefetched pages are being pinned; `awaiting` ranks have not
+    /// The prefetched pages are being pinned; `awaiting` pins have not
     /// answered.
     Repinning { awaiting: usize },
     /// The hit is known.
     Settled,
 }
 
+/// One cache group's admission pins of one request.
+struct GroupPins {
+    /// The first page pinned: every earlier page a reuse needs is on the
+    /// device.
+    first: usize,
+    /// The keys of the group's pages from `first` on.
+    keys: Vec<Key>,
+    /// Each rank's slots of the keys, once its pin is answered.
+    slots: Vec<Option<Vec<Option<u64>>>>,
+    /// Each rank's levels of the keys, once its lookup is answered; empty
+    /// for keys not looked up.
+    levels: Vec<Option<Vec<PageLevel>>>,
+    /// The positions of the keys being prefetched, pinned again once they
+    /// arrive.
+    fetching: Vec<usize>,
+}
+
+impl GroupPins {
+    /// Whether every rank holds the page at `position` of the keys: pinned
+    /// in its pool, or, when `stored` counts, in the pool or the KV storage
+    /// at the lookup.
+    fn present(&self, position: usize, stored: bool) -> bool {
+        self.slots.iter().zip(&self.levels).all(|(slots, levels)| {
+            let pinned = slots
+                .as_ref()
+                .and_then(|slots| slots.get(position))
+                .is_some_and(Option::is_some);
+            let found = levels
+                .as_ref()
+                .and_then(|levels| levels.get(position))
+                .is_some_and(|level| *level != PageLevel::Absent);
+            pinned || (stored && found)
+        })
+    }
+
+    fn answered(&self) -> bool {
+        self.slots.iter().all(Option::is_some) && self.levels.iter().all(Option::is_some)
+    }
+}
+
 /// The admission pins of one request.
 struct Pins {
     worker: WorkerGroupId,
-    /// The first page pinned: the end of the L1 match when the pins were
-    /// taken.
-    start: usize,
-    keys: Vec<Key>,
-    /// Each rank's slots, once its pin is answered.
-    slots: Vec<Option<Vec<Option<u64>>>>,
-    /// Each rank's run of pages in L2 or L3, once its lookup is answered.
-    l3: Vec<Option<usize>>,
+    /// The device prefix match, in tokens, after which the pins start.
+    device: usize,
+    /// The deepest boundary the request may reuse, in tokens.
+    limit: usize,
+    groups: Vec<GroupPins>,
     stage: Stage,
 }
 
-/// A request's page hit of the host KV cache, from its admission until its reads
-/// are accepted.
-struct Hit {
-    /// The first page of the hit.
-    start: usize,
-    worker: WorkerGroupId,
+/// The pages of one cache group a hit loads.
+struct GroupHit {
+    /// The first page loaded.
+    first: usize,
     keys: Vec<Key>,
     /// Each rank's slot of each page.
     slots: Vec<Vec<u64>>,
-    /// Whether a batch carries the reads.
+}
+
+/// A request's hit of the host KV cache, from its admission until its loads
+/// are accepted.
+struct Hit {
+    worker: WorkerGroupId,
+    groups: Vec<GroupHit>,
+    /// Whether a batch carries the loads.
     sent: bool,
 }
 
-/// The reservations of one group of published pages.
+/// What an offload of a group's pages is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffloadKind {
+    /// Pages of their own, as full attention offloads them.
+    Pages,
+    /// The pages of one sliding window, evicted whole, following the
+    /// anchor: the cache group and key of the last full-attention page
+    /// before the window's boundary.
+    Window { anchor: Option<(usize, Key)> },
+}
+
+/// The reservations of one offload of published pages.
 struct Reservation {
     worker: WorkerGroupId,
+    group: usize,
     keys: Vec<Key>,
     pages: Vec<Arc<PageRef>>,
+    window: bool,
     answered: usize,
 }
 
-/// One page write waiting for, or carried by, a batch.
-struct Write {
+/// One page offload waiting for, or carried by, a batch.
+struct Offload {
     /// The connection to the pool's server.
     client: usize,
     copy: PageCopy,
     key: Key,
-    /// Holds the page's units until the write is settled.
+    /// Holds the page's units until the offload is settled.
     _page: Arc<PageRef>,
 }
 
@@ -174,14 +284,17 @@ pub(crate) struct RankCache<'a> {
     pub cache: &'a PrefixCacheInfo,
 }
 
-/// The scheduler's side of the host KV cache.
+/// The scheduler's side of the host KV cache and the KV storage.
 pub(crate) struct KvOffloadManager {
     deployment: String,
+    /// The pages of the largest block size between aligned sliding-window
+    /// boundaries.
+    boundary_interval: usize,
     /// The connections to the servers: the engine's host's first, then other
     /// hosts' by the TCP address they were reached at.
     clients: Vec<Client>,
     remote: HashMap<String, usize>,
-    groups: HashMap<WorkerGroupId, GroupPools>,
+    workers: HashMap<WorkerGroupId, WorkerPools>,
     /// Requests submitted and not yet answered, by connection and request.
     pending: HashMap<(usize, u64), Purpose>,
     pins: HashMap<RequestId, Pins>,
@@ -191,17 +304,22 @@ pub(crate) struct KvOffloadManager {
     hits: HashMap<RequestId, Hit>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
-    /// Writes reserved and waiting for a batch of their worker group.
-    queued: HashMap<WorkerGroupId, Vec<Write>>,
-    /// Writes carried by submitted batches, by batch, with the worker group
-    /// that runs it.
-    carried: HashMap<u64, (WorkerGroupId, Vec<Write>)>,
+    /// Offloads reserved and waiting for a batch of their worker group.
+    queued: HashMap<WorkerGroupId, Vec<Offload>>,
+    /// Offloads carried by submitted batches, by batch, with the worker
+    /// group that runs it.
+    carried: HashMap<u64, (WorkerGroupId, Vec<Offload>)>,
 }
 
 impl KvOffloadManager {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `deployment`.
-    pub(crate) fn connect(socket: &std::path::Path, deployment: &str) -> anyhow::Result<Self> {
+    /// `deployment`, offloading sliding windows every `boundary_interval`
+    /// pages of a long prompt.
+    pub(crate) fn connect(
+        socket: &std::path::Path,
+        deployment: &str,
+        boundary_interval: usize,
+    ) -> anyhow::Result<Self> {
         let client = Client::connect(
             socket,
             Role::Head {
@@ -210,9 +328,10 @@ impl KvOffloadManager {
         )?;
         Ok(Self {
             deployment: deployment.to_owned(),
+            boundary_interval: boundary_interval.max(1),
             clients: vec![client],
             remote: HashMap::new(),
-            groups: HashMap::new(),
+            workers: HashMap::new(),
             pending: HashMap::new(),
             pins: HashMap::new(),
             fetches: HashMap::new(),
@@ -249,112 +368,173 @@ impl KvOffloadManager {
 
     /// Serve `worker`, whose ranks (`ranks`, in rank order) are the scopes
     /// of the deployment named by the group and their ranks, when every rank
-    /// reports a page pool for one full-attention cache group and its server
-    /// is reachable. Returns whether the host KV cache serves it.
+    /// reports a page pool for every one of its cache groups, of the same
+    /// content for a group on every rank, and its server is reachable.
+    /// Returns whether the host KV cache serves it.
     pub(crate) fn add_worker(&mut self, worker: &WorkerGroupId, ranks: &[RankCache<'_>]) -> bool {
         let Some(first) = ranks.first() else {
             return false;
         };
-        let [group] = &first.cache.groups[..] else {
-            return false;
-        };
-        if group.kind.window().is_some() {
+        let shapes = &first.cache.groups;
+        if shapes.is_empty() {
             return false;
         }
-        let mut pools = Vec::with_capacity(ranks.len());
-        let mut content = None;
+        let mut groups: Vec<CachePools> = shapes
+            .iter()
+            .map(|shape| CachePools {
+                ranks: Vec::with_capacity(ranks.len()),
+                content: [0; 32],
+                manager: GroupShape::from_group(shape).manager(),
+            })
+            .collect();
         for (rank, report) in ranks.iter().enumerate() {
-            let [pool] = &report.cache.page_pools[..] else {
-                return false;
-            };
-            if pool.group_id != 0 || content.is_some_and(|content| content != pool.content) {
+            if report.cache.groups != *shapes || report.cache.page_pools.len() != shapes.len() {
                 return false;
             }
-            content = Some(pool.content);
-            let client = if report.local {
-                0
-            } else {
-                let Some(client) = pool
-                    .endpoint
-                    .as_deref()
-                    .and_then(|address| self.remote(address))
-                else {
+            for pool in &report.cache.page_pools {
+                let Some(group) = groups.get_mut(pool.group_id as usize) else {
                     return false;
                 };
-                client
-            };
-            pools.push(RankPool {
-                client,
-                scope: Scope {
-                    deployment: self.deployment.clone(),
-                    group: worker.0.clone(),
-                    rank: rank as u32,
-                },
-                pool: pool.pool,
-            });
+                if group.ranks.len() != rank || (rank > 0 && group.content != pool.content) {
+                    return false;
+                }
+                group.content = pool.content;
+                let client = if report.local {
+                    0
+                } else {
+                    let Some(client) = pool
+                        .endpoint
+                        .as_deref()
+                        .and_then(|address| self.remote(address))
+                    else {
+                        return false;
+                    };
+                    client
+                };
+                group.ranks.push(RankPool {
+                    client,
+                    scope: Scope {
+                        deployment: self.deployment.clone(),
+                        group: worker.0.clone(),
+                        rank: rank as u32,
+                    },
+                    pool: pool.pool,
+                });
+            }
         }
-        let ranks = pools;
-        let Some(content) = content else {
-            return false;
-        };
-        self.groups.insert(
-            worker.clone(),
-            GroupPools {
-                ranks,
-                content,
-                block_size: group.block_size as usize,
-            },
-        );
-        tracing::info!(worker = %worker.0, "the host KV cache serves the worker group");
+        let step = groups
+            .iter()
+            .map(|group| group.manager.block_size())
+            .max()
+            .unwrap_or(1);
+        self.workers
+            .insert(worker.clone(), WorkerPools { groups, step });
+        tracing::info!(worker = %worker.0, groups = shapes.len(), "the host KV cache serves the worker group");
         true
     }
 
     /// Whether the host KV cache serves `worker`.
     pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
-        self.groups.contains_key(worker)
+        self.workers.contains_key(worker)
     }
 
-    /// The tokens of one page of `worker`'s cache group.
-    pub(crate) fn block_size(&self, worker: &WorkerGroupId) -> Option<usize> {
-        self.groups.get(worker).map(|group| group.block_size)
+    /// The largest block size of `worker`'s cache groups, in tokens: every
+    /// reuse boundary is a multiple of it.
+    pub(crate) fn step(&self, worker: &WorkerGroupId) -> Option<usize> {
+        self.workers.get(worker).map(|pools| pools.step)
     }
 
-    /// The keys of the first `pages` full pages of `prompt` for `worker`.
+    /// The reuse rules of `worker`'s cache groups, in group order.
+    pub(crate) fn managers(&self, worker: &WorkerGroupId) -> Vec<AttentionManager> {
+        self.workers
+            .get(worker)
+            .map(WorkerPools::managers)
+            .unwrap_or_default()
+    }
+
+    /// The first full-attention cache group of `worker`, whose pages anchor
+    /// the sliding windows.
+    pub(crate) fn anchor_group(&self, worker: &WorkerGroupId) -> Option<usize> {
+        self.workers
+            .get(worker)?
+            .groups
+            .iter()
+            .position(|group| matches!(group.manager, AttentionManager::Full(_)))
+    }
+
+    /// The aligned boundaries in `(from, to]` of a prompt of `prompt_len`
+    /// tokens on `worker`, before which its sliding windows are offloaded:
+    /// every multiple of `boundary_interval` pages of the largest block
+    /// size, the last boundary a reissue of the prompt can reuse (one prompt
+    /// token is always computed), and the last boundary of the prompt's
+    /// published pages.
+    pub(crate) fn offload_boundaries(
+        &self,
+        worker: &WorkerGroupId,
+        prompt_len: usize,
+        from: usize,
+        to: usize,
+    ) -> Vec<usize> {
+        let Some(step) = self.step(worker) else {
+            return Vec::new();
+        };
+        let interval = self.boundary_interval * step;
+        let reissue = prompt_len.saturating_sub(1) / step * step;
+        let published = prompt_len / step * step;
+        (from / step + 1..=to / step)
+            .map(|page| page * step)
+            .filter(|&boundary| {
+                boundary % interval == 0 || boundary == reissue || boundary == published
+            })
+            .collect()
+    }
+
+    /// The keys of `worker`'s cache groups for the full pages of the first
+    /// `tokens` tokens of `prompt`, by group.
     pub(crate) fn page_keys(
         &self,
         worker: &WorkerGroupId,
         prompt: &[u32],
         isolation_key: Option<u64>,
-        pages: usize,
-    ) -> Vec<Key> {
-        let Some(group) = self.groups.get(worker) else {
+        tokens: usize,
+    ) -> Vec<Vec<Key>> {
+        let Some(pools) = self.workers.get(worker) else {
             return Vec::new();
         };
-        let mut digest = Sha256::new();
-        digest.update(b"uniserve-page");
-        digest.update(group.content);
-        match isolation_key {
-            Some(key) => {
-                digest.update([1]);
-                digest.update(key.to_le_bytes());
-            }
-            None => digest.update([0]),
-        }
-        let mut chain: [u8; 32] = digest.finalize().into();
-        let mut keys = Vec::with_capacity(pages);
-        for tokens in prompt.chunks_exact(group.block_size).take(pages) {
-            let mut digest = Sha256::new();
-            digest.update(chain);
-            // The only cache group, and text (`TEXT_MODALITY_TAG`).
-            digest.update(0_u32.to_le_bytes());
-            digest.update([0_u8]);
-            for token in tokens {
-                digest.update(token.to_le_bytes());
-            }
-            chain = digest.finalize().into();
-            keys.push(Key(chain));
-        }
-        keys
+        let prompt = &prompt[..tokens.min(prompt.len())];
+        pools
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let mut digest = Sha256::new();
+                digest.update(b"uniserve-page");
+                digest.update(group.content);
+                match isolation_key {
+                    Some(key) => {
+                        digest.update([1]);
+                        digest.update(key.to_le_bytes());
+                    }
+                    None => digest.update([0]),
+                }
+                let mut chain: [u8; 32] = digest.finalize().into();
+                prompt
+                    .chunks_exact(group.manager.block_size())
+                    .map(|tokens| {
+                        let mut digest = Sha256::new();
+                        digest.update(chain);
+                        // The group, and text (`TEXT_MODALITY_TAG`).
+                        digest.update((index as u32).to_le_bytes());
+                        digest.update([0_u8]);
+                        for token in tokens {
+                            digest.update(token.to_le_bytes());
+                        }
+                        chain = digest.finalize().into();
+                        Key(chain)
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     fn submit(&mut self, client: usize, request: &Request, purpose: Purpose) -> bool {
@@ -370,168 +550,253 @@ impl KvOffloadManager {
         }
     }
 
-    /// The host KV cache's answer for admitting `request` to `worker` with `l1_pages`
-    /// pages cached in L1: `None` while pins, lookups or prefetches are in
-    /// flight, else the hit (possibly empty), which the caller takes with
-    /// [`KvOffloadManager::admit`]. The first call pins `keys[l1_pages..]` (the
-    /// request's reusable full pages) in every rank's pool and looks them up
-    /// in L2 and L3. Pins taken for another L1 match are released and taken
-    /// again.
+    /// The host KV cache's answer for admitting `request` to `worker`, whose
+    /// device cache matched its first `device` tokens and which may reuse at
+    /// most `limit`: `None` while pins, lookups or prefetches are in flight,
+    /// else the boundary of the hit (at least `device`), which the caller
+    /// takes with [`KvOffloadManager::admit`]. `keys` are the request's page
+    /// keys by group ([`KvOffloadManager::page_keys`]), covering `limit`
+    /// tokens. The first call pins every group's keys from `device` on in
+    /// every rank's pool and looks them up. Pins taken for another device
+    /// match are released and taken again.
     pub(crate) fn admission(
         &mut self,
         request: RequestId,
         worker: &WorkerGroupId,
-        keys: &[Key],
-        l1_pages: usize,
+        keys: &[Vec<Key>],
+        device: usize,
+        limit: usize,
     ) -> Option<usize> {
         if let Some(pins) = self.pins.get(&request) {
-            if pins.start != l1_pages || pins.worker != *worker {
+            if pins.device != device || pins.worker != *worker || pins.limit != limit {
                 self.release(request);
             } else {
                 return self.advance(request);
             }
         }
-        let Some(group) = self.groups.get(worker).cloned() else {
-            return Some(0);
+        let Some(pools) = self.workers.get(worker).cloned() else {
+            return Some(device);
         };
-        let wanted: Vec<Key> = keys.get(l1_pages..).unwrap_or_default().to_vec();
-        if wanted.is_empty() {
-            return Some(0);
+        if limit <= device || keys.len() != pools.groups.len() {
+            return Some(device);
         }
         // L3 can only matter when the pages could reach a prefetch.
-        let look_up = wanted.len() * group.block_size >= PREFETCH_MIN_TOKENS;
-        let ranks = group.ranks.len();
-        let mut pins = Pins {
-            worker: worker.clone(),
-            start: l1_pages,
-            keys: wanted.clone(),
-            slots: vec![None; ranks],
-            l3: vec![if look_up { None } else { Some(0) }; ranks],
-            stage: Stage::Pinning,
-        };
-        for (rank, pool) in group.ranks.iter().enumerate() {
-            let pinned = self.submit(
-                pool.client,
-                &Request::Pin {
-                    pool: pool.pool,
-                    reader: pool.scope.clone(),
-                    keys: wanted.clone(),
-                },
-                Purpose::Pin { request, rank },
-            );
-            if !pinned {
-                // A rank without pins holds nothing: the hit is empty.
-                pins.slots[rank] = Some(Vec::new());
-            }
-            if look_up {
-                let looked = self.submit(
+        let look_up = limit - device >= PREFETCH_MIN_TOKENS;
+        let ranks = pools.ranks();
+        let mut groups = Vec::with_capacity(pools.groups.len());
+        for (index, (group, keys)) in pools.groups.iter().zip(keys).enumerate() {
+            let block_size = group.manager.block_size();
+            let first = device / block_size;
+            let wanted: Vec<Key> = keys
+                .get(first..(limit / block_size).min(keys.len()))
+                .unwrap_or_default()
+                .to_vec();
+            let mut pins = GroupPins {
+                first,
+                keys: wanted.clone(),
+                slots: vec![None; ranks],
+                levels: vec![if look_up { None } else { Some(Vec::new()) }; ranks],
+                fetching: Vec::new(),
+            };
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                if wanted.is_empty() {
+                    pins.slots[rank] = Some(Vec::new());
+                    pins.levels[rank] = Some(Vec::new());
+                    continue;
+                }
+                let pinned = self.submit(
                     pool.client,
-                    &Request::Lookup {
+                    &Request::Pin {
                         pool: pool.pool,
+                        reader: pool.scope.clone(),
                         keys: wanted.clone(),
                     },
-                    Purpose::Lookup { request, rank },
+                    Purpose::Pin {
+                        request,
+                        group: index,
+                        rank,
+                    },
                 );
-                if !looked {
-                    pins.l3[rank] = Some(0);
+                if !pinned {
+                    // A rank without pins holds nothing of the group.
+                    pins.slots[rank] = Some(Vec::new());
+                }
+                if look_up {
+                    let looked = self.submit(
+                        pool.client,
+                        &Request::Lookup {
+                            pool: pool.pool,
+                            keys: wanted.clone(),
+                        },
+                        Purpose::Lookup {
+                            request,
+                            group: index,
+                            rank,
+                        },
+                    );
+                    if !looked {
+                        pins.levels[rank] = Some(Vec::new());
+                    }
                 }
             }
+            groups.push(pins);
         }
-        self.pins.insert(request, pins);
-        None
+        self.pins.insert(
+            request,
+            Pins {
+                worker: worker.clone(),
+                device,
+                limit,
+                groups,
+                stage: Stage::Pinning,
+            },
+        );
+        self.advance(request)
+    }
+
+    /// The deepest boundary of `pins` every manager of `pools` accepts, with
+    /// the pages each rank pinned, and, when `stored` counts, the pages each
+    /// rank's lookup found in its pool or the KV storage.
+    fn boundary(pools: &WorkerPools, pins: &Pins, stored: bool) -> usize {
+        let misses: Vec<Vec<usize>> = pools
+            .groups
+            .iter()
+            .zip(&pins.groups)
+            .map(|(group, pins_of)| {
+                let pages = pins.limit / group.manager.block_size();
+                manager::misses((0..pages).map(|page| {
+                    page < pins_of.first || pins_of.present(page - pins_of.first, stored)
+                }))
+            })
+            .collect();
+        manager::deepest_boundary(&pools.managers(), pools.step, pins.limit, &misses)
+            .max(pins.device)
     }
 
     /// Move `request`'s admission on from its current stage; see
     /// [`KvOffloadManager::admission`].
     fn advance(&mut self, request: RequestId) -> Option<usize> {
         let pins = self.pins.get(&request)?;
-        let group = self.groups.get(&pins.worker)?.clone();
+        let pools = self.workers.get(&pins.worker)?.clone();
         match pins.stage {
-            Stage::Settled => Some(Self::run(pins)),
+            Stage::Settled => Some(Self::boundary(&pools, pins, false)),
             Stage::Repinning { awaiting } => {
                 if awaiting > 0 {
                     return None;
                 }
                 let pins = self.pins.get_mut(&request)?;
                 pins.stage = Stage::Settled;
-                Some(Self::run(pins))
+                Some(Self::boundary(&pools, pins, false))
             }
             Stage::Pinning => {
-                let answered =
-                    pins.slots.iter().all(Option::is_some) && pins.l3.iter().all(Option::is_some);
-                if !answered {
+                if !pins.groups.iter().all(GroupPins::answered) {
                     return None;
                 }
-                let run = Self::run(pins);
-                let l3 = pins
-                    .l3
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .min()
-                    .unwrap_or(0)
-                    .min(pins.keys.len());
-                if l3 <= run || (l3 - run) * group.block_size < PREFETCH_MIN_TOKENS {
+                let pinned = Self::boundary(&pools, pins, false);
+                let stored = Self::boundary(&pools, pins, true);
+                if stored <= pinned || stored - pinned < PREFETCH_MIN_TOKENS {
                     let pins = self.pins.get_mut(&request)?;
                     pins.stage = Stage::Settled;
-                    return Some(run);
+                    return Some(pinned);
                 }
-                // Every rank's pool fetches the pages its L3 holds past the
-                // run; pages a pool holds already are left as they are.
-                let keys = pins.keys[run..l3].to_vec();
-                let mut arrived = 0;
-                for pool in &group.ranks {
+                // Every rank's pool fetches the pages the deeper boundary
+                // needs that it did not pin; pages a pool holds already are
+                // left as they are.
+                let positions: Vec<Vec<usize>> = pools
+                    .groups
+                    .iter()
+                    .zip(&pins.groups)
+                    .map(|(group, pins_of)| {
+                        let needed = group.manager.needed_pages(stored);
+                        (needed.start.max(pins_of.first)..needed.end.max(pins_of.first))
+                            .map(|page| page - pins_of.first)
+                            .collect()
+                    })
+                    .collect();
+                let mut fetches = Vec::new();
+                for ((group, pins_of), positions) in
+                    pools.groups.iter().zip(&pins.groups).zip(&positions)
+                {
+                    for (rank, pool) in group.ranks.iter().enumerate() {
+                        let slots = pins_of.slots[rank].as_deref().unwrap_or_default();
+                        let keys: Vec<Key> = positions
+                            .iter()
+                            .filter(|&&position| {
+                                slots.get(position).is_none_or(|slot| slot.is_none())
+                            })
+                            .map(|&position| pins_of.keys[position])
+                            .collect();
+                        if !keys.is_empty() {
+                            fetches.push((pool.clone(), keys));
+                        }
+                    }
+                }
+                let mut expected = 0;
+                for (pool, keys) in fetches {
                     let tag = self.next_tag;
                     self.next_tag += 1;
-                    let submitted = self.submit(
+                    if self.submit(
                         pool.client,
                         &Request::Prefetch {
                             pool: pool.pool,
-                            keys: keys.clone(),
+                            keys,
                             tag,
                         },
                         Purpose::Settle,
-                    );
-                    if submitted {
+                    ) {
                         self.fetches.insert(tag, request);
-                    } else {
-                        arrived += 1;
+                        expected += 1;
                     }
                 }
                 let pins = self.pins.get_mut(&request)?;
+                if expected == 0 {
+                    pins.stage = Stage::Settled;
+                    return Some(pinned);
+                }
+                for (pins_of, positions) in pins.groups.iter_mut().zip(positions) {
+                    pins_of.fetching = positions;
+                }
                 pins.stage = Stage::Fetching {
-                    from: run,
-                    to: l3,
-                    deadline: Instant::now() + prefetch_wait((l3 - run) * group.block_size),
-                    arrived,
+                    deadline: Instant::now() + prefetch_wait(stored - pinned),
+                    arrived: 0,
+                    expected,
                 };
                 None
             }
             Stage::Fetching {
-                from,
-                to,
                 deadline,
                 arrived,
+                expected,
             } => {
-                if arrived < group.ranks.len() && Instant::now() < deadline {
+                if arrived < expected && Instant::now() < deadline {
                     return None;
                 }
                 // Pin what arrived; pages still in flight are computed, and
                 // stay in the pools for later requests.
                 self.fetches.retain(|_, waiting| *waiting != request);
-                let (keys, ranks) = (pins.keys.clone(), pins.slots.clone());
-                let mut awaiting = 0;
-                for (rank, pool) in group.ranks.iter().enumerate() {
-                    let Some(slots) = ranks[rank].as_ref() else {
-                        continue;
-                    };
-                    let positions: Vec<usize> = (from..to)
-                        .filter(|position| slots.get(*position).is_some_and(Option::is_none))
-                        .collect();
-                    if positions.is_empty() {
-                        continue;
+                let mut repins = Vec::new();
+                for (index, (group, pins_of)) in pools.groups.iter().zip(&pins.groups).enumerate() {
+                    for (rank, pool) in group.ranks.iter().enumerate() {
+                        let Some(slots) = pins_of.slots[rank].as_ref() else {
+                            continue;
+                        };
+                        let positions: Vec<usize> = pins_of
+                            .fetching
+                            .iter()
+                            .copied()
+                            .filter(|&position| slots.get(position).is_some_and(Option::is_none))
+                            .collect();
+                        if !positions.is_empty() {
+                            let keys = positions
+                                .iter()
+                                .map(|&position| pins_of.keys[position])
+                                .collect();
+                            repins.push((index, rank, pool.clone(), keys, positions));
+                        }
                     }
-                    let keys = positions.iter().map(|position| keys[*position]).collect();
+                }
+                let mut awaiting = 0;
+                for (group, rank, pool, keys, positions) in repins {
                     if self.submit(
                         pool.client,
                         &Request::Pin {
@@ -541,6 +806,7 @@ impl KvOffloadManager {
                         },
                         Purpose::Repin {
                             request,
+                            group,
                             rank,
                             positions,
                         },
@@ -551,7 +817,7 @@ impl KvOffloadManager {
                 let pins = self.pins.get_mut(&request)?;
                 if awaiting == 0 {
                     pins.stage = Stage::Settled;
-                    return Some(Self::run(pins));
+                    return Some(Self::boundary(&pools, pins, false));
                 }
                 pins.stage = Stage::Repinning { awaiting };
                 None
@@ -559,68 +825,72 @@ impl KvOffloadManager {
         }
     }
 
-    /// The leading run of pages every rank pinned.
-    fn run(pins: &Pins) -> usize {
-        pins.slots
-            .iter()
-            .map(|slots| {
-                slots.as_ref().map_or(0, |slots| {
-                    slots.iter().take_while(|slot| slot.is_some()).count()
-                })
-            })
-            .min()
-            .unwrap_or(0)
-    }
-
-    /// Admit `request` with its pinned pages: returns the hit's first page
-    /// and its pages. The pins past the hit end now; the hit's end when its
-    /// reads are done ([`KvOffloadManager::loaded`]) or the request leaves
+    /// Admit `request` with its pinned pages: returns the device match and
+    /// the hit's boundary, when the hit goes past the match. The pins of
+    /// pages the hit does not load end now; the hit's when its loads are
+    /// done ([`KvOffloadManager::loaded`]) or the request leaves
     /// ([`KvOffloadManager::sweep`]).
     pub(crate) fn admit(&mut self, request: RequestId) -> Option<(usize, usize)> {
         let pins = self.pins.remove(&request)?;
-        let pages = Self::run(&pins);
-        let group = self.groups.get(&pins.worker)?.clone();
-        let mut slots = Vec::with_capacity(group.ranks.len());
-        for (rank, pool) in group.ranks.iter().enumerate() {
-            let pinned = pins.slots[rank].clone().unwrap_or_default();
-            let extra: Vec<Key> = pins
-                .keys
-                .iter()
-                .zip(&pinned)
-                .skip(pages)
-                .filter(|(_, slot)| slot.is_some())
-                .map(|(key, _)| *key)
-                .collect();
-            if !extra.is_empty() {
-                self.unpin(pool, extra);
+        self.fetches.retain(|_, waiting| *waiting != request);
+        let pools = self.workers.get(&pins.worker)?.clone();
+        let boundary = Self::boundary(&pools, &pins, false);
+        let mut groups = Vec::with_capacity(pools.groups.len());
+        for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
+            // A full-attention group loads its pages from the device match
+            // to the boundary; a sliding window those of its window.
+            let needed = group.manager.needed_pages(boundary);
+            let loaded = needed.start.max(pins_of.first)..needed.end.max(pins_of.first);
+            let positions = loaded.start - pins_of.first..loaded.end - pins_of.first;
+            let mut slots = Vec::with_capacity(group.ranks.len());
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                let pinned = pins_of.slots[rank].clone().unwrap_or_default();
+                let extra: Vec<Key> = pins_of
+                    .keys
+                    .iter()
+                    .zip(&pinned)
+                    .enumerate()
+                    .filter(|(position, (_, slot))| slot.is_some() && !positions.contains(position))
+                    .map(|(_, (key, _))| *key)
+                    .collect();
+                if !extra.is_empty() {
+                    self.unpin(pool, extra);
+                }
+                slots.push(
+                    positions
+                        .clone()
+                        .filter_map(|position| pinned.get(position).copied().flatten())
+                        .collect(),
+                );
             }
-            slots.push(pinned.iter().take(pages).flatten().copied().collect());
+            groups.push(GroupHit {
+                first: loaded.start,
+                keys: pins_of.keys[positions].to_vec(),
+                slots,
+            });
         }
-        if pages == 0 {
+        if boundary <= pins.device {
             return None;
         }
-        let start = pins.start;
         self.hits.insert(
             request,
             Hit {
-                start,
                 worker: pins.worker,
-                keys: pins.keys[..pages].to_vec(),
-                slots,
+                groups,
                 sent: false,
             },
         );
-        Some((start, pages))
+        Some((pins.device, boundary))
     }
 
-    /// Release `request`'s admission pins: it left the queue, or its L1
+    /// Release `request`'s admission pins: it left the queue, or its device
     /// match changed.
     pub(crate) fn release(&mut self, request: RequestId) {
         let Some(pins) = self.pins.remove(&request) else {
             return;
         };
         self.fetches.retain(|_, waiting| *waiting != request);
-        let Some(group) = self.groups.get(&pins.worker).cloned() else {
+        let Some(pools) = self.workers.get(&pins.worker).cloned() else {
             return;
         };
         // Pins still in flight are released when their answers arrive, for
@@ -631,17 +901,20 @@ impl KvOffloadManager {
             let orphan = match purpose {
                 Purpose::Pin {
                     request: pinned,
+                    group,
                     rank,
-                } if *pinned == request => Some((*rank, pins.keys.clone())),
+                } if *pinned == request => Some((*group, *rank, pins.groups[*group].keys.clone())),
                 Purpose::Repin {
                     request: pinned,
+                    group,
                     rank,
                     positions,
                 } if *pinned == request => Some((
+                    *group,
                     *rank,
                     positions
                         .iter()
-                        .map(|position| pins.keys[*position])
+                        .map(|position| pins.groups[*group].keys[*position])
                         .collect(),
                 )),
                 Purpose::Lookup {
@@ -652,8 +925,11 @@ impl KvOffloadManager {
                 }
                 _ => None,
             };
-            if let Some((rank, keys)) = orphan
-                && let Some(pool) = group.ranks.get(rank)
+            if let Some((group, rank, keys)) = orphan
+                && let Some(pool) = pools
+                    .groups
+                    .get(group)
+                    .and_then(|group| group.ranks.get(rank))
             {
                 *purpose = Purpose::Orphan {
                     pool: pool.clone(),
@@ -661,10 +937,12 @@ impl KvOffloadManager {
                 };
             }
         }
-        for (rank, pool) in group.ranks.iter().enumerate() {
-            let pinned = Self::pinned(&pins.keys, pins.slots[rank].as_deref());
-            if !pinned.is_empty() {
-                self.unpin(pool, pinned);
+        for (group, pins_of) in pools.groups.iter().zip(&pins.groups) {
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                let pinned = Self::pinned(&pins_of.keys, pins_of.slots[rank].as_deref());
+                if !pinned.is_empty() {
+                    self.unpin(pool, pinned);
+                }
             }
         }
     }
@@ -690,47 +968,53 @@ impl KvOffloadManager {
         );
     }
 
-    /// The page loads of `request`'s hit, once: `units(page)` names the
-    /// units of an absolute page of the request's table, freshly allocated
-    /// for the hit. Empty for a request without a hit or whose reads a
-    /// batch already carries.
+    /// The page loads of `request`'s hit, once: `units(group, page)` names
+    /// the units of an absolute page of the request's table of `group`,
+    /// freshly allocated for the hit. Empty for a request without a hit or
+    /// whose loads a batch already carries.
     pub(crate) fn loads(
         &mut self,
         request: RequestId,
-        units: impl Fn(usize) -> Option<Vec<UnitId>>,
+        units: impl Fn(usize, usize) -> Option<Vec<UnitId>>,
     ) -> Vec<PageCopy> {
         let Some(hit) = self.hits.get_mut(&request).filter(|hit| !hit.sent) else {
             return Vec::new();
         };
-        let Some(group) = self.groups.get(&hit.worker) else {
+        let Some(pools) = self.workers.get(&hit.worker) else {
             return Vec::new();
         };
         hit.sent = true;
         let mut copies = Vec::new();
-        for (rank, pool) in group.ranks.iter().enumerate() {
-            for (index, slot) in hit.slots[rank].iter().enumerate() {
-                if let Some(units) = units(hit.start + index) {
-                    copies.push(PageCopy {
-                        rank: rank as u32,
-                        pool: pool.pool,
-                        group_id: 0,
-                        slot: *slot,
-                        units,
-                    });
+        for (index, (group, hit_of)) in pools.groups.iter().zip(&hit.groups).enumerate() {
+            for (rank, pool) in group.ranks.iter().enumerate() {
+                for (offset, slot) in hit_of.slots[rank].iter().enumerate() {
+                    if let Some(units) = units(index, hit_of.first + offset) {
+                        copies.push(PageCopy {
+                            rank: rank as u32,
+                            pool: pool.pool,
+                            group_id: index as u32,
+                            slot: *slot,
+                            units,
+                        });
+                    }
                 }
             }
         }
         copies
     }
 
-    /// The pages of `request`'s hit, which hold the host KV cache's bytes already.
-    pub(crate) fn hit_pages(&self, request: RequestId) -> std::ops::Range<usize> {
-        self.hits
-            .get(&request)
-            .map_or(0..0, |hit| hit.start..hit.start + hit.keys.len())
+    /// The pages of `request`'s hit of each cache group, which hold the
+    /// host KV cache's bytes already; empty without a hit.
+    pub(crate) fn hit_pages(&self, request: RequestId) -> Vec<Range<usize>> {
+        self.hits.get(&request).map_or_else(Vec::new, |hit| {
+            hit.groups
+                .iter()
+                .map(|group| group.first..group.first + group.keys.len())
+                .collect()
+        })
     }
 
-    /// `request`'s reads were accepted: its pins end.
+    /// `request`'s loads were accepted: its pins end.
     pub(crate) fn loaded(&mut self, request: RequestId) {
         if self.hits.get(&request).is_some_and(|hit| hit.sent) {
             self.drop_hit(request);
@@ -741,11 +1025,16 @@ impl KvOffloadManager {
         let Some(hit) = self.hits.remove(&request) else {
             return;
         };
-        let Some(group) = self.groups.get(&hit.worker).cloned() else {
+        let Some(pools) = self.workers.get(&hit.worker).cloned() else {
             return;
         };
-        for pool in &group.ranks {
-            self.unpin(pool, hit.keys.clone());
+        for (group, hit_of) in pools.groups.iter().zip(hit.groups) {
+            if hit_of.keys.is_empty() {
+                continue;
+            }
+            for pool in &group.ranks {
+                self.unpin(pool, hit_of.keys.clone());
+            }
         }
     }
 
@@ -777,11 +1066,23 @@ impl KvOffloadManager {
                 .any(|pins| matches!(pins.stage, Stage::Fetching { .. }))
     }
 
-    /// Write published pages of `worker` to the host KV cache: `keys[i]` is the key
-    /// of the page `pages[i]` references. A slot is reserved for each page
-    /// in every rank's pool; a reserved page waits for a batch of `worker`.
-    pub(crate) fn offload(&mut self, worker: &WorkerGroupId, keys: Vec<Key>, pages: Vec<PageRef>) {
-        let Some(group) = self.groups.get(worker).cloned() else {
+    /// Offload published pages of `worker`'s cache group `group` to the host
+    /// KV cache: `keys[i]` is the key of the page `pages[i]` references. A
+    /// slot is reserved for each page in every rank's pool; a reserved page
+    /// waits for a batch of `worker`. A window that a rank's pool cannot
+    /// reserve whole is not offloaded to it.
+    pub(crate) fn offload(
+        &mut self,
+        worker: &WorkerGroupId,
+        group: usize,
+        keys: Vec<Key>,
+        pages: Vec<PageRef>,
+        kind: OffloadKind,
+    ) {
+        let Some(pools) = self.workers.get(worker).cloned() else {
+            return;
+        };
+        let Some(cache) = pools.groups.get(group) else {
             return;
         };
         if keys.is_empty() || keys.len() != pages.len() {
@@ -790,15 +1091,25 @@ impl KvOffloadManager {
         let id = self.next_reservation;
         self.next_reservation += 1;
         let mut submitted = 0;
-        for (rank, pool) in group.ranks.iter().enumerate() {
+        for (rank, pool) in cache.ranks.iter().enumerate() {
+            let window = match kind {
+                OffloadKind::Pages => None,
+                OffloadKind::Window { anchor } => Some(PageWindow {
+                    anchor: anchor.and_then(|(group, key)| {
+                        let pool = pools.groups.get(group)?.ranks.get(rank)?.pool;
+                        Some(PageAnchor { pool, key })
+                    }),
+                }),
+            };
             if self.submit(
                 pool.client,
                 &Request::Reserve {
                     pool: pool.pool,
                     writer: pool.scope.clone(),
                     keys: keys.clone(),
+                    window,
                 },
-                Purpose::Reserve { write: id, rank },
+                Purpose::Reserve { offload: id, rank },
             ) {
                 submitted += 1;
             }
@@ -808,20 +1119,22 @@ impl KvOffloadManager {
                 id,
                 Reservation {
                     worker: worker.clone(),
+                    group,
                     keys,
                     pages: pages.into_iter().map(Arc::new).collect(),
-                    answered: group.ranks.len() - submitted,
+                    window: matches!(kind, OffloadKind::Window { .. }),
+                    answered: cache.ranks.len() - submitted,
                 },
             );
         }
     }
 
-    /// Whether published pages are still on their way to the host KV cache: slots
-    /// being reserved, writes waiting for or carried by a batch, or their
-    /// commits unanswered.
+    /// Whether published pages are still on their way to the host KV cache:
+    /// slots being reserved, offloads waiting for or carried by a batch, or
+    /// their commits unanswered.
     pub(crate) fn offloading(&self) -> bool {
         !self.reservations.is_empty()
-            || self.queued.values().any(|writes| !writes.is_empty())
+            || self.queued.values().any(|offloads| !offloads.is_empty())
             || !self.carried.is_empty()
             || self
                 .pending
@@ -833,17 +1146,21 @@ impl KvOffloadManager {
     pub(crate) fn queued_workers(&self) -> Vec<WorkerGroupId> {
         self.queued
             .iter()
-            .filter(|(_, writes)| !writes.is_empty())
+            .filter(|(_, offloads)| !offloads.is_empty())
             .map(|(worker, _)| worker.clone())
             .collect()
     }
 
-    /// The page offloads queued for `worker`, which the batch `batch` carries.
+    /// The page offloads queued for `worker`, which the batch `batch`
+    /// carries.
     pub(crate) fn take_offloads(&mut self, worker: &WorkerGroupId, batch: u64) -> Vec<PageCopy> {
-        let Some(writes) = self.queued.remove(worker) else {
+        let Some(offloads) = self.queued.remove(worker) else {
             return Vec::new();
         };
-        let copies: Vec<PageCopy> = writes.iter().map(|write| write.copy.clone()).collect();
+        let copies: Vec<PageCopy> = offloads
+            .iter()
+            .map(|offload| offload.copy.clone())
+            .collect();
         tracing::debug!(
             worker = %worker.0,
             batch,
@@ -854,26 +1171,26 @@ impl KvOffloadManager {
             .entry(batch)
             .or_insert_with(|| (worker.clone(), Vec::new()))
             .1
-            .extend(writes);
+            .extend(offloads);
         copies
     }
 
-    /// The batch `batch` completed: the pages it wrote are committed when
-    /// every call of it succeeded, and aborted otherwise.
+    /// The batch `batch` completed: the pages it offloaded are committed
+    /// when every call of it succeeded, and aborted otherwise.
     pub(crate) fn completed(&mut self, batch: u64, succeeded: bool) {
-        let Some((_, writes)) = self.carried.remove(&batch) else {
+        let Some((_, offloads)) = self.carried.remove(&batch) else {
             return;
         };
-        self.settle(writes, succeeded);
+        self.settle(offloads, succeeded);
     }
 
-    fn settle(&mut self, writes: Vec<Write>, succeeded: bool) {
+    fn settle(&mut self, offloads: Vec<Offload>, succeeded: bool) {
         let mut by_pool: HashMap<(usize, u64), Vec<Key>> = HashMap::new();
-        for write in &writes {
+        for offload in &offloads {
             by_pool
-                .entry((write.client, write.copy.pool))
+                .entry((offload.client, offload.copy.pool))
                 .or_default()
-                .push(write.key);
+                .push(offload.key);
         }
         for ((client, pool), keys) in by_pool {
             let request = if succeeded {
@@ -885,7 +1202,7 @@ impl KvOffloadManager {
         }
     }
 
-    /// `worker`'s ranks were replaced: the writes waiting for its batches
+    /// `worker`'s ranks were replaced: the offloads waiting for its batches
     /// and those its batches carried are aborted, and its admission pins
     /// released.
     pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
@@ -897,8 +1214,8 @@ impl KvOffloadManager {
             .map(|(batch, _)| *batch)
             .collect();
         for batch in batches {
-            if let Some((_, writes)) = self.carried.remove(&batch) {
-                lost.extend(writes);
+            if let Some((_, offloads)) = self.carried.remove(&batch) {
+                lost.extend(offloads);
             }
         }
         self.settle(lost, false);
@@ -951,7 +1268,14 @@ impl KvOffloadManager {
                 continue;
             };
             match (purpose, answer.reply) {
-                (Purpose::Pin { request, rank }, reply) => {
+                (
+                    Purpose::Pin {
+                        request,
+                        group,
+                        rank,
+                    },
+                    reply,
+                ) => {
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
                         other => {
@@ -960,26 +1284,34 @@ impl KvOffloadManager {
                         }
                     };
                     if let Some(pins) = self.pins.get_mut(&request) {
-                        pins.slots[rank] = Some(slots);
+                        pins.groups[group].slots[rank] = Some(slots);
                         admissions = true;
                     }
                 }
-                (Purpose::Lookup { request, rank }, reply) => {
-                    let l3 = match reply {
-                        Reply::Lookup { l3, .. } => l3 as usize,
+                (
+                    Purpose::Lookup {
+                        request,
+                        group,
+                        rank,
+                    },
+                    reply,
+                ) => {
+                    let levels = match reply {
+                        Reply::Lookup { levels } => levels,
                         other => {
                             tracing::warn!(?other, "a host KV cache lookup failed");
-                            0
+                            Vec::new()
                         }
                     };
                     if let Some(pins) = self.pins.get_mut(&request) {
-                        pins.l3[rank] = Some(l3);
+                        pins.groups[group].levels[rank] = Some(levels);
                         admissions = true;
                     }
                 }
                 (
                     Purpose::Repin {
                         request,
+                        group,
                         rank,
                         positions,
                     },
@@ -993,7 +1325,7 @@ impl KvOffloadManager {
                         }
                     };
                     if let Some(pins) = self.pins.get_mut(&request) {
-                        if let Some(pinned) = pins.slots[rank].as_mut() {
+                        if let Some(pinned) = pins.groups[group].slots[rank].as_mut() {
                             for (position, slot) in positions.into_iter().zip(slots) {
                                 if let Some(entry) = pinned.get_mut(position) {
                                     *entry = slot;
@@ -1014,7 +1346,7 @@ impl KvOffloadManager {
                         }
                     }
                 }
-                (Purpose::Reserve { write, rank }, reply) => {
+                (Purpose::Reserve { offload, rank }, reply) => {
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
                         other => {
@@ -1022,7 +1354,7 @@ impl KvOffloadManager {
                             Vec::new()
                         }
                     };
-                    self.reserved(write, rank, &slots);
+                    self.reserved(offload, rank, &slots);
                 }
                 (Purpose::Settle, Reply::Error { kind, message }) => {
                     tracing::warn!(?kind, message, "a host KV cache request failed");
@@ -1034,44 +1366,68 @@ impl KvOffloadManager {
     }
 
     /// `rank` answered reservation `id` with `slots`: its reserved pages
-    /// wait for a batch.
+    /// wait for a batch. A window whose pages the pool could not all store
+    /// is aborted on that rank: a window missing one page is useless.
     fn reserved(&mut self, id: u64, rank: usize, slots: &[PageSlot]) {
         let Some(reservation) = self.reservations.get_mut(&id) else {
             return;
         };
         let pool = self
-            .groups
+            .workers
             .get(&reservation.worker)
+            .and_then(|pools| pools.groups.get(reservation.group))
             .and_then(|group| group.ranks.get(rank))
             .map(|pool| (pool.client, pool.pool));
+        let whole = slots.len() == reservation.keys.len()
+            && slots.iter().all(|slot| !matches!(slot, PageSlot::Full));
+        let mut aborted = None;
         if let Some((client, pool)) = pool {
-            for ((key, page), slot) in reservation.keys.iter().zip(&reservation.pages).zip(slots) {
-                if let PageSlot::Reserved { slot } = slot {
-                    self.queued
-                        .entry(reservation.worker.clone())
-                        .or_default()
-                        .push(Write {
-                            client,
-                            copy: PageCopy {
-                                rank: rank as u32,
-                                pool,
-                                group_id: 0,
-                                slot: *slot,
-                                units: page.units().to_vec(),
-                            },
-                            key: *key,
-                            _page: Arc::clone(page),
-                        });
+            if reservation.window && !whole {
+                let keys: Vec<Key> = reservation
+                    .keys
+                    .iter()
+                    .zip(slots)
+                    .filter(|(_, slot)| matches!(slot, PageSlot::Reserved { .. }))
+                    .map(|(key, _)| *key)
+                    .collect();
+                aborted = Some((client, pool, keys));
+            } else {
+                for ((key, page), slot) in
+                    reservation.keys.iter().zip(&reservation.pages).zip(slots)
+                {
+                    if let PageSlot::Reserved { slot } = slot {
+                        self.queued
+                            .entry(reservation.worker.clone())
+                            .or_default()
+                            .push(Offload {
+                                client,
+                                copy: PageCopy {
+                                    rank: rank as u32,
+                                    pool,
+                                    group_id: reservation.group as u32,
+                                    slot: *slot,
+                                    units: page.units().to_vec(),
+                                },
+                                key: *key,
+                                _page: Arc::clone(page),
+                            });
+                    }
                 }
             }
         }
         reservation.answered += 1;
         let done = self
-            .groups
+            .workers
             .get(&reservation.worker)
+            .and_then(|pools| pools.groups.get(reservation.group))
             .is_none_or(|group| reservation.answered >= group.ranks.len());
         if done {
             self.reservations.remove(&id);
+        }
+        if let Some((client, pool, keys)) = aborted
+            && !keys.is_empty()
+        {
+            self.submit(client, &Request::Abort { pool, keys }, Purpose::Settle);
         }
     }
 }
@@ -1088,6 +1444,7 @@ mod tests {
     use storage_server::Server;
 
     use super::*;
+    use crate::kv_cache::BlockPool;
 
     /// A Storage Server on a socket of its own, with pools of 64 pages of
     /// 16 bytes, stopped when dropped.
@@ -1167,9 +1524,9 @@ mod tests {
         })
     }
 
-    #[test]
-    fn admission_prefetches_a_long_distributed_hit_and_pins_what_arrived() {
-        let server = Running::start();
+    /// A worker of one rank on `server`, which maps a page pool for each of
+    /// `contents`, and the pools.
+    fn worker_pools(server: &Running, contents: &[u8]) -> (Client, Vec<u64>) {
         let scope = Scope {
             deployment: "model".into(),
             group: "text".into(),
@@ -1184,44 +1541,93 @@ mod tests {
             },
         )
         .unwrap();
-        let shape = PageShape {
-            content: Key([3; 32]),
+        let pools = contents
+            .iter()
+            .map(|content| {
+                let shape = PageShape {
+                    content: Key([*content; 32]),
+                    kv_head_offset: 0,
+                    kv_head_count: 8,
+                    page_bytes: 16,
+                };
+                let request = Request::PagePool {
+                    shape,
+                    numa_node: None,
+                };
+                let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
+                    panic!("the page pool was refused");
+                };
+                pool
+            })
+            .collect();
+        (worker, pools)
+    }
+
+    /// A cache group of pages of 64 tokens, of full attention or of a
+    /// sliding window of `window` tokens.
+    fn cache_group(window: Option<u32>) -> CacheGroup {
+        CacheGroup {
+            kind: window.map_or(CacheGroupKind::Full, |window| {
+                CacheGroupKind::SlidingWindow { window }
+            }),
+            block_size: 64,
+            units_per_page: 1,
+            layer_ids: vec![0],
+            num_kv_heads: 8,
+            total_kv_heads: 8,
             kv_head_offset: 0,
-            kv_head_count: 8,
-            page_bytes: 16,
-        };
-        let request = Request::PagePool {
-            shape,
-            numa_node: None,
-        };
-        let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
-            panic!("the page pool was refused");
-        };
+            head_dim: 128,
+        }
+    }
+
+    /// The prefix cache report of a rank with `groups`, whose page pools
+    /// are `pools` of contents `contents`.
+    fn report(groups: Vec<CacheGroup>, pools: &[u64], contents: &[u8]) -> PrefixCacheInfo {
+        PrefixCacheInfo {
+            num_units: 64,
+            dtype: PrefixCacheDtype::BFloat16,
+            groups,
+            page_pools: pools
+                .iter()
+                .zip(contents)
+                .enumerate()
+                .map(|(group, (pool, content))| PagePoolInfo {
+                    group_id: group as u32,
+                    pool: *pool,
+                    content: [*content; 32],
+                    endpoint: None,
+                })
+                .collect(),
+            scratch_units: 0,
+        }
+    }
+
+    /// Poll `kv_offload` until `done` holds, for at most ten seconds.
+    fn poll_until(
+        kv_offload: &mut KvOffloadManager,
+        mut done: impl FnMut(&mut KvOffloadManager) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(kv_offload) {
+            assert!(
+                Instant::now() < deadline,
+                "the host KV cache did not answer"
+            );
+            kv_offload.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn admission_prefetches_a_long_distributed_hit_and_pins_what_arrived() {
+        let server = Running::start();
+        let (_worker, pools) = worker_pools(&server, &[3]);
         let stop = Arc::new(AtomicBool::new(false));
         let mooncake = connector(&server.socket, Arc::clone(&stop));
 
-        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model").unwrap();
-        let cache = PrefixCacheInfo {
-            num_units: 64,
-            dtype: PrefixCacheDtype::BFloat16,
-            groups: vec![CacheGroup {
-                kind: CacheGroupKind::Full,
-                block_size: 64,
-                units_per_page: 1,
-                layer_ids: vec![0],
-                num_kv_heads: 8,
-                total_kv_heads: 8,
-                kv_head_offset: 0,
-                head_dim: 128,
-            }],
-            page_pools: vec![PagePoolInfo {
-                group_id: 0,
-                pool,
-                content: [3; 32],
-                endpoint: None,
-            }],
-            scratch_units: 0,
-        };
+        let mut kv_offload =
+            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+        let cache = report(vec![cache_group(None)], &pools, &[3]);
         let text = WorkerGroupId("text".into());
         assert!(kv_offload.add_worker(
             &text,
@@ -1234,20 +1640,132 @@ mod tests {
         // Eight pages that only L3 holds: 512 tokens are worth a prefetch,
         // and every page arrives within the wait.
         let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
-        let keys = kv_offload.page_keys(&text, &prompt, None, 8);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let pages = loop {
-            kv_offload.poll();
-            if let Some(pages) = kv_offload.admission(RequestId(1), &text, &keys, 0) {
-                break pages;
-            }
-            assert!(Instant::now() < deadline, "the admission did not settle");
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        assert_eq!(pages, 8);
-        assert_eq!(kv_offload.admit(RequestId(1)), Some((0, 8)));
+        let keys = kv_offload.page_keys(&text, &prompt, None, 512);
+        let mut boundary = None;
+        poll_until(&mut kv_offload, |kv_offload| {
+            boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512);
+            boundary.is_some()
+        });
+        assert_eq!(boundary, Some(512));
+        assert_eq!(kv_offload.admit(RequestId(1)), Some((0, 512)));
 
         stop.store(true, Ordering::Release);
         mooncake.join().unwrap();
+    }
+
+    /// A hybrid worker's hit ends at the deepest boundary whose sliding
+    /// window the host KV cache holds, though its full-attention pages go
+    /// further: the full-attention group loads every page before the
+    /// boundary, the sliding window only the pages of its window.
+    #[test]
+    fn a_hybrid_hit_ends_at_the_deepest_window_the_host_holds() {
+        let server = Running::start();
+        let (_worker, pools) = worker_pools(&server, &[4, 5]);
+        let mut kv_offload =
+            KvOffloadManager::connect(&server.socket, "model", DEFAULT_BOUNDARY_INTERVAL).unwrap();
+        let cache = report(
+            vec![cache_group(None), cache_group(Some(128))],
+            &pools,
+            &[4, 5],
+        );
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+
+        // A request offloaded ten full-attention pages and the window before
+        // token 384 (pages 4 and 5), anchored to the full page before it.
+        let prompt: Vec<u32> = (0..10 * 64 + 1).collect();
+        let keys = kv_offload.page_keys(&text, &prompt, None, prompt.len());
+        let block_pool = BlockPool::new(64, 0);
+        kv_offload.offload(
+            &text,
+            0,
+            keys[0][..10].to_vec(),
+            block_pool.allocate(10, 1).unwrap(),
+            OffloadKind::Pages,
+        );
+        kv_offload.offload(
+            &text,
+            1,
+            keys[1][4..6].to_vec(),
+            block_pool.allocate(2, 1).unwrap(),
+            OffloadKind::Window {
+                anchor: Some((0, keys[0][5])),
+            },
+        );
+        let mut copies = Vec::new();
+        poll_until(&mut kv_offload, |kv_offload| {
+            copies.extend(kv_offload.take_offloads(&text, 1));
+            copies.len() == 12
+        });
+        kv_offload.completed(1, true);
+        poll_until(&mut kv_offload, |kv_offload| !kv_offload.offloading());
+
+        // Every boundary past 384 lacks its window: the walk passes them.
+        let mut boundary = None;
+        poll_until(&mut kv_offload, |kv_offload| {
+            boundary = kv_offload.admission(RequestId(2), &text, &keys, 0, 640);
+            boundary.is_some()
+        });
+        assert_eq!(boundary, Some(384));
+        assert_eq!(kv_offload.admit(RequestId(2)), Some((0, 384)));
+        let loads: Vec<(u32, u32)> = kv_offload
+            .loads(RequestId(2), |_, page| Some(vec![UnitId(page as u32 + 1)]))
+            .iter()
+            .map(|copy| (copy.group_id, copy.units[0].0 - 1))
+            .collect();
+        assert_eq!(
+            loads,
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (0, 5),
+                (1, 4),
+                (1, 5)
+            ]
+        );
+    }
+
+    /// A prompt offloads its sliding windows before every interval of pages
+    /// of the largest block size, before the last boundary a reissue of it
+    /// reuses, and before the last boundary of its published pages.
+    #[test]
+    fn sliding_windows_offload_before_aligned_boundaries() {
+        let server = Running::start();
+        let (_worker, pools) = worker_pools(&server, &[6, 7]);
+        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model", 4).unwrap();
+        let cache = report(
+            vec![cache_group(None), cache_group(Some(128))],
+            &pools,
+            &[6, 7],
+        );
+        let text = WorkerGroupId("text".into());
+        assert!(kv_offload.add_worker(
+            &text,
+            &[RankCache {
+                local: true,
+                cache: &cache,
+            }]
+        ));
+        // Intervals of four pages of 64 tokens: 256 and 512. A reissue of
+        // the 640-token prompt reuses up to 576, and its last page ends at
+        // 640.
+        assert_eq!(
+            kv_offload.offload_boundaries(&text, 640, 0, 640),
+            [256, 512, 576, 640]
+        );
+        // A call that computed tokens 300..600 reached two of them.
+        assert_eq!(
+            kv_offload.offload_boundaries(&text, 640, 300, 600),
+            [512, 576]
+        );
     }
 }
