@@ -32,7 +32,7 @@ use crate::scheduler::{
 };
 use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
-use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
+use crate::scheduler::{SchedulerConfig, SchedulerStats};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
@@ -40,6 +40,7 @@ use anyhow::Context as _;
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
+use proto::request::{ExpertExchange, SchedulingPolicy};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -351,7 +352,7 @@ pub struct EngineConfig {
     /// keeps its share of every expert layer and exchanges tokens with the
     /// others at those layers, while attention and every other layer stay
     /// data-parallel. `None` keeps every expert on every scheduler.
-    pub expert_parallel: Option<crate::worker::ExpertExchange>,
+    pub expert_parallel: Option<ExpertExchange>,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
@@ -521,17 +522,14 @@ impl SchedulerHandle {
             anyhow::ensure!(
                 matches!(
                     config.expert_parallel,
-                    Some(
-                        crate::worker::ExpertExchange::DeepEp
-                            | crate::worker::ExpertExchange::MegaMoe
-                    )
+                    Some(ExpertExchange::DeepEp | ExpertExchange::MegaMoe)
                 ) && core_groups.iter().all(|core_group| core_group.len() == 1),
                 "disaggregated experts require deepep or megamoe and one model group per scheduler"
             );
         } else {
             anyhow::ensure!(
                 config.expert_parallel.is_none()
-                    || (config.expert_parallel != Some(crate::worker::ExpertExchange::DeepEp)
+                    || (config.expert_parallel != Some(ExpertExchange::DeepEp)
                         && size > 1
                         && core_groups.iter().all(|core_group| {
                             core_group.len() == 1 && core_group[0].ranks.len() == 1
@@ -1149,7 +1147,7 @@ mod tests {
                     WorkerGroupConfig::single_component("model", ranks),
                 ),
                 data_parallel_size: cores,
-                expert_parallel: Some(crate::worker::ExpertExchange::AllToAll),
+                expert_parallel: Some(ExpertExchange::AllToAll),
                 ..EngineConfig::sim("sim-model")
             };
             let error = SchedulerHandle::start_all(config)

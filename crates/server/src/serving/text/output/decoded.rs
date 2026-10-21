@@ -1,6 +1,6 @@
 //! Incremental conversion from engine events to decoded text events.
 //!
-//! [`decoded_text_event_stream`] consumes one generation request's `EventRx`,
+//! [`decoded_text_event_stream`] consumes one generation request's `EventStream`,
 //! checks the engine event protocol, detokenizes generated tokens with the
 //! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
 //! strings, and passes image events through in order. `serving::assembly`
@@ -9,13 +9,13 @@
 //! The decoder also reports its stop-string decisions to the engine: it
 //! acknowledges each token only after checking that it completes no stop
 //! string, and on a match stops generation with
-//! `EventRx::cancel_at_consumed_prefix`.
+//! `EventStream::cancel_at_consumed_prefix`.
 
 use std::sync::Arc;
 
+use crate::client::EventStream;
 use asynk_strim_attr::{TryYielder, try_stream};
-use engine::EventRx;
-use engine::{Event, PositionLogprobs, RejectionKind};
+use proto::request::{Event, PositionLogprobs, RejectionKind};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 
@@ -250,7 +250,7 @@ impl DecodeState<'_> {
         prompt_tokens: usize,
         token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
-        raw_stream: &mut EventRx,
+        raw_stream: &mut EventStream,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
         // Images completed before these tokens stay ordered ahead of them.
@@ -275,7 +275,8 @@ impl DecodeState<'_> {
 
             // Stop generation at exactly the tokens received so far, which
             // include this one.
-            raw_stream.cancel_at_consumed_prefix(engine::StreamCancelCause::StopStringMatched);
+            raw_stream
+                .cancel_at_consumed_prefix(crate::client::StreamCancelCause::StopStringMatched);
             let truncate_to = Some(if self.options.include_stop_str_in_output {
                 offset + stop_string.len()
             } else {
@@ -362,7 +363,7 @@ pub async fn decoded_text_event_stream(
     prompt_token_ids: Vec<u32>,
     prompt_logprobs_requested: bool,
     generated_logprobs_requested: bool,
-    mut raw_stream: EventRx,
+    mut raw_stream: EventStream,
     decode_options: TextDecodeOptions,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::serving::text::Result<()> {

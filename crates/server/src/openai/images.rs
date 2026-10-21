@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt as _};
 
 use crate::frontend::Engine;
 use crate::http::RequestId;
-use engine::GenerationConstraint;
+use proto::request::GenerationConstraint;
 
 use crate::openai::{
     ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,

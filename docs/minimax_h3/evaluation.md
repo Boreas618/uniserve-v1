@@ -119,7 +119,7 @@ export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Ste
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs-enlarged --reuse-deployment
 ```
 
-Start the daemon of `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
+Start the daemon of `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside UniServe's daemon, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
 
 ## OmniRef on H200
 

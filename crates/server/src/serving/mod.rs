@@ -28,7 +28,7 @@ pub mod video;
 use std::pin::Pin;
 use std::time::Instant;
 
-use engine::EventRx;
+use crate::client::EventStream;
 use futures::Stream;
 
 pub use error::{ServeError, TokenizeError};
@@ -75,7 +75,7 @@ pub(crate) fn generation_output(
     started: Instant,
     compile_us: u64,
     output: OutputParams,
-    events: EventRx,
+    events: EventStream,
 ) -> RequestOutputStream {
     Box::pin(assembly::generation_output(
         request_id, started, compile_us, output, events,
@@ -89,7 +89,7 @@ pub(crate) fn media_output(
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,
-    events: EventRx,
+    events: EventStream,
 ) -> RequestOutputStream {
     Box::pin(assembly::media_output(
         request_id,
@@ -102,10 +102,10 @@ pub(crate) fn media_output(
 
 #[cfg(test)]
 mod tests {
-    use engine::Event;
-    use engine::EventRx;
+    use crate::client::EventStream;
     use futures::StreamExt as _;
-    use ipc::TokenLogprob;
+    use proto::request::Event;
+    use proto::request::TokenLogprob;
 
     use super::*;
     use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -117,7 +117,7 @@ mod tests {
         processor: ChatOutputProcessor,
         decode: TextDecodeOptions,
         logprobs: bool,
-        events: EventRx,
+        events: EventStream,
     ) -> RequestOutputStream {
         generation_output(
             "request".into(),
@@ -136,17 +136,17 @@ mod tests {
     }
 
     /// An engine stream of `events` after the request's scheduling.
-    fn engine_events(events: impl IntoIterator<Item = Event>) -> EventRx {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        tx.try_send(Event::Scheduled {
+    fn engine_events(events: impl IntoIterator<Item = Event>) -> EventStream {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
         for event in events {
-            tx.try_send(event).unwrap();
+            tx.send(event).unwrap();
         }
-        EventRx::from_receiver(rx)
+        EventStream::detached(rx)
     }
 
     fn text_token(byte: u8) -> Event {
@@ -156,7 +156,7 @@ mod tests {
         }
     }
 
-    fn finished(reason: engine::FinishReason, completion_tokens: usize) -> Event {
+    fn finished(reason: proto::request::FinishReason, completion_tokens: usize) -> Event {
         Event::Finished {
             reason,
             stop_reason: None,
@@ -189,7 +189,7 @@ mod tests {
                     rank: 3,
                 }],
             },
-            finished(engine::FinishReason::MaxTokens, 1),
+            finished(proto::request::FinishReason::MaxTokens, 1),
         ]);
         let outputs = output(
             ChatOutputProcessor::default(),
@@ -231,7 +231,7 @@ mod tests {
     /// publishes none) returns no text. The prompt seeds decoding only.
     #[tokio::test]
     async fn a_request_without_generated_tokens_has_no_text() {
-        let events = engine_events([finished(engine::FinishReason::Eos, 1)]);
+        let events = engine_events([finished(proto::request::FinishReason::Eos, 1)]);
         let outputs = output(
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
@@ -275,7 +275,7 @@ mod tests {
                     text_token(b'x'),
                     text_token(b' '),
                     text_token(b'<'),
-                    finished(engine::FinishReason::MaxTokens, 3),
+                    finished(proto::request::FinishReason::MaxTokens, 3),
                 ],
                 None,
                 "x <",
@@ -410,8 +410,8 @@ mod tests {
     /// that token.
     #[tokio::test]
     async fn an_image_is_published_with_its_next_text_token() {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(Event::Scheduled {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -420,7 +420,7 @@ mod tests {
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
             false,
-            EventRx::from_receiver(rx),
+            EventStream::detached(rx),
         );
         tokio::pin!(outputs);
         assert!(matches!(
@@ -432,13 +432,13 @@ mod tests {
             Some(Ok(RequestOutput::Scheduled { .. }))
         ));
 
-        tx.send(text_token(b'a')).await.unwrap();
+        tx.send(text_token(b'a')).unwrap();
         while !matches!(
             outputs.next().await,
             Some(Ok(RequestOutput::TokenDelta { .. }))
         ) {}
 
-        tx.send(Event::ImageCommit { image_id: 0 }).await.unwrap();
+        tx.send(Event::ImageCommit { image_id: 0 }).unwrap();
         tx.send(Event::ImageDone {
             image_id: 0,
             height: 1,
@@ -446,7 +446,6 @@ mod tests {
             bytes: 3,
             pixels_png_b64: "cG5n".to_string(),
         })
-        .await
         .unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), outputs.next())
@@ -455,7 +454,7 @@ mod tests {
             "the image became public before a continuation token arrived"
         );
 
-        tx.send(text_token(b'b')).await.unwrap();
+        tx.send(text_token(b'b')).unwrap();
         assert!(matches!(
             outputs.next().await,
             Some(Ok(RequestOutput::ImageDone(GeneratedImage {

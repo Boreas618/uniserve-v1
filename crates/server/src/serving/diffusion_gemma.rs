@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use engine::{GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs};
+use proto::request::{GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs};
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -52,7 +52,7 @@ pub(crate) fn engine_images(
             position: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
             num_positions: placement.soft_tokens,
             encoders: vec![ImageEncoderInput {
-                encoder: engine::ImageEncoder::Vision,
+                encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: Some(placement.soft_tokens),
                 max_cache_tokens: None,
             }],
@@ -234,10 +234,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use engine::ModelDtype;
     use engine::{EngineConfig, SimEngine};
     use futures::StreamExt;
-    use ipc::CanvasSampling;
+    use proto::request::CanvasSampling;
+    use proto::request::ModelDtype;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
 

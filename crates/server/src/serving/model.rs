@@ -21,12 +21,12 @@ use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
-use engine::{
+use models::video::plan::ProcessorConfig;
+use proto::request::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
     ImageGenerationConfig,
 };
-use ipc::{ImageParams, RequestId, SamplingParams as EngineSamplingParams};
-use models::video::plan::ProcessorConfig;
+use proto::request::{ImageParams, RequestId, SamplingParams as EngineSamplingParams};
 use thiserror::Error;
 
 use crate::serving::chat::template::MultimodalRenderInfo;
@@ -236,14 +236,16 @@ impl ModelConfig {
     /// served features are applied (`resolve_generation_limits`).
     pub(crate) fn generation_limits(
         &self,
-        model_dtype: engine::ModelDtype,
-    ) -> engine::GenerationLimits {
+        model_dtype: proto::request::ModelDtype,
+    ) -> proto::request::GenerationLimits {
         match &self.parameters {
-            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => engine::GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..Default::default()
-            },
+            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
+                proto::request::GenerationLimits {
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..Default::default()
+                }
+            }
             ModelParameters::SenseNova(profile) => profile.runtime_limits(model_dtype),
             ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
             // A readout prefills text and encoded images and denoises its
@@ -251,7 +253,7 @@ impl ModelConfig {
             // token; the worker's encoder entries bound the feature bytes and
             // the number of cached encodings, so the model states no bound of
             // its own for either.
-            ModelParameters::DiffusionGemma(profile) => engine::GenerationLimits {
+            ModelParameters::DiffusionGemma(profile) => proto::request::GenerationLimits {
                 latent_downsample: 1,
                 max_vit_grid_tokens: profile.images.max_soft_tokens,
                 max_vision_feature_bytes: u64::MAX,
@@ -626,7 +628,7 @@ fn chat_only(prompt: Prompt) -> ChatRequest {
 /// `omni_required_features`.
 fn configured_omni_needs(
     policy: &ImageGenerationConfig,
-    image_encoders: &[engine::ImageEncoderInput],
+    image_encoders: &[proto::request::ImageEncoderInput],
 ) -> GenerationFeatures {
     policy.required_features(
         GenerationConstraint::Default,
@@ -655,7 +657,7 @@ fn validate_runtime_features(
 /// `ImageGenerationConfig::required_features` adds feedback encoders independently of it.
 fn omni_required_features(
     policy: &ImageGenerationConfig,
-    image_encoders: &[engine::ImageEncoderInput],
+    image_encoders: &[proto::request::ImageEncoderInput],
     has_input_image: bool,
     constraint: GenerationConstraint,
 ) -> GenerationFeatures {
@@ -759,8 +761,8 @@ impl InputProcessor {
 mod tests {
     use std::fs;
 
-    use engine::{GenerationFeatures, GenerationLimits};
-    use ipc::CanvasSampling;
+    use proto::request::CanvasSampling;
+    use proto::request::{GenerationFeatures, GenerationLimits};
     use serde_json::json;
     use tempfile::TempDir;
     use tokenizers::models::bpe::{BPE, Vocab};
@@ -939,8 +941,13 @@ mod tests {
         request_id: String,
         request: crate::openai::ChatCompletionRequest,
         images: Vec<crate::serving::ImageInput>,
-    ) -> Result<(engine::GenerationRequest, crate::serving::OutputParams), crate::openai::ApiError>
-    {
+    ) -> Result<
+        (
+            proto::request::GenerationRequest,
+            crate::serving::OutputParams,
+        ),
+        crate::openai::ApiError,
+    > {
         let (request, _) = crate::openai::chat_completions::lower_chat_request(
             request_id,
             "diffusion-gemma",

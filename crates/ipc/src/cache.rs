@@ -1,62 +1,6 @@
-//! The prefix cache's storage dtype and the cache groups a worker reports.
+//! The cache groups a worker reports.
 
 use serde::{Deserialize, Serialize};
-
-/// Storage dtype used by paged key/value cache tensors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PrefixCacheDtype {
-    /// IEEE 754 half precision.
-    #[serde(rename = "float16")]
-    Float16,
-    /// Brain floating-point half precision.
-    #[serde(rename = "bfloat16")]
-    BFloat16,
-    /// IEEE 754 single precision.
-    #[serde(rename = "float32")]
-    Float32,
-    /// Finite-only E4M3 8-bit floating point.
-    #[serde(rename = "float8_e4m3fn")]
-    Float8E4m3Fn,
-}
-
-impl PrefixCacheDtype {
-    /// Returns the stable wire name for this dtype.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Float16 => "float16",
-            Self::BFloat16 => "bfloat16",
-            Self::Float32 => "float32",
-            Self::Float8E4m3Fn => "float8_e4m3fn",
-        }
-    }
-}
-
-impl std::str::FromStr for PrefixCacheDtype {
-    type Err = PrefixCacheDtypeParseError;
-
-    /// Parses a stable prefix-cache dtype wire name.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "float16" => Ok(Self::Float16),
-            "bfloat16" => Ok(Self::BFloat16),
-            "float32" => Ok(Self::Float32),
-            "float8_e4m3fn" => Ok(Self::Float8E4m3Fn),
-            _ => Err(PrefixCacheDtypeParseError(value.to_owned())),
-        }
-    }
-}
-
-impl std::fmt::Display for PrefixCacheDtype {
-    /// Writes the stable prefix-cache dtype wire name.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Error returned for an unsupported prefix-cache dtype string.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unsupported KV-cache dtype {0:?}")]
-pub struct PrefixCacheDtypeParseError(String);
 
 /// History retention policy of a cache group.
 ///

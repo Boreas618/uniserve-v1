@@ -7,11 +7,11 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use engine::ImageEncoder;
-use engine::{GenerationLimits, GenerationRequest};
 use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
+use proto::request::ImageEncoder;
+use proto::request::{GenerationLimits, GenerationRequest};
 use server::openai::ApiError;
 use server::options::{ImageFetchOptions, MediaOptions};
 use server::profile::assets::ResolvedModelFiles;
@@ -256,7 +256,7 @@ fn try_resolved_model(
 /// request reaches.
 fn runtime_limits() -> GenerationLimits {
     GenerationLimits {
-        features: engine::GenerationFeatures::all(),
+        features: proto::request::GenerationFeatures::all(),
         max_latent_units: 1_000_000,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
@@ -346,7 +346,7 @@ async fn preprocess_video(
     request: &VideoGenerationRequest,
 ) -> Result<
     (
-        engine::DiffusionRequest,
+        proto::request::DiffusionRequest,
         server::serving::video::ProcessedVideo,
     ),
     ApiError,
@@ -489,7 +489,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(engine::GenerationFeatures::UNDERSTANDING);
+                    .remove(proto::request::GenerationFeatures::UNDERSTANDING);
             },
         ),
         (
@@ -499,7 +499,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(engine::GenerationFeatures::VISION_ENCODE);
+                    .remove(proto::request::GenerationFeatures::VISION_ENCODE);
             },
         ),
         (
@@ -509,7 +509,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(engine::GenerationFeatures::LATENT_ENCODE);
+                    .remove(proto::request::GenerationFeatures::LATENT_ENCODE);
             },
         ),
         (
@@ -519,7 +519,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(engine::GenerationFeatures::IMAGE_GENERATION);
+                    .remove(proto::request::GenerationFeatures::IMAGE_GENERATION);
             },
         ),
     ];
@@ -969,7 +969,10 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
                 .0
         };
         let generation = request(Some("blur"));
-        assert_eq!(generation.constraint, engine::GenerationConstraint::GenOnly);
+        assert_eq!(
+            generation.constraint,
+            proto::request::GenerationConstraint::GenOnly
+        );
         assert_eq!(
             (generation.image.width, generation.image.height),
             (width, height)

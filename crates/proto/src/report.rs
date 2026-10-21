@@ -1,14 +1,21 @@
 //! Serializable scheduler, cache, and worker performance snapshots.
 //!
 //! The engine's `SchedulerStatsReporter` builds one [`SchedulerStats`] per
-//! reporting interval from its cumulative scheduler counters, and the server's
-//! `record_scheduler_stats` publishes it as Prometheus metrics: interval deltas
-//! are added to counters, while gauges and lifetime values are set. Each
-//! field's documentation says which kind it is when that is not an interval
-//! delta. [`ForwardStats`] also travels from workers to the engine in batch
-//! results that report it.
+//! reporting interval from its cumulative scheduler counters, and the
+//! daemon's `record_scheduler_stats` publishes it as Prometheus metrics:
+//! interval deltas are added to counters, while gauges and lifetime values
+//! are set. Each field's documentation says which kind it is when that is not
+//! an interval delta. [`ForwardStats`] also travels from workers to the engine
+//! in batch results that report it.
+//!
+//! A snapshot crosses the request interface JSON-encoded
+//! ([`SchedulerStats::encode`]): its fields evolve with every build, each
+//! with a default, so a daemon reads the snapshots of engines of other
+//! builds.
 
-use ipc::ForwardStats;
+mod forward;
+
+pub use forward::ForwardStats;
 use serde::{Deserialize, Serialize};
 
 /// Cache query and hit counters for one reporting interval.
@@ -150,4 +157,24 @@ pub struct SchedulerStats {
     /// Per-domain accounting, in `prefill`, `decode`, `flow` order.
     #[serde(default)]
     pub domain_stats: Vec<DomainSchedulerStats>,
+}
+
+impl SchedulerStats {
+    /// The JSON encoding the request interface carries.
+    ///
+    /// # Errors
+    ///
+    /// Fails only when serialization fails, which these plain values do not.
+    pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    /// Decodes [`Self::encode`]'s encoding.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `bytes` are not a snapshot.
+    pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
 }

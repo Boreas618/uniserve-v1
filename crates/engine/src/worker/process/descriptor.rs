@@ -1,124 +1,14 @@
-//! The launch settings `WorkerProcessArgs` carries (`LaneConfig`,
-//! [`FlashInferBackend`], [`GraphPolicy`], [`LoadFormat`]), that type's
-//! defaults, the launch descriptor a rank
-//! is started with, and the environment every rank is launched with, given the
-//! head's own.
+//! The defaults of the launch settings `WorkerProcessArgs` carries, the
+//! launch descriptor a rank is started with, and the environment every rank
+//! is launched with, given the engine process's own.
 
 use anyhow::{Context, bail};
 use ipc::{DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor};
-use serde::{Deserialize, Serialize};
+use proto::request::{FlashInferBackend, GraphPolicy, LoadFormat};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::worker::WorkerProcessArgs;
-
-/// FlashInfer implementation selected in [`WorkerProcessArgs`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FlashInferBackend {
-    /// Lets the worker select a compatible backend.
-    #[default]
-    Auto,
-    /// Uses FlashAttention 2 kernels.
-    Fa2,
-    /// Uses FlashAttention 3 kernels.
-    Fa3,
-}
-
-impl FlashInferBackend {
-    /// Returns the stable command-line spelling.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Fa2 => "fa2",
-            Self::Fa3 => "fa3",
-        }
-    }
-}
-
-impl std::str::FromStr for FlashInferBackend {
-    type Err = FlashInferBackendParseError;
-
-    /// Parses the spelling [`FlashInferBackend::as_str`] produces.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "fa2" => Ok(Self::Fa2),
-            "fa3" => Ok(Self::Fa3),
-            _ => Err(FlashInferBackendParseError(value.to_owned())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unsupported FlashInfer backend {0:?}")]
-/// Error returned for an unsupported FlashInfer backend name.
-pub struct FlashInferBackendParseError(String);
-
-/// Which GPU computations a rank captures as CUDA graphs at startup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphPolicy {
-    /// Every call serves eagerly.
-    Off,
-    /// Captures graphs unless serving does not capture the attention
-    /// provider's calls, and then serves eagerly.
-    #[default]
-    Auto,
-    /// Requires graphs and refuses an attention provider serving does not
-    /// capture.
-    Full,
-}
-
-/// How a rank reads its checkpoint.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadFormat {
-    /// Detects the checkpoint files' own format.
-    #[default]
-    Auto,
-    /// Reads safetensors files.
-    Safetensors,
-    /// Reads PyTorch pickle files.
-    Pt,
-    /// Initializes weights without reading the checkpoint.
-    Dummy,
-    /// Reads the checkpoint one layer at a time.
-    Layered,
-}
-
-impl WorkerProcessArgs {
-    /// The `uniserve` executable that runs workers when none is configured:
-    /// the one installed next to the running binary, when that directory is a
-    /// Python environment's `bin/`; then the active virtual environment's;
-    /// then `uniserve` on `PATH`.
-    ///
-    /// The executable runs workers in the environment it is installed in,
-    /// so a head built outside one, such as a development build, takes the
-    /// active environment's.
-    pub fn default_executable() -> std::path::PathBuf {
-        const EXECUTABLE: &str = "uniserve";
-        let environment_bin = |directory: &std::path::Path| {
-            ["python", "python3"]
-                .iter()
-                .any(|name| directory.join(name).is_file())
-                .then(|| directory.join(EXECUTABLE))
-                .filter(|candidate| candidate.is_file())
-        };
-
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(candidate) = executable.parent().and_then(environment_bin)
-        {
-            return candidate;
-        }
-        if let Some(environment) = std::env::var_os("VIRTUAL_ENV")
-            && let Some(candidate) =
-                environment_bin(&std::path::Path::new(&environment).join("bin"))
-        {
-            return candidate;
-        }
-        EXECUTABLE.into()
-    }
-}
 
 impl WorkerProcessArgs {
     /// Call batches kept in flight against a rank unless a launch sets its
@@ -160,7 +50,9 @@ impl Default for WorkerProcessArgs {
     fn default() -> Self {
         Self {
             worker_id: "worker".into(),
-            executable: Self::default_executable(),
+            // The engine's spec names the executable of its build; without
+            // one, `uniserve` is looked up on the search path.
+            executable: "uniserve".into(),
             // A launch the server does not name serves a deployment of its
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
@@ -487,7 +379,7 @@ pub(super) fn worker_environment(
 #[cfg(test)]
 mod tests {
     use super::{WorkerProcessArgs, worker_environment};
-    use ipc::{LaneConfig, LaneSpec, StorageLaunch};
+    use ipc::StorageLaunch;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
@@ -516,52 +408,6 @@ mod tests {
             let frame = ipc::Frame::encode(&descriptor).expect("a frame");
             let received: ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
             assert_eq!(received, descriptor);
-        }
-    }
-
-    /// A lane binds the call kinds of the domains it names, and a field it
-    /// does not take is refused when it is read, instead of leaving the lane
-    /// without that limit.
-    #[test]
-    fn a_lane_naming_an_unknown_field_is_refused() {
-        let lane = r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]"#;
-        let spec = serde_json::from_str::<LaneSpec>(&format!("{lane}}}")).expect("decode lane");
-        let args = WorkerProcessArgs {
-            lanes: vec![LaneConfig::try_from(spec).expect("a valid lane")],
-            ..WorkerProcessArgs::default()
-        };
-        let descriptor = args
-            .launch_descriptor(0, storage(), None, None, None)
-            .expect("descriptor");
-        assert_eq!(
-            serde_json::to_value(&descriptor.lane[0].call_kinds).expect("kinds"),
-            serde_json::json!(["decode", "verify", "token_denoising"])
-        );
-
-        for misspelled in [r#""max_batch_token":4096"#, r#""max_inflght":2"#] {
-            let parsed = serde_json::from_str::<LaneSpec>(&format!("{lane},{misspelled}}}"));
-            assert!(parsed.is_err(), "{misspelled} must be refused");
-        }
-    }
-
-    /// A lane without SM partition or with a zero batch or in-flight limit
-    /// is refused when it is resolved, before any rank starts, since a rank
-    /// checks only what spans its lanes.
-    #[test]
-    fn a_lane_with_a_zero_budget_or_limit_is_refused() {
-        let lane = r#"{"lane_id":"decode","domains":["decode"]"#;
-        for field in [
-            r#""sm_budget":0"#,
-            r#""sm_budget":64,"max_batch_calls":0"#,
-            r#""sm_budget":64,"max_batch_tokens":0"#,
-            r#""sm_budget":64,"max_inflight":0"#,
-        ] {
-            let spec = serde_json::from_str::<LaneSpec>(&format!("{lane},{field}}}"))
-                .expect("a lane spec");
-            assert!(
-                LaneConfig::try_from(spec).is_err(),
-                "{field} must be refused"
-            );
         }
     }
 

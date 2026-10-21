@@ -52,8 +52,6 @@ pub mod probe;
 
 use std::sync::Arc;
 
-use engine::{ConditionExtent, DiffusionRequest};
-use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 use models::video::plan;
 use models::video::plan::{
     CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
@@ -61,6 +59,9 @@ use models::video::plan::{
 };
 use models::video::presentation;
 use models::video::{Canvas, Conditioning, DenoiserInfo, VideoTask};
+use proto::MediaSource;
+use proto::request::{ConditionExtent, DiffusionRequest};
+use proto::request::{DiffusionSamplingParams, RequestId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 

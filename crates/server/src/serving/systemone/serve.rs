@@ -13,11 +13,11 @@
 //! images share no cached pages, since page identities cover token ids only,
 //! and all of their readouts run concurrently.
 
-use engine::{
+use proto::request::{
     CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest,
     ImageGenerationConfig, MultimodalInputs, RejectionKind,
 };
-use ipc::{ImageParams, RequestId, SamplingParams};
+use proto::request::{ImageParams, RequestId, SamplingParams};
 
 use crate::frontend::Engine;
 use crate::serving::diffusion_gemma::engine_images;
@@ -118,6 +118,7 @@ impl Engine {
     async fn readout(&self, request: GenerationRequest) -> Result<Vec<f32>, SystemOneError> {
         let (mut events, _) = self
             .submit(request.into())
+            .await
             .map_err(|error| SystemOneError::Server(error.to_string()))?;
 
         let mut answer = None;

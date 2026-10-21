@@ -360,6 +360,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::{FromArgMatches, Parser};
+    use proto::request::{ExpertExchange, GraphPolicy, SchedulingPolicy};
 
     use super::*;
 
@@ -401,7 +402,7 @@ mod tests {
         let (config, _) = resolved(&["--config", file]).unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/file"));
         assert_eq!(config.max_running_requests.get(), 4);
-        assert_eq!(config.cuda_graph_config.policy, engine::GraphPolicy::Full);
+        assert_eq!(config.cuda_graph_config.policy, GraphPolicy::Full);
 
         let (config, _) = resolved(&[
             "/models/flag",
@@ -417,11 +418,8 @@ mod tests {
         .unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/flag"));
         assert_eq!(config.max_running_requests.get(), 1);
-        assert_eq!(config.cuda_graph_config.policy, engine::GraphPolicy::Off);
-        assert_eq!(
-            config.scheduler_config.policy,
-            engine::SchedulingPolicy::Priority
-        );
+        assert_eq!(config.cuda_graph_config.policy, GraphPolicy::Off);
+        assert_eq!(config.scheduler_config.policy, SchedulingPolicy::Priority);
         assert_eq!(config.server_config.port, 8000);
     }
 
@@ -458,7 +456,7 @@ mod tests {
         assert_eq!(config.video_config.aspect_ratios, ["16:9"]);
         assert_eq!(config.quantization_config["mode"], "balanced");
         assert!(config.moe_config.expert_parallel);
-        assert_eq!(config.moe_config.exchange, engine::ExpertExchange::DeepEp);
+        assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
         assert_eq!(
             config.server_config.request_timeout,
             Some(Duration::from_secs(120))
@@ -487,6 +485,13 @@ mod tests {
                 "cuda_graph_config.policy",
             ),
             (vec!["--set", "max_batch=4"], "max_batch"),
+            (
+                vec![
+                    "--set",
+                    "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"], max_inflght = 2 }]",
+                ],
+                "max_inflght",
+            ),
             (vec!["--set", "dtype.size=2"], "dtype"),
             (
                 vec![
@@ -579,11 +584,13 @@ mod tests {
     }
 
     /// Resolves `args`, checks them, and derives the engine configuration
-    /// they state.
+    /// the engine reads from the spec they state.
     fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, engine::EngineConfig)> {
         let (config, stated) = resolved(args)?;
         config.validate(&stated)?;
-        let engine = config.engine_config()?;
+        let mut spec = config.engine_spec()?;
+        spec.model_facts = Some(Default::default());
+        let engine = engine::EngineConfig::from_spec(&spec)?;
         Ok((config, engine))
     }
 
@@ -769,7 +776,7 @@ mod tests {
         let worker = &engine.worker_process;
         assert_eq!(worker.lanes.len(), 1);
         assert_eq!(worker.quantization_config["mode"], "performance");
-        assert_eq!(engine.expert_parallel, Some(engine::ExpertExchange::Dwdp));
+        assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
         assert_eq!(engine.chunked_prefill_size, 512);
         assert_eq!(

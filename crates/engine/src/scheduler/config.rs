@@ -4,6 +4,8 @@
 //! and sequence limits, and the batch limit when the executor advertises a
 //! nonzero call limit, to the executor's capacity.
 
+use proto::request::SchedulingPolicy;
+
 /// Default maximum calls selected by one generation scheduling pass.
 pub const DEFAULT_MAX_BATCH: usize = 128;
 /// Default token budget for one generation scheduling pass.
@@ -12,20 +14,6 @@ pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
 /// Default token threshold above which a prefill is chunked.
 pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-/// Policy used to order requests waiting for admission.
-///
-/// It orders the token-request queue only; media requests wait in arrival
-/// order under either policy.
-pub enum SchedulingPolicy {
-    /// Orders requests by arrival time.
-    #[default]
-    Fcfs,
-    /// Orders requests by ascending priority value, then arrival time.
-    Priority,
-}
 
 #[derive(Clone, Copy, Debug)]
 /// Sequence, token, and queue limits for scheduling.

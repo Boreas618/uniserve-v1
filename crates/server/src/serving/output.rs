@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use engine::{ArtifactEvent, RejectionKind};
+use proto::request::{ArtifactEvent, RejectionKind};
 
-pub use engine::StopReason;
+pub use proto::request::StopReason;
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantToolCall};
 use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs};
@@ -40,10 +40,10 @@ impl FinishReason {
     /// Maps the engine's finish reason and stop cause; `None` for an engine
     /// error, which fails the request.
     pub fn from_engine(
-        reason: engine::FinishReason,
+        reason: proto::request::FinishReason,
         stop_reason: Option<StopReason>,
     ) -> Option<Self> {
-        use engine::FinishReason as Engine;
+        use proto::request::FinishReason as Engine;
         Some(match reason {
             Engine::Completed | Engine::Eos | Engine::Stop | Engine::ImageDone => {
                 Self::Stop(stop_reason)

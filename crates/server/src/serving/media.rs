@@ -253,7 +253,7 @@ impl ImageInput {
     ///
     /// Equal bytes always give equal hashes, whether the image arrived inline
     /// or from a URL, so the value serves as the encoder-cache identity
-    /// `engine::ImageInput::hash` starts from.
+    /// `proto::request::ImageInput::hash` starts from.
     pub fn hash(&self) -> u64 {
         self.hash
     }

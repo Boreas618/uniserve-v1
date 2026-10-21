@@ -3,8 +3,8 @@
 //! `main` parses the command line and runs its command. `serve` installs
 //! tracing and builds the Tokio runtime; `async_main` hands the resolved
 //! configuration to `server::serve` together with a cancellation token that
-//! fires on Ctrl-C or SIGTERM. `worker` and `storage` run before any thread
-//! exists: a worker loads the Python runtime on the main thread,
+//! fires on Ctrl-C or SIGTERM. `engine` runs the engine process the leader
+//! daemon starts. `worker` and `storage` run before any thread exists: a worker loads the Python runtime on the main thread,
 //! and a Storage Server started with `--daemon` forks.
 
 mod cli;
@@ -108,6 +108,15 @@ fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     let args = match cli.command {
         Command::Serve(args) => args,
+        Command::Engine(engine) => {
+            logging::init_tracing(
+                "Engine",
+                cli.log.log_level.as_deref(),
+                cli.log.log_level_http.as_deref(),
+            );
+            engine::run_engine(&engine.requests, &engine.processes, engine.engine)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
         Command::Worker { arguments } => worker::run(arguments),
         Command::Storage(args) => return Ok(storage::run(args)),
     };
@@ -118,6 +127,7 @@ fn main() -> Result<std::process::ExitCode> {
     }
 
     logging::init_tracing(
+        "Daemon",
         cli.log.log_level.as_deref(),
         cli.log.log_level_http.as_deref(),
     );

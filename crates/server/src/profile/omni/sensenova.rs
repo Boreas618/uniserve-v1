@@ -5,7 +5,7 @@
 //! ratio 0.5 in `uniserve/models/sensenova_u1`). Output canvases are limited
 //! to the fixed resolution buckets in `resolution_policy`.
 
-use engine::{
+use proto::request::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
     ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
@@ -128,7 +128,7 @@ impl SenseNovaProfile {
             end_of_image_text,
         };
         let image_encoders = vec![ImageEncoderInput {
-            encoder: engine::ImageEncoder::Vision,
+            encoder: proto::request::ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: None,
         }];
@@ -144,7 +144,7 @@ impl SenseNovaProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: engine::ImageEncoder::Vision,
+                encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }],
@@ -157,7 +157,7 @@ impl SenseNovaProfile {
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
-                cfg_renorm_type: ipc::CfgRenorm::None,
+                cfg_renorm_type: proto::request::CfgRenorm::None,
                 cfg_renorm_min: 0.0,
                 cfg_interval: (0.0, 1.0),
                 timestep_shift: 3.0,
@@ -296,7 +296,7 @@ impl OmniProfile for SenseNovaProfile {
             0,
         )?;
         Ok(vec![ImageEncoderInput {
-            encoder: engine::ImageEncoder::Vision,
+            encoder: proto::request::ImageEncoder::Vision,
             num_cache_tokens: Some(tokens),
             max_cache_tokens: None,
         }])
@@ -329,7 +329,7 @@ impl OmniProfile for SenseNovaProfile {
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != engine::ImageEncoder::Vision
+            || policy.feedback_encoders[0].encoder != proto::request::ImageEncoder::Vision
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

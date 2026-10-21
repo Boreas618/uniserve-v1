@@ -2,7 +2,7 @@
 //! controls ([`resolve_sampling`]), and its generation length
 //! ([`resolve_max_tokens`]).
 
-use ipc::SamplingParams as EngineSamplingParams;
+use proto::request::SamplingParams as EngineSamplingParams;
 
 use super::{SamplingParams, TokenizeError};
 use crate::profile::SamplingDefaults;

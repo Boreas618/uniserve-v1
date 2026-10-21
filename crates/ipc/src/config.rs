@@ -1,10 +1,10 @@
-//! Execution-lane settings shared by the head and the worker runtime.
+//! Execution-lane settings shared by the engine and the worker runtime.
 
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CallKind, ForwardMode, MediaCall, TransferMode};
+use crate::CallKind;
 
 /// Why an execution lane's settings are refused.
 #[derive(Debug, thiserror::Error)]
@@ -18,8 +18,6 @@ pub enum LaneConfigError {
     /// The named optional limit is configured as zero.
     #[error("lane {0} must be positive when configured")]
     Limit(&'static str),
-    #[error("unknown execution lane domain {0:?}")]
-    Domain(String),
 }
 
 /// Concrete operations and resource limits assigned to one CUDA lane.
@@ -59,76 +57,5 @@ impl LaneConfig {
             }
         }
         Ok(())
-    }
-}
-
-/// An execution lane as an operator states it: the call domains it serves
-/// rather than the concrete call kinds a rank binds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaneSpec {
-    pub lane_id: String,
-    /// Number of streaming multiprocessors in the lane's partition.
-    pub sm_budget: usize,
-    /// `prefill`, `decode` or `flow`.
-    pub domains: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_calls: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_tokens: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_inflight: Option<usize>,
-}
-
-impl TryFrom<LaneSpec> for LaneConfig {
-    type Error = LaneConfigError;
-
-    /// Resolves the stated domains to concrete operations and validates the
-    /// lane. Rank launch descriptors carry the resolved structure directly.
-    fn try_from(options: LaneSpec) -> Result<Self, Self::Error> {
-        let mut call_kinds = Vec::new();
-        for domain in options.domains {
-            use CallKind::{Forward, Media, Transfer};
-            match domain.as_str() {
-                "prefill" => {
-                    call_kinds.extend([
-                        Forward(ForwardMode::Prefill),
-                        Media(MediaCall::VisionEncoding),
-                        Media(MediaCall::LatentEncoding),
-                        Media(MediaCall::TextEncoding),
-                    ]);
-                    call_kinds.extend(TransferMode::ALL.map(Transfer));
-                }
-                "decode" => call_kinds.extend([
-                    Forward(ForwardMode::Decode),
-                    Forward(ForwardMode::Verify),
-                    Forward(ForwardMode::TokenDenoising),
-                ]),
-                "flow" => call_kinds.extend(
-                    [
-                        MediaCall::LatentPreparation,
-                        MediaCall::Denoising,
-                        MediaCall::ImageDecoding,
-                        MediaCall::VideoDecoding,
-                        MediaCall::AudioDecoding,
-                        MediaCall::VideoEncoding,
-                        MediaCall::AudioEncoding,
-                        MediaCall::Muxing,
-                    ]
-                    .map(Media),
-                ),
-                _ => return Err(LaneConfigError::Domain(domain)),
-            }
-        }
-        let lane = Self {
-            lane_id: options.lane_id,
-            sm_budget: options.sm_budget,
-            call_kinds,
-            max_batch_calls: options.max_batch_calls,
-            max_batch_tokens: options.max_batch_tokens,
-            max_inflight: options.max_inflight,
-        };
-        lane.validate()?;
-        Ok(lane)
     }
 }

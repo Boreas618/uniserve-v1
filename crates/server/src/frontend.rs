@@ -1,22 +1,23 @@
-//! The serving engine: one model's input processing, its schedulers, and
-//! the output processing of every request.
+//! The serving engine: one model's input processing, its engine process,
+//! and the output processing of every request.
 //!
-//! An [`Engine`] owns the model's [`InputProcessor`] and its schedulers
-//! ([`SchedulerHandle`]), one per DP rank, as vLLM's `AsyncLLM` owns its
-//! input and output processors over its engine cores and SGLang's `Engine`
-//! its tokenizer manager over one scheduler per data-parallel rank. Every
-//! request takes one path:
+//! An [`Engine`] owns the model's [`InputProcessor`] and the client of the
+//! engine process that schedules its requests ([`EngineClient`]), as vLLM's
+//! `AsyncLLM` owns its input and output processors over its engine core
+//! client and SGLang's `Engine` its tokenizer manager over its schedulers.
+//! Every request takes one path:
 //!
 //! 1. its images are fetched on the async runtime and its prompt rendered and
 //!    tokenized on the blocking pool ([`InputProcessor`]);
-//! 2. [`Engine::submit`] hands the tokenized request to the least loaded live
-//!    scheduler, which returns the request's [`EventRx`];
+//! 2. [`Engine::submit`] hands the tokenized request to the engine process,
+//!    which routes it to one of its schedulers and returns its events
+//!    ([`EventStream`]);
 //! 3. the events are assembled into public [`RequestOutput`] events
 //!    ([`serving::generation_output`], [`serving::media_output`]) and wrapped
 //!    in [`RequestStats`], which records the request's metrics once.
 //!
-//! Dropping the returned stream drops its `EventRx`, which cancels the
-//! request in its scheduler; that is the only cancellation path.
+//! Dropping the returned stream drops its `EventStream`, which cancels the
+//! request in the engine; that is the only cancellation path.
 //!
 //! [`RequestOutput`]: crate::serving::RequestOutput
 
@@ -24,17 +25,17 @@ mod log_stats;
 pub(crate) mod metrics;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Context as _;
-use engine::{EventRx, SchedulerHandle, SubmitError};
-use engine::{GenerationLimits, Request};
 use futures::StreamExt as _;
 use observability::{EngineLabels, METRICS};
-use tokio_util::task::AbortOnDropHandle;
+use proto::request::wire;
+use proto::request::{GenerationLimits, Request};
 use tracing::info;
 
+use crate::client::{EngineClient, EngineState, EventStream, StatsSink, SubmitError};
+use crate::control::EngineControl;
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
 use crate::profile::{ModelConfig, ModelParameters};
 use crate::serving::media::MediaConnector;
@@ -47,28 +48,24 @@ use crate::serving::{
 use log_stats::StatsLogger;
 pub(crate) use metrics::RequestStats;
 
-/// One model served over its schedulers.
+/// One model served over its engine process.
 ///
 /// Construction spawns Tokio tasks, so every constructor must be called
 /// within a Tokio runtime.
 pub struct Engine {
     /// The single model name the API serves.
     served_model_name: String,
+    /// The model the request and scheduler metrics are labelled with.
+    model_name: String,
     processor: Arc<InputProcessor>,
-    /// The schedulers; every scheduler serves the same model with the
-    /// same limits.
-    cores: Box<[Core]>,
-    /// The scheduler a load scan starts from, advanced by every pick so
-    /// that equal loads rotate across the schedulers.
-    next_core: AtomicUsize,
+    client: Arc<EngineClient>,
+    /// What started the engine process; `None` for an engine run elsewhere.
+    control: Option<EngineControl>,
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
-    /// Tasks exporting each core's scheduler statistics, stopped with the
-    /// engine.
-    _stats_export: Box<[AbortOnDropHandle<()>]>,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
 }
@@ -88,34 +85,31 @@ pub enum Task {
     Readout,
 }
 
-/// One scheduler and the requests in flight on it.
-struct Core {
-    /// The scheduler's index, the `engine` label of its metrics.
-    index: u32,
-    engine: Arc<SchedulerHandle>,
-    /// Requests submitted to this scheduler whose event stream has not
-    /// ended.
-    in_flight: Arc<AtomicUsize>,
+/// Records each scheduler's statistics under `model_name`.
+pub(crate) fn stats_sink(model_name: String) -> StatsSink {
+    Box::new(move |scheduler, snapshot| {
+        metrics::record_scheduler_stats(&METRICS.scheduler, &model_name, scheduler, &snapshot);
+    })
 }
 
 impl Engine {
-    /// Loads the configured model and starts its schedulers and worker
-    /// processes.
+    /// Loads the configured model and starts the engine process that serves
+    /// it, with its schedulers and worker processes.
     ///
     /// `config` must have passed [`ServeConfig::validate`]; `stated` holds the
-    /// option paths the operator set; `daemon` is the leader daemon's process
-    /// socket, through which every worker starts. Starting the cores blocks
-    /// until every rank has loaded the model, so it runs on the blocking
-    /// pool.
+    /// option paths the operator set; `daemon` is this node's daemon's
+    /// process socket, through which the engine process and every worker
+    /// start. The engine's start blocks until every rank has loaded the
+    /// model, so it runs on the blocking pool.
     ///
     /// # Errors
     ///
     /// Fails when the model assets cannot be resolved, when an option of
     /// another model family was stated ([`Stated::refuse_foreign_options`]),
-    /// when the options do not derive an engine configuration
-    /// ([`ServeConfig::engine_config`]), when the schedulers fail to start,
-    /// or when the model cannot be bound to the capabilities its workers
-    /// report.
+    /// when the options do not form an engine spec
+    /// ([`ServeConfig::engine_spec`]), when the engine process fails to
+    /// start, or when the model cannot be bound to the capabilities its
+    /// workers report.
     pub async fn start(
         config: &ServeConfig,
         stated: &Stated,
@@ -145,45 +139,61 @@ impl Engine {
 
         // The options state the scheduler and the placement; the loaded model
         // completes what it determines.
-        let mut engine_config = config.engine_config()?;
-        engine_config.generation_limits =
-            model_config.generation_limits(engine_config.worker_process.dtype);
+        let mut spec = config.engine_spec()?;
         let control_tokens = special_token_ids(&model_config);
-        engine_config.bos = control_tokens.bos;
-        engine_config.eos = control_tokens.eos;
-        engine_config.end_of_image = control_tokens.end_of_image;
-        let worker = &mut engine_config.worker_process;
-        worker.daemon = daemon;
-        worker.max_model_len = max_model_len;
+        spec.model_facts = Some(wire::ModelFacts {
+            limits: Some((&model_config.generation_limits(config.dtype)).into()),
+            bos: control_tokens.bos,
+            eos: control_tokens.eos,
+            end_of_image: control_tokens.end_of_image,
+            max_model_len,
+            // Every generated canvas uses the served sampling, which the
+            // worker sizes its canvas state for and prepares its canvas
+            // steps with.
+            canvas_sampling: match &model_config.parameters {
+                ModelParameters::DiffusionGemma(profile) => Some(wire::CanvasSampling {
+                    canvas_length: profile.sampling.canvas_length,
+                    max_steps: profile.sampling.max_steps,
+                    entropy_bound: profile.sampling.entropy_bound,
+                    t_min: profile.sampling.t_min,
+                    t_max: profile.sampling.t_max,
+                    confidence_threshold: profile.sampling.confidence_threshold,
+                    stability_threshold: profile.sampling.stability_threshold,
+                }),
+                _ => None,
+            },
+            // A DiffusionGemma prompt, image block or committed block only
+            // conditions canvases: its prefill writes the prefix cache alone.
+            prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
+        });
         // Video workers prepare exactly the canvases their denoiser names for
         // the configured resolutions and aspect ratios, refusing a pair it
         // does not generate, and report them back as the only canvases
         // requests may target. Other models prepare none.
-        if !matches!(model_config.parameters, ModelParameters::MiniMaxH3) {
-            worker.video_resolutions.clear();
-            worker.video_aspect_ratios.clear();
+        if !matches!(model_config.parameters, ModelParameters::MiniMaxH3)
+            && let Some(video) = spec.video.as_mut()
+        {
+            video.resolutions.clear();
+            video.aspect_ratios.clear();
         }
-        // Every generated canvas uses the served sampling, which the worker
-        // sizes its canvas state for and prepares its canvas steps with.
-        worker.canvas_sampling = match &model_config.parameters {
-            ModelParameters::DiffusionGemma(profile) => Some(profile.sampling),
-            _ => None,
-        };
-        // A DiffusionGemma prompt, image block or committed block only
-        // conditions canvases: its prefill writes the prefix cache alone.
-        worker.prefill_outputs =
-            !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_));
 
-        info!(
-            worker_groups = ?engine_config.worker_groups,
-            block_size = ?engine_config.worker_process.block_size,
-            "starting UniServe Rust engine"
-        );
-        let cores = tokio::task::spawn_blocking(move || SchedulerHandle::start_all(engine_config))
-            .await
-            .context("the engine startup task did not complete")?
-            .context("failed to start the UniServe engine")?;
-        let first = cores.first().context("the engine started no scheduler")?;
+        info!(placement = ?spec.placement, "starting the engine process");
+        let control = EngineControl::new(
+            &config.request_socket(),
+            daemon,
+            config.host_identity.clone(),
+            config.served_model_name().to_owned(),
+            config.worker_config.executable.clone(),
+        )?;
+        let model_name = config.model().to_owned();
+        let sink = stats_sink(model_name.clone());
+        let (client, control) = tokio::task::spawn_blocking(move || {
+            control.start(spec, sink).map(|client| (client, control))
+        })
+        .await
+        .context("the engine startup task did not complete")?
+        .context("failed to start the UniServe engine")?;
+        let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
@@ -201,12 +211,11 @@ impl Engine {
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video(vision) => {
-                let reported = first
-                    .info()
-                    .video_denoiser
-                    .as_ref()
-                    .context("the video worker reported no video denoiser")?;
-                let denoiser = models::video::DenoiserInfo::decode(&reported.description)
+                anyhow::ensure!(
+                    !info.video_denoiser.is_empty(),
+                    "the video worker reported no video denoiser"
+                );
+                let denoiser = models::video::DenoiserInfo::decode(&info.video_denoiser)
                     .context("the video worker described its denoiser unreadably")?;
                 denoiser
                     .validate()
@@ -214,9 +223,7 @@ impl Engine {
                 // Reference images are banded to the units one latent
                 // encoding round covers on the deployment's latent encoder
                 // while a request's prompt is encoded.
-                let latent_encoding_lane = first
-                    .media_units(engine::MediaCall::LatentEncoding)
-                    .unwrap_or(1);
+                let latent_encoding_lane = info.latent_encoding_units.max(1);
                 // The video processor's options are its reference sizing,
                 // within what the denoiser declares.
                 let references = models::video::plan::ReferenceConfig::from_kwargs(
@@ -265,102 +272,54 @@ impl Engine {
             model_config,
             tokenizer,
             renderer,
-            first.generation_limits(),
+            info.limits.clone(),
             config.chat_config.reasoning_parser == ReasoningParser::Auto,
         )
         .context("failed to bind the configured model description")?;
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
-        Self::new(
+        let mut engine = Self::new(
             config.served_model_name().to_owned(),
-            cores,
+            model_name,
+            client,
             processor,
             images,
             readout,
             &config.logging_config,
-        )
+        );
+        engine.control = Some(control);
+        Ok(engine)
     }
 
-    /// Serves `processor`'s model under `served_model_name` over started
-    /// schedulers.
+    /// Serves `processor`'s model under `served_model_name` over the engine
+    /// `client` connects to, labelling metrics with `model_name`.
     ///
     /// `images` resolves the image references of every request, and
-    /// `readout` serves `POST /v1/systemone` for a model that has one. One
-    /// task per core publishes a scheduler-stats snapshot every second under
-    /// the core's index.
-    ///
-    /// # Errors
-    ///
-    /// Fails when there is no core, or when the cores report different
-    /// generation limits: a request is prepared once against them and may
-    /// land on any scheduler.
+    /// `readout` serves `POST /v1/systemone` for a model that has one.
     pub fn new(
         served_model_name: String,
-        cores: Vec<SchedulerHandle>,
+        model_name: String,
+        client: EngineClient,
         processor: InputProcessor,
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         logging: &LoggingOptions,
-    ) -> anyhow::Result<Self> {
-        let limits = cores
-            .first()
-            .context("an engine needs at least one scheduler")?
-            .generation_limits();
-        anyhow::ensure!(
-            cores.iter().all(|core| core.generation_limits() == limits),
-            "schedulers report different generation limits"
-        );
-
-        let cores: Box<[Core]> = (0u32..)
-            .zip(cores)
-            .map(|(index, engine)| Core {
-                index,
-                engine: Arc::new(engine),
-                in_flight: Arc::default(),
-            })
-            .collect();
-        let model_name = cores[0].engine.model_name().to_owned();
-        let stats_export = cores
-            .iter()
-            .map(|core| {
-                let stats = Arc::clone(core.engine.stats());
-                let model_name = model_name.clone();
-                let index = core.index;
-                AbortOnDropHandle::new(tokio::spawn(async move {
-                    // The reporter turns cumulative scheduler counters into
-                    // per-snapshot increments, so one reporter lives across
-                    // ticks.
-                    let mut reporter = engine::SchedulerStatsReporter::default();
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        interval.tick().await;
-                        let snapshot = reporter.snapshot(&stats);
-                        metrics::record_scheduler_stats(
-                            &METRICS.scheduler,
-                            &model_name,
-                            index,
-                            &snapshot,
-                        );
-                    }
-                }))
-            })
-            .collect();
+    ) -> Self {
+        let schedulers = client.info().schedulers as usize;
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(model_name, cores.len()));
-
-        Ok(Self {
+            .then(|| StatsLogger::start(model_name.clone(), schedulers.max(1)));
+        Self {
             served_model_name,
+            model_name,
             processor: Arc::new(processor),
-            cores,
-            next_core: AtomicUsize::new(0),
+            client: Arc::new(client),
+            control: None,
             images,
             readout: readout.map(Arc::new),
             log_requests: logging.log_requests,
-            _stats_export: stats_export,
             _stats_logger: stats_logger,
-        })
+        }
     }
 
     /// The loaded model's input processor.
@@ -373,9 +332,9 @@ impl Engine {
         &self.served_model_name
     }
 
-    /// The generation limits every scheduler serves.
+    /// The generation limits the engine serves.
     pub fn generation_limits(&self) -> GenerationLimits {
-        self.cores[0].engine.generation_limits()
+        self.client.info().limits.clone()
     }
 
     /// The video denoiser this deployment serves; `None` for a model that
@@ -405,10 +364,9 @@ impl Engine {
         tasks
     }
 
-    /// Whether the engine can accept requests: whether any scheduler is
-    /// alive. Requests go only to live schedulers.
+    /// Whether the engine can accept requests: whether it serves.
     pub fn is_healthy(&self) -> bool {
-        self.cores.iter().any(|core| !core.engine.is_dead())
+        self.client.state() == EngineState::Ready
     }
 
     /// The connector every request's image references go through.
@@ -459,7 +417,7 @@ impl Engine {
             preprocess(&request_id, move || processor.preprocess(request, images)).await?;
 
         let compile_us = elapsed_us(started);
-        let (events, core) = self.submit(request.into())?;
+        let (events, core) = self.submit(request.into()).await?;
         let output =
             serving::generation_output(request_id.clone(), started, compile_us, output, events);
         Ok(self.stats(request_id, started, core, output))
@@ -492,7 +450,7 @@ impl Engine {
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
-        let (events, core) = self.submit(Request::Diffusion(request))?;
+        let (events, core) = self.submit(Request::Diffusion(request)).await?;
         let output = serving::media_output(
             request_id.clone(),
             started,
@@ -518,89 +476,43 @@ impl Engine {
         output: RequestOutputStream,
     ) -> RequestOutputStream {
         let labels = EngineLabels {
-            model_name: self.cores[0].engine.model_name().to_owned(),
+            model_name: self.model_name.clone(),
             engine: core,
         };
         let log = self.log_requests.then_some(request_id);
         Box::pin(RequestStats::new(output, labels, started, log))
     }
 
-    /// Submits one tokenized request to the least loaded live scheduler.
+    /// Submits one tokenized request to the engine, which routes it to its
+    /// least loaded live scheduler.
     ///
     /// Returns the request's event stream and the index of the scheduler
-    /// that serves it. The engine request identifier comes from the first
-    /// core's allocator alone, so identifiers are unique across the engine
-    /// cores. Dropping the stream before its terminal event cancels the
-    /// request.
+    /// that serves it. Dropping the stream before its terminal event cancels
+    /// the request.
     ///
     /// # Errors
     ///
-    /// Fails with [`SubmitError::Dead`] when no core is alive, and with the
-    /// chosen core's submission error.
-    pub(crate) fn submit(&self, mut request: Request) -> Result<(EventRx, u32), SubmitError> {
-        let core = self.least_loaded().ok_or(SubmitError::Dead)?;
-        let request_id = self.cores[0].engine.next_request_id();
-        match &mut request {
-            Request::Generation(request) => request.request_id = request_id,
-            Request::Diffusion(request) => request.request_id = request_id,
-        }
-        // Counted before submission, so that a pick racing this one already
-        // sees the request.
-        core.in_flight.fetch_add(1, Ordering::Relaxed);
-        let mut events = core.engine.submit(request).inspect_err(|_| {
-            core.in_flight.fetch_sub(1, Ordering::Relaxed);
-        })?;
-        let in_flight = Arc::clone(&core.in_flight);
-        events.set_on_finish(move || {
-            in_flight.fetch_sub(1, Ordering::Relaxed);
-        });
-        Ok((events, core.index))
+    /// Fails when the engine serves no requests.
+    pub(crate) async fn submit(&self, request: Request) -> Result<(EventStream, u32), SubmitError> {
+        let (events, scheduler) = self.client.submit(request).await?;
+        // A request the engine ended at submission names no scheduler; its
+        // stream holds its terminal event.
+        Ok((events, scheduler.unwrap_or(0)))
     }
 
-    /// The live scheduler with the fewest requests in flight.
-    ///
-    /// The scan starts one scheduler later after every pick, so equal
-    /// loads rotate across the schedulers. This is SGLang's `total_requests` data-parallel
-    /// balancing (the argmin of running plus waiting requests,
-    /// `data_parallel_controller.py`) and vLLM's data-parallel client score
-    /// with equal waiting and running weights and a rotating start
-    /// (`v1/engine/core_client.py`). Both read load snapshots the ranks
-    /// publish; the cores here share the engine's process, so the counts are
-    /// exact at every pick. Returns `None` when every core is dead.
-    fn least_loaded(&self) -> Option<&Core> {
-        let count = self.cores.len();
-        let start = self.next_core.fetch_add(1, Ordering::Relaxed) % count;
-        (0..count)
-            .map(|offset| &self.cores[(start + offset) % count])
-            .filter(|core| !core.engine.is_dead())
-            .min_by_key(|core| core.in_flight.load(Ordering::Relaxed))
-    }
-
-    /// Shuts every scheduler down and waits until their scheduler threads
-    /// have exited.
-    ///
-    /// Each scheduler finishes its outstanding requests as aborted and closes
-    /// its executor, which on a multi-worker deployment waits for every
-    /// worker to drain and exit. The cores shut down concurrently on the blocking pool,
-    /// leaving the calling runtime thread free. Repeated calls are harmless.
+    /// Shuts the engine down: every scheduler finishes its outstanding
+    /// requests as aborted and closes its workers, and the engine process
+    /// exits. Runs on the blocking pool. Repeated calls are harmless.
     ///
     /// # Errors
     ///
-    /// Fails when a blocking shutdown task does not complete, which happens
+    /// Fails when the blocking shutdown task does not complete, which happens
     /// only if it panics or its runtime is shutting down.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        let tasks = self
-            .cores
-            .iter()
-            .map(|core| {
-                let core = Arc::clone(&core.engine);
-                tokio::task::spawn_blocking(move || core.shutdown())
-            })
-            .collect::<Vec<_>>();
-        for task in tasks {
-            task.await.context("engine shutdown did not complete")?;
-        }
-        Ok(())
+        let client = Arc::clone(&self.client);
+        tokio::task::spawn_blocking(move || client.shutdown())
+            .await
+            .context("engine shutdown did not complete")
     }
 }
 
@@ -629,6 +541,13 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros() as u64
 }
 
+/// The control tokens a model's engine schedules with.
+struct SpecialTokenIds {
+    bos: u32,
+    eos: Vec<u32>,
+    end_of_image: u32,
+}
+
 /// Resolves the control tokens the engine uses for the loaded model.
 ///
 /// `bos` and `end_of_image` come from the profile's `GenerationControls` and
@@ -639,7 +558,7 @@ fn elapsed_us(started: Instant) -> u64 {
 /// none. The primary EOS is the nonzero `GenerationControls::eos` when
 /// present, otherwise `ModelConfig::primary_eos_token_id`; when neither
 /// exists the list keeps the set's ascending order.
-fn special_token_ids(model: &ModelConfig) -> engine::SpecialTokenIds {
+fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
     let controls = model.generation_controls();
     let bos = controls.map_or(0, |value| value.bos);
     let end_of_image = controls.map_or(0, |value| value.end_of_image);
@@ -652,7 +571,7 @@ fn special_token_ids(model: &ModelConfig) -> engine::SpecialTokenIds {
         eos.retain(|value| *value != primary_eos);
         eos.insert(0, primary_eos);
     }
-    engine::SpecialTokenIds {
+    SpecialTokenIds {
         bos,
         eos,
         end_of_image,
@@ -666,10 +585,12 @@ mod tests {
     use std::time::Duration;
 
     use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
-    use engine::{Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request};
     use futures::{StreamExt as _, poll};
-    use ipc::{ImageParams, SamplingParams};
     use observability::METRICS;
+    use proto::request::{
+        Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
+    };
+    use proto::request::{ImageParams, SamplingParams};
 
     use super::Engine;
     use crate::openai::ChatCompletionRequest;
@@ -774,7 +695,7 @@ mod tests {
         let mut streams = Vec::new();
         let mut serving = Vec::new();
         for _ in 0..2 {
-            let (stream, core) = engine.submit(text_request()).expect("submit request");
+            let (stream, core) = engine.submit(text_request()).await.expect("submit request");
             streams.push(stream);
             serving.push(core);
         }
@@ -782,7 +703,7 @@ mod tests {
         for stream in &mut streams {
             while let Some(event) = stream.next().await {
                 if let Event::Finished { reason, .. } = event {
-                    assert_eq!(reason, engine::FinishReason::Eos);
+                    assert_eq!(reason, proto::request::FinishReason::Eos);
                     break;
                 }
             }

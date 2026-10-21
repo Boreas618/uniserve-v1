@@ -192,7 +192,7 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 
 ## Repository layout
 
-The [architecture guide](docs/architecture.md) describes how the daemons, the head and the rank processes divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
+The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the workers divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
 
 ```text
 crates/models/                Model-family request semantics: the MiniMax-H3 video rules

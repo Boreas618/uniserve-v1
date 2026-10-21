@@ -1,8 +1,9 @@
 //! Command-line parsing for the `uniserve` binary.
 //!
 //! One executable runs every UniServe process, each as a command: `serve`
-//! (a node's daemon, and on the leader the API server), `worker` (one
-//! worker) and `storage` (a node's Storage Server). The binary's own options, its log
+//! (a node's daemon, and on the leader the API server), `engine` (the engine
+//! process a leader daemon starts), `worker` (one worker) and `storage` (a
+//! node's Storage Server). The binary's own options, its log
 //! levels, are global; each command declares its own. `serve` takes the
 //! serving command line (`server::options::ServeArgs`), which resolves one
 //! serving configuration from a `--config` file, a few flags and `--set`
@@ -29,6 +30,21 @@ pub(crate) struct Cli {
     pub command: Command,
 }
 
+/// Where an engine process reaches the daemon that started it.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EngineArgs {
+    /// The leader daemon's request socket, `unix:<path>`.
+    #[arg(long)]
+    pub requests: String,
+    /// The leader daemon's process socket, `unix:<path>`, through which the
+    /// engine starts its workers.
+    #[arg(long)]
+    pub processes: String,
+    /// The identity the daemon started the engine under.
+    #[arg(long)]
+    pub engine: u64,
+}
+
 /// The process's log levels, which every subcommand takes.
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Logging")]
@@ -51,6 +67,10 @@ pub(crate) enum Command {
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServeArgs>),
+    /// Run the engine process the leader daemon starts: its schedulers and
+    /// the request interface.
+    #[command(hide = true)]
+    Engine(EngineArgs),
     /// Run one worker: the process a node's daemon starts for each worker
     /// of a worker group placed on the node.
     #[command(
