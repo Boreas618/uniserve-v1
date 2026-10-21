@@ -14,7 +14,7 @@
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
-use observability::{EngineLabels, F64Gauge, METRICS, U64Counter, U64Gauge};
+use crate::metrics::{EngineLabels, F64Gauge, METRICS, U64Counter, U64Gauge};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info};
 

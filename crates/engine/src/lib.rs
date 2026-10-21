@@ -1,6 +1,8 @@
 //! Scheduling, KV cache management, worker execution and request control.
 //!
-//! The crate sits between the frontend (`server`) and the worker processes.
+//! The crate is the engine process (`uniserve engine`): it serves the request
+//! interface to the leader's daemon (`service`) and drives the worker
+//! processes.
 //! A deployment runs one scheduler per DP rank: `SchedulerHandle` (`core`)
 //! launches the worker processes, or takes a supplied executor, and runs the
 //! `Scheduler` (`scheduler`) on a thread of its own. Frontends submit and

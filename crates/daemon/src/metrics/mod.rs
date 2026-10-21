@@ -98,5 +98,6 @@ impl Default for Metrics {
     }
 }
 
-/// Process-global metrics registry, written and rendered by the server crate.
+/// Process-global metrics registry, written and rendered by the leader's
+/// daemon.
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);

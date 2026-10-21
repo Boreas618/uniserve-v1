@@ -16,12 +16,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
-use futures::{Stream, StreamExt as _};
-use observability::{
+use crate::metrics::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
     EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, METRICS,
     RequestMetrics, SchedulerMetrics,
 };
+use futures::{Stream, StreamExt as _};
 use tracing::info;
 
 use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage};
@@ -514,7 +514,7 @@ fn seconds(microseconds: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observability::Metrics;
+    use crate::metrics::Metrics;
     use proto::report::DomainSchedulerStats;
 
     // Per-domain scheduler statistics reach the rendered exposition under

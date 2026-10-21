@@ -195,14 +195,14 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the workers divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
 
 ```text
+crates/proto/                 The interfaces across builds: the request interface and the process interface (Protobuf)
 crates/models/                Model-family request semantics: the MiniMax-H3 video rules
 crates/storage/               The Storage Server's protocol and client
 crates/storage-server/        The Storage Server and its Mooncake connector
-crates/observability/         Runtime metrics and process registry
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
-crates/engine/                Scheduler, KV allocation, executors, worker fleet and rank launch
-crates/server/                Serving options, model profiles, serving funnel, HTTP API, and engine clients
+crates/daemon/                The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, model profiles, input and output processing, the HTTP API, metrics and the engine's client
+crates/engine/                The engine process: schedulers, KV allocation, executors, worker groups and the request interface's service
 crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
   launch/, config/            Launch descriptor, rank configuration and startup
   model/                      Model description, loading and component placement
@@ -212,7 +212,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
-crates/uniserve/              The `uniserve` executable: `serve`, `worker` and `storage`
+crates/uniserve/              The `uniserve` executable: `serve`, `engine`, `worker` and `storage`
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls
   worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function

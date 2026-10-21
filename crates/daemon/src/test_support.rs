@@ -100,7 +100,7 @@ pub(crate) fn router(engine: Engine) -> Router {
     router_with(engine, &ServerOptions::default())
 }
 
-/// The server's router over `engine` under `server`, with the HTTP body limit
+/// The daemon's router over `engine` under `server`, with the HTTP body limit
 /// for the video submission routes and default video job options.
 pub(crate) fn router_with(engine: Engine, server: &ServerOptions) -> Router {
     let jobs = VideoJobs::new(VideoJobOptions::default(), CancellationToken::new());

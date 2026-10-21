@@ -9,7 +9,7 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 
-use crate::{F64Gauge, U64Counter, U64Gauge};
+use crate::metrics::{F64Gauge, U64Counter, U64Gauge};
 
 /// Labels identifying one model and scheduler.
 ///

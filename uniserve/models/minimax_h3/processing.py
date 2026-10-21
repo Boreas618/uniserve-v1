@@ -1,7 +1,7 @@
 """The MiniMax-H3 request rules that Python computation and tools read.
 
 The serving path plans and presents every MiniMax-H3 request in Rust
-(``crates/server/src/serving/video``): the canvas and frame count, the size
+(``crates/daemon/src/serving/video``): the canvas and frame count, the size
 every condition is prepared at, the Qwen3-VL vision grids and the tokenized
 presentation. Those rules are the ``models`` crate's
 (``crates/models/src/video``), checked against

@@ -8,12 +8,12 @@
 //!
 //! The test reads the checkpoint directory named by
 //! `UNISERVE_DIFFUSION_GEMMA_MODEL` and runs only on request:
-//! `cargo test -p server --test it diffusion_gemma_tokenizer -- --include-ignored`.
+//! `cargo test -p daemon --test it diffusion_gemma_tokenizer -- --include-ignored`.
 
 use std::path::Path;
 
+use daemon::profile::tokenizer::HuggingFaceTokenizer;
 use serde::Deserialize;
-use server::profile::tokenizer::HuggingFaceTokenizer;
 
 #[derive(Deserialize)]
 struct Fixture {

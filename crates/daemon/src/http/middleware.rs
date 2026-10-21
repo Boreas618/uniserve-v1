@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::metrics::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{MatchedPath, Request};
 use axum::http::header::{HeaderName, RETRY_AFTER};
@@ -20,7 +21,6 @@ use axum::http::{HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http_body::{Frame, SizeHint};
-use observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 

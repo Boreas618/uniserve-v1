@@ -5,7 +5,7 @@
 //! process a leader daemon starts), `worker` (one worker) and `storage` (a
 //! node's Storage Server). The binary's own options, its log
 //! levels, are global; each command declares its own. `serve` takes the
-//! serving command line (`server::options::ServeArgs`), which resolves one
+//! serving command line (`daemon::options::ServeArgs`), which resolves one
 //! serving configuration from a `--config` file, a few flags and `--set`
 //! assignments. `worker` hands its arguments to the worker library
 //! unparsed.
@@ -13,7 +13,7 @@
 use std::ffi::OsString;
 
 use clap::{Args, Parser, Subcommand};
-use server::options::ServeArgs;
+use daemon::options::ServeArgs;
 
 use crate::storage::StorageArgs;
 

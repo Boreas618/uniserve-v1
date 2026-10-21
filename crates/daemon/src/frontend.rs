@@ -27,9 +27,9 @@ pub(crate) mod metrics;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::metrics::{EngineLabels, METRICS};
 use anyhow::Context as _;
 use futures::StreamExt as _;
-use observability::{EngineLabels, METRICS};
 use proto::request::wire;
 use proto::request::{GenerationLimits, Request};
 use tracing::info;
@@ -584,9 +584,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use crate::metrics::METRICS;
     use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
     use futures::{StreamExt as _, poll};
-    use observability::METRICS;
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
     };
