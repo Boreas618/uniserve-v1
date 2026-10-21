@@ -253,7 +253,11 @@ fn read_requests(
                         error: String::new(),
                     })));
                 }
-                Some(wire::engine_command::Kind::Drain(_)) | None => {}
+                // A serving engine was promoted, or never stood by.
+                Some(
+                    wire::engine_command::Kind::Drain(_) | wire::engine_command::Kind::Promote(_),
+                )
+                | None => {}
             },
             None => {}
         }
@@ -598,8 +602,71 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
             .media_units(ipc::MediaCall::LatentEncoding)
             .unwrap_or(0),
         schedulers: schedulers.len() as u32,
+        cache_units: schedulers
+            .iter()
+            .flat_map(|scheduler| scheduler.cache_units())
+            .map(|(group, units)| wire::GroupCacheUnits {
+                worker_group: group.clone(),
+                units: *units,
+            })
+            .collect(),
     };
+    // A standing-by engine serves once the daemon promotes it.
+    if spec.standby.is_some() {
+        writer.send(&state(
+            wire::EngineState::Standby,
+            Some(info.clone()),
+            String::new(),
+        ))?;
+        tracing::info!(engine, "the engine stands by");
+        if !await_promotion(&mut reader)? {
+            tracing::info!(engine, "the daemon shut the standing-by engine down");
+            for scheduler in &schedulers {
+                scheduler.shutdown();
+            }
+            return Ok(());
+        }
+        let promoted = schedulers.iter().try_for_each(SchedulerHandle::promote);
+        if let Err(error) = promoted {
+            let _ = writer.send(&state(
+                wire::EngineState::Failed,
+                None,
+                format!("{error:#}"),
+            ));
+            for scheduler in &schedulers {
+                scheduler.shutdown();
+            }
+            return Err(error.context("promoting the standing-by engine"));
+        }
+    }
     writer.send(&state(wire::EngineState::Ready, Some(info), String::new()))?;
     tracing::info!(engine, schedulers = schedulers.len(), "the engine serves");
     serve(reader, writer, schedulers)
+}
+
+/// Waits on a standing-by engine's connection for the daemon's word: `true`
+/// once it promotes the engine, `false` once it shuts the engine down or
+/// closes the connection. A standing-by engine is submitted nothing.
+fn await_promotion(reader: &mut Connection) -> anyhow::Result<bool> {
+    loop {
+        let message = match reader.try_recv::<wire::ToEngine>() {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                reader.wait(READ_INTERVAL)?;
+                continue;
+            }
+            Err(proto::Error::Closed) => return Ok(false),
+            Err(error) => return Err(error).context("reading the daemon's requests"),
+        };
+        match message.kind {
+            Some(to_engine::Kind::Engine(command)) => match command.kind {
+                Some(wire::engine_command::Kind::Promote(_)) => return Ok(true),
+                Some(wire::engine_command::Kind::Shutdown(_)) => return Ok(false),
+                Some(wire::engine_command::Kind::Drain(_)) | None => {}
+            },
+            Some(to_engine::Kind::Submit(_) | to_engine::Kind::Command(_)) | None => {
+                tracing::warn!("the daemon addressed a standing-by engine's requests");
+            }
+        }
+    }
 }

@@ -288,6 +288,22 @@ impl Scheduler {
         &self.info
     }
 
+    /// Returns the prefix cache units of each worker group with a prefix
+    /// cache, by group identity: what an engine standing by for this one
+    /// adopts.
+    pub fn cache_units(&self) -> BTreeMap<String, u32> {
+        self.executor
+            .info()
+            .workers
+            .iter()
+            .filter_map(|(group, info)| {
+                info.prefix_cache
+                    .as_ref()
+                    .map(|cache| (group.to_string(), cache.num_units))
+            })
+            .collect()
+    }
+
     /// Returns the model limits supported by the loaded execution workers.
     pub fn generation_limits(&self) -> &crate::GenerationLimits {
         &self.generation_limits

@@ -33,7 +33,7 @@ use futures::StreamExt as _;
 use proto::request::wire;
 use proto::request::{GenerationLimits, Request};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
@@ -66,8 +66,8 @@ pub struct Leader {
     info: EngineInfo,
     /// Every request's way to the engine that serves, across engines.
     migrator: Migrator,
-    /// What started the engine process; `None` for an engine run elsewhere.
-    control: Option<EngineControl>,
+    /// What starts and replaces the engine that serves.
+    engines: Arc<Engines>,
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
@@ -190,10 +190,10 @@ impl Leader {
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
-            config.worker_config.executable.clone(),
         )?;
         let model_name = config.model().to_owned();
         let sink = stats_sink(model_name.clone());
+        let served = spec.clone();
         let (client, control) = tokio::task::spawn_blocking(move || {
             control.start(spec, sink).map(|client| (client, control))
         })
@@ -285,7 +285,7 @@ impl Leader {
         .context("failed to bind the configured model description")?;
         let images = MediaConnector::from_image_options(&config.image_fetch_config)
             .context("failed to initialize the image URL fetcher")?;
-        let mut engine = Self::new(
+        let engine = Self::new(
             config.served_model_name().to_owned(),
             model_name,
             client,
@@ -294,7 +294,7 @@ impl Leader {
             readout,
             config,
         );
-        engine.control = Some(control);
+        let _ = engine.engines.control.set((Arc::new(control), served));
         Ok(engine)
     }
 
@@ -320,12 +320,14 @@ impl Leader {
             .log_stats
             .then(|| StatsLogger::start(model_name.clone(), (info.schedulers as usize).max(1)));
         let hold = Arc::new(RequestHold::new());
+        let engines = Arc::new(Engines {
+            hold: Arc::clone(&hold),
+            control: std::sync::OnceLock::new(),
+            model_name: model_name.clone(),
+            replacing: tokio::sync::Mutex::new(()),
+        });
         let client = Arc::new(client);
-        tokio::spawn(close_on_loss(
-            Arc::clone(&hold),
-            Arc::downgrade(&client),
-            client.states(),
-        ));
+        tokio::spawn(watch_engine(Arc::clone(&engines), Arc::downgrade(&client)));
         hold.serve(client);
         Self {
             served_model_name,
@@ -333,7 +335,7 @@ impl Leader {
             processor: Arc::new(processor),
             info,
             migrator: Migrator::new(hold, options.migration_config.max_migrations),
-            control: None,
+            engines,
             images,
             readout: readout.map(Arc::new),
             log_requests: logging.log_requests,
@@ -550,30 +552,227 @@ impl Leader {
     }
 }
 
-/// Closes `hold` once `client`'s engine, whose states `states` observes,
-/// stops serving while it serves the hold: its workers failed or its process
-/// ended. No other engine takes its place, so held and later requests fail
-/// with the reason. An engine the hold no longer serves, as after a shutdown,
-/// leaves the hold as it is.
-async fn close_on_loss(
+/// What a hot update did, and how long each stage of its pause took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineUpdate {
+    /// How long requests waited for an engine: from holding them until the
+    /// promoted engine served them; the sum of the three stages below.
+    pub pause: std::time::Duration,
+    /// From holding requests until the running engine held none: its step
+    /// boundary, and the media requests it let finish.
+    pub drain: std::time::Duration,
+    /// The drained engine's close: its last pages written to the host KV
+    /// cache, its workers closed and its process exited.
+    pub close: std::time::Duration,
+    /// The standby's promotion, until it reported that it serves.
+    pub promotion: std::time::Duration,
+}
+
+/// Why a hot update did not happen or did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    /// Another update is in progress.
+    #[error("an engine update is in progress")]
+    InProgress,
+    /// The leader runs no engine process of its own to update.
+    #[error("this leader runs no engine process of its own")]
+    NoEngine,
+    /// The update failed; the message says whether the running engine
+    /// still serves.
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+impl Leader {
+    /// Updates the engine to the build `executable` runs, or to the build
+    /// the running engine's executable holds now when `None`, without
+    /// failing a request.
+    ///
+    /// A standby engine of that build starts beside the running one: its
+    /// workers map the running engine's weights and exclusive storages
+    /// without writing them and park. Once it stands by, the leader holds
+    /// new requests, drains the running engine (its token requests leave as
+    /// migratable and wait for the new engine; its other requests finish),
+    /// shuts it down, which writes its published pages to the host KV cache
+    /// and gives up its storages, promotes the standby, and has it serve
+    /// every held and migrated request.
+    ///
+    /// # Errors
+    ///
+    /// Fails when another update runs or the leader runs no engine process;
+    /// when the standby does not start, after which the running engine
+    /// serves on; and when the standby's promotion fails, after which no
+    /// engine serves and held requests fail.
+    pub async fn update(&self, executable: Option<String>) -> Result<EngineUpdate, UpdateError> {
+        let _replacing = self
+            .engines
+            .replacing
+            .try_lock()
+            .map_err(|_| UpdateError::InProgress)?;
+        let (control, served) = self.engines.control.get().ok_or(UpdateError::NoEngine)?;
+        let hold = Arc::clone(self.migrator.hold());
+        let running = hold.client().ok_or(UpdateError::NoEngine)?;
+
+        let mut spec = served.clone();
+        if let (Some(executable), Some(workers)) = (executable, spec.workers.as_mut()) {
+            workers.executable = executable;
+        }
+        spec.standby = Some(wire::Standby {
+            cache_units: running.info().cache_units.clone(),
+        });
+        let control = Arc::clone(control);
+        let sink = stats_sink(self.model_name.clone());
+        info!("starting a standby engine for a hot update");
+        let standby = tokio::task::spawn_blocking(move || control.start(spec, sink))
+            .await
+            .context("the standby engine's start did not complete")?
+            .context("the standby engine did not start; the running engine serves on")?;
+        let standby = Arc::new(standby);
+
+        // Requests wait from here until the standby serves.
+        let paused = Instant::now();
+        hold.hold();
+        // An engine lost before it drains ends its token requests as
+        // migratable on loss, and the standby replaces it all the same.
+        if let Err(error) = running.drain().await {
+            warn!("the running engine did not drain: {error}");
+        }
+        while running.in_flight() > 0 && running.state() == EngineState::Draining {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+        let drain = paused.elapsed();
+        let drained = Arc::clone(&running);
+        let exit = tokio::task::spawn_blocking(move || {
+            drained.shutdown();
+            drained.await_exit(DRAINED_EXIT)
+        })
+        .await
+        .context("the drained engine's shutdown did not complete")?;
+        match exit {
+            Ok(Some(status)) => info!(%status, "the drained engine's process exited"),
+            Ok(None) => {}
+            Err(error) => warn!("the drained engine's process: {error:#}"),
+        }
+        let close = paused.elapsed() - drain;
+
+        if let Err(error) = standby.promote().await {
+            hold.close(format!("the updated engine did not serve: {error}"));
+            return Err(anyhow::anyhow!("promoting the standby engine: {error}").into());
+        }
+        tokio::spawn(watch_engine(
+            Arc::clone(&self.engines),
+            Arc::downgrade(&standby),
+        ));
+        hold.serve(standby);
+        let pause = paused.elapsed();
+        let promotion = pause - drain - close;
+        info!(
+            pause_ms = pause.as_millis() as u64,
+            drain_ms = drain.as_millis() as u64,
+            close_ms = close.as_millis() as u64,
+            promotion_ms = promotion.as_millis() as u64,
+            "the updated engine serves"
+        );
+        Ok(EngineUpdate {
+            pause,
+            drain,
+            close,
+            promotion,
+        })
+    }
+}
+
+/// How often a hot update checks whether the drained engine's requests
+/// ended.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a hot update waits for the drained engine's process to exit
+/// once its connection closed; the daemon ends a process that outlives it
+/// with its control connection.
+const DRAINED_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What starts and replaces the leader's engines.
+struct Engines {
+    /// The hold every request passes.
     hold: Arc<RequestHold>,
-    client: std::sync::Weak<EngineClient>,
-    mut states: watch::Receiver<EngineState>,
-) {
-    let reason = loop {
+    /// What starts the leader's engine processes, and the spec they serve;
+    /// unset for an engine run elsewhere.
+    control: std::sync::OnceLock<(Arc<EngineControl>, wire::EngineSpec)>,
+    /// The model their statistics are labelled with.
+    model_name: String,
+    /// Held while an engine is replaced, by a hot update or a relaunch, so
+    /// that replacements do not overlap.
+    replacing: tokio::sync::Mutex<()>,
+}
+
+/// Watches the engine `client` names while the hold serves it, and starts
+/// another in its place when it is lost: its workers failed for good or its
+/// process ended.
+///
+/// The hold holds requests while the new engine starts; the lost engine's
+/// token requests end as migratable and wait there, and the new engine
+/// serves them and every request that arrives meanwhile. The engine's
+/// workers find their weights retained at the Storage Servers. An engine the
+/// hold no longer serves, as after a hot update or a shutdown, is left as it
+/// is. Without an engine process of the leader's own, or when the new
+/// engine does not start, the hold closes and held and later requests fail.
+async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineClient>) {
+    loop {
+        let Some(states) = client.upgrade().map(|client| client.states()) else {
+            return;
+        };
+        let reason = lost(states).await;
+        let _replacing = engines.replacing.lock().await;
+        if !client
+            .upgrade()
+            .is_some_and(|client| engines.hold.serves(&client))
+        {
+            return;
+        }
+        let Some((control, spec)) = engines.control.get() else {
+            tracing::error!(%reason, "no engine serves requests");
+            engines.hold.close(reason);
+            return;
+        };
+        tracing::error!(%reason, "the engine was lost; starting another");
+        engines.hold.hold();
+        let control = Arc::clone(control);
+        let spec = spec.clone();
+        let sink = stats_sink(engines.model_name.clone());
+        let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|started| started);
+        match started {
+            Ok(relaunched) => {
+                let relaunched = Arc::new(relaunched);
+                client = Arc::downgrade(&relaunched);
+                engines.hold.serve(relaunched);
+                info!("the relaunched engine serves");
+            }
+            Err(error) => {
+                let reason =
+                    format!("the engine was lost ({reason}) and did not start again: {error:#}");
+                tracing::error!(%reason, "no engine serves requests");
+                engines.hold.close(reason);
+                return;
+            }
+        }
+    }
+}
+
+/// Waits until the engine whose states `states` observes stops serving,
+/// and returns why. A draining or standing-by engine is no loss.
+async fn lost(mut states: watch::Receiver<EngineState>) -> String {
+    loop {
         match states.borrow_and_update().clone() {
-            // A draining engine is no loss: the hold serves the next engine.
-            EngineState::Ready | EngineState::Draining => {}
-            EngineState::Failed(error) => break format!("the engine failed: {error}"),
-            EngineState::Closed => break "the engine process ended".to_owned(),
+            EngineState::Ready | EngineState::Draining | EngineState::Standby => {}
+            EngineState::Failed(error) => return format!("the engine failed: {error}"),
+            EngineState::Closed => return "the engine process ended".to_owned(),
         }
         if states.changed().await.is_err() {
-            break "the engine process ended".to_owned();
+            return "the engine process ended".to_owned();
         }
-    };
-    if client.upgrade().is_some_and(|client| hold.serves(&client)) {
-        tracing::error!(%reason, "no engine serves requests");
-        hold.close(reason);
     }
 }
 

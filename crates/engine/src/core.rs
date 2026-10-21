@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
-use crate::handle::{CommandSender, EventRx, SubmitError};
+use crate::handle::{Command, CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -364,6 +364,12 @@ pub struct EngineConfig {
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
+    /// The prefix cache units of each worker group of the engine this one
+    /// stands by for, by group identity; `None` for an engine that serves
+    /// at once. A standing-by engine's ranks map that engine's weights and
+    /// exclusive storages without writing them, park, and serve once
+    /// [`SchedulerHandle::promote`] promotes them.
+    pub standby: Option<BTreeMap<String, u32>>,
 }
 
 impl EngineConfig {
@@ -415,6 +421,7 @@ impl EngineConfig {
             // scheduler must recognize it to finish a sim request.
             eos: vec![151645],
             end_of_image: 0,
+            standby: None,
         }
     }
 
@@ -446,6 +453,9 @@ pub struct SchedulerHandle {
     media_units: BTreeMap<MediaCall, u32>,
     stats: Arc<SchedulerStats>,
     generation_limits: GenerationLimits,
+    /// The prefix cache units of each of its worker groups
+    /// (`Scheduler::cache_units`).
+    cache_units: BTreeMap<String, u32>,
     /// The served model identifier.
     model: String,
     /// Set after `Scheduler::run` returns a fatal exit (executor or worker
@@ -669,6 +679,15 @@ impl SchedulerHandle {
             union_rank += worker.ranks.len();
         }
 
+        // A standing-by engine's ranks adopt the cache units of the groups
+        // they stand by for, so that they map those groups' cache planes.
+        if let Some(units) = &config.standby {
+            for args in &mut arguments {
+                args.standby = true;
+                args.cache_units = units.get(&args.worker_id).copied();
+            }
+        }
+
         // `spawn_all` returns groups in argument order, which pairs each group
         // with its identity and, block by block, with its scheduler.
         let launched = WorkerGroup::spawn_all(arguments)?;
@@ -718,8 +737,12 @@ impl SchedulerHandle {
             };
             let scheduler = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
             // Each scheduler's serving path runs the requests its workers'
-            // reports call for before the scheduler serves.
-            crate::warmup::warm(&scheduler, &core_config)?;
+            // reports call for before the scheduler serves. Standby ranks
+            // warmed up on their scratch units, and write nothing before
+            // they are promoted.
+            if config.standby.is_none() {
+                crate::warmup::warm(&scheduler, &core_config)?;
+            }
             cores.push(scheduler);
         }
         Ok(cores)
@@ -788,6 +811,7 @@ impl SchedulerHandle {
         let media_units = scheduler.media_units()?;
         let info = scheduler.info().clone();
         let generation_limits = scheduler.generation_limits().clone();
+        let cache_units = scheduler.cache_units();
         let stats = scheduler.stats_handle();
 
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -809,6 +833,7 @@ impl SchedulerHandle {
             media_units,
             stats,
             generation_limits,
+            cache_units,
             model: model.into(),
             dead,
             next_id: AtomicU64::new(1),
@@ -834,6 +859,32 @@ impl SchedulerHandle {
     /// Returns the generation limits resolved against worker capabilities.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.generation_limits.clone()
+    }
+
+    /// Returns the prefix cache units of each of the scheduler's worker
+    /// groups with a prefix cache, by group identity, which an engine
+    /// standing by for this one adopts (`EngineConfig::standby`).
+    pub fn cache_units(&self) -> &BTreeMap<String, u32> {
+        &self.cache_units
+    }
+
+    /// Promotes the scheduler's standing-by workers
+    /// (`EngineConfig::standby`): each takes write access to the storages it
+    /// mapped and serves. Blocks until every worker answered.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a worker refuses, dies or does not answer within its
+    /// watchdog timeout, or the scheduler has stopped.
+    pub fn promote(&self) -> anyhow::Result<()> {
+        let (answer, promoted) = crossbeam_channel::bounded(1);
+        self.commands
+            .send(Command::Promote(answer))
+            .map_err(|_| anyhow::anyhow!("the scheduler has stopped"))?;
+        promoted
+            .recv()
+            .map_err(|_| anyhow::anyhow!("the scheduler stopped while it promoted"))?
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     /// Returns live scheduler statistics shared with the scheduler thread.

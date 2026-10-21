@@ -219,12 +219,6 @@ impl PendingWorker {
         for (name, value) in worker_environment(|name| std::env::var_os(name)) {
             environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
         }
-        // The engine's working directory leads the worker's import path; the
-        // worker runs in its daemon's.
-        if let Ok(cwd) = std::env::current_dir() {
-            let path = std::env::var("PYTHONPATH").unwrap_or_default();
-            environment.insert("PYTHONPATH".to_owned(), format!("{}:{path}", cwd.display()));
-        }
 
         // One typed descriptor carries every launch value. The engine keeps
         // it and answers the rank's registration with it.
@@ -236,6 +230,9 @@ impl PendingWorker {
             sockets.experts.map(|(_, descriptor)| descriptor),
         )?;
 
+        // The worker runs the engine's build: the executable imports the
+        // `uniserve` package of the Python environment it is installed in,
+        // which holds the worker library of that build.
         let executable = args
             .executable
             .to_str()

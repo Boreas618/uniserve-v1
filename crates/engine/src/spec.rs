@@ -243,6 +243,13 @@ impl EngineConfig {
             bos: facts.bos,
             eos: facts.eos.clone(),
             end_of_image: facts.end_of_image,
+            standby: spec.standby.as_ref().map(|standby| {
+                standby
+                    .cache_units
+                    .iter()
+                    .map(|group| (group.worker_group.clone(), group.units))
+                    .collect()
+            }),
         })
     }
 }
@@ -378,6 +385,7 @@ mod tests {
                 ..wire::Experts::default()
             }),
             model_facts: Some(wire::ModelFacts::default()),
+            standby: None,
         }
     }
 
