@@ -185,7 +185,7 @@ pub struct WorkerResponseError {
 pub struct Stall {
     /// The lane performing the job: its configured lane id, or `lane-0` for
     /// the full-device lane of a rank without configured lanes. `None` when
-    /// the rank's Python thread performs it, as it does every job of a call
+    /// the rank's builder thread performs it, as it does every job of a call
     /// kind no lane serves (every job of a rank without a CUDA device).
     pub lane: Option<String>,
     /// The batch the job belongs to: the one whose forward, input

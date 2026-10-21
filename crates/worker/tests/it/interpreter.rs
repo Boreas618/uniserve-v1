@@ -1,4 +1,4 @@
-//! The Python thread of a rank: where calls, releases and submitted work of
+//! The builder thread of a rank: where calls, releases and submitted work of
 //! other threads run. A process has one interpreter, so this file holds one test
 //! and runs in a process of its own.
 

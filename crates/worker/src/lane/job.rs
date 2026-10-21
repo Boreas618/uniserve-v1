@@ -118,7 +118,7 @@ pub(super) enum Operation {
     ExpertWarmup(Arc<ExpertUnion>),
 }
 
-/// Work the execution thread hands to the Python thread and waits for, or
+/// Work the execution thread hands to the builder thread and waits for, or
 /// runs itself where it enters Python on its own.
 pub(super) enum Call {
     /// A runner method.
@@ -138,7 +138,7 @@ pub(super) enum Call {
 }
 
 /// The capture of one runner method into a graph: `capture_begin`, the
-/// method, `capture_end`, on the Python thread.
+/// method, `capture_end`, on the builder thread.
 pub(crate) struct Capture {
     pub(crate) functions: GraphFunctions,
     /// The pool the captured allocations on the stream's device live in.

@@ -24,7 +24,7 @@
 //! anything is decoded, so the conditions decode in any order: every
 //! reference video's FFmpeg process starts first, on a thread of its own,
 //! and the library's calls (images, tracks, then each video's patches once
-//! its frames arrived) run on the Python thread meanwhile.
+//! its frames arrived) run on the builder thread meanwhile.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -179,7 +179,7 @@ impl ConditionReader {
     /// fill each product exactly from its first row, in request order.
     ///
     /// Every reference video's FFmpeg decode runs on a thread of its own
-    /// from the start, beside the library's calls on the Python thread:
+    /// from the start, beside the library's calls on the builder thread:
     /// each image and audio track in request order, then each video's
     /// patches once its frames arrived.
     pub(crate) fn read(

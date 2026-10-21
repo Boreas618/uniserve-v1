@@ -55,7 +55,7 @@ impl From<&StorageView> for Argument {
 }
 
 /// A method or library function and its owned arguments, called later,
-/// possibly on another thread (a microbatch's forward, the Python thread's
+/// possibly on another thread (a microbatch's forward, the builder thread's
 /// own work). A view crosses as its torch tensor
 /// ([`StorageView::handle`]), wrapped by the first call that passes it.
 #[derive(Clone)]
@@ -81,7 +81,7 @@ impl MethodCall {
 
     /// Make the call. The arguments' values, the first wrapping of a view
     /// no earlier call passed and the call itself take one handoff to the
-    /// Python thread, where the call's references to Python objects are
+    /// builder thread, where the call's references to Python objects are
     /// dropped too.
     pub(crate) fn invoke(self) -> Result<Any> {
         Interpreter::execute(move || {

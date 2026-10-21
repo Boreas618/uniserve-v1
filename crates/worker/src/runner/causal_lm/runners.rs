@@ -77,7 +77,7 @@ pub(crate) enum Pending {
     Predicates(Opening),
     /// The predicates are known: the batch reserves its storage next.
     Opened(Opening),
-    /// The job on the lane asks the Python thread for the patch grids the
+    /// The job on the lane asks the builder thread for the patch grids the
     /// batch's vision blocks place; the batch reserves its storage next.
     Grids(Opening, Vec<GridKey>),
     /// The job on the lane is the batch's last.
@@ -755,7 +755,7 @@ pub(crate) fn complete(
     Ok(())
 }
 
-/// Ask the Python thread, in `job`, for the patch grids the opened batch's
+/// Ask the builder thread, in `job`, for the patch grids the opened batch's
 /// vision blocks place that are not known yet; reserve the batch once every
 /// grid is known.
 fn grids<'a>(owners: Owners<'a>, opening: Opening, job: Job) -> (Option<Job>, Pending) {

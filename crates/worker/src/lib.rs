@@ -2,8 +2,8 @@
 //!
 //! A worker is a Rust process that hosts the Python interpreter: the
 //! `uniserve worker` command loads this library and calls its exported
-//! [`worker_main`], which runs the control plane on the process's main
-//! thread and the interpreter on a Python thread of its own. Rust owns
+//! [`worker_main`], which runs the control thread on the process's main
+//! thread and the interpreter on its builder thread. Rust owns
 //! request state, storage, streams, graphs policy, transfers and the IPC
 //! service; Python computes through the library functions Rust imports by
 //! path.

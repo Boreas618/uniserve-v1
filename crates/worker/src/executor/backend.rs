@@ -223,7 +223,7 @@ impl WorkerBackend {
         Ok(())
     }
 
-    /// Submit `job` to the lane serving `kind` (the Python thread for a
+    /// Submit `job` to the lane serving `kind` (the builder thread for a
     /// rank that serves no call kind and so has no lane). `wake` is as for
     /// [`JobQueues::start`].
     ///
@@ -1061,7 +1061,7 @@ impl WorkerBackend {
 }
 
 /// Start the job that completes once `events` completed where `kind` is
-/// served (the Python thread for a rank without a lane, which has no device
+/// served (the builder thread for a rank without a lane, which has no device
 /// event to wait for), with the control thread's wake behind it.
 fn after(
     jobs: &JobQueues,

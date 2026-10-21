@@ -1,12 +1,12 @@
 //! The worker process: arguments, registration, descriptor, signals, the
-//! Python thread and exit status.
+//! builder thread and exit status.
 //!
 //! This module's `main` is the body of the library's exported
 //! `worker_main`, which the `uniserve worker` command calls on the
-//! process's main thread. It spawns the worker's Python thread, which hosts
+//! process's main thread. It spawns the worker's builder thread, which hosts
 //! the interpreter ([`python::host`]) and serves the Python calls of every
-//! other thread ([`Interpreter`]), and runs the control plane on the main
-//! thread. `main` returns the process exit status:
+//! other thread ([`Interpreter`]), and runs the control thread's work on
+//! the main thread. `main` returns the process exit status:
 //!
 //! | condition | status |
 //! | --- | --- |
@@ -46,7 +46,7 @@ use crate::service::Ending;
 use crate::worker::Worker;
 
 /// Run the worker and return its exit status. `python` is the environment's
-/// interpreter, which the Python thread's interpreter takes as its
+/// interpreter, which the builder thread's interpreter takes as its
 /// executable.
 pub(crate) fn main(argv: &[String], python: &Path) -> i32 {
     crate::logging::init();
@@ -163,8 +163,8 @@ impl<E: Into<Failure>> From<E> for Ended {
     }
 }
 
-/// Run the worker: start its Python thread, run the control plane on the
-/// calling thread, then stop the Python thread and destroy the worker's
+/// Run the worker: start its builder thread, serve as the control thread on
+/// the calling thread, then stop the builder thread and destroy the worker's
 /// device contexts when nothing it issued can still run on them.
 fn run(
     arguments: &Arguments,
@@ -174,12 +174,12 @@ fn run(
     let (started, ready) = crossbeam_channel::bounded(1);
     let (finish, finished) = crossbeam_channel::bounded::<()>(1);
     let python = python.to_owned();
-    let python_thread = std::thread::Builder::new()
-        .name("python".into())
+    let builder = std::thread::Builder::new()
+        .name("builder".into())
         .spawn(move || {
             match python::host(&python).and_then(|()| Interpreter::start()) {
                 Ok(interpreter) => {
-                    // The receiver outlives this thread: the control plane
+                    // The receiver outlives this thread: the control thread
                     // waits for it before its first Python call.
                     let _ = started.send(Ok(()));
                     interpreter.run(&finished);
@@ -189,16 +189,16 @@ fn run(
                 }
             }
         })
-        .map_err(|error| crate::Error::transport_source("python thread", error))?;
+        .map_err(|error| crate::Error::transport_source("builder thread", error))?;
 
     let ended = serve(arguments, signals, &ready);
-    // The Python thread finishes the call it is serving, if any, and stops.
+    // The builder thread finishes the call it is serving, if any, and stops.
     // Only a settled worker waits for it, before it destroys its contexts:
     // any other ends the process with the thread wherever it is, as an
     // aborted worker must.
     let _ = finish.send(());
     if ended.settled {
-        let _ = python_thread.join();
+        let _ = builder.join();
     }
     if !ended.orderly {
         // The communicators were not destroyed with the group's peers, and
@@ -211,7 +211,7 @@ fn run(
         return ended.outcome;
     }
 
-    // The worker was closed and dropped and the Python thread has stopped,
+    // The worker was closed and dropped and the builder thread has stopped,
     // so nothing uses a device any more, and nothing the worker issued still
     // runs on one. PyTorch's references keep every context alive until the
     // process ends, and the driver removes the shared memory behind a
@@ -229,7 +229,7 @@ fn run(
 }
 
 /// The worker's life on the control thread: register with the engine, wait
-/// for the Python thread (`ready`), start, warm up, serve and close.
+/// for the builder thread (`ready`), start, warm up, serve and close.
 ///
 /// A close by the engine is collective: the group's workers retire the
 /// communicators and process groups they share together, so the close is
@@ -270,7 +270,7 @@ fn serve(
     let hosted = ready
         .recv()
         .unwrap_or(Err(crate::Error::State(
-            "the Python thread ended without starting",
+            "the builder thread ended without starting",
         )))
         .map_err(WorkerError::from);
     if let Err(error) = hosted {
@@ -301,7 +301,7 @@ fn serve(
         Ok(Ending::Closed) => (Ok(()), true, true),
         Ok(Ending::Orphaned(error)) => (Err(error), false, true),
         Ok(Ending::Abandoned(error)) => {
-            // The Python thread may wait in the abandoned work for good,
+            // The builder thread may wait in the abandoned work for good,
             // inside a device call behind a collective whose peer stopped,
             // and an aborted close then waits with it: the worker can neither
             // return through that thread nor close. The process ends from

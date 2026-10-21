@@ -322,7 +322,7 @@ impl VideoDecoder {
                 });
                 GraphMode::Capture
             }
-            // A shape startup did not capture runs on the Python thread.
+            // A shape startup did not capture runs on the builder thread.
             _ => {
                 job.call(method(self)?);
                 GraphMode::Eager

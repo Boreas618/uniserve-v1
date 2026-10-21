@@ -60,7 +60,7 @@
 //! serves every prompt length up to it: the runner writes the padded tokens,
 //! launches the graph and copies the prompt's feature rows into the product,
 //! all natively. Prompts with vision tokens (rotary coordinates and vision
-//! rows) run on the Python thread.
+//! rows) run on the builder thread.
 //!
 //! Every runner call is ordered on the runner's stream; the caller orders
 //! that stream after the producers of its inputs and records the producer

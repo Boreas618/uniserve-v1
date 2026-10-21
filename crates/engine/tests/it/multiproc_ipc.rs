@@ -548,7 +548,7 @@ fn lose_engine(
 /// nothing in flight, as once its last batch was answered, it closes without
 /// its peers and destroys its device contexts; with a job stuck in flight,
 /// here a forward that never returns, it ends at once from its control
-/// thread, since its Python thread waits in that job. Either way it exits
+/// thread, since its builder thread waits in that job. Either way it exits
 /// promptly with status 1 and names the path in its log.
 #[test]
 fn a_rank_without_its_engine_closes_when_idle_and_ends_at_once_when_stuck() -> anyhow::Result<()> {
@@ -900,7 +900,7 @@ fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()>
         let WorkerResponse::Stalled { stall } = report else {
             anyhow::bail!("the rank answered with {report:?}");
         };
-        // A CPU rank has no lane: its Python thread performs every job.
+        // A CPU rank has no lane: its builder thread performs every job.
         anyhow::ensure!(stall.lane.is_none(), "{stall:?}");
         anyhow::ensure!(stall.batch_id == Some(1), "{stall:?}");
         anyhow::ensure!(stall.route.as_deref() == Some("prefill"), "{stall:?}");
@@ -961,7 +961,7 @@ fn a_reported_stall_replaces_the_group_naming_the_lane() -> anyhow::Result<()> {
         .context("expected the group's replacement")?;
     // The rank's report failed the group, not the group's own deadline,
     // whose failure names no lane.
-    for named in ["the Python thread stalled", "batch 1 (prefill", "31/"] {
+    for named in ["the builder thread stalled", "batch 1 (prefill", "31/"] {
         anyhow::ensure!(
             failure.message.contains(named),
             "the failure does not name {named:?}: {}",

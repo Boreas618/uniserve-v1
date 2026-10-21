@@ -162,7 +162,7 @@ pub(crate) struct Streams {
     /// host KV cache (`crate::lane`), on its primary device.
     copy: Option<Lane>,
     /// Where the lanes post their completions; the rank's job queues take
-    /// them from here, and give the posting end to the Python thread's
+    /// them from here, and give the posting end to the builder thread's
     /// work.
     posted: Sender<(JobId, Completion)>,
     completions: Receiver<(JobId, Completion)>,

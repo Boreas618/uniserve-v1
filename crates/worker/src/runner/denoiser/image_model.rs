@@ -9,7 +9,7 @@
 //!
 //! Two host functions complete the policy: `EncoderRunner.patch_grid` (the
 //! vision tower's patch grid of an image, which places its features),
-//! asked in jobs of the Python thread at input admission and kept, and
+//! asked in jobs of the builder thread at input admission and kept, and
 //! `DenoiserRunner.guidance_prefix` (an unconditional guidance prefix's
 //! tokens, by the model's prompt framing and tokenizer).
 
@@ -351,7 +351,7 @@ impl ImagePolicy {
         lock(&self.grids).get(&key).copied()
     }
 
-    /// Record in `job`, a job of the Python thread, the call asking the
+    /// Record in `job`, a job of the builder thread, the call asking the
     /// patch grid of `key`: the job's completion carries `[rows, columns]`,
     /// which [`Self::answer_grid`] keeps.
     pub(crate) fn ask_grid(&self, key: GridKey, job: &Job) {
@@ -400,7 +400,7 @@ impl ImagePolicy {
     }
 
     /// The prefix tokens the model frames for an unconditional guidance
-    /// branch of `source`, asked now on the Python thread (startup work).
+    /// branch of `source`, asked now on the builder thread (startup work).
     pub(crate) fn prefix_of(&self, source: BranchSource) -> Result<Prefix> {
         let text = |value: &str| tvm_ffi::Any::from(tvm_ffi::String::from(value));
         let values = self

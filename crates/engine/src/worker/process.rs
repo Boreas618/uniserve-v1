@@ -599,7 +599,7 @@ impl WorkerProcess {
     /// the batches behind it: the group fails it as it fails a lost rank.
     fn stalled(&self, stall: &ipc::Stall) -> anyhow::Error {
         let lane = stall.lane.as_ref().map_or_else(
-            || "the Python thread".to_owned(),
+            || "the builder thread".to_owned(),
             |lane| format!("lane {lane}"),
         );
         let calls = stall

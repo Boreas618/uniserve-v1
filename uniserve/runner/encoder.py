@@ -391,7 +391,7 @@ class EncoderRunner:
         """Fill a condition size's complete posterior draw.
 
         ``noise`` is a flat FP32 tensor of :meth:`posterior_elements`
-        elements, the control plane's storage of the draw, which every
+        elements, the worker's storage of the draw, which every
         encoding of a condition of this size then reads (:meth:`encode`).
         """
         encoder = capability(loaded.module, VideoEncoder)

@@ -1,4 +1,4 @@
-//! The Python thread of a worker.
+//! The builder thread of a worker.
 //!
 //! Exactly one thread of a worker executes Python, so no thread ever waits
 //! for the GIL. That thread is the `python` thread the worker's entry
@@ -12,7 +12,7 @@
 //! when it ran. Submitted work is served in the same queue, in arrival
 //! order with every other thread's calls. Giving up a Python object
 //! ([`super::Handle`]'s drop) is such work on every thread: the reference
-//! is dropped by the Python thread, in the order of the queue, and nobody
+//! is dropped by the builder thread, in the order of the queue, and nobody
 //! waits for it. An owner whose next step needs the releases made (closing
 //! the streams or the context that released objects use) waits for the
 //! queue once ([`Interpreter::synchronize`]).
@@ -26,7 +26,7 @@
 //!   microbatch needs a thread of its own, and exactly one of them runs at
 //!   a time;
 //! - no interpreter was started: the library is used from Python (tests,
-//!   harnesses), where the caller's thread already is the Python thread.
+//!   harnesses), where the caller's thread already is the builder thread.
 //!
 //! The library is reached by import path ([`Interpreter::import`]) through
 //! the one function `uniserve.worker.attach` registers,
@@ -48,7 +48,7 @@ thread_local! {
     static CALLS_HERE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// One entry of the Python thread's queue.
+/// One entry of the builder thread's queue.
 enum Request {
     /// Work that borrows its submitter, which is parked until it ran.
     Handed(Handoff),
@@ -83,7 +83,7 @@ impl Interpreter {
     /// The Python callable at a dotted import path, for example
     /// `uniserve.runner.causal_lm.CausalLMRunner.decode`: a function, a
     /// class (called to construct it) or a method (called with the object
-    /// first). Resolving imports the path's module on the Python thread.
+    /// first). Resolving imports the path's module on the builder thread.
     ///
     /// Fails when no import function was installed, when the path does not
     /// resolve (the library's error, which names the path) or when it names
@@ -98,14 +98,14 @@ impl Interpreter {
         Ok(Function::new(path, function))
     }
 
-    /// Make the calling thread the process's Python thread. From now on a
+    /// Make the calling thread the process's builder thread. From now on a
     /// [`super::Function`] called on another thread runs here, inside
     /// [`Self::run`].
     pub fn start() -> Result<Self> {
         let (sender, requests) = unbounded();
         REQUESTS
             .set(sender)
-            .map_err(|_| Error::State("the Python thread was already started"))?;
+            .map_err(|_| Error::State("the builder thread was already started"))?;
         CALLS_HERE.set(true);
         Ok(Self { requests })
     }
@@ -132,7 +132,7 @@ impl Interpreter {
         }
     }
 
-    /// Submit `work` to the Python thread and return without waiting for
+    /// Submit `work` to the builder thread and return without waiting for
     /// it. The work owns everything it uses and reports by a message of its
     /// own (a completion it posts), so its submitter goes on at once. Where
     /// the calling thread is the one its Python runs on (see the module
@@ -152,15 +152,15 @@ impl Interpreter {
         }
     }
 
-    /// Wait until the Python thread has run everything submitted or handed
+    /// Wait until the builder thread has run everything submitted or handed
     /// to it before this call: every released object is released when this
     /// returns. For an owner about to close what released objects use; not
     /// for a thread that serves.
     pub fn synchronize() {
-        on_python_thread(&mut || {});
+        on_builder_thread(&mut || {});
     }
 
-    /// Run `work` on the Python thread and wait for its result, or on the
+    /// Run `work` on the builder thread and wait for its result, or on the
     /// calling thread when that is where its Python runs (see the module
     /// documentation).
     ///
@@ -169,7 +169,7 @@ impl Interpreter {
     /// such as a view's first wrapping as a torch tensor
     /// ([`crate::memory::allocation::StorageView::handle`]), therefore costs
     /// one handoff, and every reference to a Python object that `work`
-    /// drops is dropped on the Python thread.
+    /// drops is dropped on the builder thread.
     #[expect(
         clippy::expect_used,
         reason = "the work stores its result before the handoff completes"
@@ -177,14 +177,14 @@ impl Interpreter {
     pub(crate) fn execute<T>(work: impl FnOnce() -> T) -> T {
         let mut work = Some(work);
         let mut result = None;
-        on_python_thread(&mut || result = work.take().map(|work| work()));
+        on_builder_thread(&mut || result = work.take().map(|work| work()));
         result.expect("a finished handoff ran its work")
     }
 }
 
-/// Run `work` on the Python thread and wait for it, or on the calling
+/// Run `work` on the builder thread and wait for it, or on the calling
 /// thread when that is where its Python runs (see the module documentation).
-fn on_python_thread(work: &mut dyn FnMut()) {
+fn on_builder_thread(work: &mut dyn FnMut()) {
     let handed = REQUESTS
         .get()
         .filter(|_| !CALLS_HERE.get())
@@ -194,12 +194,12 @@ fn on_python_thread(work: &mut dyn FnMut()) {
     }
 }
 
-/// Call `function` on the Python thread and wait for its result.
+/// Call `function` on the builder thread and wait for its result.
 pub(super) fn call(function: &tvm_ffi::Function, args: &[AnyView<'_>]) -> tvm_ffi::Result<Any> {
     Interpreter::execute(|| function.call_packed(args))
 }
 
-/// Give up a reference to a Python object: the Python thread drops it, in
+/// Give up a reference to a Python object: the builder thread drops it, in
 /// the order of its queue, and the caller does not wait.
 ///
 /// A Python object can own device resources (a graph pool frees its blocks
@@ -212,12 +212,12 @@ pub(super) fn release(value: Any) {
     Interpreter::submit(move || released.release());
 }
 
-/// A reference on its way to the Python thread.
+/// A reference on its way to the builder thread.
 struct Released(Any);
 
 // SAFETY: the value is an immutable reference-counted TVM-FFI object with
 // atomic counts, which Rust never dereferences; it is only moved to the
-// Python thread and dropped there. A handle never holds a TVM-FFI tensor:
+// builder thread and dropped there. A handle never holds a TVM-FFI tensor:
 // a torch tensor it holds is an opaque Python object.
 unsafe impl Send for Released {}
 
@@ -242,7 +242,7 @@ pub fn cooperative<T>(body: impl FnOnce() -> T) -> T {
 }
 
 // Work handed from one thread to another, whose submitter waits for it.
-// Every thread hands its Python calls to the Python thread. The work borrows
+// Every thread hands its Python calls to the builder thread. The work borrows
 // the submitter's stack, so the submitter stays parked until the receiving
 // thread has run it.
 

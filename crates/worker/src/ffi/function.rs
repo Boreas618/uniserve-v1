@@ -9,7 +9,7 @@ use crate::{Error, Result};
 /// returned.
 ///
 /// A function may be held and called by any thread. The call itself runs on
-/// the rank's Python thread (see [`super::Interpreter`]) while the caller
+/// the rank's builder thread (see [`super::Interpreter`]) while the caller
 /// waits for its result.
 ///
 /// TVM-FFI functions are reference-counted objects with atomic counts. The

@@ -687,7 +687,7 @@ enum Asked {
 /// The layout of a request's size at each prompt capacity and whether a
 /// layout holds it are the model's arithmetic over the request's own size,
 /// so no table answers them: every request is asked for, in jobs of the
-/// Python thread. A request without conditions takes one job (its layouts
+/// builder thread. A request without conditions takes one job (its layouts
 /// are startup layouts); a conditioned one takes a job for its layouts
 /// first. A request whose layout the denoiser does not hold (one prepared at
 /// startup or for an earlier request) takes a further job, on the
@@ -871,7 +871,7 @@ impl VideoRequests {
     /// request's layouts holds it; and for requests whose selected layout
     /// `denoisers` does not hold, that layout's preparation. Returns whether
     /// the job belongs on the denoiser's lane (a preparation works on its
-    /// stream) rather than on the Python thread alone.
+    /// stream) rather than on the builder thread alone.
     pub(crate) fn ask(
         &self,
         sizing: &mut Sizing,

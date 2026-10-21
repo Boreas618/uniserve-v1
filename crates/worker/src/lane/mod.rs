@@ -11,7 +11,7 @@
 //! A forward runs as jobs of its lane ([`JobQueues::start`]). A [`Job`] is
 //! the ordered list of what the forward puts on the stream; the lane's
 //! execution thread performs it: it writes the forward's inputs, launches
-//! its graph or hands its Python call to the Python thread and waits for
+//! its graph or hands its Python call to the builder thread and waits for
 //! it, and reads its outputs, so the stream's order is the thread's order.
 //! The thread posts a [`Completion`] per job under the job's [`JobId`], to
 //! the one place the control thread takes completions from
@@ -19,11 +19,11 @@
 //! Several jobs of a lane may be queued: their completions arrive in the
 //! lane's order.
 //!
-//! Work for the resource plane takes the same way to the Python thread
+//! Resource work (loading, releases) takes the same way to the builder thread
 //! ([`JobQueues::call`]): calls that issue nothing on a stream are submitted
 //! to it under a [`JobId`], and their [`Completion`] is posted to the same
 //! place. So is a job no lane serves, which has no stream: its memory
-//! writes and calls are performed by the Python thread.
+//! writes and calls are performed by the builder thread.
 //!
 //! While it serves, the control thread waits for neither: it starts work
 //! and takes completions when its wake fires. Before the rank serves and
@@ -31,7 +31,7 @@
 //! ([`JobQueues::block_on`], [`JobQueues::drain`]).
 //!
 //! Because every job is submitted and every completion taken here, the
-//! queues know which jobs each lane and the Python thread have been given
+//! queues know which jobs each lane and the builder thread have been given
 //! and not completed, and since when ([`JobQueues::oldest`]): a lane that
 //! stays inside one job, such as a driver call that does not return, is
 //! seen from the control thread, which reports it to the engine.
@@ -143,9 +143,9 @@ impl JobQueues {
     }
 }
 
-/// The job queues of a rank's lanes, the way to its Python thread and the
+/// The job queues of a rank's lanes, the way to its builder thread and the
 /// completions of what was submitted to either: the control thread's side
-/// of the execution and resource planes.
+/// of the execution threads and the builder thread.
 #[derive(Clone)]
 pub(crate) struct JobQueues {
     shared: Arc<Shared>,
@@ -156,9 +156,9 @@ struct Shared {
     queues: Vec<(Option<Vec<CallKind>>, JobQueue)>,
     /// The copy lane's queue, when the rank has one.
     copy: Option<JobQueue>,
-    /// Where every lane and the Python thread post their completions.
+    /// Where every lane and the builder thread post their completions.
     completions: Receiver<(JobId, Completion)>,
-    /// The posting end the Python thread's work is given.
+    /// The posting end the builder thread's work is given.
     posted: Sender<(JobId, Completion)>,
     /// The control thread's wake, fired behind a completion the Python
     /// thread posts. Set and read on the control thread.
@@ -169,19 +169,19 @@ struct Shared {
     /// order.
     arrived: Mutex<VecDeque<(JobId, Completion)>>,
     /// What each lane, by position, then the copy lane when the rank has
-    /// one, and then the Python thread have been given and not completed.
+    /// one, and then the builder thread have been given and not completed.
     /// Changed only by the thread that submits jobs and takes completions.
     running: Mutex<Vec<Running>>,
 }
 
-/// The jobs one performer, a lane's execution thread or the Python thread,
+/// The jobs one performer, a lane's execution thread or the builder thread,
 /// has been given and not completed, in submission order. A performer
 /// performs its jobs in that order, so the first is the one it is
 /// performing; a job whose completion waits for device events
 /// ([`Job::after`]) leaves its lane at once and may complete after the
 /// jobs behind it.
 struct Running {
-    /// The lane's name in a stall report; `None` for the Python thread.
+    /// The lane's name in a stall report; `None` for the builder thread.
     lane: Option<String>,
     /// Each job, when it was submitted and the runner method it calls.
     jobs: VecDeque<(JobId, Instant, Option<String>)>,
@@ -251,13 +251,13 @@ impl JobQueues {
         self.shared.queues.len()
     }
 
-    /// The Python thread's position among the performers: the last.
+    /// The builder thread's position among the performers: the last.
     fn python_performer(&self) -> usize {
         self.shared.queues.len() + usize::from(self.shared.copy.is_some())
     }
 
     /// Note that job `id`, which calls `method`, was given to `performer`
-    /// (a lane's position; the lanes' count for the Python thread) now.
+    /// (a lane's position; the lanes' count for the builder thread) now.
     fn submitted(&self, performer: usize, id: JobId, method: Option<String>) {
         if let Some(running) = self.running().get_mut(performer) {
             running.jobs.push_back((id, Instant::now(), method));
@@ -276,7 +276,7 @@ impl JobQueues {
         }
     }
 
-    /// The job in flight that its performer, a lane or the Python thread,
+    /// The job in flight that its performer, a lane or the builder thread,
     /// has been performing longest, and since when: of each performer's
     /// first job, timed from its submission or from the arrival of that
     /// performer's last completion, whichever is later, the earliest.
@@ -297,7 +297,7 @@ impl JobQueues {
             .min_by_key(|&(_, since)| since)
     }
 
-    /// The lane performing job `id`, `None` for the Python thread, and the
+    /// The lane performing job `id`, `None` for the builder thread, and the
     /// runner method the job calls; `None` when the job is not in flight.
     pub(crate) fn performing(&self, id: JobId) -> Option<(Option<String>, Option<String>)> {
         self.running().iter().find_map(|running| {
@@ -323,8 +323,8 @@ impl JobQueues {
     /// control thread's wake is fired behind it, or the completion is left
     /// to be taken when the control thread next takes one (nothing goes on
     /// from it). A job no lane serves (every job of a rank without a CUDA
-    /// device) has no stream: it goes to the Python thread like the
-    /// resource plane's calls ([`Self::call`]).
+    /// device) has no stream: it goes to the builder thread like resource
+    /// calls ([`Self::call`]).
     pub(crate) fn start(&self, kind: CallKind, job: Job, wake: bool) -> Result<JobId> {
         match self.lane(kind) {
             Some(lane) => {
@@ -477,7 +477,7 @@ impl JobQueues {
     }
 
     /// Submit `calls`, a job of Python calls that issue nothing on a
-    /// stream, to the Python thread without waiting for it. Its completion
+    /// stream, to the builder thread without waiting for it. Its completion
     /// arrives under the returned name where the lanes' completions arrive;
     /// `wake` says whether the control thread's wake is fired behind it, or
     /// the completion is left to be taken when the control thread next
@@ -658,7 +658,7 @@ mod tests {
         let stuck = queues.start(DECODE, stuck, true)?;
 
         // Its submitter goes on: it finds no completion, queues more work
-        // behind the job, and has the Python thread's way open beside it.
+        // behind the job, and has the builder thread's way open beside it.
         assert!(queues.take().is_none());
         let behind = queues.start(DECODE, Job::new(), true)?;
         let beside = queues.call(Job::new(), true);
@@ -742,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn a_job_no_lane_serves_takes_the_way_of_the_python_threads_calls() -> Result<()> {
+    fn a_job_no_lane_serves_takes_the_way_of_the_builder_threads_calls() -> Result<()> {
         // No interpreter is started in this process: work submitted to the
-        // Python thread runs on its submitter's.
+        // builder thread runs on its submitter's.
         let queues = JobQueues::default();
         let here = std::thread::current().id();
         let notes = Arc::new(Mutex::new(Vec::new()));

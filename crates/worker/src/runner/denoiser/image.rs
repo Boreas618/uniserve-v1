@@ -30,8 +30,8 @@
 //! tokens and predictions in order. Startup captures the configured shapes
 //! largest first; serving launches an exact shape natively (after
 //! `plan_denoise` when an attention operator plans its launch on the host)
-//! and runs any other on the Python thread. Solver updates run on the
-//! Python thread.
+//! and runs any other on the builder thread. Solver updates run on the
+//! builder thread.
 
 mod denoising;
 
