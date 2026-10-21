@@ -1,12 +1,12 @@
 //! Folds the runtime events of one video generation into its artifact.
 //!
-//! Every consumer of a video stream (the synchronous route, the job task and
-//! the Dynamo worker) waits for the same outcome: exactly one artifact
+//! Every consumer of a video stream (the synchronous route and the job task)
+//! waits for the same outcome: exactly one artifact
 //! followed by a normal finish. [`ArtifactCollector`] classifies the events
 //! once; each consumer keeps its own read loop, with its own cancellation and
 //! progress handling. A [`VideoStreamError`] has one message and one code,
-//! which the synchronous route renders as an OpenAI error, a job records as
-//! its failure, and the Dynamo worker returns as its error.
+//! which the synchronous route renders as an OpenAI error and a job records
+//! as its failure.
 
 use std::ops::ControlFlow;
 

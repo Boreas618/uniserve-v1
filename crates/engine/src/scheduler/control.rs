@@ -7,8 +7,7 @@
 //! `reap_cancellations` finishes the rest once their calls drain.
 //! Acknowledgements resolve the stop-string decisions a request awaits
 //! (`RequestOutput::decoder_boundaries`), and `abort_all_requests` ends every
-//! request when the control loop stops. Handover commands are applied by
-//! `handover`.
+//! request when the control loop stops.
 
 use super::*;
 
@@ -65,8 +64,8 @@ impl Scheduler {
                 let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
-                    prompt_tokens: st.prompt_tokens(),
-                    completion_tokens: st.num_generated_tokens,
+                    prompt_tokens: st.req.prompt_token_ids.len(),
+                    completion_tokens: 0,
                     images: 0,
                 });
             }
@@ -106,23 +105,6 @@ impl Scheduler {
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
             Command::Shutdown => return true,
-            Command::PrepareHandover(reply) => {
-                let _ = reply.send(self.prepare_handover());
-            }
-            Command::AbandonHandover => self.abandon_handover(),
-            Command::Quiesce(reply) => self.quiesce = Some(reply),
-            Command::Resume {
-                snapshot,
-                events,
-                reply,
-            } => {
-                let resumed = self.resume(*snapshot, events);
-                if let Err(error) = &resumed {
-                    tracing::error!("the engine core could not resume: {error:#}");
-                    self.fatal = true;
-                }
-                let _ = reply.send(resumed);
-            }
         }
         false
     }
@@ -217,8 +199,8 @@ impl Scheduler {
             let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
                 reason,
                 stop_reason: None,
-                prompt_tokens: st.prompt_tokens(),
-                completion_tokens: st.num_generated_tokens,
+                prompt_tokens: st.req.prompt_token_ids.len(),
+                completion_tokens: 0,
                 images: 0,
             });
         }
@@ -229,16 +211,10 @@ impl Scheduler {
     ///
     /// Every decoder boundary within the first `output_token_count` public
     /// tokens is resolved, which releases scheduling held on those decisions
-    /// and may apply a finish deferred on them. A waiting request awaits
-    /// decisions only when it resumed from a predecessor engine
-    /// (`crate::handover`); other requests are ignored.
+    /// and may apply a finish deferred on them. Requests that are not running
+    /// are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
-        let running = self.running.contains_key(&id);
-        let Some(state) = self.running.get_mut(&id).or_else(|| {
-            self.waiting
-                .iter_mut()
-                .find(|state| state.req.request_id == id)
-        }) else {
+        let Some(state) = self.running.get_mut(&id) else {
             return;
         };
         while state
@@ -249,37 +225,20 @@ impl Scheduler {
         {
             state.output.decoder_boundaries.pop_front();
         }
-        if running {
-            self.finish_pending_if_idle(id);
-        }
+        self.finish_pending_if_idle(id);
     }
 
     /// Stops a running token request whose frontend decoder matched a stop
     /// string.
     ///
     /// Drops pending decoder decisions and sets a `Stop` terminal intent that
-    /// `reap_cancellations` applies once the request's calls drain. A waiting
-    /// request, which has published tokens only when it resumed from a
-    /// predecessor engine (`crate::handover`), finishes at once. Other
-    /// requests are ignored.
+    /// `reap_cancellations` applies once the request's calls drain. Requests
+    /// that are not running are ignored.
     pub(super) fn mark_stopped(&mut self, id: RequestId) {
-        if let Some(state) = self.running.get_mut(&id) {
-            state.output.decoder_boundaries.clear();
-            state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
+        let Some(state) = self.running.get_mut(&id) else {
             return;
-        }
-        if let Some(state) = self.remove_waiting(id) {
-            let _ = state
-                .output
-                .events
-                .event_tx
-                .send(EngineCoreOutput::Finished {
-                    reason: FinishReason::Stop,
-                    stop_reason: None,
-                    prompt_tokens: state.prompt_tokens(),
-                    completion_tokens: state.num_generated_tokens,
-                    images: 0,
-                });
-        }
+        };
+        state.output.decoder_boundaries.clear();
+        state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
     }
 }

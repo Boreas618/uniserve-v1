@@ -7,7 +7,7 @@
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
 
-pub(crate) mod listener;
+mod listener;
 mod middleware;
 
 use std::sync::Arc;
@@ -43,8 +43,7 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
-/// Runs the configured HTTP server until `shutdown` is cancelled, or until
-/// it handed its deployment over and its last connection closed.
+/// Runs the configured HTTP server until `shutdown` is cancelled.
 ///
 /// The listener is bound once the engine has started, so the port accepts
 /// connections only when the server can answer them. Cancellation before the
@@ -54,110 +53,40 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// request still running as aborted, so a stream that outlived the shutdown
 /// budget ends then.
 ///
-/// When another head of the deployment runs on this host, the server
-/// succeeds it (`crate::handover`): its engine starts over workers standing
-/// by for the other head's, takes the other head's requests over, and serves
-/// on the listening socket the other head passes instead of binding one.
-/// Every server offers its deployment to a successor in the same way.
-///
 /// # Errors
 ///
-/// Fails when the configuration is invalid, the running head refuses the
-/// handover, the engine cannot start or take over, the listener cannot be
-/// bound or report its address, the server fails, or the engine shutdown
-/// fails.
+/// Fails when the configuration is invalid, the engine cannot start, the
+/// listener cannot be bound or report its address, the server fails, or the
+/// engine shutdown fails.
 pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationToken) -> Result<()> {
     config
         .validate(&stated)
         .context("invalid serving configuration")?;
 
-    let handover_socket = crate::handover::socket(config.served_model_name());
-    let cores = config.engine_config()?.data_parallel_size;
-    let predecessor = {
-        let socket = handover_socket.clone();
-        let deployment = config.served_model_name().to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::handover::Predecessor::connect(&socket, &deployment, cores)
-        })
-        .await
-        .context("the handover connection task did not complete")??
-    };
-    let adoption = predecessor
-        .as_ref()
-        .and_then(crate::handover::Predecessor::adoption);
     let engine = tokio::select! {
-        engine = Engine::start(&config, &stated, adoption) => Arc::new(engine?),
+        engine = Engine::start(&config, &stated) => Arc::new(engine?),
         () = shutdown.cancelled() => return Ok(()),
     };
     let served = async {
-        let listener = match predecessor {
-            Some(predecessor) => {
-                let cores = engine.cores();
-                let runtime = tokio::runtime::Handle::current();
-                let (descriptor, address) =
-                    tokio::task::spawn_blocking(move || predecessor.take_over(cores, &runtime))
-                        .await
-                        .context("the takeover task did not complete")??;
-                Listener::adopt(descriptor, &address)
-                    .context("failed to serve on the predecessor's listening socket")?
-            }
-            None => Listener::bind(&config.server_config)
-                .await
-                .context("failed to bind listener for HTTP server")?,
-        };
-        let handed_over = offer(&engine, &listener, handover_socket, &shutdown).await;
-        serve_on(&engine, listener, &config, &shutdown, &handed_over).await
+        let listener = Listener::bind(&config.server_config)
+            .await
+            .context("failed to bind listener for HTTP server")?;
+        serve_on(&engine, listener, &config, &shutdown).await
     }
     .await;
     let stopped = engine.shutdown().await;
     served.and(stopped)
 }
 
-/// Offers the deployment to a successor head on its handover `socket`
-/// (`crate::handover`) until `shutdown`. Returns the token the offer cancels
-/// once it handed the deployment over. A server that cannot offer serves all
-/// the same.
-async fn offer(
-    engine: &Arc<Engine>,
-    listener: &Listener,
-    socket: std::path::PathBuf,
-    shutdown: &CancellationToken,
-) -> CancellationToken {
-    let deployment = engine.served_model_name().to_owned();
-    let handed_over = CancellationToken::new();
-    let offered = async {
-        let handed = listener.handover()?;
-        let offer =
-            tokio::task::spawn_blocking(move || crate::handover::Offer::bind(&socket, &deployment))
-                .await??;
-        offer.serve(
-            engine.cores(),
-            handed,
-            handed_over.clone(),
-            shutdown.clone(),
-            tokio::runtime::Handle::current(),
-        )?;
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(error) = offered {
-        warn!("the server cannot hand its deployment over: {error:#}");
-    }
-    handed_over
-}
-
 /// Serves `engine` on `listener` until `shutdown` is cancelled and the
-/// server has drained, or its budget has run out, or until `handed_over` is
-/// cancelled and the server has drained.
+/// server has drained, or its budget has run out.
 ///
 /// Shutdown has one budget, `server_config.shutdown_timeout`, measured from
 /// the cancellation. The server stops accepting connections and waits for
 /// the requests in flight, streamed responses included; the asynchronous
 /// video jobs stop at once, since a restarted server holds none of them, and
 /// their tasks end. When the budget runs out first, the server stops waiting.
-/// A server that handed its deployment over also stops accepting
-/// connections, and waits for its open ones without a budget: their
-/// requests run on the successor. The caller shuts the engine down.
+/// The caller shuts the engine down.
 ///
 /// # Errors
 ///
@@ -167,7 +96,6 @@ async fn serve_on(
     listener: Listener,
     config: &ServeConfig,
     shutdown: &CancellationToken,
-    handed_over: &CancellationToken,
 ) -> Result<()> {
     let server = &config.server_config;
     let bind_address = listener.local_addr()?;
@@ -183,17 +111,8 @@ async fn serve_on(
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
-    // Accepting stops on shutdown, and once a successor accepts instead.
-    let stop_accepting = {
-        let (shutdown, handed_over) = (shutdown.clone(), handed_over.clone());
-        async move {
-            tokio::select! {
-                () = shutdown.cancelled() => {}
-                () = handed_over.cancelled() => {}
-            }
-        }
-    };
-    let serving = axum::serve(listener, app).with_graceful_shutdown(stop_accepting);
+    let serving =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;
@@ -585,16 +504,7 @@ mod tests {
         let server = tokio::spawn({
             let engine = Arc::clone(&engine);
             let shutdown = shutdown.clone();
-            async move {
-                serve_on(
-                    &engine,
-                    listener,
-                    &ServeConfig::default(),
-                    &shutdown,
-                    &CancellationToken::new(),
-                )
-                .await
-            }
+            async move { serve_on(&engine, listener, &ServeConfig::default(), &shutdown).await }
         });
 
         let response = reqwest::Client::new()
@@ -631,16 +541,7 @@ mod tests {
         let server = tokio::spawn({
             let engine = Arc::clone(&engine);
             let shutdown = shutdown.clone();
-            async move {
-                serve_on(
-                    &engine,
-                    listener,
-                    &config,
-                    &shutdown,
-                    &CancellationToken::new(),
-                )
-                .await
-            }
+            async move { serve_on(&engine, listener, &config, &shutdown).await }
         });
 
         // The server answers `100 Continue` once the handler waits for the

@@ -29,12 +29,10 @@ pub struct PrefixCacheInfo {
     pub groups: Vec<CacheGroup>,
     /// The host page pools this rank copies its full-attention groups'
     /// pages through; empty without a host page tier.
-    #[serde(default)]
     pub page_pools: Vec<PagePoolInfo>,
     /// Units `1..=scratch_units` the rank's warmup lends to its startup
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
-    #[serde(default)]
     pub scratch_units: u32,
 }
 

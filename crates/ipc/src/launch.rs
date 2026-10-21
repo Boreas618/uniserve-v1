@@ -404,7 +404,6 @@ pub struct StorageLaunch {
     /// the exclusive storages that worker holds without taking write
     /// access, warms up on scratch units, parks with the storages read-only
     /// and serves once promoted (`WorkerRequest::Promote`).
-    #[serde(default)]
     pub standby: bool,
 }
 
@@ -490,7 +489,6 @@ pub struct LaunchDescriptor {
     pub max_total_tokens: Option<u64>,
     /// The exact prefix cache units of a standby worker: those of the
     /// worker it stands by for, whose cache planes it maps.
-    #[serde(default)]
     pub cache_units: Option<u32>,
     /// Attention provider name of the rank's model, as `attention_backend`
     /// gave it. The rank's attention registry (`uniserve.backends.attention`)

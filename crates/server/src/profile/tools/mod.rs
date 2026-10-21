@@ -11,8 +11,8 @@
 mod error;
 mod gemma4;
 mod json;
-#[cfg(any(test, feature = "test-util"))]
-pub mod test_utils;
+#[cfg(test)]
+mod test_utils;
 mod utils;
 
 pub use error::{Result, ToolParserError};
@@ -48,7 +48,7 @@ pub trait ToolParser: Send {
     /// output represents.
     fn reset(&mut self) -> String;
 
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     /// Parses one incremental text chunk.
     fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
@@ -56,7 +56,7 @@ pub trait ToolParser: Send {
         Ok(output)
     }
 
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     /// Parses a complete assistant response and flushes all state.
     fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
         let mut output = self.parse_chunk(text)?;

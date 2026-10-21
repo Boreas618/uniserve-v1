@@ -197,7 +197,6 @@ The [architecture guide](docs/architecture.md) describes how the head, the launc
 ```text
 crates/core/                  Shared values and the engine-process codec
 crates/observability/         Runtime metrics and process registry
-crates/observability-derive/  Metrics proc-macro
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
 crates/engine/                Scheduler, KV allocation, executors, worker fleet and rank launch
@@ -213,7 +212,6 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
 crates/bin/uniserve/          `serve` CLI entrypoint
 crates/bin/uniserve-launcher/     Per-host launcher for multi-host deployments
-crates/bin/dynamo/     NVIDIA Dynamo worker backend
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls
   worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function
@@ -222,7 +220,7 @@ uniserve_eval/                Serving evaluator, profiles, and request workloads
 configs/                      Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md          Processes, the rank planes and the request path
 docs/configuration.md         The serving option tree, configuration files and deployment files
-docs/minimax_h3/              H3 serving, library, evaluation and Dynamo guides, container files
+docs/minimax_h3/              H3 serving, library and evaluation guides, container files
 ```
 
 ## License

@@ -146,7 +146,6 @@ pub struct CallOutput {
     /// Why the rank refused the call's request, on an
     /// [`ErrorCode::InputError`] completion whose rank states it; the engine
     /// rejects the request with it.
-    #[serde(default)]
     pub error_message: Option<String>,
     /// Worker timing measurements for the call.
     pub timing_counters: TimingCounters,

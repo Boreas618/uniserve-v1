@@ -217,17 +217,9 @@ pub enum Mode {
 pub enum Request {
     /// Make the caller the head of its deployment and release every scope of
     /// the deployment it does not list. Refused while a previous head of the
-    /// deployment is connected, unless `handover` states the deployment's
-    /// current claim, which that head gives its successor in a control-plane
-    /// hot update: the claim then moves to the caller unchanged, and the
-    /// workers holding it keep their access. Otherwise a new claim is
-    /// issued, and every process of the deployment that belongs to no
-    /// current worker is shot down.
-    Claim {
-        scopes: Vec<Scope>,
-        #[serde(default)]
-        handover: Option<Claim>,
-    },
+    /// deployment is connected. Every process of the deployment that
+    /// belongs to no current worker is shot down.
+    Claim { scopes: Vec<Scope> },
     /// Release every tensor of the caller's scope that `keys` does not list.
     Retain { keys: Vec<Key> },
     /// The tensors of `keys` that exist, with their storages' descriptors,

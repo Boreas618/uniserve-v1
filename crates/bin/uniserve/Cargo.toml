@@ -11,18 +11,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-educe.workspace = true
 mimalloc.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror-ext.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-uniserve-engine.workspace = true
-uniserve-core.workspace = true
 uniserve-server.workspace = true
 
 [lints]

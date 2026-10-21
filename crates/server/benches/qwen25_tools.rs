@@ -3,8 +3,7 @@
 //! Each fixture is split into fixed-size character chunks and streamed
 //! through `Qwen25ToolParser` incrementally, as the Qwen3 chat output stage
 //! feeds assistant text. Throughput is reported in input bytes. The bench
-//! target requires the `test-util` feature for the shared parser fixtures in
-//! `profile::tools::test_utils`.
+//! drives the parser through its public interface (`ToolParser`) only.
 //!
 //! The expected-output checks inside each iteration are `debug_assert`s: they
 //! run only in builds with debug assertions and are compiled out of the
@@ -13,12 +12,43 @@
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use uniserve_server::profile::tools::test_utils::{collect_stream, split_by_chars, test_tools};
-use uniserve_server::profile::tools::{Qwen25ToolParser, Tool};
+use uniserve_server::profile::tools::{Qwen25ToolParser, Tool, ToolParser, ToolParserOutput};
 
 /// Unicode scalar values per streamed chunk.
 const CHUNK_CHARS: usize = 7;
 const LONG_NORMAL_TEXT_REPEATS: usize = 2048;
+
+/// The one tool the fixtures call.
+fn weather_tools() -> Vec<Tool> {
+    vec![Tool {
+        name: "get_weather".to_string(),
+        description: None,
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "location": { "type": "string" },
+                "days": { "type": "integer" }
+            }
+        }),
+        strict: None,
+    }]
+}
+
+/// Splits text into chunks of at most `chunk_chars` Unicode scalar values.
+fn split_by_chars(text: &str, chunk_chars: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for (count, (index, _)) in text.char_indices().enumerate() {
+        if count > 0 && count % chunk_chars == 0 {
+            chunks.push(&text[start..index]);
+            start = index;
+        }
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
 
 fn tool_call(function_name: &str, arguments: &str) -> String {
     format!("<tool_call>\n{{\"name\":\"{function_name}\",\"arguments\":{arguments}}}\n</tool_call>")
@@ -40,10 +70,19 @@ fn long_normal_text_fixture() -> String {
 /// Feeds chunks into a parser and returns visible text plus parsed-call count.
 ///
 /// The stream is finished after the last chunk, which resets `parser` for the
-/// next stream. A parser error panics inside `collect_stream`.
+/// next stream. A parser error panics: every fixture is well formed.
+#[expect(
+    clippy::unwrap_used,
+    reason = "a parser failure on a well-formed fixture invalidates the bench"
+)]
 fn feed_parser(parser: &mut Qwen25ToolParser, chunks: &[&str]) -> (String, usize) {
-    let result = collect_stream(parser, chunks);
-    (result.normal_text(), result.calls().count())
+    let mut output = ToolParserOutput::default();
+    for chunk in chunks {
+        parser.parse_into(chunk, &mut output).unwrap();
+    }
+    output.append(parser.finish().unwrap());
+    let output = output.coalesce_calls();
+    (output.normal_text(), output.calls().count())
 }
 
 fn run_stream_group(
@@ -64,7 +103,7 @@ fn run_stream_group(
     group.throughput(Throughput::Bytes(text.len() as u64));
 
     // One parser serves every iteration; this relies on `finish`, called at
-    // the end of each stream by `collect_stream`, resetting parser state.
+    // the end of each stream by `feed_parser`, resetting parser state.
     group.bench_function("native_reuse_parser", |b| {
         let mut parser = Qwen25ToolParser::new(tools);
         b.iter(|| {
@@ -94,7 +133,7 @@ fn run_stream_group(
 }
 
 fn bench_qwen25_tools(c: &mut Criterion) {
-    let tools = test_tools();
+    let tools = weather_tools();
     let mixed_text = mixed_fixture();
     let long_normal_text = long_normal_text_fixture();
 

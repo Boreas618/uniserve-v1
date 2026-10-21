@@ -384,7 +384,7 @@ impl Scheduler {
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
                                     initial_position: st.num_computed_prompt_tokens,
-                                    generated_token_ids: st.resumed_token_ids().to_vec(),
+                                    generated_token_ids: Vec::new(),
                                 }),
                                 st.req.generates_images().then(|| st.req.image.clone()),
                                 input_images,

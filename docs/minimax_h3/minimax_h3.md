@@ -256,7 +256,6 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 
 - [Python library](library.md): loading and generating with the same numerical modules.
 - [Evaluation](evaluation.md): the published measurements and fixed workloads.
-- [NVIDIA Dynamo](dynamo.md): FastH3 behind Dynamo's `/v1/videos`.
 
 ## Troubleshooting
 

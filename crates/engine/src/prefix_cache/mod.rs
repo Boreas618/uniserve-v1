@@ -118,17 +118,6 @@ pub(crate) struct BlockPoolStats {
     pub(crate) pages_stored: u64,
 }
 
-/// One published prefix page of a pool, as a successor installs it: its
-/// identity, the worker that computed it, and its units.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct IndexedPage {
-    pub hash: u64,
-    pub group: u32,
-    pub tokens: Vec<u32>,
-    pub source: WorkerEndpoint,
-    pub units: Vec<u32>,
-}
-
 /// Identity of one published prefix page.
 struct PublishedPage {
     hash: u64,
@@ -551,97 +540,6 @@ impl BlockPool {
     /// Returns the number of published prefix pages, referenced or not.
     pub(crate) fn cached_pages(&self) -> usize {
         lock(&self.inner).pages.len()
-    }
-
-    /// The published pages, as a successor restores them
-    /// ([`BlockPool::restore`]): unreferenced pages first, least recently
-    /// released first, then the pages requests still hold.
-    pub(crate) fn snapshot(&self) -> Vec<IndexedPage> {
-        let inner = lock(&self.inner);
-        let mut order = Vec::with_capacity(inner.pages.len());
-        let mut queued = inner.fq_head;
-        while let Some(unit) = queued {
-            if inner.pages.contains_key(&unit) {
-                order.push(unit);
-            }
-            queued = inner.meta[unit as usize].fq_next;
-        }
-        let mut held: Vec<u32> = inner
-            .pages
-            .keys()
-            .copied()
-            .filter(|head| !inner.meta[*head as usize].in_fq)
-            .collect();
-        held.sort_unstable();
-        order.extend(held);
-        order
-            .into_iter()
-            .map(|head| {
-                let page = &inner.pages[&head];
-                IndexedPage {
-                    hash: page.hash,
-                    group: page.group,
-                    tokens: page.tokens.clone(),
-                    source: (*page.source).clone(),
-                    units: page.units.iter().map(|unit| unit.0).collect(),
-                }
-            })
-            .collect()
-    }
-
-    /// Install a predecessor's published pages ([`BlockPool::snapshot`]) in
-    /// a pool that holds nothing: each page's units, which hold its keys and
-    /// values in the cache planes this pool's workers took over, become
-    /// cached, in the predecessor's eviction order, under the endpoint
-    /// `source` maps the page's worker to. Pages of a worker `source` does
-    /// not map, and pages naming units this pool does not allocate, are
-    /// left out. Returns how many pages were installed.
-    pub(crate) fn restore(
-        &self,
-        pages: &[IndexedPage],
-        source: impl Fn(&WorkerEndpoint) -> Option<Arc<WorkerEndpoint>>,
-    ) -> usize {
-        let mut inner = lock(&self.inner);
-        let mut restored = 0;
-        for page in pages {
-            let Some(endpoint) = source(&page.source) else {
-                continue;
-            };
-            let allocatable = !page.units.is_empty()
-                && page.units.iter().all(|&unit| {
-                    inner
-                        .meta
-                        .get(unit as usize)
-                        .is_some_and(|meta| meta.in_fq && meta.published.is_none())
-                });
-            if !allocatable {
-                continue;
-            }
-            let head = page.units[0];
-            for &unit in &page.units {
-                // Requeued at the tail in the predecessor's order, so the
-                // pages it would have evicted first are evicted first.
-                inner.fq_unlink(unit);
-                let meta = &mut inner.meta[unit as usize];
-                meta.state = UnitState::Cached;
-                meta.published = Some(head);
-                inner.fq_push_back(unit);
-            }
-            inner.pages.insert(
-                head,
-                PublishedPage {
-                    hash: page.hash,
-                    group: page.group,
-                    tokens: page.tokens.clone(),
-                    source: endpoint,
-                    units: page.units.iter().map(|&unit| UnitId(unit)).collect(),
-                },
-            );
-            inner.hash_to_pages.entry(page.hash).or_default().push(head);
-            restored += 1;
-        }
-        inner.stats.free = inner.free_count;
-        restored
     }
 
     /// Revokes cache lookup for one lost incarnation without freeing live
@@ -1144,11 +1042,7 @@ impl PrefixCacheCoordinator {
     /// barring a hash collision, reuse none of each other's pages. A key of
     /// zero leaves the seed unchanged and therefore shares pages with
     /// requests that carry no key.
-    pub(crate) fn prefix_hashes(
-        &self,
-        prompt: &[u32],
-        isolation_key: Option<u64>,
-    ) -> Vec<Vec<u64>> {
+    fn prefix_hashes(&self, prompt: &[u32], isolation_key: Option<u64>) -> Vec<Vec<u64>> {
         let seed = isolation_key.map_or(self.hash_seed, |key| self.hash_seed ^ key.rotate_left(17));
         self.groups
             .iter()
@@ -1561,55 +1455,6 @@ mod tests {
 
         drop(allocation);
         assert_eq!(pool.free_units(), 9);
-    }
-
-    #[test]
-    fn a_successor_pool_restores_the_published_pages_in_eviction_order() {
-        let coordinator = PrefixCacheCoordinator::new(vec![full(2, 1)]);
-        let before = endpoint();
-        let pool = BlockPool::new(8, 0);
-        // Two requests' pages: the first request's are released, the
-        // second's still held.
-        let first = publish(&coordinator, &pool, &[1, 2, 3, 4], &before);
-        let held = publish(&coordinator, &pool, &[5, 6, 7, 8], &before);
-        drop(first);
-        let pages = pool.snapshot();
-        assert_eq!(pages.len(), 4);
-        assert_eq!(pages[0].tokens, vec![1, 2]);
-        assert_eq!(pages[3].tokens, vec![7, 8]);
-        drop(held);
-
-        // The successor's workers report a new incarnation.
-        let after = Arc::new(WorkerEndpoint {
-            incarnation: "successor".into(),
-            ..(*before).clone()
-        });
-        let successor = BlockPool::new(8, 0);
-        let restored = successor.restore(&pages, |source| {
-            (source == before.as_ref()).then(|| Arc::clone(&after))
-        });
-        assert_eq!(restored, 4);
-        assert_eq!(successor.free_units(), 7);
-        let hashes = coordinator.prefix_hashes(&[5, 6, 7, 8], None);
-        let (head, cached) = successor.lookup(hashes[0][1], 0, &[7, 8], &after).unwrap();
-        assert_eq!(head.0, pages[3].units[0]);
-        assert!(cached);
-        assert!(
-            successor
-                .lookup(hashes[0][1], 0, &[7, 8], &before)
-                .is_none()
-        );
-
-        // Allocation takes the units no page holds, then evicts the pages in
-        // the predecessor's order.
-        let fresh = successor.allocate(3, 1).unwrap();
-        assert!(fresh.iter().all(|page| {
-            pages
-                .iter()
-                .all(|indexed| !indexed.units.contains(&page.units()[0].0))
-        }));
-        let evicting = successor.allocate(1, 1).unwrap();
-        assert_eq!(evicting[0].units()[0].0, pages[0].units[0]);
     }
 
     #[test]

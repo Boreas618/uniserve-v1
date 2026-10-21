@@ -132,19 +132,6 @@ impl WorkerProcessArgs {
         }
     }
 
-    /// Parses a quantization policy as a command line states it: a JSON
-    /// object such as `{"mode":"balanced"}`, where an empty object selects
-    /// the model's default policy.
-    ///
-    /// The signature suits a command-line value parser. Fails on text that is
-    /// not JSON, and on JSON that is not an object, such as an array or a
-    /// scalar.
-    pub fn parse_quantization_config(text: &str) -> anyhow::Result<Value> {
-        let value: Value = serde_json::from_str(text)
-            .map_err(|error| anyhow::anyhow!("invalid JSON object: {error}"))?;
-        anyhow::ensure!(value.is_object(), "expected a JSON object");
-        Ok(value)
-    }
 }
 
 impl WorkerProcessArgs {

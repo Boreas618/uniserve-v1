@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/observability",
-    "crates/observability-derive",
     "crates/ipc",
     "crates/cuda",
     "crates/storage",
@@ -12,7 +11,6 @@ members = [
     "crates/server",
     "crates/bin/uniserve",
     "crates/bin/uniserve-launcher",
-    "crates/bin/dynamo",
     "crates/bin/uniserve-storage-server",
     "crates/bin/uniserve-worker",
 ]
@@ -27,7 +25,6 @@ readme = "README.md"
 [workspace.dependencies]
 uniserve-core = { path = "crates/core" }
 uniserve-observability = { path = "crates/observability" }
-uniserve-observability-derive = { path = "crates/observability-derive" }
 uniserve-ipc = { path = "crates/ipc" }
 uniserve-cuda = { path = "crates/cuda" }
 uniserve-storage = { path = "crates/storage" }
@@ -46,7 +43,6 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 arc-swap = "1.9.0"
 asynk-strim-attr = "0.1.0"
-# Dynamo currently pins 0.8.4 exactly, so the shared workspace range must include it.
 axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
 # Byte views of plain numeric slices handed to device copies.
@@ -76,10 +72,8 @@ minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 # Mooncake Store's C API, loaded at run time (`libmooncake_store.so`, built
 # with `WITH_STORE_C_SHARED`), so nothing links Mooncake.
 mooncake_store = { git = "https://github.com/kvcache-ai/Mooncake", tag = "v0.3.13.post1", default-features = false, features = ["dlopen"] }
-proc-macro2 = "1.0.106"
 prometheus-client = "0.24.0"
 png = "0.18.1"
-quote = "1.0.46"
 # Image URL fetching shares the rustls/webpki TLS backend `hf-hub` already uses.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rmp-serde = "1.3.1"
@@ -91,7 +85,6 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 serde_path_to_error = "0.1.20"
 serde_with = "3.18.0"
 socket2 = "0.6.3"
-syn = { version = "2.0.118", features = ["full"] }
 tempfile = "3.23.0"
 thiserror = "2.0.16"
 thiserror-ext = "0.3.0"
@@ -116,7 +109,6 @@ url = "2.5.8"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 winnow = "1.0.2"
-dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "c0de00088f032c18f159c01ec11058767902db4c" }
 
 # The worker's only interface to Python; must match the apache-tvm-ffi
 # release pinned in pyproject.toml.
@@ -138,12 +130,6 @@ unsafe_op_in_unsafe_fn = "deny"
 unreachable_pub = "deny"
 
 [profile.dev]
-panic = "abort"
-
-[profile.ci]
-inherits = "dev"
-debug = "line-tables-only"
-incremental = false
 panic = "abort"
 
 [profile.release]
