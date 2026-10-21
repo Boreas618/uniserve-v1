@@ -36,8 +36,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use engine::{
     BatchEvent, BatchResult, CommandSender, EVENT_BUFFER_CAPACITY, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SchedulingPolicy, SimEngine,
-    SimExecutor, SpecialTokenIds, WorkerGroupId,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine, SimExecutor,
+    SpecialTokenIds, WorkerGroupId,
 };
 use engine::{Event, FinishReason};
 use engine::{
@@ -46,6 +46,7 @@ use engine::{
     RejectionKind,
 };
 use ipc::{ImageParams, RequestId, SamplingParams};
+use proto::request::SchedulingPolicy;
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
 /// EOS, so the simulator's end of text finishes requests with `Eos`.

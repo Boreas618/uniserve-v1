@@ -3,25 +3,29 @@
 //! schedulers, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
-//! `Engine`, whose schedulers drive `SimEngine` through `SimExecutor`. The
-//! default simulator provides no video media components, so the engine
-//! refuses every video submission as an invalid request.
+//! `Engine`, whose client submits them over the request interface to
+//! schedulers that drive `SimEngine` through `SimExecutor`; the schedulers
+//! serve the interface on a thread of this process, as an engine process
+//! serves it. The default simulator provides no video media components, so
+//! the engine refuses every video submission as an invalid request.
 
 use std::collections::{BTreeSet, HashMap};
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use engine::ModelDtype;
 use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
+use proto::request::ModelDtype;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
+use crate::client::{EngineClient, EngineInfo};
 use crate::frontend::Engine;
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
@@ -148,6 +152,33 @@ pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerH
     engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
 }
 
+/// A client of `cores`, which serve the request interface on a thread of
+/// this process over a socket pair, labelling their statistics with their
+/// model.
+pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
+    let first = &cores[0];
+    let info = EngineInfo {
+        limits: first.generation_limits(),
+        video_denoiser: first
+            .info()
+            .video_denoiser
+            .as_ref()
+            .map(|denoiser| denoiser.description.clone())
+            .unwrap_or_default(),
+        latent_encoding_units: first
+            .media_units(ipc::MediaCall::LatentEncoding)
+            .unwrap_or(0),
+        schedulers: cores.len() as u32,
+    };
+    let model_name = first.model_name().to_owned();
+    let (daemon, engine) = UnixStream::pair().expect("a socket pair");
+    std::thread::Builder::new()
+        .name("sim-engine".into())
+        .spawn(move || engine::serve_requests(engine, cores))
+        .expect("start the simulated engine");
+    EngineClient::over(daemon, info, crate::frontend::stats_sink(model_name)).expect("a client")
+}
+
 /// The simulated model's facts.
 fn sim_model(parameters: ModelParameters) -> ModelConfig {
     ModelConfig {
@@ -180,11 +211,13 @@ pub(crate) fn engine_over(
             .unwrap(),
         ),
     };
+    let model_name = cores[0].model_name().to_owned();
+    let client = sim_client(cores);
     let processor = InputProcessor::new(
         model,
         tokenizer,
         renderer,
-        cores[0].generation_limits(),
+        client.info().limits.clone(),
         false,
     )
     .unwrap();
@@ -195,13 +228,13 @@ pub(crate) fn engine_over(
     };
     Engine::new(
         SERVED_MODEL.to_owned(),
-        cores,
+        model_name,
+        client,
         processor,
         images,
         readout,
         &logging,
     )
-    .unwrap()
 }
 
 /// The video service of a four-step text-to-video denoiser that generates

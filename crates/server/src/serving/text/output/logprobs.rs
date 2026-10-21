@@ -1,12 +1,12 @@
 //! Token decoding for generated and prompt logprobs.
 //!
-//! Converts the engine's token-ID candidates (`engine::PositionLogprobs`)
+//! Converts the engine's token-ID candidates (`proto::request::PositionLogprobs`)
 //! into decoded candidate strings. Ranks and log probabilities are passed
 //! through unchanged from the engine.
 
 use crate::profile::tokenizer::HuggingFaceTokenizer;
-use engine::PositionLogprobs;
 use itertools::Itertools as _;
+use proto::request::PositionLogprobs;
 use serde::{Deserialize, Serialize};
 
 use crate::serving::text::error::Error;
@@ -144,8 +144,8 @@ fn decode_position_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use engine::PositionLogprobs;
-    use ipc::TokenLogprob;
+    use proto::request::PositionLogprobs;
+    use proto::request::TokenLogprob;
 
     use super::*;
 

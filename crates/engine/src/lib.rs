@@ -20,15 +20,14 @@ pub mod allocation;
 mod clock;
 mod core;
 mod deployment;
-mod dtype;
 mod executor;
 mod handle;
 mod kv_cache;
-/// Serializable scheduler, cache, and worker performance snapshots.
-pub mod report;
 mod scheduler;
+mod service;
 #[cfg(feature = "testing")]
 mod sim;
+mod spec;
 mod warmup;
 mod worker;
 
@@ -36,7 +35,6 @@ pub use crate::core::{
     EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
 };
 pub use crate::deployment::Deployment;
-pub use crate::dtype::{ModelDtype, ModelDtypeParseError};
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageWrites,
@@ -55,26 +53,28 @@ pub use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
     PrefixCacheUsage, PrefixStats, Scheduler, SchedulerConfig, SchedulerStats,
-    SchedulerStatsReporter, SchedulingPolicy, TimingStats, WorkerStats,
+    SchedulerStatsReporter, TimingStats, WorkerStats,
 };
+pub use crate::service::{run_engine, serve_requests};
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, SimEngine, SimExecutor, sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
 pub use crate::worker::{
-    BatchSubmitError, CallReaders, ExpertExchange, ExpertParallelPlacement, FlashInferBackend,
-    FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat, WorkerExecutor,
+    BatchSubmitError, CallReaders, ExpertParallelPlacement, LaneConfig, WorkerExecutor,
     WorkerGroup, WorkerProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
+/// Serializable scheduler, cache, and worker performance snapshots.
+pub use proto::report;
 pub use proto::request::{
     ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,
     DiffusionRequestError, Event, FeedbackNextToken, FeedbackSource, FinishReason,
     GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
     GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoder,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MediaKind,
-    MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind, Request,
-    StopReason, encoder_cache_key,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MediaKind, ModelDtype,
+    ModelDtypeParseError, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot,
+    RejectionKind, Request, StopReason, encoder_cache_key,
 };
 
 /// Lock `mutex`, keeping the state a panicking holder left.

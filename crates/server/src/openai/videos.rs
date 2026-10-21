@@ -412,7 +412,7 @@ async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -
 }
 
 /// A generated artifact's bytes as a response body reads them.
-struct ArtifactBytes(Arc<dyn engine::ArtifactMedia>);
+struct ArtifactBytes(Arc<dyn proto::request::ArtifactMedia>);
 
 impl AsRef<[u8]> for ArtifactBytes {
     fn as_ref(&self) -> &[u8] {

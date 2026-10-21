@@ -103,8 +103,6 @@ mod media;
 mod output;
 mod parallel;
 mod request;
-mod shared_memory;
-mod stats;
 mod tensor;
 mod transfer;
 
@@ -112,10 +110,11 @@ pub use batch::*;
 pub use cache::*;
 pub use call::*;
 pub use command::*;
-pub use config::{LaneConfig, LaneConfigError, LaneSpec};
+pub use config::{LaneConfig, LaneConfigError};
 pub use identity::*;
 pub use info::*;
-pub use media::{MediaLocator, MediaSource, SharedMedia, SharedMediaError};
+pub use media::{SharedMedia, SharedMediaError};
+pub use proto::{MediaLocator, MediaSource, SharedMemory};
 // The request values the engine carries on to its ranks are the request
 // vocabulary's own.
 pub use output::*;
@@ -123,12 +122,12 @@ pub use parallel::{
     ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
     ParallelConfigError, SequenceParallel,
 };
+pub use proto::report::ForwardStats;
 pub use proto::request::{
-    CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams, ImageParamsError,
-    RequestId, SamplingParams, SamplingParamsError, TokenLogprob,
+    CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
+    ImageParamsError, PrefixCacheDtype, PrefixCacheDtypeParseError, RequestId, SamplingParams,
+    SamplingParamsError, TokenLogprob,
 };
 pub use request::*;
-pub use shared_memory::SharedMemory;
-pub use stats::ForwardStats;
 pub use tensor::*;
 pub use transfer::*;

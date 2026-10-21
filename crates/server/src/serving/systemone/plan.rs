@@ -38,7 +38,7 @@
 use std::ops::Range;
 use std::str::FromStr;
 
-use engine::{ReadoutRow, ReadoutSlot};
+use proto::request::{ReadoutRow, ReadoutSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

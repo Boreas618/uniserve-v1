@@ -29,15 +29,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use daemon::DaemonOptions;
-use engine::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
-    ExpertExchange, FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
-    SchedulingPolicy, TransferConfig, WorkerGroupConfig, WorkerProcessArgs,
-};
-use engine::{GenerationLimits, ModelDtype};
-use ipc::PrefixCacheDtype;
 use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+use proto::request::wire;
+use proto::request::{
+    ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, ModelDtype, PrefixCacheDtype,
+    SchedulingPolicy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -203,7 +200,7 @@ pub struct ServeConfig {
     /// the leader binds; required with several nodes.
     pub dist_init_addr: Option<String>,
     /// Execution lanes, each a stream with its own SM partition.
-    pub lanes: Vec<LaneSpec>,
+    pub lanes: Vec<LaneOptions>,
     pub server_config: ServerOptions,
     pub load_config: LoadOptions,
     pub kv_cache_config: KvCacheOptions,
@@ -229,13 +226,13 @@ impl Default for ServeConfig {
             model: None,
             served_model_name: None,
             max_model_len: None,
-            dtype: WorkerProcessArgs::DEFAULT_DTYPE,
+            dtype: ModelDtype::BFloat16,
             quantization_config: serde_json::Map::new(),
             mm_processor_kwargs: serde_json::Map::new(),
-            attention_backend: WorkerProcessArgs::DEFAULT_ATTENTION_BACKEND.to_owned(),
-            max_running_requests: positive(DEFAULT_MAX_RUNNING_REQUESTS),
+            attention_backend: "auto".to_owned(),
+            max_running_requests: positive(128),
             max_num_batched_tokens: None,
-            mem_fraction_static: WorkerProcessArgs::DEFAULT_MEM_FRACTION_STATIC,
+            mem_fraction_static: 0.7,
             tensor_parallel_size: NonZeroUsize::MIN,
             data_parallel_size: NonZeroUsize::MIN,
             worker_groups: None,
@@ -311,7 +308,7 @@ impl Default for ServerOptions {
 }
 
 /// Checkpoint loading (`load_config`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadOptions {
     /// Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer
@@ -321,6 +318,16 @@ pub struct LoadOptions {
     pub download_dir: Option<PathBuf>,
     /// Concurrent checkpoint file readers.
     pub threads: Option<NonZeroU32>,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            format: LoadFormat::Auto,
+            download_dir: None,
+            threads: None,
+        }
+    }
 }
 
 /// The KV cache (`kv_cache_config`).
@@ -333,7 +340,8 @@ pub struct KvCacheOptions {
     /// power of two; the largest size up to 64 the attention kernels read
     /// when unset.
     pub block_size: Option<NonZeroU32>,
-    /// Element type; each layer's compute type when unset.
+    /// Element type (`float16`, `bfloat16`, `float32` or `float8_e4m3fn`);
+    /// each layer's compute type when unset.
     pub dtype: Option<PrefixCacheDtype>,
     /// Reuse and retain cached prompt prefixes across requests.
     pub prefix_caching: bool,
@@ -395,20 +403,6 @@ impl MooncakeOptions {
     fn default_protocol() -> String {
         "tcp".into()
     }
-
-    /// The connector settings of a Storage Server this deployment starts.
-    /// Each host names itself to Mooncake.
-    fn connector(&self) -> storage::connector::Settings {
-        storage::connector::Settings {
-            master: self.master.clone(),
-            metadata: self.metadata_server.clone(),
-            protocol: self.protocol.clone(),
-            device: self.device.clone(),
-            hostname: None,
-            segment_bytes: self.global_segment_gib << 30,
-            library: self.library.clone(),
-        }
-    }
 }
 
 /// Admission and batching (`scheduler_config`).
@@ -434,7 +428,7 @@ impl Default for SchedulerOptions {
             policy: SchedulingPolicy::Fcfs,
             max_queued_requests: None,
             chunked_prefill_size: None,
-            max_batch: positive(DEFAULT_MAX_BATCH),
+            max_batch: positive(128),
         }
     }
 }
@@ -461,7 +455,7 @@ impl Default for PlacementOptions {
         Self {
             device: "cuda".to_owned(),
             worker_hosts: Vec::new(),
-            queue_depth: positive(WorkerProcessArgs::DEFAULT_QUEUE_DEPTH),
+            queue_depth: positive(2),
             transfer: None,
         }
     }
@@ -485,7 +479,7 @@ impl Default for MoeOptions {
     fn default() -> Self {
         Self {
             expert_parallel: false,
-            exchange: ExpertExchange::default(),
+            exchange: ExpertExchange::AllToAll,
             microbatches: NonZeroU32::MIN,
         }
     }
@@ -523,9 +517,9 @@ pub struct CudaGraphOptions {
 impl Default for CudaGraphOptions {
     fn default() -> Self {
         Self {
-            policy: GraphPolicy::default(),
-            capture_prefill: WorkerProcessArgs::DEFAULT_PREFILL_CUDA_GRAPH,
-            capture_flow: WorkerProcessArgs::DEFAULT_FLOW_CUDA_GRAPH,
+            policy: GraphPolicy::Auto,
+            capture_prefill: true,
+            capture_flow: true,
             decode_batch_sizes: None,
             prefill_token_sizes: None,
             flow_batch_sizes: None,
@@ -558,10 +552,11 @@ pub struct FlashInferOptions {
 impl Default for FlashInferOptions {
     fn default() -> Self {
         Self {
-            workspace_size: WorkerProcessArgs::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
+            // 512 MiB.
+            workspace_size: 512 << 20,
             use_tensor_core: None,
-            decode_backend: WorkerProcessArgs::DEFAULT_FLASHINFER_DECODE_BACKEND,
-            prefill_backend: WorkerProcessArgs::DEFAULT_FLASHINFER_PREFILL_BACKEND,
+            decode_backend: FlashInferBackend::Fa2,
+            prefill_backend: FlashInferBackend::Auto,
             decode_split_tile_size: None,
             prefill_split_tile_size: None,
             split_kv: true,
@@ -597,13 +592,59 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
-            executable: WorkerProcessArgs::default_executable(),
-            watchdog_timeout: WorkerProcessArgs::DEFAULT_WATCHDOG_TIMEOUT,
+            executable: default_executable(),
+            watchdog_timeout: Duration::from_secs(300),
             mesh: None,
             distributed_backend: None,
             standby: false,
         }
     }
+}
+
+/// The `uniserve` executable of the Python environment this process runs
+/// in, which runs the engine process and the workers.
+///
+/// The executable runs workers in the environment it is installed in, so a
+/// daemon built outside one, such as a development build, takes the active
+/// environment's; without one, `uniserve` is looked up on the search path.
+fn default_executable() -> PathBuf {
+    const EXECUTABLE: &str = "uniserve";
+    let environment_bin = |directory: &Path| {
+        ["python", "python3"]
+            .iter()
+            .any(|name| directory.join(name).is_file())
+            .then(|| directory.join(EXECUTABLE))
+            .filter(|candidate| candidate.is_file())
+    };
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(candidate) = executable.parent().and_then(environment_bin)
+    {
+        return candidate;
+    }
+    if let Some(environment) = std::env::var_os("VIRTUAL_ENV")
+        && let Some(candidate) = environment_bin(&Path::new(&environment).join("bin"))
+    {
+        return candidate;
+    }
+    EXECUTABLE.into()
+}
+
+/// An execution lane (`lanes`): a stream with its own SM partition, which
+/// serves the call domains it names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneOptions {
+    pub lane_id: String,
+    /// Streaming multiprocessors in the lane's partition.
+    pub sm_budget: usize,
+    /// `prefill`, `decode` or `flow`.
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_calls: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight: Option<usize>,
 }
 
 /// What the server logs about its serving (`logging_config`). A process's
@@ -754,7 +795,7 @@ impl Default for MediaOptions {
             // 256 MiB.
             max_request_bytes: 256 << 20,
             ffprobe: PathBuf::from("ffprobe"),
-            ffmpeg: PathBuf::from(WorkerProcessArgs::DEFAULT_FFMPEG),
+            ffmpeg: PathBuf::from("ffmpeg"),
         }
     }
 }
@@ -840,8 +881,15 @@ impl ServeConfig {
             !self.leads() || self.model.is_some(),
             "`model` is required: name MODEL on the command line or set `model` in --config"
         );
-        WorkerGroupConfig::validate_mem_fraction_static(self.mem_fraction_static)
-            .context("invalid `mem_fraction_static`")?;
+        // Each rank grants itself this share of every device's total
+        // storage, so any finite value in (0, 1] is meaningful.
+        anyhow::ensure!(
+            self.mem_fraction_static.is_finite()
+                && self.mem_fraction_static > 0.0
+                && self.mem_fraction_static <= 1.0,
+            "invalid `mem_fraction_static`: {} must be finite and in (0, 1]",
+            self.mem_fraction_static
+        );
         if self.worker_groups.is_some()
             && let Some(option) = PLACEMENT_SHORTHAND
                 .iter()
@@ -882,13 +930,17 @@ impl ServeConfig {
         self.node_rank == 0
     }
 
+    /// The leader's request socket, which its engine processes connect back
+    /// to: this process's own, in the user's runtime directory.
+    pub fn request_socket(&self) -> PathBuf {
+        runtime_directory().join(format!("requests-{}.sock", std::process::id()))
+    }
+
     /// The options of this node's daemon. The leader's process socket is
     /// this process's own, in the user's runtime directory; `executable`
     /// starts the node's Storage Server when it has none.
     pub fn daemon_options(&self) -> DaemonOptions {
-        let directory = storage::socket::default_socket()
-            .parent()
-            .map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let directory = runtime_directory();
         DaemonOptions {
             nnodes: self.nnodes.get(),
             node_rank: self.node_rank,
@@ -900,190 +952,187 @@ impl ServeConfig {
         }
     }
 
-    /// Derives the engine configuration these options state.
+    /// The engine spec these options state, without the model's facts,
+    /// which the frontend resolves from the checkpoint.
     ///
-    /// The deployment comes from the `worker_groups` file, placed on this
-    /// process's `host_identity`, or else from `tensor_parallel_size`,
-    /// `data_parallel_size` and `placement_config`. What the loaded model
-    /// determines keeps its neutral value for `Engine::start` to complete:
-    /// the generation limits and control tokens, and the worker launch
-    /// fields `max_model_len`, `canvas_sampling` and `prefill_outputs`.
+    /// Values the options name by a word (a policy, a backend, an element
+    /// type) travel as that word, which the engine reads; the placement
+    /// travels as stated, which the engine places.
     ///
     /// # Errors
     ///
-    /// Fails when the deployment does not place, a capture list is not
-    /// strictly increasing or repeats a shape, a lane or the transfer edges
-    /// do not resolve, or a batch bound exceeds the worker's `u32` fields.
-    pub fn engine_config(&self) -> anyhow::Result<EngineConfig> {
-        let worker_groups = match &self.worker_groups {
-            Some(path) => Deployment::read(&path.to_string_lossy())?
-                .worker_groups(&self.host_identity)
-                .context("invalid `worker_groups` deployment")?,
-            None => {
-                let tensor_parallel_size = self.tensor_parallel_size.get();
-                WorkerGroupConfig::data_parallel(
-                    &self.rank_hosts(),
-                    &self.placement_config.device,
-                    self.data_parallel_size.get(),
-                    tensor_parallel_size,
-                    self.placement_config.queue_depth.get(),
-                    WorkerGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
-                )
-            }
-        };
-
-        let lanes = self
-            .lanes
-            .iter()
-            .cloned()
-            .map(|lane| {
-                let id = lane.lane_id.clone();
-                LaneConfig::try_from(lane).with_context(|| format!("invalid lane `{id}`"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let transfer = self
-            .placement_config
-            .transfer
-            .as_deref()
-            .map(str::parse::<TransferConfig>)
-            .transpose()
-            .context("invalid `placement_config.transfer`")?
-            .unwrap_or_default();
-
-        let max_num_batched_tokens = self
-            .max_num_batched_tokens
-            .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, NonZeroUsize::get);
+    /// Fails, naming the option, when a capture list is not strictly
+    /// increasing or repeats a shape, or a batch bound exceeds the worker's
+    /// `u32` fields.
+    pub fn engine_spec(&self) -> anyhow::Result<wire::EngineSpec> {
         let graphs = &self.cuda_graph_config;
         let flashinfer = &self.flashinfer_config;
-        let worker_process = WorkerProcessArgs {
-            executable: self.worker_config.executable.clone(),
-            // A deployment is what one head serves under its served name.
+        let kv_cache = &self.kv_cache_config;
+        let worker = &self.worker_config;
+        let text = |path: &Option<PathBuf>| {
+            path.as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let bounded = |value: usize, option: &str| {
+            u32::try_from(value)
+                .with_context(|| format!("`{option}` exceeds the worker field width"))
+        };
+        let scheduling = wire::Scheduling {
+            policy: word(&self.scheduler_config.policy),
+            max_batch: bounded(
+                self.scheduler_config.max_batch.get(),
+                "scheduler_config.max_batch",
+            )?,
+            max_num_batched_tokens: self
+                .max_num_batched_tokens
+                .map(|tokens| bounded(tokens.get(), "max_num_batched_tokens"))
+                .transpose()?,
+            max_running_requests: bounded(self.max_running_requests.get(), "max_running_requests")?,
+            max_queued_requests: self
+                .scheduler_config
+                .max_queued_requests
+                .map(|requests| requests.get() as u64),
+            chunked_prefill_size: self
+                .scheduler_config
+                .chunked_prefill_size
+                .map(|size| bounded(size.get(), "scheduler_config.chunked_prefill_size"))
+                .transpose()?,
+        };
+        Ok(wire::EngineSpec {
+            // A deployment is what one leader serves under its served name.
             deployment: self.served_model_name().to_owned(),
-            page_tier: self.kv_cache_config.prefix_caching && self.kv_cache_config.host_tier,
-            storage_connector: self
-                .kv_cache_config
-                .mooncake
-                .as_ref()
-                .filter(|_| self.kv_cache_config.prefix_caching && self.kv_cache_config.host_tier)
-                .map(MooncakeOptions::connector),
-            keep_standby: self.worker_config.standby,
-            standby: false,
-            cache_units: None,
             model: self.model().to_owned(),
             host: self.host_identity.clone(),
-            queue_depth: self.placement_config.queue_depth.get(),
-            watchdog_timeout: self.worker_config.watchdog_timeout,
-            max_total_tokens: self.kv_cache_config.max_tokens.map(NonZeroU64::get),
-            block_size: self.kv_cache_config.block_size.map(NonZeroU32::get),
-            attention_backend: self.attention_backend.clone(),
-            expert_microbatches: self.moe_config.microbatches.get(),
-            load_format: self.load_config.format,
-            download_dir: self.load_config.download_dir.clone(),
-            load_threads: self.load_config.threads.map(NonZeroU32::get),
-            dtype: self.dtype,
-            quantization_config: Value::Object(self.quantization_config.clone()),
-            kv_cache_dtype: self.kv_cache_config.dtype,
-            mem_fraction_static: self.mem_fraction_static,
-            worker_mesh: self.worker_config.mesh.clone(),
-            distributed_backend: self.worker_config.distributed_backend.clone(),
-            lanes,
-            graph_policy: graphs.policy,
-            decode_graph_batch_sizes: increasing(
-                "cuda_graph_config.decode_batch_sizes",
-                &graphs.decode_batch_sizes,
-            )?,
-            prefill_cuda_graph: graphs.capture_prefill,
-            prefill_graph_token_sizes: increasing(
-                "cuda_graph_config.prefill_token_sizes",
-                &graphs.prefill_token_sizes,
-            )?,
-            flow_cuda_graph: graphs.capture_flow,
-            flow_graph_batch_sizes: increasing(
-                "cuda_graph_config.flow_batch_sizes",
-                &graphs.flow_batch_sizes,
-            )?,
-            flow_graph_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
-            video_text_capacities: increasing(
-                "video_config.text_capacities",
-                &self.video_config.text_capacities,
-            )?,
-            ffmpeg: self.media_config.ffmpeg.clone(),
-            flashinfer_workspace_size: flashinfer.workspace_size,
-            flashinfer_use_tensor_core: flashinfer.use_tensor_core,
-            flashinfer_decode_backend: flashinfer.decode_backend,
-            flashinfer_prefill_backend: flashinfer.prefill_backend,
-            flashinfer_decode_split_tile_size: flashinfer
-                .decode_split_tile_size
-                .map(NonZeroU32::get),
-            flashinfer_prefill_split_tile_size: flashinfer
-                .prefill_split_tile_size
-                .map(NonZeroU32::get),
-            flashinfer_split_kv: flashinfer.split_kv,
-            // Each forward batch is bounded by the scheduler's batch and token
-            // budgets, which the worker's launch descriptor carries as `u32`.
-            max_batch_calls: u32::try_from(self.scheduler_config.max_batch.get())
-                .context("`scheduler_config.max_batch` exceeds the worker field width")?,
-            max_batch_tokens: u32::try_from(max_num_batched_tokens)
-                .context("`max_num_batched_tokens` exceeds the worker field width")?,
+            placement: Some(wire::Placement {
+                worker_groups: text(&self.worker_groups),
+                tensor_parallel_size: bounded(
+                    self.tensor_parallel_size.get(),
+                    "tensor_parallel_size",
+                )?,
+                data_parallel_size: bounded(self.data_parallel_size.get(), "data_parallel_size")?,
+                device: self.placement_config.device.clone(),
+                queue_depth: bounded(
+                    self.placement_config.queue_depth.get(),
+                    "placement_config.queue_depth",
+                )?,
+                worker_hosts: self.placement_config.worker_hosts.clone(),
+                mem_fraction_static: self.mem_fraction_static,
+            }),
+            lanes: self
+                .lanes
+                .iter()
+                .map(|lane| wire::Lane {
+                    lane_id: lane.lane_id.clone(),
+                    sm_budget: lane.sm_budget as u32,
+                    domains: lane.domains.clone(),
+                    max_batch_calls: lane.max_batch_calls.map(|value| value as u32),
+                    max_batch_tokens: lane.max_batch_tokens.map(|value| value as u32),
+                    max_inflight: lane.max_inflight.map(|value| value as u32),
+                })
+                .collect(),
+            transfer: self.placement_config.transfer.clone().unwrap_or_default(),
+            scheduling: Some(scheduling),
+            kv_cache: Some(wire::KvCache {
+                max_tokens: kv_cache.max_tokens.map(NonZeroU64::get),
+                block_size: kv_cache.block_size.map(NonZeroU32::get),
+                dtype: kv_cache
+                    .dtype
+                    .map(PrefixCacheDtype::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                prefix_caching: kv_cache.prefix_caching,
+                host_tier: kv_cache.host_tier,
+                mooncake: kv_cache.mooncake.as_ref().map(|mooncake| wire::Mooncake {
+                    master: mooncake.master.clone(),
+                    metadata_server: mooncake.metadata_server.clone(),
+                    protocol: mooncake.protocol.clone(),
+                    device: mooncake.device.clone(),
+                    segment_bytes: mooncake.global_segment_gib << 30,
+                    library: text(&mooncake.library),
+                }),
+            }),
+            workers: Some(wire::Workers {
+                executable: worker.executable.to_string_lossy().into_owned(),
+                watchdog_timeout_ms: u64::try_from(worker.watchdog_timeout.as_millis())
+                    .unwrap_or(u64::MAX),
+                mesh: worker.mesh.clone().unwrap_or_default(),
+                distributed_backend: worker.distributed_backend.clone().unwrap_or_default(),
+                standby: worker.standby,
+                attention_backend: self.attention_backend.clone(),
+                dtype: word(&self.dtype),
+                quantization_config: Value::Object(self.quantization_config.clone()).to_string(),
+                load_format: word(&self.load_config.format),
+                download_dir: text(&self.load_config.download_dir),
+                load_threads: self.load_config.threads.map(NonZeroU32::get),
+            }),
+            cuda_graphs: Some(wire::CudaGraphs {
+                policy: word(&graphs.policy),
+                capture_prefill: graphs.capture_prefill,
+                capture_flow: graphs.capture_flow,
+                decode_batch_sizes: increasing(
+                    "cuda_graph_config.decode_batch_sizes",
+                    &graphs.decode_batch_sizes,
+                )?,
+                prefill_token_sizes: increasing(
+                    "cuda_graph_config.prefill_token_sizes",
+                    &graphs.prefill_token_sizes,
+                )?,
+                flow_batch_sizes: increasing(
+                    "cuda_graph_config.flow_batch_sizes",
+                    &graphs.flow_batch_sizes,
+                )?,
+                flow_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
+            }),
+            flashinfer: Some(wire::FlashInfer {
+                workspace_size: flashinfer.workspace_size,
+                use_tensor_core: flashinfer.use_tensor_core,
+                decode_backend: flashinfer.decode_backend.as_str().to_owned(),
+                prefill_backend: flashinfer.prefill_backend.as_str().to_owned(),
+                decode_split_tile_size: flashinfer.decode_split_tile_size.map(NonZeroU32::get),
+                prefill_split_tile_size: flashinfer.prefill_split_tile_size.map(NonZeroU32::get),
+                split_kv: flashinfer.split_kv,
+            }),
             // Video workers size resident media state for the longest
             // duration served and provision only the frame counts the API
             // admits, and prepare exactly the canvases these resolutions and
             // aspect ratios name.
-            max_video_seconds: self.video_config.max_seconds,
-            min_video_seconds: Some(MIN_VIDEO_SECONDS),
-            max_condition_rows: self.video_config.max_condition_rows,
-            video_resolutions: self.video_config.resolutions.clone(),
-            video_aspect_ratios: self.video_config.aspect_ratios.clone(),
-            ..WorkerProcessArgs::default()
-        };
-
-        Ok(EngineConfig {
-            generation_limits: GenerationLimits::default(),
-            max_batch: self.scheduler_config.max_batch.get(),
-            max_num_batched_tokens,
-            max_running_requests: self.max_running_requests.get(),
-            max_queued_requests: self
-                .scheduler_config
-                .max_queued_requests
-                .map(NonZeroUsize::get),
-            chunked_prefill_size: self
-                .scheduler_config
-                .chunked_prefill_size
-                .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, NonZeroUsize::get),
-            prefix_cache: self.kv_cache_config.prefix_caching,
-            schedule_policy: self.scheduler_config.policy,
-            worker_groups,
-            transfer,
-            data_parallel_size: self.data_parallel_size.get(),
-            expert_parallel: self
-                .moe_config
-                .expert_parallel
-                .then_some(self.moe_config.exchange),
-            worker_process,
-            bos: 0,
-            eos: Vec::new(),
-            end_of_image: 0,
+            video: Some(wire::Video {
+                max_seconds: self.video_config.max_seconds,
+                min_seconds: MIN_VIDEO_SECONDS,
+                resolutions: self.video_config.resolutions.clone(),
+                aspect_ratios: self.video_config.aspect_ratios.clone(),
+                text_capacities: increasing(
+                    "video_config.text_capacities",
+                    &self.video_config.text_capacities,
+                )?,
+                max_condition_rows: self.video_config.max_condition_rows,
+                ffmpeg: self.media_config.ffmpeg.to_string_lossy().into_owned(),
+            }),
+            experts: Some(wire::Experts {
+                expert_parallel: self.moe_config.expert_parallel,
+                exchange: word(&self.moe_config.exchange),
+                microbatches: self.moe_config.microbatches.get(),
+            }),
+            model_facts: None,
         })
     }
+}
 
-    /// Returns the hosts the placement shorthand places ranks on, this host
-    /// first.
-    ///
-    /// `WorkerGroupConfig::placed` assigns ranks to these hosts in contiguous
-    /// blocks in list order, so leading with this head's own identity
-    /// keeps rank zero and the other lowest ranks on the head's host.
-    /// Entries of `worker_hosts` that are empty or repeat this head's
-    /// identity are dropped; other repeated names are kept as given.
-    fn rank_hosts(&self) -> Vec<String> {
-        let mut hosts = vec![self.host_identity.clone()];
-        hosts.extend(
-            self.placement_config
-                .worker_hosts
-                .iter()
-                .filter(|host| !host.is_empty() && **host != self.host_identity)
-                .cloned(),
-        );
-        hosts
+/// The user's runtime directory, where this node's sockets lie beside its
+/// Storage Server's.
+fn runtime_directory() -> PathBuf {
+    storage::socket::default_socket()
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf)
+}
+
+/// The word a serving option names `value` by, as the option tree prints
+/// it.
+fn word<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(word)) => word,
+        _ => String::new(),
     }
 }
 
@@ -1111,7 +1160,7 @@ fn non_empty_secret(value: Option<&str>) -> Option<String> {
 }
 
 /// Checks that a stated capture or capacity list is strictly increasing.
-fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<Option<Vec<u32>>> {
+fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<Option<wire::Sizes>> {
     let Some(values) = values else {
         return Ok(None);
     };
@@ -1119,11 +1168,13 @@ fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<Op
         values.windows(2).all(|pair| pair[0] < pair[1]),
         "`{path}` must be strictly increasing, got {values:?}"
     );
-    Ok(Some(values.iter().map(|value| value.get()).collect()))
+    Ok(Some(wire::Sizes {
+        values: values.iter().map(|value| value.get()).collect(),
+    }))
 }
 
 /// Checks that stated image capture sizes are distinct.
-fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<Option<Vec<[u32; 2]>>> {
+fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<Option<wire::Shapes>> {
     let Some(shapes) = shapes else {
         return Ok(None);
     };
@@ -1131,5 +1182,13 @@ fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<Optio
         shapes.iter().collect::<BTreeSet<_>>().len() == shapes.len(),
         "`{path}` repeats an image size"
     );
-    Ok(Some(shapes.iter().map(|shape| shape.0).collect()))
+    Ok(Some(wire::Shapes {
+        shapes: shapes
+            .iter()
+            .map(|shape| wire::Shape {
+                height: shape.0[0],
+                width: shape.0[1],
+            })
+            .collect(),
+    }))
 }

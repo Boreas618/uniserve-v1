@@ -6,7 +6,11 @@
 //! through the model's input processing and output assembly (`serving`). The
 //! HTTP layer (`http`) exposes OpenAI-compatible routes over it.
 
-/// The serving engine over the in-process schedulers.
+/// The client of an engine process: its requests and their events.
+pub mod client;
+/// Starting the deployment's engine process.
+pub mod control;
+/// The serving engine over the engine process.
 pub mod frontend;
 /// The HTTP server: router assembly, the listener, and graceful shutdown.
 pub mod http;

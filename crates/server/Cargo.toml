@@ -13,7 +13,6 @@ base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 daemon.workspace = true
-engine.workspace = true
 fastokens.workspace = true
 fnv.workspace = true
 futures.workspace = true
@@ -22,7 +21,6 @@ http-body.workspace = true
 humantime.workspace = true
 image.workspace = true
 indexmap.workspace = true
-ipc.workspace = true
 itertools.workspace = true
 libc.workspace = true
 llm-multimodal.workspace = true
@@ -30,6 +28,7 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 models.workspace = true
 observability.workspace = true
+proto.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -55,6 +54,9 @@ winnow.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 engine = { workspace = true, features = ["testing"] }
+# Tests drive the request interface with in-process schedulers and build
+# their worker values.
+ipc.workspace = true
 expect-test.workspace = true
 tokenizers.workspace = true
 tower.workspace = true

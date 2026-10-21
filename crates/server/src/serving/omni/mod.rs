@@ -25,10 +25,10 @@ use base64::Engine as _;
 
 use crate::profile::omni::OmniProfile;
 use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
-use engine::{
+use proto::request::ImageParams;
+use proto::request::{
     GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs,
 };
-use ipc::ImageParams;
 
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::TokenizeError;

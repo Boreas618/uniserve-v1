@@ -1,0 +1,704 @@
+// The request interface: what the leader daemon submits to an engine process
+// and the events it receives back.
+//
+// The leader daemon starts each engine process, which connects to the
+// daemon's request socket (a Unix socket on the leader) and says hello. The
+// daemon answers with the engine's specification: everything it is to serve
+// and how. The engine starts its workers, then reports its state, and from
+// then on the connection carries the daemon's submissions and commands and
+// the engine's events. Every request has the identity the daemon gave it;
+// each of its events names it.
+//
+// A request's generated media (images inline, videos by descriptor) reaches
+// the daemon with its events: an `Artifact` event passes the shared memory
+// holding the bytes as a file descriptor beside its frame.
+//
+// The interface is versioned across builds: a persistent daemon serves
+// engines of successive builds. Messages change only by additions; the hello
+// exchange compares major versions.
+
+syntax = "proto3";
+
+package uniserve.request;
+
+// The first message on a connection, from the engine process.
+message Hello {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string build = 3;
+  // The identity the daemon started the engine process under.
+  uint64 engine = 4;
+}
+
+// The answer to a `Hello`.
+message Welcome {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string build = 3;
+  // Why the engine is refused; empty when it is accepted.
+  string refusal = 4;
+  // What the engine is to serve and how.
+  EngineSpec spec = 5;
+}
+
+// What travels from the engine process after the welcome.
+message FromEngine {
+  oneof kind {
+    State state = 1;
+    Accepted accepted = 2;
+    Event event = 3;
+    Stats stats = 4;
+  }
+}
+
+// What travels to the engine process after the welcome.
+message ToEngine {
+  oneof kind {
+    Submit submit = 1;
+    Command command = 2;
+    EngineCommand engine = 3;
+  }
+}
+
+// The engine's state changes.
+message State {
+  EngineState state = 1;
+  // What the engine serves, once it is ready.
+  EngineInfo info = 2;
+  // Why the engine failed, when it did.
+  string error = 3;
+}
+
+enum EngineState {
+  ENGINE_STATE_UNSPECIFIED = 0;
+  // Starting its workers.
+  ENGINE_STATE_STARTING = 1;
+  // Serving requests.
+  ENGINE_STATE_READY = 2;
+  // Its start failed or its workers are lost; it serves nothing more.
+  ENGINE_STATE_FAILED = 3;
+}
+
+// What a ready engine serves.
+message EngineInfo {
+  // The limits every request is checked against, resolved against the
+  // workers' capacities.
+  GenerationLimits limits = 1;
+  // The video denoiser as its model family describes it
+  // (`models::video::DenoiserInfo`, JSON); empty when the engine generates
+  // no video.
+  bytes video_denoiser = 2;
+  // Condition units one latent encoding call covers at once; zero when no
+  // worker encodes latents.
+  uint32 latent_encoding_units = 3;
+  // The engine's schedulers, one per DP rank.
+  uint32 schedulers = 4;
+}
+
+// Requests submitted together: the engine queues every one of them before it
+// forms its next batch.
+message Submit {
+  repeated Request requests = 1;
+}
+
+// The engine took a submitted request: it passed the engine's checks and is
+// queued on one of its schedulers. A request it refuses ends with a
+// `Rejected` event instead.
+message Accepted {
+  uint64 request = 1;
+  // The scheduler that serves it.
+  uint32 scheduler = 2;
+}
+
+message Request {
+  // The daemon's identity of the request.
+  uint64 id = 1;
+  int32 priority = 2;
+  oneof kind {
+    GenerationRequest generation = 3;
+    DiffusionRequest diffusion = 4;
+  }
+}
+
+// A command for one request.
+message Command {
+  uint64 request = 1;
+  oneof kind {
+    // The client went away: the request ends as cancelled.
+    Cancel cancel = 2;
+    // The daemon's decoder matched a stop string: the request ends as
+    // stopped.
+    StopRequest stop = 3;
+    // The daemon's decoder found that this many public tokens complete no
+    // stop string.
+    Acknowledge acknowledge = 4;
+    // The daemon ends the request at once.
+    Abort abort = 5;
+    // The daemon's consumer took this many of the request's events in all.
+    // The engine sends a request at most `EVENT_WINDOW` events beyond what
+    // its consumer took, so a slow consumer holds its request's output
+    // back in the engine, whose scheduler then stalls the request.
+    Consumed consumed = 6;
+  }
+}
+
+message Cancel {}
+message StopRequest {}
+message Acknowledge {
+  uint64 output_tokens = 1;
+}
+message Abort {}
+message Consumed {
+  uint64 events = 1;
+}
+
+// A command for the whole engine.
+message EngineCommand {
+  oneof kind {
+    // Finish every request as aborted, close the workers and exit.
+    Shutdown shutdown = 1;
+  }
+}
+
+message Shutdown {}
+
+// One scheduler's statistics of the last reporting interval.
+message Stats {
+  uint32 scheduler = 1;
+  // The snapshot (`proto::report::SchedulerStats`), JSON: observability data
+  // whose fields evolve with every build, each with a default.
+  bytes snapshot = 2;
+}
+
+// ---------------------------------------------------------------- requests
+
+message GenerationRequest {
+  repeated uint32 prompt_token_ids = 1;
+  repeated uint32 negative_prompt_token_ids = 2;
+  repeated ImageInput images = 3;
+  GenerationConstraint constraint = 4;
+  SamplingParams sampling = 5;
+  ImageParams image = 6;
+  uint32 max_images = 7;
+  uint64 max_und_tokens = 8;
+  repeated string stop_strings = 9;
+  repeated uint32 stop_token_ids = 10;
+  CachePolicy cache = 11;
+  bool include_stop_token = 12;
+  ImageGenerationConfig image_generation = 13;
+  repeated ReadoutRow readout = 14;
+}
+
+enum GenerationConstraint {
+  GENERATION_CONSTRAINT_DEFAULT = 0;
+  GENERATION_CONSTRAINT_UND_ONLY = 1;
+  GENERATION_CONSTRAINT_GEN_ONLY = 2;
+}
+
+message ImageInput {
+  uint64 hash = 1;
+  // The encoded image, base64.
+  string b64 = 2;
+  uint32 position = 3;
+  uint32 num_positions = 4;
+  repeated ImageEncoderInput encoders = 5;
+}
+
+enum ImageEncoder {
+  IMAGE_ENCODER_VISION = 0;
+  IMAGE_ENCODER_LATENT = 1;
+}
+
+message ImageEncoderInput {
+  ImageEncoder encoder = 1;
+  optional uint32 num_cache_tokens = 2;
+  optional uint32 max_cache_tokens = 3;
+}
+
+message SamplingParams {
+  float temperature = 1;
+  uint32 top_k = 2;
+  float top_p = 3;
+  bool ignore_eos = 4;
+  optional uint64 seed = 5;
+  float min_p = 6;
+  float repetition_penalty = 7;
+  float frequency_penalty = 8;
+  float presence_penalty = 9;
+  repeated LogitBias logit_bias = 10;
+  uint64 min_tokens = 11;
+  bool return_logprobs = 12;
+  uint32 n_logprobs = 13;
+  bool return_prompt_logprobs = 14;
+  uint32 n_prompt_logprobs = 15;
+  repeated TokenSequence bad_words_ids = 16;
+  // Absent: every token is allowed.
+  TokenSequence allowed_token_ids = 17;
+  float typical_p = 18;
+  repeated uint32 forced_token_ids = 19;
+}
+
+message LogitBias {
+  uint32 token = 1;
+  float bias = 2;
+}
+
+message TokenSequence {
+  repeated uint32 tokens = 1;
+}
+
+message ImageParams {
+  uint32 steps = 1;
+  float cfg_text_scale = 2;
+  float cfg_img_scale = 3;
+  CfgRenorm cfg_renorm_type = 4;
+  float cfg_renorm_min = 5;
+  float cfg_interval_start = 6;
+  float cfg_interval_end = 7;
+  float timestep_shift = 8;
+  uint32 height = 9;
+  uint32 width = 10;
+  optional uint64 seed = 11;
+}
+
+enum CfgRenorm {
+  CFG_RENORM_GLOBAL = 0;
+  CFG_RENORM_NONE = 1;
+  CFG_RENORM_TEXT_CHANNEL = 2;
+}
+
+message CachePolicy {
+  bool read = 1;
+  bool write = 2;
+  optional uint64 isolation_key = 3;
+}
+
+message ImageGenerationConfig {
+  ImageTrigger trigger = 1;
+  bool requires_text_for_image = 2;
+  FeedbackSource feedback_source = 3;
+  repeated ImageEncoderInput feedback_encoders = 4;
+  uint32 num_feedback_positions = 5;
+  FeedbackNextToken feedback_next_token = 6;
+  bool sample_feedback_continuation = 7;
+}
+
+message ImageTrigger {
+  oneof kind {
+    Disabled disabled = 1;
+    uint32 token = 2;
+    TokenSequence suffix = 3;
+    RoundCloseThenSuffix round_close_then_suffix = 4;
+  }
+}
+
+message Disabled {}
+
+message RoundCloseThenSuffix {
+  repeated uint32 close_token_ids = 1;
+  repeated uint32 trigger_token_ids = 2;
+}
+
+enum FeedbackSource {
+  FEEDBACK_SOURCE_NONE = 0;
+  FEEDBACK_SOURCE_DEVICE_PRODUCT = 1;
+  FEEDBACK_SOURCE_ARTIFACT_PRODUCT = 2;
+}
+
+message FeedbackNextToken {
+  oneof kind {
+    Disabled none = 1;
+    Disabled bos = 2;
+    Disabled end_of_image = 3;
+    uint32 token = 4;
+  }
+}
+
+message ReadoutRow {
+  repeated uint32 token_ids = 1;
+  repeated ReadoutSlot slots = 2;
+}
+
+message ReadoutSlot {
+  uint32 position = 1;
+  repeated uint32 candidates = 2;
+}
+
+message DiffusionRequest {
+  string task = 1;
+  repeated uint32 prompt_token_ids = 2;
+  bytes conditioning = 3;
+  repeated ConditionExtent conditions = 4;
+  DiffusionSamplingParams sampling = 5;
+}
+
+message ConditionExtent {
+  uint64 pixel_bytes = 1;
+  uint64 audio_samples = 2;
+  uint64 vision_patches = 3;
+  uint32 vision_tokens = 4;
+  repeated uint32 latent_units = 5;
+  uint32 audio_rows = 6;
+}
+
+message DiffusionSamplingParams {
+  uint32 num_frames = 1;
+  uint32 video_units = 2;
+  uint64 seed = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}
+
+// ------------------------------------------------------------------ events
+
+message Event {
+  uint64 request = 1;
+  oneof kind {
+    Scheduled scheduled = 2;
+    TextToken text_token = 3;
+    TextTokens text_tokens = 4;
+    TokenLogprobs token_logprobs = 5;
+    PromptLogprobs prompt_logprobs = 6;
+    Readout readout = 7;
+    ImageBegin image_begin = 8;
+    ImageStep image_step = 9;
+    ImageCommit image_commit = 10;
+    ImageDone image_done = 11;
+    MediaProgress media_progress = 12;
+    Artifact artifact = 13;
+    ArtifactUnavailable artifact_unavailable = 14;
+    Finished finished = 15;
+    Rejected rejected = 16;
+    Failed error = 17;
+  }
+}
+
+message Scheduled {
+  double queued_at = 1;
+  double scheduled_at = 2;
+}
+
+message TextToken {
+  uint32 id = 1;
+  optional float logprob = 2;
+}
+
+message TextTokens {
+  repeated uint32 ids = 1;
+}
+
+message TokenLogprob {
+  uint32 token_id = 1;
+  float logprob = 2;
+  uint32 rank = 3;
+}
+
+message TokenLogprobs {
+  uint32 id = 1;
+  repeated TokenLogprob candidates = 2;
+}
+
+message PositionLogprobs {
+  repeated TokenLogprob entries = 1;
+}
+
+message PromptLogprobs {
+  repeated PositionLogprobs positions = 1;
+}
+
+message Readout {
+  repeated float candidate_logprobs = 1;
+}
+
+message ImageBegin {
+  uint32 image_id = 1;
+  uint32 height = 2;
+  uint32 width = 3;
+  uint32 steps = 4;
+}
+
+message ImageStep {
+  uint32 image_id = 1;
+  uint32 step = 2;
+}
+
+message ImageCommit {
+  uint32 image_id = 1;
+}
+
+message ImageDone {
+  uint32 image_id = 1;
+  uint32 height = 2;
+  uint32 width = 3;
+  uint64 bytes = 4;
+  // The PNG payload, base64.
+  string png_b64 = 5;
+}
+
+message MediaProgress {
+  string phase = 1;
+  uint32 completed_steps = 2;
+}
+
+// A generated artifact: its bytes are the shared memory whose descriptor
+// travels with this frame, `bytes` long.
+message Artifact {
+  MediaKind media_kind = 1;
+  string content_type = 2;
+  uint64 bytes = 3;
+}
+
+enum MediaKind {
+  MEDIA_KIND_IMAGE = 0;
+  MEDIA_KIND_VIDEO = 1;
+  MEDIA_KIND_AUDIO = 2;
+}
+
+message ArtifactUnavailable {
+  string message = 1;
+}
+
+message Finished {
+  FinishReason reason = 1;
+  StopReason stop_reason = 2;
+  uint64 prompt_tokens = 3;
+  uint64 completion_tokens = 4;
+  uint64 images = 5;
+}
+
+enum FinishReason {
+  FINISH_REASON_COMPLETED = 0;
+  FINISH_REASON_EOS = 1;
+  FINISH_REASON_MAX_TOKENS = 2;
+  FINISH_REASON_STOP = 3;
+  FINISH_REASON_IMAGE_DONE = 4;
+  FINISH_REASON_CANCELLED = 5;
+  FINISH_REASON_ABORTED = 6;
+  FINISH_REASON_REPETITION = 7;
+  FINISH_REASON_ERROR = 8;
+}
+
+message StopReason {
+  oneof kind {
+    uint32 token = 1;
+    string text = 2;
+  }
+}
+
+message Rejected {
+  RejectionKind kind = 1;
+  string message = 2;
+}
+
+enum RejectionKind {
+  REJECTION_KIND_INVALID = 0;
+  REJECTION_KIND_OVERLOADED = 1;
+}
+
+message Failed {
+  string message = 1;
+}
+
+// ------------------------------------------------------------ limits
+
+message GenerationLimits {
+  bool understanding = 1;
+  bool vision_encode = 2;
+  bool latent_encode = 3;
+  bool image_generation = 4;
+  bool token_denoising = 5;
+  uint64 max_latent_units = 6;
+  uint32 latent_downsample = 7;
+  uint32 max_vae_grid_tokens = 8;
+  uint32 max_vit_grid_tokens = 9;
+  uint64 latent_bytes_per_unit = 10;
+  uint64 max_latent_feature_bytes = 11;
+  uint64 max_vision_feature_bytes = 12;
+  uint32 commit_marker_tokens = 13;
+  uint32 max_cfg_branches = 14;
+  uint32 encoder_cache_entries = 15;
+}
+
+// ---------------------------------------------------------------- the spec
+
+// What an engine serves and how: the deployment's serving options that
+// concern the engine, under the names the serving options give them, and
+// what the daemon resolved from the model. A value an option table names by
+// a word (a policy, a backend, an element type) travels as that word.
+message EngineSpec {
+  // The deployment: its served model name, under which the Storage Servers
+  // keep its claims and pages.
+  string deployment = 1;
+  // The model: a local directory or a Hugging Face repository.
+  string model = 2;
+  // The host identity of the leader, where the engine process runs.
+  string host = 3;
+  Placement placement = 4;
+  repeated Lane lanes = 5;
+  // Product transport per worker edge (`placement_config.transfer`); empty
+  // for the defaults.
+  string transfer = 6;
+  Scheduling scheduling = 7;
+  KvCache kv_cache = 8;
+  Workers workers = 9;
+  CudaGraphs cuda_graphs = 10;
+  FlashInfer flashinfer = 11;
+  Video video = 12;
+  Experts experts = 13;
+  ModelFacts model_facts = 14;
+}
+
+// Where the ranks run: a deployment file, or the shorthand.
+message Placement {
+  // A deployment file (`worker_groups`), placed on `EngineSpec.host`; empty
+  // for the shorthand.
+  string worker_groups = 1;
+  uint32 tensor_parallel_size = 2;
+  uint32 data_parallel_size = 3;
+  string device = 4;
+  uint32 queue_depth = 5;
+  // Hosts after the leader the shorthand spreads ranks across.
+  repeated string worker_hosts = 6;
+  double mem_fraction_static = 7;
+}
+
+message Lane {
+  string lane_id = 1;
+  uint32 sm_budget = 2;
+  repeated string domains = 3;
+  optional uint32 max_batch_calls = 4;
+  optional uint32 max_batch_tokens = 5;
+  optional uint32 max_inflight = 6;
+}
+
+message Scheduling {
+  // `fcfs` or `priority`.
+  string policy = 1;
+  uint32 max_batch = 2;
+  // Absent for the engine's default.
+  optional uint32 max_num_batched_tokens = 3;
+  uint32 max_running_requests = 4;
+  // Absent for an unbounded waiting queue.
+  optional uint64 max_queued_requests = 5;
+  // Absent for the engine's default.
+  optional uint32 chunked_prefill_size = 6;
+}
+
+message KvCache {
+  optional uint64 max_tokens = 1;
+  optional uint32 block_size = 2;
+  // Empty for each layer's compute type.
+  string dtype = 3;
+  bool prefix_caching = 4;
+  bool host_tier = 5;
+  // Absent when the deployment keeps no distributed tier.
+  Mooncake mooncake = 6;
+}
+
+message Mooncake {
+  string master = 1;
+  string metadata_server = 2;
+  string protocol = 3;
+  string device = 4;
+  uint64 segment_bytes = 5;
+  // Empty for the loader's search path.
+  string library = 6;
+}
+
+message Workers {
+  string executable = 1;
+  uint64 watchdog_timeout_ms = 2;
+  // Empty when unset.
+  string mesh = 3;
+  // Empty when unset.
+  string distributed_backend = 4;
+  bool standby = 5;
+  string attention_backend = 6;
+  string dtype = 7;
+  // The precision policy, a JSON object.
+  string quantization_config = 8;
+  string load_format = 9;
+  // Empty when unset.
+  string download_dir = 10;
+  optional uint32 load_threads = 11;
+}
+
+message CudaGraphs {
+  // `auto`, `full` or `off`.
+  string policy = 1;
+  bool capture_prefill = 2;
+  bool capture_flow = 3;
+  // Each list is absent for the worker's catalog.
+  Sizes decode_batch_sizes = 4;
+  Sizes prefill_token_sizes = 5;
+  Sizes flow_batch_sizes = 6;
+  Shapes flow_shapes = 7;
+}
+
+message Sizes {
+  repeated uint32 values = 1;
+}
+
+message Shapes {
+  repeated Shape shapes = 1;
+}
+
+message Shape {
+  uint32 height = 1;
+  uint32 width = 2;
+}
+
+message FlashInfer {
+  uint64 workspace_size = 1;
+  optional bool use_tensor_core = 2;
+  string decode_backend = 3;
+  string prefill_backend = 4;
+  optional uint32 decode_split_tile_size = 5;
+  optional uint32 prefill_split_tile_size = 6;
+  bool split_kv = 7;
+}
+
+message Video {
+  double max_seconds = 1;
+  double min_seconds = 2;
+  repeated string resolutions = 3;
+  repeated string aspect_ratios = 4;
+  // Absent for the default capacities.
+  Sizes text_capacities = 5;
+  optional uint32 max_condition_rows = 6;
+  string ffmpeg = 7;
+}
+
+message Experts {
+  bool expert_parallel = 1;
+  // `alltoall`, `megamoe`, `deepep` or `dwdp`.
+  string exchange = 2;
+  uint32 microbatches = 3;
+}
+
+// What the daemon resolved from the model's checkpoint.
+message ModelFacts {
+  // The model's generation requirements, which the engine intersects with
+  // its workers' capacities.
+  GenerationLimits limits = 1;
+  uint32 bos = 2;
+  // Every end-of-sequence token, the primary one first.
+  repeated uint32 eos = 3;
+  uint32 end_of_image = 4;
+  uint32 max_model_len = 5;
+  // A block-diffusion model's canvas sampling; absent for other models.
+  CanvasSampling canvas_sampling = 6;
+  // Whether a prompt's prefill returns outputs, which only conditioning
+  // prefills of block-diffusion models do not.
+  bool prefill_outputs = 7;
+}
+
+message CanvasSampling {
+  uint32 canvas_length = 1;
+  uint32 max_steps = 2;
+  float entropy_bound = 3;
+  float t_min = 4;
+  float t_max = 5;
+  float confidence_threshold = 6;
+  uint32 stability_threshold = 7;
+}

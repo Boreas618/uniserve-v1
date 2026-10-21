@@ -10,7 +10,7 @@
 
 use std::ops::ControlFlow;
 
-use engine::{ArtifactEvent, RejectionKind};
+use proto::request::{ArtifactEvent, RejectionKind};
 
 use crate::serving::{FinishReason, RequestOutput};
 

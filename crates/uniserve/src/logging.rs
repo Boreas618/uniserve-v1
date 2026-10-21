@@ -2,7 +2,9 @@
 //!
 //! `main` calls `init_tracing` once, before the Tokio runtime is built. Each
 //! event is written as one line of the form
-//! `(RustFrontend pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
+//! `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`,
+//! where the process is `Daemon` for `uniserve serve` and `Engine` for an
+//! engine process,
 //! with the active spans, if any, written as `outer{..}:inner{..}: ` before
 //! the fields.
 //!
@@ -38,7 +40,6 @@ const RESET: &str = "\x1b[0m";
 const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[month]-[day] [hour]:[minute]:[second]");
 
-const PROCESS_LABEL: &str = "RustFrontend";
 /// Tracing targets whose level `--log-level-http` sets, overriding, for those
 /// targets, the default level and any `RUST_LOG` directive naming exactly that
 /// target.
@@ -49,13 +50,13 @@ const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "server"];
 /// Reads `RUST_LOG` from the environment (see `build_targets_filter` for
 /// precedence). Installation failure, for example because a global subscriber
 /// is already set, is reported on stderr and is not fatal.
-pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>) {
+pub(crate) fn init_tracing(process: &str, log_level: Option<&str>, log_level_http: Option<&str>) {
     let filter = build_targets_filter(
         log_level,
         log_level_http,
         env::var("RUST_LOG").ok().as_deref(),
     );
-    let formatter = UniserveEventFormatter::new();
+    let formatter = UniserveEventFormatter::new(process);
 
     if let Err(err) = tracing_subscriber::registry()
         .with(
@@ -142,11 +143,11 @@ struct UniserveEventFormatter {
 }
 
 impl UniserveEventFormatter {
-    /// Creates the formatter, fixing the process prefix and the timer's local
-    /// offset at construction.
-    fn new() -> Self {
+    /// Creates the formatter of `label`'s process, fixing the process prefix
+    /// and the timer's local offset at construction.
+    fn new(label: &str) -> Self {
         Self {
-            prefix: format!("({} pid={})", PROCESS_LABEL, process::id()),
+            prefix: format!("({label} pid={})", process::id()),
             timer: UniserveLocalTimer::default(),
         }
     }

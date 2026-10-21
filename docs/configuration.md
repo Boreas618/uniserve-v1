@@ -185,11 +185,11 @@ retention = "30m"
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `executable` | The head's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the workers run as (`uniserve worker`), and that starts a host's Storage Server; it runs workers in the Python environment it is installed in |
+| `executable` | The daemon's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the workers run as (`uniserve worker`), and that starts a host's Storage Server; it runs workers in the Python environment it is installed in |
 | `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled lane after half of it |
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
-| `standby` | `false` | Keep a standby rank group beside each worker group whose ranks all run on the head's host and that shares no expert world. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |
+| `standby` | `false` | Keep a standby rank group beside each worker group whose ranks all run on the leader's host and that shares no expert world. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |
 
 ### `logging_config`
 
@@ -327,7 +327,7 @@ A `[[worker_groups]]` table takes:
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-memory share for this group |
 
-A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the head's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
+A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the leader's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
 
 A component table takes:
 

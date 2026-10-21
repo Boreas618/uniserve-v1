@@ -20,9 +20,8 @@
 //! The head exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
 //!
-//! The launch settings `WorkerProcessArgs` carries (`LaneConfig`,
-//! `FlashInferBackend`, `GraphPolicy`, `LoadFormat`), that type's defaults, and the launch descriptor
-//! built from it are defined in `descriptor`.
+//! The defaults of the launch settings `WorkerProcessArgs` carries and the
+//! launch descriptor built from them are defined in `descriptor`.
 
 mod descriptor;
 
@@ -40,7 +39,6 @@ use crate::worker::WorkerProcessArgs;
 use crate::worker::processes::Processes;
 
 use descriptor::worker_environment;
-pub use descriptor::{FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LoadFormat};
 
 /// Maximum time `request_close` spends draining in-flight responses from a
 /// still-alive worker before it sends the shutdown request. A hung (alive but
@@ -61,7 +59,7 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use ipc::{LaneConfig, LaneSpec};
+pub use ipc::LaneConfig;
 
 /// One adopted rank: its channel, the report of its process's exit, and the
 /// requests outstanding on it.

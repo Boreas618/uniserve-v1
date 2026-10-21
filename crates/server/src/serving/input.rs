@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use engine::GenerationConstraint;
+use proto::request::GenerationConstraint;
 
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -157,7 +157,7 @@ pub struct ImageSamplingParams {
     /// Fractional diffusion interval over which guidance applies.
     pub cfg_interval: Option<[f32; 2]>,
     /// Guidance renormalization algorithm.
-    pub cfg_renorm_type: Option<ipc::CfgRenorm>,
+    pub cfg_renorm_type: Option<proto::request::CfgRenorm>,
     /// Minimum scale at which guidance renormalization applies.
     pub cfg_renorm_min: Option<f32>,
     /// Diffusion timestep shift.

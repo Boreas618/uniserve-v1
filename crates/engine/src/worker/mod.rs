@@ -22,10 +22,9 @@ mod registry;
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
 pub(crate) use incarnations::IncarnationRegistry;
-pub use process::{
-    FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
-};
+pub use process::LaneConfig;
 use process::{PendingWorker, WorkerProcess};
+use proto::request::{ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat};
 
 /// Backpressure and terminal failures returned by a WorkerGroup batch submission.
 #[derive(Debug, thiserror::Error)]
@@ -237,28 +236,6 @@ pub struct WorkerProcessArgs {
     pub expert_parallel: Option<ExpertParallelPlacement>,
     /// Independent numerical microbatches overlapping attention and remote experts.
     pub expert_microbatches: u32,
-}
-
-/// How replicas access distributed experts: token exchange or weight prefetch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExpertExchange {
-    /// FlashInfer's NVLink all-to-all dispatch and combine around each
-    /// rank's grouped expert kernel.
-    #[default]
-    #[serde(rename = "alltoall")]
-    AllToAll,
-    /// The fused CuTeDSL MegaMoE kernel, which dispatches, runs the experts
-    /// and combines in one launch per layer over NVSHMEM; NVFP4 experts only.
-    #[serde(rename = "megamoe")]
-    MegaMoe,
-    /// Elastic source/expert dispatch and combine with grouped expert compute.
-    #[serde(rename = "deepep")]
-    DeepEp,
-    /// Independent data-parallel execution with asynchronous peer weight
-    /// prefetch into double buffers. Inference has no rank collectives.
-    #[serde(rename = "dwdp")]
-    Dwdp,
 }
 
 /// A worker group's consecutive ranks in the deployment's expert union.

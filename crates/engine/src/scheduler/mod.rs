@@ -39,7 +39,7 @@ pub(crate) mod stats_report;
 
 pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig, SchedulingPolicy,
+    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
@@ -99,6 +99,7 @@ use ipc::{
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 use ipc::{SharedMedia, TokenLogprob};
+use proto::request::SchedulingPolicy;
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;

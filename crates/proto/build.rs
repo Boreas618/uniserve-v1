@@ -128,7 +128,10 @@ fn list_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> io::Re
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let schemas = [manifest.join("src/process.proto")];
+    let schemas = [
+        manifest.join("src/process.proto"),
+        manifest.join("src/request.proto"),
+    ];
     for schema in &schemas {
         println!("cargo:rerun-if-changed={}", schema.display());
     }

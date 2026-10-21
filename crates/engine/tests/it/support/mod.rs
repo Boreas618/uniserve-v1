@@ -6,9 +6,10 @@
 
 #![allow(dead_code)]
 
-use engine::{Executor, Scheduler, SchedulerConfig, SchedulingPolicy, SimEngine, SpecialTokenIds};
+use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};
+use proto::request::SchedulingPolicy;
 
 /// Builds a scheduler whose model limits follow from `executor`'s call kinds.
 ///

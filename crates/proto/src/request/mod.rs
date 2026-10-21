@@ -7,12 +7,17 @@
 //! to the ranks. Between a daemon and an engine process they travel as the
 //! request interface's Protobuf messages.
 
+mod convert;
+mod dtype;
 mod event;
 mod generation;
 mod image;
 mod sampling;
+mod spec;
 mod values;
 
+pub use convert::WireError;
+pub use dtype::{ModelDtype, ModelDtypeParseError};
 pub use event::{
     ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event,
     FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
@@ -25,4 +30,18 @@ pub use generation::{
 };
 pub use image::{CfgRenorm, CfgRenormParseError, ImageParams, ImageParamsError};
 pub use sampling::{SamplingParams, SamplingParamsError};
-pub use values::{DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
+pub use spec::{
+    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LoadFormat,
+    PrefixCacheDtype, PrefixCacheDtypeParseError, SchedulingPolicy,
+};
+pub use values::{CanvasSampling, DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
+
+/// The most events the engine sends a request beyond those its consumer took
+/// (`Consumed`).
+pub const EVENT_WINDOW: u64 = 64;
+
+/// The messages of the request interface (`request.proto`).
+#[allow(clippy::all, reason = "code generated from the schema")]
+pub mod wire {
+    include!(concat!(env!("OUT_DIR"), "/uniserve.request.rs"));
+}

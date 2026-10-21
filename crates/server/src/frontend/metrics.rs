@@ -25,7 +25,7 @@ use observability::{
 use tracing::info;
 
 use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage};
-use engine::report::SchedulerStats;
+use proto::report::SchedulerStats;
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
 /// time.
@@ -514,8 +514,8 @@ fn seconds(microseconds: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::report::DomainSchedulerStats;
     use observability::Metrics;
+    use proto::report::DomainSchedulerStats;
 
     // Per-domain scheduler statistics reach the rendered exposition under
     // their `domain` label, with call and phase-time breakdowns under `kind`.

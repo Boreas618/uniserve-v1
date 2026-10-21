@@ -16,10 +16,10 @@
 
 use std::time::Instant;
 
+use crate::client::EventStream;
 use asynk_strim_attr::{TryYielder, try_stream};
-use engine::Event;
-use engine::EventRx;
 use futures::{StreamExt as _, pin_mut};
+use proto::request::Event;
 
 use crate::serving::chat::output::structured::StructuredEventState;
 use crate::serving::text::output::decoded_text_event_stream;
@@ -107,7 +107,7 @@ pub(super) async fn generation_output(
     started: Instant,
     compile_us: u64,
     output: OutputParams,
-    events: EventRx,
+    events: EventStream,
     mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     let OutputParams {
@@ -247,7 +247,7 @@ pub(super) async fn media_output(
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,
-    mut events: EventRx,
+    mut events: EventStream,
     mut y: TryYielder<RequestOutput, ServeError>,
 ) -> Result<()> {
     let mut clock = StreamClock::new(started, compile_us);
