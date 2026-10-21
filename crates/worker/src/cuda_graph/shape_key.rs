@@ -13,14 +13,51 @@ pub(crate) enum ShapeKey {
     /// row from its top-k candidates.
     Decode { rows: usize, sampled: bool },
     /// `prefill` of a row and token bucket, with outputs or writing only
-    /// the prefix cache.
+    /// the prefix cache, for the rows of one numerical variant.
     Prefill {
         rows: usize,
         tokens: usize,
         outputs: bool,
+        variant: PrefillVariant,
     },
     /// `commit` of a row bucket.
     Commit { rows: usize },
+}
+
+/// The numerical semantics a prefill graph is captured for besides its
+/// buckets: how its rows' causality reaches attention, whether vision
+/// features replace token embeddings, and its rotary position axes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PrefillVariant {
+    /// The rows' shared causality; `None` reads each row's causality from
+    /// the device column, so that the graph serves rows that differ.
+    pub(crate) causal: Option<bool>,
+    /// Vision features replace the embeddings of the tokens the embedding
+    /// mask marks.
+    pub(crate) embeddings: bool,
+    /// Rotary position axes the rows carry: 1, or 3 for prompts placing
+    /// vision blocks at spatial positions.
+    pub(crate) axes: usize,
+}
+
+impl PrefillVariant {
+    /// Causal text at one position axis.
+    pub(crate) const TEXT: Self = Self {
+        causal: Some(true),
+        embeddings: false,
+        axes: 1,
+    };
+
+    /// Prompts placing vision blocks at explicit positions on `axes` rotary
+    /// axes: rows of either causality, features replacing the placeholder
+    /// embeddings.
+    pub(crate) const fn media(axes: usize) -> Self {
+        Self {
+            causal: None,
+            embeddings: true,
+            axes,
+        }
+    }
 }
 
 /// One prefill capture, including its extra padding row and attention mode.
@@ -32,9 +69,7 @@ pub(crate) struct PrefillShape {
     /// Least rows served by this bucket: one, or the preceding row bucket.
     /// Startup uses this count to fit scratch prefix cache within the physical pool.
     pub(crate) live_rows: usize,
-    /// None selects per-row device causality flags.
-    pub(crate) causal: Option<bool>,
-    pub(crate) embeddings: bool,
+    pub(crate) variant: PrefillVariant,
     /// False captures cache writes alone, without computing hidden outputs.
     pub(crate) outputs: bool,
 }
@@ -144,7 +179,7 @@ pub(crate) fn prefill_shapes(
     row_sizes: &[usize],
     max_rows: usize,
     max_tokens: usize,
-    variants: &[(Option<bool>, bool)],
+    variants: &[PrefillVariant],
     outputs: bool,
     pool: Option<(&[(usize, usize)], usize)>,
 ) -> Vec<PrefillShape> {
@@ -168,12 +203,11 @@ pub(crate) fn prefill_shapes(
             if pool.is_some_and(|(pages, units)| prefill_units(pages, live_rows, least) > units) {
                 break;
             }
-            shapes.extend(variants.iter().map(|&(causal, embeddings)| PrefillShape {
+            shapes.extend(variants.iter().map(|&variant| PrefillShape {
                 token_bucket,
                 row_bucket,
                 live_rows,
-                causal,
-                embeddings,
+                variant,
                 outputs,
             }));
             least = token_bucket + 1;
@@ -192,11 +226,9 @@ pub(crate) struct TextForward<'a> {
     pub tokens: usize,
     /// Whether the batch is a decode step.
     pub decode: bool,
-    /// The attention's causality the batch's rows share; `None` when they
-    /// differ.
-    pub causal: Option<bool>,
-    /// Whether the rows carry input embeddings.
-    pub embeddings: bool,
+    /// The numerical variant the rows need: causal text, or a prompt
+    /// placing vision blocks.
+    pub variant: PrefillVariant,
     /// Whether only each row's last logits are computed.
     pub last_logits: bool,
     /// Whether the forward only writes the cache.
@@ -231,10 +263,10 @@ impl TextShapes {
     }
 
     /// Return `(rows, tokens, decode, outputs)` of the smallest captured
-    /// bucket that holds the forward, or None when no bucket holds it: the
-    /// forward then runs eagerly, as every forward does without graphs. The
-    /// capture catalog is therefore no bound on the batches the engine
-    /// forms. Decode never borrows a prefill bucket. A cache-only prefill
+    /// bucket that holds the forward, or None when no bucket holds it. The
+    /// catalogs hold every batch the worker admits (`prefill_row_buckets`,
+    /// the decode bound), so a runner with graphs refuses a forward none
+    /// holds. Decode never borrows a prefill bucket. A cache-only prefill
     /// uses a hidden-state graph only when no cache-only graph family was
     /// captured.
     pub(crate) fn select(
@@ -245,8 +277,7 @@ impl TextShapes {
             queries,
             tokens,
             decode,
-            causal,
-            embeddings,
+            variant,
             last_logits,
             cache_only,
         } = *forward;
@@ -257,7 +288,7 @@ impl TextShapes {
             ));
         }
         if decode && queries.iter().all(|&length| length == 1) {
-            if causal != Some(true) || !last_logits {
+            if variant != PrefillVariant::TEXT || !last_logits {
                 return Ok(None);
             }
             return Ok(self
@@ -276,8 +307,7 @@ impl TextShapes {
             .iter()
             .filter(|shape| {
                 shape.outputs == outputs
-                    && shape.causal == causal
-                    && shape.embeddings == embeddings
+                    && shape.variant == variant
                     && shape.row_bucket > rows
                     && shape.token_bucket >= tokens
             })
@@ -296,8 +326,7 @@ mod tests {
             token_bucket: 257,
             row_bucket: 9,
             live_rows: 4,
-            causal: Some(true),
-            embeddings: false,
+            variant: PrefillVariant::TEXT,
             outputs: true,
         };
         let lengths = shape.scratch_lengths(128, &[(16, 2), (64, 1)], 24);
@@ -329,8 +358,7 @@ mod tests {
         queries: &[],
         tokens: 0,
         decode: false,
-        causal: Some(true),
-        embeddings: false,
+        variant: PrefillVariant::TEXT,
         last_logits: false,
         cache_only: false,
     };
@@ -342,24 +370,26 @@ mod tests {
         ..PREFILL
     };
 
-    fn prefill(rows: usize, tokens: usize, causal: Option<bool>, outputs: bool) -> PrefillShape {
+    fn prefill(rows: usize, tokens: usize, variant: PrefillVariant, outputs: bool) -> PrefillShape {
         PrefillShape {
             row_bucket: rows,
             token_bucket: tokens,
             live_rows: 1,
-            causal,
-            embeddings: false,
+            variant,
             outputs,
         }
     }
 
     /// A decode takes the first configured size that holds it and never a
     /// prefill bucket; a decode no size holds, or one no decode graph
-    /// computes (non-causal rows, outputs other than the last logits), runs
-    /// eagerly.
+    /// computes (rows placing vision blocks, outputs other than the last
+    /// logits), selects none.
     #[test]
     fn decode_keeps_configured_order_and_never_uses_prefill_capacity() -> Result<()> {
-        let shapes = TextShapes::new(vec![8, 4, 16], vec![prefill(32, 64, Some(true), true)]);
+        let shapes = TextShapes::new(
+            vec![8, 4, 16],
+            vec![prefill(32, 64, PrefillVariant::TEXT, true)],
+        );
         assert_eq!(
             shapes.select(&TextForward {
                 queries: &[1; 3],
@@ -377,7 +407,7 @@ mod tests {
             TextForward {
                 queries: &[1],
                 tokens: 1,
-                causal: Some(false),
+                variant: PrefillVariant::media(3),
                 ..DECODE
             },
             TextForward {
@@ -397,10 +427,10 @@ mod tests {
         let shapes = TextShapes::new(
             vec![],
             vec![
-                prefill(8, 16, Some(true), true),
-                prefill(4, 64, Some(true), true),
-                prefill(4, 32, None, true),
-                prefill(4, 16, Some(true), false),
+                prefill(8, 16, PrefillVariant::TEXT, true),
+                prefill(4, 64, PrefillVariant::TEXT, true),
+                prefill(4, 32, PrefillVariant::media(3), true),
+                prefill(4, 16, PrefillVariant::TEXT, false),
             ],
         );
         assert_eq!(
@@ -424,7 +454,7 @@ mod tests {
             shapes.select(&TextForward {
                 queries: &[2, 3],
                 tokens: 5,
-                causal: None,
+                variant: PrefillVariant::media(3),
                 ..PREFILL
             })?,
             Some((4, 32, false, true))
@@ -438,13 +468,13 @@ mod tests {
             })?,
             Some((8, 16, false, true))
         );
-        // Embedding rows and rows beyond every bucket have no graph and run
-        // eagerly.
+        // A variant no shape was captured for, rows beyond every bucket and
+        // an empty row select none.
         for forward in [
             TextForward {
                 queries: &[2],
                 tokens: 2,
-                embeddings: true,
+                variant: PrefillVariant::media(1),
                 ..PREFILL
             },
             TextForward {
@@ -470,7 +500,7 @@ mod tests {
                 .is_err()
         );
 
-        let output_only = TextShapes::new(vec![], vec![prefill(2, 16, Some(true), true)]);
+        let output_only = TextShapes::new(vec![], vec![prefill(2, 16, PrefillVariant::TEXT, true)]);
         assert_eq!(
             output_only.select(&TextForward {
                 queries: &[2],
@@ -480,7 +510,7 @@ mod tests {
             })?,
             Some((2, 16, false, true))
         );
-        let cache_only = TextShapes::new(vec![], vec![prefill(2, 16, Some(true), false)]);
+        let cache_only = TextShapes::new(vec![], vec![prefill(2, 16, PrefillVariant::TEXT, false)]);
         assert_eq!(
             cache_only.select(&TextForward {
                 queries: &[2],
@@ -508,7 +538,7 @@ mod tests {
                 &rows,
                 max_rows,
                 max_tokens,
-                &[(Some(true), false)],
+                &[PrefillVariant::TEXT],
                 true,
                 None,
             ),
@@ -561,7 +591,7 @@ mod tests {
             &[1, 2, 4, 8],
             3,
             64,
-            &[(Some(true), false)],
+            &[PrefillVariant::TEXT],
             true,
             Some((&[(4, 1)], 4)),
         );

@@ -19,7 +19,7 @@ use crate::config::placement::RunnerKind;
 use crate::config::{Device, WorkerConfig, prefill_row_buckets};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
-use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
+use crate::cuda_graph::{PrefillShape, PrefillVariant, TextShapes, prefill_shapes};
 use crate::executor::batch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
 use crate::memory::{CachePlan, OutputPool, PrefixCache};
@@ -62,13 +62,16 @@ pub(crate) struct TextBounds {
 impl TextBounds {
     /// Derive the bounds. `units` is the cache pool's unit count, sentinel
     /// included, once fitted; before fitting, graph shapes are not bounded
-    /// by the pool.
+    /// by the pool. `media` holds the rotary axes of prompts that place
+    /// vision blocks, for a model that places them: their prefills are
+    /// captured as a variant of their own.
     pub(crate) fn new(
         config: &WorkerConfig,
         request_slots: usize,
         cache: &CachePlan,
         units: Option<u32>,
         cuda: bool,
+        media: Option<usize>,
     ) -> Result<Self> {
         let mut max_rows = config.max_batch_calls.min(request_slots.max(1));
         let mut tokens = config.max_batch_tokens;
@@ -126,6 +129,8 @@ impl TextBounds {
             .iter()
             .map(|shape| (shape.block_size as usize, shape.units_per_page as usize))
             .collect();
+        let mut variants = vec![PrefillVariant::TEXT];
+        variants.extend(media.map(PrefillVariant::media));
         let prefill = if graphs {
             let pool_rows = units.map_or(max_rows, |units| {
                 max_rows.min((units.saturating_sub(1) as usize) / row_units.max(1))
@@ -135,7 +140,7 @@ impl TextBounds {
                 &prefill_row_buckets(pool_rows),
                 pool_rows,
                 tokens,
-                &[(Some(true), false)],
+                &variants,
                 config.prefill_outputs,
                 units.map(|units| (pages.as_slice(), units.saturating_sub(1) as usize)),
             )
@@ -260,6 +265,9 @@ pub(crate) struct Startup<'a> {
     pub(crate) model: &'a LoadedModel,
     /// The model declares an image policy.
     pub(crate) image_processor: bool,
+    /// The rotary axes of prompts placing vision blocks, for a model that
+    /// places vision features in its prompts.
+    pub(crate) media_axes: Option<usize>,
     pub(crate) streams: &'a Streams,
     pub(crate) prefix_cache: Option<&'a PrefixCache>,
     pub(crate) components: &'a Components,
@@ -316,6 +324,7 @@ impl CausalLMRunners {
             prefix_cache.plan(),
             Some(prefix_cache.planes().num_units()),
             cuda.is_some(),
+            startup.media_axes,
         )?;
         if let Some(experts) = startup.experts.as_ref()
             && bounds.tokens > experts.parallel().max_tokens()
@@ -610,7 +619,8 @@ pub(crate) fn reserved_bytes(
     }
     let hidden = methods::hidden_size(model.handle())?;
     let cuda = config.device.is_cuda();
-    let bounds = TextBounds::new(config, request_slots, cache, None, cuda)?;
+    // The column bytes do not depend on the captured variants.
+    let bounds = TextBounds::new(config, request_slots, cache, None, cuda, None)?;
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
     dimensions.embeddings = image_processor;

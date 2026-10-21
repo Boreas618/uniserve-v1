@@ -71,7 +71,7 @@ use super::TokenSelection;
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, MethodCall, Methods};
 use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
-use crate::cuda_graph::{ShapeKey, TextForward, TextShapes};
+use crate::cuda_graph::{PrefillVariant, ShapeKey, TextForward, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
 use crate::memory::allocation::StorageView;
@@ -184,8 +184,6 @@ enum Choice {
 /// step capacity.
 pub(crate) struct Staged {
     plan: Plan,
-    /// Vision features replace some of the tokens' embeddings.
-    embedded: bool,
 }
 
 impl Staged {
@@ -207,6 +205,13 @@ struct Plan {
     prefixes: Vec<i64>,
     starts: Vec<i64>,
     causal: Vec<i64>,
+    /// The forward reads each row's causality from the device column
+    /// (`causal_values`): its graph serves rows of either causality, or
+    /// its rows differ.
+    device_causality: bool,
+    /// The forward reads the embedding columns: vision features replace the
+    /// embeddings of the tokens the mask marks, or its graph reads them.
+    embeddings: bool,
     /// Rotary position axes the rows carry: 1, or 3 when a row places
     /// positions explicitly.
     axes: usize,
@@ -349,10 +354,7 @@ impl CausalLMRunner {
     ) -> Result<Staged> {
         let plan = self.plan(request, context)?;
         self.copy_columns(&plan, request, context.state, job)?;
-        Ok(Staged {
-            plan,
-            embedded: !request.embeddings.is_empty(),
-        })
+        Ok(Staged { plan })
     }
 
     /// The columns `names` as method arguments, in order.
@@ -405,13 +407,9 @@ impl CausalLMRunner {
             plan.outputs.into(),
             capacity.into(),
         ];
-        arguments.extend(self.tensors(&[
-            "row_columns",
-            "input_ids",
-            "positions",
-            "causal_values",
-        ])?);
-        if staged.embedded {
+        arguments.extend(self.tensors(&["row_columns", "input_ids", "positions"])?);
+        arguments.push(self.causal_values(plan)?);
+        if plan.embeddings {
             arguments.extend(self.tensors(&["input_embeddings", "embedding_mask"])?);
         } else {
             arguments.extend([Argument::None, Argument::None]);
@@ -443,8 +441,21 @@ impl CausalLMRunner {
             plan.starts.as_slice().into(),
             plan.causal.as_slice().into(),
         ];
-        arguments.extend(self.tensors(&["row_columns", "causal_values"])?);
+        arguments.extend(self.tensors(&["row_columns"])?);
+        arguments.push(self.causal_values(plan)?);
         Ok(self.methods.call(&self.functions.plan_prefill, arguments))
+    }
+
+    /// The device column a prefill reads its rows' causality from, or none
+    /// when the rows' host causality applies to all of them.
+    fn causal_values(&self, plan: &Plan) -> Result<Argument> {
+        if !plan.device_causality {
+            return Ok(Argument::None);
+        }
+        Ok(self
+            .tensors(&["causal_values"])?
+            .pop()
+            .unwrap_or(Argument::None))
     }
 
     /// The eager methods that follow a staged forward, as `request` asks:
@@ -748,39 +759,53 @@ impl CausalLMRunner {
             .iter()
             .any(|row| matches!(row.source, RowSource::Placed { spatial: true, .. }));
         let axes = if spatial { 3 } else { 1 };
+        // A prompt placing vision blocks takes the variant whose graphs read
+        // each row's causality and the embedding columns on the device;
+        // causal text takes the text variant.
+        let variant = if multimodal {
+            PrefillVariant::media(axes)
+        } else {
+            PrefillVariant::TEXT
+        };
 
         // Graph selection depends only on call metadata, so every rank of a
-        // group selects the same graph. A forward no captured bucket holds
-        // runs eagerly at its live shape.
+        // group selects the same graph. Under graphs the catalogs hold every
+        // batch the worker admits, so a forward no captured bucket holds is
+        // refused; without graphs every forward runs eagerly at its live
+        // shape.
         let mut choice = Choice::Eager;
         let mut bucket = (live, live_tokens);
-        if self.pool.is_some() && !multimodal {
+        if self.pool.is_some() {
             let queries: Vec<usize> = rows.iter().map(|row| row.query as usize).collect();
-            if let Some((bucket_rows, bucket_tokens, decode, outputs)) =
-                self.shapes.select(&TextForward {
-                    queries: &queries,
-                    tokens: live_tokens,
-                    decode,
-                    causal: Some(true),
-                    embeddings: false,
-                    last_logits,
-                    cache_only,
-                })?
-            {
-                choice = Choice::Graph(if decode {
-                    ShapeKey::Decode {
-                        rows: bucket_rows,
-                        sampled: request.row_sampling.is_some(),
-                    }
-                } else {
-                    ShapeKey::Prefill {
-                        rows: bucket_rows,
-                        tokens: bucket_tokens,
-                        outputs,
-                    }
-                });
-                bucket = (bucket_rows, bucket_tokens);
-            }
+            let selected = self.shapes.select(&TextForward {
+                queries: &queries,
+                tokens: live_tokens,
+                decode,
+                variant,
+                last_logits,
+                cache_only,
+            })?;
+            let Some((bucket_rows, bucket_tokens, decode, outputs)) = selected else {
+                return Err(Error::Invalid(format!(
+                    "no captured text graph holds a {:?} forward of {live} rows and \
+                     {live_tokens} tokens ({variant:?})",
+                    request.mode
+                )));
+            };
+            choice = Choice::Graph(if decode {
+                ShapeKey::Decode {
+                    rows: bucket_rows,
+                    sampled: request.row_sampling.is_some(),
+                }
+            } else {
+                ShapeKey::Prefill {
+                    rows: bucket_rows,
+                    tokens: bucket_tokens,
+                    outputs,
+                    variant,
+                }
+            });
+            bucket = (bucket_rows, bucket_tokens);
         }
         let graphed = !matches!(choice, Choice::Eager);
         let (padded_rows, padded_tokens) = bucket;
@@ -972,6 +997,13 @@ impl CausalLMRunner {
                 Choice::Graph(ShapeKey::Prefill { outputs: true, .. })
             );
 
+        // A graph of the media variant reads the device columns whatever
+        // its rows hold; an eager forward reads them for rows that differ in
+        // causality, and for vision features.
+        let media_graph = graphed && variant.embeddings;
+        let device_causality = media_graph || causal.iter().any(|&value| value != causal[0]);
+        let embeddings = media_graph || !request.embeddings.is_empty();
+
         Ok(Plan {
             mode: request.mode,
             rows: padded_rows,
@@ -982,6 +1014,8 @@ impl CausalLMRunner {
             prefixes,
             starts,
             causal,
+            device_causality,
+            embeddings,
             axes,
             logit_count: logit_rows.len(),
             outputs,
@@ -1050,8 +1084,7 @@ impl CausalLMRunner {
                     bytemuck::cast_slice(values),
                 );
             }
-            if plan.causal.iter().any(|&value| value != plan.causal[0]) {
-                // Mixed causality is read from the device column.
+            if plan.device_causality {
                 causal_values = plan.causal.iter().map(|&value| value as i32).collect();
             }
         }
@@ -1081,7 +1114,7 @@ impl CausalLMRunner {
         // cleared over the invocation, then set over each block.
         let mut features = Vec::new();
         let mut masks = Vec::new();
-        if !request.embeddings.is_empty() {
+        if plan.embeddings {
             let values = self.buffers.column("input_embeddings")?;
             let row_bytes = values.nbytes() / self.buffers.dimensions.tokens.max(1) as u64;
             let mask = self.buffers.column("embedding_mask")?.address();

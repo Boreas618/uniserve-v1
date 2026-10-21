@@ -11,11 +11,13 @@
 //! the image denoiser.
 //!
 //! Every row of these calls carries explicit positions on the three rotary
-//! axes (`RowSource::Placed`; text and markers take spatial zeros), so they
-//! run eagerly with their features replacing the block's placeholder
-//! embeddings. The logical position after the call is the temporal position
-//! after its last row; a visual-state row advances it by the image
-//! denoiser's rope advance when it completes a feedback.
+//! axes (`RowSource::Placed`; text and markers take spatial zeros), and their
+//! features replace the block's placeholder embeddings. Under CUDA graphs
+//! they replay the media variant's prefill buckets, whose graphs read each
+//! row's causality and the embedding columns on the device. The logical
+//! position after the call is the temporal position after its last row; a
+//! visual-state row advances it by the image denoiser's rope advance when it
+//! completes a feedback.
 
 use cuda::DeviceId;
 use std::sync::Arc;

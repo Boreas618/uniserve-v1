@@ -453,6 +453,10 @@ impl Worker {
             queue_depth: launch.ipc.queue_depth,
             model: &model,
             image_processor: image.processing.is_some(),
+            media_axes: image
+                .processing
+                .and_then(|processing| processing.injection)
+                .map(|_| if image.spatial_positions() { 3 } else { 1 }),
             streams: &streams,
             prefix_cache: storage.prefix_cache.as_ref(),
             components: &components,
