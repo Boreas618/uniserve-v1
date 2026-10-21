@@ -202,6 +202,11 @@ impl EngineClient {
         self.shared.state.borrow().clone()
     }
 
+    /// The engine's state, observed as it changes.
+    pub fn states(&self) -> watch::Receiver<EngineState> {
+        self.shared.state.subscribe()
+    }
+
     /// Submits `request` under an identity of the client's choosing and
     /// returns its events and the scheduler serving it; the scheduler is
     /// `None` when the engine ended the request at submission, whose
