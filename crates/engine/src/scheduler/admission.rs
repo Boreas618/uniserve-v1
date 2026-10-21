@@ -276,6 +276,7 @@ impl Scheduler {
             prefix_page_hashes: Vec::new(),
             prefix_published: Vec::new(),
             page_keys: Vec::new(),
+            offload_boundary: 0,
             generated_token_ids,
             round_token_ids: Vec::new(),
             feedback_image_b64: None,
@@ -1134,35 +1135,35 @@ impl Scheduler {
                 let cached_tokens = prefix_hit.cached_tokens.min(n);
                 // The host KV cache may hold the reusable pages that follow
                 // the device match; the head waits for its pins.
-                let mut tier_tokens = 0;
+                let mut host_tokens = 0;
                 if let Some(kv_offload) = self.kv_offload.as_mut()
-                    && let Some(block) = kv_offload.block_size(&target.0)
+                    && let Some(step) = kv_offload.step(&target.0)
                     && head.req.cache.read
                     && !head.has_context_images()
                 {
                     // Reusable pages leave one prompt token to compute, as
                     // in the device cache.
-                    let reusable = n.saturating_sub(1) / block;
-                    let device_pages = cached_tokens / block;
-                    if reusable > device_pages {
+                    let limit = n.saturating_sub(1) / step * step;
+                    if limit > cached_tokens {
                         let keys = kv_offload.page_keys(
                             &target.0,
                             &head.req.prompt_token_ids,
                             head.req.cache.isolation_key,
-                            reusable,
+                            limit,
                         );
                         match kv_offload.admission(
                             head.req.request_id,
                             &target.0,
                             &keys,
-                            device_pages,
+                            cached_tokens,
+                            limit,
                         ) {
-                            Some(pages) => tier_tokens = pages * block,
+                            Some(boundary) => host_tokens = boundary - cached_tokens,
                             None => break,
                         }
                     }
                 }
-                let prefix_tokens = cached_tokens + tier_tokens;
+                let prefix_tokens = cached_tokens + host_tokens;
                 let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
                 let first_chunk_units = cache
                     .coordinator
@@ -1387,15 +1388,12 @@ impl Scheduler {
 
 impl Scheduler {
     /// Apply the host KV cache to an admitted request on `worker`: record
-    /// the keys its published pages are written under, and extend its
-    /// cached prefix by the host KV cache's hit, whose units are allocated now and
-    /// filled by its first call. A hit that no longer follows the device
-    /// prefix the request acquired is released.
+    /// the keys its published pages are offloaded under, and extend its
+    /// cached prefix to the host KV cache's hit, whose units are allocated
+    /// now and loaded by its first call. A hit that no longer follows the
+    /// device prefix the request acquired is released.
     fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
-            return;
-        };
-        let Some(block) = kv_offload.block_size(worker) else {
             return;
         };
         let Some(state) = self.running.get_mut(&id) else {
@@ -1404,23 +1402,31 @@ impl Scheduler {
         if !state.req.cache.read || state.has_context_images() {
             return;
         }
-        let pages = state.req.prompt_token_ids.len() / block;
         state.page_keys = kv_offload.page_keys(
             worker,
             &state.req.prompt_token_ids,
             state.req.cache.isolation_key,
-            pages,
+            state.req.prompt_token_ids.len(),
         );
-        let Some((start, hit)) = kv_offload.admit(id) else {
+        let computed = state.num_computed_prompt_tokens as usize;
+        state.offload_boundary = computed;
+        let Some((device, boundary)) = kv_offload.admit(id) else {
             return;
         };
-        let computed = state.num_computed_prompt_tokens as usize;
-        if computed != start * block {
+        if computed != device {
             kv_offload.abandon(id);
             return;
         }
-        let end = (start + hit) * block;
-        if !self.ensure_request_capacity(id, computed, end) {
+        // The first call continues from the boundary: a sliding window's
+        // pages before its window there are not read again, and the window's
+        // pages the device lacks are allocated for the loads.
+        let released = match (self.storage.cache.as_ref(), state.prefix_cache_mut()) {
+            (Some(cache), Some(allocation)) => {
+                cache.coordinator.release_window(allocation, boundary)
+            }
+            _ => false,
+        };
+        if !released || !self.ensure_request_capacity(id, computed, boundary) {
             if let Some(kv_offload) = self.kv_offload.as_mut() {
                 kv_offload.abandon(id);
             }
@@ -1429,17 +1435,18 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        // The hit's pages are computed once read: the first call starts
+        // The hit's pages are computed once loaded: the first call starts
         // after them, and they are published to the device cache when that
         // call's result is accepted.
-        state.num_computed_prompt_tokens = end as u32;
+        state.num_computed_prompt_tokens = boundary as u32;
         state.logical_position = state.num_computed_prompt_tokens;
         state.cache_visible_len = state.num_computed_prompt_tokens;
         state.cache_computed_len = state.num_computed_prompt_tokens;
+        state.offload_boundary = boundary;
         self.stats
             .prefix
             .hit_tokens
-            .fetch_add((hit * block) as u64, Ordering::Relaxed);
+            .fetch_add((boundary - computed) as u64, Ordering::Relaxed);
     }
 }
 

@@ -250,13 +250,19 @@ impl Scheduler {
     }
 
     /// Copy prompt pages of the worker groups whose ranks all map a page
-    /// pool through the host KV cache, as a head of `deployment` on `host`:
-    /// ranks on `host` through its Storage Server's socket, the others
-    /// through their servers' TCP addresses. A failure to reach this host's
-    /// server leaves the host KV cache off.
-    pub fn enable_kv_offload(&mut self, deployment: &str, host: &str) {
+    /// pool for every cache group through the host KV cache, as a head of
+    /// `deployment` on `host`: ranks on `host` through its Storage Server's
+    /// socket, the others through their servers' TCP addresses. Sliding
+    /// windows are offloaded every `boundary_interval` pages of a long
+    /// prompt. A failure to reach this host's server leaves the host KV cache
+    /// off.
+    pub fn enable_kv_offload(&mut self, deployment: &str, host: &str, boundary_interval: usize) {
         let socket = storage::socket::default_socket();
-        let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(&socket, deployment) {
+        let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
+            &socket,
+            deployment,
+            boundary_interval,
+        ) {
             Ok(kv_offload) => kv_offload,
             Err(error) => {
                 tracing::warn!(%error, "the host KV cache is off: the storage server is unreachable");
@@ -422,11 +428,11 @@ impl Scheduler {
         false
     }
 
-    /// Write to the host KV cache every published page that is not there
-    /// yet, before the workers close: let the batches in flight complete,
-    /// which carry writes and settle them, then carry each worker group's
-    /// remaining reserved writes in a batch of page offloads alone, and wait
-    /// for their commits. The scheduler admits and schedules nothing more.
+    /// Offload to the host KV cache every page reserved for it that is not
+    /// there yet, before the workers close: let the batches in flight
+    /// complete, which carry offloads and settle them, then carry each worker
+    /// group's remaining reserved offloads in a batch of page offloads alone,
+    /// and wait for their commits. The scheduler admits and schedules nothing more.
     /// Gives up after `PAGE_FLUSH_TIMEOUT` or when the engine fails, leaving
     /// the pages still on their way out to the host KV cache.
     pub(super) fn flush_offloads(&mut self) {
@@ -495,7 +501,7 @@ impl Scheduler {
                 .as_ref()
                 .is_some_and(crate::kv_cache::KvOffloadManager::waiting)
         {
-            TIER_POLL
+            KV_OFFLOAD_POLL
         } else {
             IDLE_LIVENESS_POLL
         };

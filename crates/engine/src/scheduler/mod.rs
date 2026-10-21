@@ -133,10 +133,10 @@ enum BatchKind {
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// Timeout of a park while the host KV cache's answers are awaited: the
 /// Storage Server answers a local connection within this.
-const TIER_POLL: Duration = Duration::from_millis(1);
+const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// Longest a closing scheduler waits for its last pages to reach the
-/// host KV cache: for the batches in flight, which carry writes, and for the
-/// batches of the remaining writes.
+/// host KV cache: for the batches in flight, which carry offloads, and for
+/// the batches of the remaining offloads.
 const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of batches carrying prefill-lane calls that may await their
 /// results before ready decode work takes precedence over further prefill
@@ -423,7 +423,7 @@ pub struct Scheduler {
     /// (`Scheduler::enable_kv_offload`).
     kv_offload: Option<crate::kv_cache::KvOffloadManager>,
     /// Set once the scheduler closes its workers: it admits and schedules
-    /// nothing more while it writes its last pages to the host KV cache
+    /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).
     closing: bool,
 }

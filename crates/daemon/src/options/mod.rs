@@ -347,14 +347,20 @@ pub struct KvCacheOptions {
     pub dtype: Option<PrefixCacheDtype>,
     /// Reuse and retain cached prompt prefixes across requests.
     pub prefix_caching: bool,
-    /// Copy full prompt pages to the host KV cache of each host's Storage
-    /// Server and read them back on a later prefix match the device cache
-    /// no longer holds. Applies with `prefix_caching`.
+    /// Offload full prompt pages to the host KV cache of each host's Storage
+    /// Server and load them back on a later prefix match the device cache
+    /// no longer holds: every published page of a full-attention group, and
+    /// a sliding-window group's window before each aligned boundary.
+    /// Applies with `prefix_caching`.
     pub host_tier: bool,
     /// Keep every page of the host KV cache in Mooncake, the KV storage,
     /// through the Storage Servers this deployment starts, and prefetch long
     /// hits back. Applies with `host_tier`; none when unset.
     pub mooncake: Option<MooncakeOptions>,
+    /// The pages of the largest block size between the aligned boundaries
+    /// a long prompt offloads its sliding windows before; the engine's
+    /// default when unset.
+    pub boundary_interval: Option<NonZeroU32>,
 }
 
 impl Default for KvCacheOptions {
@@ -366,11 +372,12 @@ impl Default for KvCacheOptions {
             prefix_caching: true,
             host_tier: true,
             mooncake: None,
+            boundary_interval: None,
         }
     }
 }
 
-/// Mooncake, the distributed host KV cache (`kv_cache_config.mooncake`): the
+/// Mooncake, the KV storage (`kv_cache_config.mooncake`): the
 /// settings of each Storage Server's Mooncake client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1055,6 +1062,7 @@ impl ServeConfig {
                     segment_bytes: mooncake.global_segment_gib << 30,
                     library: text(&mooncake.library),
                 }),
+                boundary_interval: kv_cache.boundary_interval.map(NonZeroU32::get),
             }),
             workers: Some(wire::Workers {
                 executable: worker.executable.to_string_lossy().into_owned(),

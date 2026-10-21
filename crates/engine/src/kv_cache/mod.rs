@@ -35,9 +35,12 @@
 //!   group, but a match also requires equal tokens, the same group and the
 //!   same loaded `WorkerEndpoint`. The token comparison guards against hash
 //!   collisions, and the endpoint comparison confines reuse to the loaded
-//!   worker incarnation that computed and retains the page. A reusable
-//!   prefix must hold every full-attention page before it and each
-//!   sliding-window group's window of pages just before it.
+//!   worker incarnation that computed and retains the page.
+//! - Reuse: each group's attention type has a manager ([`manager`]) that
+//!   says which pages a reuse at a boundary needs: every full-attention
+//!   page before it, and each sliding-window group's window of pages just
+//!   before it. The same managers decide reuse in the device cache and,
+//!   through [`KvOffloadManager`], in the host KV cache and the KV storage.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -50,11 +53,12 @@ use crate::lock;
 
 mod encoder_cache;
 mod freeq;
+pub(crate) mod manager;
 mod offload;
 
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::UnitMeta;
-pub(crate) use offload::{KvOffloadManager, RankCache};
+pub(crate) use offload::{DEFAULT_BOUNDARY_INTERVAL, KvOffloadManager, OffloadKind, RankCache};
 
 /// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///
@@ -583,6 +587,21 @@ pub(crate) struct GroupShape {
 }
 
 impl GroupShape {
+    /// The reuse rules of the group's attention type.
+    pub(crate) fn manager(&self) -> manager::AttentionManager {
+        match self.window {
+            None => manager::AttentionManager::Full(manager::FullAttentionManager {
+                block_size: self.block_size,
+            }),
+            Some(window) => {
+                manager::AttentionManager::SlidingWindow(manager::SlidingWindowManager {
+                    block_size: self.block_size,
+                    window,
+                })
+            }
+        }
+    }
+
     /// Derives the scheduler shape of a worker-reported group.
     pub(crate) fn from_group(group: &CacheGroup) -> Self {
         Self {
@@ -853,8 +872,9 @@ impl PrefixCacheCoordinator {
         self.prefix_enabled = enabled;
     }
 
-    /// Returns the largest block size of any group, in tokens.
-    fn max_block_size(&self) -> usize {
+    /// Returns the largest block size of any group, in tokens: every reuse
+    /// boundary is a multiple of it.
+    pub(crate) fn max_block_size(&self) -> usize {
         self.groups
             .iter()
             .map(|group| group.block_size)
@@ -1057,18 +1077,16 @@ impl PrefixCacheCoordinator {
             .collect()
     }
 
-    /// Finds the longest prompt prefix every group can reuse.
+    /// Finds the longest prompt prefix every group can reuse from the
+    /// device cache.
     ///
-    /// The prefix length `M` is a multiple of the largest block size and
-    /// leaves at least one prompt token to compute, so prefill still produces
-    /// the first sampled token's logits. A full-attention group needs every
-    /// page before `M`; a sliding-window group needs only the pages
-    /// intersecting `[M - window, M)`. Starting from the longest eligible
-    /// length, each group lowers `M` to the longest length it supports, and
-    /// the groups repeat until no group lowers it further, as the SGLang
-    /// `SWAComponent` validator does. A full group's constraint is a leading
-    /// run of hits, so any shorter length stays valid for it; a sliding
-    /// group's window moves with `M`, so it is re-checked after every change.
+    /// The prefix length is a multiple of the largest block size and leaves
+    /// at least one prompt token to compute, so prefill still produces the
+    /// first sampled token's logits. It is the deepest such boundary every
+    /// group's manager accepts with the pages the pool holds
+    /// ([`manager::deepest_boundary`]): a full-attention group needs every
+    /// page before it, a sliding-window group only the pages intersecting
+    /// its window before it.
     fn select_prefix(
         &self,
         pool: &BlockPool,
@@ -1077,7 +1095,7 @@ impl PrefixCacheCoordinator {
         source: &WorkerEndpoint,
     ) -> PrefixSelection {
         let step = self.max_block_size();
-        let mut tokens = prompt.len().saturating_sub(1) / step * step;
+        let limit = prompt.len().saturating_sub(1) / step * step;
 
         // One lookup per complete prompt page and group; each hit records
         // the page's first unit and whether it is unreferenced.
@@ -1086,7 +1104,7 @@ impl PrefixCacheCoordinator {
             .iter()
             .enumerate()
             .map(|(group, shape)| {
-                let pages = (tokens / shape.block_size).min(hashes[group].len());
+                let pages = (limit / shape.block_size).min(hashes[group].len());
                 (0..pages)
                     .map(|page| {
                         let span = &prompt[page * shape.block_size..(page + 1) * shape.block_size];
@@ -1099,44 +1117,20 @@ impl PrefixCacheCoordinator {
         // Misses before each page, so a window check is one subtraction.
         let misses = hits
             .iter()
-            .map(|pages| {
-                let mut total = 0;
-                let mut prefix = Vec::with_capacity(pages.len() + 1);
-                prefix.push(0);
-                for page in pages {
-                    total += usize::from(page.is_none());
-                    prefix.push(total);
-                }
-                prefix
-            })
+            .map(|pages| manager::misses(pages.iter().map(Option::is_some)))
             .collect::<Vec<_>>();
+        let managers: Vec<_> = self.groups.iter().map(GroupShape::manager).collect();
+        let tokens = manager::deepest_boundary(&managers, step, limit, &misses);
 
-        loop {
-            let previous = tokens;
-            for (group, shape) in self.groups.iter().enumerate() {
-                let supported = |length: usize| {
-                    let end = length / shape.block_size;
-                    let start = shape.first_needed_page(length).min(end);
-                    misses[group][end] == misses[group][start]
-                };
-                while tokens > 0 && !supported(tokens) {
-                    tokens -= step;
-                }
-            }
-            if tokens == previous {
-                break;
-            }
-        }
-
-        // Validation leaves no miss in any selected range; a range that still
-        // holds one selects no prefix rather than a table with a hole.
-        let pages = self
-            .groups
+        // The accepted boundary leaves no miss in any needed range; a range
+        // that still holds one selects no prefix rather than a table with a
+        // hole.
+        let pages = managers
             .iter()
             .enumerate()
-            .map(|(group, shape)| {
-                let end = tokens / shape.block_size;
-                let start = shape.first_needed_page(tokens).min(end);
+            .map(|(group, manager)| {
+                let needed = manager.needed_pages(tokens);
+                let (start, end) = (needed.start, needed.end);
                 let selected = hits[group][start..end]
                     .iter()
                     .copied()

@@ -1,7 +1,7 @@
 //! The host KV cache (L2) of the rank's prefix cache.
 //!
-//! Each full-attention cache group copies its pages through a page pool of
-//! the host's Storage Server: a memfd of equal slots shared by every worker
+//! Each cache group copies its pages through a page pool of the host's
+//! Storage Server: a memfd of equal slots shared by every worker
 //! of the host whose pages have the same shape. The rank maps each pool
 //! writable and registers it for device copies; the engine decides which
 //! pages to copy and carries them in batches (`Batch::page_loads`,
@@ -90,8 +90,11 @@ fn content(fingerprint: &str, plan: &CachePlan, group: usize) -> [u8; 32] {
 }
 
 impl HostKvCache {
-    /// Map a page pool for every full-attention group of `plan` at the
-    /// rank's host's Storage Server, registered with `device`. `fingerprint`
+    /// Map a page pool for every cache group of `plan` at the rank's host's
+    /// Storage Server, registered with `device`. A sliding-window group's
+    /// pool holds the windows the engine offloads before aligned
+    /// boundaries, page by page, as a full-attention group's holds every
+    /// published page. `fingerprint`
     /// is the model fingerprint (`uniserve.loading.retained.fingerprint`).
     /// Returns the host KV cache and what the rank reports of each pool.
     pub(crate) fn start(
@@ -104,12 +107,6 @@ impl HostKvCache {
         let mut pools = BTreeMap::new();
         let mut infos = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
-            // Only full-attention groups tier: a sliding window's pages are
-            // released behind it, so a prefix's window pages are not the
-            // pages before it.
-            if group.window.is_some() {
-                continue;
-            }
             let content = content(fingerprint, plan, index);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.

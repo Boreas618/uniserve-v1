@@ -49,7 +49,7 @@ pub use serve::{ServeOptions, list, retire, run_connector, serve};
 use shoot::ShootDowns;
 use storage::protocol::{
     Access, Claim, ClientMessage, ErrorKind, Event, Hello, Key, ListedDeployment, ListedTensor,
-    Listing, Mode, Placement, Reply, Request, Role, Scope, ScopeBytes, ServerMessage,
+    Listing, Mode, PageLevel, Placement, Reply, Request, Role, Scope, ScopeBytes, ServerMessage,
     StorageRecord, TensorRecord, VERSION, Welcome,
 };
 use storage::transport::Connection;
@@ -561,9 +561,17 @@ impl Server {
                 | Request::Unpin { .. }
                 | Request::Prefetch { .. },
                 role,
-            ) => self.pages(id, request, &role),
+            ) => {
+                let outcome = self.pages(id, request, &role);
+                // A reservation or a prefetch may have evicted pages, and an
+                // abort freed some: the windows that followed them end.
+                self.pages.settle();
+                outcome
+            }
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
+                // A download that failed freed the slots it had reserved.
+                self.pages.settle();
                 Ok(Outcome::Reply(Reply::Finished, Vec::new()))
             }
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
@@ -1350,6 +1358,7 @@ impl Server {
     /// End `task` as if the connector reported every page failed.
     fn fail(&mut self, task: Task) {
         self.complete(task, &[]);
+        self.pages.settle();
     }
 
     /// End `task` with the connector's `results`, one per page of the task;
@@ -1362,25 +1371,30 @@ impl Server {
                 request,
                 pool,
                 keys,
-                l2,
+                held,
             } => {
-                // A page counts in L3 when the connector found it or L2
-                // holds it by now.
-                let run = self.pages.get(pool).map_or(0, |entry| {
-                    keys.iter()
-                        .enumerate()
-                        .take_while(|(index, key)| succeeded(*index) || entry.holds(key))
-                        .count()
-                });
-                self.answer(
-                    client,
-                    request,
-                    Reply::Lookup {
-                        l2,
-                        l3: l2 + run as u32,
-                    },
-                    &[],
-                );
+                // A page the pool did not hold is in L2 when the pool holds
+                // it by now, and in L3 when the connector found it.
+                let mut missing = keys.iter().enumerate();
+                let levels = held
+                    .iter()
+                    .map(|&held| {
+                        if held {
+                            return PageLevel::Host;
+                        }
+                        let Some((index, key)) = missing.next() else {
+                            return PageLevel::Absent;
+                        };
+                        if self.pages.get(pool).is_some_and(|entry| entry.holds(key)) {
+                            PageLevel::Host
+                        } else if succeeded(index) {
+                            PageLevel::Storage
+                        } else {
+                            PageLevel::Absent
+                        }
+                    })
+                    .collect();
+                self.answer(client, request, Reply::Lookup { levels }, &[]);
                 if let Some(entry) = self.clients.get_mut(&client) {
                     entry.held = false;
                 }
@@ -1470,24 +1484,48 @@ impl Server {
         };
         match request {
             Request::Lookup { pool, keys } => {
-                let l2 = pool_of(&mut self.pages, *pool)?.lookup(keys);
-                if self.kv_storage.client.is_none() || l2 as usize >= keys.len() {
+                let held = pool_of(&mut self.pages, *pool)?.lookup(keys);
+                let missing: Vec<Key> = keys
+                    .iter()
+                    .zip(&held)
+                    .filter(|(_, held)| !**held)
+                    .map(|(key, _)| *key)
+                    .collect();
+                if self.kv_storage.client.is_none() || missing.is_empty() {
                     // Without a connector, L3 holds nothing beyond L2.
-                    return reply(Reply::Lookup { l2, l3: l2 });
+                    let levels = held
+                        .iter()
+                        .map(|&held| {
+                            if held {
+                                PageLevel::Host
+                            } else {
+                                PageLevel::Absent
+                            }
+                        })
+                        .collect();
+                    return reply(Reply::Lookup { levels });
                 }
-                // The connector looks up the pages after the L2 run; the
-                // request waits for it.
+                // The connector looks up the pages the pool does not hold;
+                // the request waits for it.
                 Ok(Outcome::KvStorage(Task::Lookup {
                     client: id,
                     request: 0,
                     pool: *pool,
-                    keys: keys[l2 as usize..].to_vec(),
-                    l2,
+                    keys: missing,
+                    held,
                 }))
             }
-            Request::Reserve { pool, writer, keys } => {
+            Request::Reserve {
+                pool,
+                writer,
+                keys,
+                window,
+            } => {
                 of_deployment(writer)?;
-                let slots = pool_of(&mut self.pages, *pool)?.reserve(writer, id, keys);
+                let slots = self
+                    .pages
+                    .reserve(*pool, writer, id, keys, *window)
+                    .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))?;
                 reply(Reply::Reserved { slots })
             }
             Request::Commit { pool, keys } => {

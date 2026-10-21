@@ -33,14 +33,15 @@ pub struct Launch {
 
 /// A task the connector runs for the server.
 pub(super) enum Task {
-    /// The L3 part of a lookup: `keys` follow the lookup's L2 run of `l2`
-    /// pages. The lookup's client waits for it.
+    /// The L3 part of a lookup: `keys` are the lookup's keys the pool did
+    /// not hold, and `held` says for each key of the lookup whether the pool
+    /// held it. The lookup's client waits for it.
     Lookup {
         client: u64,
         request: u64,
         pool: u64,
         keys: Vec<Key>,
-        l2: u32,
+        held: Vec<bool>,
     },
     /// Committed pages being written to Mooncake from their slots, which
     /// stay out of eviction until the task finishes.

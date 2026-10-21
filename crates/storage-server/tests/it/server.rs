@@ -447,7 +447,7 @@ fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
 
 #[test]
 fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
-    use storage::protocol::{PageShape, PageSlot, Reply, Request};
+    use storage::protocol::{PageLevel, PageShape, PageSlot, Reply, Request};
 
     let server = Running::start();
     let claim = head(&server.socket).claim(vec![scope("text", 0)]).unwrap();
@@ -487,6 +487,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         pool,
         writer: scope("text", 0),
         keys: vec![key(1), key(2)],
+        window: None,
     }) else {
         panic!("a reservation was refused");
     };
@@ -503,7 +504,9 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             pool,
             keys: vec![key(1), key(2)],
         }),
-        Reply::Lookup { l2: 1, l3: 1 }
+        Reply::Lookup {
+            levels: vec![PageLevel::Host, PageLevel::Absent]
+        }
     );
     // A connection from another host claims nothing.
     assert!(matches!(
@@ -548,7 +551,7 @@ fn next_event(client: &mut Client) -> (storage::protocol::Event, Vec<OwnedFd>) {
 
 #[test]
 fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() {
-    use storage::protocol::{Event, PageShape, PageSlot, Reply, Request};
+    use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
 
     let server = Running::start();
     let mut head = head(&server.socket);
@@ -599,6 +602,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
                 pool,
                 writer: scope("text", 0),
                 keys: vec![key(1)],
+                window: None,
             },
             &[],
         )
@@ -639,7 +643,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         Reply::Finished
     );
 
-    // A lookup counts the pages the connector finds after the L2 run.
+    // A lookup asks the connector for the pages the pool does not hold.
     let lookup = head
         .submit(
             &Request::Lookup {
@@ -664,7 +668,9 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         .unwrap();
     assert_eq!(
         head.wait(lookup).unwrap().reply,
-        Reply::Lookup { l2: 1, l3: 2 }
+        Reply::Lookup {
+            levels: vec![PageLevel::Host, PageLevel::Storage, PageLevel::Absent]
+        }
     );
 
     // A prefetch reads the pages the pool lacks into reserved slots, and its
@@ -699,7 +705,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         }
     );
 
-    // A connector that leaves fails its lookups: L3 holds what L2 holds.
+    // A connector that leaves fails its lookups: L3 holds nothing beyond L2.
     let lookup = head
         .submit(
             &Request::Lookup {
@@ -713,6 +719,8 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     drop(connector);
     assert_eq!(
         head.wait(lookup).unwrap().reply,
-        Reply::Lookup { l2: 2, l3: 2 }
+        Reply::Lookup {
+            levels: vec![PageLevel::Host, PageLevel::Host, PageLevel::Absent]
+        }
     );
 }

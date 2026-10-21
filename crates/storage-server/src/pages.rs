@@ -16,7 +16,13 @@
 //! | uploading | Ready and being read by the connector; not evictable |
 //!
 //! A reservation takes a free slot, or evicts the least recently used ready
-//! slot nobody reads. A head's reservations and pins end with the head's
+//! slot nobody reads. A reservation may name its pages as one sliding
+//! window of attention, which is useless once it misses a page: when one of
+//! its pages leaves the pool, the window ends, and its other pages that no
+//! other window holds and nobody reads leave with it. A window may follow a
+//! page of another pool, its anchor (the last full-attention page before
+//! the window's boundary, without which the window cannot be reused): when
+//! the anchor leaves its pool, the window ends too. A head's reservations and pins end with the head's
 //! `commit`, `abort` or `unpin`. When the head's connection closes first,
 //! they end once no worker of their writer or reader scope is connected,
 //! because that worker's copies may still run until its process ends. The
@@ -27,7 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 
-use storage::protocol::{Key, ListedPool, PageShape, PageSlot, Scope};
+use storage::protocol::{Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, Scope};
 
 type ClientId = u64;
 
@@ -82,6 +88,12 @@ pub(super) enum Fetch {
     Full,
 }
 
+/// The pages of one sliding window, and what it follows.
+struct Window {
+    slots: Vec<u32>,
+    anchor: Option<PageAnchor>,
+}
+
 /// One page pool.
 pub(super) struct Pool {
     pub(super) shape: PageShape,
@@ -98,6 +110,14 @@ pub(super) struct Pool {
     /// Slots reserved for the connector's fetches.
     fetching: u64,
     tick: u64,
+    windows: HashMap<u64, Window>,
+    /// The windows each slot's page belongs to.
+    member_of: HashMap<u32, Vec<u64>>,
+    next_window: u64,
+    /// The keys whose pages left the pool, and the windows that ended,
+    /// since [`Pools::settle`] last took them.
+    removed: Vec<Key>,
+    ended: Vec<(u64, Option<PageAnchor>)>,
 }
 
 /// Every page pool of the server.
@@ -107,6 +127,9 @@ pub(super) struct Pools {
     next: u64,
     /// The bytes of each new pool, rounded down to whole pages.
     pool_bytes: u64,
+    /// The windows that follow each anchor page, by the anchor's pool and
+    /// key: each window's pool and id.
+    anchors: HashMap<(u64, Key), Vec<(u64, u64)>>,
 }
 
 impl Pools {
@@ -116,6 +139,7 @@ impl Pools {
             by_shape: HashMap::new(),
             next: 1,
             pool_bytes,
+            anchors: HashMap::new(),
         }
     }
 
@@ -155,6 +179,11 @@ impl Pools {
                 free: (0..slots as u32).rev().collect(),
                 fetching: 0,
                 tick: 0,
+                windows: HashMap::new(),
+                member_of: HashMap::new(),
+                next_window: 1,
+                removed: Vec::new(),
+                ended: Vec::new(),
             },
         );
         self.by_shape.insert((shape, numa_node), pool);
@@ -176,6 +205,62 @@ impl Pools {
         self.pools.get_mut(&pool)
     }
 
+    /// Reserve a slot in `pool` for each of `keys` the pool holds no page
+    /// of ([`Pool::reserve`]); with `window`, the keys are one sliding
+    /// window. `None` for an unknown pool.
+    pub(super) fn reserve(
+        &mut self,
+        pool: u64,
+        writer: &Scope,
+        head: ClientId,
+        keys: &[Key],
+        window: Option<PageWindow>,
+    ) -> Option<Vec<PageSlot>> {
+        let entry = self.pools.get_mut(&pool)?;
+        let (slots, id) = entry.reserve(writer, head, keys, window);
+        if let (Some(id), Some(anchor)) = (id, window.and_then(|window| window.anchor)) {
+            self.anchors
+                .entry((anchor.pool, anchor.key))
+                .or_default()
+                .push((pool, id));
+        }
+        self.settle();
+        Some(slots)
+    }
+
+    /// End the windows whose anchors left their pools, and forget the
+    /// windows that ended, until no more pages leave. Every operation that
+    /// can take a page out of a pool runs this after it.
+    pub(super) fn settle(&mut self) {
+        loop {
+            let mut removed = Vec::new();
+            for (&id, pool) in &mut self.pools {
+                removed.extend(pool.removed.drain(..).map(|key| (id, key)));
+                for (window, anchor) in pool.ended.drain(..) {
+                    let Some(anchor) = anchor else {
+                        continue;
+                    };
+                    if let Some(followers) = self.anchors.get_mut(&(anchor.pool, anchor.key)) {
+                        followers.retain(|follower| *follower != (id, window));
+                        if followers.is_empty() {
+                            self.anchors.remove(&(anchor.pool, anchor.key));
+                        }
+                    }
+                }
+            }
+            if removed.is_empty() {
+                return;
+            }
+            for anchor in removed {
+                for (pool, window) in self.anchors.remove(&anchor).unwrap_or_default() {
+                    if let Some(pool) = self.pools.get_mut(&pool) {
+                        pool.end_window(window);
+                    }
+                }
+            }
+        }
+    }
+
     /// End the reservations and pins of a head whose connection closed: at
     /// once for a scope no connected worker has, and otherwise when that
     /// worker's connection closes (`worker_gone`).
@@ -183,6 +268,7 @@ impl Pools {
         for pool in self.pools.values_mut() {
             pool.orphan(head, connected);
         }
+        self.settle();
     }
 
     /// End the orphaned reservations and pins of `scope`, whose last
@@ -191,6 +277,7 @@ impl Pools {
         for pool in self.pools.values_mut() {
             pool.release_orphans(scope);
         }
+        self.settle();
     }
 
     /// The connector is gone: its fetches and uploads end.
@@ -198,6 +285,7 @@ impl Pools {
         for pool in self.pools.values_mut() {
             pool.connector_gone();
         }
+        self.settle();
     }
 
     pub(super) fn listing(&self) -> Vec<ListedPool> {
@@ -221,21 +309,21 @@ impl Pool {
         self.tick
     }
 
-    /// The length of the leading run of `keys` committed in the pool; the
-    /// pages of the run become the most recently used.
-    pub(super) fn lookup(&mut self, keys: &[Key]) -> u32 {
-        let mut run = 0;
-        for key in keys {
-            let Some(&slot) = self.index.get(key) else {
-                break;
-            };
-            if !matches!(self.slots[slot as usize], Slot::Ready { .. }) {
-                break;
-            }
-            self.refresh(slot);
-            run += 1;
-        }
-        run
+    /// Whether the pool holds each of `keys` committed; the pages it holds
+    /// become the most recently used.
+    pub(super) fn lookup(&mut self, keys: &[Key]) -> Vec<bool> {
+        keys.iter()
+            .map(|key| {
+                let Some(&slot) = self.index.get(key) else {
+                    return false;
+                };
+                if !matches!(self.slots[slot as usize], Slot::Ready { .. }) {
+                    return false;
+                }
+                self.refresh(slot);
+                true
+            })
+            .collect()
     }
 
     /// Make a ready slot the most recently used.
@@ -257,14 +345,17 @@ impl Pool {
     }
 
     /// A slot for each key the pool holds no page of, written by the worker
-    /// of `writer` for `head`.
-    pub(super) fn reserve(
+    /// of `writer` for `head`. With `window`, the pages of `keys` the pool
+    /// reserves or holds become one window, whose id is returned.
+    fn reserve(
         &mut self,
         writer: &Scope,
         head: ClientId,
         keys: &[Key],
-    ) -> Vec<PageSlot> {
-        keys.iter()
+        window: Option<PageWindow>,
+    ) -> (Vec<PageSlot>, Option<u64>) {
+        let slots: Vec<PageSlot> = keys
+            .iter()
             .map(|key| {
                 if self.index.contains_key(key) {
                     return PageSlot::Present;
@@ -282,7 +373,30 @@ impl Pool {
                     slot: u64::from(slot),
                 }
             })
-            .collect()
+            .collect();
+        let Some(window) = window else {
+            return (slots, None);
+        };
+        // A page reserved or held already belongs to the window as well; a
+        // page left out for want of a slot leaves the window short, and its
+        // writer aborts the rest.
+        let members: Vec<u32> = keys
+            .iter()
+            .filter_map(|key| self.index.get(key).copied())
+            .collect();
+        let id = self.next_window;
+        self.next_window += 1;
+        for slot in &members {
+            self.member_of.entry(*slot).or_default().push(id);
+        }
+        self.windows.insert(
+            id,
+            Window {
+                slots: members,
+                anchor: window.anchor,
+            },
+        );
+        (slots, Some(id))
     }
 
     /// A free slot, or the least recently used evictable one, emptied.
@@ -292,10 +406,47 @@ impl Pool {
         }
         let (_, slot) = self.evictable.pop_first()?;
         if let Slot::Ready { key, .. } = &self.slots[slot as usize] {
-            self.index.remove(key);
+            let key = *key;
+            self.index.remove(&key);
+            self.slots[slot as usize] = Slot::Free;
+            self.leave(slot, key);
         }
-        self.slots[slot as usize] = Slot::Free;
         Some(slot)
+    }
+
+    /// `slot`'s page of `key` left the pool: the windows it belonged to end.
+    fn leave(&mut self, slot: u32, key: Key) {
+        self.removed.push(key);
+        for window in self.member_of.remove(&slot).unwrap_or_default() {
+            self.end_window(window);
+        }
+    }
+
+    /// End window `id`: its pages that no other window holds and nobody
+    /// reads leave the pool. Pinned, uploading and unwritten pages stay as
+    /// pages of no window.
+    pub(super) fn end_window(&mut self, id: u64) {
+        let Some(window) = self.windows.remove(&id) else {
+            return;
+        };
+        self.ended.push((id, window.anchor));
+        for slot in window.slots {
+            let Some(windows) = self.member_of.get_mut(&slot) else {
+                continue;
+            };
+            windows.retain(|member| *member != id);
+            if !windows.is_empty() {
+                continue;
+            }
+            self.member_of.remove(&slot);
+            let idle = matches!(
+                &self.slots[slot as usize],
+                Slot::Ready { pins, uploads, .. } if Slot::idle(pins, *uploads)
+            );
+            if idle {
+                self.free_slot(slot);
+            }
+        }
     }
 
     /// Reserved pages become ready. Keys not reserved are skipped: a
@@ -453,13 +604,11 @@ impl Pool {
     }
 
     fn free_slot(&mut self, slot: u32) {
-        match &self.slots[slot as usize] {
-            Slot::Reserved { key, .. } => {
-                self.index.remove(key);
-            }
+        let key = match &self.slots[slot as usize] {
+            Slot::Reserved { key, .. } => *key,
             Slot::Fetching { key } => {
-                self.index.remove(key);
                 self.fetching -= 1;
+                *key
             }
             Slot::Ready {
                 key,
@@ -467,15 +616,17 @@ impl Pool {
                 pins,
                 uploads,
             } => {
-                self.index.remove(key);
                 if Slot::idle(pins, *uploads) {
                     self.evictable.remove(touched);
                 }
+                *key
             }
             Slot::Free => return,
-        }
+        };
+        self.index.remove(&key);
         self.slots[slot as usize] = Slot::Free;
         self.free.push(slot);
+        self.leave(slot, key);
     }
 
     /// Pin the committed pages of `keys` for the worker of `reader`.
@@ -745,67 +896,162 @@ mod tests {
         Key([byte; 32])
     }
 
-    fn pool(slots: u64) -> Pool {
+    /// A pool of `slots` pages of 16 bytes and content `content`, in
+    /// `pools`.
+    fn add_pool(pools: &mut Pools, content: u8, slots: u64) -> u64 {
         let shape = PageShape {
-            content: key(0),
+            content: key(content),
             kv_head_offset: 0,
             kv_head_count: 1,
             page_bytes: 16,
         };
-        let mut pools = Pools::new(16 * slots);
-        let id = pools.pool(shape, None).unwrap();
-        pools.pools.remove(&id).unwrap()
+        pools.pool_bytes = 16 * slots;
+        pools.pool(shape, None).unwrap()
+    }
+
+    /// The servers' pools with one pool of `slots` pages, and its id.
+    fn pools(slots: u64) -> (Pools, u64) {
+        let mut pools = Pools::new(0);
+        let id = add_pool(&mut pools, 0, slots);
+        (pools, id)
+    }
+
+    /// Reserve and commit `keys` in `pool`, as one window with `window`.
+    fn store(pools: &mut Pools, pool: u64, keys: &[Key], window: Option<PageWindow>) {
+        let slots = pools.reserve(pool, &scope(0), 1, keys, window).unwrap();
+        assert!(
+            slots
+                .iter()
+                .all(|slot| matches!(slot, PageSlot::Reserved { .. } | PageSlot::Present)),
+            "{slots:?}"
+        );
+        pools.get_mut(pool).unwrap().commit(keys);
+    }
+
+    fn held(pools: &mut Pools, pool: u64, keys: &[Key]) -> Vec<bool> {
+        pools.get_mut(pool).unwrap().lookup(keys)
     }
 
     #[test]
     fn committed_pages_are_found_and_evicted_least_recently_used_first() {
-        let mut pool = pool(2);
+        let (mut pools, id) = pools(2);
         assert!(matches!(
-            pool.reserve(&scope(0), 1, &[key(1), key(2)])[..],
+            pools
+                .reserve(id, &scope(0), 1, &[key(1), key(2)], None)
+                .unwrap()[..],
             [PageSlot::Reserved { .. }, PageSlot::Reserved { .. }]
         ));
         // Reserved pages are not readable yet.
-        assert_eq!(pool.lookup(&[key(1)]), 0);
-        pool.commit(&[key(1), key(2)]);
-        assert_eq!(pool.lookup(&[key(1), key(2), key(3)]), 2);
+        assert_eq!(held(&mut pools, id, &[key(1)]), [false]);
+        pools.get_mut(id).unwrap().commit(&[key(1), key(2)]);
+        assert_eq!(
+            held(&mut pools, id, &[key(1), key(3), key(2)]),
+            [true, false, true]
+        );
 
         // Touching the first page leaves the second least recently used.
-        assert_eq!(pool.lookup(&[key(1)]), 1);
+        assert_eq!(held(&mut pools, id, &[key(1)]), [true]);
         assert_eq!(
-            pool.reserve(&scope(0), 1, &[key(1)]),
+            pools.reserve(id, &scope(0), 1, &[key(1)], None).unwrap(),
             vec![PageSlot::Present]
         );
         assert!(matches!(
-            pool.reserve(&scope(0), 1, &[key(3)])[..],
+            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
-        assert_eq!(pool.lookup(&[key(2)]), 0);
-        assert_eq!(pool.lookup(&[key(1)]), 1);
+        assert_eq!(held(&mut pools, id, &[key(2), key(1)]), [false, true]);
     }
 
     #[test]
     fn pinned_and_reserved_slots_are_not_evicted() {
-        let mut pool = pool(2);
-        pool.reserve(&scope(0), 1, &[key(1), key(2)]);
+        let (mut pools, id) = pools(2);
+        pools.reserve(id, &scope(0), 1, &[key(1), key(2)], None);
+        let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(1)]);
-        let slot = pool_slot_of(&pool, key(1));
+        let slot = pool_slot_of(pool, key(1));
         assert_eq!(
             pool.pin(&scope(1), 1, &[key(1), key(9)]),
             vec![Some(slot), None]
         );
-        assert_eq!(pool.reserve(&scope(0), 1, &[key(3)]), vec![PageSlot::Full]);
+        assert_eq!(
+            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap(),
+            vec![PageSlot::Full]
+        );
 
-        pool.unpin(&scope(1), &[key(1)]);
+        pools.get_mut(id).unwrap().unpin(&scope(1), &[key(1)]);
         assert!(matches!(
-            pool.reserve(&scope(0), 1, &[key(3)])[..],
+            pools.reserve(id, &scope(0), 1, &[key(3)], None).unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
         // Aborting frees the reserved slot of the unwritten page.
-        pool.abort(&[key(2)]);
+        pools.get_mut(id).unwrap().abort(&[key(2)]);
         assert!(matches!(
-            pool.reserve(&scope(0), 1, &[key(4)])[..],
+            pools.reserve(id, &scope(0), 1, &[key(4)], None).unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
+    }
+
+    /// A window whose least recently used page is evicted leaves the pool
+    /// whole, while a page of no window stays.
+    #[test]
+    fn a_window_is_evicted_whole() {
+        let (mut pools, id) = pools(4);
+        store(
+            &mut pools,
+            id,
+            &[key(1), key(2)],
+            Some(PageWindow { anchor: None }),
+        );
+        store(&mut pools, id, &[key(3)], None);
+        // The window's second page is touched; its first is the least
+        // recently used page of the pool.
+        held(&mut pools, id, &[key(2)]);
+        held(&mut pools, id, &[key(3)]);
+
+        store(&mut pools, id, &[key(4), key(5)], None);
+        assert_eq!(
+            held(&mut pools, id, &[key(1), key(2), key(3), key(4), key(5)]),
+            [false, false, true, true, true]
+        );
+    }
+
+    /// A window ends when its anchor leaves another pool; a pinned page of
+    /// the window stays readable, as a page of no window.
+    #[test]
+    fn a_window_ends_with_its_anchor() {
+        let (mut pools, full) = pools(2);
+        let window = add_pool(&mut pools, 1, 4);
+        store(&mut pools, full, &[key(1)], None);
+        let anchor = Some(PageWindow {
+            anchor: Some(PageAnchor {
+                pool: full,
+                key: key(1),
+            }),
+        });
+        store(&mut pools, window, &[key(11), key(12)], anchor);
+        pools.get_mut(window).unwrap().pin(&scope(1), 1, &[key(12)]);
+
+        // Two more full-attention pages evict the anchor.
+        store(&mut pools, full, &[key(2), key(3)], None);
+        assert_eq!(held(&mut pools, full, &[key(1)]), [false]);
+        assert_eq!(held(&mut pools, window, &[key(11), key(12)]), [false, true]);
+    }
+
+    /// A page two windows share stays while one of them does.
+    #[test]
+    fn a_page_of_two_windows_stays_with_the_window_that_remains() {
+        let (mut pools, id) = pools(4);
+        let window = Some(PageWindow { anchor: None });
+        store(&mut pools, id, &[key(1), key(2)], window);
+        store(&mut pools, id, &[key(2), key(3)], window);
+        held(&mut pools, id, &[key(2), key(3)]);
+
+        // The first window's own page is the least recently used.
+        store(&mut pools, id, &[key(4), key(5)], None);
+        assert_eq!(
+            held(&mut pools, id, &[key(1), key(2), key(3)]),
+            [false, true, true]
+        );
     }
 
     #[test]
@@ -860,43 +1106,48 @@ mod tests {
 
     #[test]
     fn fetches_hold_half_the_slots_and_uploads_keep_their_pages() {
-        let mut pool = pool(4);
+        let (mut pools, id) = pools(4);
+        let pool = pools.get_mut(id).unwrap();
         let fetches = pool.prefetch(&[key(1), key(2), key(3)]);
         let [Fetch::Reserved(first), Fetch::Reserved(second), Fetch::Full] = fetches[..] else {
             panic!("fetches took {fetches:?}");
         };
         // A page being fetched is neither readable nor reserved again.
-        assert_eq!(pool.lookup(&[key(1)]), 0);
+        assert_eq!(pool.lookup(&[key(1)]), [false]);
         assert_eq!(
-            pool.reserve(&scope(0), 1, &[key(1)]),
+            pools.reserve(id, &scope(0), 1, &[key(1)], None).unwrap(),
             vec![PageSlot::Present]
         );
 
         // The first page arrived whole, the second did not.
+        let pool = pools.get_mut(id).unwrap();
         let pages = [(key(1), first), (key(2), second)];
         pool.fetched(&pages, &[true, false]);
-        assert_eq!(pool.lookup(&[key(1), key(2)]), 1);
+        assert_eq!(pool.lookup(&[key(1), key(2)]), [true, false]);
         assert_eq!(pool.listed(1).fetching, 0);
 
         // A page the connector uploads is not evicted until it is done.
         pool.upload(&pages[..1]);
-        let reserved = pool.reserve(&scope(0), 1, &[key(5), key(6), key(7), key(8)]);
+        let reserved = pools
+            .reserve(id, &scope(0), 1, &[key(5), key(6), key(7), key(8)], None)
+            .unwrap();
         assert_eq!(reserved[3], PageSlot::Full);
-        assert!(pool.holds(&key(1)));
-        pool.uploaded(&pages[..1]);
+        assert!(pools.get(id).unwrap().holds(&key(1)));
+        pools.get_mut(id).unwrap().uploaded(&pages[..1]);
         assert!(matches!(
-            pool.reserve(&scope(0), 1, &[key(9)])[..],
+            pools.reserve(id, &scope(0), 1, &[key(9)], None).unwrap()[..],
             [PageSlot::Reserved { .. }]
         ));
-        assert!(!pool.holds(&key(1)));
+        assert!(!pools.get(id).unwrap().holds(&key(1)));
     }
 
     #[test]
     fn a_closed_head_leaves_its_slots_to_the_workers_still_connected() {
-        let mut pool = pool(3);
-        pool.reserve(&scope(0), 7, &[key(1)]);
-        pool.reserve(&scope(1), 7, &[key(2)]);
-        pool.reserve(&scope(0), 7, &[key(3)]);
+        let (mut pools, id) = pools(3);
+        pools.reserve(id, &scope(0), 7, &[key(1)], None);
+        pools.reserve(id, &scope(1), 7, &[key(2)], None);
+        pools.reserve(id, &scope(0), 7, &[key(3)], None);
+        let pool = pools.get_mut(id).unwrap();
         pool.commit(&[key(3)]);
         pool.pin(&scope(1), 7, &[key(3)]);
 

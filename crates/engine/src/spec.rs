@@ -232,6 +232,12 @@ impl EngineConfig {
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
             prefix_cache: kv_cache.prefix_caching,
+            boundary_interval: kv_cache
+                .boundary_interval
+                .filter(|interval| *interval > 0)
+                .map_or(crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL, |interval| {
+                    interval as usize
+                }),
             schedule_policy: named(&scheduling.policy, "scheduler_config.policy")?,
             worker_groups,
             transfer,

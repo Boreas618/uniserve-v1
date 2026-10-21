@@ -332,6 +332,10 @@ pub struct EngineConfig {
     /// Reuse and retain prompt cache prefixes across requests. Disabling this
     /// does not remove the cache storage needed within an active request.
     pub prefix_cache: bool,
+    /// The pages of the largest block size between the aligned boundaries
+    /// a long prompt offloads its sliding windows to the host KV cache
+    /// before.
+    pub boundary_interval: usize,
     /// Waiting queue policy for admitting/scheduling requests.
     pub schedule_policy: SchedulingPolicy,
     /// Static computation components and physical rank membership.
@@ -404,6 +408,7 @@ impl EngineConfig {
             max_queued_requests: None,
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
             prefix_cache: true,
+            boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             schedule_policy: SchedulingPolicy::Fcfs,
             worker_groups: vec![WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
@@ -787,6 +792,7 @@ impl SchedulerHandle {
             scheduler.enable_kv_offload(
                 &config.worker_process.deployment,
                 &config.worker_process.host,
+                config.boundary_interval,
             );
         }
         Self::spawn(scheduler, config.worker_process.model, waker)
