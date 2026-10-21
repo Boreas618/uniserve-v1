@@ -52,11 +52,11 @@ use crate::input::readout::prompt::{
 use crate::input::readout::request::{Criteria, SystemOneRequest};
 use crate::input::readout::vocabulary::Vocabulary;
 use crate::model::assets::ResolvedModelFiles;
-use crate::model::diffusion_gemma::{
-    ControlTokens, DiffusionGemmaProfile, ImagePlacement, ImageTokenMismatch, PatchBudget,
-};
 use crate::options::{CandidateTokens, CanvasMode, ReadoutLayout, ReadoutOptions};
 use crate::tokenizer::{DynTokenizer, TokenizerError};
+use models::diffusion_gemma::{
+    ControlTokens, DiffusionGemmaProfile, ImagePlacement, ImageTokenMismatch, PatchBudget,
+};
 
 /// Largest request context the endpoint admits, in tokens (the official 64k
 /// limit); a smaller `max_model_len` lowers it.

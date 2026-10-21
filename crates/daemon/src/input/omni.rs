@@ -21,8 +21,8 @@
 
 use base64::Engine as _;
 
-use crate::model::omni::OmniProfile;
-use crate::model::omni::resolution::{ResolutionPolicy, resolve_resolution};
+use models::omni::OmniProfile;
+use models::omni::resolution::{ResolutionPolicy, resolve_resolution};
 use proto::request::ImageParams;
 use proto::request::{
     GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs,
@@ -86,7 +86,7 @@ pub(super) fn preprocess_omni(
         .ok_or(crate::output::chat::Error::MissingChatTemplate)?;
     let (prompt_token_ids, images) = match prompt {
         Prompt::Text { prompt, .. } => (
-            profile.render_prompt_ids(&processor.tokenizer, generation.constraint, &prompt)?,
+            profile.render_prompt_ids(&*processor.tokenizer, generation.constraint, &prompt)?,
             Vec::new(),
         ),
         Prompt::Chat(chat) => render_chat(
@@ -121,7 +121,7 @@ pub(super) fn preprocess_omni(
     };
 
     let negative_prompt_token_ids = profile.render_negative_prompt_ids(
-        &processor.tokenizer,
+        &*processor.tokenizer,
         negative_prompt.as_deref().unwrap_or(""),
     )?;
     let (image, max_images) = resolve_image_params(
@@ -325,7 +325,7 @@ pub(super) fn prepare_generation_resources(
 /// seed. Returns the diffusion parameters and the request's image budget,
 /// which only the scheduler reads.
 fn resolve_image_params(
-    defaults: &crate::model::omni::ImageGenerationDefaults,
+    defaults: &models::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
     image: crate::input::ImageSamplingParams,
     sampling_seed: Option<u64>,

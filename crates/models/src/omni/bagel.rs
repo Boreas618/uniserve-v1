@@ -17,8 +17,7 @@ use super::{
     GenerationControls, ImageGenerationDefaults, OmniProfile, OutputFilterPolicy, encode,
     model_dtype_bytes, required_token, required_token_id, stride_resize_tokens,
 };
-use crate::model::assets;
-use crate::tokenizer::HuggingFaceTokenizer;
+use crate::{FactsError, Vocabulary, VocabularyError};
 
 /// System instruction used under `GenerationConstraint::Default` when the
 /// request supplies none.
@@ -63,39 +62,11 @@ impl BagelProfile {
     /// latent position table.
     pub const PRIMARY_CHECKPOINT: [&'static str; 2] = ["ema.safetensors", "model.safetensors"];
     /// Learned latent position table, `[side * side, hidden]` for a square
-    /// grid of `side` latent patches per axis.
-    pub const LATENT_POSITION_TABLE: &'static str = "latent_pos_embed.pos_embed";
-
-    /// Reads the side of the learned latent position grid, in latent patches.
-    ///
-    /// The side comes from the latent position table's row count in the
-    /// primary checkpoint header, as the worker's `read_config` derives it.
+    /// grid of `side` latent patches per axis; the side of that grid is the
+    /// largest latent canvas side the profile serves ([`BagelProfile::resolve`]).
     /// `config.json`'s `max_latent_size` is not used: the published
     /// BAGEL-7B-MoT config declares 32 for its 64x64 table.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`assets::resolve_tensor_shape`] errors, and
-    /// [`assets::Error::Invalid`] when the table is not two-dimensional with
-    /// a square, nonzero row count.
-    pub async fn read_max_latent_size(model: &str) -> assets::Result<u32> {
-        let shape = assets::resolve_tensor_shape(
-            model,
-            &Self::PRIMARY_CHECKPOINT,
-            Self::LATENT_POSITION_TABLE,
-        )
-        .await?;
-        let side = match shape.as_slice() {
-            [rows, _hidden] => Some(rows.isqrt()).filter(|side| *side > 0 && side * side == *rows),
-            _ => None,
-        };
-        side.and_then(|side| u32::try_from(side).ok())
-            .ok_or_else(|| {
-                assets::Error::invalid(format!(
-                    "Bagel latent position table must be a square grid, found shape {shape:?}"
-                ))
-            })
-    }
+    pub const LATENT_POSITION_TABLE: &'static str = "latent_pos_embed.pos_embed";
 
     /// Returns the profile's runtime sizing for the selected dtype.
     ///
@@ -146,14 +117,14 @@ impl BagelProfile {
     /// [`Self::read_max_latent_size`]) and bounds each side of a generated
     /// canvas. Fails when the tokenizer lacks any of the ChatML or vision
     /// delimiter tokens.
-    pub fn resolve(tokenizer: &HuggingFaceTokenizer, max_latent_size: u32) -> assets::Result<Self> {
+    pub fn resolve(vocabulary: &dyn Vocabulary, max_latent_size: u32) -> crate::Result<Self> {
         let (start_of_image, start_of_image_text) =
-            required_token(tokenizer, "<|vision_start|>", "Bagel start-of-image")?;
+            required_token(vocabulary, "<|vision_start|>", "Bagel start-of-image")?;
         let (end_of_image, end_of_image_text) =
-            required_token(tokenizer, "<|vision_end|>", "Bagel end-of-image")?;
+            required_token(vocabulary, "<|vision_end|>", "Bagel end-of-image")?;
         let controls = GenerationControls {
-            bos: required_token_id(tokenizer, "<|im_start|>", "Bagel beginning-of-sequence")?,
-            eos: required_token_id(tokenizer, "<|im_end|>", "Bagel end-of-sequence")?,
+            bos: required_token_id(vocabulary, "<|im_start|>", "Bagel beginning-of-sequence")?,
+            eos: required_token_id(vocabulary, "<|im_end|>", "Bagel end-of-sequence")?,
             start_of_image,
             end_of_image,
             start_of_image_text,
@@ -229,11 +200,11 @@ impl BagelProfile {
     /// newline.
     pub fn wrap_context_text(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         text: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>> {
+    ) -> std::result::Result<Vec<u32>, VocabularyError> {
         let mut ids = vec![self.controls.bos];
-        ids.extend(encode(tokenizer, text)?);
+        ids.extend(encode(vocabulary, text)?);
         ids.push(self.controls.eos);
         Ok(ids)
     }
@@ -279,35 +250,35 @@ impl OmniProfile for BagelProfile {
     /// - `GenOnly` wraps the prompt with [`BagelProfile::wrap_context_text`].
     fn render_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         constraint: GenerationConstraint,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>> {
+    ) -> std::result::Result<Vec<u32>, VocabularyError> {
         match constraint {
             GenerationConstraint::Default => encode(
-                tokenizer,
+                vocabulary,
                 &format!(
                     "<|im_start|>{DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
                 ),
             ),
             GenerationConstraint::UndOnly => encode(
-                tokenizer,
+                vocabulary,
                 &format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
             ),
-            GenerationConstraint::GenOnly => self.wrap_context_text(tokenizer, prompt),
+            GenerationConstraint::GenOnly => self.wrap_context_text(vocabulary, prompt),
         }
     }
 
     /// An empty prompt yields no tokens rather than an empty framed turn.
     fn render_negative_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>> {
+    ) -> std::result::Result<Vec<u32>, VocabularyError> {
         if prompt.is_empty() {
             return Ok(Vec::new());
         }
-        self.wrap_context_text(tokenizer, prompt)
+        self.wrap_context_text(vocabulary, prompt)
     }
 
     /// The VAE grid comes from the VAE resize; the ViT grid comes from the
@@ -318,7 +289,7 @@ impl OmniProfile for BagelProfile {
         width: u32,
         height: u32,
         _image_count: usize,
-    ) -> assets::Result<Vec<ImageEncoderInput>> {
+    ) -> crate::Result<Vec<ImageEncoderInput>> {
         let vae_tokens = stride_resize_tokens(
             width,
             height,
@@ -358,7 +329,7 @@ impl OmniProfile for BagelProfile {
         &self,
         width: u32,
         height: u32,
-    ) -> assets::Result<ImageGenerationConfig> {
+    ) -> crate::Result<ImageGenerationConfig> {
         let tokens = stride_resize_tokens(
             width,
             height,
@@ -371,7 +342,7 @@ impl OmniProfile for BagelProfile {
             || policy.feedback_encoders.len() != 1
             || policy.feedback_encoders[0].encoder != proto::request::ImageEncoder::Latent
         {
-            return Err(assets::Error::invalid(
+            return Err(FactsError::invalid(
                 "image feedback encoders do not match the model processor",
             ));
         }

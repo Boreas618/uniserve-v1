@@ -1,14 +1,15 @@
-//! DiffusionGemma checkpoint facts consumed by the server.
+//! DiffusionGemma checkpoint facts.
 //!
 //! A `DiffusionGemmaForBlockDiffusion` checkpoint (`model_type =
-//! "diffusion_gemma"`) is a Gemma-4 encoder-decoder that denoises a fixed-length
-//! token canvas over a prompt prefix. [`DiffusionGemmaProfile::resolve`]
-//! normalizes the checkpoint metadata the server needs once at startup: the
-//! block-diffusion sampling of its canvases (the canvas length of the root
-//! configuration under the sampler defaults of `generation_config.json`,
-//! which a server may override, [`DenoisingOverrides`]), the canvas control
-//! tokens, and the Gemma-4 image patch budget that sizes image placeholders. The text context limit lives under the root
-//! configuration's `text_config` and is read by `assets::ModelConfig`.
+//! "diffusion_gemma"`) is a Gemma-4 encoder-decoder that denoises a
+//! fixed-length token canvas over a prompt prefix.
+//! [`DiffusionGemmaProfile::resolve`] normalizes the checkpoint metadata the
+//! daemon needs once at startup: the block-diffusion sampling of its canvases
+//! (the canvas length of the root configuration under the sampler defaults of
+//! `generation_config.json`, which a deployment may override,
+//! [`DenoisingOverrides`]), the canvas control tokens, and the Gemma-4 image
+//! patch budget that sizes image placeholders. The text context limit lives
+//! under the root configuration's `text_config`, which the daemon reads.
 //! [`ControlTokens::expand_images`] expands a rendered prompt's image tokens
 //! as the Gemma-4 processor does.
 //!
@@ -16,16 +17,12 @@
 //! metadata; the NVFP4 checkpoint differs only by a `quantization_config`,
 //! which the profile records without changing any serving behavior.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
 use proto::request::CanvasSampling;
 
-use crate::model::assets;
-use crate::model::assets::{GenerationConfig, read_json};
-use crate::model::omni::required_token_id;
-use crate::tokenizer::HuggingFaceTokenizer;
+use crate::omni::required_token_id;
+use crate::{FactsError, Vocabulary};
 
 /// Serving facts of one DiffusionGemma checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,8 +269,8 @@ impl ControlTokens {
 }
 
 /// The root `config.json` fields a DiffusionGemma profile reads.
-#[derive(Deserialize)]
-struct CheckpointConfig {
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckpointConfig {
     canvas_length: u32,
     image_token_id: u32,
     boi_token_id: u32,
@@ -285,15 +282,42 @@ struct CheckpointConfig {
 }
 
 /// The `vision_config` fields that size image patches.
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct VisionConfig {
     patch_size: u32,
     pooling_kernel_size: u32,
 }
 
+/// The block-diffusion sampler defaults of a `generation_config.json`; a
+/// field the file omits is absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct GenerationDefaults {
+    /// Block-diffusion denoising steps per canvas.
+    pub max_denoising_steps: Option<u32>,
+    /// Block-diffusion sampler settings.
+    pub sampler_config: Option<SamplerConfig>,
+    /// Block-diffusion sampling temperature at the first step.
+    pub t_min: Option<f32>,
+    /// Block-diffusion sampling temperature at the last step.
+    pub t_max: Option<f32>,
+    /// Block-diffusion stopping threshold on residual canvas uncertainty.
+    pub confidence_threshold: Option<f32>,
+    /// Consecutive unchanged block-diffusion steps that end denoising early.
+    pub stability_threshold: Option<u32>,
+}
+
+/// The `sampler_config` section of a block-diffusion `generation_config.json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SamplerConfig {
+    /// Entropy budget, in nats, of the tokens one denoising step accepts.
+    pub entropy_bound: Option<f32>,
+}
+
 impl DiffusionGemmaProfile {
-    /// Resolves the profile from the checkpoint's root configuration, its
-    /// generation defaults, and its tokenizer.
+    /// Resolves the profile from the checkpoint's root configuration
+    /// (`config`), its generation defaults, and its vocabulary.
     ///
     /// The canvas control tokens are resolved by their text (`<mask>`,
     /// `<pad>`, `<turn|>`); the image token identities come from the root
@@ -301,22 +325,17 @@ impl DiffusionGemmaProfile {
     ///
     /// # Errors
     ///
-    /// Fails when `config_path` is absent or unreadable, when it lacks a
-    /// required field, when a control token is missing from the vocabulary, or
-    /// when `generation_config.json` lacks a sampler default.
+    /// Fails when a control token is missing from the vocabulary or when
+    /// `generation` lacks a sampler default.
     pub fn resolve(
-        config_path: Option<&Path>,
-        generation: &GenerationConfig,
-        tokenizer: &HuggingFaceTokenizer,
-    ) -> assets::Result<Self> {
-        let config_path = config_path.ok_or_else(|| {
-            assets::Error::invalid("a DiffusionGemma checkpoint requires its root config.json")
-        })?;
-        let config: CheckpointConfig = read_json(config_path)?;
+        config: CheckpointConfig,
+        generation: &GenerationDefaults,
+        vocabulary: &dyn Vocabulary,
+    ) -> crate::Result<Self> {
         let tokens = ControlTokens {
-            mask: required_token_id(tokenizer, "<mask>", "DiffusionGemma canvas mask")?,
-            pad: required_token_id(tokenizer, "<pad>", "DiffusionGemma canvas padding")?,
-            turn_end: required_token_id(tokenizer, "<turn|>", "DiffusionGemma end-of-turn")?,
+            mask: required_token_id(vocabulary, "<mask>", "DiffusionGemma canvas mask")?,
+            pad: required_token_id(vocabulary, "<pad>", "DiffusionGemma canvas padding")?,
+            turn_end: required_token_id(vocabulary, "<turn|>", "DiffusionGemma end-of-turn")?,
             image: config.image_token_id,
             image_start: config.boi_token_id,
             image_end: config.eoi_token_id,
@@ -324,7 +343,7 @@ impl DiffusionGemmaProfile {
         let sampler = generation
             .sampler_config
             .as_ref()
-            .ok_or(assets::Error::MissingField {
+            .ok_or(FactsError::MissingField {
                 field: "sampler_config",
             })?;
         let sampling = CanvasSampling {
@@ -354,8 +373,8 @@ impl DiffusionGemmaProfile {
 }
 
 /// Returns a required generation-config value or names the missing field.
-fn required<T>(value: Option<T>, field: &'static str) -> assets::Result<T> {
-    value.ok_or(assets::Error::MissingField { field })
+fn required<T>(value: Option<T>, field: &'static str) -> crate::Result<T> {
+    value.ok_or(FactsError::MissingField { field })
 }
 
 #[cfg(test)]
@@ -449,7 +468,7 @@ mod tests {
             soft_tokens: u32,
         }
         let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../../../tests/python/fixtures/diffusion_gemma_image_tokens.json"
+            "../../../tests/python/fixtures/diffusion_gemma_image_tokens.json"
         ))
         .unwrap();
         let budget = PatchBudget {

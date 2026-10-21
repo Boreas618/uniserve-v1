@@ -810,7 +810,7 @@ mod tests {
     /// rather than ignored; unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use crate::model::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
+        use models::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
 
         let (_, defaults) = resolved(&["m"]).unwrap();
         for description in [Qwen3, Bagel, MiniMaxH3, DiffusionGemma] {

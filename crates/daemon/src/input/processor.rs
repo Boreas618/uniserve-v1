@@ -18,9 +18,10 @@
 use std::sync::Arc;
 
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
-use crate::model::omni::bagel::BagelProfile;
-use crate::model::{ModelConfig, ModelDescription, ModelParameters};
+use crate::model::{ModelConfig, ModelParameters};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
+use models::ModelDescription;
+use models::omni::bagel::BagelProfile;
 use models::video::plan::ProcessorConfig;
 use proto::request::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
@@ -224,7 +225,7 @@ impl ModelConfig {
     }
 
     /// Vocabulary markers used by multimodal scheduling and prompt construction.
-    pub(crate) fn generation_controls(&self) -> Option<&crate::model::omni::GenerationControls> {
+    pub(crate) fn generation_controls(&self) -> Option<&models::omni::GenerationControls> {
         match &self.parameters {
             ModelParameters::SenseNova(value) => Some(&value.controls),
             ModelParameters::Bagel(value) => Some(&value.controls),
@@ -774,9 +775,10 @@ mod tests {
 
     use super::{LoadedModel, LoadedRenderer};
     use crate::input::{InputProcessor, RequestRenderer};
-    use crate::model::{ModelConfig, ModelDescription, ModelParameters};
+    use crate::model::{ModelConfig, ModelParameters};
     use crate::options::ServeConfig;
     use crate::tokenizer::HuggingFaceTokenizer;
+    use models::ModelDescription;
 
     /// Writes a checkpoint laid out as DiffusionGemma publishes it: a root
     /// transformers `config.json` beside a `DiffusionGemmaPipeline` diffusers

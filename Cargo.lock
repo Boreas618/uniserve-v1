@@ -2140,6 +2140,7 @@ dependencies = [
 name = "models"
 version = "2.0.0"
 dependencies = [
+ "proto",
  "serde",
  "serde_json",
  "thiserror",

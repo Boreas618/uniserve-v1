@@ -13,7 +13,7 @@
 //! for a denoised canvas, so a request that sets one is refused
 //! ([`refuse_token_sampling_controls`]).
 //!
-//! [`ControlTokens::expand_images`]: crate::model::diffusion_gemma::ControlTokens::expand_images
+//! [`ControlTokens::expand_images`]: models::diffusion_gemma::ControlTokens::expand_images
 
 use std::sync::Arc;
 
@@ -22,9 +22,9 @@ use proto::request::{GenerationRequest, ImageEncoderInput, ImageInput, Multimoda
 
 use crate::input::chat::ChatRequest;
 use crate::input::{InputProcessor, SamplingParams, ServeError, TokenizeError, media};
-use crate::model::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 use crate::output::chat::ChatOutputProcessor;
 use crate::output::text::TextDecodeOptions;
+use models::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 
 /// Splits a prompt whose images stand as soft-token runs into the engine's
 /// prompt tokens and image inputs.
@@ -243,11 +243,11 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     use crate::leader::Leader;
-    use crate::model::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
     use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
     use crate::output::{FinishReason, RequestOutput};
     use crate::test_support::{SERVED_MODEL, engine_over, load_tokenizer, sim_core};
     use crate::tokenizer::HuggingFaceTokenizer;
+    use models::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 
     /// Tokens of one canvas.
     const CANVAS: u32 = 16;

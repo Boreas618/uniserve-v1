@@ -12,6 +12,13 @@ pub enum TokenizeError {
     /// The model tokenizer cannot encode request content.
     #[error(transparent)]
     Tokenizer(#[from] crate::tokenizer::TokenizerError),
+    /// The model tokenizer cannot encode the text a family rule frames.
+    #[error(transparent)]
+    Vocabulary(#[from] models::VocabularyError),
+    /// A family rule refuses the request's content, such as an image it
+    /// cannot size.
+    #[error(transparent)]
+    Facts(#[from] models::FactsError),
     /// Chat rendering or semantic request validation fails.
     #[error(transparent)]
     Chat(#[from] crate::output::chat::Error),
@@ -26,7 +33,7 @@ pub enum TokenizeError {
     Generation(#[from] proto::request::GenerationRequestError),
     /// The requested output resolution is not served.
     #[error(transparent)]
-    Resolution(#[from] crate::model::omni::resolution::ResolutionError),
+    Resolution(#[from] models::omni::resolution::ResolutionError),
     /// The profile cannot size the request's images.
     #[error(transparent)]
     Assets(#[from] crate::model::assets::Error),

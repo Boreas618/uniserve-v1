@@ -9,128 +9,28 @@
 //! binds the worker's capabilities onto it before request preprocessing and
 //! discovery share it immutably.
 //!
-//! Submodules own checkpoint asset resolution ([`assets`]), the multimodal
-//! family profiles ([`omni`]) and the DiffusionGemma checkpoint facts
-//! ([`diffusion_gemma`]). The tokenizer is `crate::tokenizer`'s, and the
-//! streaming reasoning and tool-call parsers are output processing's
-//! (`crate::output`).
+//! The checkpoint's files are resolved and read here ([`assets`]); what a
+//! family makes of them is the family's rules in the `models` crate (the
+//! multimodal profiles of `models::omni`, the DiffusionGemma facts of
+//! `models::diffusion_gemma`), which read the checkpoint's tokenizer
+//! (`crate::tokenizer`) through `models::Vocabulary`. The streaming reasoning
+//! and tool-call parsers are output processing's (`crate::output`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+use models::ModelDescription;
+use models::diffusion_gemma::DiffusionGemmaProfile;
+use models::omni::bagel::BagelProfile;
+use models::omni::sensenova::SenseNovaProfile;
+
 use crate::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
-    load_model_config, load_tokenizer_config,
+    load_model_config, load_tokenizer_config, read_json,
 };
-use crate::model::diffusion_gemma::DiffusionGemmaProfile;
-use crate::model::omni::bagel::BagelProfile;
-use crate::model::omni::sensenova::SenseNovaProfile;
 use crate::tokenizer::HuggingFaceTokenizer;
 
 pub mod assets;
-pub mod diffusion_gemma;
-pub mod omni;
-
-/// The complete configured model-description set selected at server startup.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelDescription {
-    /// Qwen3 text-generation profile, serving dense and mixture-of-experts
-    /// checkpoints alike: they share tokenizer, chat template, output parsing
-    /// and autoregressive runtime, and differ only in worker numerics.
-    #[default]
-    Qwen3,
-    /// SenseNova multimodal-generation profile.
-    #[serde(rename = "sensenova")]
-    SenseNova,
-    /// Bagel multimodal-generation profile.
-    Bagel,
-    /// MiniMax H3 video-generation profile.
-    MiniMaxH3,
-    /// DiffusionGemma block-diffusion profile: System One decision readout
-    /// and block-diffusion chat generation.
-    DiffusionGemma,
-}
-
-impl ModelDescription {
-    /// Every served model family.
-    ///
-    /// `from_model_type` and `from_pipeline_class` search only this list, so a
-    /// variant missing from it compiles but is never selected from checkpoint
-    /// metadata.
-    const ALL: [Self; 5] = [
-        Self::Qwen3,
-        Self::SenseNova,
-        Self::Bagel,
-        Self::MiniMaxH3,
-        Self::DiffusionGemma,
-    ];
-
-    /// Returns the stable profile identifier.
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Qwen3 => "qwen3",
-            Self::SenseNova => "sensenova",
-            Self::Bagel => "bagel",
-            Self::MiniMaxH3 => "minimax_h3",
-            Self::DiffusionGemma => "diffusion_gemma",
-        }
-    }
-
-    /// Returns every `model_type` a root `config.json` of this family may
-    /// declare, empty for a family that ships as a diffusers pipeline.
-    const fn model_types(self) -> &'static [&'static str] {
-        match self {
-            Self::Qwen3 => &["qwen3", "qwen3_moe"],
-            Self::SenseNova => &["neo_chat"],
-            Self::Bagel => &["bagel"],
-            Self::DiffusionGemma => &["diffusion_gemma"],
-            Self::MiniMaxH3 => &[],
-        }
-    }
-
-    /// Returns the pipeline class a family's checkpoint declares in a root
-    /// diffusers index.
-    ///
-    /// MiniMax H3 ships only as a pipeline. A DiffusionGemma checkpoint
-    /// publishes a `DiffusionGemmaPipeline` index beside its root transformers
-    /// `config.json`, which remains the source of its settings (see
-    /// [`ModelDescription::is_pipeline`]).
-    const fn pipeline_class(self) -> Option<&'static str> {
-        match self {
-            Self::MiniMaxH3 => Some("MiniMaxH3ModularPipeline"),
-            Self::DiffusionGemma => Some("DiffusionGemmaPipeline"),
-            Self::Qwen3 | Self::SenseNova | Self::Bagel => None,
-        }
-    }
-
-    /// Returns whether the family ships only as a diffusers pipeline, whose
-    /// root index rather than a root `config.json` describes the checkpoint.
-    pub const fn is_pipeline(self) -> bool {
-        self.model_types().is_empty()
-    }
-
-    /// Resolves the served profile from a checkpoint's `model_type` field.
-    ///
-    /// The checkpoint configuration is the only source of model identity.
-    /// `None` means UniServe serves no family with this `model_type` from a
-    /// root configuration; pipeline families never match here.
-    pub fn from_model_type(model_type: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|description| description.model_types().contains(&model_type))
-    }
-
-    /// Resolves the served profile from a checkpoint index's `_class_name`.
-    ///
-    /// The result may be a family described by its root configuration, which
-    /// [`ModelDescription::is_pipeline`] distinguishes.
-    pub fn from_pipeline_class(class_name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|description| description.pipeline_class() == Some(class_name))
-    }
-}
 
 /// Model-provided sampling defaults. `None` remains distinct from an explicit zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -199,7 +99,7 @@ impl ModelConfig {
     /// were resolved for the checkpoint `model` (a local directory or Hub
     /// repository id). Bagel also reads its latent position grid side from
     /// the checkpoint's safetensors header (see
-    /// `BagelProfile::read_max_latent_size`), and DiffusionGemma its canvas,
+    /// `read_bagel_max_latent_size`), and DiffusionGemma its canvas,
     /// image, and sampler settings (see `DiffusionGemmaProfile::resolve`). A
     /// configured `max_model_len` takes precedence over the checkpoint's
     /// `max_position_embeddings`, and
@@ -244,12 +144,17 @@ impl ModelConfig {
             }
             ModelDescription::Bagel => ModelParameters::Bagel(BagelProfile::resolve(
                 tokenizer,
-                BagelProfile::read_max_latent_size(model).await?,
+                read_bagel_max_latent_size(model).await?,
             )?),
             ModelDescription::DiffusionGemma => {
+                let config_path = files.config_path.as_deref().ok_or_else(|| {
+                    assets::Error::invalid(
+                        "a DiffusionGemma checkpoint requires its root config.json",
+                    )
+                })?;
                 ModelParameters::DiffusionGemma(DiffusionGemmaProfile::resolve(
-                    files.config_path.as_deref(),
-                    &generation_config,
+                    read_json(config_path)?,
+                    &generation_config.denoising,
                     tokenizer,
                 )?)
             }
@@ -342,6 +247,38 @@ impl ModelConfig {
     }
 }
 
+/// Reads the side of a Bagel checkpoint's learned latent position grid, in
+/// latent patches.
+///
+/// The side comes from the latent position table's row count
+/// (`BagelProfile::LATENT_POSITION_TABLE`) in the header of the first present
+/// primary checkpoint file (`BagelProfile::PRIMARY_CHECKPOINT`), as the
+/// worker's `read_config` derives it.
+///
+/// # Errors
+///
+/// Returns the [`assets::resolve_tensor_shape`] errors, and
+/// [`assets::Error::Invalid`] when the table is not two-dimensional with a
+/// square, nonzero row count.
+async fn read_bagel_max_latent_size(model: &str) -> assets::Result<u32> {
+    let shape = assets::resolve_tensor_shape(
+        model,
+        &BagelProfile::PRIMARY_CHECKPOINT,
+        BagelProfile::LATENT_POSITION_TABLE,
+    )
+    .await?;
+    let side = match shape.as_slice() {
+        [rows, _hidden] => Some(rows.isqrt()).filter(|side| *side > 0 && side * side == *rows),
+        _ => None,
+    };
+    side.and_then(|side| u32::try_from(side).ok())
+        .ok_or_else(|| {
+            assets::Error::invalid(format!(
+                "Bagel latent position table must be a square grid, found shape {shape:?}"
+            ))
+        })
+}
+
 /// Extracts serving generation defaults from repository configuration.
 fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
     SamplingDefaults {
@@ -393,9 +330,9 @@ mod tests {
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::model::assets::ResolvedModelFiles;
     use crate::model::assets::checkpoint::bf16_safetensors;
-    use crate::model::omni::OmniProfile as _;
-    use crate::model::omni::sensenova::SenseNovaProfile;
     use crate::tokenizer::HuggingFaceTokenizer;
+    use models::omni::OmniProfile as _;
+    use models::omni::sensenova::SenseNovaProfile;
 
     const SPECIAL_TOKENS: &[&str] = &[
         "<|im_start|>",
@@ -508,7 +445,7 @@ mod tests {
                     assert_eq!(description, ModelDescription::SenseNova);
                     assert_eq!(
                         profile.resolution_policy.default.name,
-                        crate::model::omni::resolution::ResolutionName::Landscape16x9
+                        models::omni::resolution::ResolutionName::Landscape16x9
                     );
                     assert_eq!(
                         profile
@@ -572,7 +509,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = BagelProfile::read_max_latent_size(directory.path().to_str().unwrap())
+        let error = super::read_bagel_max_latent_size(directory.path().to_str().unwrap())
             .await
             .unwrap_err();
 

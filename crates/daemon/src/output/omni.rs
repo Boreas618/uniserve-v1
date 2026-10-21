@@ -8,9 +8,9 @@
 //! stream. [`SenseNovaReasoningParser`] is the reasoning parser of a
 //! SenseNova request's `ChatOutputProcessor`.
 
-use crate::model::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 use crate::output::reasoning::{DelimitedReasoningParser, ReasoningDelta, ReasoningParser};
 use crate::tokenizer::DynTokenizer;
+use models::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 
 /// SenseNova's reasoning and visible-wrapper filter for one request.
 pub(crate) struct SenseNovaReasoningParser {

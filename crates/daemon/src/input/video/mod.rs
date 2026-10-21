@@ -1002,7 +1002,7 @@ mod tests {
     /// the vision markers and placeholders to the reference's ids.
     #[tokio::test]
     async fn checkpoint_tokenizer_matches_the_reference() {
-        use models::video::presentation::Tokenizer as _;
+        use models::Vocabulary as _;
 
         let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
             eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
@@ -1026,14 +1026,11 @@ mod tests {
                 let Some(text) = segment.get("text") else {
                     continue;
                 };
-                let ids: Vec<u64> = models::video::presentation::Tokenizer::encode(
-                    &tokenizer,
-                    text.as_str().unwrap(),
-                )
-                .unwrap()
-                .into_iter()
-                .map(u64::from)
-                .collect();
+                let ids: Vec<u64> = models::Vocabulary::encode(&tokenizer, text.as_str().unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .map(u64::from)
+                    .collect();
                 assert_eq!(Value::from(ids), segment["token_ids"], "{}", case["name"]);
             }
         }

@@ -511,7 +511,7 @@ fn default_modalities() -> Vec<ChatModality> {
 /// Image-generation controls embedded in a chat request.
 pub struct ChatImageConfig {
     /// Named output resolution preset.
-    pub resolution: Option<crate::model::omni::resolution::ResolutionName>,
+    pub resolution: Option<models::omni::resolution::ResolutionName>,
     /// Explicit output height in pixels.
     pub height: Option<u32>,
     /// Explicit output width in pixels.
