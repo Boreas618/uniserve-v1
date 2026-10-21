@@ -608,8 +608,9 @@ pub struct WorkerOptions {
     /// rank of a world or group alike; `resident`; or `suspended`, released
     /// on the device and restored at the promotion, the graph memory with
     /// its contents at unchanged addresses; workspaces that cannot keep
-    /// their addresses (DeepEP's windows) are created again at the
-    /// promotion, which captures the graphs that use them anew.
+    /// their addresses (DeepEP's windows, colocated MegaMoE's NVSHMEM heap)
+    /// are created again at the promotion, which captures the graphs that
+    /// use them anew.
     pub standby_memory: StandbyMemory,
 }
 

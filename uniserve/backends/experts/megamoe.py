@@ -104,6 +104,25 @@ class FusedExperts(ExpertTransport):
             raise ValueError("microbatches must use the same expert transport")
         self.fused.bind_microbatches([t.fused for t in transports])
 
+    def release(self) -> bool:
+        """Free a colocated buffer's NVSHMEM heap while a standby parks.
+
+        The heap's addresses are kernel launch parameters of the captured
+        graphs, and NVSHMEM keeps no address across leaving and joining:
+        :meth:`rebuild` joins again and allocates new buffers, over which
+        the graphs are captured again. Split MegaMoE's peer-mapped storage
+        stays.
+        """
+        if self.attention_ranks or self.fused is None:
+            return False
+        self.fused.release()
+        return True
+
+    def rebuild(self) -> None:
+        """Join NVSHMEM again and allocate the colocated buffer anew."""
+        if not self.attention_ranks and self.fused is not None:
+            self.fused.rebuild()
+
     def close(self) -> None:
         # The colocated NVSHMEM heap stays mapped for the process lifetime.
         if self.attention_ranks and self.fused is not None:
