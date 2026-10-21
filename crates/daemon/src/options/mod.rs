@@ -1119,6 +1119,7 @@ impl ServeConfig {
                 microbatches: self.moe_config.microbatches.get(),
             }),
             model_facts: None,
+            standby: None,
         })
     }
 }

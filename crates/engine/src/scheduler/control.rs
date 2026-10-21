@@ -105,6 +105,13 @@ impl Scheduler {
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
             Command::Migrate(cause) => self.migrate_requests(cause),
+            Command::Promote(answer) => {
+                let promoted = self
+                    .executor
+                    .promote()
+                    .map_err(|error| format!("{error:#}"));
+                let _ = answer.send(promoted);
+            }
             Command::Shutdown => return true,
         }
         false

@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::input::readout::SystemOneError;
-use crate::leader::{Leader, Task};
+use crate::leader::{Leader, Task, UpdateError};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, images, videos};
 use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
@@ -282,7 +282,15 @@ pub(crate) fn router(
         .merge(readout.unwrap_or_default())
         .layer(from_fn(middleware::track_http_metrics));
 
-    let mut authenticated = Router::new().route("/version", get(version)).merge(api);
+    // An update runs for as long as the standby engine takes to start, so
+    // it is held to no request timeout or concurrency limit.
+    let admin = Router::new()
+        .route("/engine/update", post(update_engine))
+        .with_state(Arc::clone(&engine));
+    let mut authenticated = Router::new()
+        .route("/version", get(version))
+        .merge(api)
+        .merge(admin);
     if let Some(key) = &server.api_key {
         let key: Arc<str> = Arc::from(key.as_str());
         authenticated = authenticated.layer(from_fn(move |request: Request, next: Next| {
@@ -313,6 +321,45 @@ async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// The body of `POST /engine/update`; an empty body updates to the build the
+/// running engine's executable holds now.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRequest {
+    /// The `uniserve` executable of the build to update to.
+    executable: Option<String>,
+}
+
+/// Updates the engine to another build without failing a request
+/// (`Leader::update`), and answers once the updated engine serves, with
+/// how long requests waited for it and how long each stage of that pause
+/// took: `409` while another update runs.
+async fn update_engine(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
+    let request = if body.is_empty() {
+        UpdateRequest::default()
+    } else {
+        match serde_json::from_slice::<UpdateRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+        }
+    };
+    match engine.update(request.executable).await {
+        Ok(update) => Json(json!({
+            "pause_seconds": update.pause.as_secs_f64(),
+            "drain_seconds": update.drain.as_secs_f64(),
+            "close_seconds": update.close.as_secs_f64(),
+            "promotion_seconds": update.promotion.as_secs_f64(),
+        }))
+        .into_response(),
+        Err(error @ UpdateError::InProgress) => {
+            ApiError::conflict(error.to_string()).into_response()
+        }
+        Err(error) => {
+            ApiError::server_error(format!("{:#}", anyhow::Error::from(error))).into_response()
+        }
     }
 }
 

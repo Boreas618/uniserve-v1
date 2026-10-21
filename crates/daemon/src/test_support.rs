@@ -172,6 +172,14 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
             .media_units(ipc::MediaCall::LatentEncoding)
             .unwrap_or(0),
         schedulers: cores.len() as u32,
+        cache_units: cores
+            .iter()
+            .flat_map(|core| core.cache_units())
+            .map(|(group, units)| proto::request::wire::GroupCacheUnits {
+                worker_group: group.clone(),
+                units: *units,
+            })
+            .collect(),
     };
     let model_name = first.model_name().to_owned();
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");

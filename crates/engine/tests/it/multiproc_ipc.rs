@@ -1988,6 +1988,218 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The engine configuration of a two-rank stub deployment named
+/// `deployment`.
+fn stub_engine_config(deployment: &str) -> EngineConfig {
+    let mut config = EngineConfig::sim("stub");
+    config.generation_limits = engine::GenerationLimits {
+        features: engine::GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..Default::default()
+    };
+    config.worker_groups = vec![WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        WORLD_SIZE,
+        2,
+        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+    )];
+    config.worker_process = worker_group_args();
+    config.worker_process.deployment = deployment.to_owned();
+    config
+}
+
+/// A greedy text request of the prompt `[7, 8, 9]` that generated
+/// `generated` before it migrated and generates `max_und_tokens` tokens in
+/// all: it ignores EOS, which the stub model reaches early.
+fn greedy_text(id: u64, generated: Vec<u32>, max_und_tokens: usize) -> Request {
+    Request::from(engine::GenerationRequest {
+        request_id: RequestId(id),
+        prompt_token_ids: vec![7, 8, 9],
+        negative_prompt_token_ids: Vec::new(),
+        multimodal_inputs: Default::default(),
+        constraint: engine::GenerationConstraint::UndOnly,
+        sampling: SamplingParams {
+            ignore_eos: true,
+            ..Default::default()
+        },
+        image: Default::default(),
+        max_images: 1,
+        max_und_tokens,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        cache: Default::default(),
+        include_stop_token: false,
+        image_generation: Default::default(),
+        readout: Vec::new(),
+        generated_token_ids: generated,
+    })
+}
+
+/// The tokens `events` delivers until its terminal event, and that event.
+fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u32>, Event)> {
+    let mut tokens = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the request did not end"
+        );
+        match events.try_recv() {
+            Ok(Event::TextToken { id, .. }) => tokens.push(id),
+            Ok(event) if event.is_terminal() => return Ok((tokens, event)),
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+/// An engine standing by for a running one starts beside it on the same
+/// storages, serves once the running engine closed and it is promoted, and
+/// continues a request the running one generated part of: the continuation
+/// generates what the uninterrupted request generates after those tokens,
+/// and its usage is the uninterrupted request's.
+#[test]
+fn a_standing_by_engine_continues_the_requests_of_the_engine_it_replaces() -> anyhow::Result<()> {
+    let deployment = format!("standby-{}", std::process::id());
+    let running = SchedulerHandle::start_all(stub_engine_config(&deployment))?.remove(0);
+    let result =
+        (|| -> anyhow::Result<(Vec<u32>, Event, SchedulerHandle)> {
+            let (reference, finished) =
+                tokens_until_terminal(&mut running.submit(greedy_text(91, Vec::new(), 8))?)?;
+            anyhow::ensure!(
+                matches!(finished, Event::Finished { .. }),
+                "the reference did not finish: {finished:?}"
+            );
+
+            let mut config = stub_engine_config(&deployment);
+            config.standby = Some(running.cache_units().clone());
+            let standby = SchedulerHandle::start_all(config)?.remove(0);
+            running.migrate(proto::request::MigrationCause::Drain);
+            running.shutdown();
+            standby.promote()?;
+
+            let (continued, finished) = tokens_until_terminal(
+                &mut standby.submit(greedy_text(92, reference[..3].to_vec(), 8))?,
+            )?;
+            let mut whole = reference[..3].to_vec();
+            whole.extend(continued);
+            anyhow::ensure!(whole == reference, "{whole:?} differs from {reference:?}");
+            Ok((reference, finished, standby))
+        })();
+    running.shutdown();
+    let (_reference, finished, standby) = result?;
+    standby.shutdown();
+    assert!(
+        matches!(
+            finished,
+            Event::Finished {
+                prompt_tokens: 3,
+                completion_tokens: 8,
+                ..
+            }
+        ),
+        "{finished:?}"
+    );
+    Ok(())
+}
+
+/// The tokens of the request whose worker group is lost: enough that the
+/// kill after its first tokens lands while it generates.
+const LOST_GROUP_TOKENS: usize = 1_000;
+
+/// A token request on a worker group that is lost leaves the engine as
+/// migratable after the tokens it generated, and submitted again with them it
+/// waits for the relaunched group and continues as the uninterrupted request
+/// does.
+#[test]
+fn a_request_on_a_lost_group_migrates_and_continues_after_the_relaunch() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The wrapper records each launch's process ids by generation and rank.
+    let directory = tempfile::tempdir()?;
+    let wrapper = directory.path().join("worker");
+    let worker = serde_json::to_string(&worker_executable())?;
+    let state = serde_json::to_string(directory.path())?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\n(Path({state}) / (argument('--generation') + '-' + argument('--rank') + '.pid')).write_text(str(os.getpid()))\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+    let mut config = stub_engine_config(&format!("relaunch-{}", std::process::id()));
+    config.worker_process.executable = wrapper;
+    let engine = SchedulerHandle::start_all(config)?.remove(0);
+
+    let result = (|| -> anyhow::Result<()> {
+        let (reference, finished) = tokens_until_terminal(&mut engine.submit(greedy_text(
+            101,
+            Vec::new(),
+            LOST_GROUP_TOKENS,
+        ))?)?;
+        anyhow::ensure!(
+            matches!(finished, Event::Finished { .. }),
+            "the reference did not finish: {finished:?}"
+        );
+
+        let mut events = engine.submit(greedy_text(102, Vec::new(), LOST_GROUP_TOKENS))?;
+        let mut generated = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while generated.len() < 3 {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "no tokens");
+            match events.try_recv() {
+                Ok(Event::TextToken { id, .. }) => generated.push(id),
+                Ok(event) if event.is_terminal() => anyhow::bail!("ended early: {event:?}"),
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        let pid =
+            std::fs::read_to_string(directory.path().join("1-0.pid"))?.parse::<libc::pid_t>()?;
+        // SAFETY: kill takes only integer arguments and touches no memory of this process.
+        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
+        let (tokens, terminal) = tokens_until_terminal(&mut events)?;
+        generated.extend(tokens);
+        anyhow::ensure!(
+            matches!(
+                terminal,
+                Event::Migratable {
+                    cause: proto::request::MigrationCause::Loss
+                }
+            ),
+            "the lost request did not leave as migratable: {terminal:?}"
+        );
+
+        let (continued, finished) = tokens_until_terminal(&mut engine.submit(greedy_text(
+            103,
+            generated.clone(),
+            LOST_GROUP_TOKENS,
+        ))?)?;
+        anyhow::ensure!(
+            matches!(
+                finished,
+                Event::Finished {
+                    prompt_tokens: 3,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == LOST_GROUP_TOKENS
+            ),
+            "the continuation did not finish: {finished:?}"
+        );
+        generated.extend(continued);
+        anyhow::ensure!(
+            generated == reference,
+            "the continuation differs from the reference"
+        );
+        Ok(())
+    })();
+    engine.shutdown();
+    result
+}
+
 /// Workers launched by the engine hold a request row for every running
 /// request the engine is configured to keep resident, beyond the worker's
 /// own default pool.

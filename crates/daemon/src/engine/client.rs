@@ -39,6 +39,9 @@ pub struct EngineInfo {
     pub latent_encoding_units: u32,
     /// The engine's schedulers, one per DP rank.
     pub schedulers: u32,
+    /// The prefix cache units of each worker group, which an engine
+    /// standing by for this one maps.
+    pub cache_units: Vec<wire::GroupCacheUnits>,
 }
 
 impl From<wire::EngineInfo> for EngineInfo {
@@ -48,6 +51,7 @@ impl From<wire::EngineInfo> for EngineInfo {
             video_denoiser: info.video_denoiser,
             latent_encoding_units: info.latent_encoding_units,
             schedulers: info.schedulers,
+            cache_units: info.cache_units,
         }
     }
 }
@@ -63,6 +67,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// What an engine is, as its client knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
+    /// It stands by for the running engine: its workers are loaded and
+    /// parked, and it serves once promoted.
+    Standby,
     /// It serves requests.
     Ready,
     /// It admits nothing more: it ended its token requests as migratable
@@ -138,9 +145,10 @@ pub struct EngineClient {
     shared: Arc<Shared>,
     info: EngineInfo,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Kept for as long as the engine serves, such as the daemon connection
-    /// its process lives under.
-    _keep: Option<Box<dyn Send + Sync>>,
+    /// The daemon connection the engine's process lives under, which reports
+    /// its exit; `None` for an engine whose process this client did not
+    /// start.
+    control: Option<Mutex<Connection>>,
 }
 
 impl EngineClient {
@@ -155,14 +163,15 @@ impl EngineClient {
     pub fn over(stream: UnixStream, info: EngineInfo, stats: StatsSink) -> anyhow::Result<Self> {
         let reader = Connection::from_unix(stream.try_clone()?)?;
         let writer = Connection::from_unix(stream)?;
-        Self::new(reader, writer, info, stats, None)
+        Self::new(reader, writer, info, EngineState::Ready, stats, None)
     }
 
     /// A client of the engine read through `reader` and written through
     /// `writer`, two ends of one connection over which the engine reported
-    /// itself ready with `info`; frames `reader` already holds are filed
-    /// first. `stats` receives the schedulers' statistics, and `keep` lives
-    /// as long as the client.
+    /// itself in `state` (ready or standing by) with `info`; frames `reader`
+    /// already holds are filed first. `stats` receives the schedulers'
+    /// statistics. `control` is the daemon connection the engine's process
+    /// lives under, which the client keeps; the process ends with it.
     ///
     /// # Errors
     ///
@@ -171,10 +180,11 @@ impl EngineClient {
         reader: Connection,
         writer: Connection,
         info: EngineInfo,
+        state: EngineState,
         stats: StatsSink,
-        keep: Option<Box<dyn Send + Sync>>,
+        control: Option<Connection>,
     ) -> anyhow::Result<Self> {
-        let (state, _) = watch::channel(EngineState::Ready);
+        let (state, _) = watch::channel(state);
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             requests: Mutex::default(),
@@ -191,7 +201,7 @@ impl EngineClient {
             shared,
             info,
             reader: Mutex::new(Some(thread)),
-            _keep: keep,
+            control: control.map(Mutex::new),
         })
     }
 
@@ -271,15 +281,113 @@ impl EngineClient {
         Ok((stream, scheduler))
     }
 
+    /// Promotes a standing-by engine: its workers take write access to the
+    /// storages they mapped and serve. Waits until the engine reports that
+    /// it serves; an engine that serves already is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine reports that its promotion failed, or its
+    /// connection closes first.
+    pub async fn promote(&self) -> Result<(), SubmitError> {
+        let mut states = self.states();
+        if *states.borrow_and_update() == EngineState::Standby {
+            self.shared
+                .send(to_engine::Kind::Engine(wire::EngineCommand {
+                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote {})),
+                }));
+        }
+        loop {
+            match states.borrow_and_update().clone() {
+                EngineState::Ready => return Ok(()),
+                EngineState::Failed(reason) => return Err(SubmitError::Unavailable(reason)),
+                EngineState::Closed | EngineState::Draining => {
+                    return Err(SubmitError::Unavailable(
+                        "the engine ended before it served".to_owned(),
+                    ));
+                }
+                EngineState::Standby => {}
+            }
+            if states.changed().await.is_err() {
+                return Err(SubmitError::Unavailable(
+                    "the engine's client closed".to_owned(),
+                ));
+            }
+        }
+    }
+
+    /// Waits at most `timeout` for the engine's process to exit, as the
+    /// daemon that started it reports, and returns its exit status; `None`
+    /// for an engine whose process this client did not start.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon connection fails or the process does not exit
+    /// in time.
+    pub fn await_exit(&self, timeout: Duration) -> anyhow::Result<Option<String>> {
+        use proto::process::{Downstream, Event as ProcessEvent, downstream, event};
+
+        let Some(control) = &self.control else {
+            return Ok(None);
+        };
+        let mut control = lock(control);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            while let Some(message) = control.try_recv::<Downstream>()? {
+                if let Some(downstream::Kind::Event(ProcessEvent {
+                    kind: Some(event::Kind::Exit(exit)),
+                })) = message.kind
+                {
+                    return Ok(Some(exit.status));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "the engine process did not exit within {timeout:?}"
+            );
+            control.wait(remaining.min(READ_INTERVAL))?;
+        }
+    }
+
+    /// The requests submitted to the engine that have not ended.
+    pub fn in_flight(&self) -> usize {
+        lock(&self.shared.requests).len()
+    }
+
     /// Commands the engine to drain: it admits nothing more, ends every
     /// token request that resumes from its generated tokens as migratable,
-    /// and finishes the rest. Returns at once; the engine reports
-    /// [`EngineState::Draining`].
-    pub fn drain(&self) {
+    /// and finishes the rest. Waits until the engine reports
+    /// [`EngineState::Draining`]; the requests in flight end after that, as
+    /// [`Self::in_flight`] counts.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine fails or its connection closes before it
+    /// drains.
+    pub async fn drain(&self) -> Result<(), SubmitError> {
+        let mut states = self.states();
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Drain(wire::Drain {})),
             }));
+        loop {
+            match states.borrow_and_update().clone() {
+                EngineState::Draining => return Ok(()),
+                EngineState::Failed(reason) => return Err(SubmitError::Unavailable(reason)),
+                EngineState::Closed => {
+                    return Err(SubmitError::Unavailable(
+                        "the engine ended before it drained".to_owned(),
+                    ));
+                }
+                EngineState::Ready | EngineState::Standby => {}
+            }
+            if states.changed().await.is_err() {
+                return Err(SubmitError::Unavailable(
+                    "the engine's client closed".to_owned(),
+                ));
+            }
+        }
     }
 
     /// Commands the engine to shut down, finishing every request in flight
@@ -366,6 +474,18 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 shared.state.send_replace(EngineState::Failed(state.error));
             }
             Some(from_engine::Kind::State(state))
+                if state.state == wire::EngineState::Ready as i32 =>
+            {
+                // A standing-by engine was promoted.
+                shared.state.send_if_modified(|current| {
+                    let standby = *current == EngineState::Standby;
+                    if standby {
+                        *current = EngineState::Ready;
+                    }
+                    standby
+                });
+            }
+            Some(from_engine::Kind::State(state))
                 if state.state == wire::EngineState::Draining as i32 =>
             {
                 shared.state.send_if_modified(|current| {
@@ -382,14 +502,16 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
         shared.state.send_replace(EngineState::Closed);
     }
-    // Every request still in flight ends with the engine.
+    // Every request still in flight leaves with the lost engine as
+    // migratable: the daemon submits one that resumes from its generated
+    // tokens to the engine that serves next, and fails any other.
     let pending: Vec<(RequestId, Pending)> = lock(&shared.requests).drain().collect();
     for (_, mut request) in pending {
         if let Some(answer) = request.accepted.take() {
             let _ = answer.send(None);
         }
-        let _ = request.events.send(Event::Error {
-            message: "the engine process ended".to_owned(),
+        let _ = request.events.send(Event::Migratable {
+            cause: proto::request::MigrationCause::Loss,
         });
     }
 }

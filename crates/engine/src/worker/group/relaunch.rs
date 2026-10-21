@@ -1,6 +1,6 @@
-//! Failure domains: the worker groups replaced together after a failure.
+//! Relaunch: the worker groups replaced together after a failure.
 //!
-//! A failure domain is one worker group, or every worker group that shares
+//! A relaunch covers one worker group, or every worker group that shares
 //! an expert world: their workers hold that world's communicators and
 //! exchange tokens at every expert layer, so no group can replace its
 //! workers alone. A group that keeps a parked standby promotes it instead
@@ -15,9 +15,10 @@
 //! each group its workers; each group installs them on its next poll. The
 //! relaunch takes as long as the ranks need to start, build their models and
 //! capture their graphs, and the scheduler threads keep serving their other
-//! groups meanwhile. Schedulers fail their in-flight requests on the
-//! domain when their group arrives, and admit work for it again once it
-//! installed its workers. Weights and exclusive memory come back from the
+//! groups meanwhile. When their group arrives, schedulers end their
+//! in-flight token requests on it as migratable, which the daemon submits
+//! again and which wait for the relaunched workers, and fail the others;
+//! they admit work for the group again once it installed its workers. Weights and exclusive memory come back from the
 //! Storage Server.
 //!
 //! A group that closes during a round cancels its relaunch
@@ -38,7 +39,7 @@ use crate::worker::processes::Processes;
 use crate::worker::registry::Registry;
 
 /// The groups replaced together, and their replacement rounds.
-pub(super) struct FailureDomain {
+pub(super) struct Relaunch {
     registry: Registry,
     processes: Processes,
     claims: StorageClaims,
@@ -59,21 +60,21 @@ struct Round {
     /// group takes them.
     replacements: Vec<Option<Result<Vec<WorkerProcess>, String>>>,
     /// The relaunch running, from the last arrival until it posts.
-    relaunch: Option<Relaunch>,
+    relaunch: Option<Running>,
     /// Set once a group of the domain closes: no relaunch starts or posts
     /// afterwards.
     closing: bool,
 }
 
 /// A relaunch running on its own thread.
-struct Relaunch {
+struct Running {
     /// The startup cancellation every relaunched rank shares until the
     /// relaunch is ready (`launch_all`).
     cancel: Arc<AtomicBool>,
     thread: JoinHandle<()>,
 }
 
-impl FailureDomain {
+impl Relaunch {
     /// A domain of `wakers.len()` groups, which relaunches through the
     /// deployment's `registry`, `processes` and `claims`.
     pub(super) fn new(
@@ -174,7 +175,7 @@ impl FailureDomain {
             .name("uniserve-relaunch".into())
             .spawn(move || domain.relaunch(arguments, startup));
         match spawned {
-            Ok(thread) => round.relaunch = Some(Relaunch { cancel, thread }),
+            Ok(thread) => round.relaunch = Some(Running { cancel, thread }),
             Err(error) => {
                 let message = format!("starting the relaunch thread: {error}");
                 Self::post(&mut round, Err(message));

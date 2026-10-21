@@ -80,6 +80,9 @@ enum EngineState {
   // Draining: it admits nothing more, has ended its token requests as
   // migratable and finishes the rest.
   ENGINE_STATE_DRAINING = 4;
+  // Standing by: its workers are loaded, mapped the running engine's
+  // storages without writing them and parked; it serves once promoted.
+  ENGINE_STATE_STANDBY = 5;
 }
 
 // What a ready engine serves.
@@ -96,6 +99,15 @@ message EngineInfo {
   uint32 latent_encoding_units = 3;
   // The engine's schedulers, one per DP rank.
   uint32 schedulers = 4;
+  // The prefix cache units of each worker group, which an engine standing
+  // by for this one maps.
+  repeated GroupCacheUnits cache_units = 5;
+}
+
+// The prefix cache units one worker group holds.
+message GroupCacheUnits {
+  string worker_group = 1;
+  uint32 units = 2;
 }
 
 // Requests submitted together: the engine queues every one of them before it
@@ -163,11 +175,14 @@ message EngineCommand {
     // Admit nothing more and end every token request that resumes from its
     // generated tokens as migratable; the other requests finish.
     Drain drain = 2;
+    // A standing-by engine's workers take write access and serve.
+    Promote promote = 3;
   }
 }
 
 message Shutdown {}
 message Drain {}
+message Promote {}
 
 // One scheduler's statistics of the last reporting interval.
 message Stats {
@@ -573,6 +588,17 @@ message EngineSpec {
   Video video = 12;
   Experts experts = 13;
   ModelFacts model_facts = 14;
+  // Present for an engine that stands by for the running one: its workers
+  // map the running engine's weights and exclusive storages without writing
+  // them, park, and serve once the engine is promoted.
+  Standby standby = 15;
+}
+
+// What a standing-by engine adopts of the engine it stands by for.
+message Standby {
+  // Each worker group's prefix cache units, whose cache planes the
+  // standby's ranks map.
+  repeated GroupCacheUnits cache_units = 1;
 }
 
 // Where the ranks run: a deployment file, or the shorthand.

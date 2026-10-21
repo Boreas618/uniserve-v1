@@ -1434,6 +1434,31 @@ impl Executor for WorkerExecutor {
             first_error.map_or(Ok(()), Err)
         })
     }
+
+    /// Promotes every group's standing-by ranks together
+    /// (`WorkerGroup::promote_ranks`).
+    fn promote(&mut self) -> anyhow::Result<()> {
+        std::thread::scope(|scope| {
+            let promoting = self
+                .workers
+                .iter_mut()
+                .map(|worker| scope.spawn(|| worker.1.promote_ranks()))
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for handle in promoting {
+                let result = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("worker promotion thread panicked"))
+                    .and_then(|result| result);
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
+    }
 }
 
 #[cfg(test)]

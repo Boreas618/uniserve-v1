@@ -62,7 +62,9 @@ impl Scheduler {
 impl Scheduler {
     /// Fails every submitted call while preserving requests that can be rescheduled.
     ///
-    /// Every request owning an in-flight call fails with `msg`; requests with
+    /// Every request owning an in-flight call fails with `msg`, but a token
+    /// request that resumes from its generated tokens leaves as migratable
+    /// (`MigrationCause::Loss`) for the daemon to submit again; requests with
     /// no call in flight stay queued or running. The lifecycle commands of
     /// the dropped batches are acknowledged as if they had completed.
     pub(in crate::scheduler) fn fail_all_inflight(&mut self, msg: &str) {
@@ -75,6 +77,8 @@ impl Scheduler {
         for id in ids {
             if self.media_state(id).is_some() {
                 self.finish_media(id, DiffusionTerminal::Failed(msg.to_string()));
+            } else if self.migrates_on_loss(id) {
+                self.migrate_request(id, MigrationCause::Loss);
             } else if self.running.contains_key(&id) {
                 self.emit(
                     id,
@@ -85,6 +89,18 @@ impl Scheduler {
                 self.finish(id, FinishReason::Error);
             }
         }
+    }
+
+    /// Whether running request `id` leaves as migratable when the workers
+    /// that hold it are lost: a token request that resumes from its
+    /// generated tokens, not already finishing, on a deployment that does
+    /// not generate in canvases.
+    fn migrates_on_loss(&self, id: RequestId) -> bool {
+        self.config.canvas.is_none()
+            && !self.inflight.pending_finishes.contains_key(&id)
+            && self.running.get(&id).is_some_and(|state| {
+                state.req.is_migratable() && !state.terminal_intent.is_terminal()
+            })
     }
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
@@ -195,13 +211,24 @@ impl Scheduler {
 
         // Fail each affected request that is still on the named epoch: a media
         // request records a failure intent, or a rejection with the worker's
-        // reason when the worker refused it; a token request emits an error
+        // reason when the worker refused it. A token request that resumes from
+        // its generated tokens leaves as migratable once its in-flight calls
+        // drain, after every token it generated, unless the worker refused it
+        // or it already finishes; the daemon submits it again, and it waits
+        // for the relaunched workers. Any other token request emits an error
         // unless an error finish is already pending, and defers an error
         // finish until its in-flight calls drain.
         let engine_id = self.engine_id;
+        let migrates = self.config.canvas.is_none()
+            && loss
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.code)
+                .is_none_or(|code| code != ipc::ErrorCode::InputError);
         for request in requests {
             let id = request.request_id;
             let refusal = loss.refusals.get(&request);
+            let mut migrating = false;
             let error_emitted = self
                 .inflight
                 .pending_finishes
@@ -219,27 +246,37 @@ impl Scheduler {
                     continue;
                 }
                 state.output.decoder_boundaries.clear();
-                if !error_emitted {
-                    self.emit(
+                if migrates
+                    && refusal.is_none()
+                    && state.req.is_migratable()
+                    && !state.terminal_intent.is_terminal()
+                    && !self.inflight.pending_finishes.contains_key(&id)
+                {
+                    state.terminal_intent = TerminalIntent::Migrate(MigrationCause::Loss);
+                    migrating = true;
+                } else {
+                    if !error_emitted {
+                        self.emit(
+                            id,
+                            Event::Error {
+                                message: loss.message.clone(),
+                            },
+                        );
+                    }
+                    let terminal_published = self
+                        .inflight
+                        .pending_finishes
+                        .get(&id)
+                        .is_some_and(|finish| finish.terminal_published);
+                    self.inflight.pending_finishes.insert(
                         id,
-                        Event::Error {
-                            message: loss.message.clone(),
+                        PendingFinish {
+                            reason: FinishReason::Error,
+                            stop_reason: None,
+                            terminal_published,
                         },
                     );
                 }
-                let terminal_published = self
-                    .inflight
-                    .pending_finishes
-                    .get(&id)
-                    .is_some_and(|finish| finish.terminal_published);
-                self.inflight.pending_finishes.insert(
-                    id,
-                    PendingFinish {
-                        reason: FinishReason::Error,
-                        stop_reason: None,
-                        terminal_published,
-                    },
-                );
             }
             // A later completion may already be queued behind a call the
             // failure retired. With that call gone it reaches the front of the
@@ -286,7 +323,7 @@ impl Scheduler {
                     };
                     self.finish_media(id, terminal);
                 }
-            } else if self.running.contains_key(&id) {
+            } else if self.running.contains_key(&id) && !migrating {
                 self.finish_after_inflight(id, FinishReason::Error, None);
             }
         }
@@ -295,8 +332,10 @@ impl Scheduler {
     /// Fails every queued and running request and releases scheduler-owned resources.
     ///
     /// Covers queued media submissions and every running media and token
-    /// request. Queued token requests in `waiting` are not touched: every
-    /// caller latches engine-fatal first, and `run` then stops and calls
+    /// request; a token request that resumes from its generated tokens
+    /// leaves as migratable (`MigrationCause::Loss`) instead. Queued token
+    /// requests in `waiting` are not touched: every caller latches
+    /// engine-fatal first, and `run` then stops and calls
     /// `abort_all_requests`. The dropped batches' lifecycle commands are
     /// discarded without acknowledgement.
     pub(in crate::scheduler) fn fail_all_running(&mut self, message: &str) {
@@ -314,6 +353,10 @@ impl Scheduler {
         }
         let ids = self.running.keys().copied().collect::<Vec<_>>();
         for id in ids {
+            if self.migrates_on_loss(id) {
+                self.migrate_request(id, MigrationCause::Loss);
+                continue;
+            }
             self.emit(
                 id,
                 Event::Error {

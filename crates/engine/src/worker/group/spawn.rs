@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::Context;
 
 use super::WorkerGroup;
-use super::domain::FailureDomain;
+use super::relaunch::Relaunch;
 use super::routing::refuse_shared_storage_off_engine_host;
 use crate::worker::WorkerProcessArgs;
 use crate::worker::claims::{Claims, StorageClaims};
@@ -329,14 +329,14 @@ impl WorkerGroup {
             .map(|_| crate::handle::WakeSignal::new())
             .collect::<std::io::Result<Vec<_>>>()?;
         let domain = |wakes: &[crate::handle::WakeSignal]| {
-            Arc::new(FailureDomain::new(
+            Arc::new(Relaunch::new(
                 Arc::clone(&registry),
                 Arc::clone(&processes),
                 Arc::clone(&claims),
                 wakes.iter().map(crate::handle::WakeSignal::waker).collect(),
             ))
         };
-        let domains: Vec<(Arc<FailureDomain>, usize)> =
+        let domains: Vec<(Arc<Relaunch>, usize)> =
             if arguments.iter().any(|args| args.expert_parallel.is_some()) {
                 let shared = domain(&wakes);
                 (0..wakes.len())
@@ -350,7 +350,7 @@ impl WorkerGroup {
             };
 
         let mut workers = Vec::with_capacity(groups.len());
-        for (((ranks, args), failure_domain), failure_wake) in
+        for (((ranks, args), relaunch), failure_wake) in
             groups.into_iter().zip(arguments).zip(domains).zip(wakes)
         {
             workers.push(Self::from_ranks(
@@ -359,7 +359,7 @@ impl WorkerGroup {
                 Arc::clone(&processes),
                 Arc::clone(&registry),
                 Arc::clone(&claims),
-                failure_domain,
+                relaunch,
                 failure_wake,
             )?);
         }
@@ -371,7 +371,7 @@ impl WorkerGroup {
     }
 
     /// Checks that the ranks' startup reports describe one group and builds
-    /// it, replaced with `failure_domain` and woken by `failure_wake`.
+    /// it, replaced with `relaunch` and woken by `failure_wake`.
     ///
     /// Each rank validated the report it built; the group registers each
     /// rank's incarnation as the rank it launched. The group takes rank 0's report:
@@ -387,7 +387,7 @@ impl WorkerGroup {
         processes: Processes,
         registry: Registry,
         claims: StorageClaims,
-        failure_domain: (Arc<FailureDomain>, usize),
+        relaunch: (Arc<Relaunch>, usize),
         failure_wake: crate::handle::WakeSignal,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
@@ -560,7 +560,7 @@ impl WorkerGroup {
             readiness_changed: false,
             closed: false,
             failure: None,
-            failure_domain,
+            relaunch,
             failure_wake,
             awaiting: None,
             standby: None,

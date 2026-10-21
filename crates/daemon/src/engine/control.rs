@@ -18,7 +18,7 @@ use proto::Connection;
 use proto::process::{self, downstream, event, hello, reply, request, upstream};
 use proto::request::wire;
 
-use crate::engine::client::{EngineClient, StatsSink};
+use crate::engine::client::{EngineClient, EngineState, StatsSink};
 
 /// The worker group a daemon supervises an engine process under.
 const ENGINE_GROUP: &str = "engine";
@@ -45,14 +45,12 @@ pub struct EngineControl {
     host: String,
     /// The deployment the engines serve.
     deployment: String,
-    /// The `uniserve` executable of the engine's build.
-    executable: PathBuf,
     next_engine: AtomicU64,
 }
 
 impl EngineControl {
     /// Binds the request socket at `socket` for the engines of `deployment`,
-    /// which `executable` runs on host `host` through the daemon whose
+    /// which run on host `host` through the daemon whose
     /// process socket is `processes`.
     ///
     /// # Errors
@@ -63,7 +61,6 @@ impl EngineControl {
         processes: String,
         host: String,
         deployment: String,
-        executable: PathBuf,
     ) -> anyhow::Result<Self> {
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
@@ -77,15 +74,16 @@ impl EngineControl {
             processes,
             host,
             deployment,
-            executable,
             next_engine: AtomicU64::new(1),
         })
     }
 
     /// Starts an engine process that serves `spec` and returns its client
-    /// once it reports that it serves; `stats` receives its schedulers'
-    /// statistics. Blocks for the engine's whole start, its workers' loading
-    /// included.
+    /// once it reports that it serves, or, for a spec that stands by for the
+    /// running engine (`EngineSpec::standby`), once it reports that it
+    /// stands by; `stats` receives its schedulers' statistics. The process
+    /// runs the executable of the spec's build (`workers.executable`).
+    /// Blocks for the engine's whole start, its workers' loading included.
     ///
     /// # Errors
     ///
@@ -94,7 +92,13 @@ impl EngineControl {
     /// reports that its start failed.
     pub fn start(&self, spec: wire::EngineSpec, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
-        let mut control = self.spawn(engine)?;
+        let executable = spec
+            .workers
+            .as_ref()
+            .map(|workers| workers.executable.clone())
+            .context("the engine spec states no workers")?;
+        let standby = spec.standby.is_some();
+        let mut control = self.spawn(engine, &executable)?;
         let stream = self.accept(engine, &mut control)?;
         let mut reader = Connection::from_unix(stream.try_clone()?)?;
         let mut writer = Connection::from_unix(stream)?;
@@ -131,17 +135,30 @@ impl EngineControl {
                 Some(wire::FromEngine {
                     kind: Some(wire::from_engine::Kind::State(state)),
                 }) => match wire::EngineState::try_from(state.state) {
-                    Ok(wire::EngineState::Ready) => {
+                    Ok(started @ (wire::EngineState::Ready | wire::EngineState::Standby))
+                        if (started == wire::EngineState::Standby) == standby =>
+                    {
                         let info = state.info.context("the engine reported no info")?;
-                        tracing::info!(engine, schedulers = info.schedulers, "the engine serves");
+                        let state = if standby {
+                            tracing::info!(engine, "the engine stands by");
+                            EngineState::Standby
+                        } else {
+                            tracing::info!(
+                                engine,
+                                schedulers = info.schedulers,
+                                "the engine serves"
+                            );
+                            EngineState::Ready
+                        };
                         return EngineClient::new(
                             reader,
                             writer,
                             info.into(),
+                            state,
                             stats,
                             // The process lives as long as its control
                             // connection.
-                            Some(Box::new(std::sync::Mutex::new(control))),
+                            Some(control),
                         );
                     }
                     Ok(wire::EngineState::Failed) => {
@@ -159,9 +176,9 @@ impl EngineControl {
     }
 
     /// Connects to the daemon's process socket and has it start engine
-    /// `engine` on this node; returns the control connection the process
-    /// lives under.
-    fn spawn(&self, engine: u64) -> anyhow::Result<Connection> {
+    /// `engine` as `executable` on this node; returns the control connection
+    /// the process lives under.
+    fn spawn(&self, engine: u64, executable: &str) -> anyhow::Result<Connection> {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.send(&process::Hello {
@@ -181,11 +198,7 @@ impl EngineControl {
             welcome.refusal
         );
 
-        let executable = self
-            .executable
-            .to_str()
-            .context("the engine executable's path is not valid text")?
-            .to_owned();
+        let executable = executable.to_owned();
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,

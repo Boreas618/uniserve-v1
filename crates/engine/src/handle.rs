@@ -491,6 +491,9 @@ pub enum Command {
     /// Ends every token request that resumes from its generated tokens as
     /// migratable, for the cause given; other requests go on.
     Migrate(MigrationCause),
+    /// Promotes the executor's standing-by workers (`Executor::promote`)
+    /// and answers with the outcome.
+    Promote(crossbeam_channel::Sender<Result<(), String>>),
     /// Requests orderly engine shutdown.
     Shutdown,
 }

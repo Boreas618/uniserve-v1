@@ -1399,6 +1399,13 @@ pub trait Executor: Send {
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
     /// Closes the executor and its physical workers.
     fn close(&mut self) -> Result<(), ExecutorError>;
+    /// Promotes workers that started standing by for those of another
+    /// engine: each takes write access to the storages it mapped and
+    /// serves. The default suits an executor whose workers serve from the
+    /// start.
+    fn promote(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

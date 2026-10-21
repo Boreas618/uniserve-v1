@@ -31,7 +31,7 @@ impl WorkerGroup {
     /// group that is its own failure domain on the engine's host.
     fn keeps_standby(&self) -> bool {
         self.process_args.keep_standby
-            && self.failure_domain.0.groups() == 1
+            && self.relaunch.0.groups() == 1
             && self
                 .process_args
                 .ranks
@@ -140,6 +140,24 @@ impl WorkerGroup {
                 worker.terminate();
             }
         }
+    }
+
+    /// Promotes the group's own ranks, which started standing by for those of
+    /// the engine this one replaces (`WorkerProcessArgs::standby`): each
+    /// takes write access to the storages it mapped, once the Storage Server
+    /// has the previous writer out, and serves. A group whose ranks serve
+    /// already is left as it is; the group's later launches serve at once.
+    pub(crate) fn promote_ranks(&mut self) -> anyhow::Result<()> {
+        if !self.process_args.standby {
+            return Ok(());
+        }
+        let timeout = self.process_args.watchdog_timeout;
+        for worker in &mut self.workers {
+            worker.promote(timeout)?;
+        }
+        self.process_args.standby = false;
+        tracing::info!(worker = %self.process_args.worker_id, "the standing-by ranks serve");
+        Ok(())
     }
 
     /// Promote the parked standby in place of the failed ranks, which the

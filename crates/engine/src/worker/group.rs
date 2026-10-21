@@ -17,7 +17,7 @@
 //! protocol violations, and every other error replace the whole rank group
 //! (`recover_workers`) and invalidate every request resident on it. A
 //! parked standby replaces the group within the call (`standby`); otherwise
-//! its failure domain relaunches it on a thread of its own (`domain`) while
+//! its failure domain relaunches it on a thread of its own (`relaunch`) while
 //! the group's scheduler serves its other groups, and the group installs the
 //! relaunched ranks on a later poll.
 //!
@@ -25,7 +25,7 @@
 //! group's ranks on their nodes before any group waits for its ranks'
 //! registrations and startup capabilities.
 
-mod domain;
+mod relaunch;
 mod reports;
 pub(crate) mod routing;
 mod spawn;
@@ -91,10 +91,10 @@ pub struct WorkerGroup {
     closed: bool,
     /// Rank loss is reported after all already-agreed results have been delivered.
     failure: Option<anyhow::Error>,
-    /// The failure domain the group is replaced with, and the group's
-    /// position in it (`domain::FailureDomain`): the group alone, or every
+    /// The relaunch the group is replaced with, and the group's
+    /// position in it (`relaunch::Relaunch`): the group alone, or every
     /// group of its expert world.
-    failure_domain: (Arc<domain::FailureDomain>, usize),
+    relaunch: (Arc<relaunch::Relaunch>, usize),
     /// Wakes the group's scheduler when its domain starts or finishes a
     /// replacement; each owner keeps its own, so an idle group observes the
     /// domain even when another consumes its notification first.
@@ -263,7 +263,7 @@ impl WorkerGroup {
     /// A parked standby replaces the ranks within the call. Otherwise the
     /// group arrives at its failure domain, whose relaunch runs on a thread
     /// of its own, and installs the relaunched workers when it is polled
-    /// after they are posted (`install_from_domain`); it is not ready
+    /// after they are posted (`install_relaunched`); it is not ready
     /// meanwhile. Returns the [`WorkerFailure`] that reports the lost
     /// allocations: recovery always invalidates resident work, so the result
     /// is an error either way.
@@ -280,7 +280,7 @@ impl WorkerGroup {
         // shared world while this group terminates its ranks. A group that
         // keeps a parked standby is its own domain and starts no round
         // unless the promotion fails.
-        let (domain, index) = self.failure_domain.clone();
+        let (domain, index) = self.relaunch.clone();
         let promotes = self.standby_parked();
         if !promotes {
             domain.fail(&self.process_args.worker_id, cause);
@@ -374,11 +374,11 @@ impl WorkerGroup {
     /// than the lost ones, closes the group, and the error is a
     /// [`WorkerFailure`] without endpoints or requests, whose message says
     /// why: the loss already reported everything the group held.
-    fn install_from_domain(&mut self) -> anyhow::Result<bool> {
+    fn install_relaunched(&mut self) -> anyhow::Result<bool> {
         let Some(expected) = &self.awaiting else {
             return Ok(self.is_ready());
         };
-        let (domain, index) = &self.failure_domain;
+        let (domain, index) = &self.relaunch;
         let Some(replacement) = domain.take_replacement(*index) else {
             return Ok(false);
         };
@@ -548,7 +548,7 @@ impl WorkerGroup {
         if self.awaiting.is_some() {
             return None;
         }
-        let (domain, index) = &self.failure_domain;
+        let (domain, index) = &self.relaunch;
         domain
             .pending_failure(*index)
             .map(|cause| anyhow::anyhow!("shared expert communicator failed: {cause}"))
@@ -993,10 +993,10 @@ impl WorkerGroup {
         self.poll_standby();
         // A group waiting for its failure domain's relaunch makes no progress
         // until it installs the workers the domain posts.
-        if self.awaiting.is_some() && !self.install_from_domain()? {
+        if self.awaiting.is_some() && !self.install_relaunched()? {
             if !self.closed {
                 crate::worker::park_descriptors(&self.progress_fds(), timeout)?;
-                self.install_from_domain()?;
+                self.install_relaunched()?;
             }
             return Ok(None);
         }
@@ -1066,7 +1066,7 @@ impl WorkerGroup {
         for worker in &self.workers {
             worker.cancel_startup();
         }
-        let (domain, _) = &self.failure_domain;
+        let (domain, _) = &self.relaunch;
         if domain.failing() || self.awaiting.is_some() {
             // A failed collective cannot drain. Terminate the ranks and stop
             // their processes before dropping storage; a relaunch the domain

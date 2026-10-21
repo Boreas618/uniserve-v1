@@ -22,6 +22,7 @@
 //! its token position alone.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use proto::request::{Event, GenerationRequest, MigrationCause, Request};
 use tokio::sync::mpsc;
@@ -83,6 +84,7 @@ impl Migrator {
             losses: 0,
             pending: None,
             resumed: false,
+            migrated_at: None,
             open: true,
             on_finish: None,
         };
@@ -114,6 +116,9 @@ pub struct RequestEvents {
     /// Whether the stream resumed on another engine, whose scheduling event
     /// repeats one the consumer received.
     resumed: bool,
+    /// When the request's last migration began, until the engine that serves
+    /// it next delivers its first token.
+    migrated_at: Option<Instant>,
     /// Whether the request may still be cancelled.
     open: bool,
     on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -131,6 +136,7 @@ impl RequestEvents {
             losses: 0,
             pending: None,
             resumed: false,
+            migrated_at: None,
             open: true,
             on_finish: None,
         }
@@ -244,8 +250,15 @@ impl RequestEvents {
         }
     }
 
-    /// Appends generated tokens to the request a migration submits.
+    /// Appends generated tokens to the request a migration submits; the
+    /// first after a migration ends its wait, which is logged.
     fn keep(&mut self, ids: &[u32]) {
+        if let Some(migrated_at) = self.migrated_at.take() {
+            tracing::info!(
+                wait_ms = migrated_at.elapsed().as_millis() as u64,
+                "a migrated request generates on the engine that serves it"
+            );
+        }
         if let Some(request) = &mut self.request {
             request.generated_token_ids.extend_from_slice(ids);
         }
@@ -260,6 +273,7 @@ impl RequestEvents {
     /// request does not resume from its tokens, was cancelled, lost its
     /// engine more often than it may, or could not be submitted again.
     async fn migrate(&mut self, cause: MigrationCause) -> Result<(), Event> {
+        let started = Instant::now();
         let failed = |message: String| Event::Error { message };
         if !self.open {
             return Err(failed(
@@ -297,6 +311,7 @@ impl RequestEvents {
         // The previous engine's stream ended with its migratable event.
         self.stream = stream;
         self.resumed = true;
+        self.migrated_at = Some(started);
         Ok(())
     }
 
@@ -399,7 +414,7 @@ mod tests {
             }
         }
         hold.serve(client());
-        first.drain();
+        first.drain().await.unwrap();
 
         let finished = loop {
             match next(&mut events).await {
@@ -441,6 +456,7 @@ mod tests {
             losses: 0,
             pending: None,
             resumed: false,
+            migrated_at: None,
             open: true,
             on_finish: None,
         }
