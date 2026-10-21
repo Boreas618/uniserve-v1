@@ -80,8 +80,8 @@ pub struct Claim(pub [u8; 16]);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// The head of a deployment on this host: the head itself, or on another
-    /// host the head's launcher there.
+    /// The holder of a deployment's claim on this host: the host's daemon,
+    /// for the head of the deployment.
     Head { deployment: String },
     /// A worker of `scope`, started by the launch `generation` of its group,
     /// for the head that holds `claim`.

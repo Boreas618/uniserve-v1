@@ -1,4 +1,4 @@
-//! The connection between the head and one rank or launcher.
+//! The connection between the head and one rank.
 //!
 //! A [`Channel`] is one end of a stream connection that carries
 //! [`Frame`]s, one after another: each frame's length field tells the reader
@@ -48,7 +48,7 @@ const UNIX_PREFIX: &str = "unix:";
 /// fails.
 ///
 /// A host that dies sends no close. Without this bound its ranks' requests
-/// would wait on it, and a rank or launcher whose head's host died would
+/// would wait on it, and a rank whose head's host died would
 /// keep its devices, for as long as the connection stayed silent. The system
 /// default, two hours, is no bound in practice; this value is chosen, not
 /// derived.
@@ -445,6 +445,16 @@ impl Channel {
                 .map(Some)
                 .map_err(|error| transport("reading a channel's peer address", error)),
         }
+    }
+
+    /// Closes the connection in both directions, as dropping it would, while
+    /// the channel value lives on: the peer observes the close at once, and
+    /// every later call fails.
+    pub fn shutdown(&mut self) {
+        let _ = match &self.stream {
+            Stream::Unix(stream) => stream.shutdown(std::net::Shutdown::Both),
+            Stream::Tcp(stream) => stream.shutdown(std::net::Shutdown::Both),
+        };
     }
 
     /// Returns a handle that fires this channel's local wake.

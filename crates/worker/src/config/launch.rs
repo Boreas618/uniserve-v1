@@ -31,7 +31,7 @@ pub struct IpcConfig {
 
 /// Where a group's ranks meet to form their host-collective mesh.
 ///
-/// Only the group's first rank holds `listen_fd`: the launcher bound the
+/// Only the group's first rank holds `listen_fd`: its daemon bound the
 /// listening socket before the rank existed and the rank inherited it, so
 /// the port is never released between reservation and use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,9 +257,9 @@ fn transfer_backends(value: &str) -> Result<Vec<String>, DescriptorError> {
 
 /// Where this rank's group forms its host-collective mesh.
 ///
-/// The process that spawns the group's first rank, the engine or the
-/// launcher of that rank's host, binds the rendezvous socket before the
-/// rank exists and names it in that rank's descriptor alone.
+/// The daemon that spawns the group's first rank binds the rendezvous
+/// socket before the rank exists, and the engine names it in that rank's
+/// descriptor alone.
 fn rendezvous(descriptor: &LaunchDescriptor) -> Option<RendezvousConfig> {
     text(descriptor.rendezvous_address.as_deref()).map(|address| RendezvousConfig {
         address,

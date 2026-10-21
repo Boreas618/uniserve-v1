@@ -1,8 +1,8 @@
 //! The HTTP server: router assembly, the listener, and graceful shutdown.
 //!
-//! [`serve`] starts the [`Engine`], binds the configured TCP or Unix-domain
-//! listener, and serves the router of the tasks the engine serves until
-//! shutdown. Each API module builds its own routes over the engine
+//! [`serve`] starts this node's daemon and, on the leader, the [`Engine`],
+//! binds the configured TCP or Unix-domain listener, and serves the router
+//! of the tasks the engine serves until shutdown. Each API module builds its own routes over the engine
 //! (`crate::openai`); this module registers them by task, as vLLM registers
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
@@ -11,6 +11,7 @@ mod listener;
 mod middleware;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use axum::body::Bytes;
@@ -21,6 +22,7 @@ use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use daemon::Daemon;
 use observability::METRICS;
 use serde_json::json;
 use thiserror_ext::AsReport as _;
@@ -43,35 +45,84 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
-/// Runs the configured HTTP server until `shutdown` is cancelled.
+/// Runs this node of the deployment until `shutdown` is cancelled.
 ///
-/// The listener is bound once the engine has started, so the port accepts
-/// connections only when the server can answer them. Cancellation before the
-/// engine has started stops the start and returns `Ok(())` without binding a
-/// listener. Once it has started, the server shuts down as [`serve_on`]
-/// describes, and the engine is shut down on every path, which finishes any
-/// request still running as aborted, so a stream that outlived the shutdown
-/// budget ends then.
+/// Every node starts its daemon first, which supervises the node's worker
+/// processes; the leader's waits until every other node's daemon joined. A
+/// node other than the leader then runs only its daemon, until `shutdown`
+/// or until the leader's connection closes.
+///
+/// The leader serves the HTTP API. Its listener is bound once the engine has
+/// started, so the port accepts connections only when the server can answer
+/// them. Cancellation before the engine has started stops the start and
+/// returns `Ok(())` without binding a listener. Once it has started, the
+/// server shuts down as [`serve_on`] describes, and the engine is shut down
+/// on every path, which finishes any request still running as aborted, so a
+/// stream that outlived the shutdown budget ends then. The daemon stops
+/// last, ending whatever process the engine left.
 ///
 /// # Errors
 ///
-/// Fails when the configuration is invalid, the engine cannot start, the
-/// listener cannot be bound or report its address, the server fails, or the
-/// engine shutdown fails.
+/// Fails when the configuration is invalid, the daemon cannot start or
+/// fails, the engine cannot start, the listener cannot be bound or report
+/// its address, the server fails, or the engine shutdown fails.
 pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationToken) -> Result<()> {
     config
         .validate(&stated)
         .context("invalid serving configuration")?;
 
+    // The leader's start waits for the other nodes to join, which blocks.
+    let options = config.daemon_options();
+    let starting = tokio::task::spawn_blocking(move || Daemon::start(options));
+    let daemon = tokio::select! {
+        daemon = starting => daemon
+            .context("the daemon's start did not complete")?
+            .context("failed to start this node's daemon")?,
+        () = shutdown.cancelled() => return Ok(()),
+    };
+    let served = match daemon.address() {
+        Some(address) => lead(&config, &stated, address.to_owned(), &shutdown).await,
+        None => {
+            info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
+            while daemon.is_running() {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
+                }
+            }
+            Ok(())
+        }
+    };
+    let stopped = tokio::task::spawn_blocking(move || {
+        let mut daemon = daemon;
+        daemon.stop()
+    })
+    .await
+    .context("the daemon's stop did not complete")?;
+    served.and(stopped)
+}
+
+/// How often a node other than the leader checks that its daemon still
+/// serves.
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Serves the API on the leader, whose daemon's process socket is `daemon`,
+/// until `shutdown` is cancelled.
+async fn lead(
+    config: &ServeConfig,
+    stated: &Stated,
+    daemon: String,
+    shutdown: &CancellationToken,
+) -> Result<()> {
     let engine = tokio::select! {
-        engine = Engine::start(&config, &stated) => Arc::new(engine?),
+        engine = Engine::start(config, stated, daemon) => Arc::new(engine?),
         () = shutdown.cancelled() => return Ok(()),
     };
     let served = async {
         let listener = Listener::bind(&config.server_config)
             .await
             .context("failed to bind listener for HTTP server")?;
-        serve_on(&engine, listener, &config, &shutdown).await
+        serve_on(&engine, listener, config, shutdown).await
     }
     .await;
     let stopped = engine.shutdown().await;

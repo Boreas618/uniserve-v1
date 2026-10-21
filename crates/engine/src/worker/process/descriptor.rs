@@ -166,7 +166,7 @@ impl Default for WorkerProcessArgs {
             keep_standby: false,
             standby: false,
             cache_units: None,
-            launcher_timeout: std::time::Duration::from_secs(120),
+            daemon: String::new(),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
             ranks: vec![crate::WorkerRank {
@@ -335,9 +335,8 @@ impl WorkerProcessArgs {
             export_backends: names(&export_backends),
             // Every rank of a group meets its peers at this address. The
             // group's first rank accepts them on the socket it inherits at
-            // the named descriptor rather than binding the port itself; a
-            // first rank placed elsewhere has the number filled in by the
-            // launcher that holds its host's reservation.
+            // the named descriptor rather than binding the port itself; the
+            // daemon of its node holds the reservation until it spawns it.
             rendezvous_address: rendezvous.map(str::to_owned),
             rendezvous_listen_fd,
             // A replica sharing its experts joins the expert-parallel union
@@ -459,10 +458,9 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
 /// the rank, so they precede any CUDA or NCCL initialization whatever the
 /// rank imports first; the head's own values win.
 ///
-/// The variables are set explicitly on each rank's command, even where a
-/// local child would inherit them, because a launcher on another host
-/// receives only the variables the command sets and applies them over its
-/// own environment.
+/// The variables are set explicitly on each rank's command, because the
+/// daemon that starts the rank applies only the variables the command sets
+/// over its own environment.
 pub(super) fn worker_environment(
     head: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {

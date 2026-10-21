@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` executable (its `serve`, `launcher`, `worker` and `storage` commands), the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` executable (its `serve`, `worker` and `storage` commands), the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -192,7 +192,7 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 
 ## Repository layout
 
-The [architecture guide](docs/architecture.md) describes how the head, the launchers and the rank processes divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
+The [architecture guide](docs/architecture.md) describes how the daemons, the head and the rank processes divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
 
 ```text
 crates/models/                Model-family request semantics: the MiniMax-H3 video rules
@@ -212,7 +212,7 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
-crates/uniserve/              The `uniserve` executable: `serve`, `launcher`, `worker` and `storage`
+crates/uniserve/              The `uniserve` executable: `serve`, `worker` and `storage`
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls
   worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function

@@ -33,6 +33,7 @@ uniserve serve --config fasth3.toml --print-config
 | `--max-model-len` | `max_model_len` |
 | `--mem-fraction-static` | `mem_fraction_static` |
 | `--host-identity` | `host_identity` |
+| `--nnodes`, `--node-rank`, `--dist-init-addr` | `nnodes`, `node_rank`, `dist_init_addr` |
 | `--worker-executable` | `worker_config.executable` |
 
 `--log-level` and `--log-level-http` set the log levels of the `uniserve` process; every subcommand takes them, before or after its name.
@@ -41,7 +42,7 @@ A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode 
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
-Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the head or a launcher when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes each host page pool (64 GiB unless stated; a pool is one per KV head range of the host's workers, and is allocated and pinned whole when the first worker maps it), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the memory of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the memory it left under the same name.
+Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes each host page pool (64 GiB unless stated; a pool is one per KV head range of the host's workers, and is allocated and pinned whole when the first worker maps it), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the memory of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the memory it left under the same name.
 
 Some tables configure one model family: `chat_config` and `image_fetch_config` chat models (Qwen3, SenseNova, BAGEL, DiffusionGemma); `video_config`, `media_config` and `video_job_config` MiniMax-H3; `readout_config` and `diffusion_generation_config` DiffusionGemma. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
 
@@ -90,7 +91,10 @@ retention = "30m"
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each engine core's group without `worker_groups` |
 | `data_parallel_size` | `1` | Engine cores, each with its own scheduler, KV cache and worker groups; requests go to the engine core with the fewest in flight. With `worker_groups`, the file's model groups form the engine cores as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
-| `host_identity` | `"localhost"` | This process's host name; it runs the ranks placed on this host, and a deployment rank entry without a host names it |
+| `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks placed on this host, and a deployment rank entry without a host names it |
+| `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
+| `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and runs the engine, and requires `model`; every other node runs only its daemon, which joins the leader's |
+| `dist_init_addr` | Unset | The leader's `HOST:PORT`, which the other nodes' daemons join at and the leader binds on every interface; required with several nodes |
 | `lanes` | Unset, no SM partition | Execution lanes, each `{ lane_id, sm_budget, domains }` with optional `max_batch_calls`, `max_batch_tokens` and `max_inflight`; `domains` are `prefill`, `decode` and `flow` |
 
 ### `server_config`
@@ -323,7 +327,7 @@ A `[[worker_groups]]` table takes:
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-memory share for this group |
 
-A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the head's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the host whose launcher starts with `--host-identity rank-1`.
+A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the head's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
 
 A component table takes:
 

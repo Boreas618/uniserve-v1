@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-ipc.workspace = true
 libc.workspace = true
 libloading.workspace = true
 mimalloc.workspace = true

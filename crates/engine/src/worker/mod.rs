@@ -6,18 +6,18 @@
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
 //! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
-//! process and channel, `registry` the listener ranks and launchers connect
-//! to and register at, `rendezvous` the address a group's ranks meet at, and
-//! `launcher` the per-host launchers that start ranks placed on other hosts.
+//! channel, `registry` the listener ranks connect to and register at, and
+//! `processes` the engine's connection to the deployment's daemons, which
+//! start the ranks on every node, hold the sockets their stores serve on and
+//! the deployment's Storage Server claims (`claims`).
 
 mod claims;
 mod executor;
 mod group;
 mod incarnations;
-mod launcher;
 mod process;
+mod processes;
 mod registry;
-mod rendezvous;
 
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
@@ -88,13 +88,9 @@ pub struct WorkerProcessArgs {
         String,
         std::collections::BTreeMap<String, crate::ComponentConfig>,
     >,
-    /// How long the head waits for every other host's launcher to present.
-    ///
-    /// The cluster starts a launcher on each host alongside the head, so this
-    /// covers one that is starting rather than one waiting to be scheduled.
-    /// Deployments differ in how quickly that happens, so it is a launch value
-    /// rather than a constant.
-    pub launcher_timeout: std::time::Duration,
+    /// The leader daemon's process socket, through which the engine starts
+    /// the group's workers on their nodes (`unix:<path>`).
+    pub daemon: String,
     /// How long the group waits for progress of its ranks (a joined result)
     /// while a batch is pending before it treats them as hung and replaces
     /// them, failing the requests they hold (`worker_config.watchdog_timeout`). A rank

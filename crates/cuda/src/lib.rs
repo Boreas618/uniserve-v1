@@ -35,6 +35,7 @@ mod memory;
 pub mod nccl;
 mod nvml;
 pub mod reclaim;
+pub mod shm;
 mod stream;
 mod vmm;
 

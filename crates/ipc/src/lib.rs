@@ -10,10 +10,11 @@
 //! message in the binary encoding its `serde` derive describes. These message
 //! types are the only definition of the protocol, so the engine and the worker
 //! library must be built from the same sources. A [`Channel`] carries the
-//! frames over a stream connection: a Unix socket to a rank on the head's
-//! host, TCP to a rank on another host. A rank connects to the head, sends its
-//! [`Registration`] and receives its [`LaunchDescriptor`]; the worker runtime
-//! (`uniserve worker`) then serves its end until the connection closes.
+//! frames over a stream connection: a Unix socket to a rank on the engine's
+//! node, TCP to a rank on another node. A rank connects to the engine, sends
+//! its [`Registration`] and receives its [`LaunchDescriptor`]; the worker
+//! runtime (`uniserve worker`) then serves its end until the connection
+//! closes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -77,7 +78,6 @@ pub mod error;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
 pub mod launch;
-pub mod launcher;
 pub mod registration;
 
 /// Counter-based random draws of the rank's token sampler.

@@ -78,7 +78,7 @@ fn dispatch(mut signals: std::fs::File, serving: &AtomicBool) {
             super::end(130);
         }
         // Restore the default disposition and deliver the signal again, so
-        // the launcher observes a signal death.
+        // the daemon observes a signal death.
         // SAFETY: plain libc calls with valid arguments.
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);

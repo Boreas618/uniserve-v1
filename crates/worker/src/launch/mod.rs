@@ -101,17 +101,17 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 /// communicators with its peers, or its device contexts.
 ///
 /// The driver names its memory for the process
-/// ([`ipc::launch::remove_event_memory`]); NCCL's names are random,
+/// ([`cuda::shm::remove_event_memory`]); NCCL's names are random,
 /// and those still linked among this process's mappings are its own
-/// ([`ipc::launch::NcclSegments`]). Removing a name leaves every
+/// ([`cuda::shm::NcclSegments`]). Removing a name leaves every
 /// mapping of the object, this process's and those its peers opened, valid
 /// until they end. The removal is best effort: the worker ends whatever it
 /// finds.
 fn release_names() {
     // SAFETY: getuid and getpid have no preconditions.
     let (uid, pid) = unsafe { (libc::getuid(), libc::getpid()) };
-    let _ = ipc::launch::remove_event_memory(uid, pid as u32);
-    if let Ok(segments) = ipc::launch::NcclSegments::mapped_by(None) {
+    let _ = cuda::shm::remove_event_memory(uid, pid as u32);
+    if let Ok(segments) = cuda::shm::NcclSegments::mapped_by(None) {
         let _ = segments.remove();
     }
 }

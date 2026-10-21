@@ -1,8 +1,8 @@
-//! The head's listener and the ranks and launchers that registered there.
+//! The engine's listener and the ranks that registered there.
 //!
-//! The head listens on one Unix socket path and one TCP port for the whole
-//! deployment. A rank connects to the head when it starts, through the Unix
-//! socket on the head's host and through TCP from any other host, and its
+//! The engine listens on one Unix socket path and one TCP port for the whole
+//! deployment. A rank connects to the engine when it starts, through the Unix
+//! socket on the engine's node and through TCP from any other node, and its
 //! first frame is its `Registration`: worker group, rank, launch generation
 //! and build version. [`WorkerRegistry::begin_launch`] numbers each launch of
 //! a group, and [`collect`] gathers the registrations of the
@@ -15,11 +15,8 @@
 //! must not join the relaunch. Such a rank is refused by closing its
 //! connection, which ends it; the relaunch goes on.
 //!
-//! The launcher of another host connects to the same TCP port and registers
-//! its host identity; [`WorkerRegistry::take_launchers`] hands its connection
-//! to the launcher registry (`launcher`).
-//!
-//! A host that runs ranks therefore accepts no inbound connection.
+//! A rank therefore accepts no inbound connection but its group's peer mesh
+//! and its collective store.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -61,8 +58,7 @@ struct RegisteredWorker {
     channel: Channel,
 }
 
-/// The address ranks and launchers connect to, and those that have
-/// registered there.
+/// The address ranks connect to, and those that have registered there.
 pub(crate) struct WorkerRegistry {
     listener: Listener,
     /// Holds the Unix socket's path; dropping it removes the directory.
@@ -75,13 +71,10 @@ pub(crate) struct WorkerRegistry {
     /// Registered ranks of the groups' current launches that the launches
     /// have not taken yet.
     ranks: Vec<RegisteredWorker>,
-    /// Registered launchers the launcher registry has not taken yet, by host.
-    launchers: Vec<(String, Channel)>,
 }
 
 impl WorkerRegistry {
-    /// Binds the Unix socket path and the TCP port ranks and launchers
-    /// connect to.
+    /// Binds the Unix socket path and the TCP port ranks connect to.
     ///
     /// `routable` says whether some rank runs on another host: the TCP port
     /// then binds every interface, and loopback otherwise, since a rank on
@@ -106,7 +99,6 @@ impl WorkerRegistry {
             generations: HashMap::new(),
             connecting: Vec::new(),
             ranks: Vec::new(),
-            launchers: Vec::new(),
         })))
     }
 
@@ -127,11 +119,6 @@ impl WorkerRegistry {
                 Ok(SocketAddr::new(host, port).to_string())
             }
         }
-    }
-
-    /// Returns the TCP address the head listens at, as it was bound.
-    pub(crate) fn tcp_address(&self) -> &str {
-        &self.listener.addresses()[1]
     }
 
     /// Starts a launch of `worker_id` and returns its generation, which the
@@ -181,24 +168,6 @@ impl WorkerRegistry {
         Ok(())
     }
 
-    /// Takes the connection of every launcher that has registered since the
-    /// last call, with the host identity each registered.
-    ///
-    /// Fails when a registration states another build than the head's.
-    pub(crate) fn take_launchers(&mut self) -> anyhow::Result<Vec<(String, Channel)>> {
-        self.serve()?;
-        Ok(std::mem::take(&mut self.launchers))
-    }
-
-    /// Waits a short interval for a new connection or a registration.
-    pub(crate) fn park(&self) -> anyhow::Result<()> {
-        let mut descriptors = self.listener.poll_fds();
-        for channel in &self.connecting {
-            descriptors.extend(channel.poll_fds());
-        }
-        super::park_descriptors(&descriptors, ACCEPT_INTERVAL)
-    }
-
     /// Accepts what is waiting and reads the registrations that have arrived.
     ///
     /// A connection that fails or sends something else is dropped, which
@@ -231,47 +200,35 @@ impl WorkerRegistry {
                 }
             };
             let channel = self.connecting.swap_remove(index);
-            if registration.version() != VERSION {
-                let who = match &registration {
-                    Registration::Worker {
-                        worker_id, rank, ..
-                    } => format!("rank {rank} of worker {worker_id}"),
-                    Registration::Launcher { host, .. } => format!("the launcher of host {host}"),
-                };
-                anyhow::bail!(
-                    "{who} is build {} and the head is build {VERSION}; reinstall so that both \
-                     run the same build",
-                    registration.version()
-                );
-            }
-            match registration {
-                Registration::Worker {
-                    worker_id,
+            let Registration::Worker {
+                worker_id,
+                rank,
+                generation,
+                version,
+            } = registration;
+            anyhow::ensure!(
+                version == VERSION,
+                "rank {rank} of worker {worker_id} is build {version} and the engine is build \
+                 {VERSION}; reinstall so that both run the same build"
+            );
+            let current = self.generations.get(&worker_id).copied();
+            if current != Some(generation) {
+                // Dropping the connection is the refusal: the rank exits when
+                // its connection closes.
+                tracing::warn!(
+                    worker = %worker_id,
                     rank,
                     generation,
-                    ..
-                } => {
-                    let current = self.generations.get(&worker_id).copied();
-                    if current != Some(generation) {
-                        // Dropping the connection is the refusal: the rank
-                        // exits when its connection closes.
-                        tracing::warn!(
-                            worker = %worker_id,
-                            rank,
-                            generation,
-                            current = ?current,
-                            "refusing a rank of a launch that is not its group's current one"
-                        );
-                        continue;
-                    }
-                    self.ranks.push(RegisteredWorker {
-                        worker_id,
-                        rank,
-                        channel,
-                    });
-                }
-                Registration::Launcher { host, .. } => self.launchers.push((host, channel)),
+                    current = ?current,
+                    "refusing a rank of a launch that is not its group's current one"
+                );
+                continue;
             }
+            self.ranks.push(RegisteredWorker {
+                worker_id,
+                rank,
+                channel,
+            });
         }
         Ok(())
     }
@@ -437,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_or_a_launcher_of_another_build_fails_the_wait_by_name() {
+    fn a_worker_of_another_build_fails_the_wait_by_name() {
         let shared = WorkerRegistry::bind(true).unwrap();
         let registry = || lock(&shared).unwrap();
 
@@ -464,63 +421,6 @@ mod tests {
                 && error.contains(VERSION),
             "{error}"
         );
-
-        let port = registry()
-            .tcp_address()
-            .rsplit_once(':')
-            .unwrap()
-            .1
-            .to_owned();
-        let mut launcher = Channel::connect(&format!("127.0.0.1:{port}")).unwrap();
-        launcher
-            .send(&Registration::Launcher {
-                host: "b".into(),
-                version: other.clone(),
-            })
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let error = loop {
-            let taken = registry().take_launchers();
-            match taken {
-                Ok(_) => {
-                    assert!(Instant::now() < deadline, "the launcher was not refused");
-                    registry().park().unwrap();
-                }
-                Err(error) => break error.to_string(),
-            }
-        };
-        assert!(
-            error.contains("host b") && error.contains(&other),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_launcher_registers_on_the_tcp_port() {
-        let shared = WorkerRegistry::bind(true).unwrap();
-        let registry = || lock(&shared).unwrap();
-        let port = registry()
-            .tcp_address()
-            .rsplit_once(':')
-            .unwrap()
-            .1
-            .to_owned();
-        let mut launcher = Channel::connect(&format!("127.0.0.1:{port}")).unwrap();
-        launcher
-            .send(&Registration::Launcher {
-                host: "b".into(),
-                version: VERSION.into(),
-            })
-            .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut presented = Vec::new();
-        while presented.is_empty() && Instant::now() < deadline {
-            presented = registry().take_launchers().unwrap();
-            registry().park().unwrap();
-        }
-        assert_eq!(presented.len(), 1);
-        assert_eq!(presented[0].0, "b");
     }
 
     #[test]

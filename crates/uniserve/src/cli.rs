@@ -1,8 +1,8 @@
 //! Command-line parsing for the `uniserve` binary.
 //!
 //! One executable runs every UniServe process, each as a command: `serve`
-//! (the head), `launcher` (a host's launcher), `worker` (one worker) and
-//! `storage` (a host's Storage Server). The binary's own options, its log
+//! (a node's daemon, and on the leader the API server), `worker` (one
+//! worker) and `storage` (a node's Storage Server). The binary's own options, its log
 //! levels, are global; each command declares its own. `serve` takes the
 //! serving command line (`server::options::ServeArgs`), which resolves one
 //! serving configuration from a `--config` file, a few flags and `--set`
@@ -14,7 +14,6 @@ use std::ffi::OsString;
 use clap::{Args, Parser, Subcommand};
 use server::options::ServeArgs;
 
-use crate::launcher::LauncherArgs;
 use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
@@ -45,16 +44,15 @@ pub(crate) struct LogLevels {
 /// Supported top-level CLI commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Run the UniServe OpenAI server: the Rust engine and scheduler run
-    /// in-process, driving a forward-only worker.
+    /// Run this node's daemon; on the leader (node rank 0), also the
+    /// UniServe OpenAI server, whose Rust engine and scheduler run
+    /// in-process and drive forward-only workers.
     #[command(
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServeArgs>),
-    /// Launch and supervise the workers a head places on this host.
-    Launcher(LauncherArgs),
-    /// Run one worker: the process the head and the launchers start for
-    /// each worker of a worker group.
+    /// Run one worker: the process a node's daemon starts for each worker
+    /// of a worker group placed on the node.
     #[command(
         hide = true,
         disable_help_flag = true,

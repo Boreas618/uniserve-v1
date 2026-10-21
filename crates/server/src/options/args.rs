@@ -19,7 +19,7 @@ use toml::{Table, Value};
 use super::ServeConfig;
 
 /// Each flag and the configuration path it sets.
-pub const FLAG_PATHS: [(&str, &str); 12] = [
+pub const FLAG_PATHS: [(&str, &str); 15] = [
     ("MODEL", "model"),
     ("--host", "server_config.host"),
     ("--port", "server_config.port"),
@@ -31,6 +31,9 @@ pub const FLAG_PATHS: [(&str, &str); 12] = [
     ("--max-model-len", "max_model_len"),
     ("--mem-fraction-static", "mem_fraction_static"),
     ("--host-identity", "host_identity"),
+    ("--nnodes", "nnodes"),
+    ("--node-rank", "node_rank"),
+    ("--dist-init-addr", "dist_init_addr"),
     ("--worker-executable", "worker_config.executable"),
 ];
 
@@ -70,10 +73,21 @@ pub struct ServeArgs {
     /// (`mem_fraction_static`).
     #[arg(long)]
     pub mem_fraction_static: Option<f64>,
-    /// This process's host name in a multi-host deployment
+    /// This node's host name in a deployment of several nodes
     /// (`host_identity`).
     #[arg(long)]
     pub host_identity: Option<String>,
+    /// Nodes of the deployment, each running one `uniserve serve`
+    /// (`nnodes`).
+    #[arg(long)]
+    pub nnodes: Option<NonZeroU32>,
+    /// This node's rank; the leader is rank 0 (`node_rank`).
+    #[arg(long)]
+    pub node_rank: Option<u32>,
+    /// The leader's `host:port` the other nodes join at
+    /// (`dist_init_addr`).
+    #[arg(long, value_name = "HOST:PORT")]
+    pub dist_init_addr: Option<String>,
     /// The `uniserve` executable that runs the workers
     /// (`worker_config.executable`).
     #[arg(long, value_name = "PATH")]
@@ -226,6 +240,15 @@ impl ServeArgs {
                 self.mem_fraction_static.map(Value::Float),
             ),
             ("host_identity", self.host_identity.as_deref().map(text)),
+            (
+                "nnodes",
+                self.nnodes.map(|nodes| count(u64::from(nodes.get()))),
+            ),
+            (
+                "node_rank",
+                self.node_rank.map(|rank| count(u64::from(rank))),
+            ),
+            ("dist_init_addr", self.dist_init_addr.as_deref().map(text)),
             (
                 "worker_config.executable",
                 self.worker_executable.as_ref().map(path),
@@ -530,6 +553,12 @@ mod tests {
             "0.5",
             "--host-identity",
             "rank-0",
+            "--nnodes",
+            "2",
+            "--node-rank",
+            "0",
+            "--dist-init-addr",
+            "rank-0:5000",
             "--worker-executable",
             "/opt/env/bin/uniserve",
             "--set",
@@ -556,6 +585,44 @@ mod tests {
         config.validate(&stated)?;
         let engine = config.engine_config()?;
         Ok((config, engine))
+    }
+
+    /// Only the leader serves a model; every node of a deployment of
+    /// several needs the leader's address, and its rank among them.
+    #[test]
+    fn nodes_other_than_the_leader_take_no_model() {
+        let member = [
+            "--nnodes",
+            "2",
+            "--node-rank",
+            "1",
+            "--dist-init-addr",
+            "rank-0:5000",
+        ];
+        let (config, stated) = resolved(&member).unwrap();
+        config.validate(&stated).unwrap();
+        assert!(!config.leads());
+
+        let (config, stated) = resolved(&["--nnodes", "2", "--node-rank", "1"]).unwrap();
+        let error = config.validate(&stated).unwrap_err();
+        assert!(error.to_string().contains("dist_init_addr"), "{error}");
+
+        let outside = [
+            "--nnodes",
+            "2",
+            "--node-rank",
+            "2",
+            "--dist-init-addr",
+            "rank-0:5000",
+        ];
+        let (config, stated) = resolved(&outside).unwrap();
+        let error = config.validate(&stated).unwrap_err();
+        assert!(error.to_string().contains("node_rank"), "{error}");
+
+        let leader = ["--nnodes", "2", "--dist-init-addr", "rank-0:5000"];
+        let (config, stated) = resolved(&leader).unwrap();
+        let error = config.validate(&stated).unwrap_err();
+        assert!(error.to_string().contains("`model` is required"), "{error}");
     }
 
     #[test]

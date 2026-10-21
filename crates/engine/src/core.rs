@@ -41,9 +41,8 @@ use ipc::{ComponentConfig, ParallelConfig, RequestId};
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerRank {
-    /// Host identity. The engine process spawns the ranks whose host equals
-    /// its own `WorkerProcessArgs::host`; a rank on another host is started by
-    /// that host's launcher.
+    /// Host identity: the daemon of the node with this host identity starts
+    /// the rank.
     pub host: String,
     /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU worker.
     /// On the edges `TransferConfig::with_worker_defaults` derives, device
@@ -480,7 +479,7 @@ impl EngineCore {
     /// `DataParallelController` and vLLM one engine core per data-parallel
     /// rank. Every group of every engine core launches through one
     /// `WorkerGroup::spawn_all`, so the engine cores load their models at the
-    /// same time and one launcher per remote host serves all of them.
+    /// same time and one daemon per node serves all of them.
     ///
     /// Engine cores exchange no products: every configured transfer edge must
     /// stay inside one engine core, and each binds its default edges over its

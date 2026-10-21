@@ -11,10 +11,9 @@
 //! Storage Server has the failed rank out, makes its mappings writable at
 //! unchanged addresses, and serves. The group then starts a new standby.
 //!
-//! A standby serves a group whose ranks all run on the head's host and
+//! A standby serves a group whose ranks all run on the engine's node and
 //! that is its own failure domain: a group of a shared expert world is
-//! replaced with its domain, and a launcher stops every rank of a group on
-//! its host when the group fails.
+//! replaced with its domain.
 
 use super::WorkerGroup;
 use super::validate_replacement_info;
@@ -52,8 +51,9 @@ impl WorkerGroup {
         args.standby = true;
         args.cache_units = self.info.prefix_cache.as_ref().map(|cache| cache.num_units);
         let started = (|| -> anyhow::Result<Vec<WorkerProcess>> {
-            let launched = args.spawn_workers(None, &self.registry, None, &self.claims, None)?;
-            let (mut workers, _) = args.adopt_workers(launched)?;
+            let launched =
+                args.spawn_workers(None, &self.registry, &self.processes, &self.claims, None)?;
+            let mut workers = args.adopt_workers(launched)?;
             for worker in &mut workers {
                 worker.request_startup()?;
             }

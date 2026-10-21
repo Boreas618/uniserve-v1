@@ -102,8 +102,10 @@ impl Engine {
     /// processes.
     ///
     /// `config` must have passed [`ServeConfig::validate`]; `stated` holds the
-    /// option paths the operator set. Starting the cores blocks until every
-    /// rank has loaded the model, so it runs on the blocking pool.
+    /// option paths the operator set; `daemon` is the leader daemon's process
+    /// socket, through which every worker starts. Starting the cores blocks
+    /// until every rank has loaded the model, so it runs on the blocking
+    /// pool.
     ///
     /// # Errors
     ///
@@ -113,7 +115,11 @@ impl Engine {
     /// ([`ServeConfig::engine_config`]), when the engine cores fail to start,
     /// or when the model cannot be bound to the capabilities its workers
     /// report.
-    pub async fn start(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Self> {
+    pub async fn start(
+        config: &ServeConfig,
+        stated: &Stated,
+        daemon: String,
+    ) -> anyhow::Result<Self> {
         let LoadedModel {
             config: mut model_config,
             tokenizer,
@@ -146,6 +152,7 @@ impl Engine {
         engine_config.eos = control_tokens.eos;
         engine_config.end_of_image = control_tokens.end_of_image;
         let worker = &mut engine_config.worker_process;
+        worker.daemon = daemon;
         worker.max_model_len = max_model_len;
         // Video workers prepare exactly the canvases their denoiser names for
         // the configured resolutions and aspect ratios, refusing a pair it
