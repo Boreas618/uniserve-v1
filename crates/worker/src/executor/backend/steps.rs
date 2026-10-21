@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use uniserve_ipc::CallId;
-use uniserve_ipc::{Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity};
+use ipc::CallId;
+use ipc::{Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity};
 
 use super::{WorkerBackend, kernel_calls};
 use crate::error::WorkerError;
@@ -36,11 +36,11 @@ enum Pages {
 /// cache's `device`. A batch without copies has neither.
 #[derive(Default)]
 struct PageFences {
-    device: Option<uniserve_cuda::DeviceId>,
+    device: Option<cuda::DeviceId>,
     /// Behind the reads: the batch's forward waits on it.
-    reads: Option<Arc<uniserve_cuda::Event>>,
+    reads: Option<Arc<cuda::Event>>,
     /// Behind the writes: the batch's output waits on it.
-    writes: Option<Arc<uniserve_cuda::Event>>,
+    writes: Option<Arc<cuda::Event>>,
 }
 
 /// A submitted batch with its lifecycle and numerical state.
@@ -119,7 +119,7 @@ impl WorkerBatch {
 
     /// The fence of the batch's host page tier reads once the copy lane
     /// issued them; the batch's forward waits on it.
-    pub(crate) fn page_reads(&self) -> Option<&Arc<uniserve_cuda::Event>> {
+    pub(crate) fn page_reads(&self) -> Option<&Arc<cuda::Event>> {
         match &self.pages {
             Pages::Issued(fences) => fences.reads.as_ref(),
             Pages::Unissued | Pages::Issuing(_) => None,
@@ -315,7 +315,7 @@ impl WorkerBackend {
                 // so it is a job of that lane; the model's arithmetic is a
                 // job of the Python thread alone.
                 let submitted = if on_lane {
-                    let kind = CallKind::Media(uniserve_ipc::MediaCall::LatentPreparation);
+                    let kind = CallKind::Media(ipc::MediaCall::LatentPreparation);
                     self.jobs.start(kind, job, true).map_err(lane_lost)?
                 } else {
                     self.jobs.call(job, true)

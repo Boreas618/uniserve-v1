@@ -2,7 +2,7 @@
 //! controls ([`resolve_sampling`]), and its generation length
 //! ([`resolve_max_tokens`]).
 
-use uniserve_ipc::SamplingParams as EngineSamplingParams;
+use ipc::SamplingParams as EngineSamplingParams;
 
 use super::{SamplingParams, TokenizeError};
 use crate::profile::SamplingDefaults;

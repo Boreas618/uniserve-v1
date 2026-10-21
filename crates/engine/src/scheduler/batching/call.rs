@@ -4,7 +4,7 @@
 //! grows and activates for it.
 
 use super::*;
-use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall, TransferMode};
 
 impl Scheduler {
     /// Registers one selected call with its allocated physical inputs and outputs.

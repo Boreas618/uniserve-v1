@@ -40,18 +40,18 @@ pub(crate) mod warmup;
 
 use std::sync::Arc;
 
+use cuda::{CopyBatch, SourceOrder, Stream};
 use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use crate::config::Device;
 use crate::cuda_graph::{GraphMode, GraphPool};
 use crate::ffi::DType;
 use crate::lane::{Completion, Job};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::methods::{MethodCall, kernels_call, list_kernels};
 use crate::runner::{ImageSetup, RunnerSetup};
-use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

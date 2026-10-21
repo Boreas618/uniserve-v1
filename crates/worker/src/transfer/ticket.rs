@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceGuard, Event, Stream};
+use cuda::{DeviceGuard, Event, Stream};
 
 use super::{Notify, Retirement, Spans};
 use crate::stream::Issue;
@@ -265,7 +265,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Storage, StorageView};
+    use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, notify};
 
     /// A host value of `elements` bytes.

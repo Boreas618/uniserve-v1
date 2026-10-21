@@ -20,10 +20,10 @@ pub enum TokenizeError {
     Text(#[from] crate::serving::text::Error),
     /// Sampling controls violate the engine contract.
     #[error(transparent)]
-    Sampling(#[from] uniserve_ipc::SamplingParamsError),
+    Sampling(#[from] ipc::SamplingParamsError),
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
-    Generation(#[from] uniserve_engine::GenerationRequestError),
+    Generation(#[from] engine::GenerationRequestError),
     /// The requested output resolution is not served.
     #[error(transparent)]
     Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
@@ -32,7 +32,7 @@ pub enum TokenizeError {
     Assets(#[from] crate::profile::assets::Error),
     /// The request exceeds the loaded workers' resource limits.
     #[error(transparent)]
-    Resources(#[from] uniserve_engine::GenerationResourceError),
+    Resources(#[from] engine::GenerationResourceError),
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {
@@ -85,7 +85,7 @@ pub enum ServeError {
     },
     /// No live engine core accepts the request.
     #[error(transparent)]
-    Submit(#[from] uniserve_engine::SubmitError),
+    Submit(#[from] engine::SubmitError),
     /// An input image reference cannot be fetched or decoded.
     #[error("request `{request_id}` has an invalid input image {}", .index + 1)]
     ImageInput {

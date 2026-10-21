@@ -28,17 +28,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use uniserve_engine::{
+use engine::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
     ExpertExchange, FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
     SchedulingPolicy, TransferConfig, WorkerGroupConfig, WorkerProcessArgs,
 };
-use uniserve_engine::{GenerationLimits, ModelDtype};
-use uniserve_ipc::PrefixCacheDtype;
+use engine::{GenerationLimits, ModelDtype};
+use ipc::PrefixCacheDtype;
+use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::profile::ModelDescription;
 use crate::profile::diffusion_gemma::DenoisingOverrides;
@@ -385,8 +385,8 @@ impl MooncakeOptions {
 
     /// The connector settings of a Storage Server this deployment starts.
     /// Each host names itself to Mooncake.
-    fn connector(&self) -> uniserve_storage::connector::Settings {
-        uniserve_storage::connector::Settings {
+    fn connector(&self) -> storage::connector::Settings {
+        storage::connector::Settings {
             master: self.master.clone(),
             metadata: self.metadata_server.clone(),
             protocol: self.protocol.clone(),
@@ -560,7 +560,7 @@ impl Default for FlashInferOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerOptions {
-    /// The `uniserve-worker` executable that runs the workers, which runs
+    /// The `uniserve` executable that runs the workers, which runs
     /// them in the Python environment it is installed in.
     pub executable: PathBuf,
     /// Time a batch may run without rank progress before the worker group is
@@ -910,11 +910,6 @@ impl ServeConfig {
         let flashinfer = &self.flashinfer_config;
         let worker_process = WorkerProcessArgs {
             executable: self.worker_config.executable.clone(),
-            // The Storage Server is installed beside the worker executable,
-            // in the environment the workers run in.
-            storage_server: WorkerProcessArgs::storage_server_beside(
-                &self.worker_config.executable,
-            ),
             // A deployment is what one head serves under its served name.
             deployment: self.served_model_name().to_owned(),
             page_tier: self.kv_cache_config.prefix_caching && self.kv_cache_config.host_tier,

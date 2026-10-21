@@ -2,12 +2,12 @@
 //! through one shared pixel buffer, the slot grids ([`packed_grids`]) and a
 //! feature buffer ([`PackedVision`]), with one captured graph per slot count.
 
-use uniserve_cuda::{CopyBatch, SourceOrder};
+use cuda::{CopyBatch, SourceOrder};
 
 use super::{Encoded, EncoderGraph, EncoderInfo, EncoderRunner, ImagePixels, PreparedImage, Tower};
 use crate::lane::Job;
+use crate::memory::allocation::StorageView;
 use crate::runner::methods::Argument;
-use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 

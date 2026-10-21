@@ -46,9 +46,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::CallId;
-use uniserve_ipc::{
+use cuda::{DeviceId, Stream};
+use ipc::CallId;
+use ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
     ForwardStats, MediaCall, RequestKey, TensorRef,
 };
@@ -60,10 +60,10 @@ use crate::executor::products::ProductOwners;
 use crate::executor::{BatchResult, PendingOutput, request_output};
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
-use crate::request::RequestPool;
-use crate::storage::{
+use crate::memory::{
     OutputLease, OutputPlacement, OutputPool, ProductBuffer, ProductRead, ProductStore,
 };
+use crate::request::RequestPool;
 use crate::stream::{EventPool, Issue};
 use crate::transfer::Retirement;
 use crate::{Error, Result, lock};
@@ -761,7 +761,7 @@ fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Resul
 /// stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
-    last: Option<(usize, Arc<uniserve_cuda::Event>)>,
+    last: Option<(usize, Arc<cuda::Event>)>,
 }
 
 impl StreamOrder {
@@ -785,9 +785,7 @@ impl StreamOrder {
         };
         let event = match self.last.take() {
             Some((_, event)) => event,
-            None => Arc::new(uniserve_cuda::Event::new(
-                uniserve_cuda::EventFlags::default(),
-            )),
+            None => Arc::new(cuda::Event::new(cuda::EventFlags::default())),
         };
         stream.record(&event)?;
         self.last = Some((raw, event));
@@ -951,12 +949,12 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
-    use uniserve_ipc::{BufferAllocation, GenerationParams, NewRequest, RequestKey, ShapeBound};
-    use uniserve_ipc::{RequestId, SamplingParams};
+    use cuda::{DeviceId, Event, EventFlags, Stream};
+    use ipc::{BufferAllocation, GenerationParams, NewRequest, RequestKey, ShapeBound};
+    use ipc::{RequestId, SamplingParams};
 
     use super::*;
-    use crate::storage::BufferPool;
+    use crate::memory::BufferPool;
 
     /// Blocks `stream` in a host function until the returned sender is
     /// used, so the work queued behind it on any stream that waits for it
@@ -1117,7 +1115,7 @@ mod tests {
             vec![HOST],
             values.len() + 1,
             1,
-            BufferPool::allocate(1024, &[HOST], &mut crate::storage::LocalMemory)?,
+            BufferPool::allocate(1024, &[HOST], &mut crate::memory::LocalMemory)?,
             EventPool::new(),
         )?;
         let mut calls = Vec::new();

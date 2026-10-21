@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cuda::{DeviceId, Stream};
+use ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{Batch as BatchPlan, CallKind, ForwardStats, MediaCall};
 
 use super::{ENCODER, Encoded, Recorded};
 use crate::executor::image::ImageParts;
@@ -17,9 +17,9 @@ use crate::executor::image::{ImageBatch, Progress, Resume, allocations};
 use crate::executor::products::Publications;
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::lane::{Completion, Job};
+use crate::memory::allocation::StorageView;
+use crate::memory::{Metadata, OutputPlacement, PinnedPool, ProductBuffer, ValueRange};
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::StorageView;
-use crate::storage::{Metadata, OutputPlacement, PinnedPool, ProductBuffer, ValueRange};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

@@ -20,11 +20,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use ipc::SharedMedia;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use uniserve_ipc::SharedMedia;
 
 use crate::options::VideoJobOptions;
 use crate::serving::RequestOutput;

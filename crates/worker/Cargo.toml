@@ -1,11 +1,12 @@
 [package]
-name = "uniserve-worker"
+name = "worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # The cdylib is the worker library `uniserve/_worker`, which the
-# `uniserve-worker` executable loads and calls and Python loads through
+# `uniserve` executable's `worker` command loads and calls and Python loads through
 # TVM-FFI for the video rules it exports; the rlib serves Rust tests and
 # benches.
 [lib]
@@ -15,7 +16,9 @@ crate-type = ["rlib", "cdylib"]
 base64.workspace = true
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
+cuda.workspace = true
 indexmap.workspace = true
+ipc.workspace = true
 libc.workspace = true
 libloading.workspace = true
 models.workspace = true
@@ -30,14 +33,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 signal-hook-registry.workspace = true
+storage.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tvm-ffi.workspace = true
-uniserve-cuda.workspace = true
-uniserve-ipc.workspace = true
-uniserve-storage.workspace = true
 uuid.workspace = true
 
 # A TVM-FFI library that Python GPU tests load to drive the native cache owners

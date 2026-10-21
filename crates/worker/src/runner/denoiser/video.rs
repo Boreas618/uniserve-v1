@@ -7,10 +7,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use ipc::{Call, LatentParams};
 use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
-use uniserve_ipc::{Call, LatentParams};
 
 use super::{
     DENOISER, DenoiserRunner, ENCODER, Family, LayoutFields, Methods, SampleLayout, SamplePages,
@@ -21,11 +21,11 @@ use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{LatentPlan, RequestSlots, TrajectoryVersion};
 use crate::parallel::joins::GraphFunctions;
 use crate::request::video::{VideoLayout, VideoSize};
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{LatentPlan, RequestSlots, TrajectoryVersion};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
 
@@ -157,7 +157,7 @@ pub(crate) struct DenoiserSetup<'a> {
     pub(crate) graph_pool: Option<Arc<GraphPool>>,
     pub(crate) transient_layouts: usize,
     /// Where the latent banks are taken.
-    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
+    pub(crate) memory: &'a mut dyn crate::memory::ExclusiveMemory,
 }
 
 fn bytes_of(view: &StorageView) -> u64 {

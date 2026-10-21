@@ -45,10 +45,8 @@ mod tensor;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{
-    Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, TransferMode,
-};
+use cuda::{DeviceId, Stream};
+use ipc::{Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, TransferMode};
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::batch::{Batch, Failure, Launched, Opening, Stage, fail};
@@ -60,10 +58,10 @@ use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
 use crate::lock;
+use crate::memory::{OutputPool, ProductBuffer, ProductExport};
 use crate::request::RequestPool;
-use crate::storage::{OutputPool, ProductBuffer, ProductExport};
 use crate::stream::Streams;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 use latents::PendingExport;
 use prefix_cache::{Exporting, Installation, Published};
@@ -513,7 +511,7 @@ struct Located {
 /// A transfer batch recording its last job: its borrowed owners and what it
 /// reserved.
 pub(super) struct TransferBatch<'a> {
-    pub(super) storage: &'a mut WorkerStorage,
+    pub(super) storage: &'a mut WorkerMemory,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     /// The job everything the batch issues is recorded into, and the
@@ -609,7 +607,7 @@ impl Recorded {
     /// validate every owner's update, then commit them together.
     fn commit(
         mut self,
-        storage: &mut WorkerStorage,
+        storage: &mut WorkerMemory,
         requests: &mut RequestPool,
         mut image: Option<&mut ImageParts<'_>>,
         plan: &BatchPlan,
@@ -649,11 +647,7 @@ impl Recorded {
 
     /// Retire every reservation of a batch that failed while it recorded
     /// its job, once that job completed.
-    fn discard(
-        self,
-        storage: &mut WorkerStorage,
-        image: Option<&mut ImageParts<'_>>,
-    ) -> Result<()> {
+    fn discard(self, storage: &mut WorkerMemory, image: Option<&mut ImageParts<'_>>) -> Result<()> {
         self.retire(storage, image, Located::default())
     }
 
@@ -661,7 +655,7 @@ impl Recorded {
     /// complete: each joins its call's completion.
     fn locate(
         &mut self,
-        storage: &mut WorkerStorage,
+        storage: &mut WorkerMemory,
         image: Option<&mut ImageParts<'_>>,
         located: &mut Located,
     ) -> Result<()> {
@@ -704,7 +698,7 @@ impl Recorded {
     /// transfers.
     fn validate(
         &self,
-        storage: &mut WorkerStorage,
+        storage: &mut WorkerMemory,
         plan: &BatchPlan,
         located: &Located,
     ) -> Result<()> {
@@ -722,7 +716,7 @@ impl Recorded {
     /// storage returns once they complete.
     fn retire(
         mut self,
-        storage: &mut WorkerStorage,
+        storage: &mut WorkerMemory,
         image: Option<&mut ImageParts<'_>>,
         located: Located,
     ) -> Result<()> {

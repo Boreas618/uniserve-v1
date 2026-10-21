@@ -15,13 +15,13 @@
 //! results. The runner writes host values into them with [`ColumnWrites`]
 //! and gathers bank rows into the state rows natively ([`Banks::gather`]).
 
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 
 use super::calls::Sequence;
 use crate::ffi::DType;
+use crate::memory::allocation::StorageView;
+use crate::memory::{RequestSlots, SlotField, TablePages};
 use crate::runner::input_buffers::{Columns, InputBuffers};
-use crate::storage::memory::StorageView;
-use crate::storage::{RequestSlots, SlotField, TablePages};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 

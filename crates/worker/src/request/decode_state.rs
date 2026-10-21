@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 

@@ -11,10 +11,10 @@
 
 use std::ops::Range;
 
-use uniserve_ipc::CanvasSampling;
-use uniserve_ipc::{Batch, Call, CanvasStep, ForwardBatch, NewRequest};
+use ipc::CanvasSampling;
+use ipc::{Batch, Call, CanvasStep, ForwardBatch, NewRequest};
 
-use crate::storage::{AttentionRow, TablePages};
+use crate::memory::{AttentionRow, TablePages};
 use crate::{Error, Result};
 
 /// One sequence of a forward: a block of tokens over its request's prefix.
@@ -257,8 +257,8 @@ pub(crate) fn step_row(
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::{CallId, RequestId, SamplingParams};
-    use uniserve_ipc::{CallKind, ForwardMode, GenerationParams, Readout, RequestKey};
+    use ipc::{CallId, RequestId, SamplingParams};
+    use ipc::{CallKind, ForwardMode, GenerationParams, Readout, RequestKey};
 
     use super::*;
 
@@ -269,7 +269,7 @@ mod tests {
             coordinates: Default::default(),
             component: "diffusion_gemma".into(),
             kind: CallKind::Forward(ForwardMode::TokenDenoising),
-            bounds: uniserve_ipc::Bounds {
+            bounds: ipc::Bounds {
                 max_tokens: tokens as u32,
                 ..Default::default()
             },

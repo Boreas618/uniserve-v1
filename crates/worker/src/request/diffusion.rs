@@ -25,9 +25,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::RequestKey;
+use ipc::RequestKey;
 
-use uniserve_ipc::ImageParams;
+use ipc::ImageParams;
 
 use crate::{Error, Result};
 
@@ -437,7 +437,7 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
 
     fn release_buffers(
         &mut self,
-        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _buffers: &std::collections::HashSet<ipc::BufferId>,
         _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
@@ -445,8 +445,8 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
 
     fn release_requests(
         &mut self,
-        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
-        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _requests: &std::collections::HashSet<ipc::RequestKey>,
+        _retained: &std::collections::HashSet<ipc::BufferId>,
         _jobs: &crate::executor::lifecycle::LaneJobs,
     ) -> Result<()> {
         Ok(())
@@ -454,9 +454,9 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
 
     fn retirement_ready(
         &mut self,
-        _buffers: &std::collections::HashSet<uniserve_ipc::BufferId>,
-        _requests: &std::collections::HashSet<uniserve_ipc::RequestKey>,
-        _retained: &std::collections::HashSet<uniserve_ipc::BufferId>,
+        _buffers: &std::collections::HashSet<ipc::BufferId>,
+        _requests: &std::collections::HashSet<ipc::RequestKey>,
+        _retained: &std::collections::HashSet<ipc::BufferId>,
     ) -> Result<bool> {
         Ok(true)
     }
@@ -477,7 +477,7 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::RequestId;
+    use ipc::RequestId;
 
     use super::*;
 

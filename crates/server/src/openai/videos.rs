@@ -31,7 +31,7 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::engine::Engine;
+use crate::frontend::Engine;
 use crate::http::RequestId;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::openai::{ApiError, check_model_served};

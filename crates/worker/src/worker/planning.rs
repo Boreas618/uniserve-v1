@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use uniserve_cuda::HandleType;
-use uniserve_ipc::{CallKind, ComponentInfo};
+use cuda::HandleType;
+use ipc::{CallKind, ComponentInfo};
 
 use super::loading::LoadedModel;
 use super::{endpoint, expert_exchange, exports_device_products};
@@ -18,6 +18,7 @@ use crate::config::placement::Capability;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::ffi::DType;
+use crate::memory::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::parallel::world::World;
 use crate::runner::causal_lm::start::reserved_bytes;
 use crate::runner::denoiser::VideoModel;
@@ -25,7 +26,6 @@ use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::diffusion_lm::{self};
 use crate::runner::encoder::EncoderInfo;
 use crate::runner::start::reserved_bytes as image_reserved_bytes;
-use crate::storage::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 /// Block-table width that holds the longest admitted sequence in every

@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::ImageParams;
-use uniserve_ipc::{
+use cuda::{DeviceId, Stream};
+use ipc::ImageParams;
+use ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
     MediaCall, RequestKey,
 };
@@ -37,6 +37,10 @@ use crate::host::image::ImageResult;
 use crate::host::image::ImageTask;
 use crate::host::{HostLane, HostTask};
 use crate::lane::{Completion, Job};
+use crate::memory::LatentPool;
+use crate::memory::{
+    LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
+};
 use crate::request::RequestPool;
 use crate::request::diffusion::{BranchSource, Prefix, Trajectories};
 use crate::runner::decoder::DecoderRunner;
@@ -46,12 +50,8 @@ use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::inputs::Inputs;
 use crate::runner::encoder::runners::EncoderRunners;
-use crate::storage::LatentPool;
-use crate::storage::{
-    LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
-};
 use crate::stream::Issue;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Outcome, Result};
 
 /// A decoded image's encoding, run once its pixels reached the host.
@@ -160,7 +160,7 @@ pub(crate) enum Pending {
 /// the skeleton.
 pub(crate) struct ImageBatch<'a> {
     pub(crate) parts: ImageParts<'a>,
-    pub(crate) storage: &'a mut WorkerStorage,
+    pub(crate) storage: &'a mut WorkerMemory,
     pub(crate) requests: &'a mut RequestPool,
     pub(crate) plan: &'a BatchPlan,
     /// What the batch's own steps issue on its stream: the start of its
@@ -204,7 +204,7 @@ impl<'a> ImageBatch<'a> {
     #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
     pub(crate) fn open(
         parts: ImageParts<'a>,
-        storage: &'a mut WorkerStorage,
+        storage: &'a mut WorkerMemory,
         requests: &'a mut RequestPool,
         plan: &'a BatchPlan,
         opening: Opening,
@@ -291,7 +291,7 @@ impl<'a> ImageBatch<'a> {
     /// The parked batch on the owners it borrows again, with an empty job.
     pub(crate) fn resume(
         parts: ImageParts<'a>,
-        storage: &'a mut WorkerStorage,
+        storage: &'a mut WorkerMemory,
         requests: &'a mut RequestPool,
         plan: &'a BatchPlan,
         parked: Parked,
@@ -922,12 +922,9 @@ impl HostStage for Encodings {
                     if let ImageResult::Encoded(bytes) = &*result
                         && output.reports_output
                     {
-                        let source =
-                            uniserve_ipc::MediaSource::publish(bytes).map_err(|error| {
-                                Error::Invalid(format!(
-                                    "publishing an encoded image failed: {error}"
-                                ))
-                            })?;
+                        let source = ipc::MediaSource::publish(bytes).map_err(|error| {
+                            Error::Invalid(format!("publishing an encoded image failed: {error}"))
+                        })?;
                         output.set_media(source)?;
                     }
                 }

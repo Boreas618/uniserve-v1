@@ -10,10 +10,10 @@
 //! configuration into launched worker processes; `EngineCore::with_executor`
 //! accepts an executor built elsewhere, such as the CPU simulation backend.
 
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "testing", test))]
-use uniserve_ipc::DEFAULT_COMPONENT;
-use uniserve_ipc::MediaCall;
+use ipc::DEFAULT_COMPONENT;
+use ipc::MediaCall;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,9 +34,9 @@ use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use crate::{CommandWaker, GenerationLimits, ModelDtype, Request};
 use anyhow::Context as _;
 #[cfg(test)]
-use uniserve_ipc::ComponentDistribution;
-use uniserve_ipc::WorkerInfo;
-use uniserve_ipc::{ComponentConfig, ParallelConfig, RequestId};
+use ipc::ComponentDistribution;
+use ipc::WorkerInfo;
+use ipc::{ComponentConfig, ParallelConfig, RequestId};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

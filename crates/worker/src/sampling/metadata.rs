@@ -26,10 +26,10 @@
 //! for masks, repeated tokens dropped.
 
 use indexmap::IndexMap;
-use uniserve_ipc::SamplingParams;
+use ipc::SamplingParams;
 
 use super::{SamplingControls, SamplingPath, TOKEN_VALUE_MASK, top_k_width};
-use crate::storage::LogprobLayout;
+use crate::memory::LogprobLayout;
 use crate::{Error, Result};
 
 /// Parameters per candidate row: temperature, top-p, min-p, typical-p,

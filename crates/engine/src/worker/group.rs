@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use super::registry::Registry;
 use super::{BatchSubmitError, IncarnationRegistry, WorkerProcess};
 use crate::executor::{RankBuffer, WorkerExecError, WorkerFailure};
-use uniserve_ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
+use ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -75,7 +75,7 @@ pub struct WorkerGroup {
     process_args: WorkerProcessArgs,
     /// Which component serves each media call across every worker of the
     /// deployment; the executor states it once all workers have reported.
-    media_routing: BTreeMap<uniserve_ipc::MediaCall, String>,
+    media_routing: BTreeMap<ipc::MediaCall, String>,
     /// The worker and rank each live rank incarnation of the deployment
     /// serves. The group registers its own ranks and retires them when it
     /// loses them; the executor makes it the deployment's one table.
@@ -111,7 +111,7 @@ pub struct WorkerGroup {
     registry: Registry,
     /// The deployment's storage claims, which a relaunch's workers start
     /// with and which hold while any group of the deployment lives.
-    claims: super::storage::StorageClaims,
+    claims: super::claims::StorageClaims,
     /// The rank group standing by to replace this one when it fails
     /// (`worker_config.standby`), while it starts or parks.
     standby: Option<standby::Standby>,
@@ -119,12 +119,11 @@ pub struct WorkerGroup {
 
 /// A call's identity across request epochs: engine identifier, request
 /// identifier, request epoch, and call identifier, in that order.
-type CallIdentity = (u64, u64, u64, uniserve_ipc::CallId);
+type CallIdentity = (u64, u64, u64, ipc::CallId);
 
 /// The worker routed to each component reading a call's products, keyed by
 /// the call's request and call identifiers (`RequestPlacement::readers`).
-pub type CallReaders =
-    HashMap<(RequestKey, uniserve_ipc::CallId), BTreeMap<String, crate::WorkerGroupId>>;
+pub type CallReaders = HashMap<(RequestKey, ipc::CallId), BTreeMap<String, crate::WorkerGroupId>>;
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
@@ -147,7 +146,7 @@ struct WorkerReport {
 }
 
 /// Returns the request and call identifiers carried by a worker call.
-fn call_identity(request: uniserve_ipc::RequestKey, call_id: uniserve_ipc::CallId) -> CallIdentity {
+fn call_identity(request: ipc::RequestKey, call_id: ipc::CallId) -> CallIdentity {
     (
         request.engine_id,
         request.request_id.0,
@@ -618,7 +617,7 @@ impl WorkerGroup {
             }
             let batch = &self.pending_batches[&batch_id].batch;
             if canonical.fatal
-                || canonical.code == Some(uniserve_ipc::ErrorCode::InvariantViolation)
+                || canonical.code == Some(ipc::ErrorCode::InvariantViolation)
                 || batch
                     .commands
                     .iter()
@@ -812,7 +811,7 @@ impl WorkerGroup {
     }
 
     /// Exposes accepted calls not yet joined into a published result.
-    pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &uniserve_ipc::Call> {
+    pub(crate) fn inflight_calls(&self) -> impl Iterator<Item = &ipc::Call> {
         self.pending_batches.values().flat_map(|pending| {
             pending.batch.calls.iter().filter(|call| {
                 pending

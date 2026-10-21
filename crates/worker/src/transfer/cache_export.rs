@@ -15,14 +15,14 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, SourceOrder};
-use uniserve_ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
+use cuda::{CopyBatch, SourceOrder};
+use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
 
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -185,7 +185,7 @@ impl CacheExport {
 pub(crate) fn export(
     accesses: &mut UnitAccesses,
     bases: &TransferBases,
-    tables: &crate::storage::BlockTables,
+    tables: &crate::memory::BlockTables,
     planes: &CachePlanes,
     slot: u32,
     visible: u32,
@@ -430,13 +430,13 @@ fn export_group(
 mod tests {
     use std::collections::HashSet;
 
-    use uniserve_ipc::{BlockTable, RequestKey, TransferTransport, WorkerEndpoint};
-    use uniserve_ipc::{CallId, PrefixCacheDtype, RequestId, UnitId};
+    use ipc::{BlockTable, RequestKey, TransferTransport, WorkerEndpoint};
+    use ipc::{CallId, PrefixCacheDtype, RequestId, UnitId};
 
     use super::*;
     use crate::EventPool;
     use crate::lane::Job;
-    use crate::storage::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
+    use crate::memory::{BlockTables, CacheGroupPlan, CachePlan, GroupAxis};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
             None,
             2,
             None,
-            &mut crate::storage::LocalMemory,
+            &mut crate::memory::LocalMemory,
         )?;
         let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
         let update = tables.prepare(&[BlockTable {

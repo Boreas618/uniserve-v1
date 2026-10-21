@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use uniserve_ipc::{
+use ipc::{
     CallKind, ComponentInfo, MediaCall, OutputInfo, VideoDenoiserInfo, WorkerEndpoint, WorkerInfo,
 };
 
@@ -29,8 +29,8 @@ use super::{
 };
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::graph_storage_budget_bytes;
+use crate::memory::{CachePlan, LatentPlan};
 use crate::parallel::host::HostGroup;
-use crate::storage::{CachePlan, LatentPlan};
 use crate::{Error, Result};
 
 /// Bytes one product slot of a component's outputs retains: every output's
@@ -501,8 +501,8 @@ pub(crate) fn slot_requirements(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use uniserve_cuda::DeviceId;
-    use uniserve_ipc::{DType, DimBound, ShapeBound};
+    use cuda::DeviceId;
+    use ipc::{DType, DimBound, ShapeBound};
 
     use super::*;
     use crate::capacity::DEFAULT_NUM_UNITS;
@@ -565,7 +565,7 @@ pub(crate) mod tests {
             },
             device_exports: false,
             fabric_handles: false,
-            supported_calls: vec![CallKind::Forward(uniserve_ipc::ForwardMode::Prefill)],
+            supported_calls: vec![CallKind::Forward(ipc::ForwardMode::Prefill)],
             media_components: BTreeMap::new(),
             components: Vec::new(),
         }
@@ -580,14 +580,14 @@ pub(crate) mod tests {
             quantized: false,
             // Key and value planes, each with one initialization flag.
             unit_bytes: 2 * (plane_bytes + 1),
-            dtype: uniserve_ipc::PrefixCacheDtype::BFloat16,
-            groups: vec![crate::storage::CacheGroupPlan {
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: vec![crate::memory::CacheGroupPlan {
                 window: None,
                 block_size: 64,
                 units_per_page: 2,
                 layers: vec!["layers.0".into(), "layers.1".into()],
                 layer_ids: vec![0, 1],
-                axis: crate::storage::GroupAxis {
+                axis: crate::memory::GroupAxis {
                     offset: 0,
                     total: 2,
                 },
@@ -689,10 +689,10 @@ pub(crate) mod tests {
             max_batch_calls: 8,
             max_batch_tokens: 64,
             max_request_pool_size: 8,
-            lanes: vec![uniserve_ipc::LaneConfig {
+            lanes: vec![ipc::LaneConfig {
                 lane_id: "decode".into(),
                 sm_budget: 1,
-                call_kinds: vec![CallKind::Forward(uniserve_ipc::ForwardMode::Decode)],
+                call_kinds: vec![CallKind::Forward(ipc::ForwardMode::Decode)],
                 max_batch_calls: Some(4),
                 max_batch_tokens: None,
                 max_inflight: None,

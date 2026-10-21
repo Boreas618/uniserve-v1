@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
-use uniserve_ipc::Batch as BatchPlan;
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use ipc::Batch as BatchPlan;
 
 use super::DECODER;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
@@ -15,10 +15,10 @@ use crate::executor::video::MediaBatch;
 use crate::executor::video::{Parts, decode_range, publish_bound, stream_of};
 use crate::ffi::DType;
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::allocation::StorageView;
 use crate::parallel::joins::GraphFunctions;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
 use crate::runner::{RunnerSetup, device_buffer};
-use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 

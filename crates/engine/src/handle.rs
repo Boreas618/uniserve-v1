@@ -21,8 +21,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::{EngineCoreOutput, Request};
+use ipc::RequestId;
 use tokio::sync::mpsc;
-use uniserve_ipc::RequestId;
 
 use crate::lock;
 
@@ -626,7 +626,7 @@ impl EngineHandle {
 #[cfg(test)]
 mod tests {
     use crate::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
-    use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
+    use ipc::{ImageParams, RequestId, SamplingParams};
 
     use super::*;
 

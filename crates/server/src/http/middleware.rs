@@ -20,8 +20,8 @@ use axum::http::{HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http_body::{Frame, SizeHint};
+use observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 use tokio::sync::Semaphore;
-use uniserve_observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 use uuid::Uuid;
 
 use crate::openai::ApiError;

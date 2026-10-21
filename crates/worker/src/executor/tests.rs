@@ -12,20 +12,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::{
+use ipc::{
     Batch as Plan, BatchCommand, BufferAllocation, DType as WireDType, DimBound, GenerationParams,
     NewRequest, RequestKey, ShapeBound, TensorRef, WorkerInfo,
 };
-use uniserve_ipc::{CallId, RequestId, SamplingParams};
+use ipc::{CallId, RequestId, SamplingParams};
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::{Batch, Executor, Submission};
 use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
 use crate::ffi::MemoryKind;
-use crate::storage::{BufferPool, OutputPlacement, ProductRead, ProductStore};
+use crate::memory::{BufferPool, OutputPlacement, ProductRead, ProductStore};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, ErrorCode, EventPool};
 
 type Result<T> = std::result::Result<T, WorkerError>;
@@ -197,7 +197,7 @@ fn cpu_worker(capacity: usize) -> Result<Executor> {
         vec![MemoryKind::Host],
         0,
         0,
-        BufferPool::allocate(1024, &[MemoryKind::Host], &mut crate::storage::LocalMemory)?,
+        BufferPool::allocate(1024, &[MemoryKind::Host], &mut crate::memory::LocalMemory)?,
         Arc::clone(&events),
     )?;
     let options = TransportOptions {
@@ -213,15 +213,13 @@ fn cpu_worker(capacity: usize) -> Result<Executor> {
         Arc::clone(&events),
         &options,
     )?;
-    executor
-        .backend_mut()
-        .set_worker_storage(WorkerStorage::new(
-            events,
-            tensors,
-            Arc::new(transports),
-            None,
-            None,
-        ));
+    executor.backend_mut().set_worker_storage(WorkerMemory::new(
+        events,
+        tensors,
+        Arc::new(transports),
+        None,
+        None,
+    ));
     Ok(executor)
 }
 
@@ -278,16 +276,18 @@ fn read(executor: &Executor, product: &TensorRef) -> Result<Arc<ProductRead>> {
         product,
         CallId::new(9, 0),
         Some(MemoryKind::Host),
-        None::<&uniserve_cuda::Stream>,
+        None::<&cuda::Stream>,
     )?)
 }
 
 fn complete(executor: &Executor, read: &Arc<ProductRead>) -> Result<()> {
-    Ok(tensors(executor)?.complete_reads(
-        std::slice::from_ref(read),
-        None::<&uniserve_cuda::Stream>,
-        &[],
-    )?)
+    Ok(
+        tensors(executor)?.complete_reads(
+            std::slice::from_ref(read),
+            None::<&cuda::Stream>,
+            &[],
+        )?,
+    )
 }
 
 /// Whether a later call can read `product`.

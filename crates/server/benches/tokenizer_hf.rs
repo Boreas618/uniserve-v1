@@ -9,7 +9,7 @@ use std::error::Error;
 
 use criterion::{Criterion, Throughput, black_box};
 use hf_hub::api::sync::ApiBuilder;
-use uniserve_server::profile::tokenizer::HuggingFaceTokenizer;
+use server::profile::tokenizer::HuggingFaceTokenizer;
 
 const MODEL_ID: &str = "Qwen/Qwen3.5-0.8B";
 const SAMPLE_TEXT: &str =

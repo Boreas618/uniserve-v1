@@ -13,13 +13,13 @@
 //! images share no cached pages, since page identities cover token ids only,
 //! and all of their readouts run concurrently.
 
-use uniserve_engine::{
+use engine::{
     CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
     ImageGenerationConfig, MultimodalInputs, RejectionKind,
 };
-use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{ImageParams, RequestId, SamplingParams};
 
-use crate::engine::Engine;
+use crate::frontend::Engine;
 use crate::serving::diffusion_gemma::engine_images;
 use crate::serving::media;
 use crate::serving::systemone::error::{LocItem, SystemOneError, ValidationIssue};

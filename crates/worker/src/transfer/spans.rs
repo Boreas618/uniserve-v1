@@ -7,12 +7,10 @@
 
 use std::ops::Range;
 
-use uniserve_cuda::{
-    CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async,
-};
+use cuda::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
 
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::memory::StorageView;
+use crate::memory::allocation::StorageView;
 use crate::{Error, Result};
 
 /// Ordered first-axis spans of one logical tensor. Every span has the same
@@ -276,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::Backing;
-    use crate::storage::memory::Storage;
+    use crate::memory::allocation::Storage;
 
     fn write_floats(memory: &Arc<dyn Backing>, values: &[f32]) {
         // SAFETY: test memory is host memory owned by the caller.

@@ -8,7 +8,7 @@
 //! [`InputProcessor`] renders and tokenizes a request against the loaded
 //! model; [`generation_output`] and [`media_output`] assemble a submitted
 //! request's engine events into public [`RequestOutput`] events. The
-//! [`Engine`](crate::engine::Engine) drives both around its engine cores.
+//! [`Engine`](crate::frontend::Engine) drives both around its engine cores.
 
 mod assembly;
 pub mod chat;
@@ -28,8 +28,8 @@ pub mod video;
 use std::pin::Pin;
 use std::time::Instant;
 
+use engine::EventRx;
 use futures::Stream;
-use uniserve_engine::EventRx;
 
 pub use error::{ServeError, TokenizeError};
 pub use input::{GenerateRequest, ImageSamplingParams, OutputParams, Prompt, SamplingParams};
@@ -102,10 +102,10 @@ pub(crate) fn media_output(
 
 #[cfg(test)]
 mod tests {
+    use engine::EngineCoreOutput;
+    use engine::EventRx;
     use futures::StreamExt as _;
-    use uniserve_engine::EngineCoreOutput;
-    use uniserve_engine::EventRx;
-    use uniserve_ipc::TokenLogprob;
+    use ipc::TokenLogprob;
 
     use super::*;
     use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -156,10 +156,7 @@ mod tests {
         }
     }
 
-    fn finished(
-        reason: uniserve_engine::FinishReason,
-        completion_tokens: usize,
-    ) -> EngineCoreOutput {
+    fn finished(reason: engine::FinishReason, completion_tokens: usize) -> EngineCoreOutput {
         EngineCoreOutput::Finished {
             reason,
             stop_reason: None,
@@ -192,7 +189,7 @@ mod tests {
                     rank: 3,
                 }],
             },
-            finished(uniserve_engine::FinishReason::MaxTokens, 1),
+            finished(engine::FinishReason::MaxTokens, 1),
         ]);
         let outputs = output(
             ChatOutputProcessor::default(),
@@ -234,7 +231,7 @@ mod tests {
     /// publishes none) returns no text. The prompt seeds decoding only.
     #[tokio::test]
     async fn a_request_without_generated_tokens_has_no_text() {
-        let events = engine_events([finished(uniserve_engine::FinishReason::Eos, 1)]);
+        let events = engine_events([finished(engine::FinishReason::Eos, 1)]);
         let outputs = output(
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
@@ -278,7 +275,7 @@ mod tests {
                     text_token(b'x'),
                     text_token(b' '),
                     text_token(b'<'),
-                    finished(uniserve_engine::FinishReason::MaxTokens, 3),
+                    finished(engine::FinishReason::MaxTokens, 3),
                 ],
                 None,
                 "x <",

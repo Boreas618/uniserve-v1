@@ -1,6 +1,6 @@
 //! In-process scheduling, storage management, worker execution, and request control.
 //!
-//! The crate sits between the HTTP frontend (`uniserve-server`) and the
+//! The crate sits between the HTTP frontend (`server`) and the
 //! worker processes. `EngineCore` (`core`) launches the worker
 //! processes, or takes a supplied executor, and runs the `Scheduler` on its
 //! owner thread. Frontends submit and control requests through a cloneable
@@ -14,6 +14,9 @@
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
+/// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
+/// error is public.
+pub mod allocation;
 mod clock;
 mod core;
 mod deployment;
@@ -23,16 +26,13 @@ mod executor;
 /// calculations.
 pub mod generation;
 mod handle;
-mod prefix_cache;
+mod kv_cache;
 /// Serializable scheduler, cache, and worker performance snapshots.
 pub mod report;
 mod request;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
-/// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
-/// error is public.
-pub mod storage;
 mod warmup;
 mod worker;
 
@@ -76,7 +76,7 @@ pub use crate::worker::{
     FlashInferBackendParseError, GraphPolicy, LaneConfig, LaneSpec, LoadFormat, WorkerExecutor,
     WorkerGroup, WorkerProcessArgs,
 };
-pub use uniserve_ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo};
+pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///

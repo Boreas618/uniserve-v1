@@ -20,10 +20,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ipc::{BufferId, NewRequest, RequestKey};
 use models::video::plan::requested_frames;
 use models::video::{Canvas, ConditionRole, ServedCanvas, VideoCondition};
 use tvm_ffi::Any;
-use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::ffi::integer_list;

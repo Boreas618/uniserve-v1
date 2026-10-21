@@ -53,13 +53,13 @@ use crate::error::WorkerError;
 use crate::executor::Submission;
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job};
-use crate::storage::{PendingImport, ProductRead, ProductStore};
+use crate::memory::{PendingImport, ProductRead, ProductStore};
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Result};
+use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, DType, TensorRef};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use uniserve_ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, DType, TensorRef};
 
 use hazards::{Resolved, installs, latent_hazards, require_storage, resolve};
 use imports::{consumers, import_cache, import_products};
@@ -667,8 +667,8 @@ fn publish(
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(
-    &mut crate::storage::LatentPool,
-    &crate::storage::LatentStorage,
+    &mut crate::memory::LatentPool,
+    &crate::memory::LatentStorage,
 )> {
     let latents = backend
         .parts()

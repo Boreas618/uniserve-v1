@@ -4,11 +4,11 @@ use crate::transfer::{ACK_SLOTS, CLAIMED};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use uniserve_cuda::{
+use cuda::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
 };
 
-use crate::storage::memory::Storage;
+use crate::memory::allocation::Storage;
 use crate::stream::{Fill, Issue};
 use crate::{DescriptorGrants, Error, Result};
 

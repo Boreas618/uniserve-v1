@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use uniserve_ipc::{BufferId, RequestKey};
+use ipc::{BufferId, RequestKey};
 
 use super::read::ReadRef;
 use crate::{Error, Result, lock};

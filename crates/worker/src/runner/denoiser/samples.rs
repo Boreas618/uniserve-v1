@@ -7,8 +7,8 @@ use std::ops::Range;
 
 use super::{LayoutFields, VideoModel};
 use crate::ffi::DType;
+use crate::memory::SlotField;
 use crate::request::video::VideoLayout;
-use crate::storage::SlotField;
 use crate::{Error, Result};
 
 /// A request's samples occupy at most this many pages, which bounds the

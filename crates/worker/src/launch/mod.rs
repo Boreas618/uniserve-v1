@@ -2,7 +2,7 @@
 //! Python thread and exit status.
 //!
 //! This module's `main` is the body of the library's exported
-//! `worker_main`, which the `uniserve-worker` executable calls on the
+//! `worker_main`, which the `uniserve worker` command calls on the
 //! process's main thread. It spawns the worker's Python thread, which hosts
 //! the interpreter ([`python::host`]) and serves the Python calls of every
 //! other thread ([`Interpreter`]), and runs the control plane on the main
@@ -60,7 +60,7 @@ pub(crate) fn main(argv: &[String], python: &Path) -> i32 {
         }
     };
     let usage = |error: DescriptorError| {
-        eprintln!("{USAGE}\nuniserve-worker: error: {error}");
+        eprintln!("{USAGE}\nuniserve worker: error: {error}");
         2
     };
     let arguments = match Arguments::parse(argv) {
@@ -101,17 +101,17 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 /// communicators with its peers, or its device contexts.
 ///
 /// The driver names its memory for the process
-/// ([`uniserve_ipc::launch::remove_event_memory`]); NCCL's names are random,
+/// ([`ipc::launch::remove_event_memory`]); NCCL's names are random,
 /// and those still linked among this process's mappings are its own
-/// ([`uniserve_ipc::launch::NcclSegments`]). Removing a name leaves every
+/// ([`ipc::launch::NcclSegments`]). Removing a name leaves every
 /// mapping of the object, this process's and those its peers opened, valid
 /// until they end. The removal is best effort: the worker ends whatever it
 /// finds.
 fn release_names() {
     // SAFETY: getuid and getpid have no preconditions.
     let (uid, pid) = unsafe { (libc::getuid(), libc::getpid()) };
-    let _ = uniserve_ipc::launch::remove_event_memory(uid, pid as u32);
-    if let Ok(segments) = uniserve_ipc::launch::NcclSegments::mapped_by(None) {
+    let _ = ipc::launch::remove_event_memory(uid, pid as u32);
+    if let Ok(segments) = ipc::launch::NcclSegments::mapped_by(None) {
         let _ = segments.remove();
     }
 }
@@ -133,8 +133,8 @@ pub(crate) fn end(status: i32) -> ! {
 /// worker's group as soon as it has read it, before the worker logs the
 /// error itself.
 /// A failure to send leaves the head to notice the closed connection.
-fn report_startup_failure(channel: &mut uniserve_ipc::Channel, error: &WorkerError) {
-    let response = uniserve_ipc::WorkerResponse::Error {
+fn report_startup_failure(channel: &mut ipc::Channel, error: &WorkerError) {
+    let response = ipc::WorkerResponse::Error {
         message_id: None,
         error: error.response(),
     };
@@ -218,7 +218,7 @@ fn run(
     // context's interprocess events only when the context is destroyed, not
     // when the process exits: the contexts are destroyed here.
     // SAFETY: as above, nothing in the process uses a device after this.
-    match unsafe { uniserve_cuda::PrimaryContext::reset_all() } {
+    match unsafe { cuda::PrimaryContext::reset_all() } {
         Ok(devices) => tracing::debug!(?devices, "destroyed the device contexts"),
         Err(error) => {
             let error = Failure::from(crate::Error::from(error));

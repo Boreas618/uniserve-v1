@@ -9,7 +9,7 @@ pub(crate) mod device;
 pub(crate) mod plan;
 pub(crate) mod video;
 
-use uniserve_ipc::Call;
+use ipc::Call;
 
 use crate::{Error, Result};
 

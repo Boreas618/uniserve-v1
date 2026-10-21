@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use cuda::{DeviceId, Stream};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
 
 use super::expert_union::ExpertUnion;
 use super::microbatches::{MicrobatchCall, turn};

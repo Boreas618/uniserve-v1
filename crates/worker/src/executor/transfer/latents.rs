@@ -20,15 +20,13 @@
 
 use std::sync::Arc;
 
-use uniserve_ipc::{
-    BufferId, Call, LatentParams, TensorExport, TensorRef, TensorTransfer, TransferHandle,
-};
+use ipc::{BufferId, Call, LatentParams, TensorExport, TensorRef, TensorTransfer, TransferHandle};
 
 use crate::executor::PendingOutput;
 use crate::executor::products::Publications;
 use crate::ffi::DType;
-use crate::storage::LatentPool;
-use crate::storage::{LatentExport, LatentImport, LatentStorage};
+use crate::memory::LatentPool;
+use crate::memory::{LatentExport, LatentImport, LatentStorage};
 use crate::stream::Issue;
 use crate::transfer::exports;
 use crate::transfer::{Read, ReadRef, Transports, fetch};
@@ -320,8 +318,8 @@ pub(crate) fn abandon(pool: &LatentPool, input: &LatentInput) -> Result<()> {
 mod tests {
     use std::collections::HashSet;
 
-    use uniserve_ipc::{CallId, RequestId};
-    use uniserve_ipc::{
+    use ipc::{CallId, RequestId};
+    use ipc::{
         CallKind, DType as WireDType, DimBound, RequestKey, ShapeBound, TransferMode,
         WorkerEndpoint,
     };
@@ -330,9 +328,9 @@ mod tests {
     use crate::EventPool;
     use crate::executor::PendingOutput;
     use crate::ffi::DType;
+    use crate::memory::LatentPlan;
+    use crate::memory::{LatentUpdate, TrajectoryVersion};
     use crate::request::RequestProgress;
-    use crate::storage::LatentPlan;
-    use crate::storage::{LatentUpdate, TrajectoryVersion};
     use crate::transfer::{TransferCapacity, TransportKind, TransportOptions};
 
     const SLOT: usize = 1;
@@ -346,7 +344,7 @@ mod tests {
     /// A pool of two slots and three usable two-unit pages on host memory.
     fn pool() -> Result<(LatentPool, LatentStorage)> {
         Ok((
-            crate::storage::LatentPool::new(2, 4, 2)?,
+            crate::memory::LatentPool::new(2, 4, 2)?,
             LatentStorage::allocate(
                 &LatentPlan {
                     request_pool_size: 2,
@@ -359,7 +357,7 @@ mod tests {
                 None,
                 None,
                 "latent_banks",
-                &mut crate::storage::LocalMemory,
+                &mut crate::memory::LocalMemory,
             )?,
         ))
     }
@@ -488,7 +486,7 @@ mod tests {
             &params(pages),
             bank,
             0,
-            None::<&uniserve_cuda::Stream>,
+            None::<&cuda::Stream>,
         )?;
         locate_export(pool, export, publications, &mut output)?;
         output

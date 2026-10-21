@@ -1,18 +1,17 @@
 [package]
-name = "uniserve-storage"
+name = "storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
-# The Storage Server's protocol, client and server. It depends on no
-# workspace crate and never links CUDA: it outlives builds of the head and
-# the workers, and holds device memory only through descriptors.
+# The Storage Server's protocol and its client. It depends on no workspace
+# crate and never links CUDA: the Storage Server outlives builds of every
+# other process, which speak to it through this crate.
 [dependencies]
 libc.workspace = true
-libloading.workspace = true
-mooncake_store.workspace = true
 rmp-serde.workspace = true
-rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
+rustix = { workspace = true, features = ["net"] }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

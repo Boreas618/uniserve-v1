@@ -11,21 +11,21 @@
 
 use std::collections::HashMap;
 
-use uniserve_engine::EngineCoreOutput;
-use uniserve_engine::{
+use engine::EngineCoreOutput;
+use engine::{
     Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerGroupId,
     WorkerProcessArgs,
 };
-use uniserve_engine::{
+use engine::{
     GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
+use ipc::{ImageParams, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
     // The handle keeps the sender alive, so `Scheduler::step` never sees a
     // disconnected channel while the loop below runs.
     let (command_tx, commands) = crossbeam_channel::unbounded();
-    let handle = uniserve_engine::EngineHandle::new(command_tx);
+    let handle = engine::EngineHandle::new(command_tx);
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -43,15 +43,12 @@ fn main() -> anyhow::Result<()> {
         worker_id: "local".into(),
         executable: WorkerProcessArgs::default_executable(),
         model: String::new(),
-        ranks: uniserve_engine::WorkerGroupConfig::placed(
+        ranks: engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerGroupConfig::single_component(
-                uniserve_engine::DEFAULT_COMPONENT,
-                1,
-            ),
+            engine::WorkerGroupConfig::single_component(engine::DEFAULT_COMPONENT, 1),
         )
         .ranks,
         // Allows two physical runs in flight on the rank at once.
@@ -82,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         SimEngine::generation_limits(),
     )?;
 
-    let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
+    let mut rxs: HashMap<RequestId, (&str, engine::EventRx)> = HashMap::new();
     let mut reqs = Vec::new();
     let mk = |id: u64, constraint: GenerationConstraint| generation_request(id, constraint);
     reqs.push((mk(1, GenerationConstraint::UndOnly), "text"));

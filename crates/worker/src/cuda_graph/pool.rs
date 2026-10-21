@@ -1,8 +1,8 @@
 //! Shared device budgets and allocation pools for captured numerical calls.
 
+use cuda::DeviceId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use uniserve_cuda::DeviceId;
 
 use indexmap::IndexMap;
 use tvm_ffi::Any;

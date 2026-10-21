@@ -21,7 +21,7 @@ thought channel and tool calls. The tests check what a client observes:
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
 executable is ``UNISERVE_WORKER_EXECUTABLE``, else the test environment's
-``uniserve-worker``. ``UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS`` adds
+``uniserve``. ``UNISERVE_DIFFUSION_GEMMA_SERVE_ARGS`` adds
 ``uniserve serve`` arguments that select the deployment topology, such as
 ``--data-parallel-size 4``; every topology serves the same replies.
 """

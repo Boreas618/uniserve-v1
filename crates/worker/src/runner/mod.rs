@@ -16,12 +16,12 @@ pub(crate) mod vision;
 
 use std::sync::Arc;
 
+use cuda::{DeviceId, Stream};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
 
 use crate::Result;
 use crate::ffi::{Backing, DType, Handle};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 
 /// Per-sequence language output, independently of the input's cache writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

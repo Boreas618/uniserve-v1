@@ -682,6 +682,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "thiserror",
+]
+
+[[package]]
 name = "daachorse"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,6 +903,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "engine"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bitflags",
+ "crossbeam-channel",
+ "engine",
+ "fnv",
+ "ipc",
+ "libc",
+ "models",
+ "png",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "storage-server",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1637,6 +1674,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "models",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2108,6 +2160,13 @@ dependencies = [
  "bindgen",
  "cc",
  "widestring",
+]
+
+[[package]]
+name = "observability"
+version = "2.0.0"
+dependencies = [
+ "prometheus-client",
 ]
 
 [[package]]
@@ -2983,6 +3042,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "server"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "asynk-strim-attr",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "criterion",
+ "engine",
+ "expect-test",
+ "fastokens",
+ "fnv",
+ "futures",
+ "hf-hub 0.5.0",
+ "http-body",
+ "humantime",
+ "image",
+ "indexmap 2.14.0",
+ "ipc",
+ "itertools 0.14.0",
+ "libc",
+ "llm-multimodal",
+ "minijinja",
+ "minijinja-contrib",
+ "models",
+ "observability",
+ "reqwest",
+ "serde",
+ "serde-json-fmt",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_with",
+ "sha2",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "thiserror-ext",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-futures",
+ "url",
+ "uuid",
+ "validator",
+ "winnow",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3112,6 +3225,36 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "storage"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "rmp-serde",
+ "rustix",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "storage-server"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "cuda",
+ "libc",
+ "mooncake_store",
+ "rustix",
+ "signal-hook-registry",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "strsim"
@@ -3714,208 +3857,20 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ipc",
+ "libc",
+ "libloading",
  "mimalloc",
+ "rustix",
+ "server",
+ "storage",
+ "storage-server",
+ "tempfile",
  "time",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "uniserve-server",
-]
-
-[[package]]
-name = "uniserve-cuda"
-version = "2.0.0"
-dependencies = [
- "libc",
- "libloading",
- "thiserror",
-]
-
-[[package]]
-name = "uniserve-engine"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bitflags",
- "crossbeam-channel",
- "fnv",
- "libc",
- "models",
- "png",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uniserve-engine",
- "uniserve-ipc",
- "uniserve-storage",
- "uuid",
-]
-
-[[package]]
-name = "uniserve-ipc"
-version = "2.0.0"
-dependencies = [
- "libc",
- "models",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "uniserve-launcher"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "uniserve-ipc",
- "uniserve-storage",
-]
-
-[[package]]
-name = "uniserve-observability"
-version = "2.0.0"
-dependencies = [
- "prometheus-client",
-]
-
-[[package]]
-name = "uniserve-server"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "asynk-strim-attr",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "criterion",
- "expect-test",
- "fastokens",
- "fnv",
- "futures",
- "hf-hub 0.5.0",
- "http-body",
- "humantime",
- "image",
- "indexmap 2.14.0",
- "itertools 0.14.0",
- "libc",
- "llm-multimodal",
- "minijinja",
- "minijinja-contrib",
- "models",
- "reqwest",
- "serde",
- "serde-json-fmt",
- "serde_json",
- "serde_path_to_error",
- "serde_with",
- "sha2",
- "tempfile",
- "thiserror",
- "thiserror-ext",
- "tokenizers",
- "tokio",
- "tokio-util",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-futures",
- "uniserve-engine",
- "uniserve-ipc",
- "uniserve-observability",
- "uniserve-storage",
- "url",
- "uuid",
- "validator",
- "winnow",
-]
-
-[[package]]
-name = "uniserve-storage"
-version = "2.0.0"
-dependencies = [
- "libc",
- "libloading",
- "mooncake_store",
- "rmp-serde",
- "rustix",
- "serde",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "uniserve-storage-server"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "rustix",
- "signal-hook-registry",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "uniserve-storage",
-]
-
-[[package]]
-name = "uniserve-worker"
-version = "2.0.0"
-dependencies = [
- "base64 0.22.1",
- "bytemuck",
- "crossbeam-channel",
- "indexmap 2.14.0",
- "libc",
- "libloading",
- "models",
- "nvtx",
- "png",
- "pyo3-ffi",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook-registry",
- "tempfile",
- "thiserror",
- "time",
- "tracing",
- "tracing-subscriber",
- "tvm-ffi",
- "uniserve-cuda",
- "uniserve-ipc",
- "uniserve-storage",
- "uuid",
-]
-
-[[package]]
-name = "uniserve-worker-main"
-version = "2.0.0"
-dependencies = [
- "libc",
- "libloading",
 ]
 
 [[package]]
@@ -4632,6 +4587,37 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "worker"
+version = "2.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytemuck",
+ "crossbeam-channel",
+ "cuda",
+ "indexmap 2.14.0",
+ "ipc",
+ "libc",
+ "libloading",
+ "models",
+ "nvtx",
+ "png",
+ "pyo3-ffi",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook-registry",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+ "tvm-ffi",
+ "uuid",
 ]
 
 [[package]]

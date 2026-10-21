@@ -12,15 +12,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use uniserve_ipc::{DType, DimBound, MediaCall, OutputInfo, ShapeBound};
+use ipc::{DType, DimBound, MediaCall, OutputInfo, ShapeBound};
 
 use super::plan::{MediaFacts, product_bytes};
 use crate::config::WorkerConfig;
 use crate::host::mux::encoded_unit_bytes;
+use crate::memory::LatentPlan;
 use crate::request::video::{MediaPlan, admitted_canvases};
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::{SamplePages, StateEnvelope};
-use crate::storage::LatentPlan;
 use crate::{Error, Result};
 
 /// What a rank's video components need beside its products.

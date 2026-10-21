@@ -12,8 +12,8 @@ use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use uniserve_ipc::channel::Hangup;
-use uniserve_ipc::{Channel, LaunchDescriptor, Registration, VERSION};
+use ipc::channel::Hangup;
+use ipc::{Channel, LaunchDescriptor, Registration, VERSION};
 
 use super::Arguments;
 use crate::{Error, Result};

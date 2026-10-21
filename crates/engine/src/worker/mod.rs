@@ -10,6 +10,7 @@
 //! to and register at, `rendezvous` the address a group's ranks meet at, and
 //! `launcher` the per-host launchers that start ranks placed on other hosts.
 
+mod claims;
 mod executor;
 mod group;
 mod incarnations;
@@ -17,7 +18,6 @@ mod launcher;
 mod process;
 mod registry;
 mod rendezvous;
-mod storage;
 
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
@@ -35,7 +35,7 @@ pub enum BatchSubmitError {
     /// The batch is handed back unchanged so the caller can resubmit it
     /// later; nothing was recorded or sent for it.
     #[error("worker batch queue is full")]
-    WouldBlock(Box<uniserve_ipc::Batch>),
+    WouldBlock(Box<ipc::Batch>),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),
@@ -46,11 +46,10 @@ pub enum BatchSubmitError {
 pub struct WorkerProcessArgs {
     /// Worker group identity assigned by the engine.
     pub worker_id: String,
-    /// The `uniserve-worker` executable each worker of the group runs.
+    /// The `uniserve` executable each worker of the group runs as (its
+    /// `worker` command), and that starts a host's Storage Server when the
+    /// host has none (its `storage serve` command).
     pub executable: std::path::PathBuf,
-    /// The `uniserve-storage-server` executable that starts a host's
-    /// Storage Server when the host has none.
-    pub storage_server: std::path::PathBuf,
     /// The deployment the group belongs to, which its workers' storage
     /// scopes name: the served model name.
     pub deployment: String,
@@ -60,7 +59,7 @@ pub struct WorkerProcessArgs {
     /// The Mooncake connector a host's Storage Server the deployment starts
     /// runs (`kv_cache_config.mooncake`), keeping committed pages in the
     /// distributed tier.
-    pub storage_connector: Option<uniserve_storage::connector::Settings>,
+    pub storage_connector: Option<storage::connector::Settings>,
     /// Whether the group keeps a standby rank group beside its serving one
     /// (`worker_config.standby`), promoted when the serving group fails.
     pub keep_standby: bool,
@@ -146,7 +145,7 @@ pub struct WorkerProcessArgs {
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
     /// Numeric data type of the KV (prefix) cache, when explicitly selected.
-    pub kv_cache_dtype: Option<uniserve_ipc::PrefixCacheDtype>,
+    pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
     /// Each rank's share of its device's total memory, which bounds the
     /// process's static allocations, weights and KV cache;
     /// `WorkerGroupConfig::validate_mem_fraction_static` states its range.
@@ -201,7 +200,7 @@ pub struct WorkerProcessArgs {
     /// canvases. The worker keeps the argmax history its stability
     /// threshold needs, prepares its canvas steps for exactly this sampling,
     /// and refuses a request that carries another.
-    pub canvas_sampling: Option<uniserve_ipc::CanvasSampling>,
+    pub canvas_sampling: Option<ipc::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// FlashInfer tensor-core decode selection; `None` lets the backend

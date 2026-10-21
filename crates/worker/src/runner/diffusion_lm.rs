@@ -55,8 +55,8 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::CanvasSampling;
+use cuda::Stream;
+use ipc::CanvasSampling;
 
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, Methods};
@@ -68,10 +68,10 @@ use crate::ffi::{Backing, DType, Handle};
 use crate::lane::{
     BLOCK_ON_TIMEOUT, Capture, Completion, ExpertStep, ExpertVariant, Job, JobQueues,
 };
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{AttentionRow, OutputPool, PrefixCache, TablePages};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelRecord;
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{AttentionRow, OutputPool, PrefixCache, TablePages};
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 

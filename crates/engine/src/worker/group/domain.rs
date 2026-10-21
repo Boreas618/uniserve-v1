@@ -33,9 +33,9 @@ use crate::CommandWaker;
 use super::spawn::launch_all;
 use crate::worker::WorkerProcess;
 use crate::worker::WorkerProcessArgs;
+use crate::worker::claims::StorageClaims;
 use crate::worker::launcher::Launchers;
 use crate::worker::registry::Registry;
-use crate::worker::storage::StorageClaims;
 
 /// The groups replaced together, and their replacement rounds.
 pub(super) struct FailureDomain {

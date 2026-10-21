@@ -1,0 +1,310 @@
+//! Running a Storage Server, and the operator's commands against one.
+//!
+//! [`serve`] holds this host's retained memory for the calling user until it
+//! is stopped with SIGTERM or SIGINT. A process that starts a server when its
+//! host has none starts it with `daemon` set (`storage::socket::ensure`):
+//! the server then leaves its starter's session and process tree, writes its
+//! log beside its socket and signals its starter once it listens, so a
+//! starter's end never ends it.
+//!
+//! With connector settings, the server also runs the Mooncake connector
+//! ([`run_connector`]) as a child process it starts again when it ends.
+
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::Context;
+use storage::connector::Settings;
+use storage::{Client, Role, socket};
+
+use crate::{ConnectorLaunch, Server};
+
+/// How to serve: the arguments of `uniserve storage serve`.
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    /// The socket to listen on.
+    pub socket: PathBuf,
+    /// Leave the starter's session, log beside the socket, and return to the
+    /// starter once listening.
+    pub daemon: bool,
+    /// The size of each host page pool, in bytes.
+    pub page_pool_bytes: u64,
+    /// Also accept other hosts' page requests on this TCP address
+    /// (`host:port`; port 0 picks one).
+    pub tcp: Option<String>,
+    /// The Mooncake connector's settings, when the server runs one.
+    pub connector: Option<Settings>,
+    /// The command that runs the connector, before its own arguments: this
+    /// executable and its `storage connector` command.
+    pub connector_command: Vec<OsString>,
+}
+
+/// Serve until stopped. Must be called before the process starts a thread:
+/// a daemon forks.
+///
+/// # Errors
+///
+/// Fails when the starter cannot be left, the socket cannot be bound, the
+/// server cannot start, or it fails while serving.
+pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
+    // Forked before any thread exists.
+    let ready = if options.daemon {
+        Some(detach(&options.socket)?)
+    } else {
+        None
+    };
+    init_logging();
+    let served = serve_on(&options, ready);
+    if let Err(error) = &served {
+        tracing::error!("storage server failed: {error:#}");
+    }
+    served
+}
+
+/// Run the Mooncake connector for the server on `socket` until the server
+/// closes its connection.
+///
+/// # Errors
+///
+/// Fails when the connector cannot reach Mooncake or the server.
+pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
+    init_logging();
+    let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
+    if let Err(error) = &ran {
+        tracing::error!("the Mooncake connector failed: {error:#}");
+    }
+    ran
+}
+
+/// Print the tensors, bytes and deployments the server on `socket` holds.
+///
+/// # Errors
+///
+/// Fails when the server cannot be reached or refuses the listing.
+pub fn list(socket: &Path) -> storage::Result<()> {
+    let mut client = Client::connect(socket, Role::Operator)?;
+    let listing = client.list()?;
+    for tensor in &listing.tensors {
+        let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
+        println!(
+            "{} {:?} {} bytes {:?} {} [{}]{}",
+            tensor.key.hex(),
+            tensor.placement,
+            tensor.storage_bytes,
+            tensor.access,
+            tensor.name,
+            scopes.join(", "),
+            tensor
+                .writer
+                .map(|pid| format!(" writer {pid}"))
+                .unwrap_or_default()
+        );
+    }
+    for deployment in &listing.deployments {
+        println!(
+            "deployment {} head {}",
+            deployment.deployment,
+            if deployment.head_connected {
+                "connected"
+            } else {
+                "gone"
+            }
+        );
+    }
+    for pool in &listing.page_pools {
+        println!(
+            "page pool {} kv heads {}+{} {} slots of {} bytes: {} ready, {} reserved, \
+             {} pinned, {} fetching, {} uploading",
+            pool.pool,
+            pool.shape.kv_head_offset,
+            pool.shape.kv_head_count,
+            pool.slots,
+            pool.shape.page_bytes,
+            pool.ready,
+            pool.reserved,
+            pool.pinned,
+            pool.fetching,
+            pool.uploading
+        );
+    }
+    if listing.connector {
+        println!("mooncake connector connected");
+    }
+    Ok(())
+}
+
+/// Release the memory of `deployment`, which is no longer served, at the
+/// server on `socket`.
+///
+/// # Errors
+///
+/// Fails when the server cannot be reached, or refuses because the
+/// deployment's head is connected.
+pub fn retire(socket: &Path, deployment: &str) -> storage::Result<()> {
+    let mut client = Client::connect(socket, Role::Operator)?;
+    let released = client.retire(deployment.to_owned())?;
+    println!("released {released} tensors of {deployment}");
+    Ok(())
+}
+
+/// Log to standard error at `UNISERVE_STORAGE_LOG`'s level, `info` when
+/// unset.
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("UNISERVE_STORAGE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+}
+
+/// Bind the socket and serve until stopped. `ready` is the starter's pipe,
+/// written once the server listens or found another one listening.
+fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()> {
+    let socket = &options.socket;
+    let signal = |ready: Option<OwnedFd>| {
+        if let Some(ready) = ready {
+            let _ = std::fs::File::from(ready).write_all(b"1");
+        }
+    };
+    let Some((listener, _lock)) =
+        socket::bind(socket).with_context(|| format!("binding {}", socket.display()))?
+    else {
+        tracing::info!(socket = %socket.display(), "another storage server serves this socket");
+        signal(ready);
+        return Ok(());
+    };
+    raise_descriptor_limit()?;
+    let (wake, stop) = stop_signals()?;
+    let connector = options.connector.as_ref().map(|settings| {
+        let mut command = options.connector_command.clone();
+        let program = command.remove(0);
+        command.extend(["--socket".into(), socket.as_os_str().to_owned()]);
+        command.extend(settings.arguments().into_iter().map(Into::into));
+        ConnectorLaunch {
+            program: program.into(),
+            arguments: command,
+        }
+    });
+    let mut server = Server::new(listener, options.page_pool_bytes, connector)?;
+    if let Some(address) = &options.tcp {
+        let listener = std::net::TcpListener::bind(address)
+            .with_context(|| format!("binding {address} for other hosts"))?;
+        let bound = server.listen_tcp(listener)?;
+        tracing::info!(address = %bound, "accepting other hosts' page requests");
+    }
+    tracing::info!(socket = %socket.display(), "storage server listening");
+    signal(ready);
+    server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))?;
+    tracing::info!("storage server stopped");
+    Ok(())
+}
+
+/// Raise the soft limit on open descriptors to the hard limit: the server
+/// holds one descriptor per retained storage of every worker on the host,
+/// thousands for a large model.
+fn raise_descriptor_limit() -> anyhow::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the descriptor limit");
+    }
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: setrlimit reads the struct it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("raising the descriptor limit");
+    }
+    Ok(())
+}
+
+/// A descriptor that becomes readable, and a flag that is set, when SIGTERM
+/// or SIGINT arrives.
+fn stop_signals() -> anyhow::Result<(OwnedFd, Arc<AtomicBool>)> {
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 fills the two descriptors it creates.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating the signal pipe");
+    }
+    // SAFETY: pipe2 returned two new descriptors this function owns.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    // The write end lives for the process: a handler may run until exit.
+    let writer = Box::leak(Box::new(writer)).as_raw_fd();
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let flag = Arc::clone(&stop);
+        // SAFETY: the action stores to an atomic and writes to a descriptor
+        // that is never closed, both async-signal-safe.
+        unsafe {
+            signal_hook_registry::register(signal, move || {
+                flag.store(true, Ordering::Release);
+                let _ = libc::write(writer, b"x".as_ptr().cast(), 1);
+            })
+        }
+        .context("installing a signal handler")?;
+    }
+    Ok((reader, stop))
+}
+
+/// Leave the starter: fork, let the parent wait for the child's readiness
+/// and exit, and make the child the leader of a session of its own with its
+/// standard streams on `storage-server.log` beside the socket. Returns the
+/// child's end of the readiness pipe.
+fn detach(socket: &Path) -> anyhow::Result<OwnedFd> {
+    let directory = socket.parent().context("the socket has no directory")?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("storage-server.log"))
+        .context("opening the storage server's log")?;
+
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 fills the two descriptors it creates.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating the readiness pipe");
+    }
+    // SAFETY: pipe2 returned two new descriptors this function owns.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+
+    // SAFETY: the process has one thread, so the child may run anything.
+    match unsafe { libc::fork() } {
+        -1 => Err(std::io::Error::last_os_error()).context("forking the storage server"),
+        0 => {
+            drop(reader);
+            // SAFETY: setsid and dup2 on descriptors this process owns.
+            unsafe {
+                libc::setsid();
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                if null >= 0 {
+                    libc::dup2(null, 0);
+                    libc::close(null);
+                }
+                libc::dup2(log.as_raw_fd(), 1);
+                libc::dup2(log.as_raw_fd(), 2);
+            }
+            Ok(writer)
+        }
+        _ => {
+            drop(writer);
+            // The child writes once it listens; a child that dies first
+            // closes the pipe, which reads as end of file.
+            let mut byte = [0_u8; 1];
+            let started = std::fs::File::from(reader).read(&mut byte).unwrap_or(0) == 1;
+            // SAFETY: `_exit` ends the starter without running handlers.
+            unsafe { libc::_exit(if started { 0 } else { 1 }) }
+        }
+    }
+}

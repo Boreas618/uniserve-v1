@@ -14,15 +14,15 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
+use engine::ModelDtype;
+use engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
-use uniserve_engine::ModelDtype;
-use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
-use crate::engine::Engine;
+use crate::frontend::Engine;
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -209,7 +209,7 @@ pub(crate) fn engine_over(
 /// processor geometry and the default media policy.
 pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     VideoService::new(
-        uniserve_engine::VideoDenoiserInfo {
+        engine::VideoDenoiserInfo {
             tasks: vec!["t2va".to_owned()],
             schedule_points: 5,
             video_shift: 12.0,

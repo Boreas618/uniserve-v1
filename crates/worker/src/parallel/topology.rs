@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use uniserve_ipc::ComponentConfig;
+use ipc::ComponentConfig;
 
 use crate::{Error, Result};
 
@@ -299,7 +299,7 @@ impl GroupPlan {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::{ComponentDistribution, ParallelConfig, SequenceParallel};
+    use ipc::{ComponentDistribution, ParallelConfig, SequenceParallel};
 
     use super::*;
 

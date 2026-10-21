@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::ImageParams;
-use uniserve_ipc::{ForwardStats, LatentParams, RequestKey};
+use cuda::{DeviceId, Stream};
+use ipc::ImageParams;
+use ipc::{ForwardStats, LatentParams, RequestKey};
 
 use super::{DenoiseRow, IntegrateRow};
 use crate::cuda_graph::GraphMode;
@@ -17,14 +17,14 @@ use crate::executor::image::ImageParts;
 use crate::executor::image::{ImageBatch, Planned, Progress, Resume};
 use crate::executor::transfer::latents;
 use crate::lane::{Completion, Job};
+use crate::memory::LatentUpdate;
+use crate::memory::Scratch;
+use crate::memory::TrajectoryVersion;
 use crate::parallel::ExpertUnion;
 use crate::request::diffusion::{BranchSet, BranchSource, Prefix};
 use crate::request::diffusion::{Coordinates, ForwardSlot, ImageTrajectory};
 use crate::runner::causal_lm::{CausalLMRunners, Step};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::storage::LatentUpdate;
-use crate::storage::Scratch;
-use crate::storage::TrajectoryVersion;
 use crate::stream::Issue;
 use crate::{Error, Result};
 
@@ -126,7 +126,7 @@ impl ImageBatch<'_> {
 
     /// Validate call `index`'s allocation against its admitted image and
     /// return the admission.
-    fn trajectory(&self, index: usize) -> Result<(Trajectory, uniserve_ipc::ImageParams)> {
+    fn trajectory(&self, index: usize) -> Result<(Trajectory, ipc::ImageParams)> {
         let call = &self.plan.calls[index];
         let request = self.requests.get(call.request_key.request_id.0)?;
         let image =

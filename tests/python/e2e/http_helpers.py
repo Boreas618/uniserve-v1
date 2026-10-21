@@ -41,7 +41,7 @@ def require_uniserve_binary() -> Path:
 
 
 def worker_executable() -> Path:
-    """The `uniserve-worker` executable a test server's workers run.
+    """The `uniserve` executable a test server's workers run as.
 
     `UNISERVE_WORKER_EXECUTABLE` names it; otherwise it is the one installed
     beside the interpreter running the tests, which runs the workers in that
@@ -50,7 +50,7 @@ def worker_executable() -> Path:
     configured = os.environ.get("UNISERVE_WORKER_EXECUTABLE")
     if configured:
         return Path(configured)
-    return Path(sys.executable).parent / "uniserve-worker"
+    return Path(sys.executable).parent / "uniserve"
 
 
 def wait_health(

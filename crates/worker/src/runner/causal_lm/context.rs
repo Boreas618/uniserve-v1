@@ -17,22 +17,22 @@
 //! after its last row; a visual-state row advances it by the image
 //! denoiser's rope advance when it completes a feedback.
 
+use cuda::DeviceId;
 use std::sync::Arc;
-use uniserve_cuda::DeviceId;
 
-use uniserve_ipc::{Call, ForwardBatch};
+use ipc::{Call, ForwardBatch};
 
 use crate::executor::PendingOutput;
 use crate::executor::image::ImageParts;
 use crate::ffi::MemoryKind;
 use crate::lane::Recorder;
+use crate::memory::allocation::StorageView;
+use crate::memory::{BlockTables, Metadata, ProductRead, ProductStore};
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{RowSource, TokenRow};
 use crate::runner::denoiser::image::ConditionRow;
 use crate::runner::denoiser::image_model::GridKey;
 use crate::runner::vision::{BlockPositions, PositionLayout, VisionBlock};
-use crate::storage::memory::StorageView;
-use crate::storage::{BlockTables, Metadata, ProductRead, ProductStore};
 use crate::{Error, Result};
 
 /// How a media call's rows advance its request.

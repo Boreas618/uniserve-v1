@@ -20,7 +20,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use uniserve_ipc::CanvasSampling;
+use ipc::CanvasSampling;
 
 use crate::profile::assets::{self, GenerationConfig, read_json};
 use crate::profile::omni::required_token_id;
@@ -359,7 +359,7 @@ fn required<T>(value: Option<T>, field: &'static str) -> assets::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::CanvasSampling;
+    use ipc::CanvasSampling;
 
     use super::{DenoisingOverrides, PatchBudget};
 

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Instant;
 
-use uniserve_cuda::{DeviceId, Event, EventFlags};
-use uniserve_ipc::Wake;
+use cuda::{DeviceId, Event, EventFlags};
+use ipc::Wake;
 
 use super::Issue;
 use crate::lane::{Completion, JobId};
@@ -787,7 +787,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use uniserve_ipc::{CallKind, Channel, ForwardMode, IpcError, Listener};
+    use ipc::{CallKind, Channel, ForwardMode, IpcError, Listener};
 
     use super::*;
     use crate::ffi::{DeferredCall, Function};

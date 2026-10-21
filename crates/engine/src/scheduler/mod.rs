@@ -42,13 +42,13 @@ pub use config::{
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig, SchedulingPolicy,
 };
 pub(crate) use execution::generation_consuming_calls;
+use ipc::{ForwardMode, MediaCall, TransferMode};
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
-use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
 mod admission;
 mod allocation;
@@ -79,26 +79,26 @@ use crate::scheduler::generation::{
     is_prompt_extend,
 };
 
-use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
-use crate::prefix_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
-use crate::storage::{
+use crate::allocation::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
+use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
+use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crate::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
     GenerationRequestError, MediaKind, PositionLogprobs, Request,
 };
 use crate::{RejectionKind, encoder_cache_key};
 use crossbeam_channel::Receiver;
-use uniserve_ipc::RequestId;
-use uniserve_ipc::UnitId;
-use uniserve_ipc::{
+use ipc::RequestId;
+use ipc::UnitId;
+use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
     Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange, DimBound,
     ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
-use uniserve_ipc::{SharedMedia, TokenLogprob};
+use ipc::{SharedMedia, TokenLogprob};
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
@@ -417,7 +417,7 @@ pub struct Scheduler {
     pub stats: Arc<SchedulerStats>,
     /// The host page tier, when it serves a worker group
     /// (`Scheduler::enable_page_tier`).
-    tiers: Option<crate::prefix_cache::Tiers>,
+    tiers: Option<crate::kv_cache::Tiers>,
     /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it writes its last pages to the host page tier
     /// (`Scheduler::flush_page_tier`).
@@ -447,11 +447,11 @@ fn now() -> f64 {
 
 /// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
 /// `None`.
-fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<uniserve_ipc::DType> {
+fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<ipc::DType> {
     match value {
-        Some(crate::ModelDtype::Float16) => Some(uniserve_ipc::DType::F16),
-        Some(crate::ModelDtype::BFloat16) => Some(uniserve_ipc::DType::BF16),
-        Some(crate::ModelDtype::Float32) => Some(uniserve_ipc::DType::F32),
+        Some(crate::ModelDtype::Float16) => Some(ipc::DType::F16),
+        Some(crate::ModelDtype::BFloat16) => Some(ipc::DType::BF16),
+        Some(crate::ModelDtype::Float32) => Some(ipc::DType::F32),
         None => None,
     }
 }

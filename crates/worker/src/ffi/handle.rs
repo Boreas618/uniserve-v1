@@ -78,7 +78,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Storage, StorageView};
+    use crate::memory::allocation::{Storage, StorageView};
 
     #[test]
     fn a_tvm_ffi_tensor_is_refused_as_an_opaque_handle() -> Result<()> {

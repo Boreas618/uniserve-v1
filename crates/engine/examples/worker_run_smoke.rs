@@ -16,15 +16,15 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_engine::EngineCoreOutput;
-use uniserve_engine::{
+use engine::EngineCoreOutput;
+use engine::{
     Command, EngineHandle, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup,
     WorkerGroupId, WorkerProcessArgs,
 };
-use uniserve_engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig, ModelDtype};
-use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
+use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig, ModelDtype};
+use ipc::{ImageParams, RequestId, SamplingParams};
 
-type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
+type Rxs = HashMap<RequestId, engine::EventRx>;
 
 fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<()> {
     let constraint = GenerationConstraint::UndOnly;
@@ -95,19 +95,16 @@ fn main() -> anyhow::Result<()> {
         encoder_cache_entries: 1024,
         ..WorkerProcessArgs::default()
     };
-    let engine = WorkerGroup::spawn(uniserve_engine::WorkerProcessArgs {
+    let engine = WorkerGroup::spawn(engine::WorkerProcessArgs {
         worker_id: "local".into(),
         executable: WorkerProcessArgs::default_executable(),
         model: String::new(),
-        ranks: uniserve_engine::WorkerGroupConfig::placed(
+        ranks: engine::WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cpu",
             1,
             2,
-            uniserve_engine::WorkerGroupConfig::single_component(
-                uniserve_engine::DEFAULT_COMPONENT,
-                1,
-            ),
+            engine::WorkerGroupConfig::single_component(engine::DEFAULT_COMPONENT, 1),
         )
         .ranks,
         queue_depth: 2,

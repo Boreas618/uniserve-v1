@@ -4,8 +4,8 @@
 //! remain part of its interface.
 
 use tvm_ffi::{Any, Array, Map};
-use uniserve_worker::ffi::is_none;
-use uniserve_worker::{Error, Result};
+use worker::ffi::is_none;
+use worker::{Error, Result};
 
 /// The keyword configuration of one harness call.
 pub struct Config {

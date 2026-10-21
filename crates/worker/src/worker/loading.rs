@@ -21,7 +21,7 @@ use tvm_ffi::Any;
 
 use crate::config::WorkerLaunch;
 use crate::ffi::{Handle, Interpreter, integer_list, list, strings, texts};
-use crate::storage::weights::Fingerprints;
+use crate::memory::weights::Fingerprints;
 
 /// The library module that reads and loads a rank's model.
 const LOADING: &str = "uniserve.loading.rank";
@@ -307,18 +307,16 @@ impl LoadedModel {
 
 /// The Ulysses head projection of a placement: its mode name and exchange
 /// step in rows. Kinds other than `ulysses` gather.
-pub(crate) fn head_projection(
-    placement: &uniserve_ipc::ComponentConfig,
-) -> (&'static str, Option<usize>) {
+pub(crate) fn head_projection(placement: &ipc::ComponentConfig) -> (&'static str, Option<usize>) {
     match placement.parallel_config.sequence_parallel {
-        uniserve_ipc::SequenceParallel::Ulysses {
+        ipc::SequenceParallel::Ulysses {
             projection,
             projection_rows,
             ..
         } => (
             match projection {
-                uniserve_ipc::HeadProjection::Gather => "gather",
-                uniserve_ipc::HeadProjection::Exchange => "exchange",
+                ipc::HeadProjection::Gather => "gather",
+                ipc::HeadProjection::Exchange => "exchange",
             },
             projection_rows,
         ),
@@ -327,11 +325,11 @@ pub(crate) fn head_projection(
 }
 
 /// The sequence-parallel kind name of a placement.
-pub(crate) fn sequence_kind(placement: &uniserve_ipc::ComponentConfig) -> &'static str {
+pub(crate) fn sequence_kind(placement: &ipc::ComponentConfig) -> &'static str {
     match placement.parallel_config.sequence_parallel {
-        uniserve_ipc::SequenceParallel::Local => "local",
-        uniserve_ipc::SequenceParallel::Ulysses { .. } => "ulysses",
-        uniserve_ipc::SequenceParallel::Allgather { .. } => "allgather",
-        uniserve_ipc::SequenceParallel::Hybrid { .. } => "hybrid",
+        ipc::SequenceParallel::Local => "local",
+        ipc::SequenceParallel::Ulysses { .. } => "ulysses",
+        ipc::SequenceParallel::Allgather { .. } => "allgather",
+        ipc::SequenceParallel::Hybrid { .. } => "hybrid",
     }
 }

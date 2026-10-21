@@ -1,6 +1,6 @@
 //! Startup of a video model's decoder runners on a rank.
 
-use uniserve_ipc::MediaCall;
+use ipc::MediaCall;
 
 use super::runners::DecoderRunners;
 use super::{DecodeCapacity, DecoderRunner};

@@ -11,8 +11,8 @@ pub(crate) use issue::HostFunction;
 pub use issue::{Fill, Issue, RowFill};
 
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
-use uniserve_ipc::CallKind;
+use cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use ipc::CallKind;
 
 use crate::config::{Device, WorkerConfig};
 use crate::lane::{Completion, JobId, JobQueues, Lane};

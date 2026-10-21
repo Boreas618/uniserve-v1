@@ -17,10 +17,10 @@ impl Scheduler {
         if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code);
-            if code == Some(uniserve_ipc::ErrorCode::InvariantViolation) {
+            if code == Some(ipc::ErrorCode::InvariantViolation) {
                 self.fatal = true;
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
-            } else if code == Some(uniserve_ipc::ErrorCode::InputError) {
+            } else if code == Some(ipc::ErrorCode::InputError) {
                 tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
             } else if !failure.refusals.is_empty()
                 && failure

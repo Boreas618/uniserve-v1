@@ -23,7 +23,7 @@ use crate::executor::WorkerGroupId;
 /// Returns an empty map when the routing lacks a video decoding or a video
 /// encoding component.
 pub(crate) fn video_unit_codecs(
-    routing: &std::collections::BTreeMap<uniserve_ipc::MediaCall, String>,
+    routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     placements: &[(
         &WorkerGroupId,
         &[crate::WorkerRank],
@@ -34,8 +34,8 @@ pub(crate) fn video_unit_codecs(
 > {
     let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
-        routing.get(&uniserve_ipc::MediaCall::VideoDecoding),
-        routing.get(&uniserve_ipc::MediaCall::VideoEncoding),
+        routing.get(&ipc::MediaCall::VideoDecoding),
+        routing.get(&ipc::MediaCall::VideoEncoding),
     ) else {
         return Ok(pairings);
     };
@@ -107,8 +107,8 @@ mod tests {
     use super::video_unit_codecs;
     use crate::WorkerRank;
     use crate::executor::{ComponentConfig, WorkerGroupId};
+    use ipc::MediaCall;
     use std::collections::BTreeMap;
-    use uniserve_ipc::MediaCall;
 
     fn rank(host: &str, device: &str) -> WorkerRank {
         WorkerRank {
@@ -121,7 +121,7 @@ mod tests {
         ComponentConfig {
             ranks,
             parallel_config: Default::default(),
-            distribution: Some(uniserve_ipc::ComponentDistribution::TemporalUnits),
+            distribution: Some(ipc::ComponentDistribution::TemporalUnits),
             units_per_rank,
             weights: Default::default(),
         }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use uniserve_ipc::WorkerEndpoint;
+use ipc::WorkerEndpoint;
 
 use crate::WorkerGroupId;
 

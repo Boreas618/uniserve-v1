@@ -3,17 +3,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::{BufferId, CallKind, MediaCall, RequestKey};
+use ipc::{BufferId, CallKind, MediaCall, RequestKey};
 
 use super::image::{ConditionRow, DenoiseRow};
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
+use crate::memory::{LatentCache, PrefixCache, UnitColumn};
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
 use crate::runner::component::Component;
-use crate::storage::{LatentCache, PrefixCache, UnitColumn};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

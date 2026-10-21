@@ -5,7 +5,7 @@
 //! because a rank scoped by `CUDA_VISIBLE_DEVICES` owns the visible device
 //! zero.
 
-use uniserve_cuda::DeviceId;
+use cuda::DeviceId;
 
 use super::DescriptorError;
 use crate::ffi::MemoryKind;

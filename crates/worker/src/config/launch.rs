@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use uniserve_ipc::ComponentConfig;
-use uniserve_ipc::LaunchDescriptor;
+use ipc::ComponentConfig;
+use ipc::LaunchDescriptor;
 
 use super::device::{Device, generation_device};
 use super::{
@@ -111,7 +111,7 @@ pub struct WorkerLaunch {
     pub group: String,
     pub generation: u64,
     /// Where the worker retains its weights and exclusive storages.
-    pub storage: uniserve_ipc::StorageLaunch,
+    pub storage: ipc::StorageLaunch,
     /// The deployment's name of this worker's host, its host identity in
     /// transfers and peer storage.
     pub host: String,

@@ -54,7 +54,7 @@ use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use indexmap::IndexMap;
-use uniserve_ipc::Wake;
+use ipc::Wake;
 
 use self::backend::{WorkerBackend, WorkerBatch};
 use crate::Error;
@@ -93,7 +93,7 @@ pub(crate) struct Batch {
 
 impl Batch {
     /// Bind backend data to the scheduler's request and producer dependencies.
-    pub(crate) fn from_plan(plan: &uniserve_ipc::Batch, data: WorkerBatch) -> Self {
+    pub(crate) fn from_plan(plan: &ipc::Batch, data: WorkerBatch) -> Self {
         let requests = plan
             .calls
             .iter()

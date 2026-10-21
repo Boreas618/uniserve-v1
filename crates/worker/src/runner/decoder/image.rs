@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{Batch as BatchPlan, BufferId, ForwardStats};
+use cuda::{DeviceId, Stream};
+use ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use super::{DECODER, DecodeImage};
 use crate::config::Device;
@@ -20,12 +20,12 @@ use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
 use crate::lane::Job;
 use crate::lock;
-use crate::runner::ImageSetup;
-use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, TrajectoryVersion, ValueRange,
 };
+use crate::runner::ImageSetup;
+use crate::runner::methods::{Argument, MethodCall};
 use crate::{Error, Result};
 
 /// An image decoder of a bound component.
@@ -348,7 +348,7 @@ impl ImageBatch<'_> {
             )?
         };
         self.batch.writes.extend(products.iter().cloned());
-        let product = |reference: &uniserve_ipc::TensorRef| {
+        let product = |reference: &ipc::TensorRef| {
             products
                 .iter()
                 .find(|write| write.id() == reference.buffer_id())

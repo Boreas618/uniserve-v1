@@ -86,7 +86,7 @@ impl PrimaryContext {
     /// destroyed: the driver backs the interprocess events of a context with
     /// a POSIX shared-memory object named for the process
     /// (`/dev/shm/cuda.shm.<uid>.<pid>.<n>`, ids in hexadecimal; see
-    /// `uniserve_ipc::launch::remove_event_memory`), created by the first
+    /// `ipc::launch::remove_event_memory`), created by the first
     /// `cuEventCreate` with `CU_EVENT_INTERPROCESS`, and unlinks it only when
     /// the context is destroyed. Destroying the events does not unlink it, and neither does
     /// the process's exit, by `exit` or `_exit`. A context the CUDA runtime
@@ -196,7 +196,7 @@ extern "C" fn reset_at_exit() {
         // A closed standard error must not panic inside an exit handler.
         let _ = writeln!(
             std::io::stderr(),
-            "uniserve-cuda: destroying the device contexts at exit failed: {error}"
+            "cuda: destroying the device contexts at exit failed: {error}"
         );
     }
 }

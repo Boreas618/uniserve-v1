@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{CallKind, ForwardMode};
+use cuda::Stream;
+use ipc::{CallKind, ForwardMode};
 
 use super::CausalLMRunners;
 use crate::config::placement::Components;
@@ -22,6 +22,7 @@ use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
 use crate::executor::batch::StreamOrder;
 use crate::ffi::{DType, Handle, Interpreter};
+use crate::memory::{CachePlan, OutputPool, PrefixCache};
 use crate::request::decode_state::DecodeState;
 use crate::runner::causal_lm::input_buffers::logprob_capacity;
 use crate::runner::causal_lm::runners::COMPLETION_FIELDS;
@@ -30,7 +31,6 @@ use crate::runner::causal_lm::{
 };
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::scratch::Scratches;
-use crate::storage::{CachePlan, OutputPool, PrefixCache};
 use crate::worker::LoadedModel;
 use crate::{Error, Result};
 

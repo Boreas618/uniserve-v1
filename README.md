@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve` supplies the numerical layers, loading, resource binding and the models; each worker is a `uniserve-worker` process that runs the Rust worker runtime and calls those same numerical implementations through TVM-FFI.
+UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve` supplies the numerical layers, loading, resource binding and the models; each worker is a `uniserve worker` process that runs the Rust worker runtime and calls those same numerical implementations through TVM-FFI.
 
 The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` server, `uniserve-launcher` launcher and `uniserve-worker` binaries, the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` executable (its `serve`, `launcher`, `worker` and `storage` commands), the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 ## Quickstart
 
@@ -117,7 +117,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `--host`, `--port` | The HTTP listener (`server_config`) |
 | `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Placement: a deployment file, or the tensor- and data-parallel shorthand |
 | `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-memory share |
-| `--worker-executable` | The `uniserve-worker` executable that runs the workers (`worker_config.executable`) |
+| `--worker-executable` | The `uniserve` executable the workers run as (`worker_config.executable`) |
 | `--config`, `--set`, `--print-config` | The configuration file, assignments by path, and printing the resolved tree |
 
 | Table | Options for |
@@ -196,6 +196,8 @@ The [architecture guide](docs/architecture.md) describes how the head, the launc
 
 ```text
 crates/models/                Model-family request semantics: the MiniMax-H3 video rules
+crates/storage/               The Storage Server's protocol and client
+crates/storage-server/        The Storage Server and its Mooncake connector
 crates/observability/         Runtime metrics and process registry
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
@@ -206,12 +208,11 @@ crates/worker/                Rank runtime: the library a rank process loads thr
   model/                      Model description, loading and component placement
   executor/, runner/          Batch execution per computation and its CUDA graphs
   request/, sampling/         Request progress and sampling state
-  storage/                    KV, latent, tensor, request-slot and output backing
+  memory/                     KV, latent, tensor, request-slot and output backing
   transfer/                   Local, shared-memory, CUDA VMM and channel transfers
   parallel/                   Host groups, topology and collectives across ranks
   stream/, host/, capacity/   CUDA streams and events, host lanes, capacity planning
-crates/bin/uniserve/          `serve` CLI entrypoint
-crates/bin/uniserve-launcher/     Per-host launcher for multi-host deployments
+crates/uniserve/              The `uniserve` executable: `serve`, `launcher`, `worker` and `storage`
 uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
   runner/                     The Python half of each runner, which the worker runtime calls
   worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function

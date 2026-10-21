@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 
-use uniserve_ipc::{Locator, TransferTransport, Wake};
+use ipc::{Locator, TransferTransport, Wake};
 
 use super::backing::{SourceRetirement, TransportBuffer};
 use super::registry::{BufferRegistry, RegisteredBuffer};

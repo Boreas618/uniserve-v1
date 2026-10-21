@@ -10,13 +10,13 @@
 //! have finished.
 
 use super::*;
-use uniserve_ipc::BufferId;
+use ipc::BufferId;
 
 /// Logical storage reservations and retained exports owned by the engine.
 pub(super) struct Storage {
     /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
     pub(super) cache: Option<PrefixCacheManager>,
-    pub(super) encoder_cache: crate::prefix_cache::EncoderCacheManager,
+    pub(super) encoder_cache: crate::kv_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
@@ -32,7 +32,7 @@ pub(super) struct Storage {
     pub(super) media_storage: HashMap<crate::WorkerGroupId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
-    pub(super) encoder_buffers: HashMap<uniserve_ipc::BufferId, BufferSpan>,
+    pub(super) encoder_buffers: HashMap<ipc::BufferId, BufferSpan>,
     /// Spans that left encoder-cache retention (or failed to enter it) and
     /// whose `Free` command is queued or in flight; the span returns to
     /// `buffer_pool` when `Scheduler::acknowledge_commands` sees that `Free`.
@@ -258,7 +258,7 @@ impl MediaStorage {
     pub(super) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
-        components: &BTreeMap<String, uniserve_ipc::ComponentConfig>,
+        components: &BTreeMap<String, ipc::ComponentConfig>,
         routing: &BTreeMap<MediaCall, String>,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;

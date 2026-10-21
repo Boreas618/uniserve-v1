@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use uniserve_ipc::{Channel, Listener, Registration, VERSION};
+use ipc::{Channel, Listener, Registration, VERSION};
 
 /// Deadline for every rank of one launch to register, measured from the
 /// start of `collect`, which runs after every rank of the group
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(ranks.len(), 2);
         for (rank, channel) in ranks.iter_mut().enumerate() {
             channel
-                .send(&uniserve_ipc::WorkerRequest::Info {
+                .send(&ipc::WorkerRequest::Info {
                     message_id: Some(rank as u64),
                 })
                 .unwrap();
@@ -388,7 +388,7 @@ mod tests {
         for (rank, peer) in [&mut first, &mut second].into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let request = loop {
-                if let Some(request) = peer.try_recv::<uniserve_ipc::WorkerRequest>().unwrap() {
+                if let Some(request) = peer.try_recv::<ipc::WorkerRequest>().unwrap() {
                     break request;
                 }
                 assert!(Instant::now() < deadline);
@@ -557,7 +557,7 @@ mod tests {
 
         let _silent = Channel::connect(&address).unwrap();
         let mut stray = Channel::connect(&address).unwrap();
-        stray.send(&uniserve_ipc::WorkerRequest::info()).unwrap();
+        stray.send(&ipc::WorkerRequest::info()).unwrap();
 
         let generation = registry().begin_launch("text");
         let _rank = register(&address, "text", 0, generation, VERSION);

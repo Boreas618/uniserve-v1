@@ -527,7 +527,7 @@ pub struct ChatImageConfig {
     /// Maximum number of generated images.
     pub num_images: Option<u16>,
     /// Classifier-free-guidance renormalization policy.
-    pub cfg_norm: Option<uniserve_ipc::CfgRenorm>,
+    pub cfg_norm: Option<ipc::CfgRenorm>,
     /// Minimum scale applied by guidance renormalization.
     pub cfg_renorm_min: Option<f32>,
     /// Fractional denoising interval in which guidance is active.
@@ -812,7 +812,7 @@ pub struct ImageGenerationRequest {
     pub image_guidance_scale: Option<f32>,
     /// Classifier-free-guidance renormalization policy.
     #[serde(default)]
-    pub cfg_norm: Option<uniserve_ipc::CfgRenorm>,
+    pub cfg_norm: Option<ipc::CfgRenorm>,
     /// Fractional denoising interval in which guidance is active.
     #[serde(default)]
     pub cfg_interval: Option<[f32; 2]>,

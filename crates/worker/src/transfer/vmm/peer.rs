@@ -8,12 +8,12 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
+use cuda::{DeviceAllocation, DeviceId, PeerMapping, ShareableHandle};
 
 use super::grants::{DescriptorGrants, EXPORT_NAME_BYTES};
 use super::handle::AllocationHandle;
+use crate::memory::allocation::Storage;
 use crate::parallel::host::HostGroup;
-use crate::storage::memory::Storage;
 use crate::{Error, Result};
 
 /// The export name under which a rank serves its peer allocation; a grant

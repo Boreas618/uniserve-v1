@@ -10,9 +10,9 @@
 use tvm_ffi::Any;
 
 use crate::ffi::{Function, Handle, Interpreter, Shape};
+use crate::memory::allocation::StorageView;
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
-use crate::storage::memory::StorageView;
 use crate::{Error, Result};
 
 /// One argument of a method call.

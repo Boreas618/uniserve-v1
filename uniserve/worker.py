@@ -1,6 +1,6 @@
 """The Python side of a worker: what the worker library calls first.
 
-A worker is the ``uniserve-worker`` executable, which hosts the interpreter
+A worker is the ``uniserve worker`` command, which hosts the interpreter
 on a Python thread of its own and calls :func:`attach` once it is up.
 ``attach`` configures logging and diagnostic dumps and registers
 :func:`import_path`, through which the library reaches every function of the
@@ -72,7 +72,7 @@ def library() -> tvm_ffi.Module:
     Besides the worker entry it exports the video canvas and frame-count
     rules (``video_canvas`` and the functions beside it), which any process
     may call: loading the library starts nothing. In a worker process this
-    is the library the ``uniserve-worker`` executable already loaded.
+    is the library the ``uniserve worker`` command already loaded.
 
     Raises:
         ImportError: The library is not installed.

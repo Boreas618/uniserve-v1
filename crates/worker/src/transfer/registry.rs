@@ -177,7 +177,7 @@ mod tests {
 
     use super::*;
     use crate::ffi::{Backing, DType};
-    use crate::storage::memory::{Storage, StorageView};
+    use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::backing::TransportBuffer;
     use crate::transfer::{ByteReservation, Spans, TransferCapacity};
 

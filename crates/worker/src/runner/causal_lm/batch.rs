@@ -18,10 +18,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{
-    Batch as BatchPlan, BlockTable, DType, ForwardMode, RequestKey, ShapeBound, TensorRef,
-};
+use cuda::{DeviceId, Stream};
+use ipc::{Batch as BatchPlan, BlockTable, DType, ForwardMode, RequestKey, ShapeBound, TensorRef};
 
 use super::calls::{self, Prepared};
 use super::{COMPLETION_FIELDS, CausalLMRunners};
@@ -29,16 +27,16 @@ use crate::executor::batch::{Batch, Launched};
 use crate::executor::image::ImageParts;
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job};
+use crate::memory::Metadata;
+use crate::memory::{OutputPlacement, ProductBuffer};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
 use crate::runner::causal_lm::context::grid_key;
 use crate::runner::denoiser::image_model::GridKey;
 use crate::runner::vision::PositionLayout;
 use crate::sampling::SamplingControls;
-use crate::storage::Metadata;
-use crate::storage::{OutputPlacement, ProductBuffer};
 use crate::stream::Issue as _;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 
 /// What a call contributes to its token batch's forward, beside the state
@@ -109,7 +107,7 @@ pub(super) struct Owners<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     /// The image runtime, for prompts placing image features.
     pub(super) image: Option<ImageParts<'a>>,
-    pub(super) storage: &'a mut WorkerStorage,
+    pub(super) storage: &'a mut WorkerMemory,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     /// The rank's expert union, when its forwards are expert steps.
@@ -138,7 +136,7 @@ pub(crate) struct Parked {
 
 impl Parked {
     /// The committed batch as launched work awaiting materialization.
-    pub(super) fn launch(self, stats: uniserve_ipc::ForwardStats) -> Launched {
+    pub(super) fn launch(self, stats: ipc::ForwardStats) -> Launched {
         self.batch.launch(stats, "text_materialize", None)
     }
 }
@@ -148,7 +146,7 @@ impl Parked {
 pub(super) struct TokenBatch<'a> {
     pub(super) runtime: &'a mut CausalLMRunners,
     pub(super) image: Option<ImageParts<'a>>,
-    pub(super) storage: &'a mut WorkerStorage,
+    pub(super) storage: &'a mut WorkerMemory,
     pub(super) requests: &'a mut RequestPool,
     pub(super) plan: &'a BatchPlan,
     pub(super) experts: Option<Arc<ExpertUnion>>,
@@ -171,7 +169,7 @@ impl Opening {
         placement: &crate::config::placement::GroupPlacement,
         rank: usize,
         job: &Job,
-        page_reads: Option<&Arc<uniserve_cuda::Event>>,
+        page_reads: Option<&Arc<cuda::Event>>,
     ) -> Result<Self> {
         let plan = owners.plan;
         let runtime = &mut *owners.runtime;

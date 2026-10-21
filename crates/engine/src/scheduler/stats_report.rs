@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use crate::report;
 use crate::report::{BaseCacheStats, DomainSchedulerStats, PrefixCacheStats};
 use crate::scheduler::SchedulerStats;
-use uniserve_ipc::ForwardStats;
+use ipc::ForwardStats;
 
 /// Plain-value copy of one domain's `DomainStats` counters.
 #[derive(Clone, Copy, Debug, Default)]

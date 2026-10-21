@@ -3,10 +3,10 @@
 //! the facts it reports.
 
 use crate::ffi::{Function, Handle, Interpreter};
+use crate::memory::allocation::StorageView;
 use crate::runner::methods::{Argument, Methods};
-use crate::storage::memory::StorageView;
 use crate::{Error, Result};
-use uniserve_cuda::DeviceId;
+use cuda::DeviceId;
 
 const RUNNER: &str = "uniserve.runner.causal_lm.CausalLMRunner";
 

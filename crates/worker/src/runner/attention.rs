@@ -20,12 +20,12 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
+use cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
-use crate::storage::PrefixCache;
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{AttentionRow, TablePages};
+use crate::memory::PrefixCache;
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{AttentionRow, TablePages};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

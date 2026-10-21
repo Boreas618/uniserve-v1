@@ -9,7 +9,7 @@
 //! and sends it as the message of a [`Frame`]. A rank answers with one
 //! [`BatchOutput`] of per-call [`CallOutput`] completions, which it
 //! validates where it builds the response. The worker runtime
-//! (`uniserve-worker`) consumes these types directly; a frame carries a
+//! (`uniserve worker`) consumes these types directly; a frame carries a
 //! message its sender validated, and its receiver does not check it again.
 //!
 //! Besides its calls, a batch carries the cache page tables of its requests

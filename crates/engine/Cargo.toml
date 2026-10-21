@@ -1,8 +1,9 @@
 [package]
-name = "uniserve-engine"
+name = "engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -10,18 +11,18 @@ base64.workspace = true
 bitflags.workspace = true
 crossbeam-channel.workspace = true
 fnv.workspace = true
+ipc.workspace = true
 models.workspace = true
 png = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+storage.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
-uniserve-ipc.workspace = true
-uniserve-storage.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -33,10 +34,11 @@ libc.workspace = true
 testing = ["dep:png"]
 
 [dev-dependencies]
+storage-server.workspace = true
 base64.workspace = true
+engine = { path = ".", features = ["testing"] }
 png.workspace = true
 tracing-subscriber.workspace = true
-uniserve-engine = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

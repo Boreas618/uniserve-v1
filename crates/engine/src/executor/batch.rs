@@ -8,11 +8,11 @@
 //! wire `Batch` and the persistent spans of each rank's own buffer pool.
 
 use super::WorkerGroupId;
-use std::collections::BTreeMap;
-use uniserve_ipc::{
+use ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
 };
+use std::collections::BTreeMap;
 
 /// A persistent span in the buffer pool one rank of a worker backs.
 ///
@@ -70,7 +70,7 @@ pub struct RequestPlacement {
     pub buffers: Vec<RankBuffer>,
     /// Pages of the host page tier the call's new units are filled with
     /// before its forward, on every rank of its worker group.
-    pub page_reads: Vec<uniserve_ipc::PageCopy>,
+    pub page_reads: Vec<ipc::PageCopy>,
     /// For a video request's call, the worker routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
@@ -100,7 +100,7 @@ pub struct ExecutionBatch {
     ///
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
-    pub cache_inputs: Vec<uniserve_ipc::CacheTransfer>,
+    pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host page tier.
     pub page_writes: Option<PageWrites>,
 }
@@ -111,7 +111,7 @@ pub struct ExecutionBatch {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageWrites {
     pub worker: WorkerGroupId,
-    pub pages: Vec<uniserve_ipc::PageCopy>,
+    pub pages: Vec<ipc::PageCopy>,
 }
 
 impl ExecutionBatch {

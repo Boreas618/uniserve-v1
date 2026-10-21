@@ -13,7 +13,7 @@
 //! time `resolve` runs.
 
 use super::*;
-use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// How one understanding token ends or continues its request
 /// (`Scheduler::und_token_outcome`).
@@ -238,11 +238,7 @@ impl Scheduler {
     /// finishes the request, opens an image branch, or is a round-close token.
     /// The sampled log probability and top candidates belong to the last
     /// committed token only.
-    pub(super) fn resolve_decode_text(
-        &mut self,
-        id: RequestId,
-        mut record: uniserve_ipc::CallOutput,
-    ) {
+    pub(super) fn resolve_decode_text(&mut self, id: RequestId, mut record: ipc::CallOutput) {
         self.activate_request_tables(id);
 
         // A round-close token committed alone by the previous decode became
@@ -361,7 +357,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: uniserve_ipc::CallOutput,
+        mut record: ipc::CallOutput,
         media: Option<&SharedMedia>,
     ) {
         let call_variant = call.kind;

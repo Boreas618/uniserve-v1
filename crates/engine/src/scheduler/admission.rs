@@ -18,7 +18,7 @@
 //! its route.
 
 use super::*;
-use uniserve_ipc::ForwardMode;
+use ipc::ForwardMode;
 
 /// One product a video request reserves: its declared name, the component
 /// output it is reserved under, and its request-sized shape.
@@ -405,7 +405,7 @@ impl Scheduler {
     /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
     fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerGroupId>> {
-        use uniserve_ipc::MediaCall;
+        use ipc::MediaCall;
 
         let mut required = graph
             .calls()
@@ -519,7 +519,7 @@ impl Scheduler {
         if !self
             .info
             .media_components
-            .contains_key(&uniserve_ipc::MediaCall::Muxing)
+            .contains_key(&ipc::MediaCall::Muxing)
         {
             reject(
                 RejectionKind::Invalid,
@@ -715,7 +715,7 @@ impl Scheduler {
                 request_pool_idx,
                 submission.request.prompt_token_ids.clone(),
                 submission.request.sampling,
-                uniserve_ipc::VideoAdmission {
+                ipc::VideoAdmission {
                     task: submission.request.task,
                     text_tags: submission.request.text_tags.clone(),
                     conditions: submission.request.conditions.clone(),
@@ -808,7 +808,7 @@ impl Scheduler {
     /// Computes `(height / d) * (width / d)` with floor division, where `d` is
     /// `latent_downsample` (at least 1). Denoising call planning adds
     /// `commit_marker_tokens` to it for the call's query length.
-    pub(super) fn num_vae(&self, ip: &uniserve_ipc::ImageParams) -> u64 {
+    pub(super) fn num_vae(&self, ip: &ipc::ImageParams) -> u64 {
         let dl = u64::from(self.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
@@ -1201,10 +1201,7 @@ impl Scheduler {
     fn prefill_target(
         &self,
         state: &RequestState,
-    ) -> Option<(
-        (crate::WorkerGroupId, String),
-        crate::prefix_cache::PrefixHit,
-    )> {
+    ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
@@ -1421,7 +1418,7 @@ impl Scheduler {
 /// Resources a token request holds from the moment admission commits it.
 pub(super) struct AdmissionReservation {
     /// The prefill worker's endpoint, which keys its prefix-cache residency.
-    source: uniserve_ipc::WorkerEndpoint,
+    source: ipc::WorkerEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
 }
@@ -1436,7 +1433,7 @@ fn acquire_cached_prefix(
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
-    source: &uniserve_ipc::WorkerEndpoint,
+    source: &ipc::WorkerEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images();

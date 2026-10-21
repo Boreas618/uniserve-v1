@@ -7,7 +7,7 @@
 //! executor only when the step made no progress.
 
 use super::*;
-use uniserve_ipc::{ForwardMode, MediaCall};
+use ipc::{ForwardMode, MediaCall};
 
 /// Applies the loaded workers' served features and capacities to the model's
 /// sizing facts.
@@ -202,7 +202,7 @@ impl Scheduler {
             placement: placement::Placement::default(),
             storage: allocation::Storage {
                 cache,
-                encoder_cache: crate::prefix_cache::EncoderCacheManager::new(
+                encoder_cache: crate::kv_cache::EncoderCacheManager::new(
                     generation_limits.encoder_cache_entries as usize,
                 ),
                 reserved_encoder_entries: 0,
@@ -255,8 +255,8 @@ impl Scheduler {
     /// through their servers' TCP addresses. A failure to reach this host's
     /// server leaves the tier off.
     pub fn enable_page_tier(&mut self, deployment: &str, host: &str) {
-        let socket = uniserve_storage::socket::default_socket();
-        let mut tiers = match crate::prefix_cache::Tiers::connect(&socket, deployment) {
+        let socket = storage::socket::default_socket();
+        let mut tiers = match crate::kv_cache::Tiers::connect(&socket, deployment) {
             Ok(tiers) => tiers,
             Err(error) => {
                 tracing::warn!(%error, "the host page tier is off: the storage server is unreachable");
@@ -265,10 +265,10 @@ impl Scheduler {
         };
         let mut served = false;
         for (worker, ranks) in &self.executor.info().rank_caches {
-            let reports: Option<Vec<crate::prefix_cache::RankCache<'_>>> = ranks
+            let reports: Option<Vec<crate::kv_cache::RankCache<'_>>> = ranks
                 .iter()
                 .map(|(rank_host, cache)| {
-                    cache.as_ref().map(|cache| crate::prefix_cache::RankCache {
+                    cache.as_ref().map(|cache| crate::kv_cache::RankCache {
                         local: rank_host == host,
                         cache,
                     })
@@ -428,7 +428,7 @@ impl Scheduler {
             if !self
                 .tiers
                 .as_ref()
-                .is_some_and(crate::prefix_cache::Tiers::writing)
+                .is_some_and(crate::kv_cache::Tiers::writing)
             {
                 return;
             }
@@ -462,7 +462,7 @@ impl Scheduler {
             || self
                 .tiers
                 .as_ref()
-                .is_some_and(crate::prefix_cache::Tiers::waiting)
+                .is_some_and(crate::kv_cache::Tiers::waiting)
         {
             TIER_POLL
         } else {

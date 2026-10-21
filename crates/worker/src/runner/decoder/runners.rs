@@ -3,17 +3,17 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use ipc::{CallKind, MediaCall};
 use models::video::Canvas;
-use uniserve_ipc::{CallKind, MediaCall};
 
 use super::{ClipOutput, DecodeImage, DecoderRunner, TrackUnits, UnitShape};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
+use crate::memory::LatentCache;
 use crate::profiling::kernels::KernelRecord;
 use crate::request::video::{MediaPlan, VideoSize};
 use crate::runner::component::Component;
 use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::storage::LatentCache;
 use crate::stream::Issue;
 use crate::{Error, Result};
 

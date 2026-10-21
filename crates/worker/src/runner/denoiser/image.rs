@@ -37,15 +37,18 @@ mod denoising;
 
 use std::sync::Arc;
 
+use cuda::{DeviceId, Stream};
+use ipc::ImageParams;
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::ImageParams;
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::ffi::{DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Capture, Completion, Job, Value};
+use crate::memory::AttentionRow;
+use crate::memory::PrefixCache;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::parallel::joins::GraphFunctions;
 use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::runner::ImageSetup;
@@ -53,9 +56,6 @@ use crate::runner::attention::{AttentionCapacity, AttentionMetadata};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::runner::denoiser::{DENOISER, DenoiserRunner, Family, Methods};
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::AttentionRow;
-use crate::storage::PrefixCache;
-use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

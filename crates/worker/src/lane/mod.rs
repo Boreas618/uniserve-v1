@@ -54,8 +54,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use uniserve_cuda::{DeviceId, Event};
-use uniserve_ipc::{CallKind, LaneConfig, Wake};
+use cuda::{DeviceId, Event};
+use ipc::{CallKind, LaneConfig, Wake};
 
 use crate::ffi::Interpreter;
 use crate::stream::CUDAStream;
@@ -565,7 +565,7 @@ pub(crate) const BLOCK_ON_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::ForwardMode;
+    use ipc::ForwardMode;
 
     use super::*;
     use crate::stream::Issue;

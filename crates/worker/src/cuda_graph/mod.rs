@@ -33,8 +33,8 @@ mod table;
 
 use std::sync::{Arc, Mutex};
 
+use cuda::{GraphExec, Stream};
 use tvm_ffi::Any;
-use uniserve_cuda::{GraphExec, Stream};
 
 use crate::ffi::Handle;
 use crate::{Error, Result, lock};

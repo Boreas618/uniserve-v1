@@ -34,7 +34,7 @@ use crate::executor::{
     RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerGroupId,
 };
 use anyhow::Context;
-use uniserve_ipc::{
+use ipc::{
     BatchCommand, BufferAllocation, BufferId, CacheTransfer, Call, NewRequest, RequestKey,
     TensorExport, TensorRef,
 };
@@ -51,7 +51,7 @@ struct PendingGroup {
     /// Calls whose completion this worker has not yet returned, with each
     /// call's kind, which the completion is checked against when it is
     /// joined with its call.
-    calls: HashMap<(RequestKey, uniserve_ipc::CallId), uniserve_ipc::CallKind>,
+    calls: HashMap<(RequestKey, ipc::CallId), ipc::CallKind>,
 }
 
 /// Dispatch and receipts for one scheduler batch.
@@ -1440,8 +1440,8 @@ impl Executor for WorkerExecutor {
 mod dependency_span_tests {
     use super::dependency_spans;
     use crate::executor::RankBuffer;
-    use uniserve_ipc::RequestId;
-    use uniserve_ipc::{BufferAllocation, BufferId, CallId, RequestKey};
+    use ipc::RequestId;
+    use ipc::{BufferAllocation, BufferId, CallId, RequestKey};
 
     fn span(rank: u32, offset: u64) -> RankBuffer {
         RankBuffer {

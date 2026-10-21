@@ -5,14 +5,14 @@
 
 use std::sync::Arc;
 
+use ipc::Batch as BatchPlan;
 use models::video::VideoCondition;
-use uniserve_ipc::Batch as BatchPlan;
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs};
 use crate::executor::video::MediaBatch;
 use crate::executor::video::{Parts, product_name, stream_of};
 use crate::lane::Job;
-use crate::storage::memory::StorageView;
+use crate::memory::allocation::StorageView;
 use crate::{Error, Result};
 
 /// Initialize a request's trajectory: its prepared sources, its refined

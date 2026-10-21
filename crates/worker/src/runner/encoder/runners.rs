@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_ipc::{CallKind, MediaCall};
+use ipc::{CallKind, MediaCall};
 
 use super::EncoderRunner;
 use crate::cuda_graph::GraphPool;

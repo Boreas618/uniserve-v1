@@ -11,9 +11,9 @@
 //! context over the stream's scratch, the prefix cache pool and the model's
 //! stream collectives.
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::CanvasSampling;
-use uniserve_ipc::{CallKind, ForwardMode};
+use cuda::{DeviceId, Stream};
+use ipc::CanvasSampling;
+use ipc::{CallKind, ForwardMode};
 
 use super::buffers::{BankLayout, Banks, DenoiseLayout, DenoiseViews, Dimensions};
 use super::facts::Facts;
@@ -24,11 +24,11 @@ use crate::config::placement::RunnerKind;
 use crate::config::{Device, WorkerConfig};
 use crate::cuda_graph::{GraphStorage, GraphTable, reserve_pools};
 use crate::ffi::{Handle, Interpreter};
+use crate::memory::{CachePlan, OutputPool, PrefixCache};
 use crate::parallel::{DwdpManager, ExpertUnion};
 use crate::runner::input_buffers::InputBuffers;
 use crate::runner::methods::{Argument, Methods};
 use crate::runner::scratch::Scratches;
-use crate::storage::{CachePlan, OutputPool, PrefixCache};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result};
