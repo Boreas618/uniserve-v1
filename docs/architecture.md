@@ -206,6 +206,21 @@ uniserve_eval/      HTTP evaluation client
 
 Dependency direction: `proto <- ipc <- {engine, worker}`, `{proto, storage, cuda, models} <- daemon`, `{proto, ipc, storage} <- engine`, `{ipc, cuda, storage, models} <- worker`, `{storage, cuda} <- storage-server`, `{daemon, engine, storage, storage-server} <- uniserve`. The daemon knows engines only through `proto`; the engine knows no model family: what a video request asks of its model (its conditions, the denoiser's description) crosses the engine as bytes the model family encodes (`models::video::Conditioning`, `models::video::DenoiserInfo`) beside the sizes the engine schedules by. The worker never depends on the engine or the daemon, the daemon never on the engine, `ipc` or the worker, and the engine never links CUDA.
 
+| Daemon module (`crates/daemon/src`) | Responsibility |
+| --- | --- |
+| `supervision` | every node: starting, reaping and reporting the node's processes, cleaning what they leave in `/dev/shm`, the node's Storage Server claim, the process interface's service and the daemons' membership |
+| `http` | the leader's HTTP server: the router by served task, middleware (request IDs, the API key, timeouts, concurrency, metrics), the listener and graceful shutdown |
+| `openai` | the OpenAI-compatible API's wire schemas and route handlers (chat completions, images, videos and video jobs), the System One route, the error envelope |
+| `leader.rs` | the served model: carries each request through input processing, the engine process and output processing |
+| `input` | input processing: chat requests and templates, sampling, media fetching, each model family's request lowering, the System One readout plan |
+| `output` | output processing: detokenization and stop strings, reasoning and tool parsers, chat output, assembly into public events, video artifacts |
+| `engine` | starting the engine process and the client of the request interface |
+| `model`, `tokenizer` | the served checkpoint's files, configuration and family profile; its tokenizer |
+| `options` | the serving option tree, its command line and configuration file |
+| `metrics` | the Prometheus registry and families, request and scheduler statistics |
+
+The modules are layered: each uses only modules after it in the order `http`, `openai`, `leader.rs`, `input`, `output`, `engine`, `options`, `model`, `tokenizer`, `supervision`, and `metrics`, which observes `output`'s streams, serves `leader.rs` and `http`.
+
 | Worker runtime module (`crates/worker/src`) | Responsibility |
 | --- | --- |
 | `launch`, `config` | the worker entry, arguments, signals, the Python thread's interpreter, registration with the engine; the worker's configuration; component declarations and placement |

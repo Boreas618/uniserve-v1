@@ -29,8 +29,10 @@ use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 mod api_server;
+pub(crate) mod log_stats;
 mod request;
 mod scheduler;
+pub(crate) mod stats;
 
 pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
 pub use request::{FinishedReasonLabels, RequestMetrics};

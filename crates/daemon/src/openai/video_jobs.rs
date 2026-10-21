@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::options::VideoJobOptions;
-use crate::serving::RequestOutput;
-use crate::serving::video::artifact::VideoStreamError;
+use crate::output::RequestOutput;
+use crate::output::video::VideoStreamError;
 
 /// Public job record, serialized in the responses of the video job routes.
 ///

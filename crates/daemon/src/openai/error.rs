@@ -19,8 +19,9 @@ use thiserror_ext::{Construct, Macro};
 use crate::openai::{ErrorDetail, ErrorResponse};
 use models::video::plan::VideoInputError;
 
-use crate::serving::ServeError;
-use crate::serving::video::artifact::VideoStreamError;
+use crate::input::ServeError;
+use crate::output::OutputError;
+use crate::output::video::VideoStreamError;
 
 /// `Retry-After` hint, in seconds, of a `503 Service Unavailable`.
 const RETRY_AFTER_SECONDS: HeaderValue = HeaderValue::from_static("1");
@@ -210,8 +211,8 @@ impl From<ServeError> for ApiError {
     /// Unsupported features or sampling controls, context limits, input
     /// images that cannot be fetched or decoded, refused video requests, and
     /// tokenization failures become invalid requests, a refused video request
-    /// naming its field; engine, video-processing and output-processing
-    /// failures become server errors. An input-image or tokenization failure's message
+    /// naming its field; engine and video-processing failures become server errors, as output-processing failures do
+    /// ([`OutputError`]). An input-image or tokenization failure's message
     /// appends its cause (the failing image and rule, or the violated field
     /// or limit), which `ServeError::ImageInput` and `ServeError::Tokenize`
     /// carry as their error source rather than in their own `Display`.
@@ -244,10 +245,14 @@ impl From<ServeError> for ApiError {
             ServeError::Submit(source) => {
                 Self::server_error(format!("engine runtime error: {source}"))
             }
-            ServeError::OutputProcessing { source, .. } => {
-                Self::server_error(format!("output processing error: {source}"))
-            }
         }
+    }
+}
+
+impl From<OutputError> for ApiError {
+    /// A request whose output cannot be processed fails as a server error.
+    fn from(error: OutputError) -> Self {
+        Self::server_error(format!("output processing error: {}", error.source))
     }
 }
 
@@ -285,7 +290,7 @@ mod tests {
         let cause = "video duration must be finite, positive, and at most 15 seconds";
         let error = ApiError::from(ServeError::Tokenize {
             request_id: String::from("vid-1"),
-            source: crate::serving::TokenizeError::Invalid(cause.to_string()),
+            source: crate::input::TokenizeError::Invalid(cause.to_string()),
         });
 
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
@@ -334,7 +339,7 @@ mod tests {
         let error = ApiError::from(ServeError::ImageInput {
             request_id: String::from("chat-1"),
             index: 1,
-            source: crate::serving::media::MediaError::Status { status: 404 },
+            source: crate::input::media::MediaError::Status { status: 404 },
         });
 
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);

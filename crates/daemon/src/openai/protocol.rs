@@ -4,7 +4,7 @@
 //! Every request schema rejects unknown fields (`deny_unknown_fields`), at
 //! every level. The chat request's ranges and cross-field rules run through
 //! `validator` in the route's `ValidatedJson` extractor. The video request is
-//! the video service's own form (`serving::video::VideoGenerationRequest`).
+//! the video service's own form (`input::video::VideoGenerationRequest`).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -16,7 +16,7 @@ use serde_json::Value;
 use serde_with::SerializeDisplay;
 use validator::Validate;
 
-use crate::serving::chat::{ChatToolChoice, ReasoningEffort};
+use crate::input::chat::{ChatToolChoice, ReasoningEffort};
 
 /// Returns `true` for fields whose wire default is enabled.
 fn default_true() -> bool {
@@ -511,7 +511,7 @@ fn default_modalities() -> Vec<ChatModality> {
 /// Image-generation controls embedded in a chat request.
 pub struct ChatImageConfig {
     /// Named output resolution preset.
-    pub resolution: Option<crate::profile::omni::resolution::ResolutionName>,
+    pub resolution: Option<crate::model::omni::resolution::ResolutionName>,
     /// Explicit output height in pixels.
     pub height: Option<u32>,
     /// Explicit output width in pixels.

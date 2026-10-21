@@ -4,7 +4,7 @@
 //! The handler validates and lowers the body (the schema's `validator` rules
 //! in `ValidatedJson`, then [`lower_chat_request`]), capturing the response
 //! options ([`ChatResponseContext`]), and runs the request through
-//! `Engine::generate`. Both response paths consume the `RequestOutput`
+//! `Leader::generate`. Both response paths consume the `RequestOutput`
 //! stream it returns: [`collect_chat_completion`] folds it into one
 //! `ChatCompletionResponse`; [`chat_completion_chunk_stream`] maps it to
 //! `ChatCompletionStreamResponse` chunks, and [`chat_completion_sse_stream`]
@@ -36,8 +36,12 @@ use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
 use tracing_futures::Instrument as _;
 
-use crate::frontend::Engine;
-use crate::http::RequestId;
+use crate::input::chat::{
+    ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
+};
+use crate::input::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
+use crate::leader::Leader;
+use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
     ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
@@ -47,21 +51,17 @@ use crate::openai::{
     Tool, ToolCall, ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served,
     convert_logit_bias,
 };
-use crate::profile::tools;
-use crate::serving::chat::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatContent,
-    ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
+use crate::output::chat::{
+    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall,
 };
-use crate::serving::text::{
+use crate::output::text::{
     DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
 };
-use crate::serving::{
-    FinishReason, GenerateRequest, ImageSamplingParams, Prompt, RequestOutput, SamplingParams,
-    StopReason,
-};
+use crate::output::tools;
+use crate::output::{FinishReason, RequestOutput, StopReason};
 
 /// The chat completions route.
-pub(crate) fn router(engine: Arc<Engine>) -> Router {
+pub(crate) fn router(engine: Arc<Leader>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(engine)
@@ -74,7 +74,7 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
 /// non-streaming case, become `ApiError` responses; errors after an SSE
 /// stream has started are reported inside the stream.
 async fn chat_completions(
-    State(engine): State<Arc<Engine>>,
+    State(engine): State<Arc<Leader>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
@@ -230,7 +230,7 @@ impl ChatResponseContext {
 /// terminal event, lacks output logprobs the response must include or prompt
 /// logprobs the request asked for, or fails to convert output logprobs.
 pub async fn collect_chat_completion(
-    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
+    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
     context: ChatResponseContext,
     created: u64,
 ) -> Result<ChatCompletionResponse, ApiError> {
@@ -337,7 +337,7 @@ pub async fn collect_chat_completion(
 struct CollectedChatOutput {
     message: AssistantMessage,
     prompt_token_ids: Vec<u32>,
-    prompt_logprobs: Option<crate::serving::text::DecodedPromptLogprobs>,
+    prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
     /// Output logprobs concatenated across `TokenDelta` updates; `None` when
     /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
@@ -347,7 +347,7 @@ struct CollectedChatOutput {
     /// that began but never completed are not listed.
     image_steps_per_image: Vec<u32>,
     reason: FinishReason,
-    usage: crate::serving::RequestUsage,
+    usage: crate::output::RequestUsage,
 }
 
 /// Collects semantic serving events into one non-streaming chat response payload.
@@ -355,7 +355,7 @@ struct CollectedChatOutput {
 /// The closed content blocks and tool calls carry the complete message, so
 /// the deltas inside them are skipped.
 async fn collect_chat_events(
-    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
+    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {
     pin_mut!(stream);
     let mut message = AssistantMessage::default();
@@ -461,7 +461,7 @@ async fn collect_chat_events(
 /// stream ends after the first error.
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
-    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
+    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
     context: ChatResponseContext,
     created: u64,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
@@ -1119,7 +1119,7 @@ pub fn lower_chat_request(
     // Template kwargs may not replace the variables the renderer derives
     // from the request itself.
     let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
-    if let Some(name) = crate::serving::chat::ChatOptions::RESERVED_TEMPLATE_KWARGS
+    if let Some(name) = crate::input::chat::ChatOptions::RESERVED_TEMPLATE_KWARGS
         .into_iter()
         .find(|name| template_kwargs.contains_key(*name))
     {
@@ -1146,7 +1146,7 @@ pub fn lower_chat_request(
             tools: convert_tools(request.tools)?,
             // An absent choice lets the model decide, as OpenAI's default does.
             tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
-            chat_options: crate::serving::chat::ChatOptions {
+            chat_options: crate::input::chat::ChatOptions {
                 reasoning_effort: request.reasoning_effort,
                 template_kwargs,
                 ..Default::default()
@@ -1474,9 +1474,9 @@ mod tests {
 
     use super::ChatResponseContext;
     use super::chat_completion_chunk_stream;
-    use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock};
-    use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
-    use crate::serving::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
+    use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
+    use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
+    use crate::output::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
 
     /// Single-candidate logprobs for one generated token.
     fn logprobs(token_id: u32) -> Option<DecodedLogprobs> {
@@ -1496,7 +1496,7 @@ mod tests {
     /// assembler emits them: the update of token 10 produces reasoning, and
     /// the update of token 11 closes the reasoning block and starts the
     /// answer before its `TokenDelta` arrives.
-    fn thinking_response() -> Vec<crate::serving::Result<RequestOutput>> {
+    fn thinking_response() -> Vec<Result<RequestOutput, crate::output::OutputError>> {
         vec![
             Ok(RequestOutput::Accepted(PromptInfo {
                 token_ids: vec![1].into(),

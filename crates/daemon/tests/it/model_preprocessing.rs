@@ -7,18 +7,18 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use daemon::input::chat::HfChatRenderer;
+use daemon::input::media::{ImageInput, MediaConnector, MediaListError};
+use daemon::input::video::VideoGenerationRequest;
+use daemon::input::video::VideoService;
+use daemon::input::{InputProcessor, ModelResolutionError, Prompt, RequestRenderer};
+use daemon::model::assets::ResolvedModelFiles;
+use daemon::model::{ModelConfig, ModelDescription};
 use daemon::openai::ApiError;
+use daemon::options::ChatTemplateContentFormatOption;
 use daemon::options::{ImageFetchOptions, MediaOptions};
-use daemon::profile::assets::ResolvedModelFiles;
-use daemon::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use daemon::profile::{ModelConfig, ModelDescription};
-use daemon::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use daemon::serving::media::{ImageInput, MediaConnector, MediaListError};
-use daemon::serving::video::VideoGenerationRequest;
-use daemon::serving::video::VideoService;
-use daemon::serving::{
-    InputProcessor, ModelResolutionError, OutputParams, Prompt, RequestRenderer,
-};
+use daemon::output::OutputParams;
+use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
@@ -347,7 +347,7 @@ async fn preprocess_video(
 ) -> Result<
     (
         proto::request::DiffusionRequest,
-        daemon::serving::video::ProcessedVideo,
+        daemon::input::video::ProcessedVideo,
     ),
     ApiError,
 > {

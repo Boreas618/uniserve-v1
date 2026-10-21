@@ -1,0 +1,381 @@
+//! SenseNova model parameters, prompt layout, and image configuration.
+//!
+//! Input images and generated-image feedback both use the ViT encode step,
+//! whose grid is 32 pixels per token (the default patch size 16 at downsample
+//! ratio 0.5 in `uniserve/models/sensenova_u1`). Output canvases are limited
+//! to the fixed resolution buckets in `resolution_policy`.
+
+use proto::request::{
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
+    ImageGenerationConfig, ImageTrigger, ModelDtype,
+};
+use serde::{Deserialize, Serialize};
+
+use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
+use super::{
+    DelimitedTextPolicy, GenerationControls, ImageGenerationDefaults, OmniProfile,
+    OutputFilterPolicy, chatml, encode, model_dtype_bytes, pixel_bound_tokens, required_token,
+    required_token_id,
+};
+use crate::model::assets;
+use crate::tokenizer::HuggingFaceTokenizer;
+
+/// System instruction for `GenerationConstraint::Default`.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a multimodal assistant capable of reasoning with both text and images. You support two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> block and place all reasoning inside it. You MUST interleave text with generated images using tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, directly provide the answer without reasoning. Do not use tags like <image1>, <image2>; present any images naturally alongside the text.\n\nAfter the think block, always provide a concise, user-facing final answer. The answer may include text, images, or both. Match the user's language in both reasoning and the final answer.";
+/// System instruction for `GenerationConstraint::GenOnly` and for the
+/// classifier-free guidance context.
+const IMAGE_SYSTEM_PROMPT: &str = "You are an image generation and editing assistant that accurately understands and executes user intent.\n\nYou support two modes:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\nB. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\nGeneral Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language.";
+/// Assistant prefix for `GenOnly`: ends the prompt with an empty reasoning
+/// block and the start-of-image token.
+const IMAGE_ASSISTANT_PREFIX: &str = "<think>\n\n</think>\n\n<img>";
+/// Assistant prefix of the classifier-free guidance context.
+const NEGATIVE_ASSISTANT_PREFIX: &str = "<img>";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Loaded SenseNova profile and tokenizer assets.
+pub struct SenseNovaProfile {
+    /// Special tokens that delimit multimodal generation.
+    pub controls: GenerationControls,
+    /// Default image-generation parameters.
+    pub image_defaults: ImageGenerationDefaults,
+    /// Supported image dimensions and default resolution.
+    pub resolution_policy: ResolutionPolicy,
+    /// Filters applied to decoded assistant output.
+    pub output_filter: OutputFilterPolicy,
+    /// Ordered encoders and their loaded cache requirements for input images.
+    pub image_encoders: Vec<ImageEncoderInput>,
+    /// Logical positions contributed by one input image, independently of cache tokens.
+    pub image_num_positions: u32,
+    /// Image trigger and feedback encoder requirements.
+    pub image_generation: ImageGenerationConfig,
+}
+
+impl SenseNovaProfile {
+    /// Stable profile identifier.
+    pub const ID: &'static str = "sensenova";
+    /// Pixel-to-latent downsampling factor.
+    pub const LATENT_DOWNSAMPLE: u32 = 32;
+    /// Elements of one latent unit: the RGB pixels of a
+    /// `LATENT_DOWNSAMPLE` x `LATENT_DOWNSAMPLE` patch.
+    const LATENT_UNIT_ELEMENTS: u64 =
+        3 * Self::LATENT_DOWNSAMPLE as u64 * Self::LATENT_DOWNSAMPLE as u64;
+    /// Pixels per ViT grid token along each axis.
+    const VISION_STRIDE: u32 = 32;
+    /// Tokens a generated image's feedback adds to its ViT grid.
+    const FEEDBACK_MARKER_TOKENS: u32 = 1;
+    /// Lower pixel bound of an image in the model's patch preprocessing.
+    const MIN_IMAGE_PIXELS: u64 = 512 * 512;
+    /// Upper pixel bound of any single image.
+    const MAX_IMAGE_PIXELS: u64 = 2048 * 2048;
+    /// Pixel budget a request's input images share.
+    const MAX_TOTAL_PIXELS: u64 = 4096 * 4096;
+
+    /// Returns the profile's runtime sizing for the selected dtype.
+    ///
+    /// Each grid-token bound is the largest image the profile admits: the
+    /// largest resolution bucket for a generated canvas, and the pixel bound
+    /// of an input image, plus the feedback marker, for the ViT grid. The
+    /// served features, the latent capacity, the vision feature bytes and
+    /// the encoder cache are not stated here: the fixed resolution buckets
+    /// bound a canvas's sides, and the engine scheduler's
+    /// `resolve_generation_limits` takes the features from the loaded
+    /// workers' call kinds and the capacities from what they report.
+    pub fn runtime_limits(&self, model_dtype: ModelDtype) -> GenerationLimits {
+        let dtype_bytes = model_dtype_bytes(model_dtype);
+        let unit_pixels = u64::from(Self::LATENT_DOWNSAMPLE).pow(2);
+        let max_latent_units = self
+            .resolution_policy
+            .buckets
+            .iter()
+            .map(|bucket| u64::from(bucket.width) * u64::from(bucket.height) / unit_pixels)
+            .max()
+            .unwrap_or(0);
+        let max_vision_units = Self::MAX_IMAGE_PIXELS / u64::from(Self::VISION_STRIDE).pow(2);
+        let latent_bytes_per_unit = Self::LATENT_UNIT_ELEMENTS * dtype_bytes;
+        GenerationLimits {
+            max_latent_units: u64::MAX,
+            latent_downsample: Self::LATENT_DOWNSAMPLE,
+            max_vae_grid_tokens: u32::try_from(max_latent_units).unwrap_or(u32::MAX),
+            max_vit_grid_tokens: u32::try_from(max_vision_units)
+                .unwrap_or(u32::MAX)
+                .saturating_add(Self::FEEDBACK_MARKER_TOKENS),
+            latent_bytes_per_unit,
+            max_latent_feature_bytes: max_latent_units * latent_bytes_per_unit,
+            max_vision_feature_bytes: u64::MAX,
+            commit_marker_tokens: 0,
+            max_cfg_branches: 3,
+            encoder_cache_entries: u32::MAX,
+            ..GenerationLimits::default()
+        }
+    }
+
+    /// Resolves required control tokens from the loaded tokenizer.
+    ///
+    /// Encoder token counts stay unset here; the `*_for_dimensions` methods
+    /// return per-image copies with the counts set. Fails when the tokenizer
+    /// lacks any of the ChatML or image delimiter tokens.
+    pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
+        let (start_of_image, start_of_image_text) =
+            required_token(tokenizer, "<img>", "SenseNova start-of-image")?;
+        let (end_of_image, end_of_image_text) =
+            required_token(tokenizer, "</img>", "SenseNova end-of-image")?;
+        let controls = GenerationControls {
+            bos: required_token_id(tokenizer, "<|im_start|>", "SenseNova beginning-of-sequence")?,
+            eos: required_token_id(tokenizer, "<|im_end|>", "SenseNova end-of-sequence")?,
+            start_of_image,
+            end_of_image,
+            start_of_image_text,
+            end_of_image_text,
+        };
+        let image_encoders = vec![ImageEncoderInput {
+            encoder: proto::request::ImageEncoder::Vision,
+            num_cache_tokens: None,
+            max_cache_tokens: None,
+        }];
+        let image_num_positions = 1;
+        let image_generation = ImageGenerationConfig {
+            trigger: ImageTrigger::Token {
+                token_id: controls.start_of_image,
+            },
+            requires_text_for_image: false,
+            feedback_source: Some(FeedbackSource::DeviceProduct),
+            feedback_next_token: FeedbackNextToken::Token {
+                token_id: controls.end_of_image,
+            },
+            num_feedback_positions: 2,
+            feedback_encoders: vec![ImageEncoderInput {
+                encoder: proto::request::ImageEncoder::Vision,
+                num_cache_tokens: None,
+                max_cache_tokens: None,
+            }],
+            sample_feedback_continuation: true,
+        };
+        let resolution_policy = resolution_policy();
+        Ok(Self {
+            controls,
+            image_defaults: ImageGenerationDefaults {
+                steps: 50,
+                cfg_text_scale: 4.0,
+                cfg_img_scale: 1.0,
+                cfg_renorm_type: proto::request::CfgRenorm::None,
+                cfg_renorm_min: 0.0,
+                cfg_interval: (0.0, 1.0),
+                timestep_shift: 3.0,
+                seed: Some(42),
+                max_images: 4,
+            },
+            resolution_policy,
+            output_filter: OutputFilterPolicy {
+                reasoning: Some(DelimitedTextPolicy {
+                    start: "<think>".to_string(),
+                    end: "</think>".to_string(),
+                }),
+                visible_wrappers: vec![DelimitedTextPolicy {
+                    start: "<answer>".to_string(),
+                    end: "</answer>".to_string(),
+                }],
+            },
+            image_encoders,
+            image_num_positions,
+            image_generation,
+        })
+    }
+
+    /// Renders positive prompt text before tokenization: the constraint's
+    /// system instruction, the user turn, and the constraint's assistant
+    /// prefix. `UndOnly` has no system instruction.
+    pub fn render_prompt_text(&self, constraint: GenerationConstraint, prompt: &str) -> String {
+        chatml(
+            self.default_system_prompt(constraint),
+            prompt,
+            self.assistant_prefix(constraint),
+        )
+    }
+
+    /// Returns the upper pixel bound of each input image in a request that
+    /// carries `image_count` input images.
+    ///
+    /// The request's input images share a 4096x4096 pixel budget, and no
+    /// image exceeds 2048x2048: `min(2048 * 2048, 4096 * 4096 / n)` with
+    /// floor division, as the reference preprocessing computes it and the
+    /// worker's `PatchTransform.pixel_bound` applies it with the SenseNova
+    /// processor (`uniserve/models/sensenova_u1/processing.py`).
+    pub fn input_image_max_pixels(image_count: usize) -> u64 {
+        let count = u64::try_from(image_count).unwrap_or(u64::MAX).max(1);
+        Self::MAX_IMAGE_PIXELS.min(Self::MAX_TOTAL_PIXELS / count)
+    }
+}
+
+impl OmniProfile for SenseNovaProfile {
+    fn controls(&self) -> &GenerationControls {
+        &self.controls
+    }
+
+    fn image_defaults(&self) -> &ImageGenerationDefaults {
+        &self.image_defaults
+    }
+
+    fn resolution_policy(&self) -> &ResolutionPolicy {
+        &self.resolution_policy
+    }
+
+    fn image_num_positions(&self) -> u32 {
+        self.image_num_positions
+    }
+
+    /// The default instruction, or the image-generation one under `GenOnly`;
+    /// `UndOnly` has none.
+    fn default_system_prompt(&self, constraint: GenerationConstraint) -> Option<&'static str> {
+        match constraint {
+            GenerationConstraint::Default => Some(DEFAULT_SYSTEM_PROMPT),
+            GenerationConstraint::GenOnly => Some(IMAGE_SYSTEM_PROMPT),
+            GenerationConstraint::UndOnly => None,
+        }
+    }
+
+    /// `GenOnly` continues an empty thinking block and the start-of-image
+    /// token.
+    fn assistant_prefix(&self, constraint: GenerationConstraint) -> &'static str {
+        match constraint {
+            GenerationConstraint::GenOnly => IMAGE_ASSISTANT_PREFIX,
+            GenerationConstraint::Default | GenerationConstraint::UndOnly => "",
+        }
+    }
+
+    /// An image slot becomes the start- and end-of-image markers, and the
+    /// image fills the gap between them, entering at the end-of-image token.
+    fn image_slot(&self) -> (String, Option<u32>) {
+        (
+            format!(
+                "{}{}",
+                self.controls.start_of_image_text, self.controls.end_of_image_text
+            ),
+            Some(self.controls.end_of_image),
+        )
+    }
+
+    fn render_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        constraint: GenerationConstraint,
+        prompt: &str,
+    ) -> crate::tokenizer::Result<Vec<u32>> {
+        encode(tokenizer, &self.render_prompt_text(constraint, prompt))
+    }
+
+    /// Unlike Bagel, an empty prompt still renders the framed ChatML turn
+    /// with the image system instruction.
+    fn render_negative_prompt_ids(
+        &self,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt: &str,
+    ) -> crate::tokenizer::Result<Vec<u32>> {
+        encode(
+            tokenizer,
+            &chatml(Some(IMAGE_SYSTEM_PROMPT), prompt, NEGATIVE_ASSISTANT_PREFIX),
+        )
+    }
+
+    /// The image is fitted to a 32-aligned grid with an area of at least
+    /// 512x512 pixels and at most [`SenseNovaProfile::input_image_max_pixels`]
+    /// for the request's `image_count` input images, and adds no marker
+    /// tokens. Fails for a zero dimension or an aspect ratio above 200.
+    fn image_encoders_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+        image_count: usize,
+    ) -> assets::Result<Vec<ImageEncoderInput>> {
+        let tokens = pixel_bound_tokens(
+            width,
+            height,
+            Self::VISION_STRIDE,
+            Self::MIN_IMAGE_PIXELS,
+            Self::input_image_max_pixels(image_count),
+            Self::VISION_STRIDE,
+            0,
+        )?;
+        Ok(vec![ImageEncoderInput {
+            encoder: proto::request::ImageEncoder::Vision,
+            num_cache_tokens: Some(tokens),
+            max_cache_tokens: None,
+        }])
+    }
+
+    /// An input image's pixel bound follows the request's image count.
+    fn input_image_cache_salt(&self, image_count: usize) -> Option<u64> {
+        Some(Self::input_image_max_pixels(image_count))
+    }
+
+    /// Uses the grid of a single input image plus one marker token: a
+    /// generated image does not share the input images' pixel budget. Fails
+    /// for a zero dimension or an aspect ratio above 200, or when the
+    /// profile's feedback configuration has no feedback source or is not a
+    /// single ViT encoder.
+    fn image_generation_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> assets::Result<ImageGenerationConfig> {
+        let tokens = pixel_bound_tokens(
+            width,
+            height,
+            Self::VISION_STRIDE,
+            Self::MIN_IMAGE_PIXELS,
+            Self::MAX_IMAGE_PIXELS,
+            Self::VISION_STRIDE,
+            Self::FEEDBACK_MARKER_TOKENS,
+        )?;
+        let mut policy = self.image_generation.clone();
+        if policy.feedback_source.is_none()
+            || policy.feedback_encoders.len() != 1
+            || policy.feedback_encoders[0].encoder != proto::request::ImageEncoder::Vision
+        {
+            return Err(assets::Error::invalid(
+                "image feedback encoders do not match the model processor",
+            ));
+        }
+        policy.feedback_encoders[0].num_cache_tokens = Some(tokens);
+        policy.feedback_encoders[0].max_cache_tokens = None;
+        Ok(policy)
+    }
+
+    fn output_filter(&self) -> Option<&OutputFilterPolicy> {
+        Some(&self.output_filter)
+    }
+}
+
+/// Returns the fixed SenseNova image-resolution bucket policy.
+///
+/// Only these exact dimensions are accepted (`allow_custom` is false).
+fn resolution_policy() -> ResolutionPolicy {
+    let buckets = [
+        (ResolutionName::Square, 1536, 1536),
+        (ResolutionName::Landscape16x9, 2048, 1152),
+        (ResolutionName::OnePointFiveK, 2048, 1152),
+        (ResolutionName::Portrait9x16, 1152, 2048),
+        (ResolutionName::Landscape3x2, 1888, 1248),
+        (ResolutionName::Portrait2x3, 1248, 1888),
+        (ResolutionName::Landscape4x3, 1760, 1312),
+        (ResolutionName::Portrait3x4, 1312, 1760),
+        (ResolutionName::Portrait1x2, 1088, 2144),
+        (ResolutionName::Landscape2x1, 2144, 1088),
+        (ResolutionName::Portrait1x3, 864, 2592),
+        (ResolutionName::Landscape3x1, 2592, 864),
+    ]
+    .into_iter()
+    .map(|(name, width, height)| ResolutionBucket {
+        name,
+        width,
+        height,
+    })
+    .collect::<Vec<_>>();
+    // Index 1, the 16:9 bucket, is the default resolution; reordering the
+    // list changes the default. The fixed buckets already bound every side.
+    ResolutionPolicy {
+        default: buckets[1].clone(),
+        buckets,
+        allow_custom: false,
+        max_side: None,
+    }
+}

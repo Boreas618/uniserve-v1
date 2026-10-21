@@ -1,6 +1,6 @@
 //! The HTTP server: router assembly, the listener, and graceful shutdown.
 //!
-//! [`serve`] starts this node's daemon and, on the leader, the [`Engine`],
+//! [`serve`] starts this node's daemon and, on the leader, the [`Leader`],
 //! binds the configured TCP or Unix-domain listener, and serves the router
 //! of the tasks the engine serves until shutdown. Each API module builds its own routes over the engine
 //! (`crate::openai`); this module registers them by task, as vLLM registers
@@ -30,18 +30,28 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::frontend::{Engine, Task};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
+use crate::input::readout::SystemOneError;
+use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, images, videos};
-use crate::options::{ServeConfig, ServerOptions, Stated};
-use crate::serving::systemone::SystemOneError;
-
-pub(crate) use middleware::RequestId;
+use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
 pub(crate) const BODY_LIMIT: usize = 64 << 20;
+
+/// The HTTP body limit of the video submission routes, in bytes.
+///
+/// A `data:` URI carries its media base64 encoded, four bytes per three, so
+/// a body holding `media.max_request_bytes` of media plus the request's own
+/// fields fits; it never falls below the server-wide body limit.
+pub(crate) fn video_body_limit(media: &MediaOptions) -> usize {
+    let encoded = media.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
+    usize::try_from(encoded)
+        .unwrap_or(usize::MAX)
+        .max(BODY_LIMIT)
+}
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
@@ -56,7 +66,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// started, so the port accepts connections only when the server can answer
 /// them. Cancellation before the engine has started stops the start and
 /// returns `Ok(())` without binding a listener. Once it has started, the
-/// server shuts down as [`serve_on`] describes, and the engine is shut down
+/// server shuts down as `serve_on` describes, and the engine is shut down
 /// on every path, which finishes any request still running as aborted, so a
 /// stream that outlived the shutdown budget ends then. The daemon stops
 /// last, ending whatever process the engine left.
@@ -115,7 +125,7 @@ async fn lead(
     shutdown: &CancellationToken,
 ) -> Result<()> {
     let engine = tokio::select! {
-        engine = Engine::start(config, stated, daemon) => Arc::new(engine?),
+        engine = Leader::start(config, stated, daemon) => Arc::new(engine?),
         () = shutdown.cancelled() => return Ok(()),
     };
     let served = async {
@@ -143,7 +153,7 @@ async fn lead(
 ///
 /// Fails when the listener cannot report its address or the server fails.
 async fn serve_on(
-    engine: &Arc<Engine>,
+    engine: &Arc<Leader>,
     listener: Listener,
     config: &ServeConfig,
     shutdown: &CancellationToken,
@@ -158,7 +168,7 @@ async fn serve_on(
         Arc::clone(engine),
         Arc::clone(&jobs),
         server,
-        config.media_config.body_limit(),
+        video_body_limit(&config.media_config),
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
@@ -194,7 +204,7 @@ async fn serve_on(
 /// Every engine answers the operational routes `/health` and `/metrics`,
 /// which take no API key and are not counted in HTTP metrics, and `/version`,
 /// which takes the key but is not counted. `GET /v1/models` and the routes of
-/// each served task (`Engine::supported_tasks`) take the key and are counted.
+/// each served task (`Leader::supported_tasks`) take the key and are counted.
 /// The generation routes (chat completions, image generation, synchronous
 /// video, and the System One readout) share the in-flight limit. A path no
 /// route serves answers FastAPI's `404 {"detail": "Not Found"}`.
@@ -205,7 +215,7 @@ async fn serve_on(
 /// shed or timed-out request is counted in HTTP metrics and carries its
 /// request ID.
 pub(crate) fn router(
-    engine: Arc<Engine>,
+    engine: Arc<Leader>,
     jobs: Arc<VideoJobs>,
     server: &ServerOptions,
     video_body_limit: usize,
@@ -296,9 +306,9 @@ pub(crate) fn router(
         }))
 }
 
-/// Answers `200 OK` while any scheduler is alive (`Engine::is_healthy`),
+/// Answers `200 OK` while any scheduler is alive (`Leader::is_healthy`),
 /// then `503 Service Unavailable`.
-async fn health(State(engine): State<Arc<Engine>>) -> StatusCode {
+async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
     if engine.is_healthy() {
         StatusCode::OK
     } else {
@@ -328,7 +338,7 @@ async fn version() -> Json<serde_json::Value> {
 ///
 /// The body is read as bytes so that malformed JSON is reported in the
 /// endpoint's own `422` shape.
-async fn systemone(State(engine): State<Arc<Engine>>, body: Bytes) -> Response {
+async fn systemone(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
     match engine.systemone(&body).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
@@ -357,7 +367,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::profile::ModelParameters;
+    use crate::model::ModelParameters;
     use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, sim_engine};
 
     /// A `GET` request to `path`.

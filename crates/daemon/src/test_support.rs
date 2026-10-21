@@ -3,7 +3,7 @@
 //! schedulers, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
-//! `Engine`, whose client submits them over the request interface to
+//! `Leader`, whose client submits them over the request interface to
 //! schedulers that drive `SimEngine` through `SimExecutor`; the schedulers
 //! serve the interface on a thread of this process, as an engine process
 //! serves it. The default simulator provides no video media components, so
@@ -25,16 +25,17 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
-use crate::client::{EngineClient, EngineInfo};
-use crate::frontend::Engine;
+use crate::engine::client::{EngineClient, EngineInfo};
+use crate::input::chat::HfChatRenderer;
+use crate::input::media::MediaConnector;
+use crate::input::video::VideoService;
+use crate::input::{InputProcessor, RequestRenderer};
+use crate::leader::Leader;
+use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::openai::video_jobs::VideoJobs;
+use crate::options::ChatTemplateContentFormatOption;
 use crate::options::{ImageFetchOptions, LoggingOptions, ServerOptions, VideoJobOptions};
-use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};
-use crate::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use crate::serving::media::MediaConnector;
-use crate::serving::video::VideoService;
-use crate::serving::{InputProcessor, RequestRenderer};
+use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 /// Served model name the simulated engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
@@ -96,13 +97,13 @@ pub(crate) fn configured_tokenizer() -> DynTokenizer {
 }
 
 /// The server's router over `engine` under the default server options.
-pub(crate) fn router(engine: Engine) -> Router {
+pub(crate) fn router(engine: Leader) -> Router {
     router_with(engine, &ServerOptions::default())
 }
 
 /// The daemon's router over `engine` under `server`, with the HTTP body limit
 /// for the video submission routes and default video job options.
-pub(crate) fn router_with(engine: Engine, server: &ServerOptions) -> Router {
+pub(crate) fn router_with(engine: Leader, server: &ServerOptions) -> Router {
     let jobs = VideoJobs::new(VideoJobOptions::default(), CancellationToken::new());
     crate::http::router(
         Arc::new(engine),
@@ -120,8 +121,8 @@ pub(crate) fn router_with(engine: Engine, server: &ServerOptions) -> Router {
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does, and a
 /// DiffusionGemma model runs under its own generation limits, as
-/// `Engine::start` starts it.
-pub(crate) fn sim_engine(parameters: ModelParameters) -> Engine {
+/// `Leader::start` starts it.
+pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
     sim_readout_engine(parameters, None)
 }
 
@@ -129,8 +130,8 @@ pub(crate) fn sim_engine(parameters: ModelParameters) -> Engine {
 /// with `readout`.
 pub(crate) fn sim_readout_engine(
     parameters: ModelParameters,
-    readout: Option<crate::serving::systemone::ReadoutEncoder>,
-) -> Engine {
+    readout: Option<crate::input::readout::ReadoutEncoder>,
+) -> Leader {
     let model = sim_model(parameters);
     let mut config = EngineConfig::sim(SERVED_MODEL);
     if let ModelParameters::DiffusionGemma(_) = model.parameters {
@@ -148,7 +149,7 @@ pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHand
 
 /// Builds an engine for a model with `parameters` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
-pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Engine {
+pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Leader {
     engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
 }
 
@@ -176,7 +177,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         .name("sim-engine".into())
         .spawn(move || engine::serve_requests(engine, cores))
         .expect("start the simulated engine");
-    EngineClient::over(daemon, info, crate::frontend::stats_sink(model_name)).expect("a client")
+    EngineClient::over(daemon, info, crate::leader::stats_sink(model_name)).expect("a client")
 }
 
 /// The simulated model's facts.
@@ -198,8 +199,8 @@ pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
     cores: Vec<SchedulerHandle>,
-    readout: Option<crate::serving::systemone::ReadoutEncoder>,
-) -> Engine {
+    readout: Option<crate::input::readout::ReadoutEncoder>,
+) -> Leader {
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
         _ => RequestRenderer::Chat(
@@ -226,7 +227,7 @@ pub(crate) fn engine_over(
         log_requests: false,
         log_stats: false,
     };
-    Engine::new(
+    Leader::new(
         SERVED_MODEL.to_owned(),
         model_name,
         client,

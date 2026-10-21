@@ -30,12 +30,12 @@
 
 use std::sync::Arc;
 
-use daemon::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use daemon::serving::chat::output::AssistantEvent;
-use daemon::serving::chat::{
-    AssistantBlockKind, ChatOutputProcessor, ChatRequest, ChatToolChoice, Tool,
-};
-use daemon::serving::text::TextDecodeOptions;
+use daemon::input::chat::{ChatRequest, ChatToolChoice};
+use daemon::output::chat::AssistantEvent;
+use daemon::output::chat::{AssistantBlockKind, ChatOutputProcessor};
+use daemon::output::text::TextDecodeOptions;
+use daemon::output::tools::Tool;
+use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::models::bpe::{BPE, Vocab};
@@ -289,7 +289,7 @@ fn gemma4_processor_parses_replies_token_by_token_and_by_committed_block() {
     for sample in fixture().samples {
         for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
             let processor = ChatOutputProcessor::gemma4(
-                &request_with_tools(),
+                request_with_tools().tool_parsing_enabled(),
                 &mut TextDecodeOptions::default(),
                 Arc::clone(&tokenizer),
                 true,
@@ -321,7 +321,7 @@ fn gemma4_processor_parses_real_tool_replies_as_the_reference_does() {
             for tokens_per_delta in [1, COMMITTED_BLOCK_TOKENS] {
                 let request = request_with_tools();
                 let processor = ChatOutputProcessor::gemma4(
-                    &request,
+                    request.tool_parsing_enabled(),
                     &mut TextDecodeOptions::default(),
                     Arc::clone(&tokenizer),
                     true,
@@ -352,13 +352,8 @@ fn gemma4_processor_without_parsers_streams_delimiters_as_text() {
         .find(|sample| sample.name == "tool_calls_after_reasoning")
         .expect("fixture has a tool-call sample");
     let mut decode = TextDecodeOptions::default();
-    let processor = ChatOutputProcessor::gemma4(
-        &ChatRequest::for_test(),
-        &mut decode,
-        gemma4_tokenizer(),
-        false,
-    )
-    .expect("build processor");
+    let processor = ChatOutputProcessor::gemma4(false, &mut decode, gemma4_tokenizer(), false)
+        .expect("build processor");
 
     let blocks = assistant_blocks(processor, &sample, deltas(&sample, 1));
 
