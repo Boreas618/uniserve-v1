@@ -27,8 +27,8 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
-use daemon::DaemonOptions;
 use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use proto::request::wire;
 use proto::request::{
@@ -948,7 +948,7 @@ impl ServeConfig {
             dist_init_addr: self.dist_init_addr.clone(),
             socket: directory.join(format!("process-{}.sock", std::process::id())),
             executable: self.worker_config.executable.clone(),
-            join_timeout: daemon::JOIN_TIMEOUT,
+            join_timeout: crate::supervision::JOIN_TIMEOUT,
         }
     }
 

@@ -13,6 +13,8 @@ mod middleware;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics::METRICS;
+use crate::supervision::Daemon;
 use anyhow::{Context as _, Result};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -22,8 +24,6 @@ use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use daemon::Daemon;
-use observability::METRICS;
 use serde_json::json;
 use thiserror_ext::AsReport as _;
 use tokio_util::sync::CancellationToken;

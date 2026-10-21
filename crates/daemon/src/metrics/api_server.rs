@@ -12,7 +12,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
 
-use crate::U64Counter;
+use crate::metrics::U64Counter;
 
 /// Upper bounds, in seconds, of the labeled per-handler latency histogram.
 const HTTP_REQUEST_DURATION_BUCKETS: [f64; 3] = [0.1, 0.5, 1.0];

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use server::serving::chat::{
+use daemon::serving::chat::{
     AssistantContentBlock, AssistantToolCall, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
     ChatTemplateContentFormatOption, GenerationPromptMode, HfChatRenderer,
 };

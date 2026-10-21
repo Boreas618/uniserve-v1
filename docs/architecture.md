@@ -195,18 +195,16 @@ crates/ipc/             engine-to-worker messages, the channel, registration, la
 crates/storage/         the Storage Server's protocol and client
 crates/storage-server/  the Storage Server and its Mooncake connector
 crates/cuda/            CUDA driver, VMM, NVML and NCCL bindings and graph launch, loaded at run time
-crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service
-crates/engine/          scheduler, KV cache allocation, worker groups and process launch through the daemons
-crates/server/          HTTP/OpenAI API, model profiles, request lowering and assembly
+crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader, the HTTP/OpenAI API, model profiles, input and output processing, metrics and the engine's client
+crates/engine/          the engine process: schedulers, KV cache allocation, worker groups and process launch through the daemons, the request interface's service
 crates/worker/          the worker runtime, installed as the library uniserve/_worker
-crates/observability/   metrics registry
-crates/uniserve/        the uniserve executable: serve, worker and storage
+crates/uniserve/        the uniserve executable: serve, engine, worker and storage
 uniserve/           the numerical library, the concrete models, the Python half of each runner and the worker's Python entry
 uniserve_kernels/   Triton, CuTe and CUDA kernels, and the vendored DeepEP and DeepGEMM sources
 uniserve_eval/      HTTP evaluation client
 ```
 
-Dependency direction: `proto <- ipc <- {engine, worker}`, `models <- {worker, server}`, `proto <- {daemon, engine, server}`, `{proto, storage, cuda} <- daemon`, `{storage, cuda} <- storage-server`, `cuda <- worker`, `{models, ipc, engine, daemon, observability} <- server <- uniserve`, `{storage, storage-server} <- uniserve`. The daemon knows engines only through `proto`; the engine knows no model family: what a video request asks of its model (its conditions, the denoiser's description) crosses the engine as bytes the model family encodes (`models::video::Conditioning`, `models::video::DenoiserInfo`) beside the sizes the engine schedules by. The worker never depends on the engine or server, and the engine never links CUDA.
+Dependency direction: `proto <- ipc <- {engine, worker}`, `{proto, storage, cuda, models} <- daemon`, `{proto, ipc, storage} <- engine`, `{ipc, cuda, storage, models} <- worker`, `{storage, cuda} <- storage-server`, `{daemon, engine, storage, storage-server} <- uniserve`. The daemon knows engines only through `proto`; the engine knows no model family: what a video request asks of its model (its conditions, the denoiser's description) crosses the engine as bytes the model family encodes (`models::video::Conditioning`, `models::video::DenoiserInfo`) beside the sizes the engine schedules by. The worker never depends on the engine or the daemon, the daemon never on the engine, `ipc` or the worker, and the engine never links CUDA.
 
 | Worker runtime module (`crates/worker/src`) | Responsibility |
 | --- | --- |

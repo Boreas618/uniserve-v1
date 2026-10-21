@@ -6,9 +6,7 @@ members = [
     "crates/engine",
     "crates/ipc",
     "crates/models",
-    "crates/observability",
     "crates/proto",
-    "crates/server",
     "crates/storage",
     "crates/storage-server",
     "crates/uniserve",
@@ -28,9 +26,7 @@ daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
-observability = { path = "crates/observability" }
 proto = { path = "crates/proto" }
-server = { path = "crates/server" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }
 worker = { path = "crates/worker" }
@@ -40,7 +36,7 @@ crossbeam-channel = "0.5"
 sha2 = "0.10"
 signal-hook-registry = "1.4.8"
 
-# ---- server third-party deps ----
+# ---- daemon third-party deps ----
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"

@@ -27,8 +27,8 @@ use proto::process::{
 };
 use proto::{Connection, Listener};
 
-use crate::claims::ClaimHolder;
-use crate::supervision::Supervisor;
+use crate::supervision::claims::ClaimHolder;
+use crate::supervision::supervisor::Supervisor;
 
 /// How often children are polled for exits while nothing else happens.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);

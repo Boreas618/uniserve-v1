@@ -12,11 +12,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+daemon.workspace = true
 engine.workspace = true
 libc.workspace = true
 libloading.workspace = true
 mimalloc.workspace = true
-server.workspace = true
 storage.workspace = true
 storage-server.workspace = true
 time.workspace = true

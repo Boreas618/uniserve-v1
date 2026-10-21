@@ -7,23 +7,23 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use daemon::openai::ApiError;
+use daemon::options::{ImageFetchOptions, MediaOptions};
+use daemon::profile::assets::ResolvedModelFiles;
+use daemon::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use daemon::profile::{ModelConfig, ModelDescription};
+use daemon::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
+use daemon::serving::media::{ImageInput, MediaConnector, MediaListError};
+use daemon::serving::video::VideoGenerationRequest;
+use daemon::serving::video::VideoService;
+use daemon::serving::{
+    InputProcessor, ModelResolutionError, OutputParams, Prompt, RequestRenderer,
+};
 use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
 use proto::request::ImageEncoder;
 use proto::request::{GenerationLimits, GenerationRequest};
-use server::openai::ApiError;
-use server::options::{ImageFetchOptions, MediaOptions};
-use server::profile::assets::ResolvedModelFiles;
-use server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use server::profile::{ModelConfig, ModelDescription};
-use server::serving::chat::{ChatTemplateContentFormatOption, HfChatRenderer};
-use server::serving::media::{ImageInput, MediaConnector, MediaListError};
-use server::serving::video::VideoGenerationRequest;
-use server::serving::video::VideoService;
-use server::serving::{
-    InputProcessor, ModelResolutionError, OutputParams, Prompt, RequestRenderer,
-};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
@@ -281,7 +281,7 @@ fn png_data_url() -> String {
 /// The leading text contains a literal `</img>`, which the synthetic tokenizer
 /// encodes as the SenseNova end-of-image token. The top-level `seed` (9) and
 /// the `image_config` seed (17) differ so tests can tell which one wins.
-fn image_chat_request(model: &str, image_url: &str) -> server::openai::ChatCompletionRequest {
+fn image_chat_request(model: &str, image_url: &str) -> daemon::openai::ChatCompletionRequest {
     serde_json::from_value(serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": [
@@ -300,11 +300,11 @@ fn image_chat_request(model: &str, image_url: &str) -> server::openai::ChatCompl
 fn preprocess_chat(
     processor: &InputProcessor,
     request_id: String,
-    request: server::openai::ChatCompletionRequest,
+    request: daemon::openai::ChatCompletionRequest,
     images: Vec<ImageInput>,
 ) -> Result<(GenerationRequest, OutputParams), ApiError> {
     let (request, _) =
-        server::openai::chat_completions::lower_chat_request(request_id, SERVED_MODEL, request)?;
+        daemon::openai::chat_completions::lower_chat_request(request_id, SERVED_MODEL, request)?;
     processor
         .preprocess(request, images)
         .map_err(ApiError::from)
@@ -315,9 +315,9 @@ fn preprocess_chat(
 fn preprocess_image(
     processor: &InputProcessor,
     request_id: String,
-    request: server::openai::ImageGenerationRequest,
+    request: daemon::openai::ImageGenerationRequest,
 ) -> Result<(GenerationRequest, OutputParams), ApiError> {
-    let request = server::openai::images::lower_image_request(request_id, SERVED_MODEL, request)?;
+    let request = daemon::openai::images::lower_image_request(request_id, SERVED_MODEL, request)?;
     processor
         .preprocess(request, Vec::new())
         .map_err(ApiError::from)
@@ -325,8 +325,8 @@ fn preprocess_image(
 
 /// The input-image URLs of a chat completion, in the order preprocessing
 /// pairs resolved images with them.
-fn chat_image_urls(request: &server::openai::ChatCompletionRequest) -> Vec<String> {
-    let (lowered, _) = server::openai::chat_completions::lower_chat_request(
+fn chat_image_urls(request: &daemon::openai::ChatCompletionRequest) -> Vec<String> {
+    let (lowered, _) = daemon::openai::chat_completions::lower_chat_request(
         String::new(),
         &request.model,
         request.clone(),
@@ -347,7 +347,7 @@ async fn preprocess_video(
 ) -> Result<
     (
         proto::request::DiffusionRequest,
-        server::serving::video::ProcessedVideo,
+        daemon::serving::video::ProcessedVideo,
     ),
     ApiError,
 > {
@@ -375,7 +375,7 @@ fn resolve_images(
 
 /// A single-turn text chat request to the served model, with the wire
 /// `fields` set on top.
-fn chat_request(fields: serde_json::Value) -> server::openai::ChatCompletionRequest {
+fn chat_request(fields: serde_json::Value) -> daemon::openai::ChatCompletionRequest {
     let mut request = serde_json::json!({
         "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "hello"}],
@@ -393,7 +393,7 @@ fn chat_request(fields: serde_json::Value) -> server::openai::ChatCompletionRequ
 fn preprocess_image_chat(
     processor: &InputProcessor,
     request_id: &str,
-    request: server::openai::ChatCompletionRequest,
+    request: daemon::openai::ChatCompletionRequest,
 ) -> (GenerationRequest, OutputParams) {
     let connector = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
     let images = resolve_images(&connector, chat_image_urls(&request)).unwrap();
@@ -688,7 +688,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
         assert!(
             matches!(
                 error,
-                server::openai::ApiError::InvalidRequest { param: Some(name), .. }
+                daemon::openai::ApiError::InvalidRequest { param: Some(name), .. }
                     if name == param
             ),
             "{fields}: {error:?}"
@@ -710,7 +710,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
         assert!(
             matches!(
                 error,
-                server::openai::ApiError::InvalidRequest { param: Some(name), .. }
+                daemon::openai::ApiError::InvalidRequest { param: Some(name), .. }
                     if name.starts_with("target.")
             ),
             "{target}: {error:?}"
@@ -900,7 +900,7 @@ fn context_length_limits_preprocessed_requests() {
 #[test]
 fn sampling_defaults_preserve_explicit_zero_controls() {
     let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
-    let mut request: server::openai::ChatCompletionRequest =
+    let mut request: daemon::openai::ChatCompletionRequest =
         serde_json::from_value(serde_json::json!({
             "model": SERVED_MODEL, "messages": [{"role": "user", "content": "hello"}]
         }))
@@ -934,7 +934,7 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
             request,
             Vec::new()
         ),
-        Err(server::openai::ApiError::InvalidRequest { .. })
+        Err(daemon::openai::ApiError::InvalidRequest { .. })
     ));
 }
 
@@ -962,7 +962,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
             if let Some(negative_prompt) = negative_prompt {
                 body["negative_prompt"] = negative_prompt.into();
             }
-            let request: server::openai::ImageGenerationRequest =
+            let request: daemon::openai::ImageGenerationRequest =
                 serde_json::from_value(body).unwrap();
             preprocess_image(&processor, String::from("image-api"), request)
                 .unwrap()
@@ -1009,7 +1009,7 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
             })
             .chain([serde_json::json!({"type": "text", "text": "compare"})])
             .collect::<Vec<_>>();
-        let request: server::openai::ChatCompletionRequest =
+        let request: daemon::openai::ChatCompletionRequest =
             serde_json::from_value(serde_json::json!({
                 "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": content}]
@@ -1032,7 +1032,7 @@ fn sensenova_image_cache_identity_follows_its_pixel_bound() {
 #[test]
 fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
     let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = |size: &str| -> server::openai::ImageGenerationRequest {
+    let request = |size: &str| -> daemon::openai::ImageGenerationRequest {
         serde_json::from_value(serde_json::json!({
             "model": SERVED_MODEL,
             "prompt": "a banner",
@@ -1047,7 +1047,7 @@ fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
             panic!("{size} was admitted");
         };
         assert!(
-            matches!(error, server::openai::ApiError::InvalidRequest { .. }),
+            matches!(error, daemon::openai::ApiError::InvalidRequest { .. }),
             "{size}: {error:?}"
         );
     }
@@ -1114,7 +1114,7 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
     ] {
         let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
         for stream in [true, false] {
-            let request: server::openai::ChatCompletionRequest =
+            let request: daemon::openai::ChatCompletionRequest =
                 serde_json::from_value(serde_json::json!({
                     "model": SERVED_MODEL,
                     "messages": [{"role": "user", "content": "hello"}],

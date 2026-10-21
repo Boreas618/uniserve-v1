@@ -2,7 +2,7 @@
 //!
 //! `main` parses the command line and runs its command. `serve` installs
 //! tracing and builds the Tokio runtime; `async_main` hands the resolved
-//! configuration to `server::serve` together with a cancellation token that
+//! configuration to `daemon::serve` together with a cancellation token that
 //! fires on Ctrl-C or SIGTERM. `engine` runs the engine process the leader
 //! daemon starts. `worker` and `storage` run before any thread exists: a worker loads the Python runtime on the main thread,
 //! and a Storage Server started with `--daemon` forks.
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use clap::Parser as _;
-use server::options;
+use daemon::options;
 
 use crate::cli::{Cli, Command};
 
@@ -154,7 +154,7 @@ async fn async_main(args: options::ServeArgs) -> Result<()> {
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
         worker_executable = %config.worker_config.executable.display(), "resolved serving options");
-    server::serve(config, stated, shutdown_signal()).await
+    daemon::serve(config, stated, shutdown_signal()).await
 }
 
 #[cfg(all(test, target_os = "linux"))]

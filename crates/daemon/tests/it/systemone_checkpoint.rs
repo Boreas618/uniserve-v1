@@ -9,22 +9,22 @@
 //! The tests read the checkpoint directories named by
 //! `UNISERVE_DIFFUSION_GEMMA_MODEL` (BF16) and
 //! `UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL` (NVFP4) and run only on request:
-//! `cargo test -p server --test it systemone_checkpoint -- --include-ignored`.
+//! `cargo test -p daemon --test it systemone_checkpoint -- --include-ignored`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use serde::Deserialize;
-use serde_json::Value;
-use server::options::ReadoutOptions;
-use server::profile::assets::ResolvedModelFiles;
-use server::profile::diffusion_gemma::ImagePlacement;
-use server::profile::tokenizer::HuggingFaceTokenizer;
-use server::profile::{ModelConfig, ModelDescription, ModelParameters};
-use server::serving::systemone::{
+use daemon::options::ReadoutOptions;
+use daemon::profile::assets::ResolvedModelFiles;
+use daemon::profile::diffusion_gemma::ImagePlacement;
+use daemon::profile::tokenizer::HuggingFaceTokenizer;
+use daemon::profile::{ModelConfig, ModelDescription, ModelParameters};
+use daemon::serving::systemone::{
     CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutPlan,
     SystemOneRequest,
 };
+use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Deserialize)]
 struct Fixture {

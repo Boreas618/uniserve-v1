@@ -707,12 +707,55 @@ name = "daemon"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "asynk-strim-attr",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "criterion",
  "cuda",
+ "engine",
+ "expect-test",
+ "fastokens",
+ "fnv",
+ "futures",
+ "hf-hub 0.5.0",
+ "http-body",
+ "humantime",
+ "image",
+ "indexmap 2.14.0",
+ "ipc",
+ "itertools 0.14.0",
  "libc",
+ "llm-multimodal",
+ "minijinja",
+ "minijinja-contrib",
+ "models",
+ "prometheus-client",
  "proto",
+ "reqwest",
+ "serde",
+ "serde-json-fmt",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_with",
+ "sha2",
  "storage",
  "tempfile",
+ "thiserror",
+ "thiserror-ext",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tower-http",
  "tracing",
+ "tracing-futures",
+ "url",
+ "uuid",
+ "validator",
+ "winnow",
 ]
 
 [[package]]
@@ -2283,13 +2326,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "observability"
-version = "2.0.0"
-dependencies = [
- "prometheus-client",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3288,62 +3324,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "asynk-strim-attr",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "criterion",
- "daemon",
- "engine",
- "expect-test",
- "fastokens",
- "fnv",
- "futures",
- "hf-hub 0.5.0",
- "http-body",
- "humantime",
- "image",
- "indexmap 2.14.0",
- "ipc",
- "itertools 0.14.0",
- "libc",
- "llm-multimodal",
- "minijinja",
- "minijinja-contrib",
- "models",
- "observability",
- "proto",
- "reqwest",
- "serde",
- "serde-json-fmt",
- "serde_json",
- "serde_path_to_error",
- "serde_with",
- "sha2",
- "storage",
- "tempfile",
- "thiserror",
- "thiserror-ext",
- "tokenizers",
- "tokio",
- "tokio-util",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-futures",
- "url",
- "uuid",
- "validator",
- "winnow",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4111,12 +4091,12 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "daemon",
  "engine",
  "libc",
  "libloading",
  "mimalloc",
  "rustix",
- "server",
  "storage",
  "storage-server",
  "tempfile",
