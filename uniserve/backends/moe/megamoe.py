@@ -92,6 +92,27 @@ def _initialize_nvshmem(
     _NVSHMEM_GROUP = group
 
 
+def _finalize_nvshmem(group: Communicator, bootstrap) -> None:
+    """Leave NVSHMEM, collectively over the expert group, freeing its heap.
+
+    Every symmetric allocation was freed. A rank's heap returns to the
+    device once every peer unmapped it, so the ranks wait for each other
+    after finalizing. A later :func:`_initialize_nvshmem` joins again.
+    """
+    global _NVSHMEM_GROUP
+    if _NVSHMEM_GROUP is None:
+        return
+    if _NVSHMEM_GROUP != group:
+        raise RuntimeError("NVSHMEM serves another expert group")
+    import nvshmem.core
+
+    torch.cuda.synchronize(group.device)
+    bootstrap.barrier()
+    nvshmem.core.finalize()
+    _NVSHMEM_GROUP = None
+    bootstrap.barrier()
+
+
 class MegaMoEBuffer:
     """One worker's MegaMoE symmetric buffers and kernel for an expert group.
 
@@ -117,21 +138,33 @@ class MegaMoEBuffer:
         activation: Activation,
         device: torch.device,
     ) -> None:
-        _initialize_nvshmem(group, bootstrap, device)
-        from uniserve_kernels.megamoe import get_symm_buffer_for_mega_moe
-
         self.group = group
         self.max_tokens = max_tokens
         self.hidden = hidden
+        self._bootstrap = bootstrap
+        self._device = device
+        self._sizes = (num_experts, top_k, intermediate, activation)
+        # Captured launches bind both a stream and a local token extent;
+        # all extents retain the same maximum-sized symmetric allocation.
+        self._launches: dict[tuple[int, int, int], object] = {}
+        self.symmetric = None
+        self._allocate()
+
+    def _allocate(self) -> None:
+        """Join NVSHMEM and allocate the symmetric buffers, collectively."""
+        _initialize_nvshmem(self.group, self._bootstrap, self._device)
+        from uniserve_kernels.megamoe import get_symm_buffer_for_mega_moe
+
+        num_experts, top_k, intermediate, activation = self._sizes
         # The kernel's FC1 width is the concatenated gate and up rows.
         self.symmetric = get_symm_buffer_for_mega_moe(
             num_experts,
-            max_tokens,
+            self.max_tokens,
             top_k,
-            hidden,
+            self.hidden,
             2 * intermediate,
-            group.rank,
-            group.size,
+            self.group.rank,
+            self.group.size,
             apply_topk_in_fc1=False,
             in_kernel_fc2_reduce=False,
             combine_dtype="bf16",
@@ -140,9 +173,30 @@ class MegaMoEBuffer:
             if activation == "gelu_pytorch_tanh"
             else activation,
         )
-        # Captured launches bind both a stream and a local token extent;
-        # all extents retain the same maximum-sized symmetric allocation.
-        self._launches: dict[tuple[int, int, int], object] = {}
+
+    def release(self) -> None:
+        """Free the symmetric buffers and leave NVSHMEM, collectively.
+
+        Freeing a symmetric allocation returns it to the NVSHMEM heap, not
+        to the device; only leaving NVSHMEM releases the heap, whose
+        addresses a later join does not keep. The launches bound to the
+        old buffers are dropped: :meth:`rebuild` allocates new ones, and
+        the graphs that launch the kernel are captured again.
+        """
+        if self.symmetric is None:
+            return
+        torch.cuda.synchronize(self.group.device)
+        self._bootstrap.barrier()
+        self.symmetric.destroy()
+        self.symmetric = None
+        self._launches.clear()
+        _finalize_nvshmem(self.group, self._bootstrap)
+
+    def rebuild(self) -> None:
+        """Join NVSHMEM again and allocate new symmetric buffers."""
+        if self.symmetric is not None:
+            raise RuntimeError("only a released MegaMoE buffer is rebuilt")
+        self._allocate()
 
     def launch(self, weights, fc1, fc2, tokens: int):
         """Return the launch of one layer's weights on the current stream.
