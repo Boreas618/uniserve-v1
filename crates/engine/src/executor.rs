@@ -33,7 +33,7 @@ use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport,
 
 mod batch;
 
-pub use batch::{ExecutionBatch, PageWrites, RankBuffer, RequestPlacement};
+pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestPlacement};
 
 /// What the engine launched one pool with.
 ///
@@ -86,7 +86,7 @@ pub struct ExecutorInfo {
     ///
     /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
     /// and `SimExecutor` leave it empty, which serves no pool through the
-    /// host page tier.
+    /// host KV cache.
     pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
 }
 

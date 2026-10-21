@@ -159,7 +159,7 @@ pub(crate) struct Streams {
     /// The configured lanes, or the one lane of a rank without them.
     lanes: Vec<Lane>,
     /// The copy lane of a rank whose prefix cache copies pages through the
-    /// host page tier (`crate::lane`), on its primary device.
+    /// host KV cache (`crate::lane`), on its primary device.
     copy: Option<Lane>,
     /// Where the lanes post their completions; the rank's job queues take
     /// them from here, and give the posting end to the Python thread's

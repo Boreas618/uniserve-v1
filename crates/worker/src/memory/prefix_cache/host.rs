@@ -1,11 +1,11 @@
-//! The host page tier (L2) of the rank's prefix cache.
+//! The host KV cache (L2) of the rank's prefix cache.
 //!
 //! Each full-attention cache group copies its pages through a page pool of
 //! the host's Storage Server: a memfd of equal slots shared by every worker
 //! of the host whose pages have the same shape. The rank maps each pool
 //! writable and registers it for device copies; the engine decides which
-//! pages to copy and carries them in batches (`Batch::page_reads`,
-//! `Batch::page_writes`), and the copies run on the rank's copy lane as soon
+//! pages to copy and carries them in batches (`Batch::page_loads`,
+//! `Batch::page_offloads`), and the copies run on the rank's copy lane as soon
 //! as the batch arrives (`PrefixCache::issue_pages`).
 //!
 //! A page is one page of one group on this rank, layer-major:
@@ -50,7 +50,7 @@ struct GroupPool {
 }
 
 /// The rank's page pools, by cache group.
-pub(crate) struct PageTier {
+pub(crate) struct HostKvCache {
     pools: BTreeMap<u32, GroupPool>,
 }
 
@@ -89,11 +89,11 @@ fn content(fingerprint: &str, plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.finalize().into()
 }
 
-impl PageTier {
+impl HostKvCache {
     /// Map a page pool for every full-attention group of `plan` at the
     /// rank's host's Storage Server, registered with `device`. `fingerprint`
     /// is the model fingerprint (`uniserve.loading.retained.fingerprint`).
-    /// Returns the tier and what the rank reports of each pool.
+    /// Returns the host KV cache and what the rank reports of each pool.
     pub(crate) fn start(
         retained: &Retained,
         plan: &CachePlan,
@@ -226,31 +226,31 @@ impl PageTier {
         Ok(runs)
     }
 
-    /// Fill the units of `reads` from their slots in `stream` order. The
+    /// Load the units of `loads` from their slots in `stream` order. The
     /// units are new units of the batch, which the copies overwrite whole
     /// (every column of both fields, and an FP8 pool's scales); an FP8 pool
     /// then marks them initialized with `column`, bound to `stream`.
-    pub(crate) fn read(
+    pub(crate) fn load(
         &self,
         planes: &CachePlanes,
-        reads: &[PageCopy],
+        loads: &[PageCopy],
         column: &UnitColumn,
         stream: impl Issue,
     ) -> Result<()> {
-        if reads.is_empty() {
+        if loads.is_empty() {
             return Ok(());
         }
         let mut batch = CopyBatch::new(SourceOrder::Stream);
-        for copy in reads {
+        for copy in loads {
             for (device, host, bytes) in self.runs(planes, copy)? {
                 batch.push(device, host, bytes);
             }
         }
         tracing::debug!(
-            pages = reads.len(),
-            first_slot = reads[0].slot,
-            first_unit = reads[0].units.first().map(|unit| unit.0),
-            "reading pages from the host page tier"
+            pages = loads.len(),
+            first_slot = loads[0].slot,
+            first_unit = loads[0].units.first().map(|unit| unit.0),
+            "loading pages from the host KV cache"
         );
         // SAFETY: the slots are pinned by the engine until the batch's output
         // arrives, and the units are the batch's new units, which no other
@@ -258,7 +258,7 @@ impl PageTier {
         // for these copies.
         unsafe { stream.copy(&batch) }?;
         if planes.plan().quantized {
-            let units: Vec<u32> = reads
+            let units: Vec<u32> = loads
                 .iter()
                 .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
                 .collect();
@@ -267,28 +267,28 @@ impl PageTier {
         Ok(())
     }
 
-    /// Copy the units of the published pages of `writes` into their slots
-    /// in `stream` order; the batch's output waits for the copies.
-    pub(crate) fn write(
+    /// Offload the units of the published pages of `offloads` into their
+    /// slots in `stream` order; the batch's output waits for the copies.
+    pub(crate) fn offload(
         &self,
         planes: &CachePlanes,
-        writes: &[PageCopy],
+        offloads: &[PageCopy],
         stream: impl Issue,
     ) -> Result<()> {
-        if writes.is_empty() {
+        if offloads.is_empty() {
             return Ok(());
         }
         let mut batch = CopyBatch::new(SourceOrder::Stream);
-        for copy in writes {
+        for copy in offloads {
             for (device, host, bytes) in self.runs(planes, copy)? {
                 batch.push(host, device, bytes);
             }
         }
         tracing::debug!(
-            pages = writes.len(),
-            first_slot = writes[0].slot,
-            first_unit = writes[0].units.first().map(|unit| unit.0),
-            "writing pages to the host page tier"
+            pages = offloads.len(),
+            first_slot = offloads[0].slot,
+            first_unit = offloads[0].units.first().map(|unit| unit.0),
+            "offloading pages to the host KV cache"
         );
         // SAFETY: the slots are reserved for this rank until the engine
         // commits them after the batch's output, and the engine holds the

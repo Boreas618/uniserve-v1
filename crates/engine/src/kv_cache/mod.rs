@@ -50,11 +50,11 @@ use crate::lock;
 
 mod encoder_cache;
 mod freeq;
-mod tiers;
+mod offload;
 
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::UnitMeta;
-pub(crate) use tiers::{RankCache, Tiers};
+pub(crate) use offload::{KvOffloadManager, RankCache};
 
 /// Computes an incremental per-page prefix hash with 64-bit FNV-1a.
 ///

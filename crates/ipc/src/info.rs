@@ -28,7 +28,7 @@ pub struct PrefixCacheInfo {
     /// Cache groups in table order.
     pub groups: Vec<CacheGroup>,
     /// The host page pools this rank copies its full-attention groups'
-    /// pages through; empty without a host page tier.
+    /// pages through; empty without a host KV cache.
     pub page_pools: Vec<PagePoolInfo>,
     /// Units `1..=scratch_units` the rank's warmup lends to its startup
     /// forwards. A standby worker warms up on them while its predecessor

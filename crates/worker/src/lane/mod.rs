@@ -36,7 +36,7 @@
 //! stays inside one job, such as a driver call that does not return, is
 //! seen from the control thread, which reports it to the engine.
 //!
-//! A rank whose prefix cache copies pages through the host page tier has a
+//! A rank whose prefix cache copies pages through the host KV cache has a
 //! copy lane beside them: a full-device stream of the cache's device and
 //! its thread, which serves no call kind. A batch's page copies are its
 //! jobs ([`JobQueues::start_copy`]), issued as soon as the batch arrives,

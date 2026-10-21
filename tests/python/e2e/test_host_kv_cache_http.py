@@ -1,16 +1,17 @@
-"""The host page tier keeps a prompt's cache pages across an engine restart.
+"""The host KV cache keeps a prompt's cache pages across an engine restart.
 
 Qwen3 answers a long prompt twice, the engine restarts, and the prompt is
 asked again. The second answer reuses the prompt's pages from the device
 cache; the restarted engine's device cache is empty, so the pages come back
-from the host page tier of the host's Storage Server, which outlives the
+from the host KV cache of the host's Storage Server, which outlives the
 engine. Both reuse every reusable prompt token, as the prefix cache's hit
 counter reports, and both compute the same last tokens over the same cached
 keys and values, so they decode the same greedy tokens.
 
-A prompt answered with one token is written to the tier only before its
-engine closes its workers: its prefill is the last batch, so no later batch
-carries its page writes. The restarted engine reuses its pages all the same.
+A prompt answered with one token is offloaded to the host KV cache only
+before its engine closes its workers: its prefill is the last batch, so no
+later batch carries its page offloads. The restarted engine reuses its pages
+all the same.
 
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemons at a directory of the test's, and the server the first daemon starts
@@ -38,7 +39,7 @@ from tests.python.e2e.http_helpers import (
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
-SERVED_MODEL = "qwen3-page-tier"
+SERVED_MODEL = "qwen3-host-kv-cache"
 BLOCK_SIZE = 64
 MAX_TOKENS = 32
 # About five thousand tokens of records, then a question about them.
@@ -156,7 +157,7 @@ def _checkpoint() -> str:
     return checkpoint
 
 
-def test_a_restarted_engine_reads_a_prompts_pages_from_the_host_tier(
+def test_a_restarted_engine_loads_a_prompts_pages_from_the_host_kv_cache(
     tmp_path: Path,
 ):
     runtime = _runtime()
@@ -185,7 +186,7 @@ def test_a_restarted_engine_reads_a_prompts_pages_from_the_host_tier(
     assert host and host == device
 
 
-def test_a_closing_engine_writes_its_last_pages_to_the_host_tier(
+def test_a_closing_engine_offloads_its_last_pages_to_the_host_kv_cache(
     tmp_path: Path,
 ):
     # Another prompt than the other test's, whose pages a shared server

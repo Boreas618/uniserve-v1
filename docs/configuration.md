@@ -126,8 +126,8 @@ retention = "30m"
 | `block_size` | Largest supported up to 64 | Tokens per page of the cache group with the widest token rows, a power of two |
 | `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |
-| `host_tier` | `true` | With `prefix_caching`, copy full prompt pages to the host page tier of each host's Storage Server and read them back when a later prompt's prefix continues past the device cache's match; serves worker groups whose cache is one full-attention group |
-| `mooncake` | None | With `host_tier`, keep every page of the host page tier in Mooncake, the distributed tier, and prefetch hits of at least 256 tokens back into the host page tier at admission: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host memory each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
+| `host_tier` | `true` | With `prefix_caching`, copy full prompt pages to the host KV cache of each host's Storage Server and read them back when a later prompt's prefix continues past the device cache's match; serves worker groups whose cache is one full-attention group |
+| `mooncake` | None | With `host_tier`, keep every page of the host KV cache in Mooncake, the KV storage, and prefetch hits of at least 256 tokens back into the host KV cache at admission: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host memory each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
 
 ### `scheduler_config`
 

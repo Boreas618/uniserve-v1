@@ -160,8 +160,8 @@ pub(super) struct TokenBatch<'a> {
 
 impl Opening {
     /// Bind the batch's outputs to their requests, then record in `job`
-    /// the batch's order after the previous one and after `page_reads`,
-    /// the fence of the host page tier reads the copy lane issued for it
+    /// the batch's order after the previous one and after `page_loads`,
+    /// the fence of the host KV cache reads the copy lane issued for it
     /// (`PrefixCache::issue_pages`), and the read of every host-gated
     /// predicate: the job's completion carries one byte each.
     pub(super) fn open(
@@ -169,7 +169,7 @@ impl Opening {
         placement: &crate::config::placement::GroupPlacement,
         rank: usize,
         job: &Job,
-        page_reads: Option<&Arc<cuda::Event>>,
+        page_loads: Option<&Arc<cuda::Event>>,
     ) -> Result<Self> {
         let plan = owners.plan;
         let runtime = &mut *owners.runtime;
@@ -202,7 +202,7 @@ impl Opening {
         runtime.order.wait(issue)?;
         // The copy lane made the fence's record before the batch reached
         // its lane: the batch's inputs waited for the job that records it.
-        if let Some(fence) = page_reads {
+        if let Some(fence) = page_loads {
             issue.wait(fence)?;
         }
         let mut calls = crate::executor::batch::Opening::<TokenCall>::open(
@@ -398,10 +398,10 @@ impl<'a> TokenBatch<'a> {
             )
         };
         prefix_cache.install(&assignments, stream)?;
-        // Units the host page tier's reads filled on the copy lane are
+        // Units the host KV cache's reads filled on the copy lane are
         // overwritten whole there, and are not recycled.
         let read: HashSet<u32> = plan
-            .page_reads
+            .page_loads
             .iter()
             .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
             .collect();

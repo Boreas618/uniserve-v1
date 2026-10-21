@@ -1,4 +1,4 @@
-//! The host page tier (L2) of the prefix cache, and the distributed tier
+//! The host KV cache (L2) of the prefix cache, and the KV storage
 //! (L3) behind it, as the scheduler drives them.
 //!
 //! Every host's Storage Server keeps page pools of host memory; each rank
@@ -12,15 +12,15 @@
 //!   and L3. When L3 extends the run every rank's pool holds by at least
 //!   [`PREFETCH_MIN_TOKENS`] tokens, those pages are prefetched into the
 //!   pools; admission waits for them at most [`prefetch_wait`], then pins
-//!   the pages that arrived. The leading run every rank holds is the tier's
+//!   the pages that arrived. The leading run every rank holds is the host KV cache's
 //!   hit: admission allocates units for it, the request's first prefill
-//!   batch reads the pages into them (`Batch::page_reads`) and computes from
+//!   batch reads the pages into them (`Batch::page_loads`) and computes from
 //!   the end of the hit, and the pins end once that call's result is
 //!   accepted. Pages that did not arrive in time are computed.
 //! - **Writes.** Once a prompt page is published in L1, a slot is reserved
 //!   for it in every rank's pool, while the scheduler holds a reference to
 //!   its units. The next text batch the worker group runs copies the page
-//!   (`Batch::page_writes`), and the batch's output commits it, or aborts it
+//!   (`Batch::page_offloads`), and the batch's output commits it, or aborts it
 //!   when the batch failed. Every published page is written (write
 //!   threshold one).
 //!
@@ -30,12 +30,12 @@
 //! key)`, where the content is what the ranks report for the group and the
 //! isolation key keeps tenants' prefixes apart as L1 does.
 //!
-//! The tier serves worker groups whose cache is one full-attention group.
+//! The host KV cache serves worker groups whose cache is one full-attention group.
 //! A rank's pool is reached through its host's Storage Server: on the
 //! engine's host through the server's socket, on another host over the TCP
 //! address the rank reports for it. Requests to the servers never block
 //! the scheduler:
-//! they are submitted, and their answers are taken by [`Tiers::poll`] at
+//! they are submitted, and their answers are taken by [`KvOffloadManager::poll`] at
 //! every step; while answers are awaited, a parked scheduler wakes after a
 //! millisecond to take them.
 
@@ -65,7 +65,7 @@ use crate::executor::WorkerGroupId;
 /// One rank's page pool.
 #[derive(Clone)]
 struct RankPool {
-    /// The connection to the rank's host's server, in `Tiers::clients`.
+    /// The connection to the rank's host's server, in `KvOffloadManager::clients`.
     client: usize,
     scope: Scope,
     pool: u64,
@@ -136,7 +136,7 @@ struct Pins {
     stage: Stage,
 }
 
-/// A request's page hit of the tier, from its admission until its reads
+/// A request's page hit of the host KV cache, from its admission until its reads
 /// are accepted.
 struct Hit {
     /// The first page of the hit.
@@ -167,15 +167,15 @@ struct Write {
     _page: Arc<PageRef>,
 }
 
-/// One rank's report for [`Tiers::add_worker`].
+/// One rank's report for [`KvOffloadManager::add_worker`].
 pub(crate) struct RankCache<'a> {
     /// Whether the rank runs on the engine's host.
     pub local: bool,
     pub cache: &'a PrefixCacheInfo,
 }
 
-/// The scheduler's side of the host page tier.
-pub(crate) struct Tiers {
+/// The scheduler's side of the host KV cache.
+pub(crate) struct KvOffloadManager {
     deployment: String,
     /// The connections to the servers: the engine's host's first, then other
     /// hosts' by the TCP address they were reached at.
@@ -198,7 +198,7 @@ pub(crate) struct Tiers {
     carried: HashMap<u64, (WorkerGroupId, Vec<Write>)>,
 }
 
-impl Tiers {
+impl KvOffloadManager {
     /// Connect to this host's Storage Server, at `socket`, as a head of
     /// `deployment`.
     pub(crate) fn connect(socket: &std::path::Path, deployment: &str) -> anyhow::Result<Self> {
@@ -241,7 +241,7 @@ impl Tiers {
                 Some(self.clients.len() - 1)
             }
             Err(error) => {
-                tracing::warn!(address, %error, "the host page tier cannot reach a storage server");
+                tracing::warn!(address, %error, "the host KV cache cannot reach a storage server");
                 None
             }
         }
@@ -250,7 +250,7 @@ impl Tiers {
     /// Serve `worker`, whose ranks (`ranks`, in rank order) are the scopes
     /// of the deployment named by the group and their ranks, when every rank
     /// reports a page pool for one full-attention cache group and its server
-    /// is reachable. Returns whether the tier serves it.
+    /// is reachable. Returns whether the host KV cache serves it.
     pub(crate) fn add_worker(&mut self, worker: &WorkerGroupId, ranks: &[RankCache<'_>]) -> bool {
         let Some(first) = ranks.first() else {
             return false;
@@ -305,11 +305,11 @@ impl Tiers {
                 block_size: group.block_size as usize,
             },
         );
-        tracing::info!(worker = %worker.0, "the host page tier serves the worker group");
+        tracing::info!(worker = %worker.0, "the host KV cache serves the worker group");
         true
     }
 
-    /// Whether the tier serves `worker`.
+    /// Whether the host KV cache serves `worker`.
     pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
         self.groups.contains_key(worker)
     }
@@ -364,16 +364,16 @@ impl Tiers {
                 true
             }
             Err(error) => {
-                tracing::warn!(%error, "a host page tier request failed");
+                tracing::warn!(%error, "a host KV cache request failed");
                 false
             }
         }
     }
 
-    /// The tier's answer for admitting `request` to `worker` with `l1_pages`
+    /// The host KV cache's answer for admitting `request` to `worker` with `l1_pages`
     /// pages cached in L1: `None` while pins, lookups or prefetches are in
     /// flight, else the hit (possibly empty), which the caller takes with
-    /// [`Tiers::admit`]. The first call pins `keys[l1_pages..]` (the
+    /// [`KvOffloadManager::admit`]. The first call pins `keys[l1_pages..]` (the
     /// request's reusable full pages) in every rank's pool and looks them up
     /// in L2 and L3. Pins taken for another L1 match are released and taken
     /// again.
@@ -442,7 +442,7 @@ impl Tiers {
     }
 
     /// Move `request`'s admission on from its current stage; see
-    /// [`Tiers::admission`].
+    /// [`KvOffloadManager::admission`].
     fn advance(&mut self, request: RequestId) -> Option<usize> {
         let pins = self.pins.get(&request)?;
         let group = self.groups.get(&pins.worker)?.clone();
@@ -574,8 +574,8 @@ impl Tiers {
 
     /// Admit `request` with its pinned pages: returns the hit's first page
     /// and its pages. The pins past the hit end now; the hit's end when its
-    /// reads are done ([`Tiers::read_done`]) or the request leaves
-    /// ([`Tiers::sweep`]).
+    /// reads are done ([`KvOffloadManager::loaded`]) or the request leaves
+    /// ([`KvOffloadManager::sweep`]).
     pub(crate) fn admit(&mut self, request: RequestId) -> Option<(usize, usize)> {
         let pins = self.pins.remove(&request)?;
         let pages = Self::run(&pins);
@@ -690,11 +690,11 @@ impl Tiers {
         );
     }
 
-    /// The page reads of `request`'s hit, once: `units(page)` names the
+    /// The page loads of `request`'s hit, once: `units(page)` names the
     /// units of an absolute page of the request's table, freshly allocated
     /// for the hit. Empty for a request without a hit or whose reads a
     /// batch already carries.
-    pub(crate) fn reads(
+    pub(crate) fn loads(
         &mut self,
         request: RequestId,
         units: impl Fn(usize) -> Option<Vec<UnitId>>,
@@ -723,7 +723,7 @@ impl Tiers {
         copies
     }
 
-    /// The pages of `request`'s hit, which hold the tier's bytes already.
+    /// The pages of `request`'s hit, which hold the host KV cache's bytes already.
     pub(crate) fn hit_pages(&self, request: RequestId) -> std::ops::Range<usize> {
         self.hits
             .get(&request)
@@ -731,7 +731,7 @@ impl Tiers {
     }
 
     /// `request`'s reads were accepted: its pins end.
-    pub(crate) fn read_done(&mut self, request: RequestId) {
+    pub(crate) fn loaded(&mut self, request: RequestId) {
         if self.hits.get(&request).is_some_and(|hit| hit.sent) {
             self.drop_hit(request);
         }
@@ -777,10 +777,10 @@ impl Tiers {
                 .any(|pins| matches!(pins.stage, Stage::Fetching { .. }))
     }
 
-    /// Write published pages of `worker` to the tier: `keys[i]` is the key
+    /// Write published pages of `worker` to the host KV cache: `keys[i]` is the key
     /// of the page `pages[i]` references. A slot is reserved for each page
     /// in every rank's pool; a reserved page waits for a batch of `worker`.
-    pub(crate) fn write(&mut self, worker: &WorkerGroupId, keys: Vec<Key>, pages: Vec<PageRef>) {
+    pub(crate) fn offload(&mut self, worker: &WorkerGroupId, keys: Vec<Key>, pages: Vec<PageRef>) {
         let Some(group) = self.groups.get(worker).cloned() else {
             return;
         };
@@ -816,10 +816,10 @@ impl Tiers {
         }
     }
 
-    /// Whether published pages are still on their way to the tier: slots
+    /// Whether published pages are still on their way to the host KV cache: slots
     /// being reserved, writes waiting for or carried by a batch, or their
     /// commits unanswered.
-    pub(crate) fn writing(&self) -> bool {
+    pub(crate) fn offloading(&self) -> bool {
         !self.reservations.is_empty()
             || self.queued.values().any(|writes| !writes.is_empty())
             || !self.carried.is_empty()
@@ -829,7 +829,7 @@ impl Tiers {
                 .any(|purpose| matches!(purpose, Purpose::Reserve { .. } | Purpose::Settle))
     }
 
-    /// The worker groups whose reserved page writes wait for a batch.
+    /// The worker groups whose reserved page offloads wait for a batch.
     pub(crate) fn queued_workers(&self) -> Vec<WorkerGroupId> {
         self.queued
             .iter()
@@ -838,8 +838,8 @@ impl Tiers {
             .collect()
     }
 
-    /// The page writes queued for `worker`, which the batch `batch` carries.
-    pub(crate) fn take_writes(&mut self, worker: &WorkerGroupId, batch: u64) -> Vec<PageCopy> {
+    /// The page offloads queued for `worker`, which the batch `batch` carries.
+    pub(crate) fn take_offloads(&mut self, worker: &WorkerGroupId, batch: u64) -> Vec<PageCopy> {
         let Some(writes) = self.queued.remove(worker) else {
             return Vec::new();
         };
@@ -848,7 +848,7 @@ impl Tiers {
             worker = %worker.0,
             batch,
             pages = copies.len(),
-            "a batch carries page writes to the host page tier"
+            "a batch carries page offloads to the host KV cache"
         );
         self.carried
             .entry(batch)
@@ -919,7 +919,7 @@ impl Tiers {
         let mut admissions = false;
         for client in &mut self.clients {
             if let Err(error) = client.pump() {
-                tracing::warn!(%error, "a host page tier connection failed");
+                tracing::warn!(%error, "a host KV cache connection failed");
             }
             while let Some((event, _)) = client.next_event() {
                 let Event::Prefetched { tag, .. } = event else {
@@ -955,7 +955,7 @@ impl Tiers {
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
                         other => {
-                            tracing::warn!(?other, "a host page tier pin failed");
+                            tracing::warn!(?other, "a host KV cache pin failed");
                             Vec::new()
                         }
                     };
@@ -968,7 +968,7 @@ impl Tiers {
                     let l3 = match reply {
                         Reply::Lookup { l3, .. } => l3 as usize,
                         other => {
-                            tracing::warn!(?other, "a host page tier lookup failed");
+                            tracing::warn!(?other, "a host KV cache lookup failed");
                             0
                         }
                     };
@@ -988,7 +988,7 @@ impl Tiers {
                     let slots = match reply {
                         Reply::Pinned { slots } => slots,
                         other => {
-                            tracing::warn!(?other, "a host page tier pin failed");
+                            tracing::warn!(?other, "a host KV cache pin failed");
                             Vec::new()
                         }
                     };
@@ -1018,14 +1018,14 @@ impl Tiers {
                     let slots = match reply {
                         Reply::Reserved { slots } => slots,
                         other => {
-                            tracing::warn!(?other, "a host page tier reservation failed");
+                            tracing::warn!(?other, "a host KV cache reservation failed");
                             Vec::new()
                         }
                     };
                     self.reserved(write, rank, &slots);
                 }
                 (Purpose::Settle, Reply::Error { kind, message }) => {
-                    tracing::warn!(?kind, message, "a host page tier request failed");
+                    tracing::warn!(?kind, message, "a host KV cache request failed");
                 }
                 (Purpose::Settle, _) => {}
             }
@@ -1200,7 +1200,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mooncake = connector(&server.socket, Arc::clone(&stop));
 
-        let mut tiers = Tiers::connect(&server.socket, "model").unwrap();
+        let mut kv_offload = KvOffloadManager::connect(&server.socket, "model").unwrap();
         let cache = PrefixCacheInfo {
             num_units: 64,
             dtype: PrefixCacheDtype::BFloat16,
@@ -1223,7 +1223,7 @@ mod tests {
             scratch_units: 0,
         };
         let text = WorkerGroupId("text".into());
-        assert!(tiers.add_worker(
+        assert!(kv_offload.add_worker(
             &text,
             &[RankCache {
                 local: true,
@@ -1234,18 +1234,18 @@ mod tests {
         // Eight pages that only L3 holds: 512 tokens are worth a prefetch,
         // and every page arrives within the wait.
         let prompt: Vec<u32> = (0..8 * 64 + 1).collect();
-        let keys = tiers.page_keys(&text, &prompt, None, 8);
+        let keys = kv_offload.page_keys(&text, &prompt, None, 8);
         let deadline = Instant::now() + Duration::from_secs(10);
         let pages = loop {
-            tiers.poll();
-            if let Some(pages) = tiers.admission(RequestId(1), &text, &keys, 0) {
+            kv_offload.poll();
+            if let Some(pages) = kv_offload.admission(RequestId(1), &text, &keys, 0) {
                 break pages;
             }
             assert!(Instant::now() < deadline, "the admission did not settle");
             std::thread::sleep(Duration::from_millis(1));
         };
         assert_eq!(pages, 8);
-        assert_eq!(tiers.admit(RequestId(1)), Some((0, 8)));
+        assert_eq!(kv_offload.admit(RequestId(1)), Some((0, 8)));
 
         stop.store(true, Ordering::Release);
         mooncake.join().unwrap();

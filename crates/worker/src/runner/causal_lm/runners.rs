@@ -588,7 +588,7 @@ pub(crate) fn forward(
         Some(Pending::Failed(failure)) => return fail(backend, batch, failure).map(|()| None),
         state => state,
     };
-    let page_reads = batch.page_reads().cloned();
+    let page_loads = batch.page_loads().cloned();
     let (plan, pending, _) = batch.token_parts();
 
     let parts = backend.parts();
@@ -610,7 +610,7 @@ pub(crate) fn forward(
             parts.placement,
             parts.rank,
             &job,
-            page_reads.as_ref(),
+            page_loads.as_ref(),
         ) {
             Ok(opening) if opening.reads_predicates() => (Some(job), Pending::Predicates(opening)),
             Ok(opening) => grids(owners, opening, job),

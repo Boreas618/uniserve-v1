@@ -1761,7 +1761,7 @@ mod tests {
                     decode: None,
                     buffers: Vec::new(),
                     readers: Default::default(),
-                    page_reads: Vec::new(),
+                    page_loads: Vec::new(),
                 },
             )],
             vec![ipc::BatchCommand::Start {

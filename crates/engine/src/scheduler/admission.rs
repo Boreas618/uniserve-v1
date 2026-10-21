@@ -1132,11 +1132,11 @@ impl Scheduler {
                     .min(self.config.max_num_batched_tokens)
                     .max(1);
                 let cached_tokens = prefix_hit.cached_tokens.min(n);
-                // The host page tier may hold the reusable pages that follow
+                // The host KV cache may hold the reusable pages that follow
                 // the device match; the head waits for its pins.
                 let mut tier_tokens = 0;
-                if let Some(tiers) = self.tiers.as_mut()
-                    && let Some(block) = tiers.block_size(&target.0)
+                if let Some(kv_offload) = self.kv_offload.as_mut()
+                    && let Some(block) = kv_offload.block_size(&target.0)
                     && head.req.cache.read
                     && !head.has_context_images()
                 {
@@ -1145,13 +1145,18 @@ impl Scheduler {
                     let reusable = n.saturating_sub(1) / block;
                     let device_pages = cached_tokens / block;
                     if reusable > device_pages {
-                        let keys = tiers.page_keys(
+                        let keys = kv_offload.page_keys(
                             &target.0,
                             &head.req.prompt_token_ids,
                             head.req.cache.isolation_key,
                             reusable,
                         );
-                        match tiers.admission(head.req.request_id, &target.0, &keys, device_pages) {
+                        match kv_offload.admission(
+                            head.req.request_id,
+                            &target.0,
+                            &keys,
+                            device_pages,
+                        ) {
                             Some(pages) => tier_tokens = pages * block,
                             None => break,
                         }
@@ -1201,7 +1206,7 @@ impl Scheduler {
                     let id = st.req.request_id;
                     let worker = target.0.clone();
                     self.admit_running(st, target, reservation);
-                    self.admit_page_tier(id, &worker);
+                    self.admit_offloaded_prefix(id, &worker);
                     continue;
                 }
             }
@@ -1381,16 +1386,16 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    /// Apply the host page tier to an admitted request on `worker`: record
+    /// Apply the host KV cache to an admitted request on `worker`: record
     /// the keys its published pages are written under, and extend its
-    /// cached prefix by the tier's hit, whose units are allocated now and
+    /// cached prefix by the host KV cache's hit, whose units are allocated now and
     /// filled by its first call. A hit that no longer follows the device
     /// prefix the request acquired is released.
-    fn admit_page_tier(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
-        let Some(tiers) = self.tiers.as_mut() else {
+    fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
+        let Some(kv_offload) = self.kv_offload.as_mut() else {
             return;
         };
-        let Some(block) = tiers.block_size(worker) else {
+        let Some(block) = kv_offload.block_size(worker) else {
             return;
         };
         let Some(state) = self.running.get_mut(&id) else {
@@ -1400,24 +1405,24 @@ impl Scheduler {
             return;
         }
         let pages = state.req.prompt_token_ids.len() / block;
-        state.page_keys = tiers.page_keys(
+        state.page_keys = kv_offload.page_keys(
             worker,
             &state.req.prompt_token_ids,
             state.req.cache.isolation_key,
             pages,
         );
-        let Some((start, hit)) = tiers.admit(id) else {
+        let Some((start, hit)) = kv_offload.admit(id) else {
             return;
         };
         let computed = state.num_computed_prompt_tokens as usize;
         if computed != start * block {
-            tiers.abandon(id);
+            kv_offload.abandon(id);
             return;
         }
         let end = (start + hit) * block;
         if !self.ensure_request_capacity(id, computed, end) {
-            if let Some(tiers) = self.tiers.as_mut() {
-                tiers.abandon(id);
+            if let Some(kv_offload) = self.kv_offload.as_mut() {
+                kv_offload.abandon(id);
             }
             return;
         }

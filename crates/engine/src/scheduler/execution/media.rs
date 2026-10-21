@@ -1041,7 +1041,7 @@ impl Scheduler {
             decode,
             buffers,
             readers: Some(readers),
-            page_reads: Vec::new(),
+            page_loads: Vec::new(),
         };
         self.register_inflight(
             call.clone(),

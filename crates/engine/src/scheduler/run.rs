@@ -231,7 +231,7 @@ impl Scheduler {
             prefer_media: true,
             config,
             fatal: false,
-            tiers: None,
+            kv_offload: None,
             closing: false,
             stats,
         })
@@ -250,16 +250,16 @@ impl Scheduler {
     }
 
     /// Copy prompt pages of the worker groups whose ranks all map a page
-    /// pool through the host page tier, as a head of `deployment` on `host`:
+    /// pool through the host KV cache, as a head of `deployment` on `host`:
     /// ranks on `host` through its Storage Server's socket, the others
     /// through their servers' TCP addresses. A failure to reach this host's
-    /// server leaves the tier off.
-    pub fn enable_page_tier(&mut self, deployment: &str, host: &str) {
+    /// server leaves the host KV cache off.
+    pub fn enable_kv_offload(&mut self, deployment: &str, host: &str) {
         let socket = storage::socket::default_socket();
-        let mut tiers = match crate::kv_cache::Tiers::connect(&socket, deployment) {
-            Ok(tiers) => tiers,
+        let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(&socket, deployment) {
+            Ok(kv_offload) => kv_offload,
             Err(error) => {
-                tracing::warn!(%error, "the host page tier is off: the storage server is unreachable");
+                tracing::warn!(%error, "the host KV cache is off: the storage server is unreachable");
                 return;
             }
         };
@@ -275,11 +275,11 @@ impl Scheduler {
                 })
                 .collect();
             if let Some(reports) = reports {
-                served |= tiers.add_worker(worker, &reports);
+                served |= kv_offload.add_worker(worker, &reports);
             }
         }
         if served {
-            self.tiers = Some(tiers);
+            self.kv_offload = Some(kv_offload);
         }
     }
 
@@ -415,22 +415,22 @@ impl Scheduler {
         // Finish everything still queued or running with `Aborted` before
         // closing the executor, so every open consumer receives a terminal
         // event rather than only a closed channel. The pages published so
-        // far reach the host page tier first.
-        self.flush_page_tier();
+        // far reach the host KV cache first.
+        self.flush_offloads();
         self.abort_all_requests();
         let _ = self.executor.close();
         false
     }
 
-    /// Write to the host page tier every published page that is not there
+    /// Write to the host KV cache every published page that is not there
     /// yet, before the workers close: let the batches in flight complete,
     /// which carry writes and settle them, then carry each worker group's
-    /// remaining reserved writes in a batch of page writes alone, and wait
+    /// remaining reserved writes in a batch of page offloads alone, and wait
     /// for their commits. The scheduler admits and schedules nothing more.
     /// Gives up after `PAGE_FLUSH_TIMEOUT` or when the engine fails, leaving
-    /// the pages still on their way out of the tier.
-    pub(super) fn flush_page_tier(&mut self) {
-        if self.tiers.is_none() || self.fatal {
+    /// the pages still on their way out to the host KV cache.
+    pub(super) fn flush_offloads(&mut self) {
+        if self.kv_offload.is_none() || self.fatal {
             return;
         }
         self.closing = true;
@@ -438,34 +438,34 @@ impl Scheduler {
         loop {
             let idle = self.inflight.pending_batches.is_empty()
                 && self.inflight.pending_submissions.is_empty();
-            let Some(tiers) = self.tiers.as_mut() else {
+            let Some(kv_offload) = self.kv_offload.as_mut() else {
                 return;
             };
-            tiers.poll();
+            kv_offload.poll();
             if idle {
-                for worker in tiers.queued_workers() {
+                for worker in kv_offload.queued_workers() {
                     let mut batch = self.finish_generation_batch(
                         ExecutionBatch::new(0, Vec::new(), Vec::new(), Vec::new()),
                         Instant::now(),
                     );
-                    let Some(tiers) = self.tiers.as_mut() else {
+                    let Some(kv_offload) = self.kv_offload.as_mut() else {
                         return;
                     };
-                    let pages = tiers.take_writes(&worker, batch.id);
-                    batch.page_writes = Some(crate::executor::PageWrites { worker, pages });
+                    let pages = kv_offload.take_offloads(&worker, batch.id);
+                    batch.page_offloads = Some(crate::executor::PageOffloads { worker, pages });
                     self.inflight.pending_submissions.push_back(batch);
                 }
             }
             if !self
-                .tiers
+                .kv_offload
                 .as_ref()
-                .is_some_and(crate::kv_cache::Tiers::writing)
+                .is_some_and(crate::kv_cache::KvOffloadManager::offloading)
             {
                 return;
             }
             if self.fatal || Instant::now() >= deadline {
                 tracing::warn!(
-                    "published pages did not all reach the host page tier before the workers close"
+                    "published pages did not all reach the host KV cache before the workers close"
                 );
                 return;
             }
@@ -485,15 +485,15 @@ impl Scheduler {
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host page tier arrive on a connection the executor
+        // Answers of the host KV cache arrive on a connection the executor
         // does not wait on: while some are awaited, the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
         let timeout = if self.closing
             || self
-                .tiers
+                .kv_offload
                 .as_ref()
-                .is_some_and(crate::kv_cache::Tiers::waiting)
+                .is_some_and(crate::kv_cache::KvOffloadManager::waiting)
         {
             TIER_POLL
         } else {

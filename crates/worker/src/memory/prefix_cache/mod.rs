@@ -11,7 +11,7 @@
 //!   that decide unit reuse;
 //! - the import lane: bounded workspaces whose host tasks copy other ranks'
 //!   exports into assigned pages;
-//! - [`PageTier`]: the host page pools the engine copies pages through, on
+//! - [`HostKvCache`]: the host page pools the engine copies pages through, on
 //!   the rank's copy lane ([`PrefixCache::issue_pages`]).
 //!
 //! Every device write runs on a stream the caller supplies; nothing reads a
@@ -20,8 +20,8 @@
 
 mod access;
 pub(super) mod block_tables;
+pub(crate) mod host;
 mod imports;
-pub(crate) mod pages;
 pub(super) mod plan;
 pub(super) mod planes;
 mod transfers;
@@ -40,7 +40,7 @@ use ipc::{BlockTable, BufferId, CacheTransfer, PageCopy, RequestKey, Wake};
 use tvm_ffi::Any;
 
 use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
-pub(crate) use self::pages::PageTier;
+pub(crate) use self::host::HostKvCache;
 use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
 use super::allocation::StorageView;
@@ -59,10 +59,10 @@ use crate::{Error, HostTask, Result, lock};
 /// The most import copy threads (and workspaces) a rank runs.
 const IMPORT_WORKERS: usize = 4;
 
-/// The host page tier and the copy lane its copies run on: the lane's
+/// The host KV cache and the copy lane its copies run on: the lane's
 /// stream and its unit column.
 struct PageLane {
-    tier: PageTier,
+    cache: HostKvCache,
     stream: Stream,
     column: UnitColumn,
 }
@@ -74,10 +74,10 @@ pub(crate) struct IssuedPages {
     pub(crate) job: Job,
     /// The device of the cache, whose streams record the fences.
     pub(crate) device: DeviceId,
-    /// Recorded behind the reads: the batch's forward waits on it.
-    pub(crate) reads: Option<Arc<Event>>,
-    /// Recorded behind the writes: the batch's output waits on it.
-    pub(crate) writes: Option<Arc<Event>>,
+    /// Recorded behind the loads: the batch's forward waits on it.
+    pub(crate) loads: Option<Arc<Event>>,
+    /// Recorded behind the offloads: the batch's output waits on it.
+    pub(crate) offloads: Option<Arc<Event>>,
 }
 
 /// The rank's prefix cache owners.
@@ -88,7 +88,7 @@ pub struct PrefixCache {
     accesses: UnitAccesses,
     bases: TransferBases,
     imports: Imports,
-    /// The host page tier and the copy lane its copies run on, when the
+    /// The host KV cache and the copy lane its copies run on, when the
     /// engine copies pages through it.
     pages: Option<PageLane>,
     /// The most units warmup lent as scratch (`1..=` this), which the rank
@@ -176,11 +176,11 @@ impl PrefixCache {
         })
     }
 
-    /// Copy pages through `tier` from now on, on the copy lane's `stream`.
-    pub(crate) fn set_page_tier(&mut self, tier: PageTier, stream: Stream) -> Result<()> {
+    /// Copy pages through `cache` from now on, on the copy lane's `stream`.
+    pub(crate) fn set_host_kv_cache(&mut self, cache: HostKvCache, stream: Stream) -> Result<()> {
         let column = UnitColumn::bind(&self.planes, Some(&stream))?;
         self.pages = Some(PageLane {
-            tier,
+            cache,
             stream,
             column,
         });
@@ -188,25 +188,25 @@ impl PrefixCache {
     }
 
     /// Record a batch's page copies on the copy lane, to be issued as soon
-    /// as the batch arrives: fill the units of `reads` from their slots, and
-    /// copy the published units of `writes` into theirs.
+    /// as the batch arrives: load the units of `loads` from their slots, and
+    /// offload the published units of `offloads` into theirs.
     ///
-    /// The reads fill new units of the batch, which are idle (no in-flight
+    /// The loads fill new units of the batch, which are idle (no in-flight
     /// export, import or execution addresses them, checked here) and which
-    /// the reads overwrite whole, so the batch does not recycle them; its
-    /// forward waits on the returned read fence. The writes copy pages the
+    /// the loads overwrite whole, so the batch does not recycle them; its
+    /// forward waits on the returned load fence. The offloads copy pages the
     /// engine published once it accepted the result of the call that computed
     /// them, so the forward that produced them completed before this batch
     /// was sent, and the engine holds their units until the batch's output
-    /// commits them; that output waits on the returned write fence, and
+    /// commits them; that output waits on the returned offload fence, and
     /// nothing else does.
     ///
-    /// Fails for a rank that maps no page pool, or when a read's unit is
+    /// Fails for a rank that maps no page pool, or when a load's unit is
     /// in use.
     pub(crate) fn issue_pages(
         &mut self,
-        reads: &[PageCopy],
-        writes: &[PageCopy],
+        loads: &[PageCopy],
+        offloads: &[PageCopy],
     ) -> Result<IssuedPages> {
         let lane = self.pages.as_ref().ok_or_else(|| {
             Error::Invalid("a batch copies pages but the rank maps no page pool".into())
@@ -216,7 +216,7 @@ impl PrefixCache {
             .device()
             .ok_or(Error::Invariant("a page pool maps a device cache".into()))?;
         let unit_tokens = self.planes.plan().unit_tokens();
-        let spans: Vec<_> = reads
+        let spans: Vec<_> = loads
             .iter()
             .flat_map(|copy| copy.units.iter())
             .map(|unit| (unit.0, 0, unit_tokens))
@@ -230,23 +230,23 @@ impl PrefixCache {
             issue.record(&event)?;
             Ok(event)
         };
-        let reads_fence = if reads.is_empty() {
+        let loads_fence = if loads.is_empty() {
             None
         } else {
-            lane.tier.read(&self.planes, reads, &lane.column, issue)?;
+            lane.cache.load(&self.planes, loads, &lane.column, issue)?;
             Some(fence(issue)?)
         };
-        let writes_fence = if writes.is_empty() {
+        let offloads_fence = if offloads.is_empty() {
             None
         } else {
-            lane.tier.write(&self.planes, writes, issue)?;
+            lane.cache.offload(&self.planes, offloads, issue)?;
             Some(fence(issue)?)
         };
         Ok(IssuedPages {
             job,
             device,
-            reads: reads_fence,
-            writes: writes_fence,
+            loads: loads_fence,
+            offloads: offloads_fence,
         })
     }
 

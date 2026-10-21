@@ -1,5 +1,5 @@
 //! The settings of a host's Mooncake connector, which keeps committed pages
-//! in the distributed page tier (L3) behind the host's page pools.
+//! in the distributed host KV cache (L3) behind the host's page pools.
 //!
 //! The Storage Server runs the connector (the `storage-server` crate). A
 //! process that starts a Storage Server states the connector's settings on

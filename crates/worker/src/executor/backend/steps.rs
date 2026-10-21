@@ -19,7 +19,7 @@ use crate::lane::{Completion, Job, JobId};
 use crate::runner::encoder::inputs::Inputs;
 use crate::{Error, Result};
 
-/// Where a batch's host page tier copies stand on the copy lane
+/// Where a batch's host KV cache copies stand on the copy lane
 /// (`PrefixCache::issue_pages`).
 #[derive(Default)]
 enum Pages {
@@ -37,10 +37,10 @@ enum Pages {
 #[derive(Default)]
 struct PageFences {
     device: Option<cuda::DeviceId>,
-    /// Behind the reads: the batch's forward waits on it.
-    reads: Option<Arc<cuda::Event>>,
-    /// Behind the writes: the batch's output waits on it.
-    writes: Option<Arc<cuda::Event>>,
+    /// Behind the loads: the batch's forward waits on it.
+    loads: Option<Arc<cuda::Event>>,
+    /// Behind the offloads: the batch's output waits on it.
+    offloads: Option<Arc<cuda::Event>>,
 }
 
 /// A submitted batch with its lifecycle and numerical state.
@@ -76,7 +76,7 @@ pub(crate) struct WorkerBatch {
     sizing: Option<crate::request::video::Sizing>,
     /// Products and cache transfers imported from other calls.
     inputs: crate::executor::inputs::Inputs,
-    /// The batch's host page tier copies.
+    /// The batch's host KV cache copies.
     pages: Pages,
     /// A video model's media batch between two of its jobs.
     media: Option<crate::executor::video::Pending>,
@@ -117,11 +117,11 @@ impl WorkerBatch {
         }
     }
 
-    /// The fence of the batch's host page tier reads once the copy lane
+    /// The fence of the batch's host KV cache reads once the copy lane
     /// issued them; the batch's forward waits on it.
-    pub(crate) fn page_reads(&self) -> Option<&Arc<cuda::Event>> {
+    pub(crate) fn page_loads(&self) -> Option<&Arc<cuda::Event>> {
         match &self.pages {
-            Pages::Issued(fences) => fences.reads.as_ref(),
+            Pages::Issued(fences) => fences.loads.as_ref(),
             Pages::Unissued | Pages::Issuing(_) => None,
         }
     }
@@ -282,7 +282,7 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
-        // The batch's host page tier copies go to the copy lane first, so
+        // The batch's host KV cache copies go to the copy lane first, so
         // they overlap the forward the previous batch runs; the batch goes
         // on once the lane issued them.
         if matches!(batch.pages, Pages::Unissued)
@@ -337,14 +337,14 @@ impl WorkerBackend {
         admitted.map(|()| submitted)
     }
 
-    /// Record the batch's host page tier copies and submit them to the copy
+    /// Record the batch's host KV cache copies and submit them to the copy
     /// lane; `None` when the batch copies no page.
     fn issue_pages(
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<Option<JobId>, WorkerError> {
         let plan = &batch.plan;
-        if plan.page_reads.is_empty() && plan.page_writes.is_empty() {
+        if plan.page_loads.is_empty() && plan.page_offloads.is_empty() {
             batch.pages = Pages::Issued(PageFences::default());
             return Ok(None);
         }
@@ -356,12 +356,12 @@ impl WorkerBackend {
             .ok_or_else(|| {
                 Error::Invalid("a batch copies pages but the rank has no prefix cache".into())
             })?;
-        let issued = prefix_cache.issue_pages(&plan.page_reads, &plan.page_writes)?;
+        let issued = prefix_cache.issue_pages(&plan.page_loads, &plan.page_offloads)?;
         let job = self.jobs.start_copy(issued.job, true).map_err(lane_lost)?;
         batch.pages = Pages::Issuing(PageFences {
             device: Some(issued.device),
-            reads: issued.reads,
-            writes: issued.writes,
+            loads: issued.loads,
+            offloads: issued.offloads,
         });
         Ok(Some(job))
     }
@@ -376,7 +376,7 @@ impl WorkerBackend {
         if let Pages::Issuing(fences) = std::mem::take(&mut batch.pages) {
             batch.pages = Pages::Issued(fences);
             completion.check().map_err(|failure| {
-                WorkerError::classify(failure.error, Some("host page tier copies"))
+                WorkerError::classify(failure.error, Some("host KV cache copies"))
             })?;
             return Ok(());
         }
@@ -563,10 +563,10 @@ impl WorkerBackend {
                 .collect(),
             None => Vec::new(),
         };
-        // The output reports the batch's page writes complete.
+        // The output reports the batch's page offloads complete.
         if let Pages::Issued(PageFences {
             device: Some(device),
-            writes: Some(fence),
+            offloads: Some(fence),
             ..
         }) = &batch.pages
         {

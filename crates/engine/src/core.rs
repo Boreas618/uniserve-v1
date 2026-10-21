@@ -783,8 +783,8 @@ impl SchedulerHandle {
             config.generation_limits,
         )?;
         scheduler.set_prefix_reuse(config.prefix_cache);
-        if config.prefix_cache && config.worker_process.page_tier {
-            scheduler.enable_page_tier(
+        if config.prefix_cache && config.worker_process.host_kv_cache {
+            scheduler.enable_kv_offload(
                 &config.worker_process.deployment,
                 &config.worker_process.host,
             );

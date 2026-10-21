@@ -203,7 +203,7 @@ impl Scheduler {
 
         let mut call_block_tables = Vec::new();
         let mut call_new_cache_units = Vec::new();
-        let mut call_page_reads = Vec::new();
+        let mut call_page_loads = Vec::new();
         let mut call_forward = ForwardBatch::default();
         if let Some(lengths) = cache_lengths {
             // Registration above found the request running, and a running
@@ -260,11 +260,11 @@ impl Scheduler {
                     });
                 }
             }
-            // The first call after admission fills the units of the host
-            // page tier's hit from their slots before its forward.
-            if admitted && let Some(tiers) = self.tiers.as_mut() {
+            // The first call after admission fills the units of the
+            // host KV cache's hit from their slots before its forward.
+            if admitted && let Some(kv_offload) = self.kv_offload.as_mut() {
                 let table = &allocation.tables[0];
-                call_page_reads = tiers.reads(request_id, |page| {
+                call_page_loads = kv_offload.loads(request_id, |page| {
                     table.page(page).map(|page| page.units().to_vec())
                 });
             }
@@ -538,7 +538,7 @@ impl Scheduler {
                 decode: None,
                 buffers,
                 readers: Default::default(),
-                page_reads: call_page_reads,
+                page_loads: call_page_loads,
             },
         ));
         // The resolved token product serves only the first call after its

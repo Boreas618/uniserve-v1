@@ -58,7 +58,7 @@ impl Claims {
 
         // A server the deployment starts runs its Mooncake connector.
         let server_arguments = first
-            .storage_connector
+            .kv_storage
             .as_ref()
             .map(storage::connector::Settings::arguments)
             .unwrap_or_default();
@@ -67,11 +67,11 @@ impl Claims {
             let launch = crate::worker::processes::lock(processes)?
                 .claim(host, deployment, scopes, server_arguments.clone())
                 .with_context(|| format!("claiming deployment {deployment} on host {host}"))?;
-            // The engine decides whether its workers use the host page tier.
+            // The engine decides whether its workers use the host KV cache.
             launches.insert(
                 host.to_owned(),
                 StorageLaunch {
-                    page_tier: first.page_tier,
+                    host_kv_cache: first.host_kv_cache,
                     ..launch
                 },
             );

@@ -322,7 +322,7 @@ pub(super) fn rank_projection(
             .collect::<Vec<_>>();
         // A rank also takes part to copy its share of the batch's pages.
         let copies_pages = batch
-            .page_writes
+            .page_offloads
             .iter()
             .any(|copy| copy.rank as usize == rank);
         if indices.is_empty() && batch.commands.is_empty() && !copies_pages {
@@ -370,10 +370,10 @@ pub(super) fn rank_projection(
             .retain(|units| transfers_cache || slots.contains(&units.request_pool_idx));
         // Each rank copies its own share of a page through its own pool.
         projection
-            .page_reads
+            .page_loads
             .retain(|copy| copy.rank as usize == rank);
         projection
-            .page_writes
+            .page_offloads
             .retain(|copy| copy.rank as usize == rank);
         let identities = projection
             .calls
@@ -418,7 +418,7 @@ pub(super) fn rank_projection(
             .collect();
         if projection.calls.is_empty()
             && projection.commands.is_empty()
-            && projection.page_writes.is_empty()
+            && projection.page_offloads.is_empty()
         {
             continue;
         }
