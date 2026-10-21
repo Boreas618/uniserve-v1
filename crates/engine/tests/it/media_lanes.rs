@@ -870,10 +870,10 @@ fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
             latent_units: vec![2],
             ..ConditionExtent::default()
         },
-        // 40 frames encoded in three units, read by the conditioner as a
-        // 2x2x4 grid, with a 16000-sample soundtrack.
+        // A 40-frame clip whose 39 VAE frames encode in three units, read by
+        // the conditioner as a 2x2x4 grid, with a 16000-sample soundtrack.
         ConditionExtent {
-            pixel_bytes: pixels(40),
+            pixel_bytes: pixels(39),
             audio_samples: 16_000,
             vision_patches: 16,
             vision_tokens: 4,
