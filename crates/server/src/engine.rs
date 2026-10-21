@@ -113,16 +113,7 @@ impl Engine {
     /// ([`ServeConfig::engine_config`]), when the engine cores fail to start,
     /// or when the model cannot be bound to the capabilities its workers
     /// report.
-    ///
-    /// A successor head of a control-plane handover starts its engine cores
-    /// over workers that stand by for the predecessor's under `adoption`
-    /// (`EngineCore::start_successors`); they serve once each core resumes
-    /// the predecessor's snapshot (`crate::handover`).
-    pub async fn start(
-        config: &ServeConfig,
-        stated: &Stated,
-        adoption: Option<&uniserve_engine::handover::Adoption>,
-    ) -> anyhow::Result<Self> {
+    pub async fn start(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Self> {
         let LoadedModel {
             config: mut model_config,
             tokenizer,
@@ -180,14 +171,10 @@ impl Engine {
             block_size = ?engine_config.worker_process.block_size,
             "starting UniServe Rust engine"
         );
-        let adoption = adoption.cloned();
-        let cores = tokio::task::spawn_blocking(move || match adoption {
-            Some(adoption) => EngineCore::start_successors(engine_config, &adoption),
-            None => EngineCore::start_all(engine_config),
-        })
-        .await
-        .context("the engine startup task did not complete")?
-        .context("failed to start the UniServe engine")?;
+        let cores = tokio::task::spawn_blocking(move || EngineCore::start_all(engine_config))
+            .await
+            .context("the engine startup task did not complete")?
+            .context("failed to start the UniServe engine")?;
         let first = cores.first().context("the engine started no engine core")?;
 
         // A video checkpoint serves what its placed denoiser declares in the
@@ -361,14 +348,6 @@ impl Engine {
             _stats_export: stats_export,
             _stats_logger: stats_logger,
         })
-    }
-
-    /// The engine cores, in index order.
-    pub(crate) fn cores(&self) -> Vec<Arc<EngineCore>> {
-        self.cores
-            .iter()
-            .map(|core| Arc::clone(&core.engine))
-            .collect()
     }
 
     /// The loaded model's input processor.

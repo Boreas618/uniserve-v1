@@ -1481,13 +1481,6 @@ pub(crate) struct RequestState {
     pub(super) canvas_commit: Vec<u32>,
     /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
-    /// Tokens the request generated on a predecessor engine before it
-    /// resumed here (`crate::handover`): the last ones of its prompt.
-    /// `num_generated_tokens` and `generated_token_ids` count them.
-    pub(super) resumed_tokens: usize,
-    /// Whether the client was sent the request's `Scheduled` event, which a
-    /// request resumed after its admission was.
-    pub(super) scheduled_sent: bool,
     pub(crate) terminal_intent: TerminalIntent,
     /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
@@ -1496,18 +1489,6 @@ pub(crate) struct RequestState {
 }
 
 impl RequestState {
-    /// The prompt tokens the request is charged: its prompt without the
-    /// tokens it generated on a predecessor engine.
-    pub(super) fn prompt_tokens(&self) -> usize {
-        self.req.prompt_token_ids.len() - self.resumed_tokens
-    }
-
-    /// The tokens the request generated on a predecessor engine, which end
-    /// its prompt.
-    pub(super) fn resumed_token_ids(&self) -> &[u32] {
-        &self.req.prompt_token_ids[self.prompt_tokens()..]
-    }
-
     /// Returns the request allocations, which admission installs.
     pub(super) fn allocations(&self) -> Option<&RequestAllocations> {
         self.allocations.as_ref()

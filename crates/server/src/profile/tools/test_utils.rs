@@ -1,13 +1,12 @@
-//! Shared fixtures and stream collectors for tool-parser tests and benchmarks.
+//! Shared fixtures and stream collectors for tool-parser tests.
 
 use serde_json::json;
 
 use super::{ToolParser, ToolParserOutput};
 use crate::profile::tools::Tool;
 
-/// Builds a reusable set of function tools for parser unit tests and
-/// benchmarks.
-pub fn test_tools() -> Vec<Tool> {
+/// Builds a reusable set of function tools for parser unit tests.
+pub(crate) fn test_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "get_weather".to_string(),
@@ -88,11 +87,7 @@ pub fn test_tools() -> Vec<Tool> {
 /// tool-call deltas.
 ///
 /// Panics if there are any parsing errors along the way.
-#[expect(
-    clippy::unwrap_used,
-    reason = "this assertion helper intentionally panics on parser failures"
-)]
-pub fn collect_stream(parser: &mut impl ToolParser, chunks: &[&str]) -> ToolParserOutput {
+pub(crate) fn collect_stream(parser: &mut impl ToolParser, chunks: &[&str]) -> ToolParserOutput {
     let mut output = ToolParserOutput::default();
     for chunk in chunks {
         output.append(parser.parse_chunk(chunk).unwrap());
@@ -103,7 +98,7 @@ pub fn collect_stream(parser: &mut impl ToolParser, chunks: &[&str]) -> ToolPars
 
 /// Splits text into chunks containing at most `chunk_chars` Unicode scalar
 /// values.
-pub fn split_by_chars(text: &str, chunk_chars: usize) -> Vec<&str> {
+pub(crate) fn split_by_chars(text: &str, chunk_chars: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut count = 0;

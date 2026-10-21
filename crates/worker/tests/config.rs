@@ -23,6 +23,7 @@ fn defaults() -> Value {
             "deployment": "model",
             "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             "page_tier": false,
+            "standby": false,
         },
         "host": "localhost",
         "device": "cpu",

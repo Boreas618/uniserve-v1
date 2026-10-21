@@ -83,7 +83,6 @@ pub struct StorageClaim {
     pub server: String,
     /// The arguments a server the launcher starts is given beyond its socket
     /// and its TCP address: the deployment's Mooncake connector settings.
-    #[serde(default)]
     pub arguments: Vec<String>,
 }
 

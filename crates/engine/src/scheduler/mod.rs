@@ -30,7 +30,6 @@
 //! - `output`: public events, semantic result resolution, and termination.
 //! - `allocation` and `placement`: storage ownership and worker placement.
 //! - `control`: cancellation and frontend lifecycle commands.
-//! - `handover`: quiescing and resuming requests in a control-plane handover.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
 //! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
@@ -59,7 +58,6 @@ mod denoising;
 mod execution;
 pub(crate) mod generation;
 pub(crate) mod graph;
-mod handover;
 pub(crate) mod image_artifact;
 mod inflight;
 pub(crate) mod output;
@@ -418,9 +416,6 @@ pub struct Scheduler {
     /// The host page tier, when it serves a worker group
     /// (`Scheduler::enable_page_tier`).
     tiers: Option<crate::prefix_cache::Tiers>,
-    /// Where a quiescing scheduler replies with its handover
-    /// (`Command::Quiesce`); `None` while it serves.
-    quiesce: Option<crossbeam_channel::Sender<anyhow::Result<crate::handover::Quiesced>>>,
     /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it writes its last pages to the host page tier
     /// (`Scheduler::flush_page_tier`).

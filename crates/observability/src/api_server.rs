@@ -11,7 +11,6 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
-use uniserve_observability_derive::MetricFamily;
 
 use crate::U64Counter;
 
@@ -60,29 +59,45 @@ pub(crate) type HttpHandlerHistogramFamily =
     Family<HttpHandlerLabels, Histogram, fn() -> Histogram>;
 
 /// API-server Prometheus families exported from the HTTP middleware layer.
-#[derive(MetricFamily)]
 pub struct ApiServerMetrics {
     /// HTTP request count grouped by method, status, and handler.
-    #[metric(
-        name = "http_requests",
-        help = "Total number of HTTP requests by method, status, and handler."
-    )]
     pub http_requests: HttpRequestCounterFamily,
     /// HTTP request latency grouped by method and handler.
-    #[metric(
-        name = "http_request_duration_seconds",
-        help = "Duration of HTTP requests in seconds grouped by method and handler.",
-        init = HttpHandlerHistogramFamily::new_with_constructor(
-            http_request_duration_histogram as fn() -> Histogram,
-        )
-    )]
     pub http_request_duration_seconds: HttpHandlerHistogramFamily,
     /// High-resolution HTTP request latency across all tracked handlers,
     /// without labels.
-    #[metric(
-        name = "http_request_duration_highr_seconds",
-        help = "High-resolution duration of HTTP requests in seconds.",
-        init = http_request_duration_highr_histogram()
-    )]
     pub http_request_duration_highr_seconds: Histogram,
+}
+
+impl ApiServerMetrics {
+    /// Registers every family under its exported name and help, and
+    /// returns the handles; the registry keeps a clone of each, whose state
+    /// it shares.
+    pub fn register(registry: &mut prometheus_client::registry::Registry) -> Self {
+        let http_requests: HttpRequestCounterFamily = Default::default();
+        registry.register(
+            "http_requests",
+            "Total number of HTTP requests by method, status, and handler.",
+            http_requests.clone(),
+        );
+        let http_request_duration_seconds = HttpHandlerHistogramFamily::new_with_constructor(
+            http_request_duration_histogram as fn() -> Histogram,
+        );
+        registry.register(
+            "http_request_duration_seconds",
+            "Duration of HTTP requests in seconds grouped by method and handler.",
+            http_request_duration_seconds.clone(),
+        );
+        let http_request_duration_highr_seconds = http_request_duration_highr_histogram();
+        registry.register(
+            "http_request_duration_highr_seconds",
+            "High-resolution duration of HTTP requests in seconds.",
+            http_request_duration_highr_seconds.clone(),
+        );
+        Self {
+            http_requests,
+            http_request_duration_seconds,
+            http_request_duration_highr_seconds,
+        }
+    }
 }

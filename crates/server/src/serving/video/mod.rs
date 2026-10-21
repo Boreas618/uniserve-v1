@@ -114,7 +114,7 @@ pub struct VideoTarget {
 
 /// MiniMax-H3 video-and-audio generation request: the official MiniMax /
 /// SGLang form, a `task`, its ordered `conditions` and the requested
-/// `target`. The `/v1/videos` routes and the Dynamo worker build it, and
+/// `target`. The `/v1/videos` routes build it, and
 /// `deny_unknown_fields` rejects every field not listed here, at every
 /// level. The served checkpoint fixes the schedule, and every request
 /// generates one video.

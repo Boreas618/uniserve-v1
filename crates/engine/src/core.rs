@@ -21,8 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
-use crate::handle::{Command, EngineHandle, EventRx, SubmitError};
-use crate::handover::{Adoption, CoreSnapshot, Quiesced};
+use crate::handle::{EngineHandle, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -495,28 +494,6 @@ impl EngineCore {
     /// configured edge crosses engine cores or names an unconfigured worker
     /// group, or for any reason `EngineCore::new` names.
     pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
-        Self::launch(config, None)
-    }
-
-    /// Launches a successor's engine cores in a control-plane handover
-    /// (`crate::handover`), as `start_all` does, over workers that stand by
-    /// for the predecessor's: they start under its claim, map the planes of
-    /// the cache units it reports and park, and the engine cores serve
-    /// nothing until each resumes a snapshot (`EngineCore::resume`). The
-    /// ranks warmed their kernels and captured their graphs before they
-    /// parked; the engine cores run no warmup requests.
-    ///
-    /// Fails when a worker group of `config` is not one of the
-    /// predecessor's, a rank runs on another host, or for any reason
-    /// `start_all` names.
-    pub fn start_successors(
-        config: EngineConfig,
-        adoption: &Adoption,
-    ) -> anyhow::Result<Vec<Self>> {
-        Self::launch(config, Some(adoption))
-    }
-
-    fn launch(config: EngineConfig, adoption: Option<&Adoption>) -> anyhow::Result<Vec<Self>> {
         let size = config.data_parallel_size;
         WorkerGroupConfig::validate_all(&config.worker_groups)?;
         let (model_workers, expert_workers): (Vec<_>, Vec<_>) = config
@@ -680,20 +657,6 @@ impl EngineCore {
                 union_rank += worker.ranks.len();
             }
         }
-        // A successor's workers stand by for the predecessor's, over the
-        // planes of the cache units those hold.
-        if let Some(adoption) = adoption {
-            for args in &mut arguments {
-                let units = adoption.cache_units.get(&args.worker_id).with_context(|| {
-                    format!(
-                        "the predecessor runs no worker group {}; a handover keeps the deployment's groups",
-                        args.worker_id
-                    )
-                })?;
-                args.standby = true;
-                args.cache_units = *units;
-            }
-        }
         for worker in &expert_workers {
             arguments.push(WorkerProcessArgs {
                 worker_id: worker.id.to_string(),
@@ -723,10 +686,7 @@ impl EngineCore {
 
         // `spawn_all` returns groups in argument order, which pairs each group
         // with its identity and, block by block, with its engine core.
-        let launched = match adoption {
-            Some(adoption) => WorkerGroup::spawn_successors(arguments, adoption.claim)?,
-            None => WorkerGroup::spawn_all(arguments)?,
-        };
+        let launched = WorkerGroup::spawn_all(arguments)?;
         let mut groups = model_workers
             .iter()
             .chain(&expert_workers)
@@ -773,11 +733,8 @@ impl EngineCore {
             };
             let core = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
             // Each engine core's serving path runs the requests its workers'
-            // reports call for before the engine core serves. A successor's
-            // workers stand by until it resumes.
-            if adoption.is_none() {
-                crate::warmup::warm(&core, &core_config)?;
-            }
+            // reports call for before the engine core serves.
+            crate::warmup::warm(&core, &core_config)?;
             cores.push(core);
         }
         Ok(cores)
@@ -945,82 +902,6 @@ impl EngineCore {
             return Err(SubmitError::Dead);
         }
         self.handle.submit_all(requests)
-    }
-
-    /// Prepares a control-plane handover of this engine core: its worker
-    /// groups stop their standbys, whose memory the successor's workers
-    /// take. Returns what those workers adopt, `None` for an executor whose
-    /// workers keep no storage. Fails when a group cannot be handed over or
-    /// the engine core has stopped.
-    pub fn prepare_handover(&self) -> anyhow::Result<Option<Adoption>> {
-        let (reply, answer) = crossbeam_channel::bounded(1);
-        self.handle
-            .send(Command::PrepareHandover(reply))
-            .map_err(|_| anyhow::anyhow!("the engine core has stopped"))?;
-        answer
-            .recv()
-            .context("the engine core stopped before preparing the handover")?
-    }
-
-    /// Keeps standbys again after a prepared handover that did not happen.
-    pub fn abandon_handover(&self) {
-        let _ = self.handle.send(Command::AbandonHandover);
-    }
-
-    /// Quiesces this engine core and hands its requests over: see
-    /// `crate::handover`. Blocks until the core reaches a quiescent step
-    /// boundary, after the requests it does not migrate complete; its
-    /// scheduler has then stopped and its workers have closed. The commands
-    /// its handles send from then on reach the returned relay.
-    ///
-    /// Fails when the engine core stops first, or its workers fail to close.
-    pub fn quiesce(&self) -> anyhow::Result<Quiesced> {
-        let (reply, answer) = crossbeam_channel::bounded(1);
-        self.handle
-            .send(Command::Quiesce(reply))
-            .map_err(|_| anyhow::anyhow!("the engine core has stopped"))?;
-        let mut quiesced = answer
-            .recv()
-            .context("the engine core stopped before it quiesced")??;
-        quiesced.snapshot.next_request_id = self.next_id.load(Ordering::Relaxed);
-        Ok(quiesced)
-    }
-
-    /// Resumes a predecessor's quiesced engine core on this successor's:
-    /// the workers are promoted, the predecessor's prefix cache pages
-    /// installed and its requests queued, and the core issues request
-    /// identities after the predecessor's. Returns each migrated request's
-    /// event stream in the snapshot's order; dropping one cancels its
-    /// request.
-    ///
-    /// Fails, stopping the engine core, when its workers cannot be
-    /// promoted.
-    pub fn resume(&self, snapshot: CoreSnapshot) -> anyhow::Result<Vec<(RequestId, EventRx)>> {
-        self.next_id
-            .fetch_max(snapshot.next_request_id, Ordering::Relaxed);
-        let (events, streams): (Vec<_>, Vec<_>) = snapshot
-            .requests
-            .iter()
-            .map(|migrated| {
-                let id = migrated.request.request_id;
-                let (events, stream) = self
-                    .handle
-                    .bind_resumed(id, !migrated.request.stop_strings.is_empty());
-                (events, (id, stream))
-            })
-            .unzip();
-        let (reply, answer) = crossbeam_channel::bounded(1);
-        self.handle
-            .send(Command::Resume {
-                snapshot: Box::new(snapshot),
-                events,
-                reply,
-            })
-            .map_err(|_| anyhow::anyhow!("the engine core has stopped"))?;
-        answer
-            .recv()
-            .context("the engine core stopped before it resumed")??;
-        Ok(streams)
     }
 
     /// Shuts down the scheduler, tears down its executor, and joins

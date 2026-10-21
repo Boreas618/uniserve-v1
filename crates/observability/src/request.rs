@@ -7,7 +7,6 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
-use uniserve_observability_derive::MetricFamily;
 
 use crate::{EngineLabels, HistogramFamily, U64Counter};
 
@@ -84,66 +83,102 @@ pub(crate) type FinishedReasonCounterFamily = Family<FinishedReasonLabels, U64Co
 /// `request_max_num_generation_tokens`, and `time_to_first_token_seconds` for
 /// one whose output reported its final usage. The server's `StatsLogger`
 /// reads `prompt_tokens` and `generation_tokens` to log throughput.
-#[derive(MetricFamily)]
 pub struct RequestMetrics {
     /// Prompt tokens processed by each engine.
-    #[metric(
-        name = "uniserve:prompt_tokens",
-        help = "Number of prefill tokens processed."
-    )]
     pub prompt_tokens: Family<EngineLabels, U64Counter>,
     /// Generated tokens processed by each engine.
-    #[metric(
-        name = "uniserve:generation_tokens",
-        help = "Number of generation tokens processed."
-    )]
     pub generation_tokens: Family<EngineLabels, U64Counter>,
     /// Successfully completed requests grouped by terminal reason.
-    #[metric(
-        name = "uniserve:request_success",
-        help = "Count of successfully processed requests."
-    )]
     pub request_success: FinishedReasonCounterFamily,
     /// Prompt-token count distribution per request.
-    #[metric(
-        name = "uniserve:request_prompt_tokens",
-        help = "Number of prefill tokens processed.",
-        init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
-    )]
     pub request_prompt_tokens: HistogramFamily,
     /// Generated-token count distribution per request.
-    #[metric(
-        name = "uniserve:request_generation_tokens",
-        help = "Number of generation tokens processed.",
-        init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
-    )]
     pub request_generation_tokens: HistogramFamily,
     /// Requested maximum generated-token distribution.
-    #[metric(
-        name = "uniserve:request_max_num_generation_tokens",
-        help = "Histogram of maximum number of requested generation tokens.",
-        init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
-    )]
     pub request_max_num_generation_tokens: HistogramFamily,
     /// Time-to-first-token distribution in seconds.
-    #[metric(
-        name = "uniserve:time_to_first_token_seconds",
-        help = "Histogram of time to first token in seconds.",
-        init = Family::new_with_constructor(time_to_first_token_histogram as fn() -> Histogram)
-    )]
     pub time_to_first_token_seconds: HistogramFamily,
     /// End-to-end request latency distribution in seconds.
-    #[metric(
-        name = "uniserve:e2e_request_latency_seconds",
-        help = "Histogram of e2e request latency in seconds.",
-        init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
-    )]
     pub e2e_request_latency_seconds: HistogramFamily,
     /// Time spent waiting for scheduler admission.
-    #[metric(
-        name = "uniserve:request_queue_time_seconds",
-        help = "Histogram of time spent in WAITING phase for request.",
-        init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
-    )]
     pub request_queue_time_seconds: HistogramFamily,
+}
+
+impl RequestMetrics {
+    /// Registers every family under its exported name and help, and
+    /// returns the handles; the registry keeps a clone of each, whose state
+    /// it shares.
+    pub fn register(registry: &mut prometheus_client::registry::Registry) -> Self {
+        let prompt_tokens: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:prompt_tokens",
+            "Number of prefill tokens processed.",
+            prompt_tokens.clone(),
+        );
+        let generation_tokens: Family<EngineLabels, U64Counter> = Default::default();
+        registry.register(
+            "uniserve:generation_tokens",
+            "Number of generation tokens processed.",
+            generation_tokens.clone(),
+        );
+        let request_success: FinishedReasonCounterFamily = Default::default();
+        registry.register(
+            "uniserve:request_success",
+            "Count of successfully processed requests.",
+            request_success.clone(),
+        );
+        let request_prompt_tokens =
+            Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:request_prompt_tokens",
+            "Number of prefill tokens processed.",
+            request_prompt_tokens.clone(),
+        );
+        let request_generation_tokens =
+            Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:request_generation_tokens",
+            "Number of generation tokens processed.",
+            request_generation_tokens.clone(),
+        );
+        let request_max_num_generation_tokens =
+            Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:request_max_num_generation_tokens",
+            "Histogram of maximum number of requested generation tokens.",
+            request_max_num_generation_tokens.clone(),
+        );
+        let time_to_first_token_seconds =
+            Family::new_with_constructor(time_to_first_token_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:time_to_first_token_seconds",
+            "Histogram of time to first token in seconds.",
+            time_to_first_token_seconds.clone(),
+        );
+        let e2e_request_latency_seconds =
+            Family::new_with_constructor(request_latency_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:e2e_request_latency_seconds",
+            "Histogram of e2e request latency in seconds.",
+            e2e_request_latency_seconds.clone(),
+        );
+        let request_queue_time_seconds =
+            Family::new_with_constructor(request_latency_histogram as fn() -> Histogram);
+        registry.register(
+            "uniserve:request_queue_time_seconds",
+            "Histogram of time spent in WAITING phase for request.",
+            request_queue_time_seconds.clone(),
+        );
+        Self {
+            prompt_tokens,
+            generation_tokens,
+            request_success,
+            request_prompt_tokens,
+            request_generation_tokens,
+            request_max_num_generation_tokens,
+            time_to_first_token_seconds,
+            e2e_request_latency_seconds,
+            request_queue_time_seconds,
+        }
+    }
 }

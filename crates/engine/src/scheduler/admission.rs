@@ -272,8 +272,6 @@ impl Scheduler {
             canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             queued_at: now(),
-            resumed_tokens: 0,
-            scheduled_sent: false,
             terminal_intent: super::TerminalIntent::None,
             failure: None,
             req,
@@ -1031,9 +1029,8 @@ impl Scheduler {
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
-        // A quiescing scheduler hands its waiting token requests over, and a
-        // closing one admits nothing more.
-        if self.quiescing() || self.closing {
+        // A closing scheduler admits nothing more.
+        if self.closing {
             return;
         }
         loop {
@@ -1329,15 +1326,12 @@ impl Scheduler {
         self.record_queue_wait(q, scheduled_at);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
-        if !st.scheduled_sent
-            && !st.output.events.enqueue(EngineCoreOutput::Scheduled {
-                queued_at: q,
-                scheduled_at,
-            })
-        {
+        if !st.output.events.enqueue(EngineCoreOutput::Scheduled {
+            queued_at: q,
+            scheduled_at,
+        }) {
             st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
         }
-        st.scheduled_sent = true;
 
         // Running order, resource reservations, and runtime ownership advance
         // together so the next scheduling pass observes one coherent admission.

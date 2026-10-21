@@ -14,21 +14,10 @@
 //! closes. The listener therefore owns the file of a socket it binds: binding
 //! first removes a stale socket file nobody listens on, and dropping the
 //! listener (at shutdown) removes the file again.
-//!
-//! In a control-plane handover the listening socket moves to the successor
-//! head (`crate::handover`): the predecessor passes a duplicate of it
-//! ([`Listener::handover`]) and the successor serves on it
-//! ([`Listener::adopt`]). A Unix-domain socket's file then belongs to the
-//! successor, so the predecessor's listener leaves it in place.
 
 use std::io::{ErrorKind, Result};
-use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use serde::{Deserialize, Serialize};
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
@@ -59,56 +48,14 @@ pub(crate) struct SocketFile {
     path: PathBuf,
     device: u64,
     inode: u64,
-    /// Cleared once the socket moved to a successor head, which then owns
-    /// the file.
-    owned: Arc<AtomicBool>,
-}
-
-impl SocketFile {
-    /// Takes ownership of the socket file at `path`.
-    fn own(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        Ok(Self {
-            path: path.to_owned(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            owned: Arc::new(AtomicBool::new(true)),
-        })
-    }
 }
 
 impl Drop for SocketFile {
     fn drop(&mut self) {
         let bound = std::fs::symlink_metadata(&self.path)
             .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode);
-        if bound && self.owned.load(Ordering::Acquire) {
+        if bound {
             let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Where a listening socket that moves to a successor head listens.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ListenerAddress {
-    Tcp,
-    Unix { path: PathBuf },
-}
-
-/// A predecessor's listening socket as it moves to a successor: a duplicate
-/// of its descriptor, its address, and the release of its socket file.
-pub(crate) struct HandedListener {
-    pub(crate) descriptor: OwnedFd,
-    pub(crate) address: ListenerAddress,
-    /// Leaves a Unix-domain socket's file to the successor when set to
-    /// false; `None` for a TCP socket.
-    owned: Option<Arc<AtomicBool>>,
-}
-
-impl HandedListener {
-    /// The successor took the socket over: its file is the successor's.
-    pub(crate) fn release(&self) {
-        if let Some(owned) = &self.owned {
-            owned.store(false, Ordering::Release);
         }
     }
 }
@@ -134,51 +81,15 @@ impl Listener {
     async fn bind_unix(path: &Path) -> Result<Self> {
         remove_stale_socket(path).await?;
         let listener = UnixListener::bind(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self::Unix {
             listener,
-            _socket_file: SocketFile::own(path)?,
-        })
-    }
-
-    /// A duplicate of the listening socket, to pass to a successor head.
-    pub(crate) fn handover(&self) -> Result<HandedListener> {
-        Ok(match self {
-            Self::Tcp(listener) => HandedListener {
-                descriptor: listener.as_fd().try_clone_to_owned()?,
-                address: ListenerAddress::Tcp,
-                owned: None,
-            },
-            Self::Unix {
-                listener,
-                _socket_file: file,
-            } => HandedListener {
-                descriptor: listener.as_fd().try_clone_to_owned()?,
-                address: ListenerAddress::Unix {
-                    path: file.path.clone(),
-                },
-                owned: Some(Arc::clone(&file.owned)),
+            _socket_file: SocketFile {
+                path: path.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
             },
         })
-    }
-
-    /// Serves on a listening socket a predecessor head passed. The
-    /// listener owns a Unix-domain socket's file from now on.
-    pub(crate) fn adopt(descriptor: OwnedFd, address: &ListenerAddress) -> Result<Self> {
-        match address {
-            ListenerAddress::Tcp => {
-                let listener = std::net::TcpListener::from(descriptor);
-                listener.set_nonblocking(true)?;
-                Ok(Self::Tcp(TcpListener::from_std(listener)?))
-            }
-            ListenerAddress::Unix { path } => {
-                let listener = std::os::unix::net::UnixListener::from(descriptor);
-                listener.set_nonblocking(true)?;
-                Ok(Self::Unix {
-                    listener: UnixListener::from_std(listener)?,
-                    _socket_file: SocketFile::own(path)?,
-                })
-            }
-        }
     }
 
     /// Returns a log-friendly local address string for either TCP or Unix
