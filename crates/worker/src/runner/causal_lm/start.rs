@@ -16,7 +16,7 @@ use ipc::{CallKind, ForwardMode};
 use super::CausalLMRunners;
 use crate::config::placement::Components;
 use crate::config::placement::RunnerKind;
-use crate::config::{Device, PREFILL_ROW_BUCKETS, WorkerConfig};
+use crate::config::{Device, WorkerConfig, prefill_row_buckets};
 use crate::cuda_graph::GraphStorage;
 use crate::cuda_graph::reserve_pools;
 use crate::cuda_graph::{PrefillShape, TextShapes, prefill_shapes};
@@ -101,17 +101,24 @@ impl TextBounds {
             .iter()
             .map(|shape| shape.units_per_page as usize)
             .sum();
-        let decode: Vec<usize> = if graphs {
-            config
+        // A decode batch holds a page of every group per row, so the pool
+        // bounds the rows it can admit; the catalog's sizes up to that bound
+        // are captured, and the bound itself, so that every decode batch the
+        // engine forms fits a bucket.
+        let decode_rows = units.map_or(max_rows, |units| {
+            max_rows.min(units.saturating_sub(1) as usize / row_units.max(1))
+        });
+        let decode: Vec<usize> = if graphs && decode_rows > 0 {
+            let mut sizes: Vec<usize> = config
                 .decode_graph_batch_sizes
                 .iter()
                 .copied()
-                .filter(|&rows| {
-                    rows > 0
-                        && rows <= max_rows
-                        && units.is_none_or(|units| rows * row_units < units as usize)
-                })
-                .collect()
+                .filter(|&rows| rows > 0 && rows <= decode_rows)
+                .collect();
+            if sizes.last() != Some(&decode_rows) {
+                sizes.push(decode_rows);
+            }
+            sizes
         } else {
             Vec::new()
         };
@@ -119,13 +126,13 @@ impl TextBounds {
             .iter()
             .map(|shape| (shape.block_size as usize, shape.units_per_page as usize))
             .collect();
-        let prefill = if graphs && config.prefill_cuda_graph {
+        let prefill = if graphs {
             let pool_rows = units.map_or(max_rows, |units| {
                 max_rows.min((units.saturating_sub(1) as usize) / row_units.max(1))
             });
             prefill_shapes(
                 &config.prefill_graph_token_sizes,
-                PREFILL_ROW_BUCKETS,
+                &prefill_row_buckets(pool_rows),
                 pool_rows,
                 tokens,
                 &[(Some(true), false)],

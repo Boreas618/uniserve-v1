@@ -547,10 +547,8 @@ pub(crate) mod tests {
             lanes: Vec::new(),
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: crate::config::default_decode_sizes(),
-            prefill_cuda_graph: true,
             prefill_outputs: true,
             prefill_graph_token_sizes: crate::config::default_prefill_sizes(),
-            flow_cuda_graph: true,
             flow_graph_batch_sizes: crate::config::DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
             flow_graph_shapes: crate::config::DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
         }

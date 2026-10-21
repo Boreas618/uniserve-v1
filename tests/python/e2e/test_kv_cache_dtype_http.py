@@ -77,8 +77,6 @@ def _generate(
         "--set",
         "kv_cache_config.block_size=64",
         "--set",
-        "cuda_graph_config.capture_prefill=true",
-        "--set",
         "chat_config.reasoning_parser=none",
         *extra,
     ]

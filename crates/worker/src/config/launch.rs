@@ -367,10 +367,8 @@ fn execution(
         lanes: descriptor.lane.clone(),
         graph_policy: descriptor.graph_policy.clone(),
         decode_graph_batch_sizes: default_decode_sizes(),
-        prefill_cuda_graph: descriptor.prefill_cuda_graph,
         prefill_outputs: descriptor.prefill_outputs,
         prefill_graph_token_sizes: default_prefill_sizes(),
-        flow_cuda_graph: descriptor.flow_cuda_graph,
         flow_graph_batch_sizes: DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
         flow_graph_shapes: DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
     };

@@ -683,10 +683,11 @@ message Workers {
 }
 
 message CudaGraphs {
-  // `auto`, `full` or `off`.
+  // `auto`, `full` or `off`: a worker group runs every call with CUDA
+  // graphs, or every call eagerly.
   string policy = 1;
-  bool capture_prefill = 2;
-  bool capture_flow = 3;
+  // Prefill and image denoising always capture under graphs.
+  reserved 2, 3;
   // Each list is absent for the worker's catalog.
   Sizes decode_batch_sizes = 4;
   Sizes prefill_token_sizes = 5;

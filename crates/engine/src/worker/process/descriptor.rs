@@ -36,10 +36,6 @@ impl WorkerProcessArgs {
     pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
     /// Numeric data type of model parameters and activations.
     pub const DEFAULT_DTYPE: crate::ModelDtype = crate::ModelDtype::BFloat16;
-    /// Whether every prefill call replays a CUDA graph.
-    pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
-    /// Whether image denoising calls replay CUDA graphs.
-    pub const DEFAULT_FLOW_CUDA_GRAPH: bool = true;
 }
 
 impl Default for WorkerProcessArgs {
@@ -100,10 +96,8 @@ impl Default for WorkerProcessArgs {
             lanes: Vec::new(),
             graph_policy: GraphPolicy::default(),
             decode_graph_batch_sizes: None,
-            prefill_cuda_graph: Self::DEFAULT_PREFILL_CUDA_GRAPH,
             prefill_outputs: true,
             prefill_graph_token_sizes: None,
-            flow_cuda_graph: Self::DEFAULT_FLOW_CUDA_GRAPH,
             flow_graph_batch_sizes: None,
             flow_graph_shapes: None,
             video_text_capacities: None,
@@ -283,10 +277,8 @@ impl WorkerProcessArgs {
             min_video_seconds: self.min_video_seconds,
             graph_policy: serde_name(&self.graph_policy)?,
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
-            prefill_cuda_graph: self.prefill_cuda_graph,
             prefill_outputs: self.prefill_outputs,
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
-            flow_cuda_graph: self.flow_cuda_graph,
             flow_graph_batch_sizes: self.flow_graph_batch_sizes.clone(),
             flow_graph_shapes: self.flow_graph_shapes.clone(),
             video_text_capacities: self.video_text_capacities.clone(),

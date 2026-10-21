@@ -15,8 +15,8 @@ relaunched workers find their weights retained at the Storage Server. The
 count is a continuation that no near tie decides, so rounding differences
 between the lost workers' decode of the generated tokens and the new
 workers' prefill of them cannot change it. The deployment captures few
-graphs (decode batches up to 8, no prefill graphs), so that the workers
-start again while the count streams.
+graphs (decode batches up to 8, prefill buckets of 512 tokens and the
+batch bound), so that the workers start again while the count streams.
 
 Two schedulers that share their experts (``--data-parallel-size 2`` with
 expert parallelism), or attention and expert workers exchanging through
@@ -208,7 +208,7 @@ def _stream_through_a_kill(
         "--set",
         "chat_config.reasoning_parser=none",
         "--set",
-        "cuda_graph_config.capture_prefill=false",
+        "cuda_graph_config.prefill_token_sizes=[512]",
         "--set",
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
         *options,

@@ -493,6 +493,67 @@ mod tests {
         Ok(())
     }
 
+    /// Every prefill batch of at most `max_rows` rows and the token bound,
+    /// and every decode batch of at most `max_rows` rows, selects a captured
+    /// bucket that holds it.
+    #[test]
+    fn every_batch_within_the_bounds_selects_a_bucket() -> Result<()> {
+        let (max_rows, max_tokens) = (40, 96);
+        let rows = crate::config::prefill_row_buckets(max_rows);
+        assert_eq!(rows, vec![8, 16, 41]);
+        let shapes = TextShapes::new(
+            vec![1, 2, 4, 8, 16, 32, max_rows],
+            prefill_shapes(
+                &[4, 16, 64],
+                &rows,
+                max_rows,
+                max_tokens,
+                &[(Some(true), false)],
+                true,
+                None,
+            ),
+        );
+        for count in 1..=max_rows {
+            let decode = vec![1; count];
+            let selected = shapes.select(&TextForward {
+                queries: &decode,
+                tokens: count,
+                ..DECODE
+            })?;
+            assert!(
+                selected.is_some_and(|(bucket, ..)| bucket >= count),
+                "{count} decode rows"
+            );
+            for tokens in count..=max_tokens {
+                // The rows share the tokens; any split selects the same way.
+                let mut queries = vec![1; count];
+                queries[0] += tokens - count;
+                let selected = shapes.select(&TextForward {
+                    queries: &queries,
+                    tokens,
+                    ..PREFILL
+                })?;
+                assert!(
+                    selected.is_some_and(|(bucket_rows, bucket_tokens, ..)| {
+                        bucket_rows > count && bucket_tokens >= tokens
+                    }),
+                    "{count} rows of {tokens} tokens"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_row_buckets_reach_one_past_the_largest_batch() {
+        assert_eq!(crate::config::prefill_row_buckets(3), vec![4]);
+        assert_eq!(crate::config::prefill_row_buckets(31), vec![8, 16, 32]);
+        assert_eq!(
+            crate::config::prefill_row_buckets(128),
+            vec![8, 16, 32, 64, 129]
+        );
+    }
+
     #[test]
     fn captures_exclude_buckets_no_admitted_batch_can_reach() {
         let shapes = prefill_shapes(
