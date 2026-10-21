@@ -8,6 +8,10 @@ use ffi::{Handle, RawUniqueId, api};
 
 use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
 
+/// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
+/// memory.
+const NCCL_SUSPEND_MEM: i32 = 0x01;
+
 /// The 128-byte rendezvous token every rank of a communicator initializes
 /// with. Rank 0 creates it and the worker distributes it to its peers.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,6 +350,34 @@ impl Communicator {
 
         // SAFETY: the communicator is owned and destroyed once.
         api.check(unsafe { (api.comm_destroy)(self.raw) }, "ncclCommDestroy")
+    }
+
+    /// Releases the communicator's dynamic device memory
+    /// (`ncclCommSuspend(NCCL_SUSPEND_MEM)`) until [`Self::resume`]. No
+    /// operation may run on it, nor a graph that captured one, in between.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the loaded NCCL predates suspension (2.30) or refuses it.
+    pub fn suspend(&mut self) -> Result<()> {
+        let api = api()?;
+        let suspend = api.comm_suspend.as_ref().map_err(Clone::clone)?;
+        let _guard = self.context.enter()?;
+        // SAFETY: the communicator is live and idle by the caller's contract.
+        api.check(
+            unsafe { suspend(self.raw, NCCL_SUSPEND_MEM) },
+            "ncclCommSuspend",
+        )
+    }
+
+    /// Allocates again what [`Self::suspend`] released; the communicator,
+    /// and graphs that captured its operations, run afterwards.
+    pub fn resume(&mut self) -> Result<()> {
+        let api = api()?;
+        let resume = api.comm_resume.as_ref().map_err(Clone::clone)?;
+        let _guard = self.context.enter()?;
+        // SAFETY: the communicator is live and suspended.
+        api.check(unsafe { resume(self.raw) }, "ncclCommResume")
     }
 
     /// Tears down this rank's communicator without waiting for peers, aborting

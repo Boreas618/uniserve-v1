@@ -141,6 +141,7 @@ impl Engine {
     pub(crate) fn stop(&mut self, group: &str) {
         let reply = self.request(request::Kind::Stop(Stop {
             group: group.into(),
+            generation: None,
         }));
         assert_eq!(reply.error, "", "the stop failed");
         assert!(matches!(reply.kind, Some(reply::Kind::Stopped(_))));

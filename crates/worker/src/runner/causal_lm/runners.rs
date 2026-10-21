@@ -488,6 +488,11 @@ impl CausalLMRunners {
             .collect()
     }
 
+    /// The NCCL communicators the runners' collectives run on.
+    pub(crate) fn collectives(&self) -> &[crate::parallel::StreamCollectives] {
+        &self.collectives
+    }
+
     /// Release graphs, the Python runners' execution contexts and output
     /// storage after the lanes drained, newest runner first. An aborted
     /// close keeps the contexts: device work may still address their

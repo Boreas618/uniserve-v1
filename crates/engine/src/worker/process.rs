@@ -219,6 +219,12 @@ impl PendingWorker {
         for (name, value) in worker_environment(|name| std::env::var_os(name)) {
             environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
         }
+        // A standby that may suspend its NCCL communicators while it parks
+        // captures their collectives without registering graph buffers:
+        // the registrations would not survive the suspension.
+        if args.standby && args.standby_memory != proto::request::StandbyMemory::Resident {
+            environment.insert("NCCL_GRAPH_REGISTER".to_owned(), "0".to_owned());
+        }
 
         // One typed descriptor carries every launch value. The engine keeps
         // it and answers the rank's registration with it.
@@ -388,17 +394,30 @@ impl WorkerProcess {
         Ok(true)
     }
 
-    /// Promotes a parked standby rank (`WorkerRequest::Promote`): it takes
-    /// write access to the exclusive storages its predecessor held, which
-    /// the Storage Server shoots down if it still holds them, and serves.
-    /// Waits for the rank's answer at most `timeout`.
-    ///
-    /// Fails when the rank refuses, dies, or does not answer in time.
-    pub(super) fn promote(&mut self, timeout: Duration) -> anyhow::Result<()> {
+    /// Asks a parked standby rank to promote (`WorkerRequest::Promote`): it
+    /// takes write access to the exclusive storages its predecessor held,
+    /// which the Storage Server shoots down if it still holds them, restores
+    /// what it suspended while it parked, and serves. Returns the request's
+    /// message, whose answer [`Self::await_promotion`] waits for. The ranks
+    /// of one world restore their communication collectively, so every
+    /// rank of it is asked before any answer is awaited ([`promote_all`]).
+    pub(super) fn request_promotion(&mut self) -> anyhow::Result<u64> {
         let message_id = self.alloc_call_id();
         let mut request = WorkerRequest::promote();
         request.set_message_id(Some(message_id));
         self.client.send(&request)?;
+        Ok(message_id)
+    }
+
+    /// Waits at most `timeout` for the rank's answer to the promotion
+    /// `message_id`.
+    ///
+    /// Fails when the rank refuses, dies, or does not answer in time.
+    pub(super) fn await_promotion(
+        &mut self,
+        message_id: u64,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             let response = self
@@ -431,6 +450,11 @@ impl WorkerProcess {
             );
             let _ = self.client.wait(remaining.min(WORKER_CHECK_INTERVAL));
         }
+    }
+
+    /// The generation of the group's launch the rank belongs to.
+    pub(super) fn generation(&self) -> u64 {
+        self.process.generation
     }
 
     /// Allocates the next worker message identifier.
@@ -879,4 +903,25 @@ impl Drop for WorkerProcess {
         self.cancel_startup();
         close_workers(std::slice::from_mut(self), || {});
     }
+}
+
+/// Promotes the parked standby ranks `workers`: asks every rank, then waits
+/// at most `timeout` for each answer, so that ranks restoring their world's
+/// communication together are all promoting at once.
+///
+/// # Errors
+///
+/// Fails at the first rank that refuses, dies, or does not answer in time.
+pub(in crate::worker) fn promote_all(
+    workers: &mut [WorkerProcess],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let requests = workers
+        .iter_mut()
+        .map(WorkerProcess::request_promotion)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for (worker, message_id) in workers.iter_mut().zip(requests) {
+        worker.await_promotion(message_id, timeout)?;
+    }
+    Ok(())
 }

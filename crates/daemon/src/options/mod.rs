@@ -589,19 +589,25 @@ pub struct WorkerOptions {
     pub mesh: Option<String>,
     /// Torch process-group backend for the ranks' collectives.
     pub distributed_backend: Option<String>,
-    /// Keep a standby rank group beside each worker group whose ranks all
-    /// run on the engine's host and that shares no expert world: it maps the
-    /// group's retained weights and cache, captures its graphs and parks,
-    /// and replaces the group when it fails instead of a relaunch. Each
-    /// standby rank holds a CUDA context, graph pools and workspaces of its
-    /// own, which the memory `mem_fraction_static` leaves must hold.
+    /// Keep a standby beside every worker group: it maps the group's
+    /// retained weights and cache, captures its graphs and parks, and
+    /// replaces the group when it fails instead of a relaunch. A group whose
+    /// ranks all run on the engine's host and that shares no expert world
+    /// keeps a standby rank group of its own; the groups of an expert world,
+    /// or a group on several nodes, keep a standby world: a second launch of
+    /// every group of the failure domain, with communicators of its own,
+    /// promoted together when one of them fails. Each standby rank holds a
+    /// CUDA context, graph pools and workspaces of its own, which the memory
+    /// `mem_fraction_static` leaves must hold.
     pub standby: bool,
-    /// How a parked standby (a group's, or a hot update's engine) keeps the
-    /// device memory of its graph pools and scratch: `auto` keeps it
-    /// resident while every device has the share a serving worker leaves for
-    /// graphs and activations to spare, and suspends it otherwise;
-    /// `resident`; or `suspended`, moved to host memory at unchanged
-    /// addresses and mapped back at the promotion.
+    /// How a parked standby (a group's, a failure domain's world, or a hot
+    /// update's engine) keeps the device memory of its graph pools, scratch,
+    /// expert all-to-all workspaces and NCCL communicators: `auto` keeps it
+    /// resident while every device has the share a serving worker leaves
+    /// for graphs and activations to spare, and suspends it otherwise, every
+    /// rank of a world or group alike; `resident`; or `suspended`, released
+    /// on the device and restored at the promotion, the graph memory with
+    /// its contents at unchanged addresses.
     pub standby_memory: StandbyMemory,
 }
 

@@ -223,6 +223,23 @@ class ExpertTransport:
         one; the default does nothing.
         """
 
+    def suspend(self) -> bool:
+        """Release the device workspace while a standby world parks.
+
+        Collective over the group, while no step runs. A transport whose
+        workspace keeps its addresses across a release, so that the graphs
+        captured over it stay valid, releases it and returns ``True``; the
+        default keeps the workspace and returns ``False``.
+        """
+        return False
+
+    def restore(self) -> None:
+        """Map the workspace :meth:`suspend` released back at its addresses.
+
+        Collective over the group, before any step runs; the default does
+        nothing.
+        """
+
     def close(self) -> None:
         """Release owned resources after every reader retired.
 

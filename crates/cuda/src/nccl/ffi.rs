@@ -46,6 +46,10 @@ pub(super) struct Api {
     pub(super) group_end: unsafe extern "C" fn() -> NcclResult,
     // An entry point of newer releases (2.28).
     pub(super) all_to_all: Result<Collective>,
+    /// `ncclCommSuspend(comm, flags)` and `ncclCommResume(comm)`, entry
+    /// points of newer releases (2.30).
+    pub(super) comm_suspend: Result<unsafe extern "C" fn(Handle, i32) -> NcclResult>,
+    pub(super) comm_resume: Result<unsafe extern "C" fn(Handle) -> NcclResult>,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
 }
@@ -89,6 +93,8 @@ pub(super) fn api() -> Result<&'static Api> {
                 group_start: symbol(&library, "ncclGroupStart")?,
                 group_end: symbol(&library, "ncclGroupEnd")?,
                 all_to_all: symbol(&library, "ncclAlltoAll"),
+                comm_suspend: symbol(&library, "ncclCommSuspend"),
+                comm_resume: symbol(&library, "ncclCommResume"),
                 _library: library,
             })
         }

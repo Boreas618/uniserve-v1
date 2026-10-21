@@ -1003,6 +1003,24 @@ impl SchedulerHandle {
             tracing::warn!("scheduler thread panicked during shutdown");
         }
     }
+
+    /// Shuts every scheduler of `schedulers` down together: each is asked
+    /// before any is joined. Schedulers whose workers share an expert world
+    /// must close those workers at once, since a closing expert rank waits
+    /// for every peer to leave the union.
+    pub fn shutdown_all<'a, I>(schedulers: I)
+    where
+        I: IntoIterator<Item = &'a SchedulerHandle>,
+        I::IntoIter: Clone,
+    {
+        let schedulers = schedulers.into_iter();
+        for scheduler in schedulers.clone() {
+            scheduler.commands.shutdown();
+        }
+        for scheduler in schedulers {
+            scheduler.shutdown();
+        }
+    }
 }
 
 impl Drop for SchedulerHandle {

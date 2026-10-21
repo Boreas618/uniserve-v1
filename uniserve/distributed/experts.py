@@ -275,6 +275,25 @@ def close_exchange(exchange) -> None:
     exchange.close()
 
 
+def suspend_exchange(exchange) -> bool:
+    """Release a parked standby's transport workspace, keeping its addresses.
+
+    Collective over the union: every member suspends its transport while no
+    step runs. Returns whether the transport released memory; a transport
+    whose workspace cannot be released keeps it.
+    """
+    return bool(exchange.suspend())
+
+
+def restore_exchange(exchange) -> None:
+    """Map a suspended transport workspace back at its addresses.
+
+    Collective over the union, at the promotion of the members' standby
+    world, before any step runs.
+    """
+    exchange.restore()
+
+
 def _prefetched_layers(model) -> list[FusedMoE]:
     """Expert layers whose weights are distributed: partitioned and loaded."""
     return [

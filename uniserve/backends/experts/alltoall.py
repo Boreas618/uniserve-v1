@@ -75,6 +75,24 @@ class AllToAll(ExpertTransport):
                 mnnvl_config=MnnvlConfig(comm_backend=bootstrap),
             )
 
+    def suspend(self) -> bool:
+        """Unmap the MNNVL workspace, keeping its virtual addresses.
+
+        FlashInfer releases every member's handles collectively; the
+        workspace's addresses stay reserved, so the graphs captured over it
+        replay once :meth:`restore` maps new memory there.
+        """
+        self._exchange.checkpoint_prepare()
+        return True
+
+    def restore(self) -> None:
+        """Map new MNNVL memory at the workspace's addresses, collectively.
+
+        FlashInfer re-initializes the workspace's metadata and refuses a
+        layout the captured graphs do not address.
+        """
+        self._exchange.checkpoint_restore(self.bootstrap)
+
     def dispatch(self, hidden, topk_ids, topk_weights, *, invalid_expert):
         """Route ``hidden`` rows by ``topk_ids``.
 

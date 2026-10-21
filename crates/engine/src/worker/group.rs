@@ -298,6 +298,7 @@ impl WorkerGroup {
             .iter()
             .map(|worker| worker.info().clone())
             .collect::<Vec<_>>();
+        let generation = self.workers.first().map(WorkerProcess::generation);
         for worker in &mut self.workers {
             worker.terminate();
         }
@@ -347,10 +348,17 @@ impl WorkerGroup {
         }
 
         // The group's workers are stopped on every node before the domain
-        // relaunches them through the same daemons.
-        if let Err(error) = super::processes::lock(&self.processes)
-            .and_then(|mut processes| processes.stop(&self.process_args.worker_id))
-        {
+        // relaunches them through the same daemons; a parked standby world
+        // launched beside them keeps running, to be promoted.
+        let keeps_world = domain.standby_parked();
+        if let Err(error) = super::processes::lock(&self.processes).and_then(|mut processes| {
+            match generation.filter(|_| keeps_world) {
+                Some(generation) => {
+                    processes.stop_generation(&self.process_args.worker_id, generation)
+                }
+                None => processes.stop(&self.process_args.worker_id),
+            }
+        }) {
             tracing::warn!(
                 worker = %self.process_args.worker_id,
                 "stopping the group's workers: {error:#}"

@@ -119,6 +119,25 @@ fn a_stop_ends_every_generation_of_one_group_only() {
     assert!(alive(kept), "a stop ended another group");
 }
 
+/// A stop that names one generation ends that launch of the group, and
+/// leaves the standby launched beside it running.
+#[test]
+fn a_stop_of_one_generation_leaves_the_groups_other_launches() {
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = start(&directory, "node");
+    let mut engine = Engine::connect(daemon.address().unwrap());
+    let serving = engine.spawn(sleeper("node", "group", 0, 0));
+    let standby = engine.spawn(sleeper("node", "group", 0, 1));
+
+    let reply = engine.request(request::Kind::Stop(proto::process::Stop {
+        group: "group".into(),
+        generation: Some(0),
+    }));
+    assert_eq!(reply.error, "");
+    assert!(eventually(|| !alive(serving)));
+    assert!(alive(standby), "a stop of one generation ended another");
+}
+
 #[test]
 fn an_engine_takes_its_processes_with_it() {
     let directory = tempfile::tempdir().unwrap();
@@ -141,6 +160,7 @@ fn an_engine_takes_its_processes_with_it() {
         staying
             .request(request::Kind::Stop(proto::process::Stop {
                 group: "group".into(),
+                generation: None,
             }))
             .kind,
         Some(reply::Kind::Stopped(_))
