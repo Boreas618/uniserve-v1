@@ -37,7 +37,7 @@ impl RequestKind {
     }
 }
 
-/// Head-to-worker request envelope.
+/// Engine-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRequest {
@@ -177,7 +177,7 @@ pub struct WorkerResponseError {
 }
 
 /// A job one of a rank's lanes has performed for at least the rank's stall
-/// bound, half the head's watchdog timeout
+/// bound, half the engine's watchdog timeout
 /// ([`LaunchDescriptor::watchdog_timeout_ms`](crate::LaunchDescriptor)),
 /// as the rank's control thread observes it: the job was submitted and its
 /// completion has not arrived.
@@ -204,7 +204,7 @@ pub struct Stall {
     pub running_ms: u64,
 }
 
-/// Worker-to-head response envelope.
+/// Worker-to-engine response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerResponse {
@@ -236,7 +236,7 @@ pub enum WorkerResponse {
     },
     /// Reports, unasked, a lane that stays inside one job. The rank's
     /// control thread sends it once, and goes on serving the channel; the
-    /// head fails the rank on it.
+    /// engine fails the rank on it.
     Stalled {
         /// The lane, the job's batch and how long the job has run.
         stall: Stall,

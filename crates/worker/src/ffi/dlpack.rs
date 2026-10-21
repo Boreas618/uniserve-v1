@@ -173,7 +173,7 @@ impl DType {
     }
 }
 
-/// The storage element type of a head-to-rank message's dtype; messages keep
+/// The storage element type of an engine-to-rank message's dtype; messages keep
 /// their own serialized enum, converted here once.
 impl From<ipc::DType> for DType {
     fn from(dtype: ipc::DType) -> Self {

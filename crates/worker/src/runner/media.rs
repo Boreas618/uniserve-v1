@@ -12,7 +12,7 @@
 //! ([`crate::executor::batch::HostStage`]).
 //!
 //! The codecs and the muxer run on CPU ranks. The media reader runs on a
-//! rank of the head's host, CPU or CUDA. A CPU rank's condition products are
+//! rank of the engine's host, CPU or CUDA. A CPU rank's condition products are
 //! host bytes, which encoders on its host map and a rank on another host
 //! receives only over the rank channel, whose frames are bounded far below a
 //! reference video's pixels. A CUDA rank's products lie in its device

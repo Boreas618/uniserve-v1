@@ -78,7 +78,7 @@ pub(super) fn resolve(backend: &mut WorkerBackend, plan: &BatchPlan) -> Result<R
 /// revoked here (`LatentPool::supersede`) rather than
 /// left published until its Free: the step then waits only for the reads
 /// other ranks already claimed, which finish by themselves, and never for
-/// a later batch of the head that would carry the Free.
+/// a later batch of the engine that would carry the Free.
 pub(super) fn latent_hazards(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,

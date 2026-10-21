@@ -82,17 +82,17 @@ impl WorkerRegistry {
     /// host does not need a routable one.
     pub(crate) fn bind(routable: bool) -> anyhow::Result<Registry> {
         let directory = tempfile::Builder::new()
-            .prefix("uniserve-head")
+            .prefix("uniserve-engine")
             .tempdir()
-            .context("creating the directory of the head's socket")?;
-        let unix = format!("unix:{}", directory.path().join("head.sock").display());
+            .context("creating the directory of the engine's socket")?;
+        let unix = format!("unix:{}", directory.path().join("engine.sock").display());
         let interface = if routable {
             Ipv4Addr::UNSPECIFIED
         } else {
             Ipv4Addr::LOCALHOST
         };
         let tcp = SocketAddr::from((interface, 0)).to_string();
-        let listener = Listener::bind(&[&unix, &tcp]).context("binding the head's addresses")?;
+        let listener = Listener::bind(&[&unix, &tcp]).context("binding the engine's addresses")?;
         Ok(Arc::new(Mutex::new(Self {
             listener,
             _directory: directory,
@@ -104,7 +104,7 @@ impl WorkerRegistry {
 
     /// Returns the address a rank connects to.
     ///
-    /// A rank on the head's host takes the Unix socket. A rank elsewhere
+    /// A rank on the engine's host takes the Unix socket. A rank elsewhere
     /// takes the TCP port at `reachable`, an address of this host that the
     /// other hosts route to.
     pub(crate) fn address(&self, reachable: Option<IpAddr>) -> anyhow::Result<String> {
@@ -114,7 +114,7 @@ impl WorkerRegistry {
             Some(host) => {
                 let port = addresses[1]
                     .parse::<SocketAddr>()
-                    .context("reading the head's TCP port")?
+                    .context("reading the engine's TCP port")?
                     .port();
                 Ok(SocketAddr::new(host, port).to_string())
             }
@@ -139,7 +139,7 @@ impl WorkerRegistry {
     /// Moves the registrations of `worker_id`'s current launch that have
     /// arrived into `ranks`, by rank, and leaves the other groups'.
     ///
-    /// Fails when a registration states another build than the head's, and
+    /// Fails when a registration states another build than the engine's, and
     /// when one names a rank outside `0..expected` or one already in `ranks`.
     fn take_registered(
         &mut self,
@@ -173,14 +173,14 @@ impl WorkerRegistry {
     /// A connection that fails or sends something else is dropped, which
     /// closes it, and so is a rank's registration that names another launch
     /// than its group's current one. A registration of another build than
-    /// this one fails the call by naming both: the head and whatever
+    /// this one fails the call by naming both: the engine and whatever
     /// registers with it are installed separately, and a deployment that
     /// mixes builds cannot run.
     fn serve(&mut self) -> anyhow::Result<()> {
         while let Some(channel) = self
             .listener
             .try_accept()
-            .context("accepting a connection to the head")?
+            .context("accepting a connection to the engine")?
         {
             self.connecting.push(channel);
         }
@@ -194,7 +194,7 @@ impl WorkerRegistry {
                 }
                 Ok(Some(registration)) => registration,
                 Err(error) => {
-                    tracing::warn!(%error, "a connection to the head sent no registration");
+                    tracing::warn!(%error, "a connection to the engine sent no registration");
                     self.connecting.swap_remove(index);
                     continue;
                 }
@@ -249,7 +249,7 @@ impl WorkerRegistry {
 ///
 /// Fails on an error from `alive`, when the deadline passes with ranks
 /// unregistered (named in the error), when a registration states another
-/// build than the head's, and when one names a rank outside `0..expected`
+/// build than the engine's, and when one names a rank outside `0..expected`
 /// or one that already registered. Connections of other worker groups are
 /// kept for their own launches, and a rank of an earlier launch of this
 /// group is refused without failing this one.
@@ -265,9 +265,9 @@ pub(crate) fn collect(
         // The listener lives as long as the registry, which the caller
         // holds, so its descriptors stay valid once the lock is released.
         let descriptors = {
-            let mut head = lock(registry)?;
-            head.take_registered(worker_id, expected, &mut ranks)?;
-            head.listener.poll_fds()
+            let mut registry = lock(registry)?;
+            registry.take_registered(worker_id, expected, &mut ranks)?;
+            registry.listener.poll_fds()
         };
         if ranks.len() == expected {
             return Ok(ranks.into_values().collect());
@@ -291,7 +291,7 @@ pub(crate) fn collect(
 mod tests {
     use super::*;
 
-    /// Connects to the head and registers as one rank of launch `generation`.
+    /// Connects to the engine and registers as one rank of launch `generation`.
     fn register(address: &str, worker: &str, rank: u32, generation: u64, version: &str) -> Channel {
         let mut channel = Channel::connect(address).unwrap();
         channel
@@ -305,7 +305,7 @@ mod tests {
         channel
     }
 
-    /// Waits until the head closes `channel`.
+    /// Waits until the engine closes `channel`.
     fn closed(channel: &mut Channel) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {

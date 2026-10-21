@@ -76,7 +76,7 @@ pub(crate) enum Command {
     #[command(
         hide = true,
         disable_help_flag = true,
-        override_usage = "uniserve worker --head ADDRESS --worker-id ID --rank R --generation G"
+        override_usage = "uniserve worker --engine ADDRESS --worker-id ID --rank R --generation G"
     )]
     Worker {
         /// The worker's arguments, which the worker library parses.

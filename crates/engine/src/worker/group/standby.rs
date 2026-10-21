@@ -28,7 +28,7 @@ pub(super) struct Standby {
 
 impl WorkerGroup {
     /// Whether the group keeps a standby: `worker_config.standby`, for a
-    /// group that is its own failure domain on the head's host.
+    /// group that is its own failure domain on the engine's host.
     fn keeps_standby(&self) -> bool {
         self.process_args.keep_standby
             && self.failure_domain.0.groups() == 1

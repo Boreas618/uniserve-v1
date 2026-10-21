@@ -59,7 +59,7 @@ Threads exchange messages only. The control thread submits jobs and receives com
 
 Eager expert forwards with several microbatches are the one exception to a single thread per lane: each forward stays suspended inside Python at its expert dispatch points, so each microbatch has a thread of its own, and those threads call Python themselves as cooperative turns, exactly one at a time, so they never contend for the GIL.
 
-Blocking host work runs on host lanes, threads (`<lane>-<index>`) that each serve one kind of work and hand any Python call to the Python thread like every other thread: media (`uniserve-media`), image preparation (`uniserve-image`), prefix cache imports (`worker-cache-import`), transfer reads (`uniserve-<kind>-read`) and shared-memory retirement (`uniserve-posix-shm-retire`). Signals (`worker-signals`), VMM descriptor grants (`worker-descriptor-grants`) and, during startup, the head watch (`uniserve-head-watch`) are dedicated threads. The Python thread is created by Rust and is Python's main thread; Python installs no signal handlers in a worker.
+Blocking host work runs on host lanes, threads (`<lane>-<index>`) that each serve one kind of work and hand any Python call to the Python thread like every other thread: media (`uniserve-media`), image preparation (`uniserve-image`), prefix cache imports (`worker-cache-import`), transfer reads (`uniserve-<kind>-read`) and shared-memory retirement (`uniserve-posix-shm-retire`). Signals (`worker-signals`), VMM descriptor grants (`worker-descriptor-grants`) and, during startup, the engine watch (`uniserve-engine-watch`) are dedicated threads. The Python thread is created by Rust and is Python's main thread; Python installs no signal handlers in a worker.
 
 ## How Rust calls Python
 

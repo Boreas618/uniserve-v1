@@ -1,5 +1,5 @@
 //! The rank-channel mechanism: the export's bytes travel in its location
-//! over the head's channel. An export stages them on the host
+//! over the engine's channel. An export stages them on the host
 //! ([`Staged::Channel`](super::transport::Staged)); its location is complete
 //! once the copy into the staging was performed. A read copies them from
 //! the location into its destination.

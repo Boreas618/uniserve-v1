@@ -1,5 +1,5 @@
 //! Where a group's calls run: the refusal of placements that put host-shared
-//! storage off the head's host, the ranks that read each media product
+//! storage off the engine's host, the ranks that read each media product
 //! (`media_consumer_slots`), the projection of a batch onto the calls each
 //! rank's components execute (`rank_projection`), and the rank a call's
 //! results join on (`output_owner`).
@@ -13,16 +13,16 @@ use super::WorkerGroup;
 use crate::executor::RankBuffer;
 use crate::worker::IncarnationRegistry;
 
-/// Refuses a placement whose muxer or media reader is not on the head's host.
+/// Refuses a placement whose muxer or media reader is not on the engine's host.
 ///
-/// Both exchange POSIX shared-storage objects with the head by name, and such
-/// a name resolves in one host's namespace: the head opens the artifact a
-/// muxer publishes, and the media reader opens the condition media the head
+/// Both exchange POSIX shared-storage objects with the engine by name, and such
+/// a name resolves in one host's namespace: the engine opens the artifact a
+/// muxer publishes, and the media reader opens the condition media the engine
 /// published. Either placed elsewhere would fail on the first request, so the
 /// placement is refused at startup, naming the component and the host it was
 /// placed on.
-pub(crate) fn refuse_shared_storage_off_head(
-    head: &str,
+pub(crate) fn refuse_shared_storage_off_engine_host(
+    engine_host: &str,
     ranks: &[crate::WorkerRank],
     components: &BTreeMap<String, crate::executor::ComponentConfig>,
     media_components: &BTreeMap<ipc::MediaCall, String>,
@@ -55,9 +55,9 @@ pub(crate) fn refuse_shared_storage_off_head(
                     format!("component {component} names rank {rank} outside the placement")
                 })?;
             anyhow::ensure!(
-                host == head,
-                "component {component} serves {work} on rank {rank} on host {host}, but the head \
-                 is on host {head}, and {object} named in one host's namespace"
+                host == engine_host,
+                "component {component} serves {work} on rank {rank} on host {host}, but the engine \
+                 is on host {engine_host}, and {object} named in one host's namespace"
             );
         }
     }
@@ -330,7 +330,7 @@ pub(super) fn rank_projection(
         }
         // A rank receives the batch's projection onto the calls it owns,
         // under the same identity: commands travel to every participating rank.
-        // Each call states which ranks read its products, which only the head
+        // Each call states which ranks read its products, which only the engine
         // can derive from the placement.
         let mut projection = batch.clone();
         projection.calls = indices
@@ -430,7 +430,7 @@ pub(super) fn rank_projection(
 
 #[cfg(test)]
 mod tests {
-    use super::{output_owner, refuse_shared_storage_off_head};
+    use super::{output_owner, refuse_shared_storage_off_engine_host};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
     use ipc::MediaCall;
@@ -472,25 +472,35 @@ mod tests {
     }
 
     #[test]
-    fn a_muxer_on_the_head_host_is_admitted() {
+    fn a_muxer_on_the_engine_host_is_admitted() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        refuse_shared_storage_off_head("rank-0", &ranks, &components(vec![0]), &muxing("muxer"))
-            .expect("a muxer on the head's host serves the artifact the head opens");
+        refuse_shared_storage_off_engine_host(
+            "rank-0",
+            &ranks,
+            &components(vec![0]),
+            &muxing("muxer"),
+        )
+        .expect("a muxer on the engine's host serves the artifact the engine opens");
         // A deployment without a muxer publishes no artifact and is unaffected.
-        refuse_shared_storage_off_head("rank-0", &ranks, &components(vec![3]), &BTreeMap::new())
-            .expect("a placement without muxing has no artifact to place");
+        refuse_shared_storage_off_engine_host(
+            "rank-0",
+            &ranks,
+            &components(vec![3]),
+            &BTreeMap::new(),
+        )
+        .expect("a placement without muxing has no artifact to place");
     }
 
     #[test]
-    fn a_muxer_off_the_head_host_is_refused_by_name() {
+    fn a_muxer_off_the_engine_host_is_refused_by_name() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
-        let error = refuse_shared_storage_off_head(
+        let error = refuse_shared_storage_off_engine_host(
             "rank-0",
             &ranks,
             &components(vec![3]),
             &muxing("muxer"),
         )
-        .expect_err("a muxer on another host cannot publish an artifact the head opens");
+        .expect_err("a muxer on another host cannot publish an artifact the engine opens");
         let message = format!("{error:#}");
         assert!(
             message.contains("muxer"),
@@ -502,10 +512,10 @@ mod tests {
         );
         assert!(
             message.contains("rank-0"),
-            "the refusal names the head's host: {message}"
+            "the refusal names the engine's host: {message}"
         );
 
-        let error = refuse_shared_storage_off_head(
+        let error = refuse_shared_storage_off_engine_host(
             "rank-0",
             &ranks,
             &components(vec![0]),
@@ -515,10 +525,10 @@ mod tests {
         assert!(format!("{error:#}").contains("output"));
     }
 
-    /// The media reader opens the condition media the head published by name,
-    /// so it is refused off the head's host as the muxer is.
+    /// The media reader opens the condition media the engine published by name,
+    /// so it is refused off the engine's host as the muxer is.
     #[test]
-    fn a_media_reader_off_the_head_host_is_refused_by_name() {
+    fn a_media_reader_off_the_engine_host_is_refused_by_name() {
         let ranks = placement(&["rank-0", "rank-0", "rank-1", "rank-1"]);
         let reading = |ranks: Vec<usize>| {
             (
@@ -531,11 +541,11 @@ mod tests {
         };
 
         let (components, calls) = reading(vec![1]);
-        refuse_shared_storage_off_head("rank-0", &ranks, &components, &calls)
-            .expect("a media reader on the head's host reads the published media");
+        refuse_shared_storage_off_engine_host("rank-0", &ranks, &components, &calls)
+            .expect("a media reader on the engine's host reads the published media");
 
         let (components, calls) = reading(vec![2]);
-        let error = refuse_shared_storage_off_head("rank-0", &ranks, &components, &calls)
+        let error = refuse_shared_storage_off_engine_host("rank-0", &ranks, &components, &calls)
             .expect_err("a media reader on another host cannot open the published media");
         let message = format!("{error:#}");
         assert!(

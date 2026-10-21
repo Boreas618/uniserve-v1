@@ -396,7 +396,7 @@ impl Worker {
 
         let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
-        // The head copies the cache's pages through the host page tier when
+        // The engine copies the cache's pages through the host page tier when
         // it says so; pages are keyed by the whole model's fingerprint.
         let model_fingerprint = fingerprints.as_ref().map(weights::Fingerprints::model);
         if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
@@ -739,7 +739,7 @@ impl Worker {
     }
 
     /// Serve the channel until the engine closes the rank or a fatal
-    /// response ends admission, or until the head's channel fails
+    /// response ends admission, or until the engine's channel fails
     /// ([`Ending`]), reporting a lane that stays inside one job for
     /// `stall_bound`.
     pub(crate) fn run(
@@ -760,7 +760,7 @@ impl Worker {
             cache.scratch_units = scratch;
         }
         // A standby worker parks with its exclusive storages read-only until
-        // the head promotes it.
+        // the engine promotes it.
         let standby = if self.retained.standing_by() {
             self.retained.park()?;
             Some(Arc::clone(&self.retained))
@@ -1085,7 +1085,7 @@ fn reserve_join_pools(
 }
 
 /// The worker's identity for transfers: the deployment's name of its host,
-/// its process and its incarnation. The head knows which worker group and
+/// its process and its incarnation. The engine knows which worker group and
 /// rank the incarnation serves.
 fn endpoint(host: &str) -> WorkerEndpoint {
     WorkerEndpoint {

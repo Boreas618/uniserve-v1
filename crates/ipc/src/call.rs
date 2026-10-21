@@ -364,7 +364,7 @@ pub struct Call {
     ///
     /// A producing rank cannot name its readers: it knows its own component,
     /// not which component consumes what it publishes, and a product is read
-    /// in a later batch than the one producing it. The head states them, and
+    /// in a later batch than the one producing it. The engine states them, and
     /// a published product retires once each has acknowledged it. The
     /// executing rank's own slot is never listed.
     pub consumer_slots: Vec<u32>,

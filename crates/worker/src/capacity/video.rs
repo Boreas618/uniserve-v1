@@ -28,7 +28,7 @@ pub(crate) struct VideoCapacity {
     pub(crate) media: MediaPlan,
     pub(crate) pages: SamplePages,
     /// Whether the worker holds the denoiser on any of its ranks, and so
-    /// reports the sample pool the head schedules pages by.
+    /// reports the sample pool the engine schedules pages by.
     pub(crate) sampling: bool,
     /// The denoiser's slot state on a denoising rank.
     pub(crate) envelope: Option<StateEnvelope>,

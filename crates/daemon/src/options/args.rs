@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn a_deployment_places_unnamed_ranks_on_this_host() {
         let deployment = written(
-            "head-deployment",
+            "engine-deployment",
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
              [worker_groups.components.model]\ntensor_parallel_size = 2\n",
         );

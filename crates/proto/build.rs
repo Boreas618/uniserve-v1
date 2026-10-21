@@ -6,8 +6,8 @@
 //! towards the build identity like every other source.
 //!
 //! The build identity is a digest of the workspace sources every artifact of
-//! a build is compiled from. The head, a node's daemon and the rank runtime
-//! library are installed as separate artifacts and exchange the engine
+//! a build is compiled from. The engine process, a node's daemon and the rank
+//! runtime library are installed as separate artifacts and exchange the engine
 //! interface's messages in a positional encoding, so each registration
 //! states the build it runs and the engine refuses any other; the package
 //! version cannot tell two builds of one version apart, the digest does.

@@ -11,7 +11,7 @@
 //!   that decide unit reuse;
 //! - the import lane: bounded workspaces whose host tasks copy other ranks'
 //!   exports into assigned pages;
-//! - [`PageTier`]: the host page pools the head copies pages through, on
+//! - [`PageTier`]: the host page pools the engine copies pages through, on
 //!   the rank's copy lane ([`PrefixCache::issue_pages`]).
 //!
 //! Every device write runs on a stream the caller supplies; nothing reads a
@@ -89,7 +89,7 @@ pub struct PrefixCache {
     bases: TransferBases,
     imports: Imports,
     /// The host page tier and the copy lane its copies run on, when the
-    /// head copies pages through it.
+    /// engine copies pages through it.
     pages: Option<PageLane>,
     /// The most units warmup lent as scratch (`1..=` this), which the rank
     /// reports so that a standby worker's warmup stays inside them.
@@ -195,9 +195,9 @@ impl PrefixCache {
     /// export, import or execution addresses them, checked here) and which
     /// the reads overwrite whole, so the batch does not recycle them; its
     /// forward waits on the returned read fence. The writes copy pages the
-    /// head published once it accepted the result of the call that computed
+    /// engine published once it accepted the result of the call that computed
     /// them, so the forward that produced them completed before this batch
-    /// was sent, and the head holds their units until the batch's output
+    /// was sent, and the engine holds their units until the batch's output
     /// commits them; that output waits on the returned write fence, and
     /// nothing else does.
     ///

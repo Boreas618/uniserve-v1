@@ -32,7 +32,7 @@
 //!
 //! The tier serves worker groups whose cache is one full-attention group.
 //! A rank's pool is reached through its host's Storage Server: on the
-//! head's host through the server's socket, on another host over the TCP
+//! engine's host through the server's socket, on another host over the TCP
 //! address the rank reports for it. Requests to the servers never block
 //! the scheduler:
 //! they are submitted, and their answers are taken by [`Tiers::poll`] at
@@ -169,7 +169,7 @@ struct Write {
 
 /// One rank's report for [`Tiers::add_worker`].
 pub(crate) struct RankCache<'a> {
-    /// Whether the rank runs on the head's host.
+    /// Whether the rank runs on the engine's host.
     pub local: bool,
     pub cache: &'a PrefixCacheInfo,
 }
@@ -177,7 +177,7 @@ pub(crate) struct RankCache<'a> {
 /// The scheduler's side of the host page tier.
 pub(crate) struct Tiers {
     deployment: String,
-    /// The connections to the servers: the head's host's first, then other
+    /// The connections to the servers: the engine's host's first, then other
     /// hosts' by the TCP address they were reached at.
     clients: Vec<Client>,
     remote: HashMap<String, usize>,

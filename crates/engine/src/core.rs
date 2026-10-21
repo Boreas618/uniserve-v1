@@ -274,7 +274,7 @@ impl WorkerGroupConfig {
     /// All `cores * ranks_per_core` ranks are placed at once as
     /// [`WorkerGroupConfig::placed`] places them, in blocks over `hosts`, and
     /// consecutive runs of `ranks_per_core` form the groups, so the first
-    /// schedulers fill the head's host first. The group of one scheduler
+    /// schedulers fill the engine's host first. The group of one scheduler
     /// is `model`; the group of core `i` of several is `model-<i>`.
     pub fn data_parallel(
         hosts: &[String],
@@ -1000,8 +1000,8 @@ mod tests {
 
     #[test]
     fn the_shorthand_blocks_ranks_across_the_hosts_it_is_given() {
-        // Eight devices over two four-device hosts, the head's host first as
-        // the CLI lists them. `WorkerGroup` refuses a muxer off the head's
+        // Eight devices over two four-device hosts, the engine's host first as
+        // the CLI lists them. `WorkerGroup` refuses a muxer off the engine's
         // host, so a deployment that places its muxer on rank zero needs the
         // lowest ranks on the first host, and each host must number its own
         // devices from zero.
@@ -1029,7 +1029,8 @@ mod tests {
         assert!(worker.validate().is_ok());
 
         // A component the model spans over the group keeps all eight ranks,
-        // and one it places alone stays on rank zero, which is the head's host.
+        // and one it places alone stays on rank zero, which is the engine's
+        // host.
         for entry in ["parallel", "divided"] {
             assert_eq!(
                 worker.components[entry].ranks.len(),
@@ -1041,7 +1042,8 @@ mod tests {
     }
 
     /// The two-rank groups of four schedulers over two four-device hosts
-    /// fill the head's host first, and each group keeps its ranks on one host.
+    /// fill the engine's host first, and each group keeps its ranks on one
+    /// host.
     #[test]
     fn the_data_parallel_shorthand_places_engine_cores_in_host_blocks() {
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
@@ -1160,7 +1162,7 @@ mod tests {
     #[test]
     fn a_rank_count_that_does_not_divide_its_hosts_still_places_every_rank() {
         // The first hosts take the remainder, which keeps each host's block
-        // contiguous and rank zero on the head's host.
+        // contiguous and rank zero on the engine's host.
         let hosts = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
         let worker = WorkerGroupConfig::placed(
             &hosts,

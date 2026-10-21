@@ -11,15 +11,15 @@
 //! | condition | status |
 //! | --- | --- |
 //! | argument or descriptor error | 2, after a usage line |
-//! | the head cannot be reached or refuses the registration | 1 |
-//! | the interpreter does not start | 1, after reporting to the head |
+//! | the engine cannot be reached or refuses the registration | 1 |
+//! | the interpreter does not start | 1, after reporting to the engine |
 //! | SIGINT before serving | 130 |
 //! | SIGTERM before serving | signal death |
-//! | the head's connection closing before serving | 1, at once |
+//! | the engine's connection closing before serving | 1, at once |
 //! | startup or serving failure | 1, after an aborted close |
-//! | the head's connection closing while serving with work in flight | 1, at once, from the control thread |
-//! | the head's connection closing while serving with nothing in flight | 1, after an aborted close and the destruction of the worker's device contexts |
-//! | close by the head, or after a fatal response | 0, after the worker's device contexts are destroyed |
+//! | the engine's connection closing while serving with work in flight | 1, at once, from the control thread |
+//! | the engine's connection closing while serving with nothing in flight | 1, after an aborted close and the destruction of the worker's device contexts |
+//! | close by the engine, or after a fatal response | 0, after the worker's device contexts are destroyed |
 //!
 //! A worker that ends at once runs no teardown and does not destroy its
 //! device contexts (`end`). Every worker that does not close in order with
@@ -35,7 +35,7 @@ use std::path::Path;
 
 pub use arguments::Arguments;
 pub(crate) use arguments::USAGE;
-pub(crate) use registration::HeadWatch;
+pub(crate) use registration::EngineWatch;
 pub use registration::register;
 pub(crate) use signals::Signals;
 
@@ -85,7 +85,7 @@ pub(crate) fn main(argv: &[String], python: &Path) -> i32 {
 
 /// Why a worker ended other than by an orderly close.
 enum Failure {
-    /// The head's launch descriptor names a launch this worker cannot run.
+    /// The engine's launch descriptor names a launch this worker cannot run.
     Descriptor(DescriptorError),
     Worker(WorkerError),
 }
@@ -127,12 +127,12 @@ pub(crate) fn end(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
-/// Reports a failed startup to the head on the channel the worker registered
-/// on, as the error that answers the head's request for its startup report.
-/// The head names the worker and returns its error, and may end the
+/// Reports a failed startup to the engine on the channel the worker registered
+/// on, as the error that answers the engine's request for its startup report.
+/// The engine names the worker and returns its error, and may end the
 /// worker's group as soon as it has read it, before the worker logs the
 /// error itself.
-/// A failure to send leaves the head to notice the closed connection.
+/// A failure to send leaves the engine to notice the closed connection.
 fn report_startup_failure(channel: &mut ipc::Channel, error: &WorkerError) {
     let response = ipc::WorkerResponse::Error {
         message_id: None,
@@ -228,15 +228,15 @@ fn run(
     ended.outcome
 }
 
-/// The worker's life on the control thread: register with the head, wait
+/// The worker's life on the control thread: register with the engine, wait
 /// for the Python thread (`ready`), start, warm up, serve and close.
 ///
-/// A close by the head is collective: the group's workers retire the
+/// A close by the engine is collective: the group's workers retire the
 /// communicators and process groups they share together, so the close is
-/// orderly. Without the head no worker learns what its peers do, and a peer
+/// orderly. Without the engine no worker learns what its peers do, and a peer
 /// may have abandoned its work or stopped; an orderly close would wait on it
 /// for good, so the worker closes without waiting on device work or peers. Its
-/// devices are settled when the head closed it in order, or when the head's
+/// devices are settled when the engine closed it in order, or when the engine's
 /// channel failed while nothing was in flight. When work was in flight, the
 /// process ends here at once.
 fn serve(
@@ -253,15 +253,15 @@ fn serve(
         Err(error) => return Failure::Descriptor(error).into(),
     };
 
-    // Until the service observes the connection, the head's close ends the
+    // Until the service observes the connection, the engine's close ends the
     // process from the watch's thread.
     let hangup = match channel.hangup() {
         Ok(hangup) => hangup,
         Err(error) => {
-            return crate::Error::transport_source("watching the head connection", error).into();
+            return crate::Error::transport_source("watching the engine connection", error).into();
         }
     };
-    let mut starting = match HeadWatch::start(hangup) {
+    let mut starting = match EngineWatch::start(hangup) {
         Ok(watch) => Some(watch),
         Err(error) => return error.into(),
     };
@@ -305,7 +305,7 @@ fn serve(
             // inside a device call behind a collective whose peer stopped,
             // and an aborted close then waits with it: the worker can neither
             // return through that thread nor close. The process ends from
-            // here, as the head watch ends a starting worker.
+            // here, as the engine watch ends a starting worker.
             tracing::error!("worker failed: {error}");
             end(1);
         }

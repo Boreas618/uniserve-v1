@@ -84,7 +84,7 @@ pub(crate) struct DenoiseResume {
 ///
 /// A rank opens a trajectory when it prepares its latent, so a denoising
 /// reaches this boundary for a trajectory whose committed version was
-/// transferred from the rank that prepared it: its head placed the
+/// transferred from the rank that prepared it: its engine placed the
 /// preparation and the denoising on different workers. The engine's
 /// scheduler keeps a request's image calls on the replica that holds its
 /// state, so its own plans open every trajectory at its preparation; the

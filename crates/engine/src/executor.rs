@@ -11,7 +11,7 @@
 //! the placement the engine launched them with, into the single capacity view
 //! the scheduler plans against; the result types a poll
 //! returns; and [`TransferConfig`], the directed transfer edges between worker
-//! ranks and the placement they resolve against, from which the head derives
+//! ranks and the placement they resolve against, from which the engine derives
 //! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
 //! slot, same-host slots, and whether products cross hosts) and the consumer
 //! slots stated on each producing call.
@@ -972,7 +972,7 @@ impl TransferConfig {
     /// excluding the rank itself. The answer is `true` when this rank or any
     /// consumer has no recorded host, because a shared host cannot then be
     /// established. A rank cannot derive this itself: the mapping lives in the
-    /// transfer edges and the placement, which only the head holds.
+    /// transfer edges and the placement, which only the engine holds.
     ///
     /// Readiness is a producer synchronize only where it has to be. Within a
     /// host an interprocess event carries it at no cost to the producing

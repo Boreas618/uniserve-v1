@@ -92,7 +92,7 @@ fn resolved(overrides: Value) -> Result<WorkerLaunch, String> {
 }
 
 /// Resolve the descriptor `text` states, as the rank does with the one the
-/// head sends it.
+/// engine sends it.
 fn resolve_text(text: &str) -> Result<WorkerLaunch, String> {
     let descriptor = serde_json::from_str(text).map_err(|error| error.to_string())?;
     resolve(descriptor, "worker", 1).map_err(|error| error.to_string())

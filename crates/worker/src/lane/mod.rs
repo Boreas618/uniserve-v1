@@ -34,7 +34,7 @@
 //! queues know which jobs each lane and the Python thread have been given
 //! and not completed, and since when ([`JobQueues::oldest`]): a lane that
 //! stays inside one job, such as a driver call that does not return, is
-//! seen from the control thread, which reports it to the head.
+//! seen from the control thread, which reports it to the engine.
 //!
 //! A rank whose prefix cache copies pages through the host page tier has a
 //! copy lane beside them: a full-device stream of the cache's device and

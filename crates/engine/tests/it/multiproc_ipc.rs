@@ -74,20 +74,20 @@ fn finish(request_key: RequestKey) -> BatchCommand {
     }
 }
 
-/// The head's end of one rank's channel, driven by a test: it starts a stub
+/// The engine's end of one rank's channel, driven by a test: it starts a stub
 /// rank, answers its registration, sends requests and takes each response by
 /// the identity its request carried.
-struct RawHead {
+struct RawEngine {
     channel: ipc::Channel,
     /// Responses read while waiting for another one.
     inbox: std::collections::HashMap<u64, ipc::WorkerResponse>,
 }
 
-impl RawHead {
+impl RawEngine {
     /// Starts the stub worker as a raw process, outside any group, as a
     /// member of launch 1, and answers its registration with `descriptor`.
     ///
-    /// The head listens at `address`, so the rank reaches it over a Unix
+    /// The engine listens at `address`, so the rank reaches it over a Unix
     /// socket (`unix:<path>`) or over TCP (`127.0.0.1:0`).
     fn launch(
         address: &str,
@@ -106,7 +106,7 @@ impl RawHead {
         let listener = ipc::Listener::bind(&[address])?;
         let mut child = std::process::Command::new(worker_executable())
             .arg("worker")
-            .args(["--head", &listener.addresses()[0]])
+            .args(["--engine", &listener.addresses()[0]])
             .args(["--worker-id", STUB_WORKER])
             .args(["--rank", &descriptor.rank.to_string()])
             .args(["--generation", "1"])
@@ -126,12 +126,12 @@ impl RawHead {
                 );
                 thread::sleep(Duration::from_millis(5));
             };
-            let mut head = Self {
+            let mut engine = Self {
                 channel,
                 inbox: std::collections::HashMap::new(),
             };
 
-            let registration: ipc::Registration = head.receive(Duration::from_secs(60))?;
+            let registration: ipc::Registration = engine.receive(Duration::from_secs(60))?;
             anyhow::ensure!(
                 registration
                     == ipc::Registration::Worker {
@@ -142,11 +142,11 @@ impl RawHead {
                     },
                 "the rank registered as {registration:?}"
             );
-            head.channel.send(descriptor)?;
-            Ok(head)
+            engine.channel.send(descriptor)?;
+            Ok(engine)
         })();
         match registered {
-            Ok(head) => Ok((head, child)),
+            Ok(engine) => Ok((engine, child)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -227,10 +227,10 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
     use ipc::{WorkerRequest, WorkerResponse};
 
     // A graceful exit is observable as the next launch registering and
-    // serving again. The rank reaches the head over loopback TCP, as a rank
+    // serving again. The rank reaches the engine over loopback TCP, as a rank
     // on another host would.
     for _ in 0..2 {
-        let (mut client, mut child) = RawHead::launch("127.0.0.1:0", &stub_launch_descriptor())?;
+        let (mut client, mut child) = RawEngine::launch("127.0.0.1:0", &stub_launch_descriptor())?;
         let result = (|| -> anyhow::Result<()> {
             let request = |mut request: WorkerRequest, message_id| {
                 request.set_message_id(Some(message_id));
@@ -324,12 +324,12 @@ fn native_close_drains_accepted_results_on_each_launch() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_serving_worker_leaves_interrupt_and_termination_to_its_head() -> anyhow::Result<()> {
+fn a_serving_worker_leaves_interrupt_and_termination_to_its_engine() -> anyhow::Result<()> {
     use ipc::{WorkerRequest, WorkerResponse};
 
     let directory = tempfile::tempdir()?;
-    let address = format!("unix:{}", directory.path().join("head.sock").display());
-    let (mut client, mut child) = RawHead::launch(&address, &stub_launch_descriptor())?;
+    let address = format!("unix:{}", directory.path().join("engine.sock").display());
+    let (mut client, mut child) = RawEngine::launch(&address, &stub_launch_descriptor())?;
     let result = (|| -> anyhow::Result<()> {
         let request = |mut request: WorkerRequest, message_id| {
             request.set_message_id(Some(message_id));
@@ -356,7 +356,7 @@ fn a_serving_worker_leaves_interrupt_and_termination_to_its_head() -> anyhow::Re
         serve(1, 61, 1)?;
 
         // A terminal's Ctrl-C and a service manager's stop reach every process
-        // of the job; the rank keeps serving until its head closes it.
+        // of the job; the rank keeps serving until its engine closes it.
         let pid = libc::pid_t::try_from(child.id())?;
         for signal in [libc::SIGINT, libc::SIGTERM] {
             // SAFETY: kill takes only integer arguments and touches no memory of this process.
@@ -405,8 +405,8 @@ fn a_starting_worker_stops_on_interrupt_and_dies_of_termination() -> anyhow::Res
         descriptor.components = WorkerGroupConfig::single_component("model", 2);
         descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
         let directory = tempfile::tempdir()?;
-        let address = format!("unix:{}", directory.path().join("head.sock").display());
-        let (_head, mut child) = RawHead::launch(&address, &descriptor)?;
+        let address = format!("unix:{}", directory.path().join("engine.sock").display());
+        let (_engine, mut child) = RawEngine::launch(&address, &descriptor)?;
         let result = (|| -> anyhow::Result<()> {
             // The rank connects to the rendezvous once it has described its
             // model; it is then blocked waiting for the address table.
@@ -438,12 +438,12 @@ fn a_starting_worker_stops_on_interrupt_and_dies_of_termination() -> anyhow::Res
     Ok(())
 }
 
-/// The head's connection is a rank's liveness in every state. A rank that is
+/// The engine's connection is a rank's liveness in every state. A rank that is
 /// still starting, here one waiting in its group's rendezvous for a peer that
-/// never answers, exits when the head closes the connection, and so does a
+/// never answers, exits when the engine closes the connection, and so does a
 /// rank that is serving.
 #[test]
-fn a_worker_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
+fn a_worker_exits_when_its_engine_closes_the_connection() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let address = |name: &str| format!("unix:{}", directory.path().join(name).display());
     let exits_with_failure = |mut child: std::process::Child| -> anyhow::Result<()> {
@@ -453,7 +453,7 @@ fn a_worker_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
         })?;
         anyhow::ensure!(
             status.code() == Some(1),
-            "the rank ended with {status} after its head closed"
+            "the rank ended with {status} after its engine closed"
         );
         Ok(())
     };
@@ -468,30 +468,31 @@ fn a_worker_exits_when_its_head_closes_the_connection() -> anyhow::Result<()> {
     descriptor.host_slots = vec![0, 1];
     descriptor.components = WorkerGroupConfig::single_component("model", 2);
     descriptor.rendezvous_address = Some(rendezvous.local_addr()?.to_string());
-    let (head, child) = RawHead::launch(&address("starting.sock"), &descriptor)?;
+    let (engine, child) = RawEngine::launch(&address("starting.sock"), &descriptor)?;
     let (_peer, _) = rendezvous.accept()?;
-    drop(head);
+    drop(engine);
     exits_with_failure(child)?;
 
     // Serving: a rank that has answered Info waits for its next request.
-    let (mut head, child) = RawHead::launch(&address("serving.sock"), &stub_launch_descriptor())?;
+    let (mut engine, child) =
+        RawEngine::launch(&address("serving.sock"), &stub_launch_descriptor())?;
     let mut info = ipc::WorkerRequest::info();
     info.set_message_id(Some(1));
-    let info = head.send(&info)?;
-    let answered = head.response(info, Duration::from_secs(60))?;
+    let info = engine.send(&info)?;
+    let answered = engine.response(info, Duration::from_secs(60))?;
     anyhow::ensure!(
         matches!(answered, Some(ipc::WorkerResponse::Info { .. })),
         "the rank did not become ready: {answered:?}"
     );
-    drop(head);
+    drop(engine);
     exits_with_failure(child)
 }
 
 /// Runs one stub rank under `descriptor` that is sent a prefill of `token`,
-/// then loses its head once the forward was answered, or, for the stub's
+/// then loses its engine once the forward was answered, or, for the stub's
 /// stalling token, once the stalled job was reported. Returns the rank's
 /// exit status, which it must reach within 30 seconds, and its log.
-fn lose_head(
+fn lose_engine(
     directory: &Path,
     descriptor: &LaunchDescriptor,
     name: &str,
@@ -502,7 +503,7 @@ fn lose_head(
     let address = format!("unix:{}", directory.join(format!("{name}.sock")).display());
     let log_path = directory.join(format!("{name}.log"));
     let log = std::fs::File::create(&log_path)?;
-    let (mut head, mut child) = RawHead::launch_with(&address, descriptor, log.into())?;
+    let (mut engine, mut child) = RawEngine::launch_with(&address, descriptor, log.into())?;
     let served = (|| -> anyhow::Result<()> {
         let admission = text_admission(81, 1, 1)?;
         let mut request = WorkerRequest::submit(token_batch(
@@ -517,11 +518,11 @@ fn lose_head(
             0,
         ));
         request.set_message_id(Some(1));
-        head.send(&request)?;
+        engine.send(&request)?;
         // A stalled job's report answers no request, so it carries no
         // identity.
         let stalling = token == STUB_STALL;
-        let answered = head
+        let answered = engine
             .response(if stalling { 0 } else { 1 }, Duration::from_secs(60))?
             .context("the rank neither answered nor reported its job")?;
         anyhow::ensure!(
@@ -533,7 +534,7 @@ fn lose_head(
         );
         Ok(())
     })();
-    drop(head);
+    drop(engine);
     let status = wait_exit(&mut child, Duration::from_secs(30));
     if status.is_err() {
         let _ = child.kill();
@@ -543,37 +544,37 @@ fn lose_head(
     Ok((status?, std::fs::read_to_string(log_path)?))
 }
 
-/// A serving rank whose head is lost ends by what it has in flight. With
+/// A serving rank whose engine is lost ends by what it has in flight. With
 /// nothing in flight, as once its last batch was answered, it closes without
 /// its peers and destroys its device contexts; with a job stuck in flight,
 /// here a forward that never returns, it ends at once from its control
 /// thread, since its Python thread waits in that job. Either way it exits
 /// promptly with status 1 and names the path in its log.
 #[test]
-fn a_worker_without_its_head_closes_when_idle_and_ends_at_once_when_stuck() -> anyhow::Result<()> {
+fn a_rank_without_its_engine_closes_when_idle_and_ends_at_once_when_stuck() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let descriptor = LaunchDescriptor {
         watchdog_timeout_ms: 1_000,
         ..stub_launch_descriptor()
     };
 
-    let (status, log) = lose_head(directory.path(), &descriptor, "idle", 7)?;
+    let (status, log) = lose_engine(directory.path(), &descriptor, "idle", 7)?;
     anyhow::ensure!(
         status.code() == Some(1),
         "the idle rank ended with {status}"
     );
     anyhow::ensure!(
-        log.contains("the head's channel failed with nothing in flight"),
+        log.contains("the engine's channel failed with nothing in flight"),
         "the idle rank did not close orphaned:\n{log}"
     );
 
-    let (status, log) = lose_head(directory.path(), &descriptor, "stuck", STUB_STALL)?;
+    let (status, log) = lose_engine(directory.path(), &descriptor, "stuck", STUB_STALL)?;
     anyhow::ensure!(
         status.code() == Some(1),
         "the stuck rank ended with {status}"
     );
     anyhow::ensure!(
-        log.contains("the head's channel failed with work in flight"),
+        log.contains("the engine's channel failed with work in flight"),
         "the stuck rank did not abandon its work:\n{log}"
     );
     Ok(())
@@ -834,11 +835,11 @@ fn a_lost_worker_group_is_replaced_by_its_standby() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A rank whose startup fails reports its own error to the head, which
+/// A rank whose startup fails reports its own error to the engine, which
 /// names the rank and returns that error: here a checkpoint that does not
 /// exist.
 #[test]
-fn a_failed_startup_reaches_the_head_with_the_workers_error() -> anyhow::Result<()> {
+fn a_failed_startup_reaches_the_engine_with_the_workers_error() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let missing = directory.path().join("no-such-checkpoint");
     let mut args = single_worker_args("failing", QUEUE_DEPTH);
@@ -850,25 +851,25 @@ fn a_failed_startup_reaches_the_head_with_the_workers_error() -> anyhow::Result<
     let message = format!("{error:#}");
     anyhow::ensure!(
         message.contains("rank 0 failed during startup") && message.contains("no-such-checkpoint"),
-        "the head did not return the rank's error: {message}"
+        "the engine did not return the rank's error: {message}"
     );
     Ok(())
 }
 
 /// A rank whose lane stays inside one job reports the lane and the job's
-/// forward to its head, unasked, once the job has run for the launch's stall
+/// forward to its engine, unasked, once the job has run for the launch's stall
 /// bound, and goes on serving its channel.
 #[test]
 fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()> {
     use ipc::{ErrorCallIdentity, WorkerRequest, WorkerResponse};
 
     let directory = tempfile::tempdir()?;
-    let address = format!("unix:{}", directory.path().join("head.sock").display());
+    let address = format!("unix:{}", directory.path().join("engine.sock").display());
     let descriptor = LaunchDescriptor {
         watchdog_timeout_ms: 1_000,
         ..stub_launch_descriptor()
     };
-    let (mut head, mut child) = RawHead::launch(&address, &descriptor)?;
+    let (mut engine, mut child) = RawEngine::launch(&address, &descriptor)?;
     let result = (|| -> anyhow::Result<()> {
         let request = |mut request: WorkerRequest, message_id| {
             request.set_message_id(Some(message_id));
@@ -890,10 +891,10 @@ fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()>
             UnitId(1),
             0,
         );
-        head.send(&request(WorkerRequest::submit(stalling), 1))?;
+        engine.send(&request(WorkerRequest::submit(stalling), 1))?;
 
         // The report answers no request, so it carries no identity.
-        let report = head
+        let report = engine
             .response(0, Duration::from_secs(60))?
             .context("the stalled lane was not reported")?;
         let WorkerResponse::Stalled { stall } = report else {
@@ -915,8 +916,8 @@ fn a_stalled_lane_is_reported_while_its_worker_serves_on() -> anyhow::Result<()>
         anyhow::ensure!(stall.running_ms >= 500, "{stall:?}");
 
         // The control thread still serves the channel.
-        let info = head.send(&request(WorkerRequest::info(), 2))?;
-        let answered = head.response(info, Duration::from_secs(10))?;
+        let info = engine.send(&request(WorkerRequest::info(), 2))?;
+        let answered = engine.response(info, Duration::from_secs(10))?;
         anyhow::ensure!(
             matches!(answered, Some(WorkerResponse::Info { .. })),
             "the stalled rank did not answer Info: {answered:?}"
@@ -1013,7 +1014,7 @@ fn replacement_rejects_changed_capacity() -> anyhow::Result<()> {
     // Killing rank zero relaunches the group. Once replacement.json exists
     // the wrapper starts each relaunched rank as a `media_worker` process,
     // which answers Info with that file's worker info, so the replacement
-    // describes a different capacity; the head must refuse it and stop
+    // describes a different capacity; the engine must refuse it and stop
     // using the group.
     type Change = fn(&mut ipc::WorkerInfo);
     let changes: [(&str, Change); 2] = [
@@ -1614,7 +1615,7 @@ fn registration_frames(
         .collect()
 }
 
-/// The head and its ranks must be one build, since the message types are the
+/// The engine and its ranks must be one build, since the message types are the
 /// only definition of their protocol and their encoding is positional. A rank
 /// states its build when it registers, and a launch fails by naming a rank of
 /// another one, including another build of the same package version.
@@ -1623,10 +1624,13 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     // The stand-in registers as the rank it was started as, for the launch
-    // it was started for, under a build of the head's package version that
-    // the head is not, and then waits for the head to close.
+    // it was started for, under a build of the engine's package version that
+    // the engine is not, and then waits for the engine to close.
     let other = format!("{}+0123456789abcdef", env!("CARGO_PKG_VERSION"));
-    anyhow::ensure!(other != ipc::VERSION, "the stand-in's build is the head's");
+    anyhow::ensure!(
+        other != ipc::VERSION,
+        "the stand-in's build is the engine's"
+    );
     let mut args = worker_group_args();
     let frames = registration_frames(&args, |rank| ipc::Registration::Worker {
         worker_id: args.worker_id.clone(),
@@ -1639,7 +1643,7 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport socket, sys\nframes = {frames:?}\nrank = int(sys.argv[sys.argv.index('--rank') + 1])\nhead = sys.argv[sys.argv.index('--head') + 1]\nconnection = socket.socket(socket.AF_UNIX)\nconnection.connect(head.removeprefix('unix:'))\nconnection.sendall(bytes.fromhex(frames[rank]))\nconnection.settimeout(60)\nwhile connection.recv(4096):\n    pass\n"
+            "#!/usr/bin/env python3\nimport socket, sys\nframes = {frames:?}\nrank = int(sys.argv[sys.argv.index('--rank') + 1])\nengine = sys.argv[sys.argv.index('--engine') + 1]\nconnection = socket.socket(socket.AF_UNIX)\nconnection.connect(engine.removeprefix('unix:'))\nconnection.sendall(bytes.fromhex(frames[rank]))\nconnection.settimeout(60)\nwhile connection.recv(4096):\n    pass\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -1657,7 +1661,7 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
 }
 
 /// A group relaunched after it lost a rank takes only ranks of the relaunch.
-/// A rank that registers for the launch the group lost is refused: the head
+/// A rank that registers for the launch the group lost is refused: the engine
 /// closes its connection, the relaunch completes and the group serves again.
 #[test]
 fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()> {
@@ -1665,9 +1669,9 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
 
     // Each wrapper rank records its process id. When it is started for the
     // relaunch (launch 2), it first registers as the same rank of launch 1
-    // on a connection of its own, waits until the head closes that
+    // on a connection of its own, waits until the engine closes that
     // connection, records `<rank>.refused`, and then runs the stub worker,
-    // which registers for the relaunch. Had the head taken the stale
+    // which registers for the relaunch. Had the engine taken the stale
     // registration, it would have answered it instead of closing, and the
     // relaunch would have failed on a rank registered twice.
     let directory = tempfile::tempdir()?;
@@ -1684,7 +1688,7 @@ fn a_relaunch_refuses_a_worker_of_the_launch_it_replaced() -> anyhow::Result<()>
     std::fs::write(
         &wrapper,
         format!(
-            "#!/usr/bin/env python3\nimport os, socket, sys\nfrom pathlib import Path\nrecords = Path({records})\nframes = {frames:?}\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\nrank = argument('--rank')\n(records / (rank + '.pid')).write_text(str(os.getpid()))\nif argument('--generation') == '2':\n    stale = socket.socket(socket.AF_UNIX)\n    stale.connect(argument('--head').removeprefix('unix:'))\n    stale.sendall(bytes.fromhex(frames[int(rank)]))\n    stale.settimeout(60)\n    if stale.recv(4096) == b'':\n        (records / (rank + '.refused')).write_text('')\n    stale.close()\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
+            "#!/usr/bin/env python3\nimport os, socket, sys\nfrom pathlib import Path\nrecords = Path({records})\nframes = {frames:?}\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\nrank = argument('--rank')\n(records / (rank + '.pid')).write_text(str(os.getpid()))\nif argument('--generation') == '2':\n    stale = socket.socket(socket.AF_UNIX)\n    stale.connect(argument('--engine').removeprefix('unix:'))\n    stale.sendall(bytes.fromhex(frames[int(rank)]))\n    stale.settimeout(60)\n    if stale.recv(4096) == b'':\n        (records / (rank + '.refused')).write_text('')\n    stale.close()\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
@@ -2372,7 +2376,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         host_slots: vec![0],
         products_cross_hosts: false,
         queue_depth: 8,
-        // The head's default watchdog timeout.
+        // The engine's default watchdog timeout.
         watchdog_timeout_ms: 300_000,
         model: String::new(),
         host: "localhost".into(),
@@ -3965,9 +3969,9 @@ fn image_bytes(result: &engine::BatchResult) -> anyhow::Result<Vec<u8>> {
 /// arrives) and denoises it to the image its own preparation of the same
 /// seed gives.
 ///
-/// Both workers publish every version they write, and this head submits
-/// each batch only after the previous result and frees no version on the
-/// way: a step that writes over the bank of a published version two steps
+/// Both workers publish every version they write, and the test, as the engine,
+/// submits each batch only after the previous result and frees no version on
+/// the way: a step that writes over the bank of a published version two steps
 /// back runs without waiting for a Free.
 #[test]
 fn a_trajectory_prepared_on_another_worker_denoises_to_the_same_image() -> anyhow::Result<()> {
@@ -4829,9 +4833,9 @@ fn media_worker() -> anyhow::Result<()> {
             .with_context(|| format!("a rank launch names {name}"))
     };
 
-    // Register with the head as the rank this process was started as, and
+    // Register with the engine as the rank this process was started as, and
     // take the launch descriptor it answers with.
-    let mut server = Channel::connect(argument("--head")?)?;
+    let mut server = Channel::connect(argument("--engine")?)?;
     server.send(&Registration::Worker {
         worker_id: argument("--worker-id")?.clone(),
         rank: argument("--rank")?.parse()?,

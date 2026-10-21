@@ -17,7 +17,7 @@
 //! it fails a dead one. The daemon that started a rank reaps it and removes
 //! the CUDA driver memory a rank that did not end in order left behind.
 //!
-//! The head exchanges batch descriptors and bounded result values while
+//! The engine exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
 //!
 //! The defaults of the launch settings `WorkerProcessArgs` carries and the
@@ -159,8 +159,8 @@ pub(crate) struct WorkerSockets {
 
 impl PendingWorker {
     /// Has the daemon of the rank's node start one rank, which connects to
-    /// the engine at `head` and registers as a member of its group's launch
-    /// `generation`.
+    /// the engine at `engine_address` and registers as a member of its group's
+    /// launch `generation`.
     ///
     /// Nothing here waits for the rank. `rendezvous` is the group's
     /// collective store address, and `sockets` name the reservations of the
@@ -183,7 +183,7 @@ impl PendingWorker {
         sockets: WorkerSockets,
         processes: &Processes,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        head: &str,
+        engine_address: &str,
         generation: u64,
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
@@ -196,8 +196,8 @@ impl PendingWorker {
         // repeats none of them.
         let arguments = vec![
             "worker".to_owned(),
-            "--head".to_owned(),
-            head.to_owned(),
+            "--engine".to_owned(),
+            engine_address.to_owned(),
             "--worker-id".to_owned(),
             args.worker_id.clone(),
             "--rank".to_owned(),

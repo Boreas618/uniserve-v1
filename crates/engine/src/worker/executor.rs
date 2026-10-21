@@ -14,7 +14,7 @@
 //! worker receives its batches, and therefore a request's commands, in
 //! submission order.
 //!
-//! The executor also holds the head's copy of every cross-worker product
+//! The executor also holds the engine's copy of every cross-worker product
 //! export until the scheduler frees the buffer or its request finishes
 //! without retaining it, and on a `WorkerFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
@@ -201,7 +201,7 @@ pub struct WorkerExecutor {
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
     /// Tensor exports returned by producing workers, merged across the
     /// ranks that publish parts of one product. A `channel` locator carries
-    /// the product's bytes, which the head therefore holds until the buffer
+    /// the product's bytes, which the engine therefore holds until the buffer
     /// is freed or its request finishes without retaining it.
     transfer_products: HashMap<BufferId, TensorExport>,
     /// Cache exports returned by producing workers.
@@ -794,7 +794,7 @@ impl WorkerExecutor {
                 .retain(|location| self.incarnations.position(&location.source).is_some());
         }
 
-        // Routing stays on the head: the group names each call's reading
+        // Routing stays on the engine: the group names each call's reading
         // ranks from the workers its request was routed to.
         let readers = batch
             .requests

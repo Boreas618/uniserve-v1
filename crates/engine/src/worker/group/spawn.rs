@@ -13,7 +13,7 @@ use anyhow::Context;
 
 use super::WorkerGroup;
 use super::domain::FailureDomain;
-use super::routing::refuse_shared_storage_off_head;
+use super::routing::refuse_shared_storage_off_engine_host;
 use crate::worker::WorkerProcessArgs;
 use crate::worker::claims::{Claims, StorageClaims};
 use crate::worker::process::WorkerSockets;
@@ -109,11 +109,13 @@ impl WorkerProcessArgs {
             None
         };
         let (generation, local_address, remote_address) = {
-            let mut head = crate::worker::registry::lock(registry)?;
+            let mut registry = crate::worker::registry::lock(registry)?;
             (
-                head.begin_launch(&self.worker_id),
-                head.address(None)?,
-                reachable.map(|host| head.address(Some(host))).transpose()?,
+                registry.begin_launch(&self.worker_id),
+                registry.address(None)?,
+                reachable
+                    .map(|host| registry.address(Some(host)))
+                    .transpose()?,
             )
         };
         let mut launched = LaunchedWorkers {
@@ -375,7 +377,7 @@ impl WorkerGroup {
     /// rank's incarnation as the rank it launched. The group takes rank 0's report:
     /// the ranks derive every shared capacity (block size, request slots,
     /// cache units) collectively before they report, so the reports differ
-    /// only in the fields reconciled here. The muxer must run on the head's
+    /// only in the fields reconciled here. The muxer must run on the engine's
     /// host, and the ranks' cache regions must cover every layer's KV heads
     /// without a gap. Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
@@ -456,7 +458,7 @@ impl WorkerGroup {
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
 
-        refuse_shared_storage_off_head(
+        refuse_shared_storage_off_engine_host(
             &process_args.host,
             &process_args.ranks,
             &process_args.components,
