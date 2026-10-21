@@ -14,7 +14,7 @@ use cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
     PitchedBatch, PrimaryContext, Protection, SourceOrder, Stream, Strided, StridedCopy,
-    memcpy_async, memset_d8, memset_d32, reclaim,
+    VirtualPool, memcpy_async, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -577,36 +577,15 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
 }
 
-/// A graph executable instantiated outside the crate runs its captured work
-/// on whichever stream it is launched on: a stream of the primary context
-/// and a stream of an SM partition, neither of which captured it.
+/// A graph executable instantiated from a captured graph runs its captured
+/// work on whichever stream it is launched on, after the graph is
+/// destroyed: a stream of the primary context and a stream of an SM
+/// partition, neither of which captured it.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn graph_executables_launch_on_full_device_and_partition_streams() {
     let _driver = exclusive_driver();
-    type Raw = *mut std::ffi::c_void;
-    type BeginCapture = unsafe extern "C" fn(Raw, i32) -> i32;
-    type EndCapture = unsafe extern "C" fn(Raw, *mut Raw) -> i32;
-    type Instantiate = unsafe extern "C" fn(*mut Raw, Raw, u64) -> i32;
-    type Destroy = unsafe extern "C" fn(Raw) -> i32;
-
-    // SAFETY: loading libcuda runs only the driver's own initializers.
-    let library = unsafe { libloading::Library::new("libcuda.so.1") }.unwrap();
-    // SAFETY: the signatures match cuda.h, and `library` stays loaded while the
-    // copied function pointers are used.
-    let (begin, end, instantiate, destroy_exec, destroy_graph) = unsafe {
-        (
-            *library
-                .get::<BeginCapture>(b"cuStreamBeginCapture_v2")
-                .unwrap(),
-            *library.get::<EndCapture>(b"cuStreamEndCapture").unwrap(),
-            *library
-                .get::<Instantiate>(b"cuGraphInstantiateWithFlags")
-                .unwrap(),
-            *library.get::<Destroy>(b"cuGraphExecDestroy").unwrap(),
-            *library.get::<Destroy>(b"cuGraphDestroy").unwrap(),
-        )
-    };
+    let (begin, end, destroy_graph) = capture_functions();
 
     let capture = Stream::new(DEVICE).unwrap();
     let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
@@ -614,23 +593,19 @@ fn graph_executables_launch_on_full_device_and_partition_streams() {
 
     // The captured work fills the allocation with 7; relaxed mode (2) keeps
     // the capture from interacting with other threads.
-    let (mut graph, mut executable) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let mut graph = std::ptr::null_mut();
     // SAFETY: the stream is live and owned by this test; the fill lies inside
-    // the allocation; the graph ended by this capture is instantiated once.
-    unsafe {
-        assert_eq!(begin(capture.raw() as Raw, 2), 0);
+    // the allocation; the graph ended by this capture is instantiated once
+    // and destroyed after.
+    let launched = unsafe {
+        assert_eq!(begin(capture.raw() as RawHandle, 2), 0);
         memset_d8(device.address(), 7, 256, &capture).unwrap();
-        assert_eq!(end(capture.raw() as Raw, &mut graph), 0);
-
-        // Instantiation needs a current context; the launches below run
-        // without one on this thread.
+        assert_eq!(end(capture.raw() as RawHandle, &mut graph), 0);
+        let launched = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
         let _context = DeviceGuard::new(DEVICE).unwrap();
-        assert_eq!(instantiate(&mut executable, graph, 0), 0);
-    }
-    // SAFETY: the executable and the allocation it fills outlive every
-    // launch below, each of which is synchronized before the next step.
-    let launched = unsafe { GraphExec::borrowed(executable as usize) };
-    assert_eq!(launched.raw(), executable as usize);
+        assert_eq!(destroy_graph(graph), 0);
+        launched
+    };
 
     let full = Stream::new(DEVICE).unwrap();
     let partition = Stream::partition(DEVICE, &[8]).unwrap().remove(0);
@@ -645,13 +620,92 @@ fn graph_executables_launch_on_full_device_and_partition_streams() {
         stream.synchronize().unwrap();
         assert_eq!(read(&host), vec![7; 256]);
     }
+}
 
-    // SAFETY: every launch completed; the handles are destroyed once.
+type RawHandle = *mut std::ffi::c_void;
+type BeginCapture = unsafe extern "C" fn(RawHandle, i32) -> i32;
+type EndCapture = unsafe extern "C" fn(RawHandle, *mut RawHandle) -> i32;
+type DestroyGraph = unsafe extern "C" fn(RawHandle) -> i32;
+
+/// The driver's stream capture entry points, which the crate leaves to the
+/// libraries that capture.
+fn capture_functions() -> (BeginCapture, EndCapture, DestroyGraph) {
+    // SAFETY: loading libcuda runs only the driver's own initializers; the
+    // library stays loaded for the process, as the driver is.
+    let library = Box::leak(Box::new(
+        unsafe { libloading::Library::new("libcuda.so.1") }.unwrap(),
+    ));
+    // SAFETY: the signatures match cuda.h.
     unsafe {
-        let _context = DeviceGuard::new(DEVICE).unwrap();
-        assert_eq!(destroy_exec(executable), 0);
-        assert_eq!(destroy_graph(graph), 0);
+        (
+            *library
+                .get::<BeginCapture>(b"cuStreamBeginCapture_v2")
+                .unwrap(),
+            *library.get::<EndCapture>(b"cuStreamEndCapture").unwrap(),
+            *library.get::<DestroyGraph>(b"cuGraphDestroy").unwrap(),
+        )
     }
+}
+
+/// A pool's memory keeps its addresses and contents across a suspension,
+/// and a graph captured over it before runs correctly after the restore; a
+/// freed chunk is given out again at its address.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
+    let _driver = exclusive_driver();
+    let (begin, end, destroy_graph) = capture_functions();
+    let mut pool = VirtualPool::reserve(DEVICE, 64 << 20).unwrap();
+    let first = pool.allocate(1 << 20).unwrap();
+    let second = pool.allocate(1 << 20).unwrap();
+    assert_ne!(first, second);
+    assert!(pool.contains(first) && pool.contains(second));
+    let stream = Stream::new(DEVICE).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 256).unwrap();
+
+    // The first chunk holds 5s written before the suspension; a graph
+    // captured now fills the second with 9s at every launch.
+    let mut graph = std::ptr::null_mut();
+    // SAFETY: the ranges lie inside the pool's chunks; the stream is owned
+    // by this test and the graph is instantiated once and destroyed after.
+    let fill = unsafe {
+        memset_d8(first, 5, 256, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(begin(stream.raw() as RawHandle, 2), 0);
+        memset_d8(second, 9, 256, &stream).unwrap();
+        assert_eq!(end(stream.raw() as RawHandle, &mut graph), 0);
+        let fill = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
+        let _context = DeviceGuard::new(DEVICE).unwrap();
+        assert_eq!(destroy_graph(graph), 0);
+        fill
+    };
+
+    let mapped = pool.mapped_bytes();
+    pool.suspend().unwrap();
+    assert!(
+        pool.allocate(1 << 20).is_err(),
+        "a suspended pool gives out nothing"
+    );
+    pool.restore().unwrap();
+    assert_eq!(pool.mapped_bytes(), mapped);
+
+    // SAFETY: the ranges lie inside the restored chunks, at their addresses.
+    unsafe {
+        memcpy_async(host.address(), first, 256, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![5; 256]);
+    fill.launch(&stream).unwrap();
+    // SAFETY: as above.
+    unsafe {
+        memcpy_async(host.address(), second, 256, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![9; 256]);
+
+    drop(fill);
+    pool.free(second);
+    assert_eq!(pool.allocate(1 << 20).unwrap(), second);
 }
 
 #[test]

@@ -199,25 +199,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
 
 /// A graph allocator pool on CUDA `device` (`uniserve.cuda_graph.pool`).
 fn pool(device: DeviceId) -> Result<Arc<GraphPool>> {
-    let value: Array<Any> = Interpreter::import("uniserve.cuda_graph.pool")?
-        .call_as(&[(&Any::from(i64::from(device.0))).into()])?;
-    let number = |index: usize| -> Result<u64> {
-        let value = value
-            .get(index)
-            .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))?;
-        i64::try_from(value)
-            .map(|value| value as u64)
-            .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))
-    };
-    Ok(Arc::new(GraphPool {
-        device,
-        id: (number(1)?, number(2)?),
-        value: Handle::new(
-            value
-                .get(0)
-                .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))?,
-        )?,
-    }))
+    Ok(Arc::new(GraphPool::new(device)?))
 }
 
 /// Decode `latents` (`[units, width]` per image, consecutive) of images of

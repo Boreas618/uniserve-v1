@@ -106,10 +106,12 @@ pub(super) struct Conditions {
 }
 
 /// A captured still-frame tile encoding: the Python tile runner, whose
-/// input and output the graph addresses, and the graph.
+/// input and output the graph addresses, the graph, and the encoder's
+/// stream, on which every video runner launches it.
 struct StillTile {
     runner: Methods,
     graphs: GraphTable<Vec<i64>>,
+    stream: Stream,
 }
 
 /// The encoder of a condition's medium.
@@ -268,22 +270,36 @@ impl Conditions {
         );
         graphs.insert(self.still_tile.clone(), None, graph)?;
         graphs.seal();
-        self.tile = Some(StillTile { runner, graphs });
+        self.tile = Some(StillTile {
+            runner,
+            graphs,
+            stream: stream.clone(),
+        });
         Ok(())
     }
 
     /// The tile arguments a video runner is constructed with: the tile
-    /// runner and the graph of its captured tile encoding, or none before
-    /// startup captured them.
+    /// runner and a function that launches its captured tile encoding on
+    /// the encoder's stream, or none before startup captured them. The
+    /// runner calls the function inside its eager forward, on that stream.
     fn tile_arguments(&self) -> Result<[Argument; 2]> {
         let Some(tile) = &self.tile else {
             return Ok([Argument::None, Argument::None]);
         };
         match tile.graphs.lookup(&self.still_tile, None)? {
-            Lookup::Replay(graph) => Ok([
-                Argument::Handle(tile.runner.runner().clone()),
-                Argument::Handle(graph.handle().clone()),
-            ]),
+            Lookup::Replay(graph) => {
+                let (graph, stream) = (graph.clone(), tile.stream.clone());
+                let launch = tvm_ffi::Function::from_packed(move |_| {
+                    graph.launch(&stream).map_err(|error| {
+                        tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
+                    })?;
+                    Ok(tvm_ffi::Any::default())
+                });
+                Ok([
+                    Argument::Handle(tile.runner.runner().clone()),
+                    Argument::Handle(Handle::new(tvm_ffi::Any::from(launch))?),
+                ])
+            }
             Lookup::Capture => Err(Error::Invariant(
                 "a captured still-frame tile encoding is resident".into(),
             )),

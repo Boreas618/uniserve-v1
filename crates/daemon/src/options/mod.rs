@@ -33,7 +33,7 @@ use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use proto::request::wire;
 use proto::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, ModelDtype, PrefixCacheDtype,
-    SchedulingPolicy,
+    SchedulingPolicy, StandbyMemory,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -596,6 +596,13 @@ pub struct WorkerOptions {
     /// standby rank holds a CUDA context, graph pools and workspaces of its
     /// own, which the memory `mem_fraction_static` leaves must hold.
     pub standby: bool,
+    /// How a parked standby (a group's, or a hot update's engine) keeps the
+    /// device memory of its graph pools and scratch: `auto` keeps it
+    /// resident while every device has the share a serving worker leaves for
+    /// graphs and activations to spare, and suspends it otherwise;
+    /// `resident`; or `suspended`, moved to host memory at unchanged
+    /// addresses and mapped back at the promotion.
+    pub standby_memory: StandbyMemory,
 }
 
 impl Default for WorkerOptions {
@@ -606,6 +613,7 @@ impl Default for WorkerOptions {
             mesh: None,
             distributed_backend: None,
             standby: false,
+            standby_memory: StandbyMemory::Auto,
         }
     }
 }
@@ -1077,6 +1085,7 @@ impl ServeConfig {
                 load_format: word(&self.load_config.format),
                 download_dir: text(&self.load_config.download_dir),
                 load_threads: self.load_config.threads.map(NonZeroU32::get),
+                standby_memory: word(&worker.standby_memory),
             }),
             cuda_graphs: Some(wire::CudaGraphs {
                 policy: word(&graphs.policy),

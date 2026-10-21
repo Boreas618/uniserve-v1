@@ -149,6 +149,7 @@ impl WorkerProcessArgs {
                 rank as u32,
                 StorageLaunch {
                     standby: self.standby,
+                    standby_memory: self.standby_memory,
                     ..claims.launch(&self.ranks[rank].host)?
                 },
                 rendezvous

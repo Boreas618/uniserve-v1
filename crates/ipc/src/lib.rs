@@ -126,7 +126,7 @@ pub use proto::report::ForwardStats;
 pub use proto::request::{
     CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
     ImageParamsError, PrefixCacheDtype, PrefixCacheDtypeParseError, RequestId, SamplingParams,
-    SamplingParamsError, TokenLogprob,
+    SamplingParamsError, StandbyMemory, TokenLogprob,
 };
 pub use request::*;
 pub use tensor::*;

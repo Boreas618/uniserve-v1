@@ -170,17 +170,41 @@ def test_segmented_capture_replays_eager_submissions_in_order():
         graph.release()
 
 
-def _launch(executable: int, stream: torch.cuda.Stream) -> None:
-    """Launch a raw graph executable on ``stream`` through the driver."""
-    driver = ctypes.CDLL("libcuda.so.1")
-    driver.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    driver.cuGraphLaunch.restype = ctypes.c_int
-    assert driver.cuGraphLaunch(executable, stream.cuda_stream) == 0
+class _Executable:
+    """A graph executable instantiated through the driver.
+
+    The worker instantiates the captured graphs a capture exports this way.
+    """
+
+    def __init__(self, graph: int) -> None:
+        self._driver = ctypes.CDLL("libcuda.so.1")
+        self._driver.cuGraphInstantiateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_ulonglong,
+        ]
+        self._driver.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._driver.cuGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        self._raw = ctypes.c_void_p()
+        status = self._driver.cuGraphInstantiateWithFlags(
+            ctypes.byref(self._raw), graph, 0
+        )
+        assert status == 0
+
+    def launch(self, stream: torch.cuda.Stream) -> None:
+        assert self._driver.cuGraphLaunch(self._raw, stream.cuda_stream) == 0
+
+    def destroy(self) -> None:
+        assert self._driver.cuGraphExecDestroy(self._raw) == 0
 
 
 @torch.inference_mode()
-def test_exported_executables_launch_to_the_replayed_output():
-    """Launching an exported graph's executable equals replaying it."""
+def test_exported_graphs_launch_to_the_replayed_output():
+    """An exported segment, instantiated outside torch, equals a replay.
+
+    The instantiated graph stays valid once torch releases its captured
+    graph.
+    """
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
     module = _linear(device)
@@ -188,13 +212,15 @@ def test_exported_executables_launch_to_the_replayed_output():
     with torch.cuda.stream(stream):
         module(x)
     graph = capture(lambda: module(x), stream=stream)
+    executable = None
     try:
-        exported, executables = export(graph)
+        exported, graphs = export(graph)
         assert exported is graph
-        assert len(executables) == 1
+        assert len(graphs) == 1
+        executable = _Executable(graphs[0])
 
         outputs = []
-        for run in (graph.replay, lambda: _launch(executables[0], stream)):
+        for run in (graph.replay, lambda: executable.launch(stream)):
             # The same input before each run, and a cleared output, so the
             # output read afterwards was written by that run.
             with torch.cuda.stream(stream):
@@ -203,15 +229,21 @@ def test_exported_executables_launch_to_the_replayed_output():
                 run()
                 outputs.append(graph.output.clone())
             stream.synchronize()
+            # Once the first output is read, torch releases its captured
+            # graph; the instantiated one runs on.
+            graph.handover()
         assert outputs[0].abs().sum() > 0
         assert torch.equal(outputs[0], outputs[1])
     finally:
+        stream.synchronize()
+        if executable is not None:
+            executable.destroy()
         graph.release()
 
 
 @torch.inference_mode()
-def test_export_names_one_executable_per_segment():
-    """A segmented graph exports one executable per segment."""
+def test_export_names_one_graph_per_segment():
+    """A segmented graph exports one captured graph per segment."""
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
     value = torch.ones(16, device=device)
@@ -227,11 +259,10 @@ def test_export_names_one_executable_per_segment():
         submissions[-1](lambda: value.mul_(2))
         value.add_(3)
 
-    owner = object()
     graph = capture(body, stream=stream, segments=segments)
     try:
-        exported, executables = export(graph, owner)
-        assert exported is owner
-        assert len(executables) == 2 and len(set(executables)) == 2
+        exported, graphs = export(graph)
+        assert exported is graph
+        assert len(graphs) == 2 and len(set(graphs)) == 2
     finally:
         graph.release()

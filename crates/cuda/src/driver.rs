@@ -235,6 +235,8 @@ driver_table! {
         stream_wait_event = "cuStreamWaitEvent": fn(Handle, Handle, u32);
         launch_host_func = "cuLaunchHostFunc": fn(Handle, HostFn, Handle);
         graph_launch = "cuGraphLaunch": fn(Handle, Handle);
+        graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
+        graph_exec_destroy = "cuGraphExecDestroy": fn(Handle);
 
         device_get_dev_resource = "cuDeviceGetDevResource": fn(i32, *mut DevResource, i32);
         dev_sm_resource_split_by_count = "cuDevSmResourceSplitByCount": fn(

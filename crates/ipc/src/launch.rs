@@ -43,6 +43,9 @@ pub struct StorageLaunch {
     /// access, warms up on scratch units, parks with the storages read-only
     /// and serves once promoted (`WorkerRequest::Promote`).
     pub standby: bool,
+    /// How the worker, parked as a standby, keeps the device memory of its
+    /// graph pools and scratch (`worker_config.standby_memory`).
+    pub standby_memory: crate::StandbyMemory,
 }
 
 /// Every value one rank process is launched with.

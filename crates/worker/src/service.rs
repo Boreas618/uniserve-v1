@@ -53,6 +53,27 @@ enum PendingResponse {
 /// Borrows a worker's executor and channel for one synchronous serving run.
 /// All channel waits run on the caller's thread; completion wakes interrupt
 /// them without advancing execution on a callback thread.
+/// A standby worker parked until its promotion: its retained storages,
+/// read-only, and the pools of graph memory it suspended, if it did.
+pub(crate) struct Parked {
+    pub(crate) retained: Arc<Retained>,
+    pub(crate) suspended: Vec<Arc<crate::cuda_graph::GraphPool>>,
+}
+
+impl Parked {
+    /// Restore the suspended graph memory at its addresses, then take write
+    /// access to the retained storages: the captured graphs run again.
+    fn promote(self) -> crate::Result<()> {
+        for pool in &self.suspended {
+            pool.restore()?;
+        }
+        if !self.suspended.is_empty() {
+            tracing::info!("the promoted standby worker restored its graph memory");
+        }
+        self.retained.promote()
+    }
+}
+
 pub(crate) struct Service<'a> {
     executor: &'a mut Executor,
     channel: &'a mut Channel,
@@ -72,7 +93,7 @@ pub(crate) struct Service<'a> {
     channel_failed: Cell<bool>,
     /// The Storage Server connection of a parked standby worker, which
     /// promotion takes write access through; `None` once the rank serves.
-    standby: Option<Arc<Retained>>,
+    standby: Option<Parked>,
 }
 
 impl<'a> Service<'a> {
@@ -82,7 +103,7 @@ impl<'a> Service<'a> {
         info: WorkerInfo,
         experts: bool,
         stall_bound: Duration,
-        standby: Option<Arc<Retained>>,
+        standby: Option<Parked>,
     ) -> Self {
         executor.set_completion_wake(Some(channel.wake()));
         Self {
@@ -256,7 +277,7 @@ impl<'a> Service<'a> {
             }
             WorkerRequest::Promote { message_id } => {
                 let promoted = match self.standby.take() {
-                    Some(retained) => retained.promote(),
+                    Some(parked) => parked.promote(),
                     None => Err(Error::State("only a parked standby worker is promoted")),
                 };
                 PendingResponse::Ready(Box::new(match promoted {

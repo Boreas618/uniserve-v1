@@ -2,12 +2,15 @@
 //!
 //! Rust decides which shapes are captured, in which order, into which
 //! allocator pool, and which captured graph a forward runs. Python records
-//! a graph (`uniserve.cuda_graph`): a capture function runs one
-//! bound step under `torch.cuda.CUDAGraph` in the pool Rust passes and
-//! returns the graph with the raw executable of each of its segments. Rust
-//! launches those executables itself on the forward's stream
+//! a graph (`uniserve.cuda_graph`): a capture runs one bound step under
+//! `torch.cuda.CUDAGraph` in the pool Rust passes and returns the captured
+//! graph of each of its segments. Rust instantiates each segment into an
+//! executable it owns ([`cuda::GraphExec`]), has Python release its graph
+//! objects, launches the executables on the forward's stream
 //! ([`CUDAGraph::launch`]), performing the graph breaks it noted during the
-//! capture between them, and keeps the Python graph only to release it.
+//! capture between them, and destroys them when the graph is released.
+//! The memory the graphs address is Rust's as well ([`memory`]): the pools'
+//! device memory, which keeps its addresses while any graph lives.
 //!
 //! The pieces are independent of any runner:
 //!
@@ -18,7 +21,8 @@
 //!   reuse the pool blocks and workspaces of earlier ones;
 //! - [`reserve_pools`]: one allocator pool per device for an owner, or the
 //!   pools of an owner it shares a stream with, registered with
-//!   [`GraphStorage`] for budget accounting;
+//!   [`GraphStorage`] for budget accounting, each backed by Rust's device
+//!   memory ([`GraphPool`]);
 //! - [`GraphTable`]: the graphs of one runner, keyed by the runner's own
 //!   graph key and an optional expert capacity.
 //!
@@ -27,13 +31,14 @@
 //! a silent eager fallback, because every rank of a group must make the
 //! same collective calls in the same order.
 
+mod memory;
 mod pool;
 mod shape_key;
 mod table;
 
 use std::sync::{Arc, Mutex};
 
-use cuda::{GraphExec, Stream};
+use cuda::{DeviceId, GraphExec, Stream};
 use tvm_ffi::Any;
 
 use crate::ffi::Handle;
@@ -89,43 +94,48 @@ impl GraphBreaks {
 
 /// One captured forward.
 ///
-/// A graph is an ordered list of segments, each one CUDA graph executable,
-/// with a graph break between two segments: work a graph cannot record. The
-/// Python graph owns the executables and the memory their nodes address.
+/// A graph is an ordered list of segments, each one CUDA graph executable
+/// Rust owns, with a graph break between two segments: work a graph cannot
+/// record. The executables address memory of the pool the graph was
+/// captured in, and of the buffers its step reads and writes, which their
+/// owners keep until the graph is released.
 #[derive(Clone)]
 pub(crate) struct CUDAGraph {
-    /// One executable per segment, in launch order.
+    /// One executable per segment, in launch order. The last clone of the
+    /// graph to drop destroys them; it drops after the streams the graph was
+    /// launched on drained.
     segments: Arc<[GraphExec]>,
     /// The work between segments `i` and `i + 1`, for a graph whose breaks
     /// Rust noted at capture.
     breaks: Arc<[GraphBreak]>,
-    /// The Python graph, passed back to release it and to a binding that
-    /// replays the graph itself. Shared, so that a launch which holds the
-    /// graph for a job gives up no Python reference when it ends.
+    /// The Python graph, which keeps the step's output alive and is passed
+    /// back to release it. Shared, so that a launch which holds the graph
+    /// for a job gives up no Python reference when it ends.
     graph: Arc<Handle>,
 }
 
 impl CUDAGraph {
-    /// Take the result of a capture function: the array
-    /// `[graph, executables]` of the Python graph and the raw `CUgraphExec`
-    /// handle of each of its segments in launch order.
-    pub(crate) fn captured(result: Any) -> Result<Self> {
-        let malformed = || Error::Interface("a capture returns [graph, executables]".into());
+    /// Take the result of a capture on `device`: the array `[graph,
+    /// graphs]` of the Python graph and the raw `CUgraph` of each of its
+    /// segments in launch order, which this instantiates. The caller then
+    /// has Python release the captured graphs (`handover`).
+    pub(crate) fn captured(result: Any, device: DeviceId) -> Result<Self> {
+        let malformed = || Error::Interface("a capture returns [graph, graphs]".into());
         let fields = tvm_ffi::Array::<Any>::try_from(result).map_err(|_| malformed())?;
         let field = |index: usize| fields.get(index).map_err(|_| malformed());
-        let executables = crate::ffi::integers(field(1)?).map_err(|_| malformed())?;
+        let captured = crate::ffi::integers(field(1)?).map_err(|_| malformed())?;
+        let graph = Arc::new(Handle::new(field(0)?)?);
 
-        let segments = executables
+        let segments = captured
             .into_iter()
-            // SAFETY: the Python graph in `graph` owns the executables and
-            // the memory they address. It is released only through this
-            // value's handle, after the streams it was launched on drained.
-            .map(|raw| unsafe { GraphExec::borrowed(raw as usize) })
-            .collect();
+            // SAFETY: each raw graph is a live graph the capture ended on
+            // `device`, which Python keeps until the handover that follows.
+            .map(|raw| unsafe { GraphExec::instantiate(device, raw as usize) })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
-            segments,
+            segments: segments.into(),
             breaks: Arc::new([]),
-            graph: Arc::new(Handle::new(field(0)?)?),
+            graph,
         })
     }
 
@@ -205,27 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_result_names_its_graph_and_one_executable_per_segment() -> Result<()> {
-        let result = |executables: &[i64]| {
-            Any::from(crate::ffi::list([
-                Any::from(7_i64),
-                Any::from(crate::ffi::integer_list(executables.iter().copied())),
-            ]))
-        };
-
-        let graph = CUDAGraph::captured(result(&[0x1000, 0x2000]))?;
-        assert_eq!(i64::try_from(graph.handle().to_any()).ok(), Some(7));
-        assert_eq!(
-            graph
-                .segments
-                .iter()
-                .map(GraphExec::raw)
-                .collect::<Vec<_>>(),
-            vec![0x1000, 0x2000]
-        );
-
-        // A value of another shape is not a capture result.
-        assert!(CUDAGraph::captured(Any::from(7_i64)).is_err());
-        Ok(())
+    fn a_value_of_another_shape_is_no_capture_result() {
+        assert!(CUDAGraph::captured(Any::from(7_i64), DeviceId(0)).is_err());
     }
 }

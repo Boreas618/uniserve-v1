@@ -2572,6 +2572,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 host_kv_cache: false,
                 tcp: None,
                 standby: false,
+                standby_memory: proto::request::StandbyMemory::Auto,
             };
             (std::sync::Mutex::new(head), launch)
         })

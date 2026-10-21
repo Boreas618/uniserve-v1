@@ -7,15 +7,75 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use tvm_ffi::Any;
 
+use super::memory::{GraphMemory, library_path};
 use crate::ffi::{Function, Handle};
 use crate::{Error, Result};
 
-/// One allocator pool of the numerical library (`uniserve.cuda_graph.pool`)
-/// on a device: the library's pool handle and its allocator id.
+/// The addresses each pool reserves: more than any device's memory, so a
+/// pool is bounded by its budget and the device, never by its reservation.
+const POOL_ADDRESSES: usize = 1 << 38;
+
+/// One allocator pool on a device: the device memory Rust owns
+/// ([`GraphMemory`]), the numerical library's pool that allocates from it
+/// (`uniserve.cuda_graph.pool`) and its allocator id.
 pub struct GraphPool {
     pub device: DeviceId,
     pub id: (u64, u64),
     pub value: Handle,
+    pub(crate) memory: GraphMemory,
+}
+
+impl GraphPool {
+    /// A new pool on `device`: its device memory, and the library's pool
+    /// allocating from it through `create` (`uniserve.cuda_graph.pool`).
+    /// Returns the pool and the device's total memory.
+    pub(crate) fn create(create: &Function, device: DeviceId) -> Result<(Self, i64)> {
+        let memory = GraphMemory::reserve(device, POOL_ADDRESSES)?;
+        let value: tvm_ffi::Array<Any> = create.call_as(&[
+            (&Any::from(i64::from(device.0))).into(),
+            (&Any::from(memory.slot() as i64)).into(),
+            (&Any::from(tvm_ffi::String::from(library_path()?.as_str()))).into(),
+        ])?;
+        let item = |index: usize| {
+            value
+                .get(index)
+                .map_err(|error| Error::numerical(create.name(), &error))
+        };
+        if value.len() != 4 {
+            return Err(Error::Interface(format!(
+                "{} returns [pool, id_a, id_b, total_bytes]",
+                create.name()
+            )));
+        }
+        let number = |index: usize| -> Result<i64> {
+            i64::try_from(item(index)?).map_err(|error| Error::numerical(create.name(), &error))
+        };
+        let pool = Self {
+            device,
+            id: (number(1)? as u64, number(2)? as u64),
+            value: Handle::new(item(0)?)?,
+            memory,
+        };
+        Ok((pool, number(3)?))
+    }
+
+    /// A new pool on `device`, created by the numerical library's
+    /// `uniserve.cuda_graph.pool`; see [`Self::create`].
+    pub fn new(device: DeviceId) -> Result<Self> {
+        let create = crate::ffi::Interpreter::import("uniserve.cuda_graph.pool")?;
+        Ok(Self::create(&create, device)?.0)
+    }
+
+    /// Copies the pool's memory to the host and releases it on the device,
+    /// keeping its addresses; see [`GraphMemory::suspend`].
+    pub(crate) fn suspend(&self) -> Result<()> {
+        self.memory.suspend()
+    }
+
+    /// Maps the pool's memory back with its contents.
+    pub(crate) fn restore(&self) -> Result<()> {
+        self.memory.restore()
+    }
 }
 
 /// Pool sharing, startup residency and byte limits across numerical owners.
@@ -142,6 +202,17 @@ impl GraphStorage {
         Ok(())
     }
 
+    /// Every pool of every owner, each once.
+    pub(crate) fn pools(&self) -> Vec<Arc<GraphPool>> {
+        let mut pools: Vec<Arc<GraphPool>> = Vec::new();
+        for pool in self.owners.values().flatten() {
+            if !pools.iter().any(|known| Arc::ptr_eq(known, pool)) {
+                pools.push(Arc::clone(pool));
+            }
+        }
+        pools
+    }
+
     /// Serving growth belongs to the worker grant, not the sealed graph pools.
     pub(crate) fn seal(&mut self) {
         self.outside.clear();
@@ -162,8 +233,8 @@ pub(crate) fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
 ///
 /// With `share`, the owner borrows that registered owner's pools (owners on
 /// one stream run serially, so they can share intermediates); devices it
-/// has no pool on get a new one. `create` is `uniserve.cuda_graph.pool`,
-/// returning `[pool, id_a, id_b, total_bytes]`. The owner is registered only
+/// has no pool on get a new one. `create` is `uniserve.cuda_graph.pool`
+/// ([`GraphPool::create`]). The owner is registered only
 /// after every pool exists, so a failure leaves the storage unchanged.
 pub(crate) fn reserve_pools(
     storage: &mut GraphStorage,
@@ -186,29 +257,9 @@ pub(crate) fn reserve_pools(
             pools.push(Arc::clone(pool));
             continue;
         }
-        let value: tvm_ffi::Array<Any> =
-            create.call_as(&[(&Any::from(i64::from(device.0))).into()])?;
-        let item = |index: usize| {
-            value
-                .get(index)
-                .map_err(|error| Error::numerical(create.name(), &error))
-        };
-        if value.len() != 4 {
-            return Err(Error::Interface(format!(
-                "{} returns [pool, id_a, id_b, total_bytes]",
-                create.name()
-            )));
-        }
-        let number = |index: usize| -> Result<i64> {
-            i64::try_from(item(index)?).map_err(|error| Error::numerical(create.name(), &error))
-        };
-        let id = (number(1)? as u64, number(2)? as u64);
-        defaults.push((device, graph_storage_budget_bytes(number(3)?)));
-        pools.push(Arc::new(GraphPool {
-            device,
-            id,
-            value: Handle::new(item(0)?)?,
-        }));
+        let (pool, total) = GraphPool::create(create, device)?;
+        defaults.push((device, graph_storage_budget_bytes(total)));
+        pools.push(Arc::new(pool));
     }
     storage.commit(key, pools.clone(), defaults);
     Ok(pools)

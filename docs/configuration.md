@@ -199,6 +199,7 @@ A token request that generates text moves to the engine that serves next when it
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
 | `standby` | `false` | Keep a standby rank group beside each worker group whose ranks all run on the leader's host and that shares no expert world. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |
+| `standby_memory` | `auto` | How a parked standby (a group's, or a hot update's engine's) keeps the device memory of its graph pools and operator scratch: `resident`; `suspended`, copied to host memory and released on the device at unchanged addresses, then mapped back with its contents at the promotion, before its graphs run; or `auto`, resident while every device keeps beside it a tenth of its memory, the share a serving worker leaves for graphs and activations, and suspended otherwise. A standby that lacks that share even suspended fails, and none is kept |
 
 ### `logging_config`
 

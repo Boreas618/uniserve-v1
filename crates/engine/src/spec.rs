@@ -167,6 +167,11 @@ impl EngineConfig {
                 }),
             keep_standby: workers.standby,
             standby: false,
+            standby_memory: if workers.standby_memory.is_empty() {
+                proto::request::StandbyMemory::Auto
+            } else {
+                named(&workers.standby_memory, "worker_config.standby_memory")?
+            },
             cache_units: None,
             model: spec.model.clone(),
             host: spec.host.clone(),

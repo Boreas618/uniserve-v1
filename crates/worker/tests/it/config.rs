@@ -21,6 +21,7 @@ fn defaults() -> Value {
             "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             "host_kv_cache": false,
             "standby": false,
+            "standby_memory": "auto",
         },
         "host": "localhost",
         "device": "cpu",

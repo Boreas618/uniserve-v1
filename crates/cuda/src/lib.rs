@@ -34,6 +34,7 @@ mod green;
 mod memory;
 pub mod nccl;
 mod nvml;
+mod pool;
 pub mod reclaim;
 pub mod shm;
 mod stream;
@@ -53,6 +54,7 @@ pub use graph::GraphExec;
 pub use green::GreenContext;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use nvml::{Nvml, NvmlMemory};
+pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};
 pub use vmm::{HandleType, PeerMapping, Protection, ShareableHandle};
 

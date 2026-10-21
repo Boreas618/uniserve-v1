@@ -66,6 +66,9 @@ pub struct WorkerProcessArgs {
     /// workers: they map the exclusive storages those hold without taking
     /// write access, warm up on scratch units, and park until promoted.
     pub standby: bool,
+    /// How a standby launch keeps its graph memory while it parks
+    /// (`worker_config.standby_memory`).
+    pub standby_memory: proto::request::StandbyMemory,
     /// The cache units a standby launch adopts: the serving workers'.
     pub cache_units: Option<u32>,
     /// Model identifier or local model path.

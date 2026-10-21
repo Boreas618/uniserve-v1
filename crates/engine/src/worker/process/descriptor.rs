@@ -60,6 +60,7 @@ impl Default for WorkerProcessArgs {
             kv_storage: None,
             keep_standby: false,
             standby: false,
+            standby_memory: proto::request::StandbyMemory::Auto,
             cache_units: None,
             daemon: String::new(),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
@@ -392,6 +393,7 @@ mod tests {
             host_kv_cache: true,
             tcp: Some("10.0.0.2:4100".into()),
             standby: false,
+            standby_memory: proto::request::StandbyMemory::Suspended,
         }
     }
 
