@@ -313,7 +313,7 @@ impl WorkerBackend {
                 };
                 // A layout's preparation works on the denoiser's stream,
                 // so it is a job of that lane; the model's arithmetic is a
-                // job of the Python thread alone.
+                // job of the builder thread alone.
                 let submitted = if on_lane {
                     let kind = CallKind::Media(ipc::MediaCall::LatentPreparation);
                     self.jobs.start(kind, job, true).map_err(lane_lost)?

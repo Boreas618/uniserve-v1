@@ -32,7 +32,7 @@
 //! launch performs between two segments. The capture is an operation of
 //! the forward's job, whose completion carries the graph. Without a pool
 //! (CPU lanes, graph policy off) every forward calls its method on the
-//! Python thread, and so does a forward of more blocks than the largest row
+//! builder thread, and so does a forward of more blocks than the largest row
 //! bucket holds: the engine bounds a pass's blocks by its rows and token
 //! budget, not by the buckets. A `readout` that exchanges tokens with
 //! expert peers also runs there, once over every slot of the forward.
@@ -246,7 +246,7 @@ impl DiffusionLMRunner {
         Ok((self.owner.clone(), records))
     }
 
-    /// Call `method` on the Python thread, outside any job: startup and
+    /// Call `method` on the builder thread, outside any job: startup and
     /// retirement.
     fn call(&self, method: &Function, arguments: &[Argument]) -> Result<()> {
         self.methods

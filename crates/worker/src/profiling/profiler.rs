@@ -92,7 +92,7 @@ impl ProfileConfig {
 /// One job of the window's opening or closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Start the torch profiler: a call on the Python thread.
+    /// Start the torch profiler: a call on the builder thread.
     Start,
     /// Start the CUDA capture range: a driver call on the lane's thread.
     StartRange,
@@ -186,7 +186,7 @@ impl Profiler {
     }
 
     /// Submit the next job of the window's opening or closing: a job of
-    /// the lane serving `kind`, or calls for the Python thread. `None` when
+    /// the lane serving `kind`, or calls for the builder thread. `None` when
     /// nothing is left to submit, or while the last one is in flight. The
     /// batch whose forward this is waits for the job as for its own and
     /// hands its completion to [`Self::complete`].

@@ -10,7 +10,7 @@
 //! Startup lists and renders with calls it waits for. While serving, the
 //! control thread waits for none of it ([`KernelWatch`]): the library's
 //! count of kernel choices, the runners' listings and the rendering are
-//! calls submitted to the Python thread, each taken up at its completion.
+//! calls submitted to the builder thread, each taken up at its completion.
 
 use std::collections::HashMap;
 
@@ -155,7 +155,7 @@ impl KernelRecords {
     }
 }
 
-/// What a [`KernelWatch`] submitted to the Python thread and has not heard
+/// What a [`KernelWatch`] submitted to the builder thread and has not heard
 /// of yet.
 enum Pending {
     /// The library's count of kernel choices.
@@ -170,7 +170,7 @@ enum Pending {
 /// Serving-time kernel reporting. After each batch's forward the library's
 /// count of kernel choices is asked for; when it has moved, the runners'
 /// kernels are listed, and when a runner's records changed, the table is
-/// rendered and logged. Each step is a call submitted to the Python thread
+/// rendered and logged. Each step is a call submitted to the builder thread
 /// and taken up at its completion: none is waited for, and a step that
 /// fails is logged and fails no batch.
 pub(crate) struct KernelWatch {

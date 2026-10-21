@@ -504,7 +504,7 @@ pub struct StorageView {
     shape: Vec<i64>,
     strides: Vec<i64>,
     /// The torch tensor of the view, made by the first call that passes it.
-    /// Its last clone's drop releases it on the Python thread.
+    /// Its last clone's drop releases it on the builder thread.
     tensor: Arc<OnceLock<Handle>>,
 }
 
@@ -888,8 +888,8 @@ impl StorageView {
     /// thread; a serving path makes it inside the [`Interpreter::execute`]
     /// of the call that passes the view, so the two take one handoff. A
     /// caller drops the references it makes for a call ([`Handle::to_any`])
-    /// before the view or on the Python thread, so that the view's own
-    /// reference is the last one and is released on the Python thread.
+    /// before the view or on the builder thread, so that the view's own
+    /// reference is the last one and is released on the builder thread.
     pub(crate) fn handle(&self) -> Result<&Handle> {
         if let Some(handle) = self.tensor.get() {
             return Ok(handle);

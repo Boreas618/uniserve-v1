@@ -1,7 +1,7 @@
 """The Python side of a worker: what the worker library calls first.
 
 A worker is the ``uniserve worker`` command, which hosts the interpreter
-on a Python thread of its own and calls :func:`attach` once it is up.
+on its builder thread and calls :func:`attach` once it is up.
 ``attach`` configures logging and diagnostic dumps and registers
 :func:`import_path`, through which the library reaches every function of the
 numerical library by its import path. Everything else is the library's:

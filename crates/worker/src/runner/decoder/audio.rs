@@ -194,7 +194,7 @@ impl AudioDecoder {
                 });
                 GraphMode::Capture
             }
-            // Units startup did not capture run on the Python thread.
+            // Units startup did not capture run on the builder thread.
             _ => {
                 job.call(method(self)?);
                 GraphMode::Eager

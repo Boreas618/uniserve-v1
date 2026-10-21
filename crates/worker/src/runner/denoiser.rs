@@ -20,7 +20,7 @@
 //! conditioning) into the fixed state buffers, writes the
 //! evaluation index, launches the layout's captured graph (or runs
 //! `DenoiserRunner.denoise` of `uniserve.runner.denoiser` on the
-//! Python thread) and scatters the scratch into the other bank. Every one of
+//! builder thread) and scatters the scratch into the other bank. Every one of
 //! those buffers is allocated here; the Python half receives the tensors of
 //! a forward as its arguments.
 //!

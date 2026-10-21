@@ -11,7 +11,7 @@ use crate::{Error, Result};
 ///
 /// Dropping the last reference releases the Python object, which runs
 /// Python. A handle dropped on another thread therefore submits its
-/// reference to the Python thread, which drops it: objects are released in
+/// reference to the builder thread, which drops it: objects are released in
 /// the order their owners drop them, and the thread that drops one does not
 /// wait for the release.
 #[derive(Clone)]

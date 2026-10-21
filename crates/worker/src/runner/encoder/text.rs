@@ -1,7 +1,7 @@
 //! Text encoding: a prompt zero-padded to the smallest configured text capacity
 //! that holds it ([`text_capacity`]), the buffers of a text encoder's forward,
 //! and the encode of a prompt, natively through its capacity's graph or, with
-//! vision tokens ([`PromptVision`]), on the Python thread.
+//! vision tokens ([`PromptVision`]), on the builder thread.
 
 use cuda::{CopyBatch, SourceOrder};
 

@@ -5,7 +5,7 @@
 //! uniforms. This addressing makes a draw independent of batching, execution
 //! depth, completion order, and replay.
 //!
-//! The rank's control plane generates its sampler's draws through this module
+//! The rank's control thread generates its sampler's draws through this module
 //! (`crates/worker/src/sampling`) and passes them to the sampling kernels as
 //! tensor contents; the engine simulator draws the same values for the same
 //! coordinates.

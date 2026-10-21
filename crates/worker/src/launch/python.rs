@@ -1,4 +1,4 @@
-//! The CPython interpreter a worker hosts on its Python thread.
+//! The CPython interpreter a worker hosts on its builder thread.
 //!
 //! The `uniserve worker` command loads the environment's shared
 //! `libpython` into the process's global scope before it loads this library,
@@ -28,7 +28,7 @@ use crate::{Error, Result};
 /// callable by its import path, registered by `uniserve.worker.attach`.
 const IMPORT_PATH: &str = "uniserve.worker.import_path";
 
-/// What the Python thread runs once the interpreter is up: the library's
+/// What the builder thread runs once the interpreter is up: the library's
 /// worker entry, which configures Python logging and diagnostic dumps and
 /// registers [`IMPORT_PATH`].
 const ATTACH: &CStr = c"import uniserve.worker\nuniserve.worker.attach()\n";
@@ -91,7 +91,7 @@ impl<'process> CApi<'process> {
     }
 }
 
-/// Make the calling thread the process's Python thread: initialize CPython
+/// Make the calling thread the process's builder thread: initialize CPython
 /// with `python`, the environment's interpreter, as `PyConfig.executable`,
 /// so that `sys.prefix` names the environment and subprocesses that torch
 /// and Triton start run its interpreter; run `uniserve.worker.attach()`;
