@@ -17,8 +17,7 @@ use super::{
     OutputFilterPolicy, chatml, encode, model_dtype_bytes, pixel_bound_tokens, required_token,
     required_token_id,
 };
-use crate::model::assets;
-use crate::tokenizer::HuggingFaceTokenizer;
+use crate::{FactsError, Vocabulary, VocabularyError};
 
 /// System instruction for `GenerationConstraint::Default`.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a multimodal assistant capable of reasoning with both text and images. You support two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> block and place all reasoning inside it. You MUST interleave text with generated images using tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, directly provide the answer without reasoning. Do not use tags like <image1>, <image2>; present any images naturally alongside the text.\n\nAfter the think block, always provide a concise, user-facing final answer. The answer may include text, images, or both. Match the user's language in both reasoning and the final answer.";
@@ -114,14 +113,18 @@ impl SenseNovaProfile {
     /// Encoder token counts stay unset here; the `*_for_dimensions` methods
     /// return per-image copies with the counts set. Fails when the tokenizer
     /// lacks any of the ChatML or image delimiter tokens.
-    pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
+    pub fn resolve(vocabulary: &dyn Vocabulary) -> crate::Result<Self> {
         let (start_of_image, start_of_image_text) =
-            required_token(tokenizer, "<img>", "SenseNova start-of-image")?;
+            required_token(vocabulary, "<img>", "SenseNova start-of-image")?;
         let (end_of_image, end_of_image_text) =
-            required_token(tokenizer, "</img>", "SenseNova end-of-image")?;
+            required_token(vocabulary, "</img>", "SenseNova end-of-image")?;
         let controls = GenerationControls {
-            bos: required_token_id(tokenizer, "<|im_start|>", "SenseNova beginning-of-sequence")?,
-            eos: required_token_id(tokenizer, "<|im_end|>", "SenseNova end-of-sequence")?,
+            bos: required_token_id(
+                vocabulary,
+                "<|im_start|>",
+                "SenseNova beginning-of-sequence",
+            )?,
+            eos: required_token_id(vocabulary, "<|im_end|>", "SenseNova end-of-sequence")?,
             start_of_image,
             end_of_image,
             start_of_image_text,
@@ -256,22 +259,22 @@ impl OmniProfile for SenseNovaProfile {
 
     fn render_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         constraint: GenerationConstraint,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>> {
-        encode(tokenizer, &self.render_prompt_text(constraint, prompt))
+    ) -> std::result::Result<Vec<u32>, VocabularyError> {
+        encode(vocabulary, &self.render_prompt_text(constraint, prompt))
     }
 
     /// Unlike Bagel, an empty prompt still renders the framed ChatML turn
     /// with the image system instruction.
     fn render_negative_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>> {
+    ) -> std::result::Result<Vec<u32>, VocabularyError> {
         encode(
-            tokenizer,
+            vocabulary,
             &chatml(Some(IMAGE_SYSTEM_PROMPT), prompt, NEGATIVE_ASSISTANT_PREFIX),
         )
     }
@@ -285,7 +288,7 @@ impl OmniProfile for SenseNovaProfile {
         width: u32,
         height: u32,
         image_count: usize,
-    ) -> assets::Result<Vec<ImageEncoderInput>> {
+    ) -> crate::Result<Vec<ImageEncoderInput>> {
         let tokens = pixel_bound_tokens(
             width,
             height,
@@ -316,7 +319,7 @@ impl OmniProfile for SenseNovaProfile {
         &self,
         width: u32,
         height: u32,
-    ) -> assets::Result<ImageGenerationConfig> {
+    ) -> crate::Result<ImageGenerationConfig> {
         let tokens = pixel_bound_tokens(
             width,
             height,
@@ -331,7 +334,7 @@ impl OmniProfile for SenseNovaProfile {
             || policy.feedback_encoders.len() != 1
             || policy.feedback_encoders[0].encoder != proto::request::ImageEncoder::Vision
         {
-            return Err(assets::Error::invalid(
+            return Err(FactsError::invalid(
                 "image feedback encoders do not match the model processor",
             ));
         }

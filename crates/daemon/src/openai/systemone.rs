@@ -173,7 +173,7 @@ impl Leader {
 /// it. An image's soft tokens take one position each, and the vision encoder
 /// writes exactly that many cache entries. `images` are the request's decoded
 /// `x_images`, indexed by
-/// [`ImagePlacement::source`](crate::model::diffusion_gemma::ImagePlacement).
+/// [`ImagePlacement::source`](models::diffusion_gemma::ImagePlacement).
 fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> GenerationRequest {
     let (token_ids, inputs) = engine_images(&prompt.token_ids, &prompt.images, images);
 

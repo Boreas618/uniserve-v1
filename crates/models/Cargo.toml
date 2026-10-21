@@ -6,9 +6,10 @@ license.workspace = true
 publish = false
 
 # The request semantics of each model family: checkpoint facts, input rules
-# and planning, and family-specific output parsing, as pure functions that
-# read no files and serve no HTTP.
+# and planning, and family-specific output parsing, as pure functions over
+# the request vocabulary (`proto`) that read no files and serve no HTTP.
 [dependencies]
+proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

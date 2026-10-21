@@ -142,7 +142,7 @@ pub struct GenerateRequest {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImageSamplingParams {
     /// Named output-resolution preset.
-    pub resolution: Option<crate::model::omni::resolution::ResolutionName>,
+    pub resolution: Option<models::omni::resolution::ResolutionName>,
     /// Explicit output width in pixels.
     pub width: Option<u32>,
     /// Explicit output height in pixels.

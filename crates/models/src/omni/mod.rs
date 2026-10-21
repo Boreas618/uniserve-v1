@@ -22,10 +22,8 @@ pub mod sensenova;
 use proto::request::{GenerationConstraint, ImageEncoderInput, ImageGenerationConfig};
 use serde::{Deserialize, Serialize};
 
-use crate::model::assets;
-use crate::model::assets::Error as AssetError;
-use crate::model::omni::resolution::ResolutionPolicy;
-use crate::tokenizer::HuggingFaceTokenizer;
+use crate::omni::resolution::ResolutionPolicy;
+use crate::{FactsError, Vocabulary, VocabularyError};
 
 /// What one multimodal family contributes to its requests: prompt framing,
 /// image slots, encoder sizing, and output filtering. `input::omni`
@@ -52,16 +50,16 @@ pub trait OmniProfile {
     /// Renders and encodes a text prompt under `constraint`.
     fn render_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         constraint: GenerationConstraint,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>>;
+    ) -> std::result::Result<Vec<u32>, VocabularyError>;
     /// Renders and encodes the classifier-free guidance context of `prompt`.
     fn render_negative_prompt_ids(
         &self,
-        tokenizer: &HuggingFaceTokenizer,
+        vocabulary: &dyn Vocabulary,
         prompt: &str,
-    ) -> crate::tokenizer::Result<Vec<u32>>;
+    ) -> std::result::Result<Vec<u32>, VocabularyError>;
     /// Builds the encoder inputs of an input image of the given dimensions
     /// in a request that carries `image_count` input images.
     fn image_encoders_for_dimensions(
@@ -69,7 +67,7 @@ pub trait OmniProfile {
         width: u32,
         height: u32,
         image_count: usize,
-    ) -> assets::Result<Vec<ImageEncoderInput>>;
+    ) -> crate::Result<Vec<ImageEncoderInput>>;
     /// A value that changes an input image's encoding with the request's
     /// `image_count` and therefore joins its encoder-cache identity; `None`
     /// when the count does not change it.
@@ -80,7 +78,7 @@ pub trait OmniProfile {
         &self,
         width: u32,
         height: u32,
-    ) -> assets::Result<ImageGenerationConfig>;
+    ) -> crate::Result<ImageGenerationConfig>;
     /// The reasoning and visible-wrapper filter of the family's output; `None`
     /// when its output is plain text.
     fn output_filter(&self) -> Option<&OutputFilterPolicy>;
@@ -163,15 +161,15 @@ pub struct OutputFilterPolicy {
 /// Returns the token id together with its text; `role` only labels the error
 /// for a token the vocabulary lacks.
 pub(super) fn required_token(
-    tokenizer: &HuggingFaceTokenizer,
+    vocabulary: &dyn Vocabulary,
     token: &str,
     role: &str,
-) -> assets::Result<(u32, String)> {
-    tokenizer
-        .token_to_id(token)
+) -> crate::Result<(u32, String)> {
+    vocabulary
+        .token_id(token)
         .map(|id| (id, token.to_string()))
         .ok_or_else(|| {
-            AssetError::invalid(format!(
+            FactsError::invalid(format!(
                 "configured {role} control token {token:?} is missing from the tokenizer"
             ))
         })
@@ -179,19 +177,19 @@ pub(super) fn required_token(
 
 /// Looks up a required control token and returns only its id.
 pub(super) fn required_token_id(
-    tokenizer: &HuggingFaceTokenizer,
+    vocabulary: &dyn Vocabulary,
     token: &str,
     role: &str,
-) -> assets::Result<u32> {
-    required_token(tokenizer, token, role).map(|(id, _)| id)
+) -> crate::Result<u32> {
+    required_token(vocabulary, token, role).map(|(id, _)| id)
 }
 
 /// Encodes prompt text without automatically adding special tokens.
 pub(super) fn encode(
-    tokenizer: &HuggingFaceTokenizer,
+    vocabulary: &dyn Vocabulary,
     text: &str,
-) -> crate::tokenizer::Result<Vec<u32>> {
-    tokenizer.encode(text, false)
+) -> std::result::Result<Vec<u32>, VocabularyError> {
+    vocabulary.encode(text)
 }
 
 /// Renders a minimal ChatML prompt with an open assistant turn.
@@ -226,7 +224,7 @@ pub(super) fn stride_resize_tokens(
     transforms: &[(u32, u32, u32, u64)],
     token_stride: u32,
     marker_tokens: u32,
-) -> assets::Result<u32> {
+) -> crate::Result<u32> {
     let mut dimensions = (width, height);
     for &(max_side, min_side, stride, max_pixels) in transforms {
         dimensions = stride_resize(
@@ -253,7 +251,7 @@ pub(super) fn pixel_bound_tokens(
     max_pixels: u64,
     token_stride: u32,
     marker_tokens: u32,
-) -> assets::Result<u32> {
+) -> crate::Result<u32> {
     let dimensions = pixel_bound_resize(width, height, factor, min_pixels, max_pixels)?;
     dimensions_to_tokens(dimensions, token_stride, marker_tokens)
 }
@@ -263,12 +261,12 @@ fn dimensions_to_tokens(
     (width, height): (u32, u32),
     token_stride: u32,
     marker_tokens: u32,
-) -> assets::Result<u32> {
+) -> crate::Result<u32> {
     if token_stride == 0
         || !width.is_multiple_of(token_stride)
         || !height.is_multiple_of(token_stride)
     {
-        return Err(AssetError::invalid(
+        return Err(FactsError::invalid(
             "image dimensions are outside the configured token stride",
         ));
     }
@@ -276,7 +274,7 @@ fn dimensions_to_tokens(
         .saturating_mul(u64::from(height / token_stride))
         .saturating_add(u64::from(marker_tokens));
     u32::try_from(tokens)
-        .map_err(|_| AssetError::invalid("image token count exceeds the engine range"))
+        .map_err(|_| FactsError::invalid("image token count exceeds the engine range"))
 }
 
 /// Resizes dimensions within side and pixel limits while preserving stride alignment.
@@ -293,10 +291,10 @@ fn stride_resize(
     min_side: u32,
     stride: u32,
     max_pixels: u64,
-) -> assets::Result<(u32, u32)> {
+) -> crate::Result<(u32, u32)> {
     if width == 0 || height == 0 || max_side == 0 || min_side == 0 || stride == 0 || max_pixels == 0
     {
-        return Err(AssetError::invalid(
+        return Err(FactsError::invalid(
             "configured stride-resize geometry requires positive values",
         ));
     }
@@ -343,15 +341,15 @@ fn pixel_bound_resize(
     factor: u32,
     min_pixels: u64,
     max_pixels: u64,
-) -> assets::Result<(u32, u32)> {
+) -> crate::Result<(u32, u32)> {
     if width == 0 || height == 0 || factor == 0 || min_pixels == 0 || max_pixels == 0 {
-        return Err(AssetError::invalid(
+        return Err(FactsError::invalid(
             "configured pixel-bound geometry is invalid",
         ));
     }
     let aspect = f64::from(width.max(height)) / f64::from(width.min(height));
     if aspect > 200.0 {
-        return Err(AssetError::invalid(
+        return Err(FactsError::invalid(
             "input image aspect ratio must not exceed 200",
         ));
     }

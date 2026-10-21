@@ -38,8 +38,8 @@ use proto::request::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::ModelDescription;
-use crate::model::diffusion_gemma::DenoisingOverrides;
+use models::ModelDescription;
+use models::diffusion_gemma::DenoisingOverrides;
 
 pub use args::{FLAG_PATHS, ServeArgs, Stated, printed};
 pub use values::{

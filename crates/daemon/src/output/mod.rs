@@ -258,12 +258,12 @@ mod tests {
     /// did.
     #[tokio::test]
     async fn sensenova_releases_a_trailing_delimiter_prefix_at_the_end() {
-        let policy = crate::model::omni::OutputFilterPolicy {
-            reasoning: Some(crate::model::omni::DelimitedTextPolicy {
+        let policy = models::omni::OutputFilterPolicy {
+            reasoning: Some(models::omni::DelimitedTextPolicy {
                 start: "<think>".to_string(),
                 end: "</think>".to_string(),
             }),
-            visible_wrappers: vec![crate::model::omni::DelimitedTextPolicy {
+            visible_wrappers: vec![models::omni::DelimitedTextPolicy {
                 start: "<answer>".to_string(),
                 end: "</answer>".to_string(),
             }],

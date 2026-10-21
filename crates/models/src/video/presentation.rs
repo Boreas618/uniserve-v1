@@ -17,9 +17,9 @@
 //! carries the text tag ([`TEXT_TAG`]).
 
 use std::borrow::Cow;
-use std::fmt;
 
 use super::plan::{Prepared, RequestField, RequestPlan, VideoInputError, Vision};
+use crate::Vocabulary;
 
 /// The AdaLN tag of a vision token.
 pub const VIDEO_TAG: u8 = 0;
@@ -106,24 +106,6 @@ pub fn segments<'a>(plan: &RequestPlan, prompt: &'a str) -> Vec<Segment<'a>> {
     segments
 }
 
-/// The tokenizer calls a presentation needs: the checkpoint's tokenizer with
-/// the special tokens its configuration declares, which a prompt may
-/// contain.
-pub trait Tokenizer {
-    /// Why encoding failed.
-    type Error: fmt::Display;
-
-    /// The token ids of `text`, without special tokens added.
-    ///
-    /// # Errors
-    ///
-    /// Returns the tokenizer's error.
-    fn encode(&self, text: &str) -> Result<Vec<u32>, Self::Error>;
-
-    /// The id of a named token, or `None` when the vocabulary lacks it.
-    fn token_id(&self, token: &str) -> Option<u32>;
-}
-
 /// The tokenized presentation and the AdaLN tag of every token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presentation {
@@ -141,8 +123,10 @@ pub struct Presentation {
 /// or contains a vision placeholder or marker, which would misalign the
 /// conditioner's vision inputs, and [`VideoInputError::Internal`] when the
 /// tokenizer fails or lacks the vision tokens a vision block needs.
-pub fn present<T: Tokenizer>(
-    tokenizer: &T,
+/// The vocabulary is the checkpoint's tokenizer with the special tokens its
+/// configuration declares, which a prompt may contain.
+pub fn present(
+    tokenizer: &dyn Vocabulary,
     plan: &RequestPlan,
     prompt: &str,
 ) -> Result<Presentation, VideoInputError> {
@@ -208,13 +192,13 @@ pub fn present<T: Tokenizer>(
 pub(super) mod tests {
     use std::borrow::Cow;
     use std::collections::HashMap;
-    use std::convert::Infallible;
 
     use serde_json::Value;
 
     use super::super::plan::RequestField;
     use super::super::plan::tests::{Request, fixture, vision};
-    use super::{Segment, TEXT_TAG, Tokenizer, VIDEO_TAG, VisionPad, present, segments};
+    use super::{Segment, TEXT_TAG, VIDEO_TAG, VisionPad, present, segments};
+    use crate::{Vocabulary, VocabularyError};
 
     /// The ids of the vision markers and placeholders in
     /// [`CharacterTokenizer`]'s vocabulary.
@@ -229,10 +213,8 @@ pub(super) mod tests {
     /// plus the vision markers and placeholders as special tokens.
     pub(in crate::video) struct CharacterTokenizer;
 
-    impl Tokenizer for CharacterTokenizer {
-        type Error = Infallible;
-
-        fn encode(&self, text: &str) -> Result<Vec<u32>, Infallible> {
+    impl Vocabulary for CharacterTokenizer {
+        fn encode(&self, text: &str) -> Result<Vec<u32>, VocabularyError> {
             let mut ids = Vec::new();
             let mut rest = text;
             'text: while let Some(first) = rest.chars().next() {
@@ -291,14 +273,12 @@ pub(super) mod tests {
         }
     }
 
-    impl Tokenizer for RecordedTokenizer {
-        type Error = String;
-
-        fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+    impl Vocabulary for RecordedTokenizer {
+        fn encode(&self, text: &str) -> Result<Vec<u32>, VocabularyError> {
             self.texts
                 .get(text)
                 .cloned()
-                .ok_or_else(|| format!("no recorded tokens for {text:?}"))
+                .ok_or_else(|| VocabularyError(format!("no recorded tokens for {text:?}").into()))
         }
 
         fn token_id(&self, token: &str) -> Option<u32> {

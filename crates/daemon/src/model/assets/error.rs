@@ -64,6 +64,9 @@ pub enum Error {
     #[error("invalid model asset: {0}")]
     /// Model asset content violates a profile invariant.
     Invalid(String),
+    #[error(transparent)]
+    /// The model family's rules refuse what the checkpoint states.
+    Facts(#[from] models::FactsError),
 }
 
 /// Result type returned by model-asset calls.

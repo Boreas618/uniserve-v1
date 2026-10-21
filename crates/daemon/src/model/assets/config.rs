@@ -134,26 +134,10 @@ pub struct GenerationConfig {
     pub repetition_penalty: Option<f32>,
     /// Default maximum number of generated tokens.
     pub max_new_tokens: Option<u32>,
-    /// Block-diffusion denoising steps per canvas.
-    pub max_denoising_steps: Option<u32>,
-    /// Block-diffusion sampler settings.
-    pub sampler_config: Option<DiffusionSamplerConfig>,
-    /// Block-diffusion sampling temperature at the first step.
-    pub t_min: Option<f32>,
-    /// Block-diffusion sampling temperature at the last step.
-    pub t_max: Option<f32>,
-    /// Block-diffusion stopping threshold on residual canvas uncertainty.
-    pub confidence_threshold: Option<f32>,
-    /// Consecutive unchanged block-diffusion steps that end denoising early.
-    pub stability_threshold: Option<u32>,
-}
-
-/// The `sampler_config` section of a block-diffusion `generation_config.json`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct DiffusionSamplerConfig {
-    /// Entropy budget, in nats, of the tokens one denoising step accepts.
-    pub entropy_bound: Option<f32>,
+    /// The block-diffusion sampler defaults, which only a block-diffusion
+    /// checkpoint states.
+    #[serde(flatten)]
+    pub denoising: models::diffusion_gemma::GenerationDefaults,
 }
 
 #[derive(Debug, Clone, Deserialize)]

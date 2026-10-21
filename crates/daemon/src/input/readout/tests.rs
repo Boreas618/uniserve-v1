@@ -26,9 +26,9 @@ use base64::Engine as _;
 
 use crate::model::ModelParameters;
 use crate::model::assets::ResolvedModelFiles;
-use crate::model::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use models::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use proto::request::CanvasSampling;
 
 const SPECIAL_TOKENS: [&str; 11] = [
