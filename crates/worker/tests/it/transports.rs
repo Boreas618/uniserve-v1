@@ -902,7 +902,12 @@ fn vmm_exports_are_imported_by_another_process() -> Result<()> {
     let executable = std::env::current_exe()
         .map_err(|error| Error::Invalid(format!("no test executable: {error}")))?;
     let status = Command::new(executable)
-        .args(["--exact", "transports::vmm_export_consumer", "--ignored", "--nocapture"])
+        .args([
+            "--exact",
+            "transports::vmm_export_consumer",
+            "--ignored",
+            "--nocapture",
+        ])
         .env(CHILD_LOCATOR, locator)
         .status()
         .map_err(|error| Error::Invalid(format!("cannot run the consumer: {error}")))?;
