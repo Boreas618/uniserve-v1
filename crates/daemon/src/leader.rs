@@ -31,10 +31,14 @@ use anyhow::Context as _;
 use futures::StreamExt as _;
 use proto::request::wire;
 use proto::request::{GenerationLimits, Request};
+use tokio::sync::watch;
 use tracing::info;
 
-use crate::engine::client::{EngineClient, EngineState, EventStream, StatsSink, SubmitError};
+use crate::engine::client::{
+    EngineClient, EngineInfo, EngineState, EventStream, StatsSink, SubmitError,
+};
 use crate::engine::control::EngineControl;
+use crate::engine::hold::RequestHold;
 use crate::input::media::MediaConnector;
 use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
@@ -58,7 +62,10 @@ pub struct Leader {
     /// The model the request and scheduler metrics are labelled with.
     model_name: String,
     processor: Arc<InputProcessor>,
-    client: Arc<EngineClient>,
+    /// What the engine the model was bound to reported it serves.
+    info: EngineInfo,
+    /// Every request's way to the engine that serves.
+    hold: Arc<RequestHold>,
     /// What started the engine process; `None` for an engine run elsewhere.
     control: Option<EngineControl>,
     images: MediaConnector,
@@ -305,15 +312,24 @@ impl Leader {
         readout: Option<ReadoutEncoder>,
         logging: &LoggingOptions,
     ) -> Self {
-        let schedulers = client.info().schedulers as usize;
+        let info = client.info().clone();
         let stats_logger = logging
             .log_stats
-            .then(|| StatsLogger::start(model_name.clone(), schedulers.max(1)));
+            .then(|| StatsLogger::start(model_name.clone(), (info.schedulers as usize).max(1)));
+        let hold = Arc::new(RequestHold::new());
+        let client = Arc::new(client);
+        tokio::spawn(close_on_loss(
+            Arc::clone(&hold),
+            Arc::downgrade(&client),
+            client.states(),
+        ));
+        hold.serve(client);
         Self {
             served_model_name,
             model_name,
             processor: Arc::new(processor),
-            client: Arc::new(client),
+            info,
+            hold,
             control: None,
             images,
             readout: readout.map(Arc::new),
@@ -334,7 +350,7 @@ impl Leader {
 
     /// The generation limits the engine serves.
     pub fn generation_limits(&self) -> GenerationLimits {
-        self.client.info().limits.clone()
+        self.info.limits.clone()
     }
 
     /// The video denoiser this deployment serves; `None` for a model that
@@ -364,9 +380,10 @@ impl Leader {
         tasks
     }
 
-    /// Whether the engine can accept requests: whether it serves.
+    /// Whether the engine can accept requests: whether a ready engine
+    /// serves them.
     pub fn is_healthy(&self) -> bool {
-        self.client.state() == EngineState::Ready
+        self.hold.is_serving()
     }
 
     /// The connector every request's image references go through.
@@ -489,7 +506,8 @@ impl Leader {
     }
 
     /// Submits one tokenized request to the engine, which routes it to its
-    /// least loaded live scheduler.
+    /// least loaded live scheduler; while no engine is ready, the request
+    /// waits in the hold until one is.
     ///
     /// Returns the request's event stream and the index of the scheduler
     /// that serves it. Dropping the stream before its terminal event cancels
@@ -499,7 +517,7 @@ impl Leader {
     ///
     /// Fails when the engine serves no requests.
     pub(crate) async fn submit(&self, request: Request) -> Result<(EventStream, u32), SubmitError> {
-        let (events, scheduler) = self.client.submit(request).await?;
+        let (events, scheduler) = self.hold.submit(request).await?;
         // A request the engine ended at submission names no scheduler; its
         // stream holds its terminal event.
         Ok((events, scheduler.unwrap_or(0)))
@@ -514,10 +532,40 @@ impl Leader {
     /// Fails when the blocking shutdown task does not complete, which happens
     /// only if it panics or its runtime is shutting down.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        let client = Arc::clone(&self.client);
+        let client = self.hold.client();
+        self.hold.close("the daemon is shutting down");
+        let Some(client) = client else {
+            return Ok(());
+        };
         tokio::task::spawn_blocking(move || client.shutdown())
             .await
             .context("engine shutdown did not complete")
+    }
+}
+
+/// Closes `hold` once `client`'s engine, whose states `states` observes,
+/// stops serving while it serves the hold: its workers failed or its process
+/// ended. No other engine takes its place, so held and later requests fail
+/// with the reason. An engine the hold no longer serves, as after a shutdown,
+/// leaves the hold as it is.
+async fn close_on_loss(
+    hold: Arc<RequestHold>,
+    client: std::sync::Weak<EngineClient>,
+    mut states: watch::Receiver<EngineState>,
+) {
+    let reason = loop {
+        match states.borrow_and_update().clone() {
+            EngineState::Ready => {}
+            EngineState::Failed(error) => break format!("the engine failed: {error}"),
+            EngineState::Closed => break "the engine process ended".to_owned(),
+        }
+        if states.changed().await.is_err() {
+            break "the engine process ended".to_owned();
+        }
+    };
+    if client.upgrade().is_some_and(|client| hold.serves(&client)) {
+        tracing::error!(%reason, "no engine serves requests");
+        hold.close(reason);
     }
 }
 
@@ -678,6 +726,36 @@ mod tests {
             readout: Vec::new(),
         }
         .into()
+    }
+
+    /// An engine that is lost while it serves ends the leader's serving: it
+    /// reports itself unhealthy and refuses every later request, naming the
+    /// loss.
+    #[tokio::test]
+    async fn a_lost_engine_fails_later_requests() {
+        let engine = qwen3_engine(SimEngine::new(), "lost-engine-model");
+        assert!(engine.is_healthy());
+
+        // The engine process ends without the leader asking it to.
+        let client = engine.hold.client().expect("an engine serves");
+        tokio::task::spawn_blocking(move || client.shutdown())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if !engine.is_healthy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!engine.is_healthy());
+
+        let error = engine.submit(text_request()).await.err();
+        assert_eq!(
+            error,
+            Some(crate::engine::client::SubmitError::Unavailable(
+                "the engine process ended".to_owned()
+            ))
+        );
     }
 
     /// Two requests in flight together land on different schedulers, each
