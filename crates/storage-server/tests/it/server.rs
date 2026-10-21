@@ -394,7 +394,12 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "server::stand_in_writer", "--ignored", "--nocapture"])
+        .args([
+            "--exact",
+            "server::stand_in_writer",
+            "--ignored",
+            "--nocapture",
+        ])
         .env("STORAGE_TEST_SOCKET", &server.socket)
         .env("STORAGE_TEST_CLAIM", encoded.join(","))
         .stdout(std::process::Stdio::piped())
