@@ -56,11 +56,11 @@ pub struct ServeArgs {
     /// (`worker_groups`).
     #[arg(long, value_name = "FILE")]
     pub worker_groups: Option<PathBuf>,
-    /// Tensor-parallel workers of each engine core without a deployment file
+    /// Tensor-parallel workers of each scheduler without a deployment file
     /// (`tensor_parallel_size`).
     #[arg(long)]
     pub tensor_parallel_size: Option<NonZeroUsize>,
-    /// Engine cores (`data_parallel_size`).
+    /// Schedulers (`data_parallel_size`).
     #[arg(long)]
     pub data_parallel_size: Option<NonZeroUsize>,
     /// Concurrently resident requests (`max_running_requests`).
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(config.model(), "/models/file");
     }
 
-    /// Without a deployment file each engine core's group runs one component
+    /// Without a deployment file each scheduler's group runs one component
     /// tensor-parallel over its workers; the placement shorthand is refused
     /// beside a file.
     #[test]

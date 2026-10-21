@@ -323,7 +323,7 @@ async fn videos_create(
         let mut collector = ArtifactCollector::default();
         let result = loop {
             // Deletion or server shutdown ends the task; returning drops the
-            // stream, which cancels the request in its engine core.
+            // stream, which cancels the request in its scheduler.
             let event = tokio::select! {
                 event = stream.next() => event,
                 () = cancellation.cancelled() => return,

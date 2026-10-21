@@ -33,14 +33,14 @@
 use std::time::Duration;
 
 use crate::{
-    CachePolicy, EngineCoreOutput, FeedbackNextToken, FinishReason, GenerationConstraint,
-    GenerationRequest, ImageGenerationConfig, ImageTrigger, MultimodalInputs, Request,
+    CachePolicy, Event, FeedbackNextToken, FinishReason, GenerationConstraint, GenerationRequest,
+    ImageGenerationConfig, ImageTrigger, MultimodalInputs, Request,
 };
 use anyhow::Context as _;
 use ipc::{CallKind, ForwardMode, MediaCall};
 use ipc::{ImageParams, SamplingParams};
 
-use crate::core::{EngineConfig, EngineCore};
+use crate::core::{EngineConfig, SchedulerHandle};
 use crate::handle::EventRx;
 
 /// Denoising steps of a warmup image: the fewest that run a step from a
@@ -54,7 +54,7 @@ const IMAGE_STEPS: u16 = 2;
 ///
 /// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
 /// worker has no kernels or graphs to warm.
-pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<()> {
+pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Result<()> {
     let on_cuda = config
         .worker_groups
         .iter()
@@ -248,7 +248,11 @@ fn warmup_request(
 /// The requests reach the scheduler in one command, so it queues all of them
 /// before it forms its next batch, as it would concurrent clients that all
 /// arrived before that batch.
-fn run(core: &EngineCore, group: &str, requests: Vec<GenerationRequest>) -> anyhow::Result<()> {
+fn run(
+    core: &SchedulerHandle,
+    group: &str,
+    requests: Vec<GenerationRequest>,
+) -> anyhow::Result<()> {
     let mut streams = core
         .submit_all(requests.into_iter().map(Request::from).collect())
         .map_err(|error| anyhow::anyhow!("{group} warmup was not accepted: {error}"))?;
@@ -260,20 +264,20 @@ fn run(core: &EngineCore, group: &str, requests: Vec<GenerationRequest>) -> anyh
 }
 
 /// Reads one request's events until its terminal event.
-fn await_finish(core: &EngineCore, group: &str, stream: &mut EventRx) -> anyhow::Result<()> {
+fn await_finish(core: &SchedulerHandle, group: &str, stream: &mut EventRx) -> anyhow::Result<()> {
     loop {
         match stream.try_recv() {
-            Ok(EngineCoreOutput::Finished { reason, .. }) => {
+            Ok(Event::Finished { reason, .. }) => {
                 anyhow::ensure!(
                     !matches!(reason, FinishReason::Error | FinishReason::Aborted),
                     "{group} warmup finished with {reason:?}"
                 );
                 return Ok(());
             }
-            Ok(EngineCoreOutput::Rejected { message, .. }) => {
+            Ok(Event::Rejected { message, .. }) => {
                 anyhow::bail!("{group} warmup was rejected: {message}")
             }
-            Ok(EngineCoreOutput::Error { message }) => {
+            Ok(Event::Error { message }) => {
                 anyhow::bail!("{group} warmup failed: {message}")
             }
             Ok(_) => {}
@@ -309,7 +313,7 @@ mod tests {
         let mut config = EngineConfig::sim("warmup");
         config.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
         deployment(&mut config);
-        let core = EngineCore::with_executor(config.clone(), Box::new(executor)).unwrap();
+        let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
 
         let result = warm(&core, &config);
         core.shutdown();
@@ -370,7 +374,7 @@ mod tests {
         let mut executor = SimExecutor::new(SimEngine::new());
         let boundary = executor.observe();
         let config = EngineConfig::sim("warmup");
-        let core = EngineCore::with_executor(config.clone(), Box::new(executor)).unwrap();
+        let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
 
         let result = warm(&core, &config);
         core.shutdown();

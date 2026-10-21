@@ -8,7 +8,7 @@
 //! [`InputProcessor`] renders and tokenizes a request against the loaded
 //! model; [`generation_output`] and [`media_output`] assemble a submitted
 //! request's engine events into public [`RequestOutput`] events. The
-//! [`Engine`](crate::frontend::Engine) drives both around its engine cores.
+//! [`Engine`](crate::frontend::Engine) drives both around its schedulers.
 
 mod assembly;
 pub mod chat;
@@ -102,7 +102,7 @@ pub(crate) fn media_output(
 
 #[cfg(test)]
 mod tests {
-    use engine::EngineCoreOutput;
+    use engine::Event;
     use engine::EventRx;
     use futures::StreamExt as _;
     use ipc::TokenLogprob;
@@ -136,9 +136,9 @@ mod tests {
     }
 
     /// An engine stream of `events` after the request's scheduling.
-    fn engine_events(events: impl IntoIterator<Item = EngineCoreOutput>) -> EventRx {
+    fn engine_events(events: impl IntoIterator<Item = Event>) -> EventRx {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        tx.try_send(EngineCoreOutput::Scheduled {
+        tx.try_send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -149,15 +149,15 @@ mod tests {
         EventRx::from_receiver(rx)
     }
 
-    fn text_token(byte: u8) -> EngineCoreOutput {
-        EngineCoreOutput::TextToken {
+    fn text_token(byte: u8) -> Event {
+        Event::TextToken {
             id: u32::from(byte),
             logprob: None,
         }
     }
 
-    fn finished(reason: engine::FinishReason, completion_tokens: usize) -> EngineCoreOutput {
-        EngineCoreOutput::Finished {
+    fn finished(reason: engine::FinishReason, completion_tokens: usize) -> Event {
+        Event::Finished {
             reason,
             stop_reason: None,
             prompt_tokens: 1,
@@ -181,7 +181,7 @@ mod tests {
     async fn token_deltas_carry_ranked_logprobs() {
         let events = engine_events([
             text_token(b'a'),
-            EngineCoreOutput::TokenLogprobs {
+            Event::TokenLogprobs {
                 id: u32::from(b'a'),
                 candidates: vec![TokenLogprob {
                     token_id: u32::from(b'a'),
@@ -321,10 +321,10 @@ mod tests {
     #[tokio::test]
     async fn an_engine_failure_is_a_failed_terminal() {
         for failure in [
-            EngineCoreOutput::Error {
+            Event::Error {
                 message: "worker call failed".to_string(),
             },
-            EngineCoreOutput::ArtifactUnavailable {
+            Event::ArtifactUnavailable {
                 message: "worker call failed".to_string(),
             },
         ] {
@@ -353,7 +353,7 @@ mod tests {
     /// with the tokens through the one that completed it.
     #[tokio::test]
     async fn each_committed_block_is_one_delta() {
-        let block = |text: &str| EngineCoreOutput::TextTokens {
+        let block = |text: &str| Event::TextTokens {
             ids: text.bytes().map(u32::from).collect(),
         };
         let request = ChatRequest::for_test();
@@ -411,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn an_image_is_published_with_its_next_text_token() {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(EngineCoreOutput::Scheduled {
+        tx.try_send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -438,10 +438,8 @@ mod tests {
             Some(Ok(RequestOutput::TokenDelta { .. }))
         ) {}
 
-        tx.send(EngineCoreOutput::ImageCommit { image_id: 0 })
-            .await
-            .unwrap();
-        tx.send(EngineCoreOutput::ImageDone {
+        tx.send(Event::ImageCommit { image_id: 0 }).await.unwrap();
+        tx.send(Event::ImageDone {
             image_id: 0,
             height: 1,
             width: 1,

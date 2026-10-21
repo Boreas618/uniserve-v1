@@ -152,7 +152,7 @@ The [evaluation guide](docs/minimax_h3/evaluation.md) lists every suite and the 
 
 ## Text and expert parallelism
 
-For data-parallel serving, run one engine core per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
+For data-parallel serving, run one scheduler per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
 
 ```bash
 uniserve serve /models/diffusiongemma-26B-A4B-it \
@@ -160,7 +160,7 @@ uniserve serve /models/diffusiongemma-26B-A4B-it \
   --data-parallel-size 4
 ```
 
-Adding `--set moe_config.expert_parallel=true` keeps the four engine cores' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the engine cores exchange tokens at each expert layer. Every expert layer then runs in steps the engine cores take together: an engine core without work joins each step another one starts, and all of them pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
+Adding `--set moe_config.expert_parallel=true` keeps the four schedulers' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the schedulers exchange tokens at each expert layer. Every expert layer then runs in steps the schedulers take together: a scheduler without work joins each step another one starts, and all of them pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
 
 For text-to-video-and-audio generation with the FastH3 checkpoints, including the packed NVFP4 releases, use the [FastH3 guide](docs/minimax_h3/minimax_h3.md).
 

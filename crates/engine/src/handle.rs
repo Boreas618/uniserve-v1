@@ -1,9 +1,10 @@
-//! Cloneable submission and control handles for an engine owner thread.
+//! The command channel of a scheduler thread and the event channels of its
+//! requests.
 //!
-//! Frontends control the scheduler thread with [`Command`]s that an
-//! [`EngineHandle`] sends on a crossbeam channel; each successful send fires
-//! the handle's `CommandWaker`, which wakes a parked scheduler unless it is
-//! the no-op waker.
+//! Frontends control the scheduler thread with [`Command`]s that its
+//! [`SchedulerHandle`](crate::SchedulerHandle) sends on a crossbeam channel;
+//! each successful send fires the channel's `CommandWaker`, which wakes a
+//! parked scheduler unless it is the no-op waker.
 //! Each accepted request receives a bounded event channel ([`EventTx`] and
 //! [`EventRx`], [`EVENT_BUFFER_CAPACITY`] events). A scheduler that stops
 //! while a request's channel is full hands the events it could not send to
@@ -20,7 +21,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::{EngineCoreOutput, Request};
+use crate::{Event, Request};
 use ipc::RequestId;
 use tokio::sync::mpsc;
 
@@ -28,7 +29,7 @@ use crate::lock;
 
 /// Thread-safe notification used to wake an engine after command enqueue.
 ///
-/// Callers run `wake` on their own thread: `EngineHandle` right after it
+/// Callers run `wake` on their own thread: the command sender right after it
 /// enqueues a command, and `EventRx` after it consumes an output event and
 /// frees channel capacity. The engine's implementations (the `WakeSignal`
 /// socket write and the simulator's progress channel send) do not block.
@@ -92,7 +93,7 @@ impl std::fmt::Debug for CommandWaker {
 
 /// Events a closing sender hands to its receiver, shared by the two ends of
 /// one request's event channel.
-type Handoff = Arc<Mutex<VecDeque<EngineCoreOutput>>>;
+type Handoff = Arc<Mutex<VecDeque<Event>>>;
 
 /// Pollable command ingress whose lifetime is independent of Worker membership.
 ///
@@ -173,10 +174,10 @@ pub const EVENT_BUFFER_CAPACITY: usize = 64;
 pub enum EventSendError {
     #[error("generation event channel is full")]
     /// Carries the event rejected by a full bounded channel.
-    Full(Box<EngineCoreOutput>),
+    Full(Box<Event>),
     #[error("generation event channel is closed")]
     /// Carries the event rejected after the receiver closed.
-    Closed(Box<EngineCoreOutput>),
+    Closed(Box<Event>),
 }
 
 /// Cause recorded when an event receiver closes before terminal completion.
@@ -203,7 +204,7 @@ pub enum SubmitError {
 /// Bounded engine-to-caller event sender.
 #[derive(Clone)]
 pub struct EventTx {
-    inner: mpsc::Sender<EngineCoreOutput>,
+    inner: mpsc::Sender<Event>,
     handoff: Handoff,
 }
 
@@ -214,7 +215,7 @@ impl EventTx {
     /// The receiver yields them in order once it has drained the channel and
     /// every sender has closed, so only a request's last publisher uses this.
     /// Nothing is kept when the receiver has already closed.
-    pub(crate) fn close_with(self, events: VecDeque<EngineCoreOutput>) {
+    pub(crate) fn close_with(self, events: VecDeque<Event>) {
         if events.is_empty() || self.inner.is_closed() {
             return;
         }
@@ -228,7 +229,7 @@ impl EventTx {
     /// Never blocks. The scheduler keeps an event rejected as `Full` in the
     /// request's output journal (`EventJournal`) and resends it, in order, on
     /// a later flush that finds the channel has room.
-    pub fn send(&self, event: EngineCoreOutput) -> Result<(), EventSendError> {
+    pub fn send(&self, event: Event) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
             mpsc::error::TrySendError::Closed(event) => EventSendError::Closed(Box::new(event)),
@@ -254,7 +255,7 @@ impl EventTx {
 /// sender handed over on closing (`EventTx::close_with`), and only then
 /// reports the stream closed.
 pub struct EventRx {
-    inner: mpsc::Receiver<EngineCoreOutput>,
+    inner: mpsc::Receiver<Event>,
     handoff: Handoff,
     waker: CommandWaker,
     cancellation: Option<EventCancellation>,
@@ -271,7 +272,7 @@ pub struct EventRx {
 /// holds it; it is dropped on the terminal event, channel close, or first
 /// cancellation.
 struct EventCancellation {
-    handle: EngineHandle,
+    handle: CommandSender,
     request_id: RequestId,
     /// Whether the request's tokens await the frontend decoder's stop-string
     /// decisions: set by `submit` for token requests with stop strings.
@@ -280,7 +281,7 @@ struct EventCancellation {
 
 impl EventRx {
     /// Wraps a Tokio receiver without engine cancellation or wake integration.
-    pub fn from_receiver(inner: mpsc::Receiver<EngineCoreOutput>) -> Self {
+    pub fn from_receiver(inner: mpsc::Receiver<Event>) -> Self {
         Self {
             inner,
             handoff: Handoff::default(),
@@ -303,7 +304,7 @@ impl EventRx {
     ///
     /// Returns `None` once the channel is closed and empty and every handed
     /// over event has been yielded, which also runs the completion callback.
-    pub async fn recv(&mut self) -> Option<EngineCoreOutput> {
+    pub async fn recv(&mut self) -> Option<Event> {
         let event = match self.inner.recv().await {
             Some(event) => Some(event),
             None => self.take_handoff(),
@@ -321,7 +322,7 @@ impl EventRx {
     }
 
     /// Receives the next event.
-    pub async fn next(&mut self) -> Option<EngineCoreOutput> {
+    pub async fn next(&mut self) -> Option<Event> {
         self.recv().await
     }
 
@@ -329,7 +330,7 @@ impl EventRx {
     ///
     /// Reports `Disconnected` only after every handed over event has been
     /// yielded.
-    pub fn try_recv(&mut self) -> Result<EngineCoreOutput, mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
         let event = match self.inner.try_recv() {
             Err(mpsc::error::TryRecvError::Disconnected) => self
                 .take_handoff()
@@ -344,23 +345,21 @@ impl EventRx {
     }
 
     /// Removes the next event a closed sender handed over.
-    fn take_handoff(&self) -> Option<EngineCoreOutput> {
+    fn take_handoff(&self) -> Option<Event> {
         lock(&self.handoff).pop_front()
     }
 
     /// Updates the received token count and completion state for a received
     /// event.
-    fn observe(&mut self, event: &EngineCoreOutput) {
+    fn observe(&mut self, event: &Event) {
         match event {
-            EngineCoreOutput::TextToken { .. } => {
+            Event::TextToken { .. } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(1);
             }
-            EngineCoreOutput::TextTokens { ids } => {
+            Event::TextTokens { ids } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(ids.len());
             }
-            EngineCoreOutput::Finished { .. }
-            | EngineCoreOutput::Rejected { .. }
-            | EngineCoreOutput::Error { .. } => {
+            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. } => {
                 self.finish();
             }
             _ => {}
@@ -494,8 +493,10 @@ pub enum Command {
     Shutdown,
 }
 
-/// Cloneable front door over the scheduler. `submit` enqueues to the scheduler;
-/// dropping the last handle tears the engine down.
+/// The cloneable sender of one scheduler's commands: the counterpart of the
+/// receiver `Scheduler::run` and `Scheduler::step` drain. A
+/// [`SchedulerHandle`](crate::SchedulerHandle) holds the sender of the
+/// scheduler it runs.
 ///
 /// The scheduler stops when every sender of its command channel has dropped,
 /// which includes the clones held by live [`EventRx`] values that are still
@@ -507,20 +508,21 @@ pub enum Command {
 /// With the no-op waker, a parked scheduler observes commands only when its
 /// executor poll returns.
 #[derive(Clone)]
-pub struct EngineHandle {
+pub struct CommandSender {
     tx: crossbeam_channel::Sender<Command>,
     waker: CommandWaker,
 }
 
-impl EngineHandle {
-    /// Constructs a handle with the no-op waker, for a scheduler that observes
-    /// commands only through its timed executor poll.
+impl CommandSender {
+    /// Constructs a sender with the no-op waker, for a scheduler that
+    /// observes commands only through its timed executor poll.
     pub fn new(tx: crossbeam_channel::Sender<Command>) -> Self {
         Self::with_waker(tx, CommandWaker::noop())
     }
 
-    /// Constructs a handle that fires `waker` after every enqueue, used when the
-    /// engine drives an event-driven executor that parks between steps.
+    /// Constructs a sender that fires `waker` after every enqueue, used when
+    /// the scheduler drives an event-driven executor that parks between
+    /// steps.
     pub fn with_waker(tx: crossbeam_channel::Sender<Command>, waker: CommandWaker) -> Self {
         Self { tx, waker }
     }
@@ -540,8 +542,8 @@ impl EngineHandle {
     ///
     /// The returned receiver cancels the request when dropped before its
     /// terminal event. Fails with `SubmitError::Closed` when the command
-    /// channel is closed; this handle never reports `SubmitError::Dead`,
-    /// which `EngineCore::submit` checks before calling it.
+    /// channel is closed; a sender never reports `SubmitError::Dead`, which
+    /// `SchedulerHandle::submit` checks before calling it.
     pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
         let (submission, events) = self.bind(request.into());
         self.send(Command::Submit(vec![submission]))
@@ -599,11 +601,13 @@ impl EngineHandle {
     pub fn cancel(&self, id: RequestId) {
         let _ = self.send(Command::Cancel(id));
     }
+
     /// Finishes a request successfully, as when its decoder matched a stop
     /// string.
     pub fn stop(&self, id: RequestId) {
         let _ = self.send(Command::Stop(id));
     }
+
     /// Acknowledges that the first `output_token_count` public tokens of a
     /// request with stop strings complete none of them.
     pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
@@ -612,12 +616,13 @@ impl EngineHandle {
             output_token_count,
         });
     }
+
     /// Aborts a request immediately without applying client cancellation semantics.
     pub fn abort(&self, id: RequestId) {
         let _ = self.send(Command::Abort(id));
     }
 
-    /// Requests orderly engine shutdown.
+    /// Requests orderly scheduler shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
     }
@@ -679,7 +684,7 @@ mod tests {
     #[test]
     fn submit_enqueues_submit_command_with_request() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
 
         let _events = handle.submit(test_request(11)).unwrap();
 
@@ -692,7 +697,7 @@ mod tests {
     #[test]
     fn submit_all_enqueues_its_requests_in_one_command() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
 
         let events = handle
             .submit_all([test_request(21), test_request(22), test_request(23)].map(Request::from))
@@ -712,19 +717,19 @@ mod tests {
     #[test]
     fn dropping_event_receiver_cancels_the_request() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let mut events = handle.submit(test_request(12)).unwrap();
         let event_tx = submitted_events(rx.recv().unwrap());
 
         event_tx
-            .send(EngineCoreOutput::TextToken {
+            .send(Event::TextToken {
                 id: 7,
                 logprob: None,
             })
             .unwrap();
         assert!(matches!(
             events.try_recv(),
-            Ok(EngineCoreOutput::TextToken { id: 7, .. })
+            Ok(Event::TextToken { id: 7, .. })
         ));
         events.acknowledge_consumed_prefix();
         drop(events);
@@ -742,14 +747,14 @@ mod tests {
     #[test]
     fn stop_string_request_reports_decoder_decisions() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let mut request = test_request(14);
         request.stop_strings = vec!["end".to_string()];
         let mut events = handle.submit(request).unwrap();
         let event_tx = submitted_events(rx.recv().unwrap());
 
         event_tx
-            .send(EngineCoreOutput::TextTokens { ids: vec![7, 8] })
+            .send(Event::TextTokens { ids: vec![7, 8] })
             .unwrap();
         assert!(events.try_recv().is_ok());
         events.acknowledge_consumed_prefix();
@@ -779,7 +784,7 @@ mod tests {
     #[test]
     fn request_control_commands_preserve_their_semantics() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
 
         handle.cancel(RequestId(1));
         handle.stop(RequestId(4));
@@ -816,11 +821,11 @@ mod tests {
     #[tokio::test]
     async fn receiver_yields_handed_over_events_after_the_channel_drains() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let mut events = handle.submit(test_request(13)).unwrap();
         let event_tx = submitted_events(rx.recv().unwrap());
 
-        let token = |id| EngineCoreOutput::TextToken { id, logprob: None };
+        let token = |id| Event::TextToken { id, logprob: None };
         for id in 0..EVENT_BUFFER_CAPACITY as u32 {
             event_tx.send(token(id)).unwrap();
         }
@@ -829,7 +834,7 @@ mod tests {
             event_tx.send(token(capacity)),
             Err(EventSendError::Full(_))
         ));
-        let terminal = EngineCoreOutput::Finished {
+        let terminal = Event::Finished {
             reason: crate::FinishReason::Aborted,
             stop_reason: None,
             prompt_tokens: 3,
@@ -840,13 +845,13 @@ mod tests {
 
         for expected in 0..=capacity {
             match events.recv().await {
-                Some(EngineCoreOutput::TextToken { id, .. }) => assert_eq!(id, expected),
+                Some(Event::TextToken { id, .. }) => assert_eq!(id, expected),
                 other => panic!("expected token {expected}, received {other:?}"),
             }
         }
         assert!(matches!(
             events.recv().await,
-            Some(EngineCoreOutput::Finished {
+            Some(Event::Finished {
                 reason: crate::FinishReason::Aborted,
                 ..
             })
@@ -859,7 +864,7 @@ mod tests {
     #[test]
     fn submit_after_receiver_dropped_returns_error() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         drop(rx);
 
         let result = handle.submit(test_request(99));
@@ -880,7 +885,7 @@ mod tests {
         });
 
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::with_waker(tx, waker);
+        let handle = CommandSender::with_waker(tx, waker);
 
         handle.cancel(RequestId(1));
         handle.abort(RequestId(2));
@@ -897,7 +902,7 @@ mod tests {
     #[test]
     fn cloned_handle_shares_channel() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let clone = handle.clone();
 
         clone.shutdown();

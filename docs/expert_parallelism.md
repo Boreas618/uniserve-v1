@@ -1,8 +1,8 @@
 # Expert parallelism
 
-Mixture-of-experts models can shard their routed experts across GPUs. UniServe supports three deployments: engine cores that shard the experts among themselves and exchange tokens at every expert layer, dedicated expert workers that hold the experts while attention workers route tokens to them, and distributed weight data parallelism (DWDP), in which engine cores read missing expert weights from their peers instead of exchanging tokens.
+Mixture-of-experts models can shard their routed experts across GPUs. UniServe supports three deployments: schedulers that shard the experts among themselves and exchange tokens at every expert layer, dedicated expert workers that hold the experts while attention workers route tokens to them, and distributed weight data parallelism (DWDP), in which schedulers read missing expert weights from their peers instead of exchanging tokens.
 
-## Engine cores sharing their experts
+## Schedulers sharing their experts
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/uniserve serve /models/Qwen3-30B-A3B \
   --set moe_config.expert_parallel=true --set moe_config.exchange=alltoall
 ```
 
-Every engine core keeps its own scheduler, KV cache and attention, and its worker holds `1 / N` of each layer's routed experts. The engine cores run every expert layer together: before each forward, their workers agree over a host connection on which engine core's batch runs and on the step's per-core token capacity, and every other worker joins the step without tokens of its own, so its experts serve the tokens routed to them. A worker that is idle keeps joining. Expert parallelism requires one-worker groups and one execution lane.
+Every scheduler keeps its own KV cache and attention, and its worker holds `1 / N` of each layer's routed experts. The schedulers run every expert layer together: before each forward, their workers agree over a host connection on which scheduler's batch runs and on the step's per-scheduler token capacity, and every other worker joins the step without tokens of its own, so its experts serve the tokens routed to them. A worker that is idle keeps joining. Expert parallelism requires one-worker groups and one execution lane.
 
 `moe_config.exchange` selects the token transport:
 
@@ -60,4 +60,4 @@ Attention ranks hold no routed-expert weights; expert ranks hold every routed ex
   --set moe_config.exchange=dwdp
 ```
 
-Each engine core's worker keeps its expert shard resident and, before each expert layer, copies the shards of the other workers from peer memory into two reusable buffers per weight, prefetching the next layer while the current one computes. Engine cores advance independently and never wait for each other during inference; only startup is collective. The workers need peer-accessible GPUs on one host and one execution lane, and the experts must run on the CuTeDSL kernels (BF16 with widths that are multiples of 64, or NVFP4, on SM100). The startup log reports the resident, buffer and per-invocation copy bytes.
+Each scheduler's worker keeps its expert shard resident and, before each expert layer, copies the shards of the other workers from peer memory into two reusable buffers per weight, prefetching the next layer while the current one computes. Schedulers advance independently and never wait for each other during inference; only startup is collective. The workers need peer-accessible GPUs on one host and one execution lane, and the experts must run on the CuTeDSL kernels (BF16 with widths that are multiples of 64, or NVFP4, on SM100). The startup log reports the resident, buffer and per-invocation copy bytes.

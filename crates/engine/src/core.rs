@@ -1,14 +1,17 @@
-//! In-process composition of worker executors, scheduler ownership, and handles.
+//! The deployment's composition: its worker groups, its schedulers and their
+//! handles.
 //!
-//! [`EngineCore`] owns the scheduler thread and worker lifecycle while exposing
-//! a transport-independent [`EngineHandle`] to request producers.
+//! A deployment runs one scheduler per DP rank. [`SchedulerHandle`] owns a
+//! scheduler's thread and is the front door request producers submit and
+//! control requests through.
 //!
 //! [`WorkerGroupConfig`] is the static deployment description: each WorkerGroup has
 //! an ordered list of physical [`WorkerRank`]s and named components whose
 //! `ranks` index into that list. [`EngineConfig`] adds scheduler budgets,
-//! transfer bindings, and rank launch defaults. `EngineCore::new` turns that
-//! configuration into launched worker processes; `EngineCore::with_executor`
-//! accepts an executor built elsewhere, such as the CPU simulation backend.
+//! transfer bindings, and rank launch defaults. `SchedulerHandle::start_all`
+//! turns that configuration into launched worker processes and one scheduler
+//! per DP rank; `SchedulerHandle::with_executor` accepts an executor built
+//! elsewhere, such as the CPU simulation backend.
 
 #[cfg(any(feature = "testing", test))]
 use ipc::DEFAULT_COMPONENT;
@@ -21,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
-use crate::handle::{EngineHandle, EventRx, SubmitError};
+use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -31,7 +34,7 @@ use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
-use crate::{CommandWaker, GenerationLimits, ModelDtype, Request};
+use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
 #[cfg(test)]
 use ipc::ComponentDistribution;
@@ -58,7 +61,7 @@ pub enum WorkerGroupRole {
     /// Model capabilities, request state, and (when present) attention/KV.
     #[default]
     Model,
-    /// Routed experts shared by the deployment's engine cores.
+    /// Routed experts shared by the deployment's schedulers.
     Experts,
 }
 
@@ -81,7 +84,7 @@ pub struct WorkerGroupConfig {
     /// Per-rank share of device memory available to this worker process for
     /// static allocations (weights and KV cache).
     ///
-    /// When set, `EngineCore::new` launches the group's ranks with it as
+    /// When set, `SchedulerHandle::start_all` launches the group's ranks with it as
     /// `WorkerProcessArgs::mem_fraction_static` instead of the engine-wide
     /// default, which `--mem-fraction-static` sets.
     ///
@@ -264,13 +267,13 @@ impl WorkerGroupConfig {
     }
 
     /// Expands the data-parallel CLI shorthand into one group of
-    /// `ranks_per_core` ranks for each of `cores` engine cores, each carrying
+    /// `ranks_per_core` ranks for each of `cores` schedulers, each carrying
     /// `components`.
     ///
     /// All `cores * ranks_per_core` ranks are placed at once as
     /// [`WorkerGroupConfig::placed`] places them, in blocks over `hosts`, and
     /// consecutive runs of `ranks_per_core` form the groups, so the first
-    /// engine cores fill the head's host first. The group of one engine core
+    /// schedulers fill the head's host first. The group of one scheduler
     /// is `model`; the group of core `i` of several is `model-<i>`.
     pub fn data_parallel(
         hosts: &[String],
@@ -306,8 +309,8 @@ impl WorkerGroupConfig {
     }
 }
 
-/// Configuration for the in-process engine cores of one deployment: one
-/// engine core, or `data_parallel_size` of them.
+/// Configuration of one deployment's schedulers: one per DP rank,
+/// `data_parallel_size` of them.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Model generation requirements, intersected with loaded worker capacities.
@@ -316,7 +319,7 @@ pub struct EngineConfig {
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum number of concurrently running requests. `EngineCore::new`
+    /// Maximum number of concurrently running requests. `SchedulerHandle::start_all`
     /// sizes every worker's request pool from it.
     pub max_running_requests: usize,
     /// Most requests, waiting or finished with undelivered events, the
@@ -335,19 +338,19 @@ pub struct EngineConfig {
     /// Per-edge data-plane transfer backend selection (`placement_config.transfer`), e.g.
     /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`. Participating worker
     /// ranks receive the selected transport. Before process launch,
-    /// `EngineCore::new` binds a default for every ordered rank pair, within
+    /// `SchedulerHandle::start_all` binds a default for every ordered rank pair, within
     /// and across WorkerGroups, that no configured edge covers, derived from
     /// rank host/device coordinates.
     pub transfer: TransferConfig,
-    /// Number of engine cores `worker_groups` forms, as equal consecutive
-    /// blocks of model groups ([`EngineCore::start_all`]). One means the
-    /// groups form one engine core.
+    /// Number of schedulers `worker_groups` forms, as equal consecutive
+    /// blocks of model groups ([`SchedulerHandle::start_all`]). One means the
+    /// groups form one scheduler.
     pub data_parallel_size: usize,
-    /// Whether the engine cores shard the model's routed experts, and how
-    /// they exchange tokens: each engine core's group is then one worker,
+    /// Whether the schedulers shard the model's routed experts, and how
+    /// they exchange tokens: each scheduler's group is then one worker,
     /// keeps its share of every expert layer and exchanges tokens with the
     /// others at those layers, while attention and every other layer stay
-    /// data-parallel. `None` keeps every expert on every engine core.
+    /// data-parallel. `None` keeps every expert on every scheduler.
     pub expert_parallel: Option<crate::worker::ExpertExchange>,
     /// Rank launch defaults refined by each WorkerGroup configuration.
     ///
@@ -365,8 +368,9 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// Builds a minimal configuration for the CPU simulation backend.
     ///
-    /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
-    /// build a `Sim` backend because it has no spawnable worker process.
+    /// Pair this with [`SchedulerHandle::with_executor`]:
+    /// [`SchedulerHandle::start_all`] cannot build a `Sim` backend because it
+    /// has no spawnable worker process.
     #[cfg(feature = "testing")]
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
@@ -423,74 +427,59 @@ impl EngineConfig {
     }
 }
 
-/// The engine core: scheduler thread, executor, and worker info as one
-/// transport-free object.
-pub struct EngineCore {
-    handle: EngineHandle,
+/// One DP rank's scheduler, running on a thread of its own, and the front
+/// door through which its requests are submitted and controlled.
+///
+/// The thread owns the [`Scheduler`] and its executor; the handle reaches
+/// it only through the scheduler's command channel, and keeps what the
+/// scheduler reported at start: the worker capabilities, the media units of
+/// each routed media call, the generation limits and the live statistics.
+/// The dead latch records a fatal executor or worker failure, after which
+/// the handle refuses submissions. Dropping the handle shuts the scheduler
+/// down and joins its thread.
+pub struct SchedulerHandle {
+    commands: CommandSender,
     info: WorkerInfo,
     /// Media units one call of each routed media call covers at once
     /// (`ExecutorInfo::media_units`).
     media_units: BTreeMap<MediaCall, u32>,
     stats: Arc<SchedulerStats>,
-    model_name: String,
-    model_dtype: ModelDtype,
     generation_limits: GenerationLimits,
-    /// Engine-dead latch: set after `Scheduler::run` returns a fatal exit
-    /// (executor or worker failure). A scheduler thread panic does not set it.
+    /// The served model identifier.
+    model: String,
+    /// Set after `Scheduler::run` returns a fatal exit (executor or worker
+    /// failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
     next_id: AtomicU64,
-    sched_thread: Mutex<Option<JoinHandle<()>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl EngineCore {
-    /// Launches every configured WorkerGroup, builds the scheduler, and starts
-    /// the scheduler owner thread.
+impl SchedulerHandle {
+    /// Launches the deployment's workers and runs one scheduler per DP rank,
+    /// `config.data_parallel_size` of them, each over its own copy of the
+    /// deployment's model worker groups.
     ///
-    /// Every group is launched with a request pool of `max_running_requests` rows
-    /// plus the largest reserve a runtime keeps outside that limit.
-    ///
-    /// Blocks until every rank has loaded the model and reported its
-    /// capabilities. Fails when `config.data_parallel_size` is not one (see
-    /// [`EngineCore::start_all`]), `WorkerGroupConfig::validate_all` rejects the
-    /// workers, a configured transfer edge names an unconfigured worker,
-    /// `WorkerGroup::spawn_all` fails to launch a group,
-    /// `WorkerExecutor::try_new` refuses the launched groups, the workers of
-    /// a runtime with a prefix cache hold too few request rows for
-    /// `max_running_requests` running requests, or the scheduler or its thread
-    /// cannot be created.
-    pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            config.data_parallel_size == 1,
-            "one engine core serves one data-parallel copy; EngineCore::start_all \
-             launches several"
-        );
-        let mut cores = Self::start_all(config)?;
-        Ok(cores.remove(0))
-    }
-
-    /// Launches `config.data_parallel_size` engine cores, each over its own
-    /// copy of the deployment's model worker groups.
-    ///
-    /// `config.worker_groups` lists the engine cores' model groups as equal
-    /// consecutive blocks. Each engine core gets its own scheduler thread,
-    /// executor, cache pool, prefix cache and request rows over its own
-    /// groups, the way
-    /// SGLang runs one scheduler per data-parallel rank behind its
+    /// `config.worker_groups` lists the schedulers' model groups as equal
+    /// consecutive blocks. Each scheduler gets its own thread, executor,
+    /// cache pool, prefix cache and request rows over its own groups, the
+    /// way SGLang runs one scheduler per data-parallel rank behind its
     /// `DataParallelController` and vLLM one engine core per data-parallel
-    /// rank. Every group of every engine core launches through one
-    /// `WorkerGroup::spawn_all`, so the engine cores load their models at the
+    /// rank. Every group of every scheduler launches through one
+    /// `WorkerGroup::spawn_all`, so the schedulers load their models at the
     /// same time and one daemon per node serves all of them.
     ///
-    /// Engine cores exchange no products: every configured transfer edge must
-    /// stay inside one engine core, and each binds its default edges over its
+    /// Schedulers exchange no products: every configured transfer edge must
+    /// stay inside one scheduler, and each binds its default edges over its
     /// own groups only.
     ///
     /// Fails when the size is zero or does not divide the groups, when the
-    /// engine cores' groups are not the same deployment on different ranks
+    /// schedulers' groups are not the same deployment on different ranks
     /// (group count, rank counts, components, queue depth and
     /// mem_fraction_static must match position by position), when a
-    /// configured edge crosses engine cores or names an unconfigured worker
-    /// group, or for any reason `EngineCore::new` names.
+    /// configured edge crosses schedulers or names an unconfigured worker
+    /// group, when the workers of a token runtime hold too few request rows
+    /// for `max_running_requests` running requests, or when a group cannot
+    /// be launched, a scheduler cannot be built or its warmup fails.
     pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
         let size = config.data_parallel_size;
         WorkerGroupConfig::validate_all(&config.worker_groups)?;
@@ -501,7 +490,7 @@ impl EngineCore {
             .partition(|worker| worker.role == WorkerGroupRole::Model);
         anyhow::ensure!(
             size > 0 && !model_workers.is_empty() && model_workers.len().is_multiple_of(size),
-            "{} worker groups do not form {size} equal engine cores",
+            "{} worker groups do not form {size} equal schedulers",
             model_workers.len()
         );
         let core_groups: Vec<&[WorkerGroupConfig]> =
@@ -513,7 +502,7 @@ impl EngineCore {
                         && group.components == first.components
                         && group.queue_depth == first.queue_depth
                         && group.mem_fraction_static == first.mem_fraction_static,
-                    "engine cores must place the same groups: worker group {} \
+                    "schedulers must place the same groups: worker group {} \
                      differs from worker group {}",
                     group.id,
                     first.id
@@ -537,7 +526,7 @@ impl EngineCore {
                             | crate::worker::ExpertExchange::MegaMoe
                     )
                 ) && core_groups.iter().all(|core_group| core_group.len() == 1),
-                "disaggregated experts require deepep or megamoe and one model group per engine core"
+                "disaggregated experts require deepep or megamoe and one model group per scheduler"
             );
         } else {
             anyhow::ensure!(
@@ -547,7 +536,7 @@ impl EngineCore {
                         && core_groups.iter().all(|core_group| {
                             core_group.len() == 1 && core_group[0].ranks.len() == 1
                         })),
-                "colocated expert parallelism requires two or more engine cores of one \
+                "colocated expert parallelism requires two or more schedulers of one \
                  one-worker group each; deepep requires dedicated expert workers"
             );
         }
@@ -569,7 +558,7 @@ impl EngineCore {
             size
         };
 
-        // Each engine core resolves its transfer edges over its own groups.
+        // Each scheduler resolves its transfer edges over its own groups.
         // The edges `with_worker_defaults` adds only name the core's groups,
         // so checking the configured ones covers every edge.
         let mut transfers = Vec::with_capacity(size);
@@ -589,7 +578,7 @@ impl EngineCore {
             for edge in &edges {
                 anyhow::ensure!(
                     members.contains(&edge.destination_worker),
-                    "transfer edge {} -> {} leaves its source's engine core",
+                    "transfer edge {} -> {} leaves its source's scheduler",
                     edge.source_worker,
                     edge.destination_worker
                 );
@@ -618,8 +607,8 @@ impl EngineCore {
 
         // Each group launches from the shared defaults with its own identity,
         // placement, components, queue depth, and mem_fraction_static, plus its
-        // engine core's resolved transfer edges and the components of every
-        // group of its engine core (`peers`), from which the group resolves
+        // scheduler's resolved transfer edges and the components of every
+        // group of its scheduler (`peers`), from which the group resolves
         // the ranks, possibly in other groups, that read its products.
         let mut arguments = Vec::with_capacity(config.worker_groups.len());
         let mut union_rank = 0;
@@ -683,7 +672,7 @@ impl EngineCore {
         }
 
         // `spawn_all` returns groups in argument order, which pairs each group
-        // with its identity and, block by block, with its engine core.
+        // with its identity and, block by block, with its scheduler.
         let launched = WorkerGroup::spawn_all(arguments)?;
         let mut groups = model_workers
             .iter()
@@ -692,7 +681,7 @@ impl EngineCore {
             .zip(launched)
             .collect::<Vec<_>>();
         // Shared expert groups have one lifecycle owner. They advertise no
-        // request capabilities, so they never become an engine core's own.
+        // request capabilities, so they never become a scheduler's own.
         let mut shared = groups.split_off(model_workers.len());
         let mut groups = groups.into_iter();
         let mut cores = Vec::with_capacity(size);
@@ -729,20 +718,21 @@ impl EngineCore {
                 expert_parallel: None,
                 ..config.clone()
             };
-            let core = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
-            // Each engine core's serving path runs the requests its workers'
-            // reports call for before the engine core serves.
-            crate::warmup::warm(&core, &core_config)?;
-            cores.push(core);
+            let scheduler = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
+            // Each scheduler's serving path runs the requests its workers'
+            // reports call for before the scheduler serves.
+            crate::warmup::warm(&scheduler, &core_config)?;
+            cores.push(scheduler);
         }
         Ok(cores)
     }
 
-    /// Builds the engine core from an executor supplied by a higher composition layer.
+    /// Runs a scheduler over an executor supplied by a higher composition
+    /// layer, such as the CPU simulation backend.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park. The constructor uses neither `config.workers`
-    /// nor `config.transfer`.
+    /// scheduler's idle park. Neither `config.worker_groups` nor
+    /// `config.transfer` is read.
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
@@ -750,24 +740,15 @@ impl EngineCore {
         Self::assemble(config, executor, CommandWaker::noop())
     }
 
-    /// Assembles scheduler state and transport channels around an initialized executor.
+    /// Builds the scheduler `config` states over `executor` and runs it.
     fn assemble(
         config: EngineConfig,
         executor: Box<dyn Executor>,
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
-        let special_tokens = config.control_tokens();
-        // The scheduler takes the executor; the server sizes media work by
-        // these widths before it submits requests.
-        let media_units = executor
-            .info()
-            .media_routing()?
-            .into_keys()
-            .filter_map(|call| executor.info().media_units(call).map(|units| (call, units)))
-            .collect();
-        let mut sched = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             executor,
-            special_tokens,
+            config.control_tokens(),
             SchedulerConfig {
                 max_batch: config.max_batch,
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
@@ -780,53 +761,61 @@ impl EngineCore {
             config.worker_process.dtype,
             config.generation_limits,
         )?;
-        sched.set_prefix_reuse(config.prefix_cache);
+        scheduler.set_prefix_reuse(config.prefix_cache);
         if config.prefix_cache && config.worker_process.page_tier {
-            sched.enable_page_tier(
+            scheduler.enable_page_tier(
                 &config.worker_process.deployment,
                 &config.worker_process.host,
             );
         }
-        let info = sched.info().clone();
-        let model_dtype = config.worker_process.dtype;
-        let generation_limits = sched.generation_limits().clone();
-        let stats = sched.stats_handle();
+        Self::spawn(scheduler, config.worker_process.model, waker)
+    }
 
-        // The scheduler thread owns the `Scheduler` and its executor; request
-        // producers reach it only through the command channel.
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    /// Runs `scheduler`, which serves `model`, on a thread of its own.
+    /// `waker` is fired after every command is enqueued; it is the
+    /// executor's command waker for an executor that parks between steps, or
+    /// the no-op waker for one the scheduler polls.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the executor's media routing is inconsistent or the thread
+    /// cannot be started.
+    pub fn spawn(
+        scheduler: Scheduler,
+        model: impl Into<String>,
+        waker: CommandWaker,
+    ) -> anyhow::Result<Self> {
+        // Requests size their media work by these widths before they are
+        // submitted.
+        let media_units = scheduler.media_units()?;
+        let info = scheduler.info().clone();
+        let generation_limits = scheduler.generation_limits().clone();
+        let stats = scheduler.stats_handle();
+
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let dead = Arc::new(AtomicBool::new(false));
-        let sched_thread = {
+        let thread = {
             let dead = Arc::clone(&dead);
             std::thread::Builder::new()
                 .name("scheduler".into())
                 .spawn(move || {
-                    let fatal = sched.run(cmd_rx);
-                    if fatal {
+                    if scheduler.run(receiver) {
                         dead.store(true, Ordering::SeqCst);
                     }
                 })
-                .context("failed to spawn scheduler thread")?
+                .context("failed to spawn the scheduler thread")?
         };
-        let handle = EngineHandle::with_waker(cmd_tx, waker);
-
         Ok(Self {
-            handle,
+            commands: CommandSender::with_waker(sender, waker),
             info,
             media_units,
             stats,
-            model_name: config.worker_process.model,
-            model_dtype,
             generation_limits,
+            model: model.into(),
             dead,
             next_id: AtomicU64::new(1),
-            sched_thread: Mutex::new(Some(sched_thread)),
+            thread: Mutex::new(Some(thread)),
         })
-    }
-
-    /// Returns a cloneable command-channel front door over the scheduler.
-    pub fn handle(&self) -> EngineHandle {
-        self.handle.clone()
     }
 
     /// Returns the worker-reported runtime capabilities.
@@ -856,62 +845,89 @@ impl EngineCore {
 
     /// Returns the served model identifier.
     pub fn model_name(&self) -> &str {
-        &self.model_name
+        &self.model
     }
 
-    /// Returns the model parameter data type.
-    pub fn model_dtype(&self) -> ModelDtype {
-        self.model_dtype
-    }
-
-    /// Allocates the next internal scheduler request id.
+    /// Allocates the next request id of this scheduler's own requests.
     ///
-    /// Ids start at 1 and are unique for the lifetime of this core; `Relaxed`
-    /// suffices because only uniqueness is required.
+    /// Ids start at 1 and are unique for the lifetime of this scheduler;
+    /// `Relaxed` suffices because only uniqueness is required.
     pub fn next_request_id(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Returns whether the engine has encountered a terminal worker or executor failure.
+    /// Returns whether the scheduler stopped on a terminal worker or
+    /// executor failure.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
     }
 
-    /// Submits one translated request to the scheduler.
+    /// Submits a request and returns its bounded event stream.
     ///
-    /// Returns `SubmitError::Dead` once the dead latch is set and
+    /// The returned receiver cancels the request when dropped before its
+    /// terminal event.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `SubmitError::Dead` once the dead latch is set and with
     /// `SubmitError::Closed` when the command channel no longer accepts
-    /// commands. Submitting through a cloned `handle()` skips the latch check
-    /// and can only report `Closed`.
-    pub fn submit(&self, request: Request) -> Result<EventRx, SubmitError> {
+    /// commands.
+    pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
         }
-        self.handle.submit(request)
+        self.commands.submit(request.into())
     }
 
-    /// Submits translated requests together, as `EngineHandle::submit_all`:
-    /// the scheduler queues every one of them before it forms its next batch.
+    /// Submits requests in one command and returns their event streams in
+    /// submission order: the scheduler queues every one of them before it
+    /// forms its next batch, as it would requests from concurrent clients
+    /// that all arrived before that batch. Separate `submit` calls give no
+    /// such guarantee.
     ///
-    /// Returns their event streams in submission order, and the errors of
-    /// `submit`.
+    /// # Errors
+    ///
+    /// As [`Self::submit`].
     pub fn submit_all(&self, requests: Vec<Request>) -> Result<Vec<EventRx>, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
         }
-        self.handle.submit_all(requests)
+        self.commands.submit_all(requests)
     }
 
-    /// Shuts down the scheduler, tears down its executor, and joins
-    /// its thread. Idempotent.
+    /// Cancels a request.
+    pub fn cancel(&self, id: RequestId) {
+        self.commands.cancel(id);
+    }
+
+    /// Finishes a request successfully, as when its decoder matched a stop
+    /// string.
+    pub fn stop(&self, id: RequestId) {
+        self.commands.stop(id);
+    }
+
+    /// Acknowledges that the first `output_token_count` public tokens of a
+    /// request with stop strings complete none of them.
+    pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
+        self.commands.acknowledge_at(id, output_token_count);
+    }
+
+    /// Aborts a request immediately without applying client cancellation
+    /// semantics.
+    pub fn abort(&self, id: RequestId) {
+        self.commands.abort(id);
+    }
+
+    /// Shuts down the scheduler, tears down its executor, and joins its
+    /// thread. Idempotent.
     ///
     /// Blocks until the scheduler thread exits; on shutdown `Scheduler::run`
     /// first finishes queued and running requests with `Aborted` and closes
     /// the executor. A poisoned thread lock or a panicked scheduler thread is
     /// logged, not propagated.
     pub fn shutdown(&self) {
-        self.handle.shutdown();
-        let thread = match self.sched_thread.lock() {
+        self.commands.shutdown();
+        let thread = match self.thread.lock() {
             Ok(mut guard) => guard.take(),
             Err(error) => {
                 tracing::warn!("scheduler thread lock poisoned during shutdown");
@@ -926,8 +942,9 @@ impl EngineCore {
     }
 }
 
-impl Drop for EngineCore {
-    /// Runs `EngineCore::shutdown`, blocking until the scheduler thread exits.
+impl Drop for SchedulerHandle {
+    /// Runs `SchedulerHandle::shutdown`, blocking until the scheduler thread
+    /// exits.
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -1025,7 +1042,7 @@ mod tests {
         assert_eq!(worker.components["alone"].ranks, vec![0]);
     }
 
-    /// The two-rank groups of four engine cores over two four-device hosts
+    /// The two-rank groups of four schedulers over two four-device hosts
     /// fill the head's host first, and each group keeps its ranks on one host.
     #[test]
     fn the_data_parallel_shorthand_places_engine_cores_in_host_blocks() {
@@ -1075,7 +1092,7 @@ mod tests {
         );
         assert!(WorkerGroupConfig::validate_all(&groups).is_ok());
 
-        // One engine core keeps the single-group identity.
+        // One scheduler keeps the single-group identity.
         let single = WorkerGroupConfig::data_parallel(
             &hosts,
             "cuda",
@@ -1088,7 +1105,7 @@ mod tests {
         assert_eq!(single[0].id.to_string(), "model");
     }
 
-    /// Engine cores must place the same deployment on different ranks, and
+    /// Schedulers must place the same deployment on different ranks, and
     /// the size must divide the groups; both are refused before any worker
     /// launches.
     #[test]
@@ -1106,17 +1123,17 @@ mod tests {
             data_parallel_size: 3,
             ..EngineConfig::sim("sim-model")
         };
-        assert!(EngineCore::start_all(config.clone()).is_err());
+        assert!(SchedulerHandle::start_all(config.clone()).is_err());
 
         config.data_parallel_size = 2;
         config.worker_groups[1].queue_depth = 3;
-        let error = EngineCore::start_all(config)
+        let error = SchedulerHandle::start_all(config)
             .err()
-            .expect("unequal engine cores are refused");
-        assert!(error.to_string().contains("engine cores must place"));
+            .expect("unequal schedulers are refused");
+        assert!(error.to_string().contains("schedulers must place"));
     }
 
-    /// Experts shard across two or more engine cores of one worker each; any
+    /// Experts shard across two or more schedulers of one worker each; any
     /// other placement is refused before a worker launches.
     #[test]
     fn expert_parallelism_needs_several_one_worker_engine_cores() {
@@ -1135,7 +1152,7 @@ mod tests {
                 expert_parallel: Some(crate::worker::ExpertExchange::AllToAll),
                 ..EngineConfig::sim("sim-model")
             };
-            let error = EngineCore::start_all(config)
+            let error = SchedulerHandle::start_all(config)
                 .err()
                 .expect("the placement is refused");
             assert!(error.to_string().contains("expert parallelism"), "{error}");

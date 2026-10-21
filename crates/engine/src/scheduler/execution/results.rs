@@ -58,7 +58,7 @@ impl Scheduler {
             Err(error) => {
                 // The client's message carries the failed step and its cause.
                 let message = format!("{:#}", anyhow::Error::new(error));
-                let event = EngineCoreOutput::ArtifactUnavailable { message };
+                let event = Event::ArtifactUnavailable { message };
                 if let Some(state) = self.media_state_mut(id) {
                     let _ = state.output.enqueue(event);
                 } else {
@@ -251,7 +251,7 @@ impl Scheduler {
                     CallKind::Media(MediaCall::Muxing) => "finalizing",
                     _ => unreachable!("media request completed a non-media call"),
                 };
-                let _ = state.output.enqueue(EngineCoreOutput::MediaProgress {
+                let _ = state.output.enqueue(Event::MediaProgress {
                     phase: phase.to_owned(),
                     completed_steps: state.denoising.completed(),
                 });
@@ -316,8 +316,8 @@ impl Scheduler {
         self.running_order.retain(|candidate| *candidate != id);
         match event {
             DiffusionTerminal::Completed(artifact) => {
-                let _ = state.output.enqueue(EngineCoreOutput::Artifact(artifact));
-                let _ = state.output.enqueue(EngineCoreOutput::Finished {
+                let _ = state.output.enqueue(Event::Artifact(artifact));
+                let _ = state.output.enqueue(Event::Finished {
                     reason: FinishReason::Completed,
                     stop_reason: None,
                     prompt_tokens: state.request.prompt_token_ids.len(),
@@ -326,16 +326,16 @@ impl Scheduler {
                 });
             }
             DiffusionTerminal::Failed(message) => {
-                let _ = state.output.enqueue(EngineCoreOutput::Error { message });
+                let _ = state.output.enqueue(Event::Error { message });
             }
             DiffusionTerminal::Rejected(message) => {
-                let _ = state.output.enqueue(EngineCoreOutput::Rejected {
+                let _ = state.output.enqueue(Event::Rejected {
                     kind: RejectionKind::Invalid,
                     message,
                 });
             }
             DiffusionTerminal::Finished(reason) => {
-                let _ = state.output.enqueue(EngineCoreOutput::Finished {
+                let _ = state.output.enqueue(Event::Finished {
                     reason,
                     stop_reason: None,
                     prompt_tokens: state.request.prompt_token_ids.len(),

@@ -181,10 +181,10 @@ pub struct ServeConfig {
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
     pub mem_fraction_static: f64,
-    /// Tensor-parallel workers of each engine core's group when no
+    /// Tensor-parallel workers of each scheduler's group when no
     /// `worker_groups` file is given.
     pub tensor_parallel_size: NonZeroUsize,
-    /// Engine cores, each with its own scheduler, KV cache and worker
+    /// Schedulers, each with its own scheduler, KV cache and worker
     /// groups. With a `worker_groups` file, its model groups form the engine
     /// cores as equal consecutive blocks.
     pub data_parallel_size: NonZeroUsize,
@@ -471,7 +471,7 @@ impl Default for PlacementOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeOptions {
-    /// Shard routed experts across the engine cores or the
+    /// Shard routed experts across the schedulers or the
     /// deployment's expert workers.
     pub expert_parallel: bool,
     /// How sharded experts are reached: `alltoall`, `megamoe`, `deepep` or

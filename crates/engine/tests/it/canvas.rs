@@ -19,11 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchEvent, EngineHandle, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimExecutor,
+    BatchEvent, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimExecutor,
     sim_canvas_stop_step, sim_text_token,
 };
 use engine::{
-    CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
+    CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest,
     ImageGenerationConfig, MultimodalInputs, RejectionKind,
 };
 use ipc::{Call, CallKind, ForwardBatch, ForwardMode};
@@ -94,7 +94,7 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
 /// A block-diffusion scheduler running on its own thread, with the batches
 /// its executor accepts.
 struct Running {
-    handle: EngineHandle,
+    handle: CommandSender,
     batches: crossbeam_channel::Receiver<BatchEvent>,
     thread: thread::JoinHandle<bool>,
 }
@@ -107,7 +107,7 @@ impl Running {
             support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
                 .unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let thread = thread::spawn(move || scheduler.run(rx));
         Self {
             handle,
@@ -141,13 +141,13 @@ impl Running {
 }
 
 /// Collects one request's events through its terminal event.
-fn events(receiver: EventRx) -> Vec<EngineCoreOutput> {
+fn events(receiver: EventRx) -> Vec<Event> {
     events_within(receiver, Duration::from_secs(20))
 }
 
 /// Collects one request's events through its terminal event, which must
 /// arrive within `timeout`.
-fn events_within(mut receiver: EventRx, timeout: Duration) -> Vec<EngineCoreOutput> {
+fn events_within(mut receiver: EventRx, timeout: Duration) -> Vec<Event> {
     let mut events = Vec::new();
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -155,9 +155,7 @@ fn events_within(mut receiver: EventRx, timeout: Duration) -> Vec<EngineCoreOutp
             Ok(event) => {
                 let terminal = matches!(
                     event,
-                    EngineCoreOutput::Finished { .. }
-                        | EngineCoreOutput::Rejected { .. }
-                        | EngineCoreOutput::Error { .. }
+                    Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
                 );
                 events.push(event);
                 if terminal {
@@ -171,25 +169,25 @@ fn events_within(mut receiver: EventRx, timeout: Duration) -> Vec<EngineCoreOutp
 }
 
 /// The token blocks a request published, in order.
-fn published_blocks(events: &[EngineCoreOutput]) -> Vec<Vec<u32>> {
+fn published_blocks(events: &[Event]) -> Vec<Vec<u32>> {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, EngineCoreOutput::TextToken { .. })),
+            .any(|event| matches!(event, Event::TextToken { .. })),
         "canvas text is published by block: {events:?}"
     );
     events
         .iter()
         .filter_map(|event| match event {
-            EngineCoreOutput::TextTokens { ids } => Some(ids.clone()),
+            Event::TextTokens { ids } => Some(ids.clone()),
             _ => None,
         })
         .collect()
 }
 
-fn finish_of(events: &[EngineCoreOutput]) -> (FinishReason, usize) {
+fn finish_of(events: &[Event]) -> (FinishReason, usize) {
     match events.last() {
-        Some(EngineCoreOutput::Finished {
+        Some(Event::Finished {
             reason,
             completion_tokens,
             ..
@@ -609,7 +607,7 @@ fn an_unseeded_canvas_request_is_refused() {
     assert!(
         matches!(
             answer.last(),
-            Some(EngineCoreOutput::Rejected {
+            Some(Event::Rejected {
                 kind: RejectionKind::Invalid,
                 ..
             })
@@ -642,7 +640,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     let scheduler =
         support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
+    let handle = CommandSender::new(tx);
     let generating_events = handle.submit(generating).unwrap();
     let waiting_events = handle.submit(waiting).unwrap();
     let thread = thread::spawn(move || scheduler.run(rx));

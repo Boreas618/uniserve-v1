@@ -19,9 +19,9 @@ use super::*;
 /// or product reference aliases across requests or epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestKey {
-    /// Engine core that allocates request identifiers.
+    /// Scheduler that allocates request identifiers.
     pub engine_id: u64,
-    /// Identifier assigned to the request within its engine core.
+    /// Identifier assigned to the request within its scheduler.
     pub request_id: RequestId,
     /// Admission generation that distinguishes reuse of the same request identifier.
     pub request_epoch: u64,

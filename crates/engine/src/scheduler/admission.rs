@@ -3,7 +3,7 @@
 //! Submission (`enqueue`, `enqueue_media`) validates a request and checks it
 //! against the loaded worker's capabilities and the waiting-queue bound. It
 //! either queues the request or rejects it synchronously with
-//! `EngineCoreOutput::Rejected` on the request's event channel. Admission
+//! `Event::Rejected` on the request's event channel. Admission
 //! (`admit`, `admit_media`), which the scheduling pass runs before and
 //! between batch assembly, moves requests from the head of the token and
 //! media waiting queues into the running set while `max_running_requests` and
@@ -93,7 +93,7 @@ impl Scheduler {
         let max_cache_tokens = match self.validate_submission(&req) {
             Ok(tokens) => tokens,
             Err(message) => {
-                let _ = event_tx.send(EngineCoreOutput::Rejected {
+                let _ = event_tx.send(Event::Rejected {
                     kind: RejectionKind::Invalid,
                     message,
                 });
@@ -111,7 +111,7 @@ impl Scheduler {
             .max_queued_requests
             .is_some_and(|bound| waiting >= bound)
         {
-            let _ = event_tx.send(EngineCoreOutput::Rejected {
+            let _ = event_tx.send(Event::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "scheduler waiting queue is full".into(),
             });
@@ -507,7 +507,7 @@ impl Scheduler {
         queued_at: f64,
     ) {
         let reject = |kind: RejectionKind, message: String| {
-            let _ = event_tx.send(EngineCoreOutput::Rejected { kind, message });
+            let _ = event_tx.send(Event::Rejected { kind, message });
         };
         if let Err(message) = request.validate() {
             reject(RejectionKind::Invalid, message.to_string());
@@ -792,7 +792,7 @@ impl Scheduler {
             // request's public phases report from here on.
             let scheduled_at = now();
             self.record_queue_wait(submission.queued_at, scheduled_at);
-            if !state.output.enqueue(EngineCoreOutput::Scheduled {
+            if !state.output.enqueue(Event::Scheduled {
                 queued_at: submission.queued_at,
                 scheduled_at,
             }) {
@@ -1062,7 +1062,7 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
-                    let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
+                    let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
                     });
@@ -1148,7 +1148,7 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
-                    let _ = st.output.events.event_tx.send(EngineCoreOutput::Rejected {
+                    let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
                     });
@@ -1323,7 +1323,7 @@ impl Scheduler {
         self.record_queue_wait(q, scheduled_at);
 
         let encoder_entries = st.req.num_encoder_cache_entries();
-        if !st.output.events.enqueue(EngineCoreOutput::Scheduled {
+        if !st.output.events.enqueue(Event::Scheduled {
             queued_at: q,
             scheduled_at,
         }) {

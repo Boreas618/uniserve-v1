@@ -15,7 +15,7 @@
 //! each group its workers; each group installs them on its next poll. The
 //! relaunch takes as long as the ranks need to start, build their models and
 //! capture their graphs, and the scheduler threads keep serving their other
-//! groups meanwhile. Engine cores fail their in-flight requests on the
+//! groups meanwhile. Schedulers fail their in-flight requests on the
 //! domain when their group arrives, and admit work for it again once it
 //! installed its workers. Weights and exclusive memory come back from the
 //! Storage Server.

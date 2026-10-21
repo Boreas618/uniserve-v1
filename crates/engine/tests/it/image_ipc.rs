@@ -1,6 +1,6 @@
 //! Image understanding and generation through a native worker process.
 //!
-//! These tests run the engine (`EngineCore`) over one real worker process
+//! These tests run a scheduler (`SchedulerHandle`) over one real worker process
 //! (`uniserve worker` with the weightless stub model on CPU), so every
 //! image call the engine plans executes in the worker's image and text
 //! runtimes: vision encoding of an inline image and the context prefill that
@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerProcessArgs};
+use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerProcessArgs};
 use engine::{
-    EngineCoreOutput, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
+    Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs, Request,
 };
@@ -44,7 +44,7 @@ fn worker_executable() -> PathBuf {
 }
 
 /// One CPU rank holding the language model and its patch encoder.
-fn engine() -> anyhow::Result<EngineCore> {
+fn engine() -> anyhow::Result<SchedulerHandle> {
     let components: BTreeMap<String, ComponentConfig> = ["model", "vision_encoder"]
         .into_iter()
         .map(|name| {
@@ -100,7 +100,7 @@ fn engine() -> anyhow::Result<EngineCore> {
         attention_backend: "torch".into(),
         ..config.worker_process.clone()
     };
-    EngineCore::new(config)
+    Ok(SchedulerHandle::start_all(config)?.remove(0))
 }
 
 /// A base64 PNG of `side` x `side` pixels of one color.
@@ -192,7 +192,7 @@ struct Outcome {
 }
 
 /// Submit `request` and collect its events until it finishes.
-fn run(engine: &EngineCore, request: GenerationRequest) -> anyhow::Result<Outcome> {
+fn run(engine: &SchedulerHandle, request: GenerationRequest) -> anyhow::Result<Outcome> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
@@ -205,18 +205,18 @@ fn run(engine: &EngineCore, request: GenerationRequest) -> anyhow::Result<Outcom
             .with_context(|| format!("request {id:?} timed out"))?
             .with_context(|| format!("request {id:?} event stream closed"))?;
         match event {
-            EngineCoreOutput::TextToken { id, .. } => outcome.tokens.push(id),
-            EngineCoreOutput::TextTokens { ids } => outcome.tokens.extend(ids),
-            EngineCoreOutput::PromptLogprobs { positions } => {
+            Event::TextToken { id, .. } => outcome.tokens.push(id),
+            Event::TextTokens { ids } => outcome.tokens.extend(ids),
+            Event::PromptLogprobs { positions } => {
                 outcome.prompt_scores += positions.len();
             }
-            EngineCoreOutput::ImageDone { pixels_png_b64, .. } => {
+            Event::ImageDone { pixels_png_b64, .. } => {
                 outcome.images.push(pixels_png_b64);
             }
-            EngineCoreOutput::Rejected { message, .. } => {
+            Event::Rejected { message, .. } => {
                 anyhow::bail!("request {id:?} was rejected: {message}")
             }
-            EngineCoreOutput::Finished { reason, .. } => {
+            Event::Finished { reason, .. } => {
                 outcome.reason = Some(reason);
                 return Ok(outcome);
             }

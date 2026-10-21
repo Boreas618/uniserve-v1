@@ -16,13 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchEvent, ComponentConfig, EngineHandle, EventRx, ExecutionBatch, SchedulerConfig,
+    BatchEvent, CommandSender, ComponentConfig, EventRx, ExecutionBatch, SchedulerConfig,
     SchedulerStats, SimEngine, SimExecutor, sim_candidate_logprob,
 };
 use engine::{
-    CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, MultimodalInputs, ReadoutRow,
-    ReadoutSlot, RejectionKind,
+    CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest, ImageEncoderInput,
+    ImageGenerationConfig, ImageInput, MultimodalInputs, ReadoutRow, ReadoutSlot, RejectionKind,
 };
 use ipc::{Call, CallKind, ComponentInfo, ForwardMode, MediaCall};
 use ipc::{ImageParams, RequestId, SamplingParams};
@@ -106,7 +105,7 @@ fn expected_logprobs(request: &GenerationRequest) -> Vec<f32> {
 /// A block-diffusion scheduler running on its own thread, with the batches
 /// its executor accepts.
 struct Running {
-    handle: EngineHandle,
+    handle: CommandSender,
     batches: crossbeam_channel::Receiver<BatchEvent>,
     stats: Arc<SchedulerStats>,
     thread: thread::JoinHandle<bool>,
@@ -121,7 +120,7 @@ impl Running {
                 .unwrap();
         let stats = scheduler.stats_handle();
         let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = EngineHandle::new(tx);
+        let handle = CommandSender::new(tx);
         let thread = thread::spawn(move || scheduler.run(rx));
         Self {
             handle,
@@ -156,7 +155,7 @@ impl Running {
 }
 
 /// Collects one request's events through its terminal event.
-fn events(mut receiver: EventRx) -> Vec<EngineCoreOutput> {
+fn events(mut receiver: EventRx) -> Vec<Event> {
     let mut events = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -164,9 +163,7 @@ fn events(mut receiver: EventRx) -> Vec<EngineCoreOutput> {
             Ok(event) => {
                 let terminal = matches!(
                     event,
-                    EngineCoreOutput::Finished { .. }
-                        | EngineCoreOutput::Rejected { .. }
-                        | EngineCoreOutput::Error { .. }
+                    Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
                 );
                 events.push(event);
                 if terminal {
@@ -191,11 +188,11 @@ fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ipc::Forward
 
 /// Asserts the answer events of a completed readout: one `Readout` with
 /// every expected log-probability, then `Completed` with nothing generated.
-fn assert_answered(events: &[EngineCoreOutput], request: &GenerationRequest) {
+fn assert_answered(events: &[Event], request: &GenerationRequest) {
     let answers: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            EngineCoreOutput::Readout { candidate_logprobs } => Some(candidate_logprobs.clone()),
+            Event::Readout { candidate_logprobs } => Some(candidate_logprobs.clone()),
             _ => None,
         })
         .collect();
@@ -203,11 +200,11 @@ fn assert_answered(events: &[EngineCoreOutput], request: &GenerationRequest) {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, EngineCoreOutput::TextToken { .. })),
+            .any(|event| matches!(event, Event::TextToken { .. })),
         "a readout generated text: {events:?}"
     );
     match events.last() {
-        Some(EngineCoreOutput::Finished {
+        Some(Event::Finished {
             reason,
             completion_tokens,
             ..
@@ -305,10 +302,10 @@ fn a_non_finite_readout_logprob_fails_the_request_with_its_cause() {
     assert!(
         !answer
             .iter()
-            .any(|event| matches!(event, EngineCoreOutput::Readout { .. })),
+            .any(|event| matches!(event, Event::Readout { .. })),
         "a rejected readout gives no answer: {answer:?}"
     );
-    let Some(EngineCoreOutput::Error { message }) = answer.last() else {
+    let Some(Event::Error { message }) = answer.last() else {
         panic!("the readout did not fail with an error: {answer:?}");
     };
     // Candidate 11 is the second of the three read by the only slot of
@@ -382,7 +379,7 @@ fn a_canvas_row_beyond_the_step_budget_is_refused() {
     assert!(
         matches!(
             answer.last(),
-            Some(EngineCoreOutput::Rejected {
+            Some(Event::Rejected {
                 kind: RejectionKind::Invalid,
                 ..
             })
@@ -778,7 +775,7 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     let scheduler =
         support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
+    let handle = CommandSender::new(tx);
     let short = readout_request(7, prompt(16, 1000), vec![row(32, &[(1, &[60])])]);
     let long = readout_request(8, prompt(200, 3000), vec![row(32, &[(1, &[61])])]);
     let short_events = handle.submit(short.clone()).unwrap();
@@ -822,7 +819,7 @@ fn a_block_diffusion_runtime_serves_only_readouts() {
     assert!(
         matches!(
             answer.last(),
-            Some(EngineCoreOutput::Rejected {
+            Some(Event::Rejected {
                 kind: RejectionKind::Invalid,
                 ..
             })

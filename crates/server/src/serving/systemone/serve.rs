@@ -14,7 +14,7 @@
 //! and all of their readouts run concurrently.
 
 use engine::{
-    CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
+    CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest,
     ImageGenerationConfig, MultimodalInputs, RejectionKind,
 };
 use ipc::{ImageParams, RequestId, SamplingParams};
@@ -114,7 +114,7 @@ impl Engine {
     /// Submits one prompt's readout and waits for its answer.
     ///
     /// Dropping the future drops the readout's event stream, which cancels
-    /// it in its engine core.
+    /// it in its scheduler.
     async fn readout(&self, request: GenerationRequest) -> Result<Vec<f32>, SystemOneError> {
         let (mut events, _) = self
             .submit(request.into())
@@ -123,10 +123,10 @@ impl Engine {
         let mut answer = None;
         while let Some(event) = events.recv().await {
             match event {
-                EngineCoreOutput::Readout { candidate_logprobs } => {
+                Event::Readout { candidate_logprobs } => {
                     answer = Some(candidate_logprobs);
                 }
-                EngineCoreOutput::Finished {
+                Event::Finished {
                     reason: FinishReason::Completed,
                     ..
                 } => {
@@ -134,16 +134,16 @@ impl Engine {
                         SystemOneError::Server("a readout finished without its answer".to_owned())
                     });
                 }
-                EngineCoreOutput::Finished { reason, .. } => {
+                Event::Finished { reason, .. } => {
                     return Err(SystemOneError::Server(format!(
                         "a readout ended as {reason:?}"
                     )));
                 }
-                EngineCoreOutput::Rejected {
+                Event::Rejected {
                     kind: RejectionKind::Overloaded,
                     message,
                 } => return Err(SystemOneError::Overloaded(message)),
-                EngineCoreOutput::Rejected {
+                Event::Rejected {
                     kind: RejectionKind::Invalid,
                     message,
                 } => {
@@ -151,7 +151,7 @@ impl Engine {
                         ValidationIssue::value_error(vec!["body".into()], &message, None),
                     ]));
                 }
-                EngineCoreOutput::Error { message } => {
+                Event::Error { message } => {
                     return Err(SystemOneError::Server(message));
                 }
                 _ => {}

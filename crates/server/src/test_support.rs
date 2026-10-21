@@ -1,9 +1,9 @@
 //! Simulated components shared by the crate's tests, one fixture each: the
 //! byte tokenizer, in-memory tokenizer loading, the engine over simulated
-//! engine cores, the video service, and the server's router.
+//! schedulers, the video service, and the server's router.
 //!
 //! Requests travel through the server's router (`http::router`) into a real
-//! `Engine`, whose engine cores drive `SimEngine` through `SimExecutor`. The
+//! `Engine`, whose schedulers drive `SimEngine` through `SimExecutor`. The
 //! default simulator provides no video media components, so the engine
 //! refuses every video submission as an invalid request.
 
@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use engine::ModelDtype;
-use engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
+use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
@@ -136,15 +136,15 @@ pub(crate) fn sim_readout_engine(
     engine_over(model, configured_tokenizer(), vec![core], readout)
 }
 
-/// Starts an engine core under `config` that drives `worker` in process.
-pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> EngineCore {
-    EngineCore::with_executor(config, Box::new(SimExecutor::new(worker)))
-        .expect("start a sim engine core")
+/// Starts a scheduler under `config` that drives `worker` in process.
+pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHandle {
+    SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(worker)))
+        .expect("start a sim scheduler")
 }
 
-/// Builds an engine for a model with `parameters` over started engine cores,
+/// Builds an engine for a model with `parameters` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
-pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<EngineCore>) -> Engine {
+pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Engine {
     engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
 }
 
@@ -166,7 +166,7 @@ fn sim_model(parameters: ModelParameters) -> ModelConfig {
 pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
-    cores: Vec<EngineCore>,
+    cores: Vec<SchedulerHandle>,
     readout: Option<crate::serving::systemone::ReadoutEncoder>,
 ) -> Engine {
     let renderer = match &model.parameters {

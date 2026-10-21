@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use engine::EngineCoreOutput;
-use engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
+use engine::Event;
+use engine::{CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor};
 use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
@@ -35,9 +35,7 @@ fn main() -> anyhow::Result<()> {
 
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(cmd_tx);
-    let jh = thread::spawn(move || sched.run(cmd_rx));
+    let handle = SchedulerHandle::spawn(sched, "sim-model", CommandWaker::noop())?;
 
     let mut rxs: HashMap<RequestId, (String, engine::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
@@ -125,9 +123,9 @@ fn main() -> anyhow::Result<()> {
             while let Ok(ev) = rx.try_recv() {
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
                 match ev {
-                    EngineCoreOutput::TextToken { .. } => e.1 += 1,
-                    EngineCoreOutput::ImageDone { .. } => e.2 += 1,
-                    EngineCoreOutput::Finished { .. } if !e.3 => {
+                    Event::TextToken { .. } => e.1 += 1,
+                    Event::ImageDone { .. } => e.2 += 1,
+                    Event::Finished { .. } if !e.3 => {
                         e.3 = true;
                         done += 1;
                     }
@@ -152,7 +150,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
     handle.shutdown();
-    let _ = jh.join();
     println!(
         "\nRUST SIM CONTROL-PLANE: {}",
         if ok { "PASS" } else { "FAIL" }
