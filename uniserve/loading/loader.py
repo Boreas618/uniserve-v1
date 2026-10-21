@@ -190,6 +190,28 @@ def load_weights(
     return reports
 
 
+def _release_unselected(model: nn.Module, selected: set[int]) -> None:
+    """Leave every module this rank does not select on meta.
+
+    A constructor may build a tensor on a concrete device even under the
+    meta device, such as a VAE's latent statistics computed from its
+    configuration. A module the rank does not hold keeps no such tensor: its
+    own parameters and buffers become meta placeholders, as everything
+    unselected is, and a selected module's tensors stay as they are.
+    """
+    for module in model.modules():
+        if id(module) in selected:
+            continue
+        for name, parameter in module._parameters.items():
+            if parameter is not None and not parameter.is_meta:
+                module._parameters[name] = nn.Parameter(
+                    parameter.to("meta"), requires_grad=parameter.requires_grad
+                )
+        for name, buffer in module._buffers.items():
+            if buffer is not None and not buffer.is_meta:
+                module._buffers[name] = buffer.to("meta")
+
+
 def load_model(
     model_class: Callable[[ConfigT], ModelT],
     config: ConfigT,
@@ -275,6 +297,7 @@ def load_model(
             "participation"
         )
     selected.difference_update(remote)
+    _release_unselected(model, selected)
     excluded = select_modules(model, exclude_modules)
     for path, mesh in meshes.items():
         child = model.get_submodule(path)
