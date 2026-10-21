@@ -65,6 +65,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub enum EngineState {
     /// It serves requests.
     Ready,
+    /// It admits nothing more: it ended its token requests as migratable
+    /// and finishes the rest.
+    Draining,
     /// It serves nothing more: its workers failed.
     Failed(String),
     /// Its connection closed.
@@ -245,12 +248,8 @@ impl EngineClient {
                 accepted: Some(accepted),
             },
         );
-        self.shared.send(to_engine::Kind::Submit(wire::Submit {
-            requests: vec![request.to_wire()],
-        }));
-        // A closed connection drops the acceptance with the request, whose
-        // stream then holds the connection's error event.
-        let scheduler = acceptance.await.unwrap_or(None);
+        // The stream exists before the acceptance arrives, so that dropping
+        // the submission while it waits cancels the request.
         let stream = EventStream {
             id,
             events: receiver,
@@ -263,7 +262,24 @@ impl EngineClient {
             open: true,
             on_finish: None,
         };
+        self.shared.send(to_engine::Kind::Submit(wire::Submit {
+            requests: vec![request.to_wire()],
+        }));
+        // A closed connection drops the acceptance with the request, whose
+        // stream then holds the connection's error event.
+        let scheduler = acceptance.await.unwrap_or(None);
         Ok((stream, scheduler))
+    }
+
+    /// Commands the engine to drain: it admits nothing more, ends every
+    /// token request that resumes from its generated tokens as migratable,
+    /// and finishes the rest. Returns at once; the engine reports
+    /// [`EngineState::Draining`].
+    pub fn drain(&self) {
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Drain(wire::Drain {})),
+            }));
     }
 
     /// Commands the engine to shut down, finishing every request in flight
@@ -349,6 +365,17 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 tracing::error!(error = %state.error, "the engine failed");
                 shared.state.send_replace(EngineState::Failed(state.error));
             }
+            Some(from_engine::Kind::State(state))
+                if state.state == wire::EngineState::Draining as i32 =>
+            {
+                shared.state.send_if_modified(|current| {
+                    let ready = *current == EngineState::Ready;
+                    if ready {
+                        *current = EngineState::Draining;
+                    }
+                    ready
+                });
+            }
             Some(from_engine::Kind::State(_)) | None => {}
         }
     }
@@ -370,10 +397,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
 /// Hands one event to its request's stream; a terminal event ends the
 /// request.
 fn file(shared: &Shared, id: RequestId, event: Event) {
-    let terminal = matches!(
-        event,
-        Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
-    );
+    let terminal = event.is_terminal();
     let mut requests = lock(&shared.requests);
     let Some(pending) = requests.get_mut(&id) else {
         return;
@@ -479,7 +503,7 @@ impl EventStream {
         match event {
             Event::TextToken { .. } => self.text_tokens += 1,
             Event::TextTokens { ids } => self.text_tokens += ids.len(),
-            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. } => {
+            event if event.is_terminal() => {
                 self.finish();
                 return;
             }

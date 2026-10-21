@@ -863,9 +863,29 @@ pub struct GenerationRequest {
     /// makes the request a generating one.
     #[serde(default)]
     pub readout: Vec<ReadoutRow>,
+    /// The tokens a migrated request generated on the engines that served it
+    /// before, in order; empty for a new request. They continue its prompt:
+    /// the engine computes their cache and generates after them, and counts
+    /// them as generated against `max_und_tokens` and `min_tokens`, in the
+    /// penalties and bad words of its sampling, and in its usage.
+    #[serde(default)]
+    pub generated_token_ids: Vec<u32>,
 }
 
 impl GenerationRequest {
+    /// Returns whether the request resumes generation it began on another
+    /// engine.
+    pub fn is_migrated(&self) -> bool {
+        !self.generated_token_ids.is_empty()
+    }
+
+    /// Returns whether the request can resume on another engine from the
+    /// tokens it generated: whether it generates text alone. An image's
+    /// trajectory and a readout's answers are not tokens.
+    pub fn is_migratable(&self) -> bool {
+        !self.is_readout() && !self.generates_images()
+    }
+
     /// Returns whether the request reads canvas slots instead of generating.
     pub fn is_readout(&self) -> bool {
         !self.readout.is_empty()
@@ -945,6 +965,21 @@ impl GenerationRequest {
         }
         if matches!(self.constraint, GenerationConstraint::GenOnly) && !self.generates_images() {
             return Err(GenerationRequestError::GenOnlyCannotProduceImage);
+        }
+        if self.is_migrated() {
+            if !self.is_migratable() {
+                return Err(GenerationRequestError::MigratedMedia);
+            }
+            // Its prompt's log-probabilities were reported where it began.
+            if self.sampling.return_prompt_logprobs {
+                return Err(GenerationRequestError::MigratedPromptLogprobs);
+            }
+            if self.generated_token_ids.len() >= self.max_und_tokens {
+                return Err(GenerationRequestError::MigratedPastLimit {
+                    generated: self.generated_token_ids.len(),
+                    max_und_tokens: self.max_und_tokens,
+                });
+            }
         }
 
         // Trigger patterns must be nonempty. Text that continues after an image
@@ -1138,6 +1173,22 @@ pub enum GenerationRequestError {
     /// A readout request also asks to generate tokens or images.
     #[error("a readout request generates no tokens or images")]
     GeneratingReadout,
+    /// A migrated request reads canvas slots or generates images, whose
+    /// state its tokens do not restore.
+    #[error("only a text generation request resumes from its generated tokens")]
+    MigratedMedia,
+    /// A migrated request asks for its prompt's log-probabilities again.
+    #[error("a migrated request does not report prompt log-probabilities again")]
+    MigratedPromptLogprobs,
+    /// A migrated request generated as many tokens as its limit allows, so it
+    /// had finished.
+    #[error("a migrated request generated {generated} tokens of its {max_und_tokens}-token limit")]
+    MigratedPastLimit {
+        /// Tokens the request generated before it migrated.
+        generated: usize,
+        /// The request's token limit.
+        max_und_tokens: usize,
+    },
     /// A readout row has no tokens or reads no slot.
     #[error("every readout row must hold tokens and read at least one slot")]
     EmptyReadoutRow,
@@ -1287,6 +1338,7 @@ mod tests {
             },
             image_generation: policy,
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         }
     }
 

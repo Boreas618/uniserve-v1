@@ -64,7 +64,7 @@ impl Scheduler {
                 let _ = st.output.events.event_tx.send(Event::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
-                    prompt_tokens: st.req.prompt_token_ids.len(),
+                    prompt_tokens: st.charged_prompt_tokens(),
                     completion_tokens: 0,
                     images: 0,
                 });
@@ -104,6 +104,7 @@ impl Scheduler {
             } => self.acknowledge_output(request_id, output_token_count),
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
+            Command::Migrate(cause) => self.migrate_requests(cause),
             Command::Shutdown => return true,
         }
         false
@@ -199,7 +200,7 @@ impl Scheduler {
             let _ = st.output.events.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
-                prompt_tokens: st.req.prompt_token_ids.len(),
+                prompt_tokens: st.charged_prompt_tokens(),
                 completion_tokens: 0,
                 images: 0,
             });
@@ -226,6 +227,43 @@ impl Scheduler {
             state.output.decoder_boundaries.pop_front();
         }
         self.finish_pending_if_idle(id);
+    }
+
+    /// Ends every token request that resumes from its generated tokens as
+    /// migratable, for `cause`.
+    ///
+    /// A request resumes from its tokens when it generates text alone
+    /// (`GenerationRequest::is_migratable`) on a deployment that does not
+    /// generate in canvases. A queued one ends at once. A running one stops
+    /// scheduling, drops the decoder decisions it awaits, and ends once its
+    /// calls in flight drain, after every token it generated; a token those
+    /// calls produce is discarded, and the engine that serves next generates
+    /// it again. A request already finishing finishes. Media requests and the
+    /// token requests that do not resume go on.
+    pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
+        if self.config.canvas.is_some() {
+            return;
+        }
+        let queued: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .filter(|st| st.req.is_migratable())
+            .map(|st| st.req.request_id)
+            .collect();
+        for id in queued {
+            if let Some(st) = self.remove_waiting(id) {
+                let _ = st.output.events.event_tx.send(Event::Migratable { cause });
+            }
+        }
+        for (id, st) in &mut self.running {
+            if st.req.is_migratable()
+                && !st.terminal_intent.is_terminal()
+                && !self.inflight.pending_finishes.contains_key(id)
+            {
+                st.output.decoder_boundaries.clear();
+                st.terminal_intent = TerminalIntent::Migrate(cause);
+            }
+        }
     }
 
     /// Stops a running token request whose frontend decoder matched a stop

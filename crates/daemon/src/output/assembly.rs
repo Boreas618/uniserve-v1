@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use crate::engine::client::EventStream;
+use crate::migration::RequestEvents;
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
 use proto::request::Event;
@@ -110,7 +110,7 @@ pub(super) async fn generation_output(
     started: Instant,
     compile_us: u64,
     output: OutputParams,
-    events: EventStream,
+    events: RequestEvents,
     mut y: TryYielder<RequestOutput, OutputError>,
 ) -> Result<()> {
     let OutputParams {
@@ -250,7 +250,7 @@ pub(super) async fn media_output(
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,
-    mut events: EventStream,
+    mut events: RequestEvents,
     mut y: TryYielder<RequestOutput, OutputError>,
 ) -> Result<()> {
     let mut clock = StreamClock::new(started, compile_us);

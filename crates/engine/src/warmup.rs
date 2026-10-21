@@ -240,6 +240,7 @@ fn warmup_request(
             sample_feedback_continuation: false,
         },
         readout: Vec::new(),
+        generated_token_ids: Vec::new(),
     }
 }
 

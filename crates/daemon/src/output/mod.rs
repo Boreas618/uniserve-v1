@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use futures::Stream;
 
-use crate::engine::client::EventStream;
+use crate::migration::RequestEvents;
 
 pub use events::{
     FinishReason, GeneratedImage, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings,
@@ -74,7 +74,7 @@ pub(crate) fn generation_output(
     started: Instant,
     compile_us: u64,
     output: OutputParams,
-    events: EventStream,
+    events: RequestEvents,
 ) -> RequestOutputStream {
     Box::pin(assembly::generation_output(
         request_id, started, compile_us, output, events,
@@ -88,7 +88,7 @@ pub(crate) fn media_output(
     started: Instant,
     compile_us: u64,
     prompt_tokens: usize,
-    events: EventStream,
+    events: RequestEvents,
 ) -> RequestOutputStream {
     Box::pin(assembly::media_output(
         request_id,
@@ -101,7 +101,7 @@ pub(crate) fn media_output(
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::client::EventStream;
+    use crate::migration::RequestEvents;
     use futures::StreamExt as _;
     use proto::request::Event;
     use proto::request::TokenLogprob;
@@ -116,7 +116,7 @@ mod tests {
         processor: ChatOutputProcessor,
         decode: TextDecodeOptions,
         logprobs: bool,
-        events: EventStream,
+        events: RequestEvents,
     ) -> RequestOutputStream {
         generation_output(
             "request".into(),
@@ -135,7 +135,7 @@ mod tests {
     }
 
     /// An engine stream of `events` after the request's scheduling.
-    fn engine_events(events: impl IntoIterator<Item = Event>) -> EventStream {
+    fn engine_events(events: impl IntoIterator<Item = Event>) -> RequestEvents {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Event::Scheduled {
             queued_at: 1.0,
@@ -145,7 +145,7 @@ mod tests {
         for event in events {
             tx.send(event).unwrap();
         }
-        EventStream::detached(rx)
+        RequestEvents::detached(rx)
     }
 
     fn text_token(byte: u8) -> Event {
@@ -418,7 +418,7 @@ mod tests {
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
             false,
-            EventStream::detached(rx),
+            RequestEvents::detached(rx),
         );
         tokio::pin!(outputs);
         assert!(matches!(

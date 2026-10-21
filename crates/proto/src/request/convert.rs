@@ -15,8 +15,8 @@ use super::{
     DiffusionSamplingParams, Event, FeedbackNextToken, FeedbackSource, FinishReason,
     GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoder,
     ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaKind,
-    MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind, Request, RequestId,
-    SamplingParams, StopReason, TokenLogprob,
+    MigrationCause, MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind,
+    Request, RequestId, SamplingParams, StopReason, TokenLogprob,
 };
 
 /// A message that states no valid value.
@@ -129,6 +129,7 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                         .collect(),
                 })
                 .collect(),
+            generated_token_ids: request.generated_token_ids.clone(),
         }
     }
 }
@@ -183,6 +184,7 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                         .collect(),
                 })
                 .collect(),
+            generated_token_ids: request.generated_token_ids,
         })
     }
 }
@@ -678,6 +680,12 @@ impl Event {
             Self::Error { message } => Kind::Error(wire::Failed {
                 message: message.clone(),
             }),
+            Self::Migratable { cause } => Kind::Migratable(wire::Migratable {
+                cause: match cause {
+                    MigrationCause::Drain => wire::MigrationCause::Drain,
+                    MigrationCause::Loss => wire::MigrationCause::Loss,
+                } as i32,
+            }),
         };
         let event = wire::Event {
             request: request.0,
@@ -791,6 +799,12 @@ impl Event {
             },
             Kind::Error(failed) => Self::Error {
                 message: failed.message,
+            },
+            Kind::Migratable(migratable) => Self::Migratable {
+                cause: match known::<wire::MigrationCause>(migratable.cause, "migration cause")? {
+                    wire::MigrationCause::Drain => MigrationCause::Drain,
+                    wire::MigrationCause::Loss => MigrationCause::Loss,
+                },
             },
         };
         Ok((request, event))

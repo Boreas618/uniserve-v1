@@ -40,7 +40,7 @@ use anyhow::Context as _;
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
-use proto::request::{ExpertExchange, SchedulingPolicy};
+use proto::request::{ExpertExchange, MigrationCause, SchedulingPolicy};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -914,6 +914,14 @@ impl SchedulerHandle {
     /// semantics.
     pub fn abort(&self, id: RequestId) {
         self.commands.abort(id);
+    }
+
+    /// Ends every token request the scheduler holds that resumes from its
+    /// generated tokens (`GenerationRequest::is_migratable`) as migratable,
+    /// for `cause`: a queued one at once, a running one once its calls in
+    /// flight drain, after every token it generated. Other requests go on.
+    pub fn migrate(&self, cause: MigrationCause) {
+        self.commands.migrate(cause);
     }
 
     /// Shuts down the scheduler, tears down its executor, and joins its

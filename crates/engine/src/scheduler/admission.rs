@@ -174,6 +174,13 @@ impl Scheduler {
             if let Some(error) = error {
                 return Err(format!("invalid generation request: {error:?}"));
             }
+            // A canvas's committed blocks are tokens, but the denoising state
+            // of the block in progress is not.
+            if req.is_migrated() {
+                return Err(
+                    "a block-diffusion request does not resume from generated tokens".into(),
+                );
+            }
         }
         // A context prefill writes an input image's vision block whole, as
         // one attention block of one call, so the block's exact cache length
@@ -210,10 +217,20 @@ impl Scheduler {
     /// cache token count (`validate_submission`).
     pub(super) fn request_state(
         &mut self,
-        req: GenerationRequest,
+        mut req: GenerationRequest,
         event_tx: EventTx,
         max_cache_tokens: usize,
     ) -> RequestState {
+        // A migrated request's generated tokens continue its prompt: the
+        // engine computes their cache as it computes the prompt's and samples
+        // after the last of them, at the position the request had reached.
+        // They count as generated from the start, so the token limit,
+        // `min_tokens`, the penalties and the bad words continue where they
+        // were; its usage charges only its own prompt as prompt
+        // (`RequestState::charged_prompt_tokens`).
+        req.prompt_token_ids
+            .extend_from_slice(&req.generated_token_ids);
+        let generated_token_ids = req.generated_token_ids.clone();
         // Multimodal requests reserve their configured bounded cache envelope at
         // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty() || req.generates_images();
@@ -241,7 +258,7 @@ impl Scheduler {
             cache_visible_len: 0,
             cache_computed_len: 0,
             next_token: 0,
-            num_generated_tokens: 0,
+            num_generated_tokens: generated_token_ids.len(),
             image_id: 0,
             num_generated_images: 0,
             image_reservation_pending: false,
@@ -259,7 +276,7 @@ impl Scheduler {
             prefix_page_hashes: Vec::new(),
             prefix_published: Vec::new(),
             page_keys: Vec::new(),
-            generated_token_ids: Vec::new(),
+            generated_token_ids,
             round_token_ids: Vec::new(),
             feedback_image_b64: None,
             replayable: true,
@@ -984,6 +1001,10 @@ impl Scheduler {
         for (id, intent) in cancelled {
             let reason = match intent {
                 TerminalIntent::Finish(reason) => reason,
+                TerminalIntent::Migrate(cause) => {
+                    self.migrate_request(id, cause);
+                    continue;
+                }
                 TerminalIntent::Failure(_) | TerminalIntent::Rejected(_) => FinishReason::Error,
                 TerminalIntent::None => continue,
             };
@@ -1006,6 +1027,10 @@ impl Scheduler {
                 TerminalIntent::Failure(message) => DiffusionTerminal::Failed(message),
                 TerminalIntent::Rejected(message) => DiffusionTerminal::Rejected(message),
                 TerminalIntent::Finish(reason) => DiffusionTerminal::Finished(reason),
+                // `migrate_requests` marks token requests alone.
+                TerminalIntent::Migrate(_) => {
+                    DiffusionTerminal::Failed("a media request does not migrate".to_owned())
+                }
                 TerminalIntent::None => continue,
             };
             self.finish_media(id, event);

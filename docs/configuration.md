@@ -138,6 +138,14 @@ retention = "30m"
 | `chunked_prefill_size` | `8192` | Prompt tokens one request prefills in one step; token models only |
 | `max_batch` | `128` | Calls assembled into one forward batch, clamped to what the workers accept |
 
+### `migration_config`
+
+A token request that generates text moves to the engine that serves next when its engine drains for a hot update or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `max_migrations` | `3` | Migrations caused by lost workers or a lost engine process that a request survives before it fails; migrations of a hot update are not counted |
+
 ### `placement_config`
 
 `device`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.

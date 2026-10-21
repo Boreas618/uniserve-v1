@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use proto::Connection;
 use proto::request::wire::{self, from_engine, to_engine};
-use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, Request, RequestId};
+use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request, RequestId};
 
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
@@ -209,6 +209,7 @@ fn read_requests(
     streams: &tokio::sync::mpsc::UnboundedSender<Stream>,
 ) -> anyhow::Result<()> {
     let mut failed = false;
+    let mut draining = false;
     loop {
         if !failed && routing.all_dead() {
             failed = true;
@@ -232,6 +233,7 @@ fn read_requests(
             Err(error) => return Err(error).context("reading the daemon's requests"),
         };
         match message.kind {
+            Some(to_engine::Kind::Submit(submit)) if draining => refuse_draining(submit, frames),
             Some(to_engine::Kind::Submit(submit)) => submit_all(submit, routing, frames, streams),
             Some(to_engine::Kind::Command(command)) => apply(command, routing),
             Some(to_engine::Kind::Engine(command)) => match command.kind {
@@ -239,7 +241,19 @@ fn read_requests(
                     tracing::info!("the daemon shuts the engine down");
                     return Ok(());
                 }
-                None => {}
+                Some(wire::engine_command::Kind::Drain(_)) if !draining => {
+                    tracing::info!("the engine drains");
+                    draining = true;
+                    for slot in &routing.slots {
+                        slot.handle.migrate(MigrationCause::Drain);
+                    }
+                    let _ = frames.send(Frame::plain(from_engine::Kind::State(wire::State {
+                        state: wire::EngineState::Draining as i32,
+                        info: None,
+                        error: String::new(),
+                    })));
+                }
+                Some(wire::engine_command::Kind::Drain(_)) | None => {}
             },
             None => {}
         }
@@ -323,6 +337,29 @@ fn submit_all(
                 }
             }
         }
+    }
+}
+
+/// Answers the requests a draining engine is submitted: a token request that
+/// resumes from its generated tokens leaves at once as migratable, as the
+/// ones it held did, and any other is refused.
+fn refuse_draining(submit: wire::Submit, frames: &crossbeam_channel::Sender<Frame>) {
+    for message in submit.requests {
+        let id = RequestId(message.id);
+        let event = match Request::from_wire(message) {
+            Ok(Request::Generation(request)) if request.is_migratable() => Event::Migratable {
+                cause: MigrationCause::Drain,
+            },
+            Ok(_) => Event::Error {
+                message: "the engine drains and admits no request".to_owned(),
+            },
+            Err(error) => {
+                refuse(frames, id, error.to_string());
+                continue;
+            }
+        };
+        let (event, _) = event.to_wire(id);
+        let _ = frames.send(Frame::plain(from_engine::Kind::Event(event)));
     }
 }
 
@@ -443,10 +480,7 @@ async fn forward(stream: Stream, routing: &Routing, frames: &crossbeam_channel::
             break;
         };
         sent += 1;
-        let terminal = matches!(
-            event,
-            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
-        );
+        let terminal = event.is_terminal();
         let (message, media) = event.to_wire(id);
         let _ = frames.send(Frame {
             message: wire::FromEngine {

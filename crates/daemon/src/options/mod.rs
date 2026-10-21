@@ -205,6 +205,7 @@ pub struct ServeConfig {
     pub load_config: LoadOptions,
     pub kv_cache_config: KvCacheOptions,
     pub scheduler_config: SchedulerOptions,
+    pub migration_config: MigrationOptions,
     pub placement_config: PlacementOptions,
     pub moe_config: MoeOptions,
     pub cuda_graph_config: CudaGraphOptions,
@@ -245,6 +246,7 @@ impl Default for ServeConfig {
             load_config: LoadOptions::default(),
             kv_cache_config: KvCacheOptions::default(),
             scheduler_config: SchedulerOptions::default(),
+            migration_config: MigrationOptions::default(),
             placement_config: PlacementOptions::default(),
             moe_config: MoeOptions::default(),
             cuda_graph_config: CudaGraphOptions::default(),
@@ -783,6 +785,22 @@ impl Default for MediaOptions {
             ffprobe: PathBuf::from("ffprobe"),
             ffmpeg: PathBuf::from("ffmpeg"),
         }
+    }
+}
+
+/// Moving token requests between engines (`migration_config`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationOptions {
+    /// Migrations caused by lost workers or a lost engine process that a
+    /// request survives; it fails on the next. Migrations of a hot update
+    /// are not counted.
+    pub max_migrations: u32,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> Self {
+        Self { max_migrations: 3 }
     }
 }
 

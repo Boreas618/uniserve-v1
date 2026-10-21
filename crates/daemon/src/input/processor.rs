@@ -535,6 +535,7 @@ impl InputProcessor {
             },
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         };
         let mut decode = sampling_params.decode_options();
 

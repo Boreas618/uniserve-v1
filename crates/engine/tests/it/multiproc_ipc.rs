@@ -1955,6 +1955,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
             include_stop_token: false,
             image_generation: Default::default(),
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         }))?;
         std::fs::write(directory.path().join("release"), "")?;
         runtime.block_on(async {
