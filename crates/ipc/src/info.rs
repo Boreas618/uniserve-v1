@@ -436,8 +436,8 @@ pub struct WorkerInfo {
     pub components: Vec<ComponentInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
-    /// Maximum calls in one batch. A prefill or decode batch that no captured
-    /// graph holds runs eagerly, so the captured graphs bound no batch.
+    /// Maximum calls in one batch. Under CUDA graphs the rank captured a text
+    /// graph for every prefill and decode batch within these bounds.
     pub max_batch_calls: u32,
     /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,

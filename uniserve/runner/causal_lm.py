@@ -543,7 +543,7 @@ class CausalLMRunner:
         starts: Sequence[int],
         causal: Sequence[int],
         row_columns: torch.Tensor,
-        causal_values: torch.Tensor,
+        causal_values: torch.Tensor | None,
     ) -> AttentionBatch:
         """Gather the attention metadata of ``rows`` rows of host tokens."""
         self._attention_metadata.gather(row_columns, rows, tokens, widths)
@@ -568,7 +568,7 @@ class CausalLMRunner:
         starts: Sequence[int],
         causal: Sequence[int],
         row_columns: torch.Tensor,
-        causal_values: torch.Tensor,
+        causal_values: torch.Tensor | None,
     ) -> None:
         """Plan the attention launches of the next captured prefill.
 
@@ -604,7 +604,7 @@ class CausalLMRunner:
         row_columns: torch.Tensor,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        causal_values: torch.Tensor,
+        causal_values: torch.Tensor | None,
         input_embeddings: torch.Tensor | None,
         embedding_mask: torch.Tensor | None,
         hidden: torch.Tensor,
@@ -641,7 +641,10 @@ class CausalLMRunner:
             row_columns: The packed int64 row columns.
             input_ids: ``[T]`` int64 tokens.
             positions: ``[3, T]`` int64 positions, axis-major.
-            causal_values: ``[R]`` int32 causality of rows that differ.
+            causal_values: ``[R]`` int32 causality of each row, which the
+                forward reads on the device when its rows differ or its
+                graph serves rows of either causality; ``None`` applies
+                ``causal``.
             input_embeddings: ``[T, hidden]`` vision features replacing the
                 embeddings of the tokens ``embedding_mask`` (``[T]`` uint8)
                 marks, or ``None`` for a prompt without them.

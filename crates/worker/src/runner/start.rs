@@ -342,12 +342,15 @@ impl ImageOwners {
         let (bounds, capacity, pool) = match (denoising, prefix_cache, layout) {
             (false, ..) => (None, None, None),
             (true, Some(prefix_cache), Some(layout)) => {
+                // The denoiser reads the bounds' tables; text variants are the
+                // text runners'.
                 let bounds = TextBounds::new(
                     config,
                     startup.request_slots,
                     prefix_cache.plan(),
                     Some(prefix_cache.planes().num_units()),
                     config.device.is_cuda(),
+                    None,
                 )?;
                 let tokens = flow_tokens(&layout, config);
                 let width = bounds.widths.iter().copied().max().unwrap_or(1).max(1) as usize;

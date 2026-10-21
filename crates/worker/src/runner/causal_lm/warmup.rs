@@ -84,6 +84,30 @@ impl WarmupHooks for CausalLMWarmup {
     }
 }
 
+/// Rows of `lengths` tokens at explicit positions (on three rotary axes
+/// when `spatial`) for consecutive slots from `first`.
+fn placed_rows(
+    first: usize,
+    lengths: &[usize],
+    selection: TokenSelection,
+    spatial: bool,
+) -> Result<Vec<TokenRow>> {
+    lengths
+        .iter()
+        .enumerate()
+        .map(|(row, &length)| {
+            text_row(
+                (first + row) as u32,
+                &vec![0; length],
+                0,
+                0,
+                selection,
+                spatial,
+            )
+        })
+        .collect()
+}
+
 /// Rows of `lengths` host tokens for consecutive slots from `first`.
 fn rows(
     first: usize,
@@ -192,7 +216,15 @@ impl CausalLMRunners {
                     TokenSelection::Cache
                 };
                 for capacity in variants(shape.token_bucket) {
-                    let rows = rows(1, &lengths, 0, selection);
+                    // The media variant's graphs serve prompts placing vision
+                    // blocks, whose rows carry explicit positions; their
+                    // causality and features are device columns, so text rows
+                    // at explicit positions capture them.
+                    let rows = if shape.variant.embeddings {
+                        placed_rows(1, &lengths, selection, shape.variant.axes == 3)?
+                    } else {
+                        rows(1, &lengths, 0, selection)
+                    };
                     self.warmup_bucket(
                         lanes,
                         kind,
@@ -322,10 +354,10 @@ impl CausalLMRunners {
     /// A context prefill writes a vision block (non-causal rows that attend
     /// to all of themselves, at explicit positions, their features replacing
     /// the placeholder embeddings) whole, either in a chunk with prompt text
-    /// before it or alone. It always runs eagerly, so no capture prepares
-    /// its attention inputs; each of the two compositions runs here once,
-    /// so that the kernels serving them are selected and compiled before
-    /// the first image request. A block of four features in a 2 x 2 grid stands for
+    /// before it or alone. Each of the two compositions runs here once:
+    /// under graphs it launches the media variant's captured bucket with
+    /// real features, eagerly it selects and compiles the kernels serving
+    /// it, before the first image request. A block of four features in a 2 x 2 grid stands for
     /// every image: kernel choice depends on the attention input class,
     /// not on lengths.
     fn warm_context(

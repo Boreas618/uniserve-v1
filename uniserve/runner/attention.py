@@ -139,10 +139,11 @@ class AttentionMetadata:
 
         ``queries`` and ``prefixes`` are the rows' host lengths, ``starts``
         each windowed table's first pages (``rows`` per table), ``causal``
-        each row's causality and ``widths`` each table's page width. When
-        the rows' causality differs, the caller staged it in
-        ``causal_values`` for operators that consume the device column
-        (``None`` for a forward whose rows agree). Rows that write the
+        each row's causality and ``widths`` each table's page width.
+        ``causal_values`` is the device column operators read each row's
+        causality from, which the caller staged when the forward reads it
+        there (its rows differ, or its captured graph serves rows of either
+        causality); ``None`` applies ``causal`` to the rows. Rows that write the
         cache read paged inputs with a slot mapping; read-only rows
         (``writes`` false) read their segments without writing.
         """
@@ -158,11 +159,7 @@ class AttentionMetadata:
             host=tuple(int(value) for value in prefixes),
         )
         mode = tuple(bool(value) for value in causal)
-        flags = (
-            None
-            if causal_values is None or len(set(mode)) == 1
-            else causal_values[:rows]
-        )
+        flags = None if causal_values is None else causal_values[:rows]
         entries: dict[int, AttentionInput] = {}
         for table, width in enumerate(widths):
             first = None
