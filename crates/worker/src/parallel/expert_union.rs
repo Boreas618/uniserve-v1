@@ -85,6 +85,11 @@ pub(super) struct ExpertFunctions {
     pub(super) join: Function,
     warm_thread: Function,
     close: Function,
+    /// `suspend_exchange(exchange) -> bool` and `restore_exchange(exchange)`:
+    /// a parked standby world's transport workspace, released and mapped
+    /// back at its addresses.
+    suspend: Function,
+    restore: Function,
     /// `ExpertLayers.close(layers)`.
     close_layers: Function,
 }
@@ -100,6 +105,8 @@ impl ExpertFunctions {
             join: function("join")?,
             warm_thread: function("warm_thread")?,
             close: function("close_exchange")?,
+            suspend: function("suspend_exchange")?,
+            restore: function("restore_exchange")?,
             close_layers: function("ExpertLayers.close")?,
         })
     }
@@ -234,6 +241,30 @@ impl ExpertUnion {
         }
         self.join(agreement.capacity)?;
         Ok((true, agreement.released))
+    }
+
+    /// Release every microbatch's transport workspace that keeps its
+    /// addresses across a release, while the member parks as a standby;
+    /// collective over the union, while no step runs. Returns whether any
+    /// workspace was released, which [`Self::restore`] maps back.
+    pub(crate) fn suspend(&self) -> Result<bool> {
+        let mut released = false;
+        for peer in &self.microbatches {
+            let value = self.functions.suspend.call(&[peer.exchange.view()])?;
+            released |= bool::try_from(value)
+                .map_err(|error| Error::numerical(self.functions.suspend.name(), &error))?;
+        }
+        Ok(released)
+    }
+
+    /// Map every workspace [`Self::suspend`] released back at its
+    /// addresses; collective over the union, at the promotion, before any
+    /// step runs.
+    pub(crate) fn restore(&self) -> Result<()> {
+        for peer in &self.microbatches {
+            self.functions.restore.invoke(&[peer.exchange.view()])?;
+        }
+        Ok(())
     }
 
     /// Release joins, threads, bindings and transports after every graph

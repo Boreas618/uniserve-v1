@@ -124,6 +124,9 @@ message Spawned {
 // reported.
 message Stop {
   string group = 1;
+  // The one launch generation to end; every generation of the group when
+  // absent.
+  optional uint64 generation = 2;
 }
 
 message Stopped {}

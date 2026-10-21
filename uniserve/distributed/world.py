@@ -319,6 +319,45 @@ def mesh(
     return result
 
 
+def _nccl_backends(world: World) -> list[Any]:
+    """The NCCL backend of every group the world owns on its device."""
+    if world.device.type != "cuda":
+        return []
+    backends = []
+    for group in world.groups:
+        try:
+            backend = group._get_backend(world.device)
+        except RuntimeError:
+            # A group without a backend for the device: a Gloo-only group.
+            continue
+        if isinstance(backend, dist.ProcessGroupNCCL):
+            backends.append(backend)
+    return backends
+
+
+def suspend(world: World) -> None:
+    """Release the device memory of the world's NCCL communicators.
+
+    A parked standby calls this after its device drained; nothing runs on
+    the communicators, nor a graph that captured one of their collectives,
+    until :func:`resume`. Local to this rank (``ncclCommSuspend``).
+    """
+    if world.device.type == "cuda":
+        torch.cuda.synchronize(world.device)
+    for backend in _nccl_backends(world):
+        backend.suspend()
+
+
+def resume(world: World) -> None:
+    """Allocate again what :func:`suspend` released.
+
+    Called before the communicators, or the graphs that captured their
+    collectives, run again.
+    """
+    for backend in _nccl_backends(world):
+        backend.resume()
+
+
 def destroy(world: World) -> None:
     """Retire owned groups, newest first, after the device drained."""
     groups, world.groups = world.groups, []

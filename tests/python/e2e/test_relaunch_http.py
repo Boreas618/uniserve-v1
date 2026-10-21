@@ -18,6 +18,16 @@ workers' prefill of them cannot change it. The deployment captures few
 graphs (decode batches up to 8, no prefill graphs), so that the workers
 start again while the count streams.
 
+Two schedulers that share their experts (``--data-parallel-size 2`` with
+expert parallelism) form one expert world, which keeps a standby world
+(``worker_config.standby``): once both serve, each worker group is launched
+a second time beside the first, at a rendezvous of its own, and parks with
+its graphs captured, its device memory kept resident or suspended
+(``worker_config.standby_memory``: suspended, it also releases its
+all-to-all workspaces and NCCL communicators, which its ranks restore
+together at the promotion). Killing a serving rank promotes that world in
+place of a relaunch, and the request continues on it.
+
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemon at a directory of the test's, and the server the daemon starts there
 is stopped at the end.
@@ -31,6 +41,7 @@ import re
 import shutil
 import signal
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -89,10 +100,13 @@ def _chunk_tokens(line: str) -> tuple[list[str], dict | None, bool]:
     return tokens, chunk.get("usage"), False
 
 
-def _processes(argument: str, runtime: Path) -> list[int]:
+def _processes(
+    argument: str, runtime: Path, generation: int | None = None
+) -> list[int]:
     """The pids of the test's `uniserve` processes running `argument`.
 
-    A process is the test's when its environment names `runtime`.
+    A process is the test's when its environment names `runtime`; with
+    `generation`, only a worker of that launch of its group counts.
     """
     pids = []
     for entry in Path("/proc").iterdir():
@@ -103,10 +117,15 @@ def _processes(argument: str, runtime: Path) -> list[int]:
             environment = (entry / "environ").read_bytes().decode()
         except OSError:
             continue
+        launch = (
+            generation is None
+            or f"--generation\0{generation}\0" in "\0".join(command)
+        )
         if (
             len(command) > 1
             and command[1] == argument
             and str(runtime) in environment
+            and launch
         ):
             pids.append(int(entry.name))
     return pids
@@ -138,14 +157,30 @@ def _log_lines(log: Path) -> list[str]:
     return [colors.sub("", line) for line in log.read_text().splitlines()]
 
 
+def _await_line(log: Path, text: str, timeout_s: float) -> None:
+    """Wait until the server log holds a line containing `text`."""
+    deadline = time.monotonic() + timeout_s
+    while not any(text in line for line in _log_lines(log)):
+        if time.monotonic() > deadline:
+            pytest.fail(f"the server did not log {text!r}")
+        time.sleep(1)
+
+
 def _stream_through_a_kill(
-    tmp_path: Path, victim: str
+    tmp_path: Path,
+    victim: str,
+    *,
+    options: tuple[str, ...] = (),
+    devices: str = "0",
+    parked: str | None = None,
 ) -> tuple[list[str], dict, list[str], dict, list[str]]:
     """Stream the count, killing a `victim` process after the first tokens.
 
-    `victim` is `worker` or `engine`. Returns the streamed tokens and
-    usage, the tokens and usage of the count asked again afterwards, and the
-    server log's lines.
+    `victim` is `worker` (a rank of a group's first launch) or `engine`.
+    The server runs on `devices` with the extra `options`; with `parked`,
+    the stream starts once the server logged it. Returns the streamed
+    tokens and usage, the tokens and usage of the count asked again
+    afterwards, and the server log's lines.
     """
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
@@ -172,13 +207,16 @@ def _stream_through_a_kill(
         "cuda_graph_config.capture_prefill=false",
         "--set",
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+        *options,
     ]
-    env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {"CUDA_VISIBLE_DEVICES": devices, "XDG_RUNTIME_DIR": str(runtime)}
     log = tmp_path / "server.log"
     streamed: list[str] = []
     usage = None
     try:
         with server_process(command, base_url, log, timeout_s=900, env=env):
+            if parked is not None:
+                _await_line(log, parked, timeout_s=900)
             with httpx.stream(
                 "POST",
                 f"{base_url}/v1/chat/completions",
@@ -194,7 +232,11 @@ def _stream_through_a_kill(
                     streamed.extend(tokens)
                     usage = chunk_usage or usage
                     if not killed and len(streamed) >= EARLY_TOKENS:
-                        pids = _processes(victim, runtime)
+                        pids = _processes(
+                            victim,
+                            runtime,
+                            generation=1 if victim == "worker" else None,
+                        )
                         assert pids, f"no {victim} process serves"
                         os.kill(pids[0], signal.SIGKILL)
                         killed = True
@@ -237,5 +279,46 @@ def test_a_request_continues_after_its_engine_process_is_lost(tmp_path: Path):
     assert any("a request migrated" in line for line in lines), (
         "the streaming request did not migrate"
     )
+    assert streamed == reference
+    assert usage == reference_usage
+
+
+@pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
+def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
+    tmp_path: Path, standby_memory: str
+):
+    streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
+        tmp_path,
+        "worker",
+        options=(
+            "--data-parallel-size",
+            "2",
+            "--set",
+            "moe_config.expert_parallel=true",
+            "--set",
+            "worker_config.standby=true",
+            "--set",
+            f"worker_config.standby_memory={standby_memory}",
+        ),
+        devices="0,1",
+        parked="the standby world of the failure domain is parked",
+    )
+
+    def logged(text: str) -> bool:
+        return any(text in line for line in lines)
+
+    assert logged("the failure domain's standby world was promoted")
+    assert not logged("relaunching the failure domain's worker groups")
+    assert logged("a request migrated"), "the streaming request did not migrate"
+    if standby_memory == "suspended":
+        for event in (
+            "the standby worker suspended its expert transports",
+            "the standby worker suspended its communicators",
+            "the promoted standby worker restored its expert transports",
+            "the promoted standby worker resumed its communicators",
+        ):
+            assert logged(event), event
+    else:
+        assert logged("the standby worker keeps its graph memory resident")
     assert streamed == reference
     assert usage == reference_usage

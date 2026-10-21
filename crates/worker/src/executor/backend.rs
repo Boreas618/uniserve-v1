@@ -472,6 +472,22 @@ impl WorkerBackend {
         self.runtimes.host_weights = weights;
     }
 
+    /// The NCCL communicators of every runner's collectives, which a parked
+    /// standby suspends.
+    pub(crate) fn collectives(&self) -> impl Iterator<Item = &crate::parallel::StreamCollectives> {
+        let text = self
+            .runtimes
+            .text
+            .iter()
+            .flat_map(|text| text.collectives());
+        let diffusion = self
+            .runtimes
+            .diffusion_lm
+            .iter()
+            .flat_map(|runner| runner.collectives());
+        text.chain(diffusion)
+    }
+
     pub(crate) fn experts(&self) -> Option<&Arc<crate::parallel::ExpertUnion>> {
         self.runtimes.experts.as_ref()
     }

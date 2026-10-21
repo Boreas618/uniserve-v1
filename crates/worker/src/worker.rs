@@ -48,7 +48,7 @@ use crate::capacity::plan::Plan;
 use crate::config::placement::{Components, GroupPlacement};
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
-use crate::cuda_graph::{GraphPool, GraphStorage, graph_storage_budget_bytes};
+use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
@@ -79,7 +79,7 @@ use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
-use crate::service::{Ending, Parked, Service};
+use crate::service::{Ending, Parked, Service, Suspension};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
@@ -766,11 +766,11 @@ impl Worker {
         // the engine promotes it, and with the memory its graphs address
         // released when keeping it would crowd the workers it stands by for.
         let standby = if self.retained.standing_by() {
-            let suspended = self.park_graph_memory()?;
+            let suspension = self.park_memory()?;
             self.retained.park()?;
             Some(Parked {
                 retained: Arc::clone(&self.retained),
-                suspended,
+                suspension,
             })
         } else {
             None
@@ -785,21 +785,27 @@ impl Worker {
         served
     }
 
-    /// How a parked standby keeps the device memory its graphs and scratch
-    /// address, as `worker_config.standby_memory` says: resident or
-    /// suspended (copied to host memory, its device memory released, its
-    /// addresses kept, restored at the promotion); with `auto`, resident when
+    /// How a parked standby keeps the device memory its graphs address, as
+    /// `worker_config.standby_memory` says: resident or suspended (its
+    /// device memory released, its addresses kept, restored at the
+    /// promotion); with `auto`, resident when
     /// every device keeps, beside it, the share of its memory a serving
     /// worker's capacity plan leaves for graphs and activations
-    /// ([`graph_storage_budget_bytes`]), and suspended otherwise. Returns the
-    /// pools it suspended.
+    /// ([`graph_storage_budget_bytes`]), and suspended otherwise. The ranks
+    /// that park together (the expert union the rank belongs to, else its
+    /// worker group) take one mode: one rank's crowded device suspends them
+    /// all. Suspending copies the graph pools and scratch to host memory,
+    /// releases the expert transports' workspaces that keep their addresses
+    /// ([`ExpertUnion::suspend`]), and suspends every NCCL communicator of
+    /// the runners' collectives and of the torch world. Returns what it
+    /// released.
     ///
     /// # Errors
     ///
     /// Fails when a device lacks that share even once the memory is
     /// suspended: the standby does not fit beside the workers it stands by
     /// for, and none is kept.
-    fn park_graph_memory(&mut self) -> std::result::Result<Vec<Arc<GraphPool>>, WorkerError> {
+    fn park_memory(&mut self) -> std::result::Result<Suspension, WorkerError> {
         let mut pools = self.graphs.pools();
         pools.extend(self.scratches.pools());
         let mut devices: Vec<DeviceId> = pools.iter().map(|pool| pool.device).collect();
@@ -818,12 +824,18 @@ impl Worker {
                 for &device in &devices {
                     crowded |= short(device).map_err(phase("standby"))?;
                 }
-                crowded
+                // Collective transports suspend on every rank or on none.
+                let group = self.world.union.as_ref().unwrap_or(&self.world.host);
+                group
+                    .all_gather_bytes(&[u8::from(crowded)])
+                    .map_err(phase("standby"))?
+                    .iter()
+                    .any(|vote| vote.first() == Some(&1))
             }
         };
         if !crowded {
             tracing::info!(bytes, "the standby worker keeps its graph memory resident");
-            return Ok(Vec::new());
+            return Ok(Suspension::default());
         }
 
         // Warmup ended: no work runs on the streams once they drained.
@@ -834,6 +846,23 @@ impl Worker {
             pool.suspend().map_err(phase("standby"))?;
         }
         tracing::info!(bytes, "the standby worker suspended its graph memory");
+        let experts = match self.executor.backend().experts() {
+            Some(union) if union.suspend().map_err(phase("standby"))? => {
+                tracing::info!("the standby worker suspended its expert transports");
+                Some(Arc::clone(union))
+            }
+            _ => None,
+        };
+        // NCCL releases its communicators' buffers; the graphs that captured
+        // their collectives replay once they resume.
+        for collectives in self.executor.backend().collectives() {
+            collectives.suspend().map_err(phase("standby"))?;
+        }
+        let world = self.world.torch().clone();
+        Interpreter::import("uniserve.distributed.world.suspend")
+            .and_then(|suspend| suspend.invoke(&[world.view()]))
+            .map_err(phase("standby"))?;
+        tracing::info!("the standby worker suspended its communicators");
         for &device in &devices {
             if short(device).map_err(phase("standby"))? {
                 return Err(phase("standby")(Error::Invalid(format!(
@@ -841,7 +870,11 @@ impl Worker {
                 ))));
             }
         }
-        Ok(pools)
+        Ok(Suspension {
+            pools,
+            experts,
+            world: Some(world),
+        })
     }
 
     /// Release every owner in dependency order. An aborted close never

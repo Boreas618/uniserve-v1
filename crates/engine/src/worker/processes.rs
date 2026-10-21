@@ -101,11 +101,23 @@ impl ExitReports {
             .and_then(|ranks| ranks.get(&rank))
     }
 
-    /// Ends every running launch of `group`: their kept exits are
-    /// discarded, as is every exit of them read later.
-    fn stop(&mut self, group: &str) {
-        self.running.remove(group);
-        self.reported.retain(|(name, _), _| name != group);
+    /// Ends every running launch of `group`, or only its launch
+    /// `generation`: their kept exits are discarded, as is every exit of
+    /// them read later.
+    fn stop(&mut self, group: &str, generation: Option<u64>) {
+        match generation {
+            None => {
+                self.running.remove(group);
+                self.reported.retain(|(name, _), _| name != group);
+            }
+            Some(generation) => {
+                if let Some(running) = self.running.get_mut(group) {
+                    running.remove(&generation);
+                }
+                self.reported
+                    .retain(|(name, launched), _| name != group || *launched != generation);
+            }
+        }
     }
 }
 
@@ -263,9 +275,21 @@ impl ProcessClient {
     ///
     /// Fails when the daemon cannot be reached.
     pub(crate) fn stop(&mut self, group: &str) -> anyhow::Result<()> {
-        self.exits.stop(group);
+        self.exits.stop(group, None);
         self.request(request::Kind::Stop(Stop {
             group: group.to_owned(),
+            generation: None,
+        }))
+        .map(|_| ())
+    }
+
+    /// Stops `group`'s launch `generation` on every node, leaving its other
+    /// launches (a standby beside it) running.
+    pub(crate) fn stop_generation(&mut self, group: &str, generation: u64) -> anyhow::Result<()> {
+        self.exits.stop(group, Some(generation));
+        self.request(request::Kind::Stop(Stop {
+            group: group.to_owned(),
+            generation: Some(generation),
         }))
         .map(|_| ())
     }

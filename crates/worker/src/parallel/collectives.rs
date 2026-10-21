@@ -322,6 +322,30 @@ impl StreamCommunicator {
         })
     }
 
+    /// Release the communicator's dynamic device memory while no operation
+    /// runs on it ([`Communicator::suspend`]): its transfer stream drains
+    /// first, and nothing, a graph that captured one of its operations
+    /// included, runs on it until [`Self::resume`].
+    pub(crate) fn suspend(&mut self) -> Result<()> {
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or(Error::State("closed communicator"))?;
+        resources.transfer.synchronize()?;
+        resources.communicator.suspend()?;
+        Ok(())
+    }
+
+    /// Allocate again what [`Self::suspend`] released.
+    pub(crate) fn resume(&mut self) -> Result<()> {
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or(Error::State("closed communicator"))?;
+        resources.communicator.resume()?;
+        Ok(())
+    }
+
     /// Close collectively after all borrowed graph and tensor accesses retire.
     /// Aborted execution retains handles, mappings and streams until process exit.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
@@ -520,6 +544,24 @@ impl StreamCollectives {
             .iter()
             .find(|group| group.group.name == name)
             .map(functions)
+    }
+
+    /// Release every communicator's dynamic device memory while a standby
+    /// parks ([`StreamCommunicator::suspend`]); local to this rank.
+    pub(crate) fn suspend(&self) -> Result<()> {
+        for group in &self.groups {
+            lock(&group.comm).suspend()?;
+        }
+        Ok(())
+    }
+
+    /// Allocate again what [`Self::suspend`] released, before any graph
+    /// that captured their collectives runs.
+    pub(crate) fn resume(&self) -> Result<()> {
+        for group in &self.groups {
+            lock(&group.comm).resume()?;
+        }
+        Ok(())
     }
 
     /// Destroy the communicators collectively after every graph and call

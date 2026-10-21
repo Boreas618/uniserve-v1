@@ -28,6 +28,13 @@ memory and released on the device at unchanged addresses, then mapped back
 with its contents at the promotion, before its graphs run. Either way the
 new engine's graphs decode the same count.
 
+The deployment runs on one GPU, or as two schedulers that share their
+experts (``--data-parallel-size 2`` with expert parallelism): the standby
+engine's workers then form an expert world of their own beside the running
+one, and a suspended standby also releases its all-to-all workspaces and
+NCCL communicators, which every rank of its world restores together at the
+promotion.
+
 The test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemon at a directory of the test's, and the server the daemon starts there
 is stopped at the end. ``UNISERVE_UPDATE_EXECUTABLE`` names the ``uniserve``
@@ -150,10 +157,27 @@ def _engine_builds(lines: list[str]) -> set[str]:
     }
 
 
+# The devices and extra options of each deployment.
+TOPOLOGIES = {
+    "single": ("0", ()),
+    "experts": (
+        "0,1",
+        (
+            "--data-parallel-size",
+            "2",
+            "--set",
+            "moe_config.expert_parallel=true",
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
 @pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
 def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
-    tmp_path: Path, standby_memory: str
+    tmp_path: Path, standby_memory: str, topology: str
 ):
+    devices, options = TOPOLOGIES[topology]
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -181,8 +205,9 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
         "--set",
         f"worker_config.standby_memory={standby_memory}",
+        *options,
     ]
-    env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
+    env = {"CUDA_VISIBLE_DEVICES": devices, "XDG_RUNTIME_DIR": str(runtime)}
     update_body = {}
     if executable := os.environ.get("UNISERVE_UPDATE_EXECUTABLE"):
         update_body["executable"] = executable
@@ -245,6 +270,12 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
     assert any(
         "the drained engine's process exited" in line for line in lines
     ), "the drained engine's process did not exit"
+    # The drain closes the workers, which exit once they gave up their
+    # storages; none is stopped at the shutdown deadline.
+    assert not any(
+        "worker did not exit before the shutdown deadline" in line
+        for line in lines
+    ), "a drained engine's worker did not exit"
     if "executable" in update_body:
         builds = _engine_builds(lines)
         assert len(builds) == 2, f"the engines ran the builds {builds}"
@@ -257,6 +288,14 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
             "the promoted standby worker restored its graph memory" in line
             for line in lines
         ), "the promoted standby worker did not restore its graph memory"
+        if topology == "experts":
+            for event in (
+                "the standby worker suspended its expert transports",
+                "the standby worker suspended its communicators",
+                "the promoted standby worker restored its expert transports",
+                "the promoted standby worker resumed its communicators",
+            ):
+                assert any(event in line for line in lines), event
     else:
         assert any(
             "the standby worker keeps its graph memory resident" in line

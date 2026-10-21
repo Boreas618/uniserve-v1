@@ -188,9 +188,7 @@ fn serve(
     // Shutting the schedulers down ends every request in flight, whose
     // terminal events the forwarder still sends; then the forwarder and the
     // writer end with their channels.
-    for slot in &routing.slots {
-        slot.handle.shutdown();
-    }
+    SchedulerHandle::shutdown_all(routing.slots.iter().map(|slot| &slot.handle));
     drop(streams);
     let _ = events_thread.join();
     drop(frames);
@@ -621,21 +619,35 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
         tracing::info!(engine, "the engine stands by");
         if !await_promotion(&mut reader)? {
             tracing::info!(engine, "the daemon shut the standing-by engine down");
-            for scheduler in &schedulers {
-                scheduler.shutdown();
-            }
+            SchedulerHandle::shutdown_all(&schedulers);
             return Ok(());
         }
-        let promoted = schedulers.iter().try_for_each(SchedulerHandle::promote);
+        // Every scheduler promotes at once: the ranks of an expert world
+        // that spans schedulers restore their suspended workspaces
+        // together, so none may wait for another scheduler's promotion.
+        let promoted = std::thread::scope(|scope| {
+            let promoting: Vec<_> = schedulers
+                .iter()
+                .map(|scheduler| scope.spawn(|| scheduler.promote()))
+                .collect();
+            let mut outcome = Ok(());
+            for promotion in promoting {
+                let result = promotion
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a scheduler's promotion panicked")));
+                if outcome.is_ok() {
+                    outcome = result;
+                }
+            }
+            outcome
+        });
         if let Err(error) = promoted {
             let _ = writer.send(&state(
                 wire::EngineState::Failed,
                 None,
                 format!("{error:#}"),
             ));
-            for scheduler in &schedulers {
-                scheduler.shutdown();
-            }
+            SchedulerHandle::shutdown_all(&schedulers);
             return Err(error.context("promoting the standing-by engine"));
         }
     }

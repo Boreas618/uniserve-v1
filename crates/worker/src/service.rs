@@ -53,22 +53,55 @@ enum PendingResponse {
 /// Borrows a worker's executor and channel for one synchronous serving run.
 /// All channel waits run on the caller's thread; completion wakes interrupt
 /// them without advancing execution on a callback thread.
+/// What a parked standby worker released, which its promotion restores;
+/// nothing for a standby that keeps its memory resident.
+#[derive(Default)]
+pub(crate) struct Suspension {
+    /// The graph pools and scratch whose contents it moved to host memory.
+    pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
+    /// The expert union whose transport workspaces it released.
+    pub(crate) experts: Option<Arc<crate::parallel::ExpertUnion>>,
+    /// The torch world whose NCCL communicators it suspended, with those of
+    /// the runners' collectives.
+    pub(crate) world: Option<crate::ffi::Handle>,
+}
+
 /// A standby worker parked until its promotion: its retained storages,
-/// read-only, and the pools of graph memory it suspended, if it did.
+/// read-only, and what it released while parked.
 pub(crate) struct Parked {
     pub(crate) retained: Arc<Retained>,
-    pub(crate) suspended: Vec<Arc<crate::cuda_graph::GraphPool>>,
+    pub(crate) suspension: Suspension,
 }
 
 impl Parked {
-    /// Restore the suspended graph memory at its addresses, then take write
+    /// Restore what the standby released, at its addresses, then take write
     /// access to the retained storages: the captured graphs run again.
-    fn promote(self) -> crate::Result<()> {
-        for pool in &self.suspended {
+    /// Restoring the expert transports is collective over the union: the
+    /// engine asks every rank of the standby world to promote before it
+    /// awaits any.
+    fn promote(self, backend: &crate::executor::backend::WorkerBackend) -> crate::Result<()> {
+        let Suspension {
+            pools,
+            experts,
+            world,
+        } = &self.suspension;
+        for pool in pools {
             pool.restore()?;
         }
-        if !self.suspended.is_empty() {
+        if !pools.is_empty() {
             tracing::info!("the promoted standby worker restored its graph memory");
+        }
+        if let Some(world) = world {
+            for collectives in backend.collectives() {
+                collectives.resume()?;
+            }
+            crate::ffi::Interpreter::import("uniserve.distributed.world.resume")?
+                .invoke(&[world.view()])?;
+            tracing::info!("the promoted standby worker resumed its communicators");
+        }
+        if let Some(experts) = experts {
+            experts.restore()?;
+            tracing::info!("the promoted standby worker restored its expert transports");
         }
         self.retained.promote()
     }
@@ -221,7 +254,12 @@ impl<'a> Service<'a> {
                 }
             }
 
-            if self.experts {
+            // A parked standby joins no expert step: its world's ranks run no
+            // collective between parking and the promotion but the one that
+            // restores their transports (`Parked::promote`), which each
+            // reaches from here in any order.
+            let joins = self.experts && self.standby.is_none();
+            if joins {
                 if self.awaits_own_step()? {
                     self.wait(EXPERT_POLL)?;
                     continue;
@@ -237,7 +275,7 @@ impl<'a> Service<'a> {
             if !self.pending.is_empty() || self.executor.has_work() {
                 // Remote acknowledgment words have no wake source. Poll only
                 // while one is outstanding; ordinary work waits on its wake.
-                let timeout = if self.experts {
+                let timeout = if joins {
                     EXPERT_POLL
                 } else if self.executor.backend().awaiting_acknowledgment()? {
                     Duration::from_millis(1)
@@ -245,7 +283,7 @@ impl<'a> Service<'a> {
                     Duration::from_secs(60)
                 };
                 self.wait(timeout)?;
-            } else if self.experts {
+            } else if joins {
                 self.wait(EXPERT_POLL)?;
             } else {
                 // Nothing is owed or running, so only a request or the engine's
@@ -277,7 +315,7 @@ impl<'a> Service<'a> {
             }
             WorkerRequest::Promote { message_id } => {
                 let promoted = match self.standby.take() {
-                    Some(parked) => parked.promote(),
+                    Some(parked) => parked.promote(self.executor.backend()),
                     None => Err(Error::State("only a parked standby worker is promoted")),
                 };
                 PendingResponse::Ready(Box::new(match promoted {

@@ -260,6 +260,11 @@ impl DiffusionLMRunner {
         self.graphs.seal();
     }
 
+    /// The NCCL communicators the runner's collectives run on.
+    pub(crate) fn collectives(&self) -> &[crate::parallel::StreamCollectives] {
+        &self.collectives
+    }
+
     /// Release graphs, the Python runner's execution context and output
     /// storage after the lane drained. An aborted close keeps the context:
     /// device work may still address its workspace.

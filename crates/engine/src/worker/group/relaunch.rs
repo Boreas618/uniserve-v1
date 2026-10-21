@@ -24,6 +24,19 @@
 //! A group that closes during a round cancels its relaunch
 //! (`cancel_relaunch`): the relaunched ranks are terminated, whether they
 //! were still starting or already posted.
+//!
+//! A domain whose groups keep a standby (`worker_config.standby`) but
+//! cannot keep it in place (an expert world, or a group on several nodes)
+//! keeps a standby world instead: a second launch of every group of the
+//! domain, at a world and rendezvous of its own, which captures its graphs
+//! and parks beside the serving world. Each group offers its launch
+//! arguments once it serves (`offer_standby`), and the last offer starts
+//! the standby world on a thread of its own. A replacement round of a
+//! domain whose standby world parked promotes it instead of relaunching:
+//! every rank of it is asked to promote before any answer is awaited, since
+//! the world restores its communication together, and the groups install
+//! the promoted ranks as relaunched ones and offer a new standby. A
+//! promotion that fails terminates the standby and relaunches the domain.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +60,29 @@ pub(super) struct Relaunch {
     /// relaunch wake every group's scheduler.
     wakers: Vec<CommandWaker>,
     round: Mutex<Round>,
+    /// The domain's standby world. Where both locks are held, this one is
+    /// taken first.
+    standby: Mutex<Standby>,
+}
+
+/// The domain's standby world and the launches its groups offered for the
+/// next one.
+struct Standby {
+    /// The standby launch each group offered since the last standby world
+    /// started; `None` for a group that has not offered. A standby world
+    /// starts once every group offered and none runs.
+    offered: Vec<Option<WorkerProcessArgs>>,
+    world: StandbyWorld,
+}
+
+/// The standby world of a domain; see the module documentation.
+enum StandbyWorld {
+    Absent,
+    /// The standby world starts on a thread of its own.
+    Starting(Running),
+    /// Every rank of the standby world reported its startup and parked;
+    /// its workers by group.
+    Parked(Vec<Vec<WorkerProcess>>),
 }
 
 /// The replacement round in progress.
@@ -96,7 +132,109 @@ impl Relaunch {
                 relaunch: None,
                 closing: false,
             }),
+            standby: Mutex::new(Standby {
+                offered: vec![None; groups],
+                world: StandbyWorld::Absent,
+            }),
         }
+    }
+
+    fn standby(&self) -> std::sync::MutexGuard<'_, Standby> {
+        self.standby
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Group `index` serves and offers `arguments` (a standby launch of it:
+    /// standing by, with its serving ranks' cache units) for the domain's
+    /// next standby world. The last offer starts the standby world on a
+    /// thread of its own, or, while one runs, once it ends; every offer
+    /// returns at once.
+    pub(super) fn offer_standby(self: &Arc<Self>, index: usize, arguments: WorkerProcessArgs) {
+        let mut standby = self.standby();
+        if let Some(slot) = standby.offered.get_mut(index) {
+            *slot = Some(arguments);
+        }
+        self.start_offered(&mut standby);
+    }
+
+    /// Starts a standby world from the offered launches, when every group
+    /// offered one, none runs, and the domain is not closing.
+    fn start_offered(self: &Arc<Self>, standby: &mut Standby) {
+        if !matches!(standby.world, StandbyWorld::Absent)
+            || !standby.offered.iter().all(Option::is_some)
+            || self.round().closing
+        {
+            return;
+        }
+        let arguments: Vec<WorkerProcessArgs> = standby
+            .offered
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
+        tracing::info!(
+            groups = arguments.len(),
+            "a standby world of the failure domain is starting"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let domain = Arc::clone(self);
+        let startup = Arc::clone(&cancel);
+        let spawned = std::thread::Builder::new()
+            .name("uniserve-standby".into())
+            .spawn(move || domain.start_standby_world(arguments, startup));
+        match spawned {
+            Ok(thread) => standby.world = StandbyWorld::Starting(Running { cancel, thread }),
+            Err(error) => tracing::warn!("the standby world could not start: {error}"),
+        }
+    }
+
+    /// The standby thread: launch the standby world and park it. A standby
+    /// world that cannot start is reported and left out: the domain's
+    /// losses relaunch it. A loss while it starts stops its ranks with the
+    /// lost groups' (`arrive`), so it ends without parking, and the groups
+    /// relaunched meanwhile have offered the next standby world, which
+    /// starts then.
+    fn start_standby_world(
+        self: Arc<Self>,
+        mut arguments: Vec<WorkerProcessArgs>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let launched = launch_all(
+            &mut arguments,
+            &self.registry,
+            &self.processes,
+            &self.claims,
+            Arc::clone(&cancel),
+        );
+        let mut standby = self.standby();
+        // Read under the standby's lock: a closing domain set it before it
+        // took the standby world (`cancel_relaunch`).
+        let closing = self.round().closing;
+        match launched {
+            Ok(mut groups) if !closing && !cancel.load(Ordering::Acquire) => {
+                for worker in groups.iter_mut().flatten() {
+                    worker.set_startup_cancel(None);
+                }
+                tracing::info!("the standby world of the failure domain is parked");
+                standby.world = StandbyWorld::Parked(groups);
+                return;
+            }
+            Ok(groups) => {
+                for mut workers in groups {
+                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                }
+            }
+            Err(error) => tracing::warn!("the standby world could not start: {error:#}"),
+        }
+        if !closing {
+            standby.world = StandbyWorld::Absent;
+            self.start_offered(&mut standby);
+        }
+    }
+
+    /// Whether the domain's standby world parked.
+    pub(super) fn standby_parked(&self) -> bool {
+        matches!(self.standby().world, StandbyWorld::Parked(_))
     }
 
     fn round(&self) -> std::sync::MutexGuard<'_, Round> {
@@ -149,9 +287,13 @@ impl Relaunch {
     }
 
     /// Group `index` terminated its workers and arrives with the arguments
-    /// it is relaunched from. The last group to arrive starts the relaunch
-    /// on a thread of its own; every arrival returns at once.
+    /// it is relaunched from. The last group to arrive starts the relaunch,
+    /// or the promotion of the domain's parked standby world, on a thread
+    /// of its own; every arrival returns at once.
     pub(super) fn arrive(self: &Arc<Self>, index: usize, arguments: WorkerProcessArgs) {
+        // The standby's lock is taken before the round's, as everywhere
+        // both are held: the last arrival takes a parked standby world.
+        let mut standby = self.standby();
         let mut round = self.round();
         if round.closing {
             return;
@@ -163,17 +305,34 @@ impl Relaunch {
             return;
         }
 
-        tracing::warn!(
-            groups = round.arrived.len(),
-            "relaunching the failure domain's worker groups"
-        );
-        let arguments = round.arrived.iter().flatten().cloned().collect();
+        let arguments: Vec<WorkerProcessArgs> = round.arrived.iter().flatten().cloned().collect();
+        let groups = arguments.len();
+        let parked = match std::mem::replace(&mut standby.world, StandbyWorld::Absent) {
+            StandbyWorld::Parked(world) => Some(world),
+            StandbyWorld::Starting(running) => {
+                // The lost groups stopped every launch of theirs, the
+                // starting standby world's among them.
+                running.cancel.store(true, Ordering::Release);
+                standby.world = StandbyWorld::Starting(running);
+                None
+            }
+            StandbyWorld::Absent => None,
+        };
+        drop(standby);
+        if parked.is_some() {
+            tracing::warn!(groups, "promoting the failure domain's standby world");
+        } else {
+            tracing::warn!(groups, "relaunching the failure domain's worker groups");
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let domain = Arc::clone(self);
         let startup = Arc::clone(&cancel);
         let spawned = std::thread::Builder::new()
             .name("uniserve-relaunch".into())
-            .spawn(move || domain.relaunch(arguments, startup));
+            .spawn(move || match parked {
+                Some(world) => domain.promote(world, arguments, startup),
+                None => domain.relaunch(arguments, startup),
+            });
         match spawned {
             Ok(thread) => round.relaunch = Some(Running { cancel, thread }),
             Err(error) => {
@@ -181,6 +340,54 @@ impl Relaunch {
                 Self::post(&mut round, Err(message));
                 drop(round);
                 self.wake_all();
+            }
+        }
+    }
+
+    /// The relaunch thread of a domain whose standby world parked: promote
+    /// every rank of it and post each group its ranks, then wake every
+    /// group. A promotion that fails terminates the standby world and
+    /// relaunches the domain instead.
+    fn promote(
+        &self,
+        mut world: Vec<Vec<WorkerProcess>>,
+        arguments: Vec<WorkerProcessArgs>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        let timeout = arguments
+            .iter()
+            .map(|args| args.watchdog_timeout)
+            .max()
+            .unwrap_or_default();
+        let mut ranks: Vec<WorkerProcess> = world.iter_mut().flat_map(std::mem::take).collect();
+        let promoted = crate::worker::process::promote_all(&mut ranks, timeout);
+        // The ranks return to their groups, in group order.
+        let mut ranks = ranks.into_iter();
+        for (workers, args) in world.iter_mut().zip(&arguments) {
+            workers.extend(ranks.by_ref().take(args.ranks.len()));
+        }
+        match promoted {
+            Ok(()) => {
+                tracing::info!("the failure domain's standby world was promoted");
+                let mut round = self.round();
+                if round.closing {
+                    drop(round);
+                    for mut workers in world {
+                        workers.iter_mut().for_each(WorkerProcess::terminate);
+                    }
+                    return;
+                }
+                round.relaunch = None;
+                Self::post(&mut round, Ok(world));
+                drop(round);
+                self.wake_all();
+            }
+            Err(error) => {
+                tracing::warn!("the standby world could not be promoted; relaunching: {error:#}");
+                for mut workers in world {
+                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                }
+                self.relaunch(arguments, cancel);
             }
         }
     }
@@ -261,6 +468,22 @@ impl Relaunch {
             if relaunch.thread.join().is_err() {
                 tracing::error!("the relaunch thread panicked");
             }
+        }
+        // The standby world ends with the domain.
+        let standby = std::mem::replace(&mut self.standby().world, StandbyWorld::Absent);
+        match standby {
+            StandbyWorld::Starting(running) => {
+                running.cancel.store(true, Ordering::Release);
+                if running.thread.join().is_err() {
+                    tracing::error!("the standby thread panicked");
+                }
+            }
+            StandbyWorld::Parked(world) => {
+                for mut workers in world {
+                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                }
+            }
+            StandbyWorld::Absent => {}
         }
         let posted: Vec<_> = self
             .round()

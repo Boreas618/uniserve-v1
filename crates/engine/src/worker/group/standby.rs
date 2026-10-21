@@ -11,9 +11,11 @@
 //! Storage Server has the failed rank out, makes its mappings writable at
 //! unchanged addresses, and serves. The group then starts a new standby.
 //!
-//! A standby serves a group whose ranks all run on the engine's node and
-//! that is its own failure domain: a group of a shared expert world is
-//! replaced with its domain.
+//! A standby serves in place a group whose ranks all run on the engine's
+//! node and that is its own failure domain. Any other group that keeps a
+//! standby (a group of a shared expert world, or on several nodes) offers
+//! its launch to its failure domain's standby world (`Relaunch`), which a
+//! round of the domain promotes as a whole.
 
 use super::WorkerGroup;
 use super::validate_replacement_info;
@@ -27,8 +29,8 @@ pub(super) struct Standby {
 }
 
 impl WorkerGroup {
-    /// Whether the group keeps a standby: `worker_config.standby`, for a
-    /// group that is its own failure domain on the engine's host.
+    /// Whether the group keeps a standby in place: `worker_config.standby`,
+    /// for a group that is its own failure domain on the engine's host.
     fn keeps_standby(&self) -> bool {
         self.process_args.keep_standby
             && self.relaunch.0.groups() == 1
@@ -44,12 +46,18 @@ impl WorkerGroup {
     /// follows them. A standby that cannot start is reported and left out:
     /// the group is then replaced by a relaunch when it fails.
     pub(super) fn start_standby(&mut self) {
-        if self.closed || self.standby.is_some() || !self.keeps_standby() {
+        if self.closed || self.standby.is_some() || !self.process_args.keep_standby {
             return;
         }
         let mut args = self.process_args.clone();
         args.standby = true;
         args.cache_units = self.info.prefix_cache.as_ref().map(|cache| cache.num_units);
+        if !self.keeps_standby() {
+            // The group's failure domain keeps the standby world.
+            let (domain, index) = &self.relaunch;
+            domain.offer_standby(*index, args);
+            return;
+        }
         let started = (|| -> anyhow::Result<Vec<WorkerProcess>> {
             let launched =
                 args.spawn_workers(None, &self.registry, &self.processes, &self.claims, None)?;
@@ -151,10 +159,7 @@ impl WorkerGroup {
         if !self.process_args.standby {
             return Ok(());
         }
-        let timeout = self.process_args.watchdog_timeout;
-        for worker in &mut self.workers {
-            worker.promote(timeout)?;
-        }
+        crate::worker::process::promote_all(&mut self.workers, self.process_args.watchdog_timeout)?;
         self.process_args.standby = false;
         tracing::info!(worker = %self.process_args.worker_id, "the standing-by ranks serve");
         Ok(())
@@ -169,11 +174,10 @@ impl WorkerGroup {
             return None;
         }
         let mut standby = self.standby.take()?;
-        let timeout = self.process_args.watchdog_timeout;
-        let promoted = standby
-            .workers
-            .iter_mut()
-            .try_for_each(|worker| worker.promote(timeout));
+        let promoted = crate::worker::process::promote_all(
+            &mut standby.workers,
+            self.process_args.watchdog_timeout,
+        );
         Some(match promoted {
             Ok(()) => {
                 for worker in &mut standby.workers {

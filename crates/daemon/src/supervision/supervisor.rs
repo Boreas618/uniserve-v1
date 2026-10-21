@@ -178,16 +178,24 @@ impl Supervisor {
 
     /// Stops every process of `engine`'s `group` without reporting its exit,
     /// and closes the group's reservations, ahead of the group's next launch.
-    pub(crate) fn stop(&mut self, engine: u64, group: &str) {
+    pub(crate) fn stop(&mut self, engine: u64, group: &str, generation: Option<u64>) {
         let stopped: Vec<Key> = self
             .children
             .keys()
-            .filter(|(owner, name, _, _)| *owner == engine && name == group)
+            .filter(|(owner, name, _, launched)| {
+                *owner == engine
+                    && name == group
+                    && generation.is_none_or(|generation| *launched == generation)
+            })
             .cloned()
             .collect();
         self.terminate(stopped);
-        self.reservations
-            .retain(|_, held| held.engine != engine || held.group != group);
+        // A group's reservations serve every launch of it; they end with the
+        // group.
+        if generation.is_none() {
+            self.reservations
+                .retain(|_, held| held.engine != engine || held.group != group);
+        }
     }
 
     /// Ends every process and reservation of an engine whose connection
