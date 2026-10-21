@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use engine::EventRx;
-use engine::{EngineCoreOutput, PositionLogprobs, RejectionKind};
+use engine::{Event, PositionLogprobs, RejectionKind};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 
@@ -396,7 +396,7 @@ pub async fn decoded_text_event_stream(
         match event {
             // Scheduling metadata may arrive before prompt logprobs; start is
             // emitted only after both prerequisites are complete.
-            EngineCoreOutput::Scheduled {
+            Event::Scheduled {
                 queued_at,
                 scheduled_at,
             } => {
@@ -411,7 +411,7 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
-            EngineCoreOutput::PromptLogprobs { positions } => {
+            Event::PromptLogprobs { positions } => {
                 if !prompt_logprobs_requested {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -437,7 +437,7 @@ pub async fn decoded_text_event_stream(
             }
             // Generated logprobs, when requested, defer decoding until the
             // matching TokenLogprobs event validates the token identity.
-            EngineCoreOutput::TextToken { id, .. } => {
+            Event::TextToken { id, .. } => {
                 state
                     .emit_start_if_ready(
                         &request_id,
@@ -466,7 +466,7 @@ pub async fn decoded_text_event_stream(
             }
             // Tokens committed together, such as a block-diffusion canvas,
             // carry no logprobs and decode as one update.
-            EngineCoreOutput::TextTokens { ids } => {
+            Event::TextTokens { ids } => {
                 state
                     .emit_start_if_ready(
                         &request_id,
@@ -498,7 +498,7 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
-            EngineCoreOutput::TokenLogprobs { id, candidates } => {
+            Event::TokenLogprobs { id, candidates } => {
                 let pending = state
                     .pending_token
                     .take()
@@ -530,21 +530,21 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
-            EngineCoreOutput::ImageBegin { .. } => {
+            Event::ImageBegin { .. } => {
                 state.ensure_output_ready(&request_id, "an image start")?;
                 y.yield_ok(DecodedTextEvent::Image(ImageEvent::Begin)).await;
             }
-            EngineCoreOutput::ImageStep { image_id, .. } => {
+            Event::ImageStep { image_id, .. } => {
                 state.ensure_output_ready(&request_id, "an image step")?;
                 y.yield_ok(DecodedTextEvent::Image(ImageEvent::Step { image_id }))
                     .await;
             }
             // A commit marks the image's entry into the model context; the
             // completed image follows it.
-            EngineCoreOutput::ImageCommit { .. } => {
+            Event::ImageCommit { .. } => {
                 state.ensure_output_ready(&request_id, "an image commit")?;
             }
-            EngineCoreOutput::ImageDone {
+            Event::ImageDone {
                 image_id,
                 height,
                 width,
@@ -562,7 +562,7 @@ pub async fn decoded_text_event_stream(
             }
             // A terminal event flushes decoder holdback only after every pending
             // token/logprob pair and all prompt metadata have resolved.
-            EngineCoreOutput::Finished {
+            Event::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
@@ -615,22 +615,19 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
-            EngineCoreOutput::Rejected { kind, message } => {
+            Event::Rejected { kind, message } => {
                 y.yield_ok(DecodedTextEvent::Rejected { kind, message })
                     .await;
                 return Ok(());
             }
-            EngineCoreOutput::Error { message }
-            | EngineCoreOutput::ArtifactUnavailable { message } => {
+            Event::Error { message } | Event::ArtifactUnavailable { message } => {
                 state.flush_images(&mut y).await;
                 y.yield_ok(DecodedTextEvent::Failed { message }).await;
                 return Ok(());
             }
             // Media artifacts belong to diffusion requests, and readout
             // answers to readout requests, which other consumers collect.
-            EngineCoreOutput::Artifact(_)
-            | EngineCoreOutput::MediaProgress { .. }
-            | EngineCoreOutput::Readout { .. } => {
+            Event::Artifact(_) | Event::MediaProgress { .. } | Event::Readout { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "a generation request received a media or readout event".to_string(),

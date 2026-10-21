@@ -146,7 +146,7 @@ impl Scheduler {
         config.max_queued_requests = config.max_queued_requests.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_running_requests` (`guidance_prefix_rows`). `EngineCore::new` launches
+        // `max_running_requests` (`guidance_prefix_rows`). `SchedulerHandle::start_all` launches
         // workers with enough rows and refuses a token runtime whose workers
         // hold fewer, so this clamp lowers the limit only for a supplied
         // executor or for workers that fit their request pools to device
@@ -291,6 +291,21 @@ impl Scheduler {
     /// Returns the model limits supported by the loaded execution workers.
     pub fn generation_limits(&self) -> &crate::GenerationLimits {
         &self.generation_limits
+    }
+
+    /// Returns the media units one call of each routed media call covers at
+    /// once (`ExecutorInfo::media_units`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the executor's media routing is inconsistent.
+    pub fn media_units(&self) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
+        let info = self.executor.info();
+        Ok(info
+            .media_routing()?
+            .into_keys()
+            .filter_map(|call| info.media_units(call).map(|units| (call, units)))
+            .collect())
     }
 
     /// Returns a shared handle to scheduler counters.

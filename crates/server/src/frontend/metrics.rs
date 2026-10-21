@@ -1,14 +1,14 @@
 //! Prometheus metrics for engine-reported scheduler statistics and finished
 //! requests.
 //!
-//! `Engine::new` runs a once-per-second task per engine core that asks the
+//! `Engine::new` runs a once-per-second task per scheduler that asks the
 //! core's `SchedulerStatsReporter` for a `SchedulerStats` snapshot and passes
 //! it to [`record_scheduler_stats`] under the core's data-parallel rank. The
 //! reporter already turns cumulative scheduler counters into per-interval
 //! increments; this module only maps fields onto the `SchedulerMetrics`
 //! families.
 //!
-//! [`RequestStats`] wraps the output stream of every request an engine core
+//! [`RequestStats`] wraps the output stream of every request a scheduler
 //! accepted and records the request once into the `RequestMetrics` families:
 //! its outcome, and its token usage when it finished.
 
@@ -330,7 +330,7 @@ pub(crate) fn record_scheduler_stats(
         .inc_by(stats.batch_count);
 }
 
-/// The output stream of one request an engine core accepted, recording the
+/// The output stream of one request a scheduler accepted, recording the
 /// request into the request metric families once.
 ///
 /// Every event passes through unchanged. The request is recorded when its

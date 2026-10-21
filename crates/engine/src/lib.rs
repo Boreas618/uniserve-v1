@@ -1,12 +1,12 @@
-//! In-process scheduling, storage management, worker execution, and request control.
+//! Scheduling, KV cache management, worker execution and request control.
 //!
-//! The crate sits between the HTTP frontend (`server`) and the
-//! worker processes. `EngineCore` (`core`) launches the worker
-//! processes, or takes a supplied executor, and runs the `Scheduler` on its
-//! owner thread. Frontends submit and control requests through a cloneable
-//! `EngineHandle` (`handle`) and receive each request's events on its
-//! `EventRx`. On the owner thread, the `Scheduler` (`scheduler`) admits
-//! requests, assigns cache pages (`prefix_cache`) and other worker storage (`storage`),
+//! The crate sits between the frontend (`server`) and the worker processes.
+//! A deployment runs one scheduler per DP rank: `SchedulerHandle` (`core`)
+//! launches the worker processes, or takes a supplied executor, and runs the
+//! `Scheduler` (`scheduler`) on a thread of its own. Frontends submit and
+//! control requests through the handle and receive each request's events on
+//! its `EventRx` (`handle`). On its thread, the `Scheduler` admits requests,
+//! assigns cache pages (`kv_cache`) and other worker storage (`allocation`),
 //! and submits calls through the `Executor` trait (`executor`);
 //! `WorkerExecutor` (`worker`) splits each batch into per-worker submissions
 //! to the worker processes.
@@ -36,7 +36,9 @@ mod sim;
 mod warmup;
 mod worker;
 
-pub use crate::core::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
+pub use crate::core::{
+    EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
+};
 pub use crate::deployment::Deployment;
 pub use crate::dtype::{ModelDtype, ModelDtypeParseError};
 pub use crate::executor::{
@@ -53,12 +55,12 @@ pub use crate::generation::{
     ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
 };
 pub use crate::handle::{
-    Command, CommandWaker, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
+    Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx, EventSendError, EventTx,
     StreamCancelCause, Submission, SubmitError, Wake,
 };
 pub use crate::request::{
-    ArtifactEvent, DiffusionRequest, DiffusionRequestError, EngineCoreOutput, FinishReason,
-    MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
+    ArtifactEvent, DiffusionRequest, DiffusionRequestError, Event, FinishReason, MediaKind,
+    PositionLogprobs, RejectionKind, Request, StopReason,
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{

@@ -1,7 +1,7 @@
 //! Requests and lifecycle events exchanged across the public engine boundary.
 //!
 //! The server submits each engine request as a [`Request`], a token generation
-//! or a video diffusion, and receives that request's [`EngineCoreOutput`]
+//! or a video diffusion, and receives that request's [`Event`]
 //! events in order. `Finished`, `Rejected`, and `Error`
 //! are terminal: the engine's `EventRx` marks the request finished when it
 //! receives one of them.
@@ -55,7 +55,7 @@ pub struct PositionLogprobs {
 
 /// Typed event stream the engine emits for each request, of either kind.
 #[derive(Debug, Clone)]
-pub enum EngineCoreOutput {
+pub enum Event {
     /// Reports scheduler admission timing.
     Scheduled {
         /// Time the request entered the queue, in seconds since the Unix epoch.

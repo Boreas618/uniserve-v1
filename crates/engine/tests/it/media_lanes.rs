@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use engine::{
-    BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
+    BatchEvent, BatchResult, CommandSender, ComponentConfig, ComponentDistribution, ExecutionBatch,
     Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PoolPlacement, RequestPlacement,
     SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerGroupId,
 };
-use engine::{DiffusionRequest, EngineCoreOutput, FinishReason, RejectionKind, Request};
+use engine::{DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
     ShapeBound,
@@ -346,7 +346,7 @@ struct Served {
     /// Every submitted media call with its placement, in submission order.
     calls: Vec<(Call, RequestPlacement)>,
     /// Every event each request's stream delivered.
-    outcomes: HashMap<RequestId, Vec<EngineCoreOutput>>,
+    outcomes: HashMap<RequestId, Vec<Event>>,
 }
 
 impl Served {
@@ -372,7 +372,7 @@ impl Served {
     fn assert_completed(&self, request: RequestId) {
         let events = &self.outcomes[&request];
         let artifact = events.iter().find_map(|event| match event {
-            EngineCoreOutput::Artifact(artifact) => Some(artifact),
+            Event::Artifact(artifact) => Some(artifact),
             _ => None,
         });
         let artifact = artifact
@@ -382,7 +382,7 @@ impl Served {
         assert!(
             matches!(
                 events.last(),
-                Some(EngineCoreOutput::Finished {
+                Some(Event::Finished {
                     reason: FinishReason::Completed,
                     ..
                 })
@@ -403,7 +403,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let scheduler =
         support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
+    let handle = CommandSender::new(tx);
     let mut stream = handle
         .submit(Request::Diffusion(DiffusionRequest {
             request_id: RequestId(90),
@@ -450,7 +450,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut events = Vec::new();
     while Instant::now() < deadline {
         if let Ok(event) = stream.try_recv() {
-            let finished = matches!(event, EngineCoreOutput::Finished { .. });
+            let finished = matches!(event, Event::Finished { .. });
             events.push(event);
             if finished {
                 break;
@@ -527,7 +527,7 @@ fn serve_through(
     )
     .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
+    let handle = CommandSender::new(tx);
 
     // Every request is queued before the loop starts, so one admission pass
     // sees them together, resident in submission order.
@@ -540,7 +540,7 @@ fn serve_through(
         .collect::<Vec<_>>();
     let engine_loop = thread::spawn(move || scheduler.run(rx));
 
-    let mut outcomes: HashMap<RequestId, Vec<EngineCoreOutput>> = HashMap::new();
+    let mut outcomes: HashMap<RequestId, Vec<Event>> = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut terminal = 0;
     while terminal < streams.len() && Instant::now() < deadline {
@@ -550,9 +550,7 @@ fn serve_through(
                 idle = false;
                 if matches!(
                     event,
-                    EngineCoreOutput::Finished { .. }
-                        | EngineCoreOutput::Rejected { .. }
-                        | EngineCoreOutput::Error { .. }
+                    Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. }
                 ) {
                     terminal += 1;
                 }
@@ -821,14 +819,14 @@ fn an_admitted_video_request_reports_scheduling_before_its_progress() {
     let events = &served.outcomes[&request];
     let scheduled = events
         .iter()
-        .position(|event| matches!(event, EngineCoreOutput::Scheduled { .. }))
+        .position(|event| matches!(event, Event::Scheduled { .. }))
         .unwrap_or_else(|| panic!("the request was never reported as scheduled: {events:?}"));
     let first_progress = events
         .iter()
-        .position(|event| matches!(event, EngineCoreOutput::MediaProgress { .. }))
+        .position(|event| matches!(event, Event::MediaProgress { .. }))
         .expect("the request reported progress");
     assert!(scheduled < first_progress, "{events:?}");
-    let EngineCoreOutput::Scheduled {
+    let Event::Scheduled {
         queued_at,
         scheduled_at,
     } = events[scheduled]
@@ -855,7 +853,7 @@ fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
     assert!(
         matches!(
             events.as_slice(),
-            [EngineCoreOutput::Rejected {
+            [Event::Rejected {
                 kind: RejectionKind::Overloaded,
                 ..
             }]
@@ -1141,7 +1139,7 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
     let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
     let rejected = |served: &Served, id: u64| match served.outcomes[&RequestId(id)].as_slice() {
         [
-            EngineCoreOutput::Rejected {
+            Event::Rejected {
                 kind: RejectionKind::Invalid,
                 message,
             },
@@ -1185,7 +1183,7 @@ fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
     let refused = served.outcomes[&RequestId(1)]
         .iter()
         .find_map(|event| match event {
-            EngineCoreOutput::Rejected { kind, message } => Some((*kind, message.clone())),
+            Event::Rejected { kind, message } => Some((*kind, message.clone())),
             _ => None,
         });
     assert_eq!(refused, Some((RejectionKind::Invalid, reason.to_owned())));
@@ -1257,7 +1255,7 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
 
     match served.outcomes[&RequestId(3)].as_slice() {
         [
-            EngineCoreOutput::Rejected {
+            Event::Rejected {
                 kind: RejectionKind::Invalid,
                 message,
             },

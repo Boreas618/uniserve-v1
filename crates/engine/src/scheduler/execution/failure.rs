@@ -78,7 +78,7 @@ impl Scheduler {
             } else if self.running.contains_key(&id) {
                 self.emit(
                     id,
-                    EngineCoreOutput::Error {
+                    Event::Error {
                         message: msg.to_string(),
                     },
                 );
@@ -222,7 +222,7 @@ impl Scheduler {
                 if !error_emitted {
                     self.emit(
                         id,
-                        EngineCoreOutput::Error {
+                        Event::Error {
                             message: loss.message.clone(),
                         },
                     );
@@ -304,7 +304,7 @@ impl Scheduler {
         self.fail_inflight_domain_credits();
         let _ = self.inflight.clear_failed_calls();
         while let Some(submission) = self.waiting_media.pop_front() {
-            let _ = submission.event_tx.send(EngineCoreOutput::Error {
+            let _ = submission.event_tx.send(Event::Error {
                 message: message.to_string(),
             });
         }
@@ -316,7 +316,7 @@ impl Scheduler {
         for id in ids {
             self.emit(
                 id,
-                EngineCoreOutput::Error {
+                Event::Error {
                     message: message.to_string(),
                 },
             );

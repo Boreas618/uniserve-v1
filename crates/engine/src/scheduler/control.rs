@@ -44,7 +44,7 @@ impl Scheduler {
         self.inflight.pending_submissions.clear();
 
         while let Some(submission) = self.waiting_media.pop_front() {
-            let _ = submission.event_tx.send(EngineCoreOutput::Finished {
+            let _ = submission.event_tx.send(Event::Finished {
                 reason: FinishReason::Aborted,
                 stop_reason: None,
                 prompt_tokens: submission.request.prompt_token_ids.len(),
@@ -61,7 +61,7 @@ impl Scheduler {
             let mut ids = Vec::new();
             while let Some(st) = self.waiting.pop_front() {
                 ids.push(st.req.request_id);
-                let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
+                let _ = st.output.events.event_tx.send(Event::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
                     prompt_tokens: st.req.prompt_token_ids.len(),
@@ -153,7 +153,7 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
-            let _ = submission.event_tx.send(EngineCoreOutput::Finished {
+            let _ = submission.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: submission.request.prompt_token_ids.len(),
@@ -196,7 +196,7 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
-            let _ = st.output.events.event_tx.send(EngineCoreOutput::Finished {
+            let _ = st.output.events.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: st.req.prompt_token_ids.len(),

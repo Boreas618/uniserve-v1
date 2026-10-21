@@ -3,7 +3,7 @@
 //!
 //! These tests launch real worker processes (`uniserve worker` with the
 //! weightless stub model on CPU) and drive them through the engine's
-//! `WorkerGroup`, `WorkerExecutor` or `EngineCore`, or through a raw
+//! `WorkerGroup`, `WorkerExecutor` or `SchedulerHandle`, or through a raw
 //! `Channel` when the worker's own protocol handling is under test.
 //! Lifecycle batches (Start, Finish, Free) exercise registration, startup,
 //! Info, admission, retirement, close and signals; token batches run the
@@ -34,10 +34,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use engine::{
-    CallReaders, EngineConfig, EngineCore, Executor, RankBuffer, WorkerFailure, WorkerGroup,
+    CallReaders, EngineConfig, Executor, RankBuffer, SchedulerHandle, WorkerFailure, WorkerGroup,
     WorkerGroupConfig, WorkerProcessArgs,
 };
-use engine::{DiffusionRequest, EngineCoreOutput, Request};
+use engine::{DiffusionRequest, Event, Request};
 use ipc::{
     Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call,
     CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode, ForwardBatch, ForwardMode,
@@ -53,7 +53,7 @@ const STUB_IMAGE_START: u32 = 151_670;
 /// The stub model's token whose forward on a CPU rank never returns
 /// (`uniserve.models.stub.STUB_STALL_TOKEN_ID`).
 const STUB_STALL: u32 = 151_669;
-/// Held across `EngineCore::new` in
+/// Held across `SchedulerHandle::start_all` in
 /// `unsupported_media_is_rejected_without_stopping_the_engine` and across the
 /// rank-group launch in `a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails`,
 /// so those two launches never overlap. Other tests launch without taking it.
@@ -1857,7 +1857,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     )];
     config.worker_process = worker_group_args();
     config.worker_process.executable = wrapper.clone();
-    let engine = EngineCore::new(config)?;
+    let engine = SchedulerHandle::start_all(config)?.remove(0);
 
     // Removing the launch executable makes recovery fail at the same OS
     // boundary as a missing deployment prerequisite, without changing IPC.
@@ -1914,7 +1914,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
     )];
     config.worker_process = worker_group_args();
     config.worker_process.executable = wrapper;
-    let engine = EngineCore::new(config)?;
+    let engine = SchedulerHandle::start_all(config)?.remove(0);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
@@ -1960,14 +1960,13 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
                     .context("the request did not finish after the relaunch")?
                     .context("the request's events ended without a terminal event")?;
                 match event {
-                    EngineCoreOutput::Finished {
+                    Event::Finished {
                         completion_tokens, ..
                     } => {
                         anyhow::ensure!(completion_tokens == 2, "{completion_tokens} tokens");
                         return Ok(());
                     }
-                    EngineCoreOutput::Rejected { message, .. }
-                    | EngineCoreOutput::Error { message } => {
+                    Event::Rejected { message, .. } | Event::Error { message } => {
                         anyhow::bail!("the request failed: {message}")
                     }
                     _ => {}
@@ -2040,7 +2039,7 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
-        EngineCore::new(config)?
+        SchedulerHandle::start_all(config)?.remove(0)
     };
     let request_rows = engine.info().request_slots as usize;
     engine.shutdown();
@@ -2076,7 +2075,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         let _launch_guard = CHILD_LAUNCH_ENV_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
-        EngineCore::new(config)?
+        SchedulerHandle::start_all(config)?.remove(0)
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -2117,7 +2116,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 anyhow::anyhow!("media event stream closed for request {request_id:?}")
             })?;
             assert!(
-                matches!(event, EngineCoreOutput::Rejected { .. }),
+                matches!(event, Event::Rejected { .. }),
                 "unsupported request {request_id:?} was not rejected: {event:?}"
             );
         }

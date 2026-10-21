@@ -34,8 +34,8 @@ fn terminal_event(
     state: &RequestState,
     reason: FinishReason,
     stop_reason: Option<crate::StopReason>,
-) -> EngineCoreOutput {
-    EngineCoreOutput::Finished {
+) -> Event {
+    Event::Finished {
         reason,
         stop_reason,
         prompt_tokens: state.req.prompt_token_ids.len(),
@@ -49,7 +49,7 @@ fn terminal_event(
 /// Returns `true` only when the receiver has closed, in which case the journal
 /// is discarded. Returns `false` when the journal drained completely or when
 /// the channel filled again, leaving the remainder journaled.
-fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOutput>) -> bool {
+fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<Event>) -> bool {
     while let Some(event) = journal.pop_front() {
         match event_tx.send(event) {
             Ok(()) => {}
@@ -66,7 +66,7 @@ fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<EngineCoreOut
     false
 }
 
-/// EngineCoreOutput journal and usage counters for one request.
+/// Event journal and usage counters for one request.
 pub(super) struct RequestOutput {
     pub(super) events: EventJournal,
     /// `TextToken` events accepted into the ordered output.
@@ -108,7 +108,7 @@ impl RequestOutput {
 /// every in-flight call and the next one, plus a terminal reserve.
 pub(super) struct EventJournal {
     pub(super) event_tx: EventTx,
-    journal: VecDeque<EngineCoreOutput>,
+    journal: VecDeque<Event>,
 }
 
 impl EventJournal {
@@ -141,7 +141,7 @@ impl EventJournal {
     ///
     /// Returns `true` when the event was delivered, journaled, or coalesced, and
     /// `false` when the receiver has closed and the event was dropped.
-    pub(super) fn enqueue(&mut self, event: EngineCoreOutput) -> bool {
+    pub(super) fn enqueue(&mut self, event: Event) -> bool {
         if self.flush() {
             return false;
         }
@@ -149,8 +149,8 @@ impl EventJournal {
         // A journaled progress event that has not been delivered is superseded
         // by the newer one; coalescing only replaces the journal tail, so no
         // other event loses its place.
-        if matches!(event, EngineCoreOutput::MediaProgress { .. })
-            && let Some(last @ EngineCoreOutput::MediaProgress { .. }) = self.journal.back_mut()
+        if matches!(event, Event::MediaProgress { .. })
+            && let Some(last @ Event::MediaProgress { .. }) = self.journal.back_mut()
         {
             *last = event;
             return true;
@@ -672,7 +672,7 @@ impl Scheduler {
                     );
                     return self.finish(id, FinishReason::Error);
                 }
-                self.emit(id, EngineCoreOutput::Readout { candidate_logprobs });
+                self.emit(id, Event::Readout { candidate_logprobs });
                 self.finish(id, FinishReason::Completed);
             }
             CallKind::Media(MediaCall::Denoising) => {
@@ -703,7 +703,7 @@ impl Scheduler {
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
-                        EngineCoreOutput::ImageBegin {
+                        Event::ImageBegin {
                             image_id,
                             height: h,
                             width: w,
@@ -713,7 +713,7 @@ impl Scheduler {
                 }
 
                 for step in prev_sd.saturating_add(1)..=sd {
-                    self.emit(id, EngineCoreOutput::ImageStep { image_id, step });
+                    self.emit(id, Event::ImageStep { image_id, step });
                 }
 
                 // The host planner enters commit after the configured step count;
@@ -729,7 +729,7 @@ impl Scheduler {
             CallKind::Media(MediaCall::ImageDecoding) => {
                 // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self.running.get(&id).map_or(0, |st| st.image_id);
-                self.emit(id, EngineCoreOutput::ImageCommit { image_id });
+                self.emit(id, Event::ImageCommit { image_id });
 
                 let image = media
                     .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
@@ -957,7 +957,7 @@ impl Scheduler {
         }
         self.emit(
             id,
-            EngineCoreOutput::PromptLogprobs {
+            Event::PromptLogprobs {
                 positions: selected
                     .into_iter()
                     .map(|entries| PositionLogprobs { entries })
@@ -1114,7 +1114,7 @@ impl Scheduler {
     ///
     /// Returns `false` for a request that is not running. A closed receiver
     /// also returns `false` and marks the request for cancellation.
-    pub(super) fn emit(&mut self, id: RequestId, event: EngineCoreOutput) -> bool {
+    pub(super) fn emit(&mut self, id: RequestId, event: Event) -> bool {
         // A request whose terminal event is published publishes nothing more.
         if self
             .inflight
@@ -1148,7 +1148,7 @@ impl Scheduler {
         if !st.req.emits_text() {
             return false;
         }
-        let published = self.emit(id, EngineCoreOutput::TextToken { id: tok, logprob });
+        let published = self.emit(id, Event::TextToken { id: tok, logprob });
         if published && let Some(state) = self.running.get_mut(&id) {
             state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
         }
@@ -1169,7 +1169,7 @@ impl Scheduler {
             return;
         }
         let count = tokens.len();
-        let published = self.emit(id, EngineCoreOutput::TextTokens { ids: tokens });
+        let published = self.emit(id, Event::TextTokens { ids: tokens });
         if published && let Some(state) = self.running.get_mut(&id) {
             state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
         }
@@ -1259,7 +1259,7 @@ impl Scheduler {
         {
             self.emit(
                 id,
-                EngineCoreOutput::TokenLogprobs {
+                Event::TokenLogprobs {
                     id: tok,
                     candidates: top_logprobs,
                 },
@@ -1409,7 +1409,7 @@ impl Scheduler {
         };
         if state.failure.is_none() {
             state.failure = Some(cause.clone());
-            self.emit(id, EngineCoreOutput::Error { message: cause });
+            self.emit(id, Event::Error { message: cause });
         }
         self.finish_after_inflight(id, FinishReason::Error, None);
     }

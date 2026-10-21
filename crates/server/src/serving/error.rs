@@ -83,7 +83,7 @@ pub enum ServeError {
         /// Maximum token count declared by the profile.
         max_tokens: u32,
     },
-    /// No live engine core accepts the request.
+    /// No live scheduler accepts the request.
     #[error(transparent)]
     Submit(#[from] engine::SubmitError),
     /// An input image reference cannot be fetched or decoded.

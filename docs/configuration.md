@@ -1,6 +1,6 @@
 # Configuration
 
-A UniServe server is configured by one tree of serving options and, for a placement other than one tensor-parallel worker group per engine core, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure.
+A UniServe server is configured by one tree of serving options and, for a placement other than one tensor-parallel worker group per scheduler, a deployment file. The tree's top level holds the options most deployments state; the rest sit in `*_config` tables, one per part of the system they configure.
 
 ## Command line
 
@@ -88,8 +88,8 @@ retention = "30m"
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
 | `mem_fraction_static` | `0.7` | Each rank's share of its device's memory for weights, static allocations and the KV cache, in (0, 1]; a deployment group's `mem_fraction_static` overrides it |
-| `tensor_parallel_size` | `1` | Tensor-parallel workers of each engine core's group without `worker_groups` |
-| `data_parallel_size` | `1` | Engine cores, each with its own scheduler, KV cache and worker groups; requests go to the engine core with the fewest in flight. With `worker_groups`, the file's model groups form the engine cores as equal consecutive blocks |
+| `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
+| `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups; requests go to the scheduler with the fewest in flight. With `worker_groups`, the file's model groups form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
 | `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks placed on this host, and a deployment rank entry without a host names it |
 | `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
@@ -155,7 +155,7 @@ retention = "30m"
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `expert_parallel` | `false` | Shard routed experts across the engine cores or the deployment's expert workers |
+| `expert_parallel` | `false` | Shard routed experts across the schedulers or the deployment's expert workers |
 | `exchange` | `"alltoall"` | `alltoall`, `megamoe`, `deepep` or `dwdp` |
 | `microbatches` | `1` | Microbatches overlapping attention with dedicated expert workers |
 

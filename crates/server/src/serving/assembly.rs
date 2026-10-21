@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use asynk_strim_attr::{TryYielder, try_stream};
-use engine::EngineCoreOutput;
+use engine::Event;
 use engine::EventRx;
 use futures::{StreamExt as _, pin_mut};
 
@@ -253,7 +253,7 @@ pub(super) async fn media_output(
     let mut clock = StreamClock::new(started, compile_us);
     while let Some(event) = events.next().await {
         let output = match event {
-            EngineCoreOutput::Scheduled {
+            Event::Scheduled {
                 queued_at,
                 scheduled_at,
             } => {
@@ -263,18 +263,18 @@ pub(super) async fn media_output(
                     scheduled_at,
                 }
             }
-            EngineCoreOutput::MediaProgress {
+            Event::MediaProgress {
                 phase,
                 completed_steps,
             } => RequestOutput::MediaProgress {
                 phase,
                 completed_steps,
             },
-            EngineCoreOutput::Artifact(artifact) => {
+            Event::Artifact(artifact) => {
                 clock.visible();
                 RequestOutput::Artifact(artifact)
             }
-            EngineCoreOutput::Finished {
+            Event::Finished {
                 reason,
                 stop_reason,
                 ..
@@ -295,12 +295,11 @@ pub(super) async fn media_output(
                 y.yield_ok(terminal).await;
                 return Ok(());
             }
-            EngineCoreOutput::Rejected { kind, message } => {
+            Event::Rejected { kind, message } => {
                 y.yield_ok(RequestOutput::Rejected { kind, message }).await;
                 return Ok(());
             }
-            EngineCoreOutput::Error { message }
-            | EngineCoreOutput::ArtifactUnavailable { message } => {
+            Event::Error { message } | Event::ArtifactUnavailable { message } => {
                 y.yield_ok(RequestOutput::Failed { message }).await;
                 return Ok(());
             }

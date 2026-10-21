@@ -9,7 +9,7 @@
 //! - `scheduler`: the server engine's scheduler-stats export tasks
 //!   (`record_scheduler_stats`), from periodic `SchedulerStats` snapshots.
 //! - `request`: the server engine's `RequestStats`, once for each request an
-//!   engine core accepted, when the request ends; the server's `StatsLogger`
+//!   scheduler accepted, when the request ends; the server's `StatsLogger`
 //!   reads its prompt and generation token counters.
 //!
 //! Every metric field is a `prometheus-client` handle whose clones share their

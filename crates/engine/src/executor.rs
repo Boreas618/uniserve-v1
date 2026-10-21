@@ -919,10 +919,10 @@ impl TransferConfig {
         (backends, exports)
     }
 
-    /// Returns the acknowledgment slot of one rank across the engine core's groups.
+    /// Returns the acknowledgment slot of one rank across the scheduler's groups.
     ///
     /// Each published chunk or segment carries one acknowledgment word per
-    /// rank of the engine core's groups. A consumer claims the word at its own slot when it
+    /// rank of the scheduler's groups. A consumer claims the word at its own slot when it
     /// begins reading and acknowledges it once its reads are done, so the
     /// producer can tell a consumer still reading from one that has finished
     /// or never began. Slots are dense across the groups. A worker group absent

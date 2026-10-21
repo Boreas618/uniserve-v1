@@ -21,7 +21,7 @@ These are binary event tasks. Baseline prompts have median length 301 tokens, an
 
 ## Generated text
 
-UniServe `e9d37456` generated one response per task with four engine cores, concurrency 64, thinking enabled, seed 42, the full 256-token canvas and default denoising settings. The completion limit is 8,192 tokens including thinking; the context limit is 32,768. Each dataset and precision starts a fresh server. Scoring uses the returned final-answer channel; empty final answers count incorrect and remain in the denominator. All eight points completed, yielding 6,096 terminal HTTP responses.
+UniServe `e9d37456` generated one response per task with four schedulers, concurrency 64, thinking enabled, seed 42, the full 256-token canvas and default denoising settings. The completion limit is 8,192 tokens including thinking; the context limit is 32,768. Each dataset and precision starts a fresh server. Scoring uses the returned final-answer channel; empty final answers count incorrect and remain in the denominator. All eight points completed, yielding 6,096 terminal HTTP responses.
 
 GSM8K, HumanEval and IFEval use their complete test cohorts. MMLU-Pro uses a fixed 1,024-question sample drawn uniformly without replacement with Python seed 42 from question-ID-sorted test rows, with the official five validation demonstrations per category. GSM8K is zero-shot. HumanEval requests complete Python source and applies the official checker without repairing generated code. IFEval prompts and checks are unchanged.
 

@@ -168,7 +168,7 @@ pub struct TensorRecord {
 
 /// What the pages of one page pool are: every worker of a host's NUMA node
 /// whose pages have this shape shares the pool, whatever its deployment,
-/// worker group or engine core, so an identical page is stored once.
+/// worker group or scheduler, so an identical page is stored once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageShape {
     /// The digest of what determines a page's encoding, computed by the

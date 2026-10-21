@@ -1,12 +1,12 @@
 //! UniServe HTTP frontend, model profiles, request lowering, and output assembly.
 //!
 //! The crate serves one option tree (`options::ServeConfig`). [`Engine`] is
-//! the serving engine: it loads the model, starts one engine core per
+//! the serving engine: it loads the model, starts one scheduler per
 //! data-parallel rank, and turns each request into a stream of public events
 //! through the model's input processing and output assembly (`serving`). The
 //! HTTP layer (`http`) exposes OpenAI-compatible routes over it.
 
-/// The serving engine over the in-process engine cores.
+/// The serving engine over the in-process schedulers.
 pub mod frontend;
 /// The HTTP server: router assembly, the listener, and graceful shutdown.
 pub mod http;

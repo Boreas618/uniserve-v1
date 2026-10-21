@@ -1,22 +1,22 @@
-//! The serving engine: one model's input processing, its engine cores, and
+//! The serving engine: one model's input processing, its schedulers, and
 //! the output processing of every request.
 //!
-//! An [`Engine`] owns the model's [`InputProcessor`] and its
-//! [`EngineCore`]s, one per data-parallel copy of scheduling, as vLLM's
-//! `AsyncLLM` owns its input and output processors over its engine cores and
-//! SGLang's `Engine` its tokenizer manager over one scheduler per
-//! data-parallel rank. Every request takes one path:
+//! An [`Engine`] owns the model's [`InputProcessor`] and its schedulers
+//! ([`SchedulerHandle`]), one per DP rank, as vLLM's `AsyncLLM` owns its
+//! input and output processors over its engine cores and SGLang's `Engine`
+//! its tokenizer manager over one scheduler per data-parallel rank. Every
+//! request takes one path:
 //!
 //! 1. its images are fetched on the async runtime and its prompt rendered and
 //!    tokenized on the blocking pool ([`InputProcessor`]);
 //! 2. [`Engine::submit`] hands the tokenized request to the least loaded live
-//!    engine core, which returns the request's [`EventRx`];
+//!    scheduler, which returns the request's [`EventRx`];
 //! 3. the events are assembled into public [`RequestOutput`] events
 //!    ([`serving::generation_output`], [`serving::media_output`]) and wrapped
 //!    in [`RequestStats`], which records the request's metrics once.
 //!
 //! Dropping the returned stream drops its `EventRx`, which cancels the
-//! request in its engine core; that is the only cancellation path.
+//! request in its scheduler; that is the only cancellation path.
 //!
 //! [`RequestOutput`]: crate::serving::RequestOutput
 
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Context as _;
-use engine::{EngineCore, EventRx, SubmitError, VideoDenoiserInfo};
+use engine::{EventRx, SchedulerHandle, SubmitError, VideoDenoiserInfo};
 use engine::{GenerationLimits, Request};
 use observability::{EngineLabels, METRICS};
 use tokio_util::task::AbortOnDropHandle;
@@ -46,7 +46,7 @@ use crate::serving::{
 use log_stats::StatsLogger;
 pub(crate) use metrics::RequestStats;
 
-/// One model served over its engine cores.
+/// One model served over its schedulers.
 ///
 /// Construction spawns Tokio tasks, so every constructor must be called
 /// within a Tokio runtime.
@@ -54,11 +54,11 @@ pub struct Engine {
     /// The single model name the API serves.
     served_model_name: String,
     processor: Arc<InputProcessor>,
-    /// The engine cores; every engine core serves the same model with the
+    /// The schedulers; every scheduler serves the same model with the
     /// same limits.
     cores: Box<[Core]>,
-    /// The engine core a load scan starts from, advanced by every pick so
-    /// that equal loads rotate across the engine cores.
+    /// The scheduler a load scan starts from, advanced by every pick so
+    /// that equal loads rotate across the schedulers.
     next_core: AtomicUsize,
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
@@ -87,18 +87,18 @@ pub enum Task {
     Readout,
 }
 
-/// One engine core and the requests in flight on it.
+/// One scheduler and the requests in flight on it.
 struct Core {
-    /// The engine core's index, the `engine` label of its metrics.
+    /// The scheduler's index, the `engine` label of its metrics.
     index: u32,
-    engine: Arc<EngineCore>,
-    /// Requests submitted to this engine core whose event stream has not
+    engine: Arc<SchedulerHandle>,
+    /// Requests submitted to this scheduler whose event stream has not
     /// ended.
     in_flight: Arc<AtomicUsize>,
 }
 
 impl Engine {
-    /// Loads the configured model and starts its engine cores and worker
+    /// Loads the configured model and starts its schedulers and worker
     /// processes.
     ///
     /// `config` must have passed [`ServeConfig::validate`]; `stated` holds the
@@ -112,7 +112,7 @@ impl Engine {
     /// Fails when the model assets cannot be resolved, when an option of
     /// another model family was stated ([`Stated::refuse_foreign_options`]),
     /// when the options do not derive an engine configuration
-    /// ([`ServeConfig::engine_config`]), when the engine cores fail to start,
+    /// ([`ServeConfig::engine_config`]), when the schedulers fail to start,
     /// or when the model cannot be bound to the capabilities its workers
     /// report.
     pub async fn start(
@@ -178,11 +178,11 @@ impl Engine {
             block_size = ?engine_config.worker_process.block_size,
             "starting UniServe Rust engine"
         );
-        let cores = tokio::task::spawn_blocking(move || EngineCore::start_all(engine_config))
+        let cores = tokio::task::spawn_blocking(move || SchedulerHandle::start_all(engine_config))
             .await
             .context("the engine startup task did not complete")?
             .context("failed to start the UniServe engine")?;
-        let first = cores.first().context("the engine started no engine core")?;
+        let first = cores.first().context("the engine started no scheduler")?;
 
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
@@ -276,7 +276,7 @@ impl Engine {
     }
 
     /// Serves `processor`'s model under `served_model_name` over started
-    /// engine cores.
+    /// schedulers.
     ///
     /// `images` resolves the image references of every request, and
     /// `readout` serves `POST /v1/systemone` for a model that has one. One
@@ -287,10 +287,10 @@ impl Engine {
     ///
     /// Fails when there is no core, or when the cores report different
     /// generation limits: a request is prepared once against them and may
-    /// land on any engine core.
+    /// land on any scheduler.
     pub fn new(
         served_model_name: String,
-        cores: Vec<EngineCore>,
+        cores: Vec<SchedulerHandle>,
         processor: InputProcessor,
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
@@ -298,11 +298,11 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let limits = cores
             .first()
-            .context("an engine needs at least one engine core")?
+            .context("an engine needs at least one scheduler")?
             .generation_limits();
         anyhow::ensure!(
             cores.iter().all(|core| core.generation_limits() == limits),
-            "engine cores report different generation limits"
+            "schedulers report different generation limits"
         );
 
         let cores: Box<[Core]> = (0u32..)
@@ -367,7 +367,7 @@ impl Engine {
         &self.served_model_name
     }
 
-    /// The generation limits every engine core serves.
+    /// The generation limits every scheduler serves.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.cores[0].engine.generation_limits()
     }
@@ -399,8 +399,8 @@ impl Engine {
         tasks
     }
 
-    /// Whether the engine can accept requests: whether any engine core is
-    /// alive. Requests go only to live engine cores.
+    /// Whether the engine can accept requests: whether any scheduler is
+    /// alive. Requests go only to live schedulers.
     pub fn is_healthy(&self) -> bool {
         self.cores.iter().any(|core| !core.engine.is_dead())
     }
@@ -425,7 +425,7 @@ impl Engine {
     /// # Errors
     ///
     /// Fails when an image cannot be fetched, preprocessing refuses the
-    /// request, or no engine core accepts it.
+    /// request, or no scheduler accepts it.
     pub async fn generate(
         &self,
         request: GenerateRequest,
@@ -468,7 +468,7 @@ impl Engine {
     /// # Errors
     ///
     /// Fails when the model serves no video, the video service refuses the
-    /// request, or no engine core accepts it.
+    /// request, or no scheduler accepts it.
     pub async fn generate_video(
         &self,
         request_id: String,
@@ -497,7 +497,7 @@ impl Engine {
         Ok((processed, self.stats(request_id, started, core, output)))
     }
 
-    /// Records `output`'s request metrics under the engine core that serves
+    /// Records `output`'s request metrics under the scheduler that serves
     /// it.
     fn stats(
         &self,
@@ -514,9 +514,9 @@ impl Engine {
         Box::pin(RequestStats::new(output, labels, started, log))
     }
 
-    /// Submits one tokenized request to the least loaded live engine core.
+    /// Submits one tokenized request to the least loaded live scheduler.
     ///
-    /// Returns the request's event stream and the index of the engine core
+    /// Returns the request's event stream and the index of the scheduler
     /// that serves it. The engine request identifier comes from the first
     /// core's allocator alone, so identifiers are unique across the engine
     /// cores. Dropping the stream before its terminal event cancels the
@@ -546,10 +546,10 @@ impl Engine {
         Ok((events, core.index))
     }
 
-    /// The live engine core with the fewest requests in flight.
+    /// The live scheduler with the fewest requests in flight.
     ///
-    /// The scan starts one engine core later after every pick, so equal
-    /// loads rotate across the engine cores. This is SGLang's `total_requests` data-parallel
+    /// The scan starts one scheduler later after every pick, so equal
+    /// loads rotate across the schedulers. This is SGLang's `total_requests` data-parallel
     /// balancing (the argmin of running plus waiting requests,
     /// `data_parallel_controller.py`) and vLLM's data-parallel client score
     /// with equal waiting and running weights and a rotating start
@@ -565,7 +565,7 @@ impl Engine {
             .min_by_key(|core| core.in_flight.load(Ordering::Relaxed))
     }
 
-    /// Shuts every engine core down and waits until their scheduler threads
+    /// Shuts every scheduler down and waits until their scheduler threads
     /// have exited.
     ///
     /// Each scheduler finishes its outstanding requests as aborted and closes
@@ -654,10 +654,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use engine::{EngineConfig, EngineCore, Executor, SimEngine, SimExecutor};
-    use engine::{
-        EngineCoreOutput, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
-    };
+    use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
+    use engine::{Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request};
     use futures::{StreamExt as _, poll};
     use ipc::{ImageParams, SamplingParams};
     use observability::METRICS;
@@ -671,10 +669,10 @@ mod tests {
     use crate::serving::{FinishReason, GenerateRequest, RequestOutput};
     use crate::test_support::{SERVED_MODEL, sim_core, sim_engine_over};
 
-    /// A Qwen3 engine over one engine core, named `engine_model`, that drives
+    /// A Qwen3 engine over one scheduler, named `engine_model`, that drives
     /// `worker`.
     ///
-    /// The engine core's model name labels the process-wide request metrics,
+    /// The scheduler's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
     fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Engine {
         let core = sim_core(EngineConfig::sim(engine_model), worker);
@@ -744,8 +742,8 @@ mod tests {
         .into()
     }
 
-    /// Two requests in flight together land on different engine cores, each
-    /// served entirely by its own engine core.
+    /// Two requests in flight together land on different schedulers, each
+    /// served entirely by its own scheduler.
     #[tokio::test]
     async fn concurrent_requests_spread_over_engine_cores() {
         let mut cores = Vec::new();
@@ -754,8 +752,8 @@ mod tests {
             let mut executor = SimExecutor::new(SimEngine::new());
             observers.push(executor.observe());
             cores.push(
-                EngineCore::with_executor(EngineConfig::sim("sim-model"), Box::new(executor))
-                    .expect("start a sim engine core"),
+                SchedulerHandle::with_executor(EngineConfig::sim("sim-model"), Box::new(executor))
+                    .expect("start a sim scheduler"),
             );
         }
         let engine = sim_engine_over(ModelParameters::Qwen3, cores);
@@ -772,7 +770,7 @@ mod tests {
         assert_ne!(serving[0], serving[1]);
         for stream in &mut streams {
             while let Some(event) = stream.next().await {
-                if let EngineCoreOutput::Finished { reason, .. } = event {
+                if let Event::Finished { reason, .. } = event {
                     assert_eq!(reason, engine::FinishReason::Eos);
                     break;
                 }
@@ -853,7 +851,7 @@ mod tests {
     async fn shutdown_leaves_the_runtime_free_during_executor_teardown() {
         let (release_tx, release) = std::sync::mpsc::channel();
         let released = Arc::new(AtomicBool::new(false));
-        let core = EngineCore::with_executor(
+        let core = SchedulerHandle::with_executor(
             EngineConfig::sim("sim-model"),
             Box::new(GatedCloseExecutor {
                 inner: SimExecutor::new(SimEngine::new()),
@@ -861,7 +859,7 @@ mod tests {
                 released: Arc::clone(&released),
             }),
         )
-        .expect("start a sim engine core");
+        .expect("start a sim scheduler");
         let engine = sim_engine_over(ModelParameters::Qwen3, vec![core]);
 
         let releaser = tokio::spawn(async move {
@@ -989,7 +987,7 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    /// Each request is recorded under the engine core that served it.
+    /// Each request is recorded under the scheduler that served it.
     #[tokio::test]
     async fn request_metrics_name_the_engine_core_that_served_each_request() {
         let engine_model = "core-metrics-model";

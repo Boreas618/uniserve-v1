@@ -85,7 +85,7 @@ use crate::allocation::{
 use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
 use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crate::{
-    ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
+    ArtifactEvent, DiffusionRequest, Event, FinishReason, GenerationRequest,
     GenerationRequestError, MediaKind, PositionLogprobs, Request,
 };
 use crate::{RejectionKind, encoder_cache_key};
@@ -146,9 +146,9 @@ const PREFILL_WINDOW_CREDITS: usize = 2;
 ///
 /// Reads the dimensions and size through `png_artifact_info`; returns `None`
 /// when the payload has no PNG header with nonzero dimensions.
-fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<EngineCoreOutput> {
+fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<Event> {
     let metadata = png_artifact_info(&pixels_png_b64)?;
-    Some(EngineCoreOutput::ImageDone {
+    Some(Event::ImageDone {
         image_id,
         height: metadata.height,
         width: metadata.width,

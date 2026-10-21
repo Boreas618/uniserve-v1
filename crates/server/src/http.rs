@@ -296,7 +296,7 @@ pub(crate) fn router(
         }))
 }
 
-/// Answers `200 OK` while any engine core is alive (`Engine::is_healthy`),
+/// Answers `200 OK` while any scheduler is alive (`Engine::is_healthy`),
 /// then `503 Service Unavailable`.
 async fn health(State(engine): State<Arc<Engine>>) -> StatusCode {
     if engine.is_healthy() {
