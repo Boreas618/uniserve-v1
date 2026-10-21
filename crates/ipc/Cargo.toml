@@ -10,6 +10,7 @@ ignored = ["serde_bytes"]
 
 [dependencies]
 libc.workspace = true
+proto.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
@@ -18,10 +19,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-# The build script digests the workspace sources into the build version.
-[build-dependencies]
-sha2.workspace = true
 
 [lints]
 workspace = true

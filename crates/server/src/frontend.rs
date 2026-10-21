@@ -30,6 +30,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use engine::{EventRx, SchedulerHandle, SubmitError};
 use engine::{GenerationLimits, Request};
+use futures::StreamExt as _;
 use observability::{EngineLabels, METRICS};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::info;
@@ -487,7 +488,7 @@ impl Engine {
                     request_id: request_id.clone(),
                     feature: "video_generation",
                 })?;
-        let (request, processed) = video
+        let (request, processed, media) = video
             .process(&request_id, &request, self.processor.config().max_model_len)
             .await?;
         let prompt_tokens = request.prompt_token_ids.len();
@@ -499,6 +500,11 @@ impl Engine {
             prompt_tokens,
             events,
         );
+        // The workers read the condition media while the request runs, which
+        // ends with its event stream.
+        let output: RequestOutputStream = Box::pin(output.inspect(move |_| {
+            let _ = &media;
+        }));
         Ok((processed, self.stats(request_id, started, core, output)))
     }
 

@@ -10,7 +10,6 @@ use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
     ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use ipc::MediaCall;
 use serde::{Deserialize, Serialize};
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -162,12 +161,12 @@ impl BagelProfile {
         };
         let image_encoders = vec![
             ImageEncoderInput {
-                encoder: MediaCall::LatentEncoding,
+                encoder: engine::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             },
             ImageEncoderInput {
-                encoder: MediaCall::VisionEncoding,
+                encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             },
@@ -184,7 +183,7 @@ impl BagelProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: MediaCall::LatentEncoding,
+                encoder: engine::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }],
@@ -336,12 +335,12 @@ impl OmniProfile for BagelProfile {
         )?;
         Ok(vec![
             ImageEncoderInput {
-                encoder: MediaCall::LatentEncoding,
+                encoder: engine::ImageEncoder::Latent,
                 num_cache_tokens: Some(vae_tokens),
                 max_cache_tokens: None,
             },
             ImageEncoderInput {
-                encoder: MediaCall::VisionEncoding,
+                encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: Some(vit_tokens),
                 max_cache_tokens: None,
             },
@@ -370,7 +369,7 @@ impl OmniProfile for BagelProfile {
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != MediaCall::LatentEncoding
+            || policy.feedback_encoders[0].encoder != engine::ImageEncoder::Latent
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

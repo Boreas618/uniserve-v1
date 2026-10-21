@@ -6,12 +6,15 @@ license.workspace = true
 publish = false
 
 # The interfaces that cross builds: the process interface between daemons and
-# engine processes, as Protobuf schemas compiled at build time, and their
-# framing. Every process that speaks them depends on this crate alone among
-# the workspace's.
+# engine processes and the request interface between the leader daemon and an
+# engine process, as Protobuf schemas compiled at build time, their framing,
+# and the request vocabulary both ends work with.
 [dependencies]
+bitflags.workspace = true
+fnv.workspace = true
 libc.workspace = true
 prost.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]

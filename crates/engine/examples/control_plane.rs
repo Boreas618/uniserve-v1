@@ -18,7 +18,7 @@ use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use ipc::{ImageParams, MediaCall, RequestId, SamplingParams};
+use ipc::{ImageParams, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
             feedback_next_token: FeedbackNextToken::EndOfImage,
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: MediaCall::VisionEncoding,
+                encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }],

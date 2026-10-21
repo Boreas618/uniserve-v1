@@ -98,13 +98,11 @@ mod call;
 mod command;
 mod config;
 mod identity;
-mod image;
 mod info;
 mod media;
 mod output;
 mod parallel;
 mod request;
-mod sampling;
 mod shared_memory;
 mod stats;
 mod tensor;
@@ -116,16 +114,20 @@ pub use call::*;
 pub use command::*;
 pub use config::{LaneConfig, LaneConfigError, LaneSpec};
 pub use identity::*;
-pub use image::*;
 pub use info::*;
 pub use media::{MediaLocator, MediaSource, SharedMedia, SharedMediaError};
+// The request values the engine carries on to its ranks are the request
+// vocabulary's own.
 pub use output::*;
 pub use parallel::{
     ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
     ParallelConfigError, SequenceParallel,
 };
+pub use proto::request::{
+    CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams, ImageParamsError,
+    RequestId, SamplingParams, SamplingParamsError, TokenLogprob,
+};
 pub use request::*;
-pub use sampling::*;
 pub use shared_memory::SharedMemory;
 pub use stats::ForwardStats;
 pub use tensor::*;

@@ -7,6 +7,8 @@
 //!
 //! - [`process`]: how daemons and engine processes start, stop and supervise
 //!   the processes of a deployment.
+//! - [`request`]: what the leader daemon submits to an engine process and the
+//!   events it receives back, as the Rust values both ends work with.
 //!
 //! Each connection opens with a hello exchange that compares
 //! [`PROTOCOL_MAJOR`]; a peer never sends a field the other's
@@ -14,6 +16,7 @@
 //! one frame each, over a Unix socket on one node or TCP between nodes.
 
 mod connection;
+pub mod request;
 
 pub use connection::{Connection, Error, Listener, Result};
 

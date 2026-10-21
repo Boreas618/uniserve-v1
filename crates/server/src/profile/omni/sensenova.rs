@@ -9,7 +9,6 @@ use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
     ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use ipc::MediaCall;
 use serde::{Deserialize, Serialize};
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
@@ -129,7 +128,7 @@ impl SenseNovaProfile {
             end_of_image_text,
         };
         let image_encoders = vec![ImageEncoderInput {
-            encoder: MediaCall::VisionEncoding,
+            encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: None,
         }];
@@ -145,7 +144,7 @@ impl SenseNovaProfile {
             },
             num_feedback_positions: 2,
             feedback_encoders: vec![ImageEncoderInput {
-                encoder: MediaCall::VisionEncoding,
+                encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }],
@@ -297,7 +296,7 @@ impl OmniProfile for SenseNovaProfile {
             0,
         )?;
         Ok(vec![ImageEncoderInput {
-            encoder: MediaCall::VisionEncoding,
+            encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: Some(tokens),
             max_cache_tokens: None,
         }])
@@ -330,7 +329,7 @@ impl OmniProfile for SenseNovaProfile {
         let mut policy = self.image_generation.clone();
         if policy.feedback_source.is_none()
             || policy.feedback_encoders.len() != 1
-            || policy.feedback_encoders[0].encoder != MediaCall::VisionEncoding
+            || policy.feedback_encoders[0].encoder != engine::ImageEncoder::Vision
         {
             return Err(assets::Error::invalid(
                 "image feedback encoders do not match the model processor",

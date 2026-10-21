@@ -12,12 +12,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct UnitId(pub u32);
 
-/// Request identity within one engine.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
-)]
-pub struct RequestId(pub u64);
-
 /// Logical call identity, preserved when a scheduler batch is split across workers.
 /// The request index is the ordinal assigned at selection, before physical row packing.
 #[derive(

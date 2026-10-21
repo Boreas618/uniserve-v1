@@ -1,15 +1,14 @@
-//! Requests and lifecycle events exchanged across the public engine boundary.
+//! Requests and their lifecycle events.
 //!
-//! The server submits each engine request as a [`Request`], a token generation
-//! or a video diffusion, and receives that request's [`Event`]
-//! events in order. `Finished`, `Rejected`, and `Error`
-//! are terminal: the engine's `EventRx` marks the request finished when it
-//! receives one of them.
+//! The daemon submits each request as a [`Request`], a token generation or a
+//! video diffusion, and receives that request's [`Event`]s in order.
+//! `Finished`, `Rejected`, and `Error` are terminal.
 
 use serde::{Deserialize, Serialize};
 
-use ipc::{DiffusionSamplingParams, MediaSource, RequestId, SharedMedia, TokenLogprob};
 use std::sync::Arc;
+
+use super::{DiffusionSamplingParams, RequestId, TokenLogprob};
 
 /// Terminal cause for one generation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +217,20 @@ pub enum MediaKind {
     Audio,
 }
 
+/// The bytes of one generated artifact, immutable once published.
+///
+/// The engine holds the worker's export and passes it on by descriptor
+/// (`descriptor`); the daemon holds the mapping of the descriptor it
+/// received. Either keeps the bytes readable for as long as it lives.
+pub trait ArtifactMedia: std::fmt::Debug + Send + Sync {
+    /// The artifact's bytes.
+    fn bytes(&self) -> &[u8];
+
+    /// The shared-memory object holding the bytes, which another process
+    /// maps; `None` for bytes held in this process alone.
+    fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
+}
+
 /// One caller-visible artifact retaining its immutable shared-storage mapping.
 #[derive(Debug, Clone)]
 pub struct ArtifactEvent {
@@ -226,7 +239,7 @@ pub struct ArtifactEvent {
     /// MIME content type of the artifact payload.
     pub content_type: String,
     /// Mapped payload retained through delivery, job retention, and active downloads.
-    pub media: Arc<SharedMedia>,
+    pub media: Arc<dyn ArtifactMedia>,
 }
 
 /// A video request. Final media bytes are returned through shared storage.
@@ -249,13 +262,10 @@ pub struct DiffusionRequest {
     /// family plans them, which the workers decode.
     pub conditioning: Vec<u8>,
     /// The sizes of each condition, in request order; empty for a task
-    /// without conditions.
+    /// without conditions. The submitter keeps each condition's media
+    /// published, under the locator the conditioning names, until the
+    /// request ends.
     pub conditions: Vec<ConditionExtent>,
-    /// The shared-memory export of each condition's media, in request
-    /// order. The request holds them, and so keeps their bytes readable,
-    /// until the engine retires it.
-    #[serde(skip)]
-    pub media: Vec<Arc<MediaSource>>,
     /// Scheduler priority.
     pub priority: i32,
     /// Effective diffusion controls and model-preprocessed media unit count.
@@ -293,9 +303,8 @@ impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
     /// The prompt is nonempty and its token count fits in `u32`; the frame
-    /// and media-unit counts and the canvas are positive; the task is named
-    /// and the conditioning present; and every condition has its media
-    /// published in `media`.
+    /// and media-unit counts and the canvas are positive; and the task is
+    /// named and the conditioning present.
     ///
     /// The engine's media admission rejects a failing request with
     /// `RejectionKind::Invalid`; it also refuses a task the deployment's
@@ -317,11 +326,6 @@ impl DiffusionRequest {
                 "the request names no task or carries no conditioning",
             ));
         }
-        if self.media.len() != self.conditions.len() {
-            return Err(DiffusionRequestError::Conditions(
-                "a condition's media is not published",
-            ));
-        }
         Ok(())
     }
 }
@@ -336,7 +340,7 @@ pub enum DiffusionRequestError {
     /// prompt token count exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
-    /// The task, conditioning or condition media are missing.
+    /// The task or the conditioning is missing.
     #[error("video conditions are invalid: {0}")]
     Conditions(&'static str),
 }
@@ -351,14 +355,14 @@ pub enum Request {
     /// Token generation: autoregressive text, interleaved text and images, or
     /// block-diffusion canvases and readouts. Boxed, as it is several times
     /// the size of a diffusion request.
-    Generation(Box<crate::generation::GenerationRequest>),
+    Generation(Box<super::GenerationRequest>),
     /// Video diffusion.
     Diffusion(DiffusionRequest),
 }
 
-impl From<crate::generation::GenerationRequest> for Request {
+impl From<super::GenerationRequest> for Request {
     /// Wraps a token generation request in the shared request enum.
-    fn from(request: crate::generation::GenerationRequest) -> Self {
+    fn from(request: super::GenerationRequest) -> Self {
         Self::Generation(Box::new(request))
     }
 }

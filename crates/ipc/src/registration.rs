@@ -21,11 +21,7 @@ use serde::{Deserialize, Serialize};
 /// library may be installed from different trees, so the engine refuses a
 /// registration that states another version. The digest tells apart two
 /// builds of one package version.
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    "+",
-    env!("UNISERVE_SOURCE_DIGEST")
-);
+pub const VERSION: &str = proto::BUILD;
 
 /// The first frame a worker sends: who it is and what it was built as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

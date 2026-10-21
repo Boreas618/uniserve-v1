@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use engine::{GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs};
-use ipc::MediaCall;
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -53,7 +52,7 @@ pub(crate) fn engine_images(
             position: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
             num_positions: placement.soft_tokens,
             encoders: vec![ImageEncoderInput {
-                encoder: MediaCall::VisionEncoding,
+                encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: Some(placement.soft_tokens),
                 max_cache_tokens: None,
             }],

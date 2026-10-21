@@ -388,7 +388,6 @@ mod tests {
     use std::fs;
 
     use engine::GenerationConstraint;
-    use ipc::MediaCall;
     use tempfile::tempdir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
@@ -519,7 +518,7 @@ mod tests {
                             .iter()
                             .map(|input| input.encoder)
                             .collect::<Vec<_>>(),
-                        vec![MediaCall::VisionEncoding]
+                        vec![engine::ImageEncoder::Vision]
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }
@@ -534,7 +533,7 @@ mod tests {
                             .iter()
                             .map(|input| input.encoder)
                             .collect::<Vec<_>>(),
-                        vec![MediaCall::LatentEncoding, MediaCall::VisionEncoding]
+                        vec![engine::ImageEncoder::Latent, engine::ImageEncoder::Vision]
                     );
                     assert!(profile.image_generation.feedback_source.is_some());
                 }

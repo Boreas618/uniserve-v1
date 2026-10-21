@@ -27,7 +27,7 @@ use ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
     ShapeBound,
 };
-use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
+use ipc::{DiffusionSamplingParams, RequestId};
 use models::video::Canvas;
 
 /// Denoising steps the simulated model advertises and every request follows.
@@ -260,7 +260,6 @@ fn video_request(id: u64, video_units: u32) -> Request {
         prompt_token_ids: PROMPT.to_vec(),
         conditioning: b"{}".to_vec(),
         conditions: Vec::new(),
-        media: Vec::new(),
         priority: 0,
         sampling: DiffusionSamplingParams {
             num_frames: 16,
@@ -365,7 +364,7 @@ impl Served {
         let artifact = artifact
             .unwrap_or_else(|| panic!("request {request:?} delivered no artifact: {events:?}"));
         assert_eq!(artifact.content_type, "video/mp4");
-        assert!(!artifact.media.as_bytes().is_empty());
+        assert!(!artifact.media.bytes().is_empty());
         assert!(
             matches!(
                 events.last(),
@@ -398,7 +397,6 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             prompt_token_ids: PROMPT.to_vec(),
             conditioning: b"{}".to_vec(),
             conditions: Vec::new(),
-            media: Vec::new(),
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: 128,
@@ -856,9 +854,8 @@ const CONDITION_CANVAS: Canvas = Canvas {
 };
 
 /// A `ref2va` request with an image reference, a three-unit video reference
-/// with its soundtrack and an audio reference. `media` keeps the published
-/// bytes alive as the server's exports would.
-fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
+/// with its soundtrack and an audio reference.
+fn reference_request(id: u64) -> Request {
     let pixels =
         |frames: u64| frames * u64::from(CONDITION_CANVAS.width * CONDITION_CANVAS.height) * 3;
     let conditions = vec![
@@ -895,7 +892,6 @@ fn reference_request(id: u64, media: &Arc<MediaSource>) -> Request {
         task: "ref2va".to_owned(),
         prompt_token_ids: (0..prompt_tokens).collect(),
         conditioning: b"{}".to_vec(),
-        media: vec![Arc::clone(media); conditions.len()],
         conditions,
         priority: 0,
         sampling: DiffusionSamplingParams {
@@ -939,8 +935,7 @@ fn leading(product: &ipc::TensorRef) -> u32 {
 #[test]
 fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let request = RequestId(5);
-    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
-    let served = serve(video_worker(2, 2), vec![reference_request(5, &media)]);
+    let served = serve(video_worker(2, 2), vec![reference_request(5)]);
     served.assert_completed(request);
 
     // The media read is the request's first call, alone in its batch.
@@ -1097,7 +1092,6 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
 /// the product and both sizes, beyond what the latent encoder declares.
 #[test]
 fn conditioned_requests_beyond_the_deployment_are_refused() {
-    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
     let rejected = |served: &Served, id: u64| match served.outcomes[&RequestId(id)].as_slice() {
         [
             Event::Rejected {
@@ -1112,11 +1106,11 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
     if let Some(denoiser) = sim.mut_info_for_test().video_denoiser.as_mut() {
         denoiser.tasks.retain(|task| task.name == "t2va");
     }
-    let served = serve(sim, vec![reference_request(1, &media)]);
+    let served = serve(sim, vec![reference_request(1)]);
     let message = rejected(&served, 1);
     assert!(message.contains("ref2va"), "{message}");
 
-    let Request::Diffusion(mut oversized) = reference_request(2, &media) else {
+    let Request::Diffusion(mut oversized) = reference_request(2) else {
         unreachable!("the fixture is a video request");
     };
     oversized.conditions[1].latent_units = vec![MAX_CONDITION_ROWS; 3];
@@ -1135,11 +1129,10 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
 /// completes.
 #[test]
 fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
-    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
     let mut sim = video_worker(2, 2);
     let reason = "the conditions take 46848 rows, more than the 40960 this worker provisions";
     sim.refuse_request(RequestId(1), reason);
-    let served = serve(sim, vec![reference_request(1, &media), video_request(2, 2)]);
+    let served = serve(sim, vec![reference_request(1), video_request(2, 2)]);
 
     let refused = served.outcomes[&RequestId(1)]
         .iter()
@@ -1425,13 +1418,12 @@ impl Executor for PooledExecutor {
 #[test]
 fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
     let request = RequestId(5);
-    let media = Arc::new(MediaSource::publish(b"condition media").unwrap());
     let (executor, boundary, handed_back) =
         PooledExecutor::new(video_worker(2, 2), MediaCall::LatentEncoding);
     let served = serve_through(
         Box::new(executor),
         boundary,
-        vec![reference_request(5, &media)],
+        vec![reference_request(5)],
         None,
     );
 

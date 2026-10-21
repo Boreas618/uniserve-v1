@@ -159,6 +159,15 @@ pub struct ProcessedVideo {
     pub canvas: Canvas,
 }
 
+/// The condition media of one planned request, published to shared memory.
+///
+/// The workers read each by name while the request runs, so whoever submits
+/// the request holds them until it ends; dropping them unlinks the names.
+#[derive(Debug)]
+pub struct PublishedMedia {
+    _sources: Vec<MediaSource>,
+}
+
 /// Processes the video requests of one deployment.
 ///
 /// One instance is shared by all requests; [`VideoService::process`] takes
@@ -379,7 +388,7 @@ impl VideoService {
         request_id: &str,
         request: &VideoGenerationRequest,
         max_prompt_tokens: u32,
-    ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
+    ) -> Result<(DiffusionRequest, ProcessedVideo, PublishedMedia), ServeError> {
         let target = Target {
             short_edge: request.target.short_edge,
             aspect_ratio: &request.target.aspect_ratio,
@@ -463,7 +472,7 @@ impl Presenter {
         &self,
         fetched: Fetched,
         max_prompt_tokens: u32,
-    ) -> Result<(DiffusionRequest, ProcessedVideo), ServeError> {
+    ) -> Result<(DiffusionRequest, ProcessedVideo, PublishedMedia), ServeError> {
         let target = Target {
             short_edge: fetched.short_edge,
             aspect_ratio: &fetched.aspect_ratio,
@@ -508,7 +517,7 @@ impl Presenter {
                 bytes: locator.bytes,
             };
             conditions.push(condition.describe(plan.canvas, locator, bands));
-            media.push(Arc::new(source));
+            media.push(source);
         }
         let conditioning = Conditioning {
             task: plan.task,
@@ -527,7 +536,6 @@ impl Presenter {
             conditioning: conditioning.encode().map_err(|error| {
                 VideoInputError::Internal(format!("encoding the conditioning failed: {error}"))
             })?,
-            media,
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: plan.num_frames,
@@ -544,7 +552,7 @@ impl Presenter {
             num_frames: plan.num_frames,
             canvas: plan.canvas,
         };
-        Ok((request, video))
+        Ok((request, video, PublishedMedia { _sources: media }))
     }
 }
 
@@ -766,10 +774,11 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&image), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         });
-        let (unenlarged, _) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
-            .process("reference", &request(body.clone()), 1 << 16)
-            .await
-            .unwrap();
+        let (unenlarged, _, _unenlarged_media) =
+            encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
+                .process("reference", &request(body.clone()), 1 << 16)
+                .await
+                .unwrap();
         // 90 is 2.8 patches and rounds to 96.
         let own = Canvas {
             width: 160,
@@ -785,10 +794,11 @@ mod tests {
             })
         );
 
-        let (request, video) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
-            .process("reference", &request(body), 1 << 16)
-            .await
-            .unwrap();
+        let (request, video, _media) =
+            encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
+                .process("reference", &request(body), 1 << 16)
+                .await
+                .unwrap();
         let planned_request = planned(&request);
         assert_eq!(request.task, "ref2va");
         assert_eq!(planned_request.task, VideoTask::Ref2va);
@@ -864,7 +874,10 @@ mod tests {
                 serde_json::json!({"type": "image", "uri": image, "role": "reference"});
                 count
             ];
-            let (request, _) = encoding_service(4, ReferenceConfig::released(&REFERENCE_LIMITS))
+            let (request, _, _media) = encoding_service(
+                4,
+                ReferenceConfig::released(&REFERENCE_LIMITS),
+            )
             .process(
                 "images",
                 &request(serde_json::json!({
@@ -898,7 +911,7 @@ mod tests {
     /// latent encoder.
     #[tokio::test]
     async fn keyframes_are_fitted_to_the_canvas() {
-        let (request, processed) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
+        let (request, processed, _media) = encoding_service(4, ReferenceConfig::new(&REFERENCE_LIMITS))
             .process(
                 "keyframes",
                 &request(serde_json::json!({
@@ -961,7 +974,7 @@ mod tests {
             "conditions": [{"type": "image", "uri": data_uri(&png(160, 90)), "role": "reference"}],
             "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
         }));
-        let (request, _) = service().process("rows", &body, 1 << 16).await.unwrap();
+        let (request, _, _media) = service().process("rows", &body, 1 << 16).await.unwrap();
         assert_eq!(planned(&request).conditions[0].latent_units, [7296]);
     }
 

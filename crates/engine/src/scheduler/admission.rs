@@ -183,7 +183,7 @@ impl Scheduler {
             .images
             .iter()
             .flat_map(|image| &image.encoders)
-            .filter(|input| input.encoder == MediaCall::VisionEncoding)
+            .filter(|input| input.encoder == crate::ImageEncoder::Vision)
             .filter_map(|input| input.num_cache_tokens)
             .find(|&tokens| tokens as usize > self.config.max_num_batched_tokens)
         {

@@ -167,6 +167,16 @@ impl SharedMedia {
     }
 }
 
+impl proto::request::ArtifactMedia for SharedMedia {
+    fn bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+}
+
 impl AsRef<[u8]> for SharedMedia {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()

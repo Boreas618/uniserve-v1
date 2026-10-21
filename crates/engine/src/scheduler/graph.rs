@@ -305,18 +305,12 @@ impl VideoGraph {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
+    use ipc::{DiffusionSamplingParams, RequestId};
 
     use super::*;
     use crate::ConditionExtent;
 
     fn request(conditions: Vec<ConditionExtent>) -> DiffusionRequest {
-        let media = conditions
-            .iter()
-            .map(|_| Arc::new(MediaSource::publish(b"media").unwrap()))
-            .collect();
         DiffusionRequest {
             request_id: RequestId(1),
             task: if conditions.is_empty() {
@@ -328,7 +322,6 @@ mod tests {
             prompt_token_ids: vec![1; 40],
             conditioning: b"{}".to_vec(),
             conditions,
-            media,
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: 124,

@@ -220,7 +220,11 @@ impl Scheduler {
                 let feedback = &st.req.image_generation;
                 feedback.feedback_source.as_ref()?;
                 let encoder_index = self.scheduled_feedback(id)?.0;
-                let encoder = feedback.feedback_encoders.get(encoder_index)?.encoder;
+                let encoder = feedback
+                    .feedback_encoders
+                    .get(encoder_index)?
+                    .encoder
+                    .into();
                 let source = (feedback.feedback_source
                     == Some(crate::FeedbackSource::DeviceProduct))
                 .then(|| {
@@ -465,7 +469,7 @@ impl Scheduler {
                     generation::plan_encode(
                         &scheduler.generation_limits,
                         request,
-                        step,
+                        step.into(),
                         image_b64,
                         None,
                         false,
@@ -486,7 +490,7 @@ impl Scheduler {
                 key: cache_key,
                 product: product.clone(),
             });
-            if step == MediaCall::LatentEncoding {
+            if step == crate::ImageEncoder::Latent {
                 state.input_image_features = Some(product);
                 state.phase = Phase::IngestState;
                 return self.next_context_call(id, budget, context_rows);
@@ -531,7 +535,7 @@ impl Scheduler {
                     break;
                 };
                 if end < text_stop
-                    || input.encoder != MediaCall::VisionEncoding
+                    || input.encoder != crate::ImageEncoder::Vision
                     || rows >= context_rows
                 {
                     break;
@@ -604,7 +608,7 @@ impl Scheduler {
     pub(in crate::scheduler) fn next_context_encode(
         &self,
         id: RequestId,
-    ) -> Option<(BlockCursor, MediaCall)> {
+    ) -> Option<(BlockCursor, crate::ImageEncoder)> {
         let state = self.running.get(&id)?;
         if state.phase == Phase::IngestState {
             return None;
@@ -615,7 +619,7 @@ impl Scheduler {
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {
             let position = image.position as usize;
-            if input.encoder == MediaCall::LatentEncoding {
+            if input.encoder == crate::ImageEncoder::Latent {
                 return (position == cursor).then_some((block, input.encoder));
             }
             if position > cursor && position >= reach {

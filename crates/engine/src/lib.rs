@@ -22,14 +22,10 @@ mod core;
 mod deployment;
 mod dtype;
 mod executor;
-/// Tokenized generation requests, image configuration, and capacity
-/// calculations.
-pub mod generation;
 mod handle;
 mod kv_cache;
 /// Serializable scheduler, cache, and worker performance snapshots.
 pub mod report;
-mod request;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
@@ -48,20 +44,12 @@ pub use crate::executor::{
     TransferConfig, TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure,
     WorkerGroupId, WorkerResult,
 };
-pub use crate::generation::{
-    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
-    GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
-    GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
-    ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
-};
 pub use crate::handle::{
     Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx, EventSendError, EventTx,
     StreamCancelCause, Submission, SubmitError, Wake,
 };
-pub use crate::request::{
-    ArtifactEvent, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event, FinishReason,
-    MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
-};
+// The engine schedules requests in the request vocabulary its daemon
+// submits them in.
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
@@ -79,6 +67,15 @@ pub use crate::worker::{
     WorkerGroup, WorkerProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
+pub use proto::request::{
+    ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,
+    DiffusionRequestError, Event, FeedbackNextToken, FeedbackSource, FinishReason,
+    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
+    GenerationRequest, GenerationRequestError, GenerationResourceError, ImageEncoder,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MediaKind,
+    MultimodalInputs, PositionLogprobs, ReadoutRow, ReadoutSlot, RejectionKind, Request,
+    StopReason, encoder_cache_key,
+};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///
