@@ -28,12 +28,7 @@ initialize CUDA.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import (
-    AbstractContextManager,
-    ExitStack,
-    contextmanager,
-    nullcontext,
-)
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import torch
@@ -147,37 +142,45 @@ class BreakableCUDAGraph:
 
     A step is usually one CUDA graph. Work a graph cannot record splits it
     into several graphs, its segments, with a graph break between two of
-    them. A graph Rust serves hands its captured segments over
-    (:meth:`raw_cuda_graphs`, :meth:`handover`) and keeps only the step's
-    output; a graph :func:`capture` instantiated replays in torch
-    (:meth:`replay`). The graph keeps its private capture stream: PyTorch
-    frees a capture stream's workspaces when the graph resets, so a stream
-    shared with other graphs could invalidate their inputs.
+    them: a break op the worker notes and performs natively at every
+    launch (:func:`break_graph`). A graph Rust serves hands its captured
+    segments over (:meth:`raw_cuda_graphs`, :meth:`handover`) and keeps
+    only the step's output; a graph without breaks that :func:`capture`
+    instantiated replays in torch (:meth:`replay`). The graph keeps its
+    private capture stream: PyTorch frees a capture stream's workspaces
+    when the graph resets, so a stream shared with other graphs could
+    invalidate their inputs.
     """
 
     def __init__(
         self,
         graphs: Sequence[torch.cuda.CUDAGraph],
-        steps: Sequence[Callable[[], object]],
         output: Any,
         capture_stream: torch.cuda.Stream,
     ) -> None:
         self._graphs = tuple(graphs)
-        self._steps = tuple(steps)
         self._capture_stream = capture_stream
         self.output = output
 
     def replay(self) -> Any:
-        """Submit every segment on the stream that captured the step.
+        """Submit the graph on the stream that captured the step.
 
         Only a graph :func:`capture` instantiated replays. Replay also
         advances the philox offsets of every generator the capture
         registered, so random draws continue as an eager sequence would.
         Returns the captured output (views into fixed buffers or the
         graph's pool, overwritten by the next replay).
+
+        Raises:
+            RuntimeError: The graph has breaks, whose ops only the worker
+                that noted them performs.
         """
-        for step in self._steps:
-            step()
+        if len(self._graphs) != 1:
+            raise RuntimeError(
+                "a graph with breaks launches in the worker that noted "
+                "its break ops"
+            )
+        self._graphs[0].replay()
         return self.output
 
     def raw_cuda_graphs(self) -> list[int]:
@@ -195,7 +198,7 @@ class BreakableCUDAGraph:
         The step's output stays until :meth:`release`; nothing replays the
         graph in torch afterwards.
         """
-        graphs, self._graphs, self._steps = self._graphs, (), ()
+        graphs, self._graphs = self._graphs, ()
         failure = None
         for graph in graphs:
             try:
@@ -210,7 +213,7 @@ class BreakableCUDAGraph:
 
         The caller has drained every stream this graph ran on.
         """
-        graphs, self._graphs, self._steps = self._graphs, (), ()
+        graphs, self._graphs = self._graphs, ()
         self.output = None
         failure = None
         for graph in graphs:
@@ -223,13 +226,12 @@ class BreakableCUDAGraph:
 
 
 class _Segments:
-    """Capture segments split at eager submissions.
+    """Capture segments split at graph breaks.
 
     ``begin`` starts a graph on the private capture stream and joins the
     computation stream into the capture; ``end`` joins it back and ends the
-    graph. ``submit`` (handed to a segmenting scope) ends the current
-    segment, records an eager call and begins the next segment in the same
-    pool, so allocations stay shared across the step.
+    graph. ``break_graph`` ends the current segment and begins the next in
+    the same pool, so allocations stay shared across the step.
     """
 
     def __init__(
@@ -244,7 +246,6 @@ class _Segments:
         self.pool = pool_handle
         self.generators = tuple(generators)
         self.graphs: list[torch.cuda.CUDAGraph] = []
-        self.steps: list[Callable[[], object]] = []
         self._active: torch.cuda.CUDAGraph | None = None
 
     def begin(self) -> None:
@@ -267,12 +268,6 @@ class _Segments:
         if self.pool is None:
             # Later segments share the first segment's private pool.
             self.pool = graph.pool()
-        self.steps.append(graph.replay)
-
-    def submit(self, call: Callable[[], object]) -> None:
-        self.end()
-        self.steps.append(call)
-        self.begin()
 
     def break_graph(self) -> None:
         """End the current segment and begin the next in the same pool."""
@@ -291,7 +286,6 @@ class _Segments:
         for graph in self.graphs:
             graph.reset()
         self.graphs.clear()
-        self.steps.clear()
 
 
 @contextmanager
@@ -403,7 +397,6 @@ class Capture:
             ) from error
         return BreakableCUDAGraph(
             self.segments.graphs,
-            self.segments.steps,
             output,
             self.capture_stream,
         )
@@ -414,10 +407,6 @@ def capture(
     *,
     stream: torch.cuda.Stream,
     pool: torch.cuda.MemPool | None = None,
-    segments: Callable[
-        [Callable[[Callable[[], object]], None]], AbstractContextManager
-    ]
-    | None = None,
     generators: Iterable[torch.Generator] = (),
     peers: Sequence[Sequence[Any]] = (),
 ) -> BreakableCUDAGraph:
@@ -434,11 +423,6 @@ def capture(
         stream: The binding's computation stream.
         pool: The allocator pool Rust assigned to this graph's owner;
             ``None`` creates a private pool.
-        segments: For steps containing work a graph cannot record (an
-            expert weight prefetch submitting copies between layers): a
-            factory of a scope entered around the body that receives a
-            ``submit(call)`` function. Each submission ends the current
-            graph, runs ``call`` eagerly at replay, and begins the next.
         generators: Generators the body draws from besides the device's
             default generator, which every capture registers. Replay
             advances each registered generator's offset.
@@ -459,14 +443,9 @@ def capture(
         for ordinal, handle in peers
     )
     recording = Capture(stream, pool, generators, placed)
-    scope = (
-        nullcontext()
-        if segments is None
-        else segments(recording.segments.submit)
-    )
     recording.begin()
     try:
-        with scope, torch.cuda.stream(stream):
+        with torch.cuda.stream(stream):
             output = body()
     except Exception as error:
         recording.end(failure=error)

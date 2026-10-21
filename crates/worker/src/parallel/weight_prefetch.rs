@@ -25,7 +25,7 @@ use tvm_ffi::{Any, AnyView};
 use super::world::World;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerLaunch};
-use crate::cuda_graph::GraphBreaks;
+use crate::cuda_graph::{BreakOp, GraphBreaks};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Streams;
@@ -849,8 +849,10 @@ fn hooks(weights: &Arc<ExpertWeights>, break_graph: &Function, breaks: &GraphBre
             let stream = compute(weights, stream)?;
             unit(weights.before(count(layer)?, &stream, |index| {
                 break_graph.invoke(&[])?;
-                let owner = Arc::clone(&owner);
-                breaks.note(Arc::new(move || owner.copy(index)));
+                breaks.note(BreakOp::WeightCopy {
+                    weights: Arc::clone(&owner),
+                    layer: index,
+                });
                 Ok(())
             }))
         }))
