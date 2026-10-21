@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use daemon::profile::tools::{Qwen25ToolParser, Tool, ToolParser, ToolParserOutput};
+use daemon::output::tools::{Qwen25ToolParser, Tool, ToolParser, ToolParserOutput};
 
 /// Unicode scalar values per streamed chunk.
 const CHUNK_CHARS: usize = 7;

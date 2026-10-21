@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use daemon::profile::tokenizer::HuggingFaceTokenizer;
+use daemon::tokenizer::HuggingFaceTokenizer;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

@@ -31,19 +31,19 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::frontend::Engine;
-use crate::http::RequestId;
+use crate::input::video::REQUEST_FIELDS;
+use crate::input::video::VideoGenerationRequest;
+use crate::leader::Leader;
+use crate::openai::RequestId;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::openai::{ApiError, check_model_served};
-use crate::serving::video::REQUEST_FIELDS;
-use crate::serving::video::VideoGenerationRequest;
-use crate::serving::video::artifact::ArtifactCollector;
+use crate::output::video::ArtifactCollector;
 use String;
 
 /// The state of the asynchronous video job routes.
 #[derive(Clone)]
 struct JobState {
-    engine: Arc<Engine>,
+    engine: Arc<Leader>,
     jobs: Arc<VideoJobs>,
 }
 
@@ -51,7 +51,7 @@ struct JobState {
 ///
 /// Its body may carry condition media inline, so its body limit is
 /// `body_limit`, the configured media total.
-pub(crate) fn generation_router(engine: Arc<Engine>, body_limit: usize) -> Router {
+pub(crate) fn generation_router(engine: Arc<Leader>, body_limit: usize) -> Router {
     Router::new()
         .route(
             "/v1/videos/sync",
@@ -64,7 +64,7 @@ pub(crate) fn generation_router(engine: Arc<Engine>, body_limit: usize) -> Route
 ///
 /// Job creation takes condition media inline like the synchronous route, so
 /// `POST /v1/videos` has the same `body_limit`.
-pub(crate) fn job_router(engine: Arc<Engine>, jobs: Arc<VideoJobs>, body_limit: usize) -> Router {
+pub(crate) fn job_router(engine: Arc<Leader>, jobs: Arc<VideoJobs>, body_limit: usize) -> Router {
     Router::new()
         .route(
             "/v1/videos",
@@ -88,7 +88,7 @@ pub(crate) fn job_router(engine: Arc<Engine>, jobs: Arc<VideoJobs>, body_limit: 
 /// `503` for a rejection); any other stream that ends without an artifact is
 /// a `500`.
 async fn videos_sync(
-    State(engine): State<Arc<Engine>>,
+    State(engine): State<Arc<Leader>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
     VideoBody(body): VideoBody,
 ) -> Response {
@@ -457,7 +457,7 @@ async fn capabilities(State(state): State<JobState>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::ModelParameters;
+    use crate::model::ModelParameters;
     use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 
     fn video_router() -> Router {
@@ -578,7 +578,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(defaulted.seed, crate::serving::video::DEFAULT_VIDEO_SEED);
+        assert_eq!(defaulted.seed, crate::input::video::DEFAULT_VIDEO_SEED);
     }
 
     /// Fields outside the schema, a schedule field included, and file parts

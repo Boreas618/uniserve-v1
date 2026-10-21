@@ -11,6 +11,10 @@
 //!   it, or as whole bytes;
 //! - a list is an array, a comma-separated string (`"1024,10240"`) or one
 //!   element, printed as an array.
+//!
+//! It also defines the option values a component reads by name: the chat
+//! template's content format and the System One readout's layout, canvas and
+//! candidate tokens.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -19,6 +23,7 @@ use std::time::Duration;
 
 use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 /// Parses a duration: whole seconds or a value with units.
 pub(super) fn parse_duration(text: &str) -> Result<Duration, String> {
@@ -372,5 +377,144 @@ mod tests {
         );
         assert!(lists("sizes = \"1024,0\"\nshapes = []").is_err());
         assert!(lists("sizes = []\nshapes = \"1152\"").is_err());
+    }
+}
+
+/// Configurable chat-template content format selection.
+///
+/// `FromStr` accepts the `*_LITERAL` constants case-insensitively.
+/// `ChatTemplateContentFormat::Preserve` has no option; only `Auto` detection
+/// selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
+pub enum ChatTemplateContentFormatOption {
+    /// Detect the format from the template source.
+    #[default]
+    Auto,
+    /// Always flatten content into plain strings before rendering.
+    String,
+    /// Always pass content through in OpenAI-compatible structured form.
+    OpenAi,
+}
+
+impl ChatTemplateContentFormatOption {
+    /// Configuration literal for automatic content-shape detection.
+    pub const AUTO_LITERAL: &str = "auto";
+    /// Configuration literal for structured OpenAI content parts.
+    pub const OPENAI_LITERAL: &str = "openai";
+    /// Configuration literal for flattened string content.
+    pub const STRING_LITERAL: &str = "string";
+}
+
+impl FromStr for ChatTemplateContentFormatOption {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case(Self::AUTO_LITERAL) {
+            Ok(Self::Auto)
+        } else if value.eq_ignore_ascii_case(Self::STRING_LITERAL) {
+            Ok(Self::String)
+        } else if value.eq_ignore_ascii_case(Self::OPENAI_LITERAL) {
+            Ok(Self::OpenAi)
+        } else {
+            Err(format!(
+                "invalid content format `{value}`; expected one of: {}, {}, {}",
+                Self::AUTO_LITERAL,
+                Self::STRING_LITERAL,
+                Self::OPENAI_LITERAL
+            ))
+        }
+    }
+}
+
+impl fmt::Display for ChatTemplateContentFormatOption {
+    /// Writes the lowercase configuration literal.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str(Self::AUTO_LITERAL),
+            Self::String => f.write_str(Self::STRING_LITERAL),
+            Self::OpenAi => f.write_str(Self::OPENAI_LITERAL),
+        }
+    }
+}
+
+/// How a request's questions are divided among prompts and canvases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadoutLayout {
+    /// Questions share prompts and canvases up to the canvas capacity.
+    #[default]
+    Joint,
+    /// Every question has its own prompt and canvas, so adding or removing a
+    /// question never changes another question's answer.
+    Independent,
+}
+
+/// How long each readout canvas is.
+///
+/// Its serde form is `"full"`, `"compact"`, or the token count of a fixed
+/// canvas, as a number or as text; `ReadoutEncoder::load` checks a fixed
+/// count against the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CanvasMode {
+    /// The checkpoint's full `canvas_length`.
+    #[default]
+    Full,
+    /// The smallest multiple of 16 tokens that holds the scaffold and `<turn|>`.
+    Compact,
+    /// A fixed multiple of 16, no longer than the checkpoint's canvas.
+    Fixed(u32),
+}
+
+/// Spellings whose probability contributes to each answer candidate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateTokens {
+    /// Sum every supported single-token spelling of a candidate.
+    #[default]
+    Variants,
+    /// Read only the primary, space-prefixed spelling of each candidate.
+    Primary,
+}
+
+impl FromStr for CanvasMode {
+    type Err = String;
+
+    /// Parses `full`, `compact`, or a token count.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full" => Ok(Self::Full),
+            "compact" => Ok(Self::Compact),
+            other => other.parse().map(Self::Fixed).map_err(|_| {
+                format!(
+                    "unknown readout canvas `{other}`; expected full, compact, or a token count"
+                )
+            }),
+        }
+    }
+}
+
+impl Serialize for CanvasMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Full => serializer.serialize_str("full"),
+            Self::Compact => serializer.serialize_str("compact"),
+            Self::Fixed(length) => serializer.serialize_u32(*length),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CanvasMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Length(u32),
+            Text(String),
+        }
+
+        match Form::deserialize(deserializer)? {
+            Form::Length(length) => Ok(Self::Fixed(length)),
+            Form::Text(text) => text.parse().map_err(serde::de::Error::custom),
+        }
     }
 }

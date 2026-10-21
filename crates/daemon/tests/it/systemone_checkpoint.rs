@@ -14,15 +14,13 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use daemon::input::readout::{ImageSize, ReadoutEncoder, ReadoutPlan, SystemOneRequest};
+use daemon::model::assets::ResolvedModelFiles;
+use daemon::model::diffusion_gemma::ImagePlacement;
+use daemon::model::{ModelConfig, ModelDescription, ModelParameters};
 use daemon::options::ReadoutOptions;
-use daemon::profile::assets::ResolvedModelFiles;
-use daemon::profile::diffusion_gemma::ImagePlacement;
-use daemon::profile::tokenizer::HuggingFaceTokenizer;
-use daemon::profile::{ModelConfig, ModelDescription, ModelParameters};
-use daemon::serving::systemone::{
-    CandidateTokens, CanvasMode, ImageSize, ReadoutEncoder, ReadoutLayout, ReadoutPlan,
-    SystemOneRequest,
-};
+use daemon::options::{CandidateTokens, CanvasMode, ReadoutLayout};
+use daemon::tokenizer::HuggingFaceTokenizer;
 use serde::Deserialize;
 use serde_json::Value;
 

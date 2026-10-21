@@ -24,7 +24,7 @@ use http_body::{Frame, SizeHint};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::openai::ApiError;
+use crate::openai::{ApiError, RequestId};
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -37,15 +37,6 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// `Retry-After` hint, in seconds, of a request the concurrency limit sheds.
 const RETRY_AFTER_SECONDS: HeaderValue = HeaderValue::from_static("1");
-
-/// The request's base ID, inserted into the request extensions by
-/// [`resolve_request_id`].
-///
-/// Route handlers prefix it per API (`chatcmpl-`, `img-`, `vid-`) and name
-/// the request by the result in responses and logs. As in vLLM, the ID need
-/// not be unique: the engine identifies each request by its own identifier.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestId(pub(crate) String);
 
 /// Resolves the request's ID and, when `echo` is set, returns it in the
 /// `X-Request-Id` response header.
@@ -346,8 +337,8 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 mod tests {
     use axum::http::StatusCode;
 
+    use crate::model::ModelParameters;
     use crate::options::ServerOptions;
-    use crate::profile::ModelParameters;
     use crate::test_support::{SERVED_MODEL, post_json, router_with, send, sim_engine};
 
     /// Sends a two-token chat completion with `request_id` as its

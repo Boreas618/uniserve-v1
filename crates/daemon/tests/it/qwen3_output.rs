@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use daemon::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use daemon::serving::chat::output::AssistantEvent;
-use daemon::serving::chat::{
-    AssistantBlockKind, ChatOutputProcessor, ChatRequest, ChatToolChoice, Tool,
-};
+use daemon::input::chat::{ChatRequest, ChatToolChoice};
+use daemon::output::chat::AssistantEvent;
+use daemon::output::chat::{AssistantBlockKind, ChatOutputProcessor};
+use daemon::output::tools::Tool;
+use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
@@ -116,7 +116,8 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
         .token_to_id("<|im_end|>")
         .ok_or_else(|| std::io::Error::other("configured prompt-end token is unavailable"))?;
     // The final argument enables reasoning parsing.
-    let processor = ChatOutputProcessor::qwen3(&request_with_lookup(), tokenizer, true)?;
+    let processor =
+        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), tokenizer, true)?;
 
     // The prompt ends with `<|im_end|>` and has no reasoning delimiter after
     // it, so generation starts outside a reasoning section and the `<think>`
@@ -156,7 +157,8 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
 /// starts inside a call's arguments.
 #[test]
 fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult {
-    let processor = ChatOutputProcessor::qwen3(&request_with_lookup(), qwen_tokenizer()?, false)?;
+    let processor =
+        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), qwen_tokenizer()?, false)?;
 
     // The first delta starts outside any call and ends inside the second
     // call's arguments; the second delta starts inside those arguments.
@@ -203,7 +205,7 @@ fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult
 /// delimiters arrive in separate deltas.
 #[test]
 fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
-    let processor = ChatOutputProcessor::qwen3(&ChatRequest::for_test(), qwen_tokenizer()?, false)?;
+    let processor = ChatOutputProcessor::qwen3(None, qwen_tokenizer()?, false)?;
 
     let events = parse(processor, &[], &["<think>", "hi</think>after"])?;
 

@@ -9,8 +9,8 @@
 //! [`ServeArgs`] reads the tree: a `--config` file first, then the flags that
 //! name a path of it, then `--set` assignments, each overriding the last.
 //! The tree is the server's configuration: each part of the server reads its
-//! own table, and [`ServeConfig::engine_config`] derives the engine
-//! configuration the scheduler and placement options state.
+//! own table, and [`ServeConfig::engine_spec`] states what of it concerns
+//! the engine process.
 //!
 //! Some options configure one model family: the token batch budgets,
 //! `chat_config` and `image_fetch_config` token models, `video_config`,
@@ -38,13 +38,13 @@ use proto::request::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::profile::ModelDescription;
-use crate::profile::diffusion_gemma::DenoisingOverrides;
-use crate::serving::chat::ChatTemplateContentFormatOption;
-use crate::serving::systemone::{CandidateTokens, CanvasMode, ReadoutLayout};
+use crate::model::ModelDescription;
+use crate::model::diffusion_gemma::DenoisingOverrides;
 
 pub use args::{FLAG_PATHS, ServeArgs, Stated, printed};
-pub use values::ImageSize;
+pub use values::{
+    CandidateTokens, CanvasMode, ChatTemplateContentFormatOption, ImageSize, ReadoutLayout,
+};
 
 /// Environment variable read for the API key when `server_config.api_key`
 /// is unset.
@@ -773,20 +773,6 @@ pub struct MediaOptions {
     pub ffmpeg: PathBuf,
 }
 
-impl MediaOptions {
-    /// The HTTP body limit of the video submission routes, in bytes.
-    ///
-    /// A `data:` URI carries its media base64 encoded, four bytes per three,
-    /// so a body holding `max_request_bytes` of media plus the request's own
-    /// fields fits; it never falls below the server-wide body limit.
-    pub fn body_limit(&self) -> usize {
-        let encoded = self.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
-        usize::try_from(encoded)
-            .unwrap_or(usize::MAX)
-            .max(crate::http::BODY_LIMIT)
-    }
-}
-
 impl Default for MediaOptions {
     fn default() -> Self {
         Self {
@@ -953,7 +939,7 @@ impl ServeConfig {
     }
 
     /// The engine spec these options state, without the model's facts,
-    /// which the frontend resolves from the checkpoint.
+    /// which the leader resolves from the checkpoint.
     ///
     /// Values the options name by a word (a policy, a backend, an element
     /// type) travel as that word, which the engine reads; the placement

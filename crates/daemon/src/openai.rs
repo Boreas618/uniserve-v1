@@ -1,10 +1,10 @@
 //! The OpenAI-compatible API: wire schemas, errors, and the route handlers.
 //!
-//! Each endpoint module builds its own router over the [`Engine`]
+//! Each endpoint module builds its own router over the [`Leader`]
 //! (`chat_completions`, `images`, `videos`); `crate::http::router` registers
 //! the routers of the tasks the engine serves. A request is deserialized into
 //! the strict schemas of `protocol` (unknown fields are rejected) and
-//! validated by [`ValidatedJson`]; the engine lowers, tokenizes and submits
+//! validated by `ValidatedJson`; the engine lowers, tokenizes and submits
 //! it, and its `RequestOutput` stream comes back to the endpoint module for
 //! response assembly. Every failure answers in the OpenAI error envelope of
 //! [`ApiError`].
@@ -13,6 +13,7 @@ pub mod chat_completions;
 pub(crate) mod error;
 pub mod images;
 mod protocol;
+mod systemone;
 pub(crate) mod video_jobs;
 pub mod videos;
 
@@ -26,13 +27,22 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use validator::Validate;
 
-use crate::frontend::Engine;
+use crate::leader::Leader;
 
 pub use error::{ApiError, Result};
+
+/// The request's base ID, which the HTTP layer resolves and inserts into the
+/// request extensions before a route handler runs.
+///
+/// Route handlers prefix it per API (`chatcmpl-`, `img-`, `vid-`) and name
+/// the request by the result in responses and logs. As in vLLM, the ID need
+/// not be unique: the engine identifies each request by its own identifier.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestId(pub(crate) String);
 pub use protocol::*;
 
 /// The model listing route, `GET /v1/models`.
-pub(crate) fn models_router(engine: Arc<Engine>) -> Router {
+pub(crate) fn models_router(engine: Arc<Leader>) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .with_state(engine)
@@ -51,8 +61,8 @@ pub(crate) fn unix_time() -> u64 {
 /// Returns the served model in OpenAI `list models` format.
 ///
 /// A server serves exactly one model, so the list always has one entry, named
-/// by `Engine::served_model_name`.
-async fn list_models(State(engine): State<Arc<Engine>>) -> Json<ListModelsResponse> {
+/// by `Leader::served_model_name`.
+async fn list_models(State(engine): State<Arc<Leader>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; the listing
     // reports the time it was produced.
     let created = unix_time() as i64;

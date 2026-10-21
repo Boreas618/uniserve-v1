@@ -7,10 +7,11 @@
 
 use std::collections::HashMap;
 
-use daemon::serving::chat::{
-    AssistantContentBlock, AssistantToolCall, ChatContentPart, ChatMessage, ChatRequest, ChatRole,
-    ChatTemplateContentFormatOption, GenerationPromptMode, HfChatRenderer,
+use daemon::input::chat::{
+    ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode, HfChatRenderer,
 };
+use daemon::options::ChatTemplateContentFormatOption;
+use daemon::output::chat::{AssistantContentBlock, AssistantToolCall};
 
 const QWEN3_TEMPLATE: &str = include_str!("../templates/qwen3.jinja");
 

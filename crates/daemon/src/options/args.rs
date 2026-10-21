@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(config.flashinfer_config.workspace_size, 1 << 30);
         assert_eq!(
             config.readout_config.canvas,
-            crate::serving::systemone::CanvasMode::Fixed(64)
+            crate::options::CanvasMode::Fixed(64)
         );
         assert_eq!(config.server_config.host, "0.0.0.0");
     }
@@ -810,7 +810,7 @@ mod tests {
     /// rather than ignored; unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use crate::profile::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
+        use crate::model::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
 
         let (_, defaults) = resolved(&["m"]).unwrap();
         for description in [Qwen3, Bagel, MiniMaxH3, DiffusionGemma] {

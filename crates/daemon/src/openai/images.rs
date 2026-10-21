@@ -14,20 +14,19 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _};
 
-use crate::frontend::Engine;
-use crate::http::RequestId;
+use crate::leader::Leader;
+use crate::openai::RequestId;
 use proto::request::GenerationConstraint;
 
+use crate::input::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
 use crate::openai::{
     ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,
     check_model_served,
 };
-use crate::serving::{
-    FinishReason, GenerateRequest, ImageSamplingParams, Prompt, RequestOutput, SamplingParams,
-};
+use crate::output::{FinishReason, RequestOutput};
 
 /// The image generation route.
-pub(crate) fn router(engine: Arc<Engine>) -> Router {
+pub(crate) fn router(engine: Arc<Leader>) -> Router {
     Router::new()
         .route("/v1/images/generations", post(images_generations))
         .with_state(engine)
@@ -35,7 +34,7 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
 
 /// Validates, submits, and collects one image-generation request.
 async fn images_generations(
-    State(engine): State<Arc<Engine>>,
+    State(engine): State<Arc<Leader>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ImageGenerationRequest>,
 ) -> Response {
@@ -148,7 +147,7 @@ fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
 /// when the request fails or is aborted, emits a video event, or ends
 /// without a `Finished` event or without any image.
 pub async fn collect_image_generation(
-    stream: impl Stream<Item = crate::serving::Result<RequestOutput>> + Send,
+    stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
     created: u64,
 ) -> Result<ImageGenerationResponse, ApiError> {
     futures::pin_mut!(stream);
