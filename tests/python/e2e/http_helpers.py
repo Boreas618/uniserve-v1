@@ -19,6 +19,30 @@ from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
 
+# Attention on the first GPU and the routed experts on the second, exchanging
+# tokens through an expert transport: two worker groups of one expert world.
+DEDICATED_EXPERTS = """
+[[worker_groups]]
+id = "attention"
+ranks = ["cuda:0"]
+queue_depth = 2
+
+[worker_groups.components.model]
+
+[[worker_groups]]
+id = "experts"
+role = "experts"
+ranks = ["cuda:1"]
+queue_depth = 2
+"""
+
+
+def dedicated_experts(directory: Path) -> Path:
+    """Write :data:`DEDICATED_EXPERTS` under ``directory``; return its path."""
+    placement = directory / "attention_experts.toml"
+    placement.write_text(DEDICATED_EXPERTS)
+    return placement
+
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

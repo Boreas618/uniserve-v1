@@ -333,6 +333,12 @@ impl CausalLMRunner {
         self.graphs.seal();
     }
 
+    /// Release every graph and accept captures again
+    /// ([`GraphTable::reopen`]).
+    pub(crate) fn reopen(&mut self) -> Result<()> {
+        self.graphs.reopen()
+    }
+
     /// Plan `request` and record the writes of its inputs on the runner's
     /// stream in `job`.
     pub(crate) fn stage(

@@ -90,6 +90,10 @@ pub(super) struct ExpertFunctions {
     /// back at its addresses.
     suspend: Function,
     restore: Function,
+    /// `release_exchange(exchange) -> bool` and `rebuild_exchange(exchange)`:
+    /// a workspace that cannot keep its addresses, freed and created again.
+    release: Function,
+    rebuild: Function,
     /// `ExpertLayers.close(layers)`.
     close_layers: Function,
 }
@@ -107,6 +111,8 @@ impl ExpertFunctions {
             close: function("close_exchange")?,
             suspend: function("suspend_exchange")?,
             restore: function("restore_exchange")?,
+            release: function("release_exchange")?,
+            rebuild: function("rebuild_exchange")?,
             close_layers: function("ExpertLayers.close")?,
         })
     }
@@ -264,6 +270,43 @@ impl ExpertUnion {
         for peer in &self.microbatches {
             self.functions.restore.invoke(&[peer.exchange.view()])?;
         }
+        Ok(())
+    }
+
+    /// Free every microbatch's transport workspace that cannot keep its
+    /// addresses (DeepEP's windows, an NVSHMEM heap), after
+    /// [`Self::suspend`]; collective over the union, while no step runs.
+    /// Returns whether any was freed: the graphs that run expert steps
+    /// address it, so the promotion rebuilds it ([`Self::rebuild`]) and
+    /// captures them again.
+    pub(crate) fn release(&self) -> Result<bool> {
+        let mut released = false;
+        for peer in &self.microbatches {
+            let value = self.functions.release.call(&[peer.exchange.view()])?;
+            released |= bool::try_from(value)
+                .map_err(|error| Error::numerical(self.functions.release.name(), &error))?;
+        }
+        Ok(released)
+    }
+
+    /// Create every workspace [`Self::release`] freed again, collectively
+    /// over the union, and release the joins captured over the freed ones:
+    /// the warmup that follows announces its steps again and captures the
+    /// joins anew ([`ExpertWarmup`]). Called at the promotion, before any
+    /// step runs.
+    pub(crate) fn rebuild(&mut self) -> Result<()> {
+        for peer in &self.microbatches {
+            self.functions.rebuild.invoke(&[peer.exchange.view()])?;
+        }
+        if let Some(mut joins) = self.joins.take() {
+            joins.close(false)?;
+        }
+        for peer in &mut self.microbatches {
+            if let Some(mut graphs) = peer.graphs.take() {
+                graphs.close(false)?;
+            }
+        }
+        self.warming.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -631,6 +674,10 @@ impl WarmupHooks for ExpertWarmup {
             .check()
             .map(drop)
             .map_err(|failure| failed("expert warmup")(failure.error))
+    }
+
+    fn steps_experts(&self) -> bool {
+        true
     }
 }
 

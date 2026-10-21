@@ -472,6 +472,30 @@ impl WorkerBackend {
         self.runtimes.host_weights = weights;
     }
 
+    /// Release the graphs of every runtime that runs expert steps and accept
+    /// their captures again, once the expert transports were rebuilt at new
+    /// addresses. The lanes are idle.
+    pub(crate) fn reopen_expert_graphs(&mut self) -> Result<()> {
+        if let Some(text) = self.runtimes.text.as_mut() {
+            text.reopen()?;
+        }
+        for runner in &mut self.runtimes.diffusion_lm {
+            runner.reopen()?;
+        }
+        Ok(())
+    }
+
+    /// Refuse further captures of the runtimes that run expert steps, once
+    /// they were captured again.
+    pub(crate) fn seal_expert_graphs(&mut self) {
+        if let Some(text) = self.runtimes.text.as_mut() {
+            text.seal();
+        }
+        for runner in &mut self.runtimes.diffusion_lm {
+            runner.seal();
+        }
+    }
+
     /// The NCCL communicators of every runner's collectives, which a parked
     /// standby suspends.
     pub(crate) fn collectives(&self) -> impl Iterator<Item = &crate::parallel::StreamCollectives> {
