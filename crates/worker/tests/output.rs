@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use uniserve_core::TokenLogprob;
+use uniserve_ipc::TokenLogprob;
 use uniserve_worker::ffi::{Backing, DType};
 use uniserve_worker::storage::{LogprobLayout, OutputBuffer, OutputStorage, Storage, StorageView};
 use uniserve_worker::{EventPool, Result};

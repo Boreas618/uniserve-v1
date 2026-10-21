@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use config::Config;
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
-use uniserve_core::{CallId, RequestId, UnitId};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
+use uniserve_ipc::{CallId, RequestId, UnitId};
 use uniserve_worker::ffi::{Function, Handle, Interpreter};
 use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView, UnitColumn};

@@ -142,11 +142,11 @@ pub struct WorkerProcessArgs {
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
     /// Numeric data type used by model parameters and activations.
-    pub dtype: uniserve_core::ModelDtype,
+    pub dtype: crate::ModelDtype,
     /// WorkerGroup-specific quantization policy.
     pub quantization_config: serde_json::Value,
     /// Numeric data type of the KV (prefix) cache, when explicitly selected.
-    pub kv_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
+    pub kv_cache_dtype: Option<uniserve_ipc::PrefixCacheDtype>,
     /// Each rank's share of its device's total memory, which bounds the
     /// process's static allocations, weights and KV cache;
     /// `WorkerGroupConfig::validate_mem_fraction_static` states its range.
@@ -201,7 +201,7 @@ pub struct WorkerProcessArgs {
     /// canvases. The worker keeps the argmax history its stability
     /// threshold needs, prepares its canvas steps for exactly this sampling,
     /// and refuses a request that carries another.
-    pub canvas_sampling: Option<uniserve_core::CanvasSampling>,
+    pub canvas_sampling: Option<uniserve_ipc::CanvasSampling>,
     /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
     /// FlashInfer tensor-core decode selection; `None` lets the backend

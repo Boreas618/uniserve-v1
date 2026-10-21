@@ -38,8 +38,8 @@ use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
 
-use uniserve_core::ComponentWeights;
 use uniserve_cuda::{DeviceId, PrimaryContext};
+use uniserve_ipc::ComponentWeights;
 use uniserve_ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;

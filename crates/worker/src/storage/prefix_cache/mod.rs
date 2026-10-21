@@ -35,8 +35,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tvm_ffi::Any;
-use uniserve_core::CallId;
 use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
+use uniserve_ipc::CallId;
 use uniserve_ipc::{BlockTable, BufferId, CacheTransfer, PageCopy, RequestKey, Wake};
 
 use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
@@ -729,7 +729,7 @@ impl PrefixCache {
                     group_id: group as u32,
                     start_page: 0,
                     unit_ids: (unit..unit + units as u32)
-                        .map(uniserve_core::UnitId)
+                        .map(uniserve_ipc::UnitId)
                         .collect(),
                     allocated_tokens: (pages * shape.block_size as usize) as u32,
                 });

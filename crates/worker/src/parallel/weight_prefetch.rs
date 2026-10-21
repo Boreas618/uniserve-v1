@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use indexmap::IndexMap;
-use uniserve_core::ComponentWeights;
 use uniserve_cuda::{
     CaptureStatus, CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream,
 };
+use uniserve_ipc::ComponentWeights;
 
 use std::sync::Arc;
 

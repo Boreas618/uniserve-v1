@@ -32,13 +32,13 @@
 
 use std::time::Duration;
 
-use anyhow::Context as _;
-use uniserve_core::{
+use crate::{
     CachePolicy, EngineCoreOutput, FeedbackNextToken, FinishReason, GenerationConstraint,
-    GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger, MultimodalInputs, Request,
-    SamplingParams,
+    GenerationRequest, ImageGenerationConfig, ImageTrigger, MultimodalInputs, Request,
 };
+use anyhow::Context as _;
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
+use uniserve_ipc::{ImageParams, SamplingParams};
 
 use crate::core::{EngineConfig, EngineCore};
 use crate::handle::EventRx;
@@ -198,7 +198,7 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
 /// negative prompt does.
 fn warmup_request(
     config: &EngineConfig,
-    request_id: uniserve_core::RequestId,
+    request_id: uniserve_ipc::RequestId,
     constraint: GenerationConstraint,
     tokens: usize,
     image: ImageParams,
@@ -292,7 +292,8 @@ fn await_finish(core: &EngineCore, group: &str, stream: &mut EventRx) -> anyhow:
 mod tests {
     use std::collections::BTreeSet;
 
-    use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
+    use crate::{GenerationFeatures, GenerationLimits};
+    use uniserve_ipc::CanvasSampling;
     use uniserve_ipc::{BatchCommand, ImageWarmup};
 
     use super::*;

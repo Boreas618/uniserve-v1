@@ -9,12 +9,12 @@ ignored = ["serde_bytes"]
 
 [dependencies]
 libc.workspace = true
+models.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-uniserve-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use uniserve_core::ComponentConfig;
+use uniserve_ipc::ComponentConfig;
 use uniserve_ipc::LaunchDescriptor;
 
 use super::device::{Device, generation_device};

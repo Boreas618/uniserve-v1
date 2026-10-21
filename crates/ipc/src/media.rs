@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use crate::SharedMemory;
+use crate::shared_memory::SharedMemory;
 
 /// Why a shared-storage media export could not be claimed.
 ///
@@ -216,8 +216,8 @@ impl MediaSource {
     }
 
     /// The object's name without its leading `/` and its byte count.
-    pub fn locator(&self) -> crate::MediaLocator {
-        crate::MediaLocator {
+    pub fn locator(&self) -> models::video::MediaLocator {
+        models::video::MediaLocator {
             name: self.storage.name().to_owned(),
             bytes: self.storage.size() as u64,
         }
@@ -226,8 +226,8 @@ impl MediaSource {
     /// Hand the named object to its receiving process. The receiver must
     /// claim it with `SharedMedia::open`, which unlinks it on receipt.
     /// Dropping this publisher afterwards leaves the name available.
-    pub fn into_locator(self) -> crate::MediaLocator {
-        crate::MediaLocator {
+    pub fn into_locator(self) -> models::video::MediaLocator {
+        models::video::MediaLocator {
             bytes: self.storage.size() as u64,
             name: self.storage.into_name(),
         }

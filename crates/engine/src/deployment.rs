@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use serde::Deserialize;
-use uniserve_core::{
+use uniserve_ipc::{
     ComponentConfig, ComponentDistribution, ComponentWeights, ParallelConfig, SequenceParallel,
 };
 use uniserve_ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};

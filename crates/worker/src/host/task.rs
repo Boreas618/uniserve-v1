@@ -9,8 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use models::video::VideoCondition;
 use tvm_ffi::{Any, AnyView};
-use uniserve_core::VideoCondition;
 
 use uniserve_cuda::{CopyBatch, SourceOrder};
 

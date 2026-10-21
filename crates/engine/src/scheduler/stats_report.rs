@@ -12,11 +12,10 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
+use crate::report;
+use crate::report::{BaseCacheStats, DomainSchedulerStats, PrefixCacheStats};
 use crate::scheduler::SchedulerStats;
-use uniserve_core::codec::stats;
-use uniserve_core::codec::stats::{
-    BaseCacheStats, DomainSchedulerStats, ForwardStats, PrefixCacheStats,
-};
+use uniserve_ipc::ForwardStats;
 
 /// Plain-value copy of one domain's `DomainStats` counters.
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,7 +58,7 @@ impl SchedulerStatsReporter {
     /// Advances the reporter's baselines, so each counter increment appears in
     /// exactly one snapshot. The first snapshot reports everything counted
     /// since the scheduler started.
-    pub fn snapshot(&mut self, stats: &SchedulerStats) -> stats::SchedulerStats {
+    pub fn snapshot(&mut self, stats: &SchedulerStats) -> report::SchedulerStats {
         let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
         let free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
         let prefix_cache_usage = if num_units > 0 {
@@ -104,7 +103,7 @@ impl SchedulerStatsReporter {
 
         // The scheduler tracks no DP waves, prefix-cache request counts, or
         // preemptions, so those fields are reported as zero.
-        stats::SchedulerStats {
+        report::SchedulerStats {
             num_running_reqs: stats.general.running.load(Ordering::Relaxed) as u64,
             num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
             step_counter: stats.general.steps.load(Ordering::Relaxed),

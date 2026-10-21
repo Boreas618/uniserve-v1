@@ -329,7 +329,7 @@ fn overlaps(ranges: &Ranges, spans: &[(u32, u32, u32)]) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use uniserve_core::{CallId, RequestId};
+    use uniserve_ipc::{CallId, RequestId};
 
     use super::*;
 

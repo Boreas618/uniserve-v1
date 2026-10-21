@@ -880,8 +880,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use uniserve_core::{CallId, RequestId};
     use uniserve_ipc::{BufferId, LatentParams, RequestKey};
+    use uniserve_ipc::{CallId, RequestId};
 
     use super::*;
     use crate::EventPool;

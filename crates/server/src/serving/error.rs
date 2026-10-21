@@ -20,10 +20,10 @@ pub enum TokenizeError {
     Text(#[from] crate::serving::text::Error),
     /// Sampling controls violate the engine contract.
     #[error(transparent)]
-    Sampling(#[from] uniserve_core::SamplingParamsError),
+    Sampling(#[from] uniserve_ipc::SamplingParamsError),
     /// The lowered request violates the canonical generation contract.
     #[error(transparent)]
-    Generation(#[from] uniserve_core::GenerationRequestError),
+    Generation(#[from] uniserve_engine::GenerationRequestError),
     /// The requested output resolution is not served.
     #[error(transparent)]
     Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
@@ -32,7 +32,7 @@ pub enum TokenizeError {
     Assets(#[from] crate::profile::assets::Error),
     /// The request exceeds the loaded workers' resource limits.
     #[error(transparent)]
-    Resources(#[from] uniserve_core::GenerationResourceError),
+    Resources(#[from] uniserve_engine::GenerationResourceError),
     /// The minimum generation length exceeds the maximum generation length.
     #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
     MinTokensExceedsMaximum {
@@ -99,7 +99,7 @@ pub enum ServeError {
     },
     /// The video service refuses a video request or cannot process it.
     #[error(transparent)]
-    Video(#[from] uniserve_core::video::plan::VideoInputError),
+    Video(#[from] models::video::plan::VideoInputError),
     /// Request tokenization fails before engine submission.
     #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {

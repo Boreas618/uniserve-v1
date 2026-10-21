@@ -430,8 +430,8 @@ fn export_group(
 mod tests {
     use std::collections::HashSet;
 
-    use uniserve_core::{CallId, PrefixCacheDtype, RequestId, UnitId};
     use uniserve_ipc::{BlockTable, RequestKey, TransferTransport, WorkerEndpoint};
+    use uniserve_ipc::{CallId, PrefixCacheDtype, RequestId, UnitId};
 
     use super::*;
     use crate::EventPool;

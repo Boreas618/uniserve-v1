@@ -121,7 +121,7 @@ mod tests {
         ComponentConfig {
             ranks,
             parallel_config: Default::default(),
-            distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
+            distribution: Some(uniserve_ipc::ComponentDistribution::TemporalUnits),
             units_per_rank,
             weights: Default::default(),
         }

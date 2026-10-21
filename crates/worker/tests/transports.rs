@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use uniserve_core::PrefixCacheDtype;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
+use uniserve_ipc::PrefixCacheDtype;
 use uniserve_ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use uniserve_worker::ffi::{Backing, DType, MemoryKind};
 use uniserve_worker::storage::LocalMemory;

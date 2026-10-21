@@ -20,9 +20,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use models::video::plan::requested_frames;
+use models::video::{Canvas, ConditionRole, ServedCanvas, VideoCondition};
 use tvm_ffi::Any;
-use uniserve_core::video::plan::requested_frames;
-use uniserve_core::{Canvas, ConditionRole, ServedCanvas, VideoCondition};
 use uniserve_ipc::{BufferId, NewRequest, RequestKey};
 
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
@@ -782,7 +782,7 @@ impl VideoRequests {
             width: media.width,
             height: media.height,
         };
-        if (video.task == uniserve_core::VideoTask::T2va) != video.conditions.is_empty() {
+        if (video.task == models::video::VideoTask::T2va) != video.conditions.is_empty() {
             return Err(Error::Invalid(
                 "a video request's task disagrees with its conditions".into(),
             ));

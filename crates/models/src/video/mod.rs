@@ -19,7 +19,45 @@ pub mod presentation;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Canvas;
+/// A video raster in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Canvas {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// A video-and-audio generation task, by its request name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoTask {
+    /// Text to video and audio.
+    T2va,
+    /// First and/or last keyframe to video and audio.
+    Fl2va,
+    /// Image, video and audio references to video and audio.
+    Ref2va,
+}
+
+impl VideoTask {
+    /// Every task, in canonical order.
+    pub const ALL: [Self; 3] = [Self::T2va, Self::Fl2va, Self::Ref2va];
+
+    /// The task's request name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::T2va => "t2va",
+            Self::Fl2va => "fl2va",
+            Self::Ref2va => "ref2va",
+        }
+    }
+
+    /// The task a request name denotes, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|task| task.as_str() == name)
+    }
+}
 
 /// How a condition relates to the generated video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

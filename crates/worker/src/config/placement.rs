@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
 use tvm_ffi::Any;
-use uniserve_core::ComponentConfig;
+use uniserve_ipc::ComponentConfig;
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 
 use super::Device;
@@ -693,7 +693,7 @@ impl Components {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{ComponentDistribution, ParallelConfig};
+    use uniserve_ipc::{ComponentDistribution, ParallelConfig};
 
     use super::*;
 

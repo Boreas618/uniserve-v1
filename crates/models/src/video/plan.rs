@@ -39,14 +39,12 @@
 //!   start offset.
 
 use std::fmt;
-use std::io;
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{Canvas, VideoTask};
 use super::{ConditionMedia, ConditionVision, FrameClips, ImageFit, MediaLocator};
 use super::{ReferenceLimits, ServedCanvas, VideoCondition, VisionGrid};
-use crate::{Canvas, VideoTask};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -216,27 +214,16 @@ pub enum RuleError {
     VideoCanvas(CanvasError),
 }
 
-/// A checkpoint's processor configs that [`ProcessorConfig::read`] cannot use.
+/// A checkpoint's processor configs that [`ProcessorConfig::parse`] cannot
+/// use.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessorConfigError {
-    /// A config file could not be read.
-    #[error("reading {}", path.display())]
-    Read {
-        /// The file.
-        path: PathBuf,
-        /// The read's failure.
-        #[source]
-        source: io::Error,
-    },
-    /// A config file is not a processor config.
-    #[error("parsing {}", path.display())]
-    Parse {
-        /// The file.
-        path: PathBuf,
-        /// The parse's failure.
-        #[source]
-        source: serde_json::Error,
-    },
+    /// The image processor config is not a processor config.
+    #[error("parsing the image processor config")]
+    Image(#[source] serde_json::Error),
+    /// The video processor config is not a processor config.
+    #[error("parsing the video processor config")]
+    Video(#[source] serde_json::Error),
     /// The image and video processors patch differently.
     #[error("the image and video processors disagree on the patch geometry")]
     Geometry,
@@ -738,7 +725,7 @@ impl PlanLimits {
 /// SGLang name it (their `VisionConfig` is the vision tower's model
 /// configuration). Read from the checkpoint's
 /// `processor/preprocessor_config.json` and
-/// `processor/video_preprocessor_config.json` with [`ProcessorConfig::read`].
+/// `processor/video_preprocessor_config.json` with [`ProcessorConfig::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
     /// Pixels per patch side.
@@ -772,28 +759,19 @@ struct ProcessorSize {
 }
 
 impl ProcessorConfig {
-    /// Reads a checkpoint's image processor config
+    /// Parses a checkpoint's image processor config
     /// (`processor/preprocessor_config.json`) and video processor config
-    /// (`processor/video_preprocessor_config.json`).
+    /// (`processor/video_preprocessor_config.json`), given as their texts.
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessorConfigError`] when a file cannot be read or parsed, or
-    /// when the two configs disagree on the patch geometry.
-    pub fn read(image: &Path, video: &Path) -> Result<Self, ProcessorConfigError> {
-        let read = |path: &Path| -> Result<ProcessorFile, ProcessorConfigError> {
-            let text =
-                std::fs::read_to_string(path).map_err(|source| ProcessorConfigError::Read {
-                    path: path.to_owned(),
-                    source,
-                })?;
-            serde_json::from_str(&text).map_err(|source| ProcessorConfigError::Parse {
-                path: path.to_owned(),
-                source,
-            })
-        };
-        let image = read(image)?;
-        let video = read(video)?;
+    /// Returns [`ProcessorConfigError`] when a text is not a processor config,
+    /// or when the two configs disagree on the patch geometry.
+    pub fn parse(image: &str, video: &str) -> Result<Self, ProcessorConfigError> {
+        let image: ProcessorFile =
+            serde_json::from_str(image).map_err(ProcessorConfigError::Image)?;
+        let video: ProcessorFile =
+            serde_json::from_str(video).map_err(ProcessorConfigError::Video)?;
         let geometry =
             |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
         if geometry(&image) != geometry(&video) {
@@ -2132,7 +2110,7 @@ pub(super) mod tests {
         reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
         video_reference,
     };
-    use crate::{MediaLocator, ReferenceLimits, ServedCanvas};
+    use crate::video::{MediaLocator, ReferenceLimits, ServedCanvas};
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {

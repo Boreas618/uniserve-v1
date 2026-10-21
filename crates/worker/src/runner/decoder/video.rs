@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_core::Canvas;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::Batch as BatchPlan;
 

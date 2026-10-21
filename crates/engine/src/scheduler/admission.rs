@@ -808,7 +808,7 @@ impl Scheduler {
     /// Computes `(height / d) * (width / d)` with floor division, where `d` is
     /// `latent_downsample` (at least 1). Denoising call planning adds
     /// `commit_marker_tokens` to it for the call's query length.
-    pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
+    pub(super) fn num_vae(&self, ip: &uniserve_ipc::ImageParams) -> u64 {
         let dl = u64::from(self.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
@@ -817,7 +817,7 @@ impl Scheduler {
     pub(super) fn missing_required_feature(
         &self,
         request: &GenerationRequest,
-    ) -> Option<uniserve_core::GenerationFeatures> {
+    ) -> Option<crate::GenerationFeatures> {
         // A block-diffusion runtime generates every request it does not read
         // out in canvases.
         let features = if self.config.canvas.is_some() && !request.is_readout() {

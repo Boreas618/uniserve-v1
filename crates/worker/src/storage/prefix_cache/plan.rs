@@ -11,8 +11,8 @@
 //! (field, column) of one unit; a group's logical page of `block_size`
 //! tokens occupies `units_per_page` units.
 
-use uniserve_core::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
 use uniserve_ipc::PrefixCacheInfo;
+use uniserve_ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
 
 use tvm_ffi::Any;
 

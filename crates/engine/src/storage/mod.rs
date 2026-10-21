@@ -15,8 +15,10 @@
 //! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
-use uniserve_core::ByteAllocator;
 use uniserve_ipc::{RequestKey, WorkerInfo};
+
+mod bytes;
+pub(crate) use bytes::ByteAllocator;
 
 pub(crate) use crate::prefix_cache::CacheAllocation;
 use crate::prefix_cache::{BlockPool, GroupShape, PrefixCacheCoordinator};
@@ -337,7 +339,7 @@ impl PrefixCacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RequestId;
+    use uniserve_ipc::RequestId;
 
     fn owner(id: u64) -> RequestKey {
         RequestKey::new(1, RequestId(id), 1)

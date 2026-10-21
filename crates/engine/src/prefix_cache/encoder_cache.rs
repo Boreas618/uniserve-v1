@@ -1,6 +1,6 @@
 //! Reference-counted cache of worker-resident encoder products.
 //!
-//! Content-derived keys (`uniserve_core::encoder_cache_key`, over the image
+//! Content-derived keys (`crate::encoder_cache_key`, over the image
 //! hash, the encoder's index in the image's encoders, and its encoding call)
 //! map to immutable product references. The scheduler owns this bookkeeping;
 //! the tensors themselves live in worker buffers. Requests pin the entries they read, unpinned
@@ -316,7 +316,7 @@ impl EncoderCacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RequestId;
+    use uniserve_ipc::RequestId;
     use uniserve_ipc::{CallId, DType, RequestKey, ShapeBound};
 
     fn product(generation: u32) -> TensorRef {

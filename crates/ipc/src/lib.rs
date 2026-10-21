@@ -18,10 +18,6 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{
-    CacheGroup, ImageParams, PrefixCacheDtype, RequestId, SamplingParams, TokenLogprob, UnitId,
-};
-pub use uniserve_core::{CallId, ForwardStats, MediaCall};
 
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -38,16 +34,16 @@ impl ValidationError {
     }
 }
 
-impl From<uniserve_core::SamplingParamsError> for ValidationError {
+impl From<SamplingParamsError> for ValidationError {
     /// Converts sampling validation failures into worker-protocol failures.
-    fn from(error: uniserve_core::SamplingParamsError) -> Self {
+    fn from(error: SamplingParamsError) -> Self {
         Self::message(error.to_string())
     }
 }
 
-impl From<uniserve_core::ImageParamsError> for ValidationError {
+impl From<ImageParamsError> for ValidationError {
     /// Converts image validation failures into worker-protocol failures.
-    fn from(error: uniserve_core::ImageParamsError) -> Self {
+    fn from(error: ImageParamsError) -> Self {
         Self::message(error.to_string())
     }
 }
@@ -84,6 +80,9 @@ pub mod launch;
 pub mod launcher;
 pub mod registration;
 
+/// Counter-based random draws of the rank's token sampler.
+pub mod philox;
+
 pub use channel::{Channel, Listener, Wake};
 pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;
@@ -94,21 +93,40 @@ pub use registration::{Registration, VERSION};
 // each module takes the shared imports through `use super::*` and the
 // validation macros through textual scope.
 mod batch;
+mod cache;
 mod call;
 mod command;
 mod config;
+mod identity;
+mod image;
 mod info;
+mod media;
 mod output;
+mod parallel;
 mod request;
+mod sampling;
+mod shared_memory;
+mod stats;
 mod tensor;
 mod transfer;
 
 pub use batch::*;
+pub use cache::*;
 pub use call::*;
 pub use command::*;
 pub use config::{LaneConfig, LaneConfigError, LaneSpec};
+pub use identity::*;
+pub use image::*;
 pub use info::*;
+pub use media::{MediaSource, SharedMedia, SharedMediaError};
 pub use output::*;
+pub use parallel::{
+    ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
+    ParallelConfigError, SequenceParallel,
+};
 pub use request::*;
+pub use sampling::*;
+pub use shared_memory::SharedMemory;
+pub use stats::ForwardStats;
 pub use tensor::*;
 pub use transfer::*;

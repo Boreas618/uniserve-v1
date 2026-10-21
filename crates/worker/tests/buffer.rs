@@ -1,7 +1,7 @@
 //! Physical range binding of scheduler-placed buffers in host arenas.
 
-use uniserve_core::{CallId, RequestId};
 use uniserve_ipc::{BufferAllocation, BufferId, RequestKey};
+use uniserve_ipc::{CallId, RequestId};
 use uniserve_worker::ffi::{Backing, MemoryKind};
 use uniserve_worker::storage::BufferPool;
 use uniserve_worker::storage::LocalMemory;

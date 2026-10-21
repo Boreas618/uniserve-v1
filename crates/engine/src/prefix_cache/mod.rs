@@ -43,8 +43,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use uniserve_core::{CacheGroup, Modality, UnitId};
 use uniserve_ipc::WorkerEndpoint;
+use uniserve_ipc::{CacheGroup, UnitId};
 
 use crate::lock;
 
@@ -67,7 +67,7 @@ pub(crate) use tiers::{RankCache, Tiers};
 pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &[u32]) -> u64 {
     use std::hash::Hasher as _;
 
-    let mut hasher = uniserve_core::Fnv1a::default();
+    let mut hasher = fnv::FnvHasher::default();
     hasher.write(&parent.to_le_bytes());
     hasher.write(&group_id.to_le_bytes());
     hasher.write(&[modality_tag]);
@@ -78,13 +78,10 @@ pub(crate) fn block_hash(parent: u64, group_id: u32, modality_tag: u8, tokens: &
     hasher.finish()
 }
 
-/// Returns the stable byte tag included in modality-specific prefix hashes.
-pub(crate) fn modality_tag(modality: Modality) -> u8 {
-    match modality {
-        Modality::Und => 0,
-        Modality::Gen => 1,
-    }
-}
+/// The modality byte of a page hash: every published page holds text
+/// (understanding-branch) tokens. The byte is part of the page keys the host
+/// KV cache and KV storage find pages by, so its value is fixed.
+pub(crate) const TEXT_MODALITY_TAG: u8 = 0;
 
 /// Ownership state of one physical cache unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1052,8 +1049,7 @@ impl PrefixCacheCoordinator {
                 prompt
                     .chunks_exact(shape.block_size)
                     .map(|tokens| {
-                        parent =
-                            block_hash(parent, group as u32, modality_tag(Modality::Und), tokens);
+                        parent = block_hash(parent, group as u32, TEXT_MODALITY_TAG, tokens);
                         parent
                     })
                     .collect()

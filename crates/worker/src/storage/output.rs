@@ -14,8 +14,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use uniserve_core::TokenLogprob;
 use uniserve_cuda::{DeviceId, Event, SourceOrder};
+use uniserve_ipc::TokenLogprob;
 
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::storage::memory::{Storage, StorageView};

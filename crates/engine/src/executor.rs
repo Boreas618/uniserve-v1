@@ -16,7 +16,7 @@
 //! slot, same-host slots, and whether products cross hosts) and the consumer
 //! slots stated on each producing call.
 
-pub use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
+pub use uniserve_ipc::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
@@ -177,7 +177,7 @@ impl ExecutorInfo {
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
-            let missing = crate::scheduler::graph::task_calls(uniserve_core::VideoTask::T2va)
+            let missing = crate::scheduler::graph::task_calls(models::video::VideoTask::T2va)
                 .into_iter()
                 .filter(|call| !routing.contains_key(call))
                 .map(|call| format!("{call:?}"))
@@ -470,7 +470,7 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
         return Ok(());
     };
     for name in &denoiser.tasks {
-        let Some(task) = uniserve_core::VideoTask::from_name(name) else {
+        let Some(task) = models::video::VideoTask::from_name(name) else {
             anyhow::bail!("the video denoiser serves unknown task {name:?}");
         };
         let missing = crate::scheduler::graph::task_calls(task)
@@ -493,7 +493,7 @@ pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
     pub output: uniserve_ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
-    pub media: Result<Option<Arc<uniserve_core::SharedMedia>>, uniserve_core::SharedMediaError>,
+    pub media: Result<Option<Arc<uniserve_ipc::SharedMedia>>, uniserve_ipc::SharedMediaError>,
 }
 
 /// A decoded physical result that owns media before routing or rank validation.
@@ -529,8 +529,7 @@ impl WorkerResult {
                         let uniserve_ipc::ArtifactHandle::PosixShm { name } = media.handle;
                         // SAFETY: export transfers immutable storage after the writer closes.
                         // The mapping owns the bytes even if this result is rejected downstream.
-                        unsafe { uniserve_core::SharedMedia::open(&name, media.bytes) }
-                            .map(Arc::new)
+                        unsafe { uniserve_ipc::SharedMedia::open(&name, media.bytes) }.map(Arc::new)
                     })
                     .transpose();
                 CallResult { output, media }
@@ -1430,21 +1429,21 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
-                frames: uniserve_core::FrameClips {
+                frames: models::video::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,
                     clip_latent_frames: 5,
                     tail_latent_frames: 2,
                 },
-                canvases: vec![uniserve_core::ServedCanvas {
+                canvases: vec![models::video::ServedCanvas {
                     short_edge: 480,
                     aspect_ratio: "16:9".to_owned(),
-                    canvas: uniserve_core::Canvas {
+                    canvas: models::video::Canvas {
                         width: 832,
                         height: 480,
                     },
                 }],
-                references: uniserve_core::ReferenceLimits::default(),
+                references: models::video::ReferenceLimits::default(),
             }),
             ..WorkerInfo::default()
         }
@@ -1566,7 +1565,7 @@ mod tests {
     fn media_units_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
         let temporal = |ranks: Vec<usize>, units_per_rank: usize| ComponentConfig {
-            distribution: Some(uniserve_core::ComponentDistribution::TemporalUnits),
+            distribution: Some(uniserve_ipc::ComponentDistribution::TemporalUnits),
             units_per_rank,
             ..parallel(ranks)
         };
@@ -1674,21 +1673,21 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
-                frames: uniserve_core::FrameClips {
+                frames: models::video::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,
                     clip_latent_frames: 5,
                     tail_latent_frames: 2,
                 },
-                canvases: vec![uniserve_core::ServedCanvas {
+                canvases: vec![models::video::ServedCanvas {
                     short_edge: 480,
                     aspect_ratio: "16:9".to_owned(),
-                    canvas: uniserve_core::Canvas {
+                    canvas: models::video::Canvas {
                         width: 832,
                         height: 480,
                     },
                 }],
-                references: uniserve_core::ReferenceLimits::default(),
+                references: models::video::ReferenceLimits::default(),
             });
             ExecutorInfo {
                 workers: vec![(WorkerGroupId("model".to_owned()), info)],
@@ -1847,7 +1846,7 @@ mod tests {
             device: "cpu".to_owned(),
         };
         let product = TensorRef {
-            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            request_key: RequestKey::new(1, uniserve_ipc::RequestId(7), 1),
             producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,
@@ -1916,7 +1915,7 @@ mod tests {
         incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
 
         let product = TensorRef {
-            request_key: RequestKey::new(1, uniserve_core::RequestId(7), 1),
+            request_key: RequestKey::new(1, uniserve_ipc::RequestId(7), 1),
             producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,

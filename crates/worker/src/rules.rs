@@ -1,4 +1,4 @@
-//! The MiniMax-H3 request rules of `uniserve-core`, exported to Python.
+//! The MiniMax-H3 request rules of the `models` crate, exported to Python.
 //!
 //! The server plans and presents every request with these rules. The model
 //! package (`uniserve.models.minimax_h3.processing`) reads the parts of them
@@ -15,9 +15,10 @@
 //! These calls run on the caller's thread and touch no rank state: they are
 //! the rules' arithmetic and nothing else.
 
+use models::video::plan;
+use models::video::plan::{MAX_VIDEO_SECONDS, Target, VideoInputError};
+use models::video::{Canvas, FrameClips, ServedCanvas, VideoTask};
 use tvm_ffi::{Any, Array};
-use uniserve_core::video::plan::{self, MAX_VIDEO_SECONDS, Target, VideoInputError};
-use uniserve_core::{Canvas, FrameClips, ServedCanvas, VideoTask};
 
 use crate::ffi::{integer_list, integers, list};
 

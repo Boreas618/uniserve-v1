@@ -28,16 +28,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
-use uniserve_core::{GenerationLimits, ModelDtype, PrefixCacheDtype};
 use uniserve_engine::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
     ExpertExchange, FlashInferBackend, GraphPolicy, LaneConfig, LaneSpec, LoadFormat,
     SchedulingPolicy, TransferConfig, WorkerGroupConfig, WorkerProcessArgs,
 };
+use uniserve_engine::{GenerationLimits, ModelDtype};
+use uniserve_ipc::PrefixCacheDtype;
 
 use crate::profile::ModelDescription;
 use crate::profile::diffusion_gemma::DenoisingOverrides;
@@ -691,7 +692,7 @@ pub struct VideoOptions {
 impl Default for VideoOptions {
     fn default() -> Self {
         Self {
-            max_seconds: uniserve_core::video::plan::MAX_VIDEO_SECONDS,
+            max_seconds: models::video::plan::MAX_VIDEO_SECONDS,
             resolutions: vec!["768p".to_owned()],
             aspect_ratios: vec!["16:9".to_owned(), "9:16".to_owned()],
             text_capacities: None,

@@ -38,8 +38,8 @@ mod denoising;
 use std::sync::Arc;
 
 use tvm_ffi::Any;
-use uniserve_core::ImageParams;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::ImageParams;
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;

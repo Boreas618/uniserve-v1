@@ -2,7 +2,7 @@
 //!
 //! The server publishes every condition's fetched bytes to POSIX shared
 //! memory on the head host and plans how each is prepared
-//! (`uniserve_core::VideoCondition`). One media reading call per conditioned
+//! (`models::video::VideoCondition`). One media reading call per conditioned
 //! request decodes them, in request order, into the request's condition
 //! products:
 //!
@@ -30,10 +30,9 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use models::video::{AudioClip, ConditionMedia, MediaLocator, VideoClip, VideoCondition};
 use tvm_ffi::{Any, AnyView};
-use uniserve_core::{
-    AudioClip, ConditionMedia, MediaLocator, SharedMemory, VideoClip, VideoCondition,
-};
+use uniserve_ipc::SharedMemory;
 
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::storage::memory::{Storage, StorageView};
@@ -492,7 +491,7 @@ fn copy_host(source: &StorageView, destination: &StorageView) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{
+    use models::video::{
         Canvas, ConditionRole, ConditionVision, ImageFit, MediaLocator, VisionGrid,
     };
 
@@ -555,7 +554,7 @@ mod tests {
         let conditions = [
             condition(
                 ConditionMedia::Video {
-                    clip: uniserve_core::VideoClip {
+                    clip: models::video::VideoClip {
                         canvas,
                         start_frame: 0,
                         frames: 7,

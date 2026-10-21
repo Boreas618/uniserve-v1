@@ -1,17 +1,18 @@
-//! Shared byte-address allocation for scheduler and worker startup storage.
+//! First-fit byte-range allocation over a worker storage the scheduler
+//! places products in.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 
 /// First-fit allocation over aligned byte ranges, coalescing on release.
 /// This assigns addresses; the caller owns the backing and its readers.
-pub struct ByteAllocator {
+pub(crate) struct ByteAllocator {
     free: BTreeMap<u64, u64>,
 }
 
 impl ByteAllocator {
     /// Make the complete address space available for allocation.
-    pub fn new(bytes: u64) -> Self {
+    pub(crate) fn new(bytes: u64) -> Self {
         Self {
             free: (bytes > 0).then_some((0, bytes)).into_iter().collect(),
         }
@@ -19,7 +20,7 @@ impl ByteAllocator {
 
     /// Reserve an aligned range without consuming capacity on failure.
     /// Zero sizes and alignments that are not powers of two return None.
-    pub fn allocate(&mut self, bytes: u64, alignment: u32) -> Option<Range<u64>> {
+    pub(crate) fn allocate(&mut self, bytes: u64, alignment: u32) -> Option<Range<u64>> {
         if bytes == 0 || !alignment.is_power_of_two() {
             return None;
         }
@@ -41,7 +42,7 @@ impl ByteAllocator {
     }
 
     /// Return a previously allocated range exactly once, after its readers retire.
-    pub fn free(&mut self, range: Range<u64>) {
+    pub(crate) fn free(&mut self, range: Range<u64>) {
         let mut start = range.start;
         let mut end = range.end;
         if let Some((&left, &bytes)) = self.free.range(..=start).next_back()

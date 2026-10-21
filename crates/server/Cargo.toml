@@ -12,6 +12,7 @@ base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 fastokens.workspace = true
+fnv.workspace = true
 futures.workspace = true
 hf-hub.workspace = true
 http-body.workspace = true
@@ -23,6 +24,7 @@ libc.workspace = true
 llm-multimodal.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
+models.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
 serde.workspace = true
 serde-json-fmt.workspace = true
@@ -39,8 +41,8 @@ toml.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-uniserve-core.workspace = true
 uniserve-engine.workspace = true
+uniserve-ipc.workspace = true
 uniserve-observability.workspace = true
 uniserve-storage.workspace = true
 url.workspace = true
@@ -54,7 +56,6 @@ expect-test.workspace = true
 tokenizers.workspace = true
 tower.workspace = true
 uniserve-engine = { workspace = true, features = ["testing"] }
-uniserve-ipc.workspace = true
 
 [[bench]]
 name = "tokenizer_hf"

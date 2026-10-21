@@ -8,8 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{MediaSource, RequestId, SharedMedia, VideoCondition};
+use models::video::{VideoCondition, VideoTask};
 use std::sync::Arc;
+use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId, SharedMedia, TokenLogprob};
 
 /// Terminal cause for one generation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,18 +46,6 @@ pub enum StopReason {
     String(String),
 }
 
-/// One ranked vocabulary candidate at a generated or prompt token position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TokenLogprob {
-    /// Vocabulary token identity.
-    pub token_id: u32,
-    /// Natural-log probability assigned to the token.
-    pub logprob: f32,
-    /// One-based competition rank at the position; tied log probabilities
-    /// share a rank.
-    pub rank: u32,
-}
-
 /// Ranked candidates for one scored token position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PositionLogprobs {
@@ -65,11 +54,7 @@ pub struct PositionLogprobs {
 }
 
 /// Typed event stream the engine emits for each request, of either kind.
-///
-/// Every event but an `Artifact`, whose media is a mapping of this process,
-/// serializes, so a control-plane handover relays a token request's events
-/// between processes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum EngineCoreOutput {
     /// Reports scheduler admission timing.
     Scheduled {
@@ -172,7 +157,6 @@ pub enum EngineCoreOutput {
         completed_steps: u32,
     },
     /// Publishes a transport-backed media artifact.
-    #[serde(skip)]
     Artifact(ArtifactEvent),
     /// Generated media could not be acquired from its published storage.
     ///
@@ -244,61 +228,6 @@ pub struct ArtifactEvent {
     pub content_type: String,
     /// Mapped payload retained through delivery, job retention, and active downloads.
     pub media: Arc<SharedMedia>,
-}
-
-/// A video raster in pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Canvas {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-}
-
-/// A video-and-audio generation task, by its request name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VideoTask {
-    /// Text to video and audio.
-    T2va,
-    /// First and/or last keyframe to video and audio.
-    Fl2va,
-    /// Image, video and audio references to video and audio.
-    Ref2va,
-}
-
-impl VideoTask {
-    /// Every task, in canonical order.
-    pub const ALL: [Self; 3] = [Self::T2va, Self::Fl2va, Self::Ref2va];
-
-    /// The task's request name.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::T2va => "t2va",
-            Self::Fl2va => "fl2va",
-            Self::Ref2va => "ref2va",
-        }
-    }
-
-    /// The task a request name denotes, if any.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|task| task.as_str() == name)
-    }
-}
-
-/// Effective diffusion controls, resolved once by model preprocessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffusionSamplingParams {
-    /// Number of output frames after model-specific alignment.
-    pub num_frames: u32,
-    /// Video media units the decoder reconstructs, independent of GPU rank count.
-    pub video_units: u32,
-    /// Deterministic request-level noise seed.
-    pub seed: u64,
-    /// Output raster width in pixels: the request's canvas.
-    pub width: u32,
-    /// Output raster height in pixels: the request's canvas.
-    pub height: u32,
 }
 
 /// A video request. Final media bytes are returned through shared storage.
@@ -414,14 +343,14 @@ pub enum Request {
     /// Token generation: autoregressive text, interleaved text and images, or
     /// block-diffusion canvases and readouts. Boxed, as it is several times
     /// the size of a diffusion request.
-    Generation(Box<crate::GenerationRequest>),
+    Generation(Box<crate::generation::GenerationRequest>),
     /// Video diffusion.
     Diffusion(DiffusionRequest),
 }
 
-impl From<crate::GenerationRequest> for Request {
+impl From<crate::generation::GenerationRequest> for Request {
     /// Wraps a token generation request in the shared request enum.
-    fn from(request: crate::GenerationRequest) -> Self {
+    fn from(request: crate::generation::GenerationRequest) -> Self {
         Self::Generation(Box::new(request))
     }
 }

@@ -46,13 +46,24 @@ pub type RequestOutputStream = Pin<Box<dyn Stream<Item = Result<RequestOutput>> 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
 
+/// The 64-bit FNV-1a hash of `bytes`, stable across processes, builds and
+/// platforms. It keys cache isolation and request-derived seeds; it is not
+/// collision resistant.
+pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher as _;
+
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
 /// Folds a request's cache salt into a stable isolation key.
 ///
 /// Returns `None` when the salt is absent, which leaves the request in the shared cache
 /// partition. Otherwise the key is the 64-bit FNV-1a hash of the salt, which is
 /// deterministic across processes.
 pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
-    salt.map(|salt| uniserve_core::Fnv1a::hash(salt.as_bytes()))
+    salt.map(|salt| stable_hash(salt.as_bytes()))
 }
 
 /// Builds the public event stream of one submitted generation request.
@@ -92,8 +103,9 @@ pub(crate) fn media_output(
 #[cfg(test)]
 mod tests {
     use futures::StreamExt as _;
-    use uniserve_core::{EngineCoreOutput, TokenLogprob};
+    use uniserve_engine::EngineCoreOutput;
     use uniserve_engine::EventRx;
+    use uniserve_ipc::TokenLogprob;
 
     use super::*;
     use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -144,7 +156,10 @@ mod tests {
         }
     }
 
-    fn finished(reason: uniserve_core::FinishReason, completion_tokens: usize) -> EngineCoreOutput {
+    fn finished(
+        reason: uniserve_engine::FinishReason,
+        completion_tokens: usize,
+    ) -> EngineCoreOutput {
         EngineCoreOutput::Finished {
             reason,
             stop_reason: None,
@@ -177,7 +192,7 @@ mod tests {
                     rank: 3,
                 }],
             },
-            finished(uniserve_core::FinishReason::MaxTokens, 1),
+            finished(uniserve_engine::FinishReason::MaxTokens, 1),
         ]);
         let outputs = output(
             ChatOutputProcessor::default(),
@@ -219,7 +234,7 @@ mod tests {
     /// publishes none) returns no text. The prompt seeds decoding only.
     #[tokio::test]
     async fn a_request_without_generated_tokens_has_no_text() {
-        let events = engine_events([finished(uniserve_core::FinishReason::Eos, 1)]);
+        let events = engine_events([finished(uniserve_engine::FinishReason::Eos, 1)]);
         let outputs = output(
             ChatOutputProcessor::default(),
             TextDecodeOptions::default(),
@@ -263,7 +278,7 @@ mod tests {
                     text_token(b'x'),
                     text_token(b' '),
                     text_token(b'<'),
-                    finished(uniserve_core::FinishReason::MaxTokens, 3),
+                    finished(uniserve_engine::FinishReason::MaxTokens, 3),
                 ],
                 None,
                 "x <",

@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use uniserve_core::{ArtifactEvent, RejectionKind};
+use uniserve_engine::{ArtifactEvent, RejectionKind};
 
-pub use uniserve_core::StopReason;
+pub use uniserve_engine::StopReason;
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantToolCall};
 use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs};
@@ -40,10 +40,10 @@ impl FinishReason {
     /// Maps the engine's finish reason and stop cause; `None` for an engine
     /// error, which fails the request.
     pub fn from_engine(
-        reason: uniserve_core::FinishReason,
+        reason: uniserve_engine::FinishReason,
         stop_reason: Option<StopReason>,
     ) -> Option<Self> {
-        use uniserve_core::FinishReason as Engine;
+        use uniserve_engine::FinishReason as Engine;
         Some(match reason {
             Engine::Completed | Engine::Eos | Engine::Stop | Engine::ImageDone => {
                 Self::Stop(stop_reason)

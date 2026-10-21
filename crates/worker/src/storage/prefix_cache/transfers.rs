@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_core::CallId;
+use uniserve_ipc::CallId;
 use uniserve_ipc::{BufferId, CacheTransfer, RequestKey};
 
 use crate::{BlockTables, Error, Result};
@@ -213,7 +213,7 @@ fn validate_next_base(
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{CallId, RequestId};
+    use uniserve_ipc::{CallId, RequestId};
 
     use super::*;
 

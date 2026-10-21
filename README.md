@@ -195,7 +195,7 @@ For decision-session replay, use the `systemone` dataset with a non-empty `sessi
 The [architecture guide](docs/architecture.md) describes how the head, the launchers and the rank processes divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
 
 ```text
-crates/core/                  Shared values and the engine-process codec
+crates/models/                Model-family request semantics: the MiniMax-H3 video rules
 crates/observability/         Runtime metrics and process registry
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
 crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime

@@ -31,13 +31,12 @@ use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats, SchedulingPolicy};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
+use crate::{CommandWaker, GenerationLimits, ModelDtype, Request};
 use anyhow::Context as _;
 #[cfg(test)]
-use uniserve_core::ComponentDistribution;
-use uniserve_core::{
-    CommandWaker, ComponentConfig, GenerationLimits, ModelDtype, ParallelConfig, Request, RequestId,
-};
+use uniserve_ipc::ComponentDistribution;
 use uniserve_ipc::WorkerInfo;
+use uniserve_ipc::{ComponentConfig, ParallelConfig, RequestId};
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

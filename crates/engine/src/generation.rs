@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use uniserve_ipc::{
     ImageParams, ImageParamsError, MediaCall, RequestId, SamplingParams, SamplingParamsError,
 };
 
@@ -105,68 +105,6 @@ pub struct ReadoutSlot {
     pub candidates: Vec<u32>,
 }
 
-/// Block-diffusion sampling of a deployment's canvases.
-///
-/// Text is generated in blocks of `canvas_length` tokens. A block starts as
-/// uniformly random tokens and is denoised for at most `max_steps` steps: a
-/// step samples every position from the model's logits at a temperature that
-/// falls linearly from `t_max` to `t_min`, accepts the lowest-entropy samples
-/// within `entropy_bound` and renoises the others. A block stops early once
-/// its argmax canvas has held for `stability_threshold` steps and its mean
-/// entropy is below `confidence_threshold`. The block's argmax canvas is then
-/// committed to the request's context as causal prompt, and the next block
-/// follows it. Every draw follows the request's `SamplingParams::seed`.
-///
-/// The deployment's launch configuration owns the sampling: every request a
-/// block-diffusion runtime generates, rather than reads out, runs under it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct CanvasSampling {
-    /// Tokens of one block.
-    pub canvas_length: u32,
-    /// Denoising steps a block runs at most.
-    pub max_steps: u32,
-    /// Entropy, in nats, the accepted samples of one step may carry beyond
-    /// the largest one.
-    pub entropy_bound: f32,
-    /// Sampling temperature of a block's last step.
-    pub t_min: f32,
-    /// Sampling temperature of a block's first step.
-    pub t_max: f32,
-    /// Mean canvas entropy, in nats, below which a stable block stops; zero
-    /// never stops a block early.
-    pub confidence_threshold: f32,
-    /// Steps the argmax canvas must hold unchanged before a block stops;
-    /// zero stops a block on confidence alone.
-    pub stability_threshold: u32,
-}
-
-impl CanvasSampling {
-    /// Returns the first parameter outside the domain the block-diffusion
-    /// sampler takes, if any: a positive canvas length and step limit, a
-    /// positive entropy bound, temperatures with `0 <= t_min < t_max`, and a
-    /// non-negative confidence threshold, all finite. A zero stability
-    /// threshold stops a block on confidence alone, and a zero confidence
-    /// threshold runs every block for all its steps.
-    pub fn invalid_parameter(&self) -> Option<&'static str> {
-        let positive = |value: f32| value.is_finite() && value > 0.0;
-        if self.canvas_length == 0 {
-            Some("canvas_length")
-        } else if self.max_steps == 0 {
-            Some("max_steps")
-        } else if !positive(self.entropy_bound) {
-            Some("entropy_bound")
-        } else if !(self.t_min.is_finite() && self.t_min >= 0.0) {
-            Some("t_min")
-        } else if !(self.t_max.is_finite() && self.t_max > self.t_min) {
-            Some("t_max")
-        } else if !(self.confidence_threshold.is_finite() && self.confidence_threshold >= 0.0) {
-            Some("confidence_threshold")
-        } else {
-            None
-        }
-    }
-}
-
 /// An encoded image and the model's requirements for adding it to context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageInput {
@@ -232,7 +170,7 @@ pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: MediaCa
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the encoder index distinguishes repeated encoder kinds within one image
     // input.
-    let mut hasher = crate::Fnv1a::default();
+    let mut hasher = fnv::FnvHasher::default();
     hasher.write(&image_hash.to_le_bytes());
     hasher.write(&(encoder_index as u64).to_le_bytes());
     hasher.write(&[encoder as u8]);

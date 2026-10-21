@@ -11,7 +11,7 @@
 
 use std::ops::Range;
 
-use uniserve_core::CanvasSampling;
+use uniserve_ipc::CanvasSampling;
 use uniserve_ipc::{Batch, Call, CanvasStep, ForwardBatch, NewRequest};
 
 use crate::storage::{AttentionRow, TablePages};
@@ -257,7 +257,7 @@ pub(crate) fn step_row(
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{CallId, RequestId, SamplingParams};
+    use uniserve_ipc::{CallId, RequestId, SamplingParams};
     use uniserve_ipc::{CallKind, ForwardMode, GenerationParams, Readout, RequestKey};
 
     use super::*;

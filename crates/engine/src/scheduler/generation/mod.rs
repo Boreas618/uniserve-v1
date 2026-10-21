@@ -23,13 +23,12 @@ use crate::prefix_cache::{BlockTable, CacheAllocation};
 
 use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
-use uniserve_core::{
-    CanvasSampling, GenerationRequest, ImageEncoderInput, ImageInput, RequestId, SamplingParams,
-};
+use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use uniserve_ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
     Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
+use uniserve_ipc::{CanvasSampling, RequestId, SamplingParams};
 
 /// Builds an unstamped product reference for a planned call output.
 ///
@@ -435,7 +434,7 @@ impl RequestState {
 /// Builds the immutable auxiliary feature product produced by an encode call.
 fn encoder_output(
     encoder: MediaCall,
-    limits: &uniserve_core::GenerationLimits,
+    limits: &crate::GenerationLimits,
 ) -> Result<TensorRef, PlanningError> {
     // An image encoder is a latent or a vision encoding call
     // (`GenerationRequest::validate`).
@@ -673,9 +672,9 @@ pub(super) fn plan_decode(
 /// predicate that feedback writes report. `sample_continuation` declares a
 /// sampled-token output.
 pub(super) fn plan_image_extend(
-    limits: &uniserve_core::GenerationLimits,
+    limits: &crate::GenerationLimits,
     request: &GenerationRequest,
-    encoder: uniserve_core::ImageEncoderInput,
+    encoder: crate::ImageEncoderInput,
     feature: TensorRef,
     feedback: bool,
     sample_continuation: bool,
@@ -707,7 +706,7 @@ pub(super) fn plan_image_extend(
 /// feedback or a feedback source, and with `MissingImageInput` for an
 /// input-image encode that has neither bytes nor a source.
 pub(super) fn plan_encode(
-    limits: &uniserve_core::GenerationLimits,
+    limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     step: MediaCall,
     image_base64: String,
@@ -777,7 +776,7 @@ pub(super) fn plan_cache_export(
 
 /// Creates initial noise from the image's deterministic RNG coordinate and conditioning.
 pub(super) fn plan_diffusion_prepare(
-    limits: &uniserve_core::GenerationLimits,
+    limits: &crate::GenerationLimits,
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     image_id: u32,
@@ -800,7 +799,7 @@ pub(super) fn plan_diffusion_prepare(
 
 /// Plans one denoising step against its input latent and conditioning tensors.
 pub(super) fn plan_diffusion_step(
-    limits: &uniserve_core::GenerationLimits,
+    limits: &crate::GenerationLimits,
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     conditioning: BufferId,
@@ -870,8 +869,7 @@ fn finish_plan(
 /// Encoded PNG bytes are delivered separately through the completion media handle.
 fn feedback_image_output(request: &GenerationRequest) -> Result<Option<TensorRef>, PlanningError> {
     if request.feeds_back_images()
-        && request.image_generation.feedback_source
-            == Some(uniserve_core::FeedbackSource::DeviceProduct)
+        && request.image_generation.feedback_source == Some(crate::FeedbackSource::DeviceProduct)
     {
         return Ok(Some(bounded_tensor(
             1,
@@ -892,7 +890,7 @@ fn feedback_image_output(request: &GenerationRequest) -> Result<Option<TensorRef
 /// Failure while constructing the next worker call.
 pub(crate) enum PlanningError {
     #[error(transparent)]
-    Capacity(#[from] uniserve_core::GenerationResourceError),
+    Capacity(#[from] crate::GenerationResourceError),
     #[error("invalid prompt range {start}..{end} for {prompt_tokens} input tokens")]
     InvalidPromptRange {
         start: u32,

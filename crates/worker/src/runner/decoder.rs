@@ -40,8 +40,8 @@ pub(crate) mod warmup;
 
 use std::sync::Arc;
 
+use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_core::Canvas;
 use uniserve_cuda::{CopyBatch, SourceOrder, Stream};
 
 use crate::config::Device;

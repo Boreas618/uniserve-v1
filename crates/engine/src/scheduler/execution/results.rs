@@ -26,7 +26,7 @@ impl Scheduler {
     pub(in crate::scheduler) fn queue_completion(
         &mut self,
         mut record: uniserve_ipc::CallOutput,
-        media: Result<Option<Arc<SharedMedia>>, uniserve_core::SharedMediaError>,
+        media: Result<Option<Arc<SharedMedia>>, uniserve_ipc::SharedMediaError>,
     ) {
         let id = record.request_key.request_id;
         let call_id = record.call_id;

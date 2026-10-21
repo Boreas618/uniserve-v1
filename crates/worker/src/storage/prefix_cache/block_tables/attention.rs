@@ -165,7 +165,7 @@ impl BlockTables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::UnitId;
+    use uniserve_ipc::UnitId;
 
     #[test]
     fn window_pages_split_layer_units_and_keep_full_history() -> Result<()> {

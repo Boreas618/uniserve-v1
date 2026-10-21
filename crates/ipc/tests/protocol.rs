@@ -13,11 +13,11 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use uniserve_core::{
+use uniserve_ipc::*;
+use uniserve_ipc::{
     CacheGroup, CacheGroupKind, CfgRenorm, ImageParams, RequestId, SamplingParams, TokenLogprob,
     UnitId,
 };
-use uniserve_ipc::*;
 
 /// Returns `message` as a receiver decodes it from the frame a sender made.
 fn round_trip<M: Serialize + serde::de::DeserializeOwned>(message: &M) -> M {
@@ -229,7 +229,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
         prompt_token_ids,
         media_sampling(),
         VideoAdmission {
-            task: uniserve_core::VideoTask::T2va,
+            task: models::video::VideoTask::T2va,
             text_tags,
             conditions: Vec::new(),
         },
@@ -239,8 +239,8 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
 
 /// One condition of each media kind: a cover-cropped keyframe, an image
 /// reference, a video reference with its soundtrack and an audio reference.
-fn reference_conditions() -> Vec<uniserve_core::VideoCondition> {
-    use uniserve_core::{
+fn reference_conditions() -> Vec<models::video::VideoCondition> {
+    use models::video::{
         AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, MediaLocator,
         VideoClip, VideoCondition, VisionGrid,
     };
@@ -1279,7 +1279,7 @@ fn conditioned_media_admission_round_trips() {
         vec![5, 6, 7, 8],
         media_sampling(),
         VideoAdmission {
-            task: uniserve_core::VideoTask::Ref2va,
+            task: models::video::VideoTask::Ref2va,
             text_tags: vec![1, 0, 0, 1],
             conditions: reference_conditions(),
         },
@@ -1318,10 +1318,10 @@ fn inconsistent_media_admissions_are_refused() {
             },
         )
     };
-    assert!(admit(uniserve_core::VideoTask::T2va, vec![1, 1], Vec::new()).is_err());
+    assert!(admit(models::video::VideoTask::T2va, vec![1, 1], Vec::new()).is_err());
     assert!(
         admit(
-            uniserve_core::VideoTask::T2va,
+            models::video::VideoTask::T2va,
             vec![1, 1, 1],
             reference_conditions()
         )
@@ -1329,7 +1329,7 @@ fn inconsistent_media_admissions_are_refused() {
     );
     assert!(
         admit(
-            uniserve_core::VideoTask::Ref2va,
+            models::video::VideoTask::Ref2va,
             vec![1, 1, 1],
             reference_conditions()
         )
@@ -1664,7 +1664,7 @@ fn worker_info_round_trips() {
 /// both forms must decode, each with its own units per rank.
 #[test]
 fn a_component_round_trips_with_and_without_a_distribution() {
-    use uniserve_core::{ComponentConfig, ComponentDistribution, ParallelConfig};
+    use uniserve_ipc::{ComponentConfig, ComponentDistribution, ParallelConfig};
 
     let grouped = ComponentConfig::parallel(vec![0], ParallelConfig::default());
     let distributed = ComponentConfig {
@@ -1682,7 +1682,7 @@ fn a_component_round_trips_with_and_without_a_distribution() {
 /// included.
 #[test]
 fn a_component_round_trips_with_every_sequence_parallel_strategy() {
-    use uniserve_core::{ComponentConfig, ParallelConfig, SequenceParallel};
+    use uniserve_ipc::{ComponentConfig, ParallelConfig, SequenceParallel};
 
     let strategies = [
         SequenceParallel::Local,

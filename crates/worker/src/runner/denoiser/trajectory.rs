@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use uniserve_core::VideoCondition;
+use models::video::VideoCondition;
 use uniserve_ipc::Batch as BatchPlan;
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs};

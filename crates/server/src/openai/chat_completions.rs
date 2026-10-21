@@ -34,7 +34,7 @@ use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
 use tracing_futures::Instrument as _;
-use uniserve_core::GenerationConstraint;
+use uniserve_engine::GenerationConstraint;
 
 use crate::engine::Engine;
 use crate::http::RequestId;
@@ -92,7 +92,7 @@ async fn chat_completions(
     );
 
     // One timestamp for the whole response, shared by every streamed chunk.
-    let created = uniserve_core::now_unix_secs_u64();
+    let created = crate::openai::unix_time();
 
     let serve_stream = match engine
         .generate(request)

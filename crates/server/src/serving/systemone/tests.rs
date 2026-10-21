@@ -29,7 +29,7 @@ use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
-use uniserve_core::CanvasSampling;
+use uniserve_ipc::CanvasSampling;
 
 const SPECIAL_TOKENS: [&str; 11] = [
     "<pad>",

@@ -22,8 +22,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 
+use crate::{CanvasSampling, ComponentConfig};
 use serde::{Deserialize, Serialize};
-use uniserve_core::{CanvasSampling, ComponentConfig};
 
 use crate::LaneConfig;
 

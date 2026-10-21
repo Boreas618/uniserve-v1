@@ -40,7 +40,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uniserve_core::{ReadoutRow, ReadoutSlot};
+use uniserve_engine::{ReadoutRow, ReadoutSlot};
 
 use crate::options::ReadoutOptions;
 use crate::profile::assets::ResolvedModelFiles;

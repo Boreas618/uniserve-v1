@@ -5,9 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use uniserve_core::SamplingParams;
-use uniserve_core::philox::{request_sampling_key, sampling_uniform};
 use uniserve_ipc::Call;
+use uniserve_ipc::SamplingParams;
+use uniserve_ipc::philox::{request_sampling_key, sampling_uniform};
 
 use crate::Result;
 

@@ -1,10 +1,10 @@
 //! Resolve numerical completion into accepted request progress and wire output.
 
-use uniserve_core::{CallId, MediaSource};
 use uniserve_ipc::{
     ArtifactHandle, BatchOutput, Call, CallOutput, CallStatus, ErrorCode, MediaOutput, RequestKey,
     TensorExport, TensorRef, TimingCounters,
 };
+use uniserve_ipc::{CallId, MediaSource};
 
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
 
@@ -442,12 +442,12 @@ fn token_id(value: i64) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{CallId, MediaSource, RequestId, SharedMedia};
     use uniserve_ipc::{
         BatchOutput, Call, CallKind, DType, LatentParams, Locator, MediaCall, RequestKey,
         ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle, TransferTransport,
         WorkerInfo,
     };
+    use uniserve_ipc::{CallId, MediaSource, RequestId, SharedMedia};
 
     use super::*;
     use crate::storage::TrajectoryVersion;

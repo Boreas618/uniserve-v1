@@ -8,7 +8,7 @@
 //! service; Python computes through the library functions Rust imports by
 //! path.
 //!
-//! The library also exports the video request rules of `uniserve-core` to
+//! The library also exports the video request rules of the `models` crate to
 //! the Python library, which plans MiniMax-H3 requests with them.
 //!
 //! Besides that entry point the crate exposes only what its integration

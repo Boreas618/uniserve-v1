@@ -6,7 +6,7 @@ use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use uniserve_core::CallId;
+use uniserve_ipc::CallId;
 use uniserve_ipc::{RequestKey, TensorRef};
 
 /// A relay lane: its memory, request slot and lane index.

@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_core::ImageParams;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::ImageParams;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
     MediaCall, RequestKey,
@@ -923,7 +923,7 @@ impl HostStage for Encodings {
                         && output.reports_output
                     {
                         let source =
-                            uniserve_core::MediaSource::publish(bytes).map_err(|error| {
+                            uniserve_ipc::MediaSource::publish(bytes).map_err(|error| {
                                 Error::Invalid(format!(
                                     "publishing an encoded image failed: {error}"
                                 ))

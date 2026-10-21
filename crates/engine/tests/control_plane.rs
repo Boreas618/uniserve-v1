@@ -36,17 +36,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use uniserve_ipc::{Call, CallKind, ForwardMode, MediaCall, TransferMode};
 
-use uniserve_core::{EngineCoreOutput, FinishReason};
-use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger,
-    MultimodalInputs, RejectionKind, RequestId, SamplingParams,
-};
 use uniserve_engine::{
     BatchEvent, BatchResult, EVENT_BUFFER_CAPACITY, EngineHandle, ExecutionBatch, Executor,
     ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SchedulingPolicy, SimEngine,
     SimExecutor, SpecialTokenIds, WorkerGroupId,
 };
+use uniserve_engine::{EngineCoreOutput, FinishReason};
+use uniserve_engine::{
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
+    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs,
+    RejectionKind,
+};
+use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
 /// EOS, so the simulator's end of text finishes requests with `Eos`.
@@ -60,7 +61,7 @@ fn special_tokens() -> SpecialTokenIds {
 /// call enables only its own feature.
 #[test]
 fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
-    use uniserve_core::GenerationFeatures;
+    use uniserve_engine::GenerationFeatures;
 
     let image_path = vec![
         CallKind::Media(MediaCall::LatentPreparation),
@@ -434,9 +435,9 @@ fn generation_request(
 
     let cache = Default::default();
     let limits = GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING
-            | uniserve_core::GenerationFeatures::VISION_ENCODE
-            | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
+        features: uniserve_engine::GenerationFeatures::UNDERSTANDING
+            | uniserve_engine::GenerationFeatures::VISION_ENCODE
+            | uniserve_engine::GenerationFeatures::IMAGE_GENERATION,
         max_latent_units: 65_536,
         latent_downsample: 16,
         max_vae_grid_tokens: 65_536,
@@ -1460,7 +1461,7 @@ fn stop_string_cutoff_is_request_local() {
 #[test]
 fn hybrid_groups_share_one_unit_pool() {
     use std::sync::atomic::Ordering;
-    use uniserve_core::{CacheGroup, CacheGroupKind};
+    use uniserve_ipc::{CacheGroup, CacheGroupKind};
 
     let mut sim = SimEngine::new();
     sim.set_queue_depth(2);
@@ -1686,7 +1687,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
             GenerationConstraint::UndOnly,
             8,
         );
-        request.cache = uniserve_core::CachePolicy {
+        request.cache = uniserve_engine::CachePolicy {
             read,
             write,
             isolation_key: Some(isolation_key),

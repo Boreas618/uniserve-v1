@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/core",
+    "crates/models",
     "crates/observability",
     "crates/ipc",
     "crates/cuda",
@@ -23,7 +23,7 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-uniserve-core = { path = "crates/core" }
+models = { path = "crates/models" }
 uniserve-observability = { path = "crates/observability" }
 uniserve-ipc = { path = "crates/ipc" }
 uniserve-cuda = { path = "crates/cuda" }
@@ -47,6 +47,8 @@ axum = { version = "0.8.4", features = ["multipart"] }
 base64 = "0.22.1"
 # Byte views of plain numeric slices handed to device copies.
 bytemuck = "1.25.0"
+# Stable 64-bit FNV-1a, which keys pages and cache isolation across builds.
+fnv = "1.0.7"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }

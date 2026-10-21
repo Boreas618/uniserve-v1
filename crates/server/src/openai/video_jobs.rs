@@ -24,7 +24,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use uniserve_core::SharedMedia;
+use uniserve_ipc::SharedMedia;
 
 use crate::options::VideoJobOptions;
 use crate::serving::RequestOutput;
@@ -334,7 +334,7 @@ impl VideoJobs {
             return;
         };
 
-        let now = uniserve_core::now_unix_secs_u64();
+        let now = crate::openai::unix_time();
         job.record.completed_at = Some(now);
         job.record.expires_at = Some(now + self.settings.retention.as_secs());
         match result {
@@ -403,7 +403,7 @@ mod tests {
             id: id.to_owned(),
             object: "video",
             model: "FastH3".to_owned(),
-            created_at: uniserve_core::now_unix_secs_u64(),
+            created_at: crate::openai::unix_time(),
             completed_at: None,
             expires_at: None,
             seconds: 5.0,

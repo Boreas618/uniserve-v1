@@ -34,20 +34,18 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use uniserve_core::{
-    DiffusionRequest, DiffusionSamplingParams, EngineCoreOutput, Request, RequestId,
-    SamplingParams, UnitId,
-};
 use uniserve_engine::{
     CallReaders, EngineConfig, EngineCore, Executor, RankBuffer, WorkerFailure, WorkerGroup,
     WorkerGroupConfig, WorkerProcessArgs,
 };
+use uniserve_engine::{DiffusionRequest, EngineCoreOutput, Request};
 use uniserve_ipc::{
     Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call,
     CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode, ForwardBatch, ForwardMode,
     GenerationParams, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
     ShapeBound, TensorRef, TransferMode,
 };
+use uniserve_ipc::{DiffusionSamplingParams, RequestId, SamplingParams, UnitId};
 
 const WORLD_SIZE: usize = 2;
 const QUEUE_DEPTH: usize = 2;
@@ -1366,7 +1364,7 @@ fn first_token_logprobs(
     request_id: u64,
     slot: u32,
     top_p: f32,
-) -> anyhow::Result<Vec<uniserve_core::TokenLogprob>> {
+) -> anyhow::Result<Vec<uniserve_ipc::TokenLogprob>> {
     let mut admission = text_admission(request_id, 1, slot)?;
     let sampling = &mut admission.generation.as_mut().unwrap().sampling;
     sampling.top_p = top_p;
@@ -1893,8 +1891,8 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut config = EngineConfig::sim("stub");
-    config.generation_limits = uniserve_core::GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+    config.generation_limits = uniserve_engine::GenerationLimits {
+        features: uniserve_engine::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
         max_cfg_branches: 1,
         ..Default::default()
@@ -1950,8 +1948,8 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
     let mut config = EngineConfig::sim("stub");
-    config.generation_limits = uniserve_core::GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+    config.generation_limits = uniserve_engine::GenerationLimits {
+        features: uniserve_engine::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
         max_cfg_branches: 1,
         ..Default::default()
@@ -1985,12 +1983,12 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
             thread::sleep(Duration::from_millis(20));
         }
 
-        let mut events = engine.submit(Request::from(uniserve_core::GenerationRequest {
+        let mut events = engine.submit(Request::from(uniserve_engine::GenerationRequest {
             request_id: RequestId(81),
             prompt_token_ids: vec![7, 8],
             negative_prompt_token_ids: Vec::new(),
             multimodal_inputs: Default::default(),
-            constraint: uniserve_core::GenerationConstraint::Default,
+            constraint: uniserve_engine::GenerationConstraint::Default,
             sampling: SamplingParams::default(),
             image: Default::default(),
             max_images: 1,
@@ -2075,8 +2073,8 @@ fn launched_workers_hold_a_request_row_per_running_request() -> anyhow::Result<(
     const RUNNING: usize = 200;
 
     let mut config = EngineConfig::sim("stub");
-    config.generation_limits = uniserve_core::GenerationLimits {
-        features: uniserve_core::GenerationFeatures::UNDERSTANDING,
+    config.generation_limits = uniserve_engine::GenerationLimits {
+        features: uniserve_engine::GenerationFeatures::UNDERSTANDING,
         latent_downsample: 1,
         max_cfg_branches: 1,
         ..Default::default()
@@ -2112,7 +2110,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         .with_max_level(tracing::Level::ERROR)
         .try_init();
     let mut config = EngineConfig::sim("stub");
-    config.generation_limits = uniserve_core::GenerationLimits {
+    config.generation_limits = uniserve_engine::GenerationLimits {
         latent_downsample: 1,
         max_cfg_branches: 1,
         ..Default::default()
@@ -2145,7 +2143,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
             let prompt_token_ids = vec![100_000 + index as u32];
             let events = engine.submit(Request::Diffusion(DiffusionRequest {
                 request_id,
-                task: uniserve_core::VideoTask::T2va,
+                task: models::video::VideoTask::T2va,
                 text_tags: vec![1; prompt_token_ids.len()],
                 prompt_token_ids,
                 conditions: Vec::new(),
@@ -2795,7 +2793,7 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             height: 768,
         },
         uniserve_ipc::VideoAdmission {
-            task: uniserve_core::VideoTask::T2va,
+            task: models::video::VideoTask::T2va,
             text_tags: vec![1],
             conditions: Vec::new(),
         },
@@ -3719,13 +3717,13 @@ mod trajectory {
             initial_position: 0,
             generated_token_ids: Vec::new(),
         };
-        let image = uniserve_core::ImageParams {
+        let image = uniserve_ipc::ImageParams {
             steps: IMAGE_STEPS as u16,
             height: SIDE,
             width: SIDE,
             seed: Some(7),
             cfg_text_scale: 1.0,
-            ..uniserve_core::ImageParams::default()
+            ..uniserve_ipc::ImageParams::default()
         };
         Ok(NewRequest::new(
             RequestKey::new(1, RequestId(request_id), 1),
@@ -4296,7 +4294,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
                     &retire,
                     "target",
                     edges,
-                    Some(uniserve_core::PrefixCacheDtype::Float16),
+                    Some(uniserve_ipc::PrefixCacheDtype::Float16),
                 )?,
             ),
         ],
@@ -4640,7 +4638,7 @@ fn cuda_worker(
     retire: &Retire,
     worker_id: &str,
     edges: &str,
-    prefix_cache_dtype: Option<uniserve_core::PrefixCacheDtype>,
+    prefix_cache_dtype: Option<uniserve_ipc::PrefixCacheDtype>,
 ) -> anyhow::Result<WorkerGroup> {
     let mut args = single_worker_args(worker_id, QUEUE_DEPTH);
     for rank in &mut args.ranks {
@@ -4826,7 +4824,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
         // mappings keep the bytes.
         assert!(
             // SAFETY: the rank handed off an immutable, completed export.
-            unsafe { uniserve_core::SharedMedia::open(published_name.trim(), 1) }.is_err(),
+            unsafe { uniserve_ipc::SharedMedia::open(published_name.trim(), 1) }.is_err(),
             "unclaimed media in {case}"
         );
         if rejected {
@@ -4956,8 +4954,7 @@ fn media_worker() -> anyhow::Result<()> {
                 if descriptor.rank == media_rank
                     && let Some(completion) = completions.first_mut()
                 {
-                    let locator =
-                        uniserve_core::MediaSource::publish(MEDIA_PAYLOAD)?.into_locator();
+                    let locator = uniserve_ipc::MediaSource::publish(MEDIA_PAYLOAD)?.into_locator();
                     std::fs::write(std::env::var(MEDIA_WORKER_NAME)?, &locator.name)?;
                     completion.media_output = Some(MediaOutput {
                         handle: ArtifactHandle::PosixShm { name: locator.name },
@@ -5051,15 +5048,15 @@ fn a_failed_external_input_fails_the_calls_reading_it() -> anyhow::Result<()> {
 /// The components the stub model declares, each on its own rank of a
 /// two-rank group: the language backbone on rank 1 and the patch encoder on
 /// rank 0.
-fn split_components() -> std::collections::BTreeMap<String, uniserve_core::ComponentConfig> {
+fn split_components() -> std::collections::BTreeMap<String, uniserve_ipc::ComponentConfig> {
     [
         (
             "model".into(),
-            uniserve_core::ComponentConfig::parallel(vec![1], Default::default()),
+            uniserve_ipc::ComponentConfig::parallel(vec![1], Default::default()),
         ),
         (
             "vision_encoder".into(),
-            uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
+            uniserve_ipc::ComponentConfig::parallel(vec![0], Default::default()),
         ),
     ]
     .into_iter()
@@ -5073,11 +5070,11 @@ fn single_worker_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs 
     let components = std::collections::BTreeMap::from([
         (
             "model".into(),
-            uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
+            uniserve_ipc::ComponentConfig::parallel(vec![0], Default::default()),
         ),
         (
             "vision_encoder".into(),
-            uniserve_core::ComponentConfig::parallel(vec![0], Default::default()),
+            uniserve_ipc::ComponentConfig::parallel(vec![0], Default::default()),
         ),
     ]);
     let binding =

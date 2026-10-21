@@ -474,7 +474,7 @@ impl Scheduler {
         }
         if matches!(
             state.req.image_generation.trigger,
-            uniserve_core::ImageTrigger::RoundCloseThenSuffix { .. }
+            crate::ImageTrigger::RoundCloseThenSuffix { .. }
         ) {
             return false;
         }
@@ -600,7 +600,7 @@ impl Scheduler {
         let chainable = if last.kind == CallKind::Media(MediaCall::ImageDecoding) {
             state.req.feeds_back_images()
                 && state.req.image_generation.feedback_source
-                    == Some(uniserve_core::FeedbackSource::DeviceProduct)
+                    == Some(crate::FeedbackSource::DeviceProduct)
         } else if consumes_image_features(last)
             && is_feedback_call(last)
             && self.scheduled_feedback(id)?.0 == 0

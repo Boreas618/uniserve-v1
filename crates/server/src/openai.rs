@@ -38,6 +38,16 @@ pub(crate) fn models_router(engine: Arc<Engine>) -> Router {
         .with_state(engine)
 }
 
+/// The current wall-clock time in whole seconds since the Unix epoch, as the
+/// `created` field of OpenAI objects states it; times before the epoch clamp
+/// to zero.
+pub(crate) fn unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Returns the served model in OpenAI `list models` format.
 ///
 /// A server serves exactly one model, so the list always has one entry, named
@@ -45,7 +55,7 @@ pub(crate) fn models_router(engine: Arc<Engine>) -> Router {
 async fn list_models(State(engine): State<Arc<Engine>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; the listing
     // reports the time it was produced.
-    let created = uniserve_core::now_unix_secs_u64() as i64;
+    let created = unix_time() as i64;
     Json(ListModelsResponse {
         object: "list".to_string(),
         data: vec![ModelObject {

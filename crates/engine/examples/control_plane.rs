@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::EngineCoreOutput;
-use uniserve_core::{
-    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger, MediaCall, ModelDtype,
-    RequestId, SamplingParams,
-};
+use uniserve_engine::EngineCoreOutput;
 use uniserve_engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
+use uniserve_engine::{
+    FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
+    ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
+};
+use uniserve_ipc::{ImageParams, MediaCall, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
@@ -67,8 +67,8 @@ fn main() -> anyhow::Result<()> {
         // These limits only check the request locally before submission; the
         // scheduler resolves its limits separately against the executor.
         let limits = GenerationLimits {
-            features: uniserve_core::GenerationFeatures::UNDERSTANDING
-                | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
+            features: uniserve_engine::GenerationFeatures::UNDERSTANDING
+                | uniserve_engine::GenerationFeatures::IMAGE_GENERATION,
             max_latent_units: 64,
             latent_downsample: 16,
             max_vae_grid_tokens: 64,

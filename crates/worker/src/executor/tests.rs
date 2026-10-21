@@ -12,11 +12,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_core::{CallId, RequestId, SamplingParams};
 use uniserve_ipc::{
     Batch as Plan, BatchCommand, BufferAllocation, DType as WireDType, DimBound, GenerationParams,
     NewRequest, RequestKey, ShapeBound, TensorRef, WorkerInfo,
 };
+use uniserve_ipc::{CallId, RequestId, SamplingParams};
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::{Batch, Executor, Submission};

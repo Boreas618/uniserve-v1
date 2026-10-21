@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_core::ImageParams;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::ImageParams;
 use uniserve_ipc::{ForwardStats, LatentParams, RequestKey};
 
 use super::{DenoiseRow, IntegrateRow};
@@ -126,7 +126,7 @@ impl ImageBatch<'_> {
 
     /// Validate call `index`'s allocation against its admitted image and
     /// return the admission.
-    fn trajectory(&self, index: usize) -> Result<(Trajectory, uniserve_core::ImageParams)> {
+    fn trajectory(&self, index: usize) -> Result<(Trajectory, uniserve_ipc::ImageParams)> {
         let call = &self.plan.calls[index];
         let request = self.requests.get(call.request_key.request_id.0)?;
         let image =

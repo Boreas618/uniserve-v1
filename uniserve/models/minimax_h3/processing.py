@@ -3,9 +3,10 @@
 The serving path plans and presents every MiniMax-H3 request in Rust
 (``crates/server/src/serving/video``): the canvas and frame count, the size
 every condition is prepared at, the Qwen3-VL vision grids and the tokenized
-presentation. Those rules are ``uniserve-core``'s (``crates/core/src/video``),
-checked against ``tests/python/fixtures/minimax_h3_plan.json``, which is
-generated from the diffusers reference pipeline.
+presentation. Those rules are the ``models`` crate's
+(``crates/models/src/video``), checked against
+``tests/python/fixtures/minimax_h3_plan.json``, which is generated from the
+diffusers reference pipeline.
 
 This module calls the parts of the same rules that the model package and its
 tools use, through the worker library (``uniserve._worker``): the
@@ -51,7 +52,7 @@ def _canvases(values: Sequence[int]) -> tuple[image.Config, ...]:
 class Task(StrEnum):
     """A MiniMax-H3 task, by its request name.
 
-    The members are the rules' tasks (``uniserve_core::VideoTask``) in their
+    The members are the rules' tasks (``models::video::VideoTask``) in their
     canonical order; importing the module refuses an enum that differs from
     them, so a task the rules add or rename cannot be missed here.
     """

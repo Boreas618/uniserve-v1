@@ -35,12 +35,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_core::{CallId, MediaSource};
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, CallStatus, ErrorCode,
     ForwardStats, MediaCall, TensorRef, WorkerInfo,
 };
+use uniserve_ipc::{CallId, MediaSource};
 
 use crate::config::Device;
 use crate::config::placement::GroupPlacement;
