@@ -96,21 +96,6 @@ pub struct GenerationParams {
     pub generated_token_ids: Vec<u32>,
 }
 
-/// Effective diffusion controls, resolved once by model preprocessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffusionSamplingParams {
-    /// Number of output frames after model-specific alignment.
-    pub num_frames: u32,
-    /// Video media units the decoder reconstructs, independent of GPU rank count.
-    pub video_units: u32,
-    /// Deterministic request-level noise seed.
-    pub seed: u64,
-    /// Output raster width in pixels: the request's canvas.
-    pub width: u32,
-    /// Output raster height in pixels: the request's canvas.
-    pub height: u32,
-}
-
 /// Block-diffusion sampling of a deployment's canvases.
 ///
 /// Text is generated in blocks of `canvas_length` tokens. A block starts as

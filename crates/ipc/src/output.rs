@@ -288,15 +288,3 @@ impl BatchOutput {
         Ok(())
     }
 }
-
-/// One ranked vocabulary candidate at a generated or prompt token position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TokenLogprob {
-    /// Vocabulary token identity.
-    pub token_id: u32,
-    /// Natural-log probability assigned to the token.
-    pub logprob: f32,
-    /// One-based competition rank at the position; tied log probabilities
-    /// share a rank.
-    pub rank: u32,
-}

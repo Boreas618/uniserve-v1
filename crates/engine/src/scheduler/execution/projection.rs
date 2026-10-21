@@ -625,7 +625,8 @@ impl Scheduler {
                     feedback
                         .feedback_encoders
                         .get(self.scheduled_feedback(id)?.0)?
-                        .encoder,
+                        .encoder
+                        .into(),
                 )
             }
             Phase::IngestState => return None,

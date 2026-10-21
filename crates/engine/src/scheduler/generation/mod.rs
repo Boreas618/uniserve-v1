@@ -683,7 +683,7 @@ pub(super) fn plan_image_extend(
     let capacity = encoder.cache_token_capacity(limits)?;
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
-    if encoder.encoder == MediaCall::LatentEncoding {
+    if encoder.encoder == crate::ImageEncoder::Latent {
         call.latent_feature_input = Some(feature);
     } else {
         call.vision_inputs = vec![VisionInput { offset: 0, feature }];
@@ -1625,7 +1625,7 @@ impl RequestState {
         };
         for _ in 0..blocks {
             let (image, input) = self.input_block(advance.cursor)?;
-            if input.encoder != MediaCall::VisionEncoding {
+            if input.encoder != crate::ImageEncoder::Vision {
                 return None;
             }
             advance.prefix_cache = advance.prefix_cache.checked_add(input.num_cache_tokens?)?;

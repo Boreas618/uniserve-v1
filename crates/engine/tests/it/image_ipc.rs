@@ -26,7 +26,7 @@ use engine::{
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs, Request,
 };
-use ipc::{ComponentConfig, ImageParams, MediaCall, RequestId, SamplingParams};
+use ipc::{ComponentConfig, ImageParams, RequestId, SamplingParams};
 
 /// The stub's end-of-image marker, which its head maps to end of sequence.
 const END_OF_IMAGE: u32 = 1007;
@@ -139,7 +139,7 @@ fn policy(feedback: bool) -> ImageGenerationConfig {
         num_feedback_positions: 2,
         feedback_encoders: if feedback {
             vec![ImageEncoderInput {
-                encoder: MediaCall::LatentEncoding,
+                encoder: engine::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
             }]
@@ -330,7 +330,7 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
                 position: 2,
                 num_positions: 1,
                 encoders: vec![ImageEncoderInput {
-                    encoder: MediaCall::VisionEncoding,
+                    encoder: engine::ImageEncoder::Vision,
                     num_cache_tokens: Some(4),
                     max_cache_tokens: None,
                 }],

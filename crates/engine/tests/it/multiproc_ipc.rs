@@ -2099,7 +2099,6 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
                 prompt_token_ids,
                 conditioning: conditioning.encode()?,
                 conditions: Vec::new(),
-                media: Vec::new(),
                 priority: 0,
                 sampling: DiffusionSamplingParams {
                     num_frames: 22,

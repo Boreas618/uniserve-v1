@@ -20,7 +20,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use ipc::SharedMedia;
+use engine::ArtifactMedia;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -185,20 +185,20 @@ struct RetainedJob {
 /// bytes stay counted against the store's byte budget until the download ends, even
 /// if the job is deleted or expires meanwhile.
 pub(crate) struct RetainedMedia {
-    media: Arc<SharedMedia>,
+    media: Arc<dyn ArtifactMedia>,
     _bytes: OwnedSemaphorePermit,
 }
 
 impl std::ops::Deref for RetainedMedia {
-    type Target = SharedMedia;
-    fn deref(&self) -> &Self::Target {
-        &self.media
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.media.bytes()
     }
 }
 
 impl AsRef<[u8]> for RetainedMedia {
     fn as_ref(&self) -> &[u8] {
-        self.media.as_bytes()
+        self.media.bytes()
     }
 }
 
@@ -304,7 +304,7 @@ impl VideoJobs {
     pub(crate) fn finish(
         self: &Arc<Self>,
         id: &str,
-        result: Result<Arc<SharedMedia>, VideoFailure>,
+        result: Result<Arc<dyn ArtifactMedia>, VideoFailure>,
         timing: Option<GenerationTiming>,
     ) {
         let mut entries = self.entries();
@@ -313,7 +313,7 @@ impl VideoJobs {
         // artifact larger than `u32::MAX` bytes and an exhausted budget both
         // fail the job.
         let result = result.and_then(|media| {
-            let bytes = u32::try_from(media.len())
+            let bytes = u32::try_from(media.bytes().len())
                 .ok()
                 .and_then(|bytes| Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok());
             match bytes {

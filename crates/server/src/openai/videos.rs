@@ -127,7 +127,7 @@ async fn videos_sync(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, &artifact.content_type)
-        .header(header::CONTENT_LENGTH, artifact.media.len())
+        .header(header::CONTENT_LENGTH, artifact.media.bytes().len())
         .header(
             "server-timing",
             format!("generation;dur={generation_ms:.1}"),
@@ -144,7 +144,7 @@ async fn videos_sync(
             );
     }
     response
-        .body(media_body(artifact.media))
+        .body(media_body(Arc::new(ArtifactBytes(artifact.media))))
         .unwrap_or_else(|error| {
             ApiError::server_error(format!("failed to construct media response: {error}"))
                 .into_response()
@@ -409,6 +409,15 @@ async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -
         media_body(media),
     )
         .into_response()
+}
+
+/// A generated artifact's bytes as a response body reads them.
+struct ArtifactBytes(Arc<dyn engine::ArtifactMedia>);
+
+impl AsRef<[u8]> for ArtifactBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
 }
 
 /// Streams `media` as a body of copied chunks of at most 64 KiB.

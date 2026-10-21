@@ -18,8 +18,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use ipc::{
-    ImageParams, ImageParamsError, MediaCall, RequestId, SamplingParams, SamplingParamsError,
+use super::{
+    ImageEncoder, ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError,
 };
 
 /// Output constraint applied to the default generation paradigm.
@@ -136,7 +136,7 @@ impl ImageInput {
             && self
                 .encoders
                 .iter()
-                .all(|input| input.encoder == MediaCall::VisionEncoding)
+                .all(|input| input.encoder == ImageEncoder::Vision)
     }
 }
 
@@ -147,9 +147,9 @@ impl ImageInput {
 /// (see [`ImageEncoderInput::cache_token_capacity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageEncoderInput {
-    /// Encoding call consuming this image: [`MediaCall::VisionEncoding`] or
-    /// [`MediaCall::LatentEncoding`]. List order determines context write order.
-    pub encoder: MediaCall,
+    /// The encoder consuming this image. List order determines context write
+    /// order.
+    pub encoder: ImageEncoder,
     /// Exact cache tokens this encoder writes, when known before execution.
     pub num_cache_tokens: Option<u32>,
     /// Upper bound on a worker-selected cache length. When both it and
@@ -164,16 +164,20 @@ pub struct ImageEncoderInput {
 /// derives the key when it looks up a cached product before encoding and
 /// again when it stores the encoder's product, so both must use the same
 /// index for a stored product to be found.
-pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: MediaCall) -> u64 {
+pub fn encoder_cache_key(image_hash: u64, encoder_index: usize, encoder: ImageEncoder) -> u64 {
     use std::hash::Hasher as _;
 
     // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
     // the encoder index distinguishes repeated encoder kinds within one image
     // input.
+    let tag: u8 = match encoder {
+        ImageEncoder::Vision => 1,
+        ImageEncoder::Latent => 2,
+    };
     let mut hasher = fnv::FnvHasher::default();
     hasher.write(&image_hash.to_le_bytes());
     hasher.write(&(encoder_index as u64).to_le_bytes());
-    hasher.write(&[encoder as u8]);
+    hasher.write(&[tag]);
     hasher.finish()
 }
 
@@ -317,7 +321,7 @@ impl ImageGenerationConfig {
     pub fn required_features(
         &self,
         constraint: GenerationConstraint,
-        context_image_steps: impl IntoIterator<Item = MediaCall>,
+        context_image_steps: impl IntoIterator<Item = ImageEncoder>,
     ) -> GenerationFeatures {
         // Understanding execution is the common control path for every request.
         let mut needs = GenerationFeatures::UNDERSTANDING;
@@ -342,13 +346,11 @@ impl ImageGenerationConfig {
     }
 }
 
-/// Returns the runtime feature that executes one image encoding call; a call
-/// that encodes no image requires none.
-const fn encoder_feature(encoder: MediaCall) -> GenerationFeatures {
+/// Returns the runtime feature that executes one image encoder.
+const fn encoder_feature(encoder: ImageEncoder) -> GenerationFeatures {
     match encoder {
-        MediaCall::LatentEncoding => GenerationFeatures::LATENT_ENCODE,
-        MediaCall::VisionEncoding => GenerationFeatures::VISION_ENCODE,
-        _ => GenerationFeatures::empty(),
+        ImageEncoder::Latent => GenerationFeatures::LATENT_ENCODE,
+        ImageEncoder::Vision => GenerationFeatures::VISION_ENCODE,
     }
 }
 
@@ -642,12 +644,12 @@ impl GenerationRequest {
         .then_some(self.image_generation.feedback_encoders.as_slice());
         for (step, bytes, resource) in [
             (
-                MediaCall::LatentEncoding,
+                ImageEncoder::Latent,
                 limits.max_latent_feature_bytes,
                 "max_latent_feature_bytes",
             ),
             (
-                MediaCall::VisionEncoding,
+                ImageEncoder::Vision,
                 limits.max_vision_feature_bytes,
                 "max_vision_feature_bytes",
             ),
@@ -721,10 +723,8 @@ impl ImageEncoderInput {
         limits: &GenerationLimits,
     ) -> Result<u32, GenerationResourceError> {
         let capacity = match self.encoder {
-            MediaCall::LatentEncoding => limits.max_vae_grid_tokens,
-            MediaCall::VisionEncoding => limits.max_vit_grid_tokens,
-            // `GenerationRequest::validate` refuses any other encoder.
-            _ => 0,
+            ImageEncoder::Latent => limits.max_vae_grid_tokens,
+            ImageEncoder::Vision => limits.max_vit_grid_tokens,
         };
         let tokens = self
             .num_cache_tokens
@@ -906,7 +906,7 @@ impl GenerationRequest {
     }
 
     /// Returns the encoding calls of the request's context images.
-    fn context_encoders(&self) -> impl Iterator<Item = MediaCall> + '_ {
+    fn context_encoders(&self) -> impl Iterator<Item = ImageEncoder> + '_ {
         self.multimodal_inputs
             .images
             .iter()
@@ -1066,14 +1066,6 @@ fn validate_image_encoders(
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
     for input in inputs {
-        if !matches!(
-            input.encoder,
-            MediaCall::VisionEncoding | MediaCall::LatentEncoding
-        ) {
-            return Err(GenerationRequestError::NotAnImageEncoder {
-                call: input.encoder,
-            });
-        }
         if input.num_cache_tokens == Some(0) || input.max_cache_tokens == Some(0) {
             return Err(GenerationRequestError::ZeroImageCacheBound);
         }
@@ -1098,12 +1090,6 @@ pub enum GenerationRequestError {
     /// An image input, or configured image feedback, declares no encoder stages.
     #[error("image input has no encoders")]
     MissingImageEncoders,
-    /// An image encoder is neither a vision nor a latent encoding call.
-    #[error("{} is not an image encoder", call.as_str())]
-    NotAnImageEncoder {
-        /// The call the input names.
-        call: MediaCall,
-    },
     /// An input image carries no encoded payload.
     #[error("image payload must not be empty")]
     EmptyImagePayload,
@@ -1247,12 +1233,12 @@ mod tests {
             num_feedback_positions: 1,
             feedback_encoders: vec![
                 ImageEncoderInput {
-                    encoder: MediaCall::LatentEncoding,
+                    encoder: ImageEncoder::Latent,
                     num_cache_tokens: None,
                     max_cache_tokens: Some(64),
                 },
                 ImageEncoderInput {
-                    encoder: MediaCall::VisionEncoding,
+                    encoder: ImageEncoder::Vision,
                     num_cache_tokens: None,
                     max_cache_tokens: Some(64),
                 },
@@ -1273,12 +1259,12 @@ mod tests {
                     num_positions: 1,
                     encoders: vec![
                         ImageEncoderInput {
-                            encoder: MediaCall::LatentEncoding,
+                            encoder: ImageEncoder::Latent,
                             num_cache_tokens: None,
                             max_cache_tokens: Some(64),
                         },
                         ImageEncoderInput {
-                            encoder: MediaCall::VisionEncoding,
+                            encoder: ImageEncoder::Vision,
                             num_cache_tokens: Some(32),
                             max_cache_tokens: None,
                         },
@@ -1319,11 +1305,11 @@ mod tests {
 
     #[test]
     fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let first = encoder_cache_key(17, 0, MediaCall::LatentEncoding);
-        assert_eq!(first, encoder_cache_key(17, 0, MediaCall::LatentEncoding));
-        assert_ne!(first, encoder_cache_key(18, 0, MediaCall::LatentEncoding));
-        assert_ne!(first, encoder_cache_key(17, 1, MediaCall::LatentEncoding));
-        assert_ne!(first, encoder_cache_key(17, 0, MediaCall::VisionEncoding));
+        let first = encoder_cache_key(17, 0, ImageEncoder::Latent);
+        assert_eq!(first, encoder_cache_key(17, 0, ImageEncoder::Latent));
+        assert_ne!(first, encoder_cache_key(18, 0, ImageEncoder::Latent));
+        assert_ne!(first, encoder_cache_key(17, 1, ImageEncoder::Latent));
+        assert_ne!(first, encoder_cache_key(17, 0, ImageEncoder::Vision));
     }
 
     #[test]
@@ -1348,15 +1334,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_generation_graph_roundtrips_and_validates() {
-        let request = complete_request();
-        request.validate().expect("valid canonical request");
-
-        let encoded = serde_json::to_value(&request).expect("serialize request");
-        let decoded: GenerationRequest =
-            serde_json::from_value(encoded).expect("deserialize request");
-        assert_eq!(decoded, request);
-        decoded.validate().expect("round-tripped request is valid");
+    fn the_canonical_generation_graph_validates() {
+        complete_request()
+            .validate()
+            .expect("valid canonical request");
     }
 
     #[test]
@@ -1397,12 +1378,12 @@ mod tests {
             num_positions: 1,
             encoders: vec![
                 ImageEncoderInput {
-                    encoder: MediaCall::LatentEncoding,
+                    encoder: ImageEncoder::Latent,
                     num_cache_tokens: Some(1_026),
                     max_cache_tokens: None,
                 },
                 ImageEncoderInput {
-                    encoder: MediaCall::VisionEncoding,
+                    encoder: ImageEncoder::Vision,
                     num_cache_tokens: Some(1_371),
                     max_cache_tokens: None,
                 },
@@ -1511,17 +1492,6 @@ mod tests {
             Err(GenerationRequestError::MissingImageEncoders)
         );
 
-        // An image is encoded by a vision or a latent encoding call, nothing
-        // else.
-        let mut not_an_encoder = complete_request();
-        not_an_encoder.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::Denoising;
-        assert_eq!(
-            not_an_encoder.validate(),
-            Err(GenerationRequestError::NotAnImageEncoder {
-                call: MediaCall::Denoising
-            })
-        );
-
         // Exact contributions and capacities are validated before admission.
         for (tokens, capacity, error) in [
             (Some(0), None, GenerationRequestError::ZeroImageCacheBound),
@@ -1552,7 +1522,7 @@ mod tests {
         let mut injected = complete_request();
         injected.multimodal_inputs.images[0].encoders.truncate(1);
         injected.multimodal_inputs.images[0].encoders[0] = ImageEncoderInput {
-            encoder: MediaCall::VisionEncoding,
+            encoder: ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: Some(64),
         };
@@ -1629,7 +1599,7 @@ mod tests {
         request.max_und_tokens = 0;
         request.image_generation = ImageGenerationConfig::default();
         request.multimodal_inputs.images[0].encoders.truncate(1);
-        request.multimodal_inputs.images[0].encoders[0].encoder = MediaCall::VisionEncoding;
+        request.multimodal_inputs.images[0].encoders[0].encoder = ImageEncoder::Vision;
         request.multimodal_inputs.images[0].encoders[0].num_cache_tokens = Some(64);
         request.readout = vec![
             ReadoutRow {

@@ -7,8 +7,8 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use engine::ImageEncoder;
 use engine::{GenerationLimits, GenerationRequest};
-use ipc::MediaCall;
 use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
@@ -356,6 +356,8 @@ async fn preprocess_video(
         .expect("the processor serves video")
         .process(request_id, request, processor.config().max_model_len)
         .await
+        // No worker reads the published condition media here.
+        .map(|(request, video, _media)| (request, video))
         .map_err(ApiError::from)
 }
 
@@ -565,7 +567,7 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
             .collect::<Vec<_>>(),
     );
     assert_eq!(position, marker_positions[1]);
-    assert_eq!(steps, &[MediaCall::VisionEncoding]);
+    assert_eq!(steps, &[ImageEncoder::Vision]);
 
     // Feedback for the default 16:9 canvas (2048x1152) is a 64x36 ViT grid at
     // 32 pixels per token plus one marker token.
@@ -603,10 +605,7 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
     // each input image, in that order.
     assert!(position > 0);
     assert!((position as usize) < response.prompt_token_ids.len());
-    assert_eq!(
-        steps,
-        &[MediaCall::LatentEncoding, MediaCall::VisionEncoding]
-    );
+    assert_eq!(steps, &[ImageEncoder::Latent, ImageEncoder::Vision]);
 }
 
 #[tokio::test]

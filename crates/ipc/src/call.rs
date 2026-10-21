@@ -869,3 +869,13 @@ impl MediaCall {
         matches!(self, Self::Denoising)
     }
 }
+
+impl From<proto::request::ImageEncoder> for MediaCall {
+    /// The call an image encoder of a request runs.
+    fn from(encoder: proto::request::ImageEncoder) -> Self {
+        match encoder {
+            proto::request::ImageEncoder::Vision => Self::VisionEncoding,
+            proto::request::ImageEncoder::Latent => Self::LatentEncoding,
+        }
+    }
+}
