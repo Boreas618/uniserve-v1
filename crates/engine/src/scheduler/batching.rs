@@ -647,10 +647,10 @@ impl Scheduler {
             batch.id = self.inflight.next_batch_id();
         }
 
-        // A text batch of one worker group carries the page writes the
-        // host page tier reserved for that group: its runner copies them
+        // A text batch of one worker group carries the page offloads the
+        // host KV cache reserved for that group: its runner copies them
         // before its forward, and its output settles them.
-        if let Some(tiers) = self.tiers.as_mut()
+        if let Some(kv_offload) = self.kv_offload.as_mut()
             && let Some((_, first)) = batch.requests.first()
             && batch.requests.iter().all(|(call, placement)| {
                 placement.worker == first.worker
@@ -662,9 +662,9 @@ impl Scheduler {
             })
         {
             let worker = first.worker.clone();
-            let pages = tiers.take_writes(&worker, batch.id);
+            let pages = kv_offload.take_offloads(&worker, batch.id);
             if !pages.is_empty() {
-                batch.page_writes = Some(crate::executor::PageWrites { worker, pages });
+                batch.page_offloads = Some(crate::executor::PageOffloads { worker, pages });
             }
         }
 

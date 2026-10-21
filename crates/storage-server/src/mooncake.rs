@@ -1,4 +1,4 @@
-//! The Mooncake connector: the distributed page tier (L3) behind a host's
+//! The Mooncake connector: the distributed host KV cache (L3) behind a host's
 //! page pools.
 //!
 //! The Storage Server runs the connector as a child process

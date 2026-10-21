@@ -14,7 +14,7 @@
 //!   asynchronously by the head.
 //! - [`socket`]: where the server listens, and starting it when absent.
 //! - [`connector`]: the settings of the Mooncake connector a server runs,
-//!   which keeps committed pages in the distributed tier (L3).
+//!   which keeps committed pages in the KV storage (L3).
 //!
 //! The server holds memory and never interprets it: clients compute every
 //! key, define what the bytes mean, and run every device copy.

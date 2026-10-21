@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | free | Unused |
 //! | reserved | Being written by the worker of its writer scope |
-//! | fetching | Being written by the connector, from the distributed tier |
+//! | fetching | Being written by the connector, from the KV storage |
 //! | ready | Holds a committed page and may be read |
 //! | pinned | Ready and being read by workers; not evictable |
 //! | uploading | Ready and being read by the connector; not evictable |
@@ -48,7 +48,7 @@ enum Slot {
         head: Option<ClientId>,
     },
     /// Reserved for the connector, which reads the page from the
-    /// distributed tier.
+    /// KV storage.
     Fetching {
         key: Key,
     },

@@ -55,7 +55,7 @@ use crate::executor::backend::WorkerBackend;
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::Interpreter;
 use crate::lane::BLOCK_ON_TIMEOUT;
-use crate::memory::PageTier;
+use crate::memory::HostKvCache;
 use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
 use crate::memory::weights::{self, WeightKeys};
@@ -396,17 +396,17 @@ impl Worker {
 
         let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
-        // The engine copies the cache's pages through the host page tier when
+        // The engine copies the cache's pages through the host KV cache when
         // it says so; pages are keyed by the whole model's fingerprint.
         let model_fingerprint = fingerprints.as_ref().map(weights::Fingerprints::model);
         if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
-            launch.storage.page_tier,
+            launch.storage.host_kv_cache,
             model_fingerprint.as_deref(),
             storage.prefix_cache.as_mut(),
             device.cuda(),
             info.prefix_cache.as_mut(),
         ) {
-            let (tier, pools) = PageTier::start(
+            let (host_kv_cache, pools) = HostKvCache::start(
                 &retained,
                 prefix_cache.plan(),
                 cuda,
@@ -414,14 +414,14 @@ impl Worker {
                 launch.storage.tcp.as_deref(),
             )
             .map_err(phase("storage"))?;
-            // The tier's copies run on a copy lane of the cache's device,
+            // The host KV cache's copies run on a copy lane of the cache's device,
             // beside the forwards of the lanes.
             let copy = streams
                 .start_copy_lane(cuda)
                 .and_then(|lane| Ok(lane.stream()?.clone()))
                 .map_err(phase("streams"))?;
             prefix_cache
-                .set_page_tier(tier, copy)
+                .set_host_kv_cache(host_kv_cache, copy)
                 .map_err(phase("storage"))?;
             reported.page_pools = pools;
         }

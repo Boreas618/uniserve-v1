@@ -68,9 +68,9 @@ pub struct RequestPlacement {
     /// rank of the worker that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
-    /// Pages of the host page tier the call's new units are filled with
+    /// Pages of the host KV cache the call's new units are filled with
     /// before its forward, on every rank of its worker group.
-    pub page_reads: Vec<ipc::PageCopy>,
+    pub page_loads: Vec<ipc::PageCopy>,
     /// For a video request's call, the worker routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
@@ -101,15 +101,15 @@ pub struct ExecutionBatch {
     /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
     /// the worker-local batches it builds.
     pub cache_inputs: Vec<ipc::CacheTransfer>,
-    /// Published pages the batch writes to the host page tier.
-    pub page_writes: Option<PageWrites>,
+    /// Published pages the batch writes to the host KV cache.
+    pub page_offloads: Option<PageOffloads>,
 }
 
-/// Published pages one worker group writes to the host page tier, for
+/// Published pages one worker group writes to the host KV cache, for
 /// every rank of the group (`PageCopy::rank`). The group runs every call
 /// of a batch that carries them; a batch without calls carries only them.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PageWrites {
+pub struct PageOffloads {
     pub worker: WorkerGroupId,
     pub pages: Vec<ipc::PageCopy>,
 }
@@ -128,7 +128,7 @@ impl ExecutionBatch {
             commands,
             input_transfers,
             cache_inputs: Vec::new(),
-            page_writes: None,
+            page_offloads: None,
         }
     }
 
@@ -190,10 +190,10 @@ impl ExecutionBatch {
     /// matching their calls, non-overlapping spans) are checked once, by
     /// `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // A batch of page writes alone writes the engine's last published
-        // pages to the host page tier before it closes its workers.
+        // A batch of page offloads alone writes the engine's last published
+        // pages to the host KV cache before it closes its workers.
         anyhow::ensure!(
-            !self.requests.is_empty() || !self.commands.is_empty() || self.page_writes.is_some(),
+            !self.requests.is_empty() || !self.commands.is_empty() || self.page_offloads.is_some(),
             "logical batch must carry at least one call, command or page write"
         );
 
@@ -278,14 +278,14 @@ impl ExecutionBatch {
             commands,
             input_transfers: input_products,
             cache_inputs,
-            page_writes,
+            page_offloads,
         } = self;
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
         let mut forward = ForwardBatch::default();
         let mut latent_params = Vec::new();
         let mut decode_ranges = Vec::new();
-        let mut page_reads = Vec::new();
+        let mut page_loads = Vec::new();
         let mut rank_buffers = Vec::new();
         let mut calls = Vec::with_capacity(requests.len());
 
@@ -295,7 +295,7 @@ impl ExecutionBatch {
             forward.append(placement.forward, call_index as u32)?;
             latent_params.extend(placement.latent);
             decode_ranges.extend(placement.decode);
-            page_reads.extend(placement.page_reads);
+            page_loads.extend(placement.page_loads);
             rank_buffers.extend(placement.buffers);
             calls.push(call);
         }
@@ -313,8 +313,8 @@ impl ExecutionBatch {
             commands,
             input_products,
             cache_inputs,
-            page_reads,
-            page_writes: page_writes.map_or_else(Vec::new, |writes| writes.pages),
+            page_loads,
+            page_offloads: page_offloads.map_or_else(Vec::new, |writes| writes.pages),
         };
         batch.validate_unplaced()?;
         Ok((batch, rank_buffers))

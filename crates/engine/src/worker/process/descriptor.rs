@@ -56,8 +56,8 @@ impl Default for WorkerProcessArgs {
             // A launch the server does not name serves a deployment of its
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
-            page_tier: false,
-            storage_connector: None,
+            host_kv_cache: false,
+            kv_storage: None,
             keep_standby: false,
             standby: false,
             cache_units: None,
@@ -389,7 +389,7 @@ mod tests {
             socket: "/run/uniserve/storage.sock".into(),
             deployment: "model".into(),
             claim: [7; 16],
-            page_tier: true,
+            host_kv_cache: true,
             tcp: Some("10.0.0.2:4100".into()),
             standby: false,
         }

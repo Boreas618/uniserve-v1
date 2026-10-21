@@ -131,11 +131,11 @@ enum BatchKind {
 /// with wake integration also returns early on commands and consumer reads;
 /// the timeout is only a liveness deadline.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
-/// Timeout of a park while the host page tier's answers are awaited: the
+/// Timeout of a park while the host KV cache's answers are awaited: the
 /// Storage Server answers a local connection within this.
 const TIER_POLL: Duration = Duration::from_millis(1);
-/// Longest a closing scheduler waits for its last pages to reach the host
-/// page tier: for the batches in flight, which carry writes, and for the
+/// Longest a closing scheduler waits for its last pages to reach the
+/// host KV cache: for the batches in flight, which carry writes, and for the
 /// batches of the remaining writes.
 const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of batches carrying prefill-lane calls that may await their
@@ -419,12 +419,12 @@ pub struct Scheduler {
     fatal: bool,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
-    /// The host page tier, when it serves a worker group
-    /// (`Scheduler::enable_page_tier`).
-    tiers: Option<crate::kv_cache::Tiers>,
+    /// The host KV cache, when it serves a worker group
+    /// (`Scheduler::enable_kv_offload`).
+    kv_offload: Option<crate::kv_cache::KvOffloadManager>,
     /// Set once the scheduler closes its workers: it admits and schedules
-    /// nothing more while it writes its last pages to the host page tier
-    /// (`Scheduler::flush_page_tier`).
+    /// nothing more while it writes its last pages to the host KV cache
+    /// (`Scheduler::flush_offloads`).
     closing: bool,
 }
 

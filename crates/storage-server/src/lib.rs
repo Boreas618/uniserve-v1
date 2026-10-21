@@ -10,9 +10,9 @@
 //! descriptor or any process maps it.
 //!
 //! The server also keeps the host's page pools ([`pages`]): the slots of
-//! the host page tier and which page each holds. Its Mooncake connector
-//! ([`mooncake`], run as a child process [`connector`] supervises) keeps
-//! committed pages in the distributed tier and reads them back for
+//! the host KV cache and which page each holds. Its Mooncake connector
+//! ([`mooncake`], run as a child process [`kv_storage`] supervises) keeps
+//! committed pages in the KV storage and reads them back for
 //! prefetches.
 //!
 //! [`serve`] runs a server, the `uniserve storage serve` command, and
@@ -25,7 +25,7 @@
 //! its connection's queue until then, while every other connection is
 //! served on.
 
-mod connector;
+mod kv_storage;
 pub mod mooncake;
 mod pages;
 mod serve;
@@ -42,8 +42,8 @@ use std::time::Duration;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::mooncake::BATCH_PAGES;
-pub use connector::Launch as ConnectorLaunch;
-use connector::{Connector, Task};
+pub use kv_storage::Launch as ConnectorLaunch;
+use kv_storage::{KvStorage, Task};
 pub use pages::DEFAULT_POOL_BYTES;
 pub use serve::{ServeOptions, list, retire, run_connector, serve};
 use shoot::ShootDowns;
@@ -125,7 +125,7 @@ enum Outcome {
     /// The request waits for these processes to be shot down.
     Wait(Vec<Holder>),
     /// The request is answered when the connector finishes this task.
-    Connector(Task),
+    KvStorage(Task),
 }
 
 /// A descriptor that travels with a reply.
@@ -149,7 +149,7 @@ pub struct Server {
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
     pages: pages::Pools,
-    connector: Connector,
+    kv_storage: KvStorage,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
 }
@@ -175,7 +175,7 @@ impl Server {
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
             pages: pages::Pools::new(page_pool_bytes),
-            connector: Connector::new(connector),
+            kv_storage: KvStorage::new(connector),
             events: Vec::new(),
         })
     }
@@ -222,12 +222,12 @@ impl Server {
         for pidfd in &pidfds {
             fds.push(PollFd::new(pidfd.as_ref(), PollFlags::IN));
         }
-        if let Some((_, pidfd)) = &self.connector.child {
+        if let Some((_, pidfd)) = &self.kv_storage.child {
             fds.push(PollFd::new(pidfd, PollFlags::IN));
         }
         let timeout = [
             self.shootdowns.polling().then_some(NVML_POLL),
-            self.connector.timeout(),
+            self.kv_storage.timeout(),
         ]
         .into_iter()
         .flatten()
@@ -262,8 +262,8 @@ impl Server {
         if self.shootdowns.advance() {
             self.settle_shootdowns();
         }
-        self.connector.reap();
-        self.connector.start_due();
+        self.kv_storage.reap();
+        self.kv_storage.start_due();
         self.serve_queues();
         self.flush_and_reap();
         Ok(())
@@ -383,7 +383,7 @@ impl Server {
                             .connection
                             .send(&ServerMessage::Welcome(welcome), &[]);
                     }
-                    if self.connector.client == Some(id) {
+                    if self.kv_storage.client == Some(id) {
                         self.offer_pools();
                         self.send_events();
                     }
@@ -436,12 +436,12 @@ impl Server {
             if matches!(hello.role, Role::Connector) {
                 // The connector's client is forgotten when its connection
                 // closes, so one that is known is connected.
-                if self.connector.client.is_some() {
+                if self.kv_storage.client.is_some() {
                     return Welcome::Refused {
                         message: "the server has a connector".into(),
                     };
                 }
-                self.connector.client = Some(id);
+                self.kv_storage.client = Some(id);
                 tracing::info!(pid = client.pid, "the Mooncake connector connected");
             }
             client.role = Some(hello.role);
@@ -475,7 +475,7 @@ impl Server {
                     self.answer(id, request_id, reply, &storages);
                     self.send_events();
                 }
-                Ok(Outcome::Connector(mut task)) => {
+                Ok(Outcome::KvStorage(mut task)) => {
                     if let Task::Lookup { request, .. } = &mut task {
                         *request = request_id;
                     }
@@ -1106,7 +1106,7 @@ impl Server {
             Some(Role::Worker { scope, .. }) if !connected_worker(&self.clients, scope) => {
                 self.pages.worker_gone(scope);
             }
-            Some(Role::Connector) if self.connector.client == Some(id) => self.connector_gone(),
+            Some(Role::Connector) if self.kv_storage.client == Some(id) => self.connector_gone(),
             _ => {}
         }
         if let Some(Role::Head { deployment }) = &client.role
@@ -1203,7 +1203,7 @@ impl Server {
                 })
                 .collect(),
             page_pools: self.pages.listing(),
-            connector: self.connector.client.is_some(),
+            connector: self.kv_storage.client.is_some(),
         }
     }
 
@@ -1236,11 +1236,11 @@ impl Server {
 
     /// Give the connector every page pool it does not map yet.
     fn offer_pools(&mut self) {
-        let Some(connector) = self.connector.client else {
+        let Some(connector) = self.kv_storage.client else {
             return;
         };
         for listed in self.pages.listing() {
-            if self.connector.offered.insert(listed.pool) {
+            if self.kv_storage.offered.insert(listed.pool) {
                 self.events.push((
                     connector,
                     Event::Pool {
@@ -1256,11 +1256,11 @@ impl Server {
 
     /// Hand `task` to the connector; without one, the task fails at once.
     fn assign(&mut self, task: Task) {
-        let Some(connector) = self.connector.client else {
+        let Some(connector) = self.kv_storage.client else {
             self.fail(task);
             return;
         };
-        let id = self.connector.next_task();
+        let id = self.kv_storage.next_task();
         let event = match &task {
             Task::Lookup { pool, keys, .. } => Event::Exists {
                 task: id,
@@ -1278,15 +1278,15 @@ impl Server {
                 pages: wide(pages),
             },
         };
-        self.connector.tasks.insert(id, task);
+        self.kv_storage.tasks.insert(id, task);
         self.events.push((connector, event, Vec::new()));
     }
 
-    /// Write pages committed in `pool` to the distributed tier, in tasks of
+    /// Write pages committed in `pool` to the KV storage, in tasks of
     /// at most [`BATCH_PAGES`] pages, holding their slots until each task
     /// ends.
     fn upload(&mut self, pool: u64, pages: Vec<(Key, u32)>) {
-        if self.connector.client.is_none() || pages.is_empty() {
+        if self.kv_storage.client.is_none() || pages.is_empty() {
             return;
         }
         let Some(entry) = self.pages.get_mut(pool) else {
@@ -1310,7 +1310,7 @@ impl Server {
         tag: u64,
     ) -> Result<(), (ErrorKind, String)> {
         let entry = pool_of(&mut self.pages, pool)?;
-        let fetches = if self.connector.client.is_some() {
+        let fetches = if self.kv_storage.client.is_some() {
             entry.prefetch(keys)
         } else {
             vec![pages::Fetch::Full; keys.len()]
@@ -1341,7 +1341,7 @@ impl Server {
 
     /// The connector reported the results of `task`.
     fn finished(&mut self, task: u64, results: &[bool]) {
-        let Some(task) = self.connector.tasks.remove(&task) else {
+        let Some(task) = self.kv_storage.tasks.remove(&task) else {
             return;
         };
         self.complete(task, results);
@@ -1389,11 +1389,7 @@ impl Server {
             Task::Upload { pool, pages } => {
                 let failed = (0..pages.len()).filter(|index| !succeeded(*index)).count();
                 if failed > 0 {
-                    tracing::warn!(
-                        pool,
-                        failed,
-                        "pages were not written to the distributed tier"
-                    );
+                    tracing::warn!(pool, failed, "pages were not written to the KV storage");
                 }
                 if let Some(entry) = self.pages.get_mut(pool) {
                     entry.uploaded(&pages);
@@ -1423,9 +1419,14 @@ impl Server {
     /// connector maps every pool again.
     fn connector_gone(&mut self) {
         tracing::warn!("the Mooncake connector disconnected");
-        self.connector.client = None;
-        self.connector.offered.clear();
-        let tasks: Vec<Task> = self.connector.tasks.drain().map(|(_, task)| task).collect();
+        self.kv_storage.client = None;
+        self.kv_storage.offered.clear();
+        let tasks: Vec<Task> = self
+            .kv_storage
+            .tasks
+            .drain()
+            .map(|(_, task)| task)
+            .collect();
         for task in tasks {
             self.fail(task);
         }
@@ -1470,13 +1471,13 @@ impl Server {
         match request {
             Request::Lookup { pool, keys } => {
                 let l2 = pool_of(&mut self.pages, *pool)?.lookup(keys);
-                if self.connector.client.is_none() || l2 as usize >= keys.len() {
+                if self.kv_storage.client.is_none() || l2 as usize >= keys.len() {
                     // Without a connector, L3 holds nothing beyond L2.
                     return reply(Reply::Lookup { l2, l3: l2 });
                 }
                 // The connector looks up the pages after the L2 run; the
                 // request waits for it.
-                Ok(Outcome::Connector(Task::Lookup {
+                Ok(Outcome::KvStorage(Task::Lookup {
                     client: id,
                     request: 0,
                     pool: *pool,

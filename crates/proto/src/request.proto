@@ -644,7 +644,7 @@ message KvCache {
   string dtype = 3;
   bool prefix_caching = 4;
   bool host_tier = 5;
-  // Absent when the deployment keeps no distributed tier.
+  // Absent when the deployment keeps no KV storage.
   Mooncake mooncake = 6;
 }
 

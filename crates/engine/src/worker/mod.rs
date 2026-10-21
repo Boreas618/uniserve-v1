@@ -52,13 +52,13 @@ pub struct WorkerProcessArgs {
     /// The deployment the group belongs to, which its workers' storage
     /// scopes name: the served model name.
     pub deployment: String,
-    /// Whether the engine copies the group's cache pages through the host
-    /// page tier (`kv_cache_config.host_tier`).
-    pub page_tier: bool,
+    /// Whether the engine copies the group's cache pages through the
+    /// host KV cache (`kv_cache_config.host_tier`).
+    pub host_kv_cache: bool,
     /// The Mooncake connector a host's Storage Server the deployment starts
     /// runs (`kv_cache_config.mooncake`), keeping committed pages in the
-    /// distributed tier.
-    pub storage_connector: Option<storage::connector::Settings>,
+    /// KV storage.
+    pub kv_storage: Option<storage::connector::Settings>,
     /// Whether the group keeps a standby rank group beside its serving one
     /// (`worker_config.standby`), promoted when the serving group fails.
     pub keep_standby: bool,

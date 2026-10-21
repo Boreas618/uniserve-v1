@@ -347,13 +347,13 @@ pub struct KvCacheOptions {
     pub dtype: Option<PrefixCacheDtype>,
     /// Reuse and retain cached prompt prefixes across requests.
     pub prefix_caching: bool,
-    /// Copy full prompt pages to the host page tier of each host's Storage
+    /// Copy full prompt pages to the host KV cache of each host's Storage
     /// Server and read them back on a later prefix match the device cache
     /// no longer holds. Applies with `prefix_caching`.
     pub host_tier: bool,
-    /// Keep every page of the host page tier in Mooncake, the distributed
-    /// tier, through the Storage Servers this deployment starts, and
-    /// prefetch long hits back. Applies with `host_tier`; none when unset.
+    /// Keep every page of the host KV cache in Mooncake, the KV storage,
+    /// through the Storage Servers this deployment starts, and prefetch long
+    /// hits back. Applies with `host_tier`; none when unset.
     pub mooncake: Option<MooncakeOptions>,
 }
 
@@ -370,7 +370,7 @@ impl Default for KvCacheOptions {
     }
 }
 
-/// Mooncake, the distributed page tier (`kv_cache_config.mooncake`): the
+/// Mooncake, the distributed host KV cache (`kv_cache_config.mooncake`): the
 /// settings of each Storage Server's Mooncake client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

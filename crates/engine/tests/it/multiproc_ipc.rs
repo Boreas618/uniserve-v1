@@ -1458,7 +1458,7 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
             decode: None,
             buffers: on_every_rank(batch.buffer_allocations),
             readers: Default::default(),
-            page_reads: Vec::new(),
+            page_loads: Vec::new(),
         };
         executor.submit(ExecutionBatch::new(
             batch_id,
@@ -2569,7 +2569,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 socket: socket.to_string_lossy().into_owned(),
                 deployment: STUB_WORKER.into(),
                 claim: claim.0,
-                page_tier: false,
+                host_kv_cache: false,
                 tcp: None,
                 standby: false,
             };
@@ -5282,7 +5282,7 @@ fn place(mut batch: Batch, worker: &str, inputs: Vec<ipc::TensorExport>) -> engi
                 decode: batch.decode_ranges.into_iter().next(),
                 buffers: on_every_rank(batch.buffer_allocations),
                 readers: Default::default(),
-                page_reads: Vec::new(),
+                page_loads: Vec::new(),
             },
         )],
         batch.commands,

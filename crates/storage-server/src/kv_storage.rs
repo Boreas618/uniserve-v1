@@ -1,4 +1,5 @@
-//! The server's side of the Mooncake connector (L3).
+//! The server's side of the KV storage (L3), which its Mooncake connector
+//! serves.
 //!
 //! The server runs the connector ([`crate::connector`]) as a child process
 //! and starts it again when it ends. The connector connects as
@@ -56,7 +57,7 @@ pub(super) enum Task {
 }
 
 /// The connector process and its connection.
-pub(super) struct Connector {
+pub(super) struct KvStorage {
     launch: Option<Launch>,
     /// The running process, with its pidfd.
     pub(super) child: Option<(Child, OwnedFd)>,
@@ -70,7 +71,7 @@ pub(super) struct Connector {
     pub(super) offered: BTreeSet<u64>,
 }
 
-impl Connector {
+impl KvStorage {
     pub(super) fn new(launch: Option<Launch>) -> Self {
         let restart = launch.as_ref().map(|_| Instant::now());
         Self {

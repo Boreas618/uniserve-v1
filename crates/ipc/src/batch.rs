@@ -375,13 +375,13 @@ pub struct Batch {
     pub input_products: Vec<TensorExport>,
     /// Imported cache exports consumed by explicit cache installation call kinds.
     pub cache_inputs: Vec<CacheTransfer>,
-    /// Pages read from the host page tier into new units, on the rank's
+    /// Pages read from the host KV cache into new units, on the rank's
     /// copy lane as soon as the batch arrives; the forward waits for them.
-    pub page_reads: Vec<PageCopy>,
-    /// Published pages written to the host page tier, on the rank's copy
+    pub page_loads: Vec<PageCopy>,
+    /// Published pages written to the host KV cache, on the rank's copy
     /// lane as soon as the batch arrives; the batch's output reports them
     /// complete. A batch may carry them alone.
-    pub page_writes: Vec<PageCopy>,
+    pub page_offloads: Vec<PageCopy>,
 }
 
 impl Batch {
@@ -408,8 +408,8 @@ impl Batch {
                 .collect(),
             input_products: Vec::new(),
             cache_inputs: Vec::new(),
-            page_reads: Vec::new(),
-            page_writes: Vec::new(),
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
         }
     }
 
@@ -470,10 +470,10 @@ impl Batch {
     /// Validates the batch, and its buffer spans when `placed`.
     fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
-        // A batch of page writes alone writes an engine's last published pages
-        // to the host page tier before it closes its workers.
+        // A batch of page offloads alone writes an engine's last published pages
+        // to the host KV cache before it closes its workers.
         ensure_valid!(
-            !self.calls.is_empty() || !self.commands.is_empty() || !self.page_writes.is_empty(),
+            !self.calls.is_empty() || !self.commands.is_empty() || !self.page_offloads.is_empty(),
             "a submission batch must carry at least one call, control or page write"
         );
         ensure_valid!(
@@ -516,11 +516,11 @@ impl Batch {
             .iter()
             .flat_map(|allocation| allocation.unit_ids.iter())
             .collect::<HashSet<_>>();
-        for copy in self.page_reads.iter().chain(&self.page_writes) {
+        for copy in self.page_loads.iter().chain(&self.page_offloads) {
             copy.validate()?;
         }
         ensure_valid!(
-            self.page_reads
+            self.page_loads
                 .iter()
                 .all(|copy| copy.units.iter().all(|unit| new_units.contains(unit))),
             "a page read fills units that are not new units of the batch"

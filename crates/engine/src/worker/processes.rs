@@ -246,8 +246,8 @@ impl ProcessClient {
                 .claim
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("a claim token is not 16 bytes"))?,
-            // The engine states whether its workers use the host page tier.
-            page_tier: false,
+            // The engine states whether its workers use the host KV cache.
+            host_kv_cache: false,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
             // The engine states whether a group stands by.
             standby: false,

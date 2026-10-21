@@ -1322,8 +1322,8 @@ fn batch_rejects_two_calls_for_one_request() {
         commands: Vec::new(),
         input_products: Vec::new(),
         cache_inputs: Vec::new(),
-        page_reads: Vec::new(),
-        page_writes: Vec::new(),
+        page_loads: Vec::new(),
+        page_offloads: Vec::new(),
     };
     assert!(batch.validate().is_err());
 }
@@ -1343,11 +1343,11 @@ fn a_batch_may_carry_page_writes_alone() {
         commands: Vec::new(),
         input_products: Vec::new(),
         cache_inputs: Vec::new(),
-        page_reads: Vec::new(),
-        page_writes: Vec::new(),
+        page_loads: Vec::new(),
+        page_offloads: Vec::new(),
     };
     assert!(batch.validate().is_err());
-    batch.page_writes.push(PageCopy {
+    batch.page_offloads.push(PageCopy {
         rank: 0,
         pool: 1,
         group_id: 0,

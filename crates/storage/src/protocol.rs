@@ -22,7 +22,7 @@
 //! and tracks each slot's state; workers copy pages in and out of the slots
 //! on their own streams, at the head's direction. Behind the pools, the
 //! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
-//! in the distributed tier (L3) and reads them back for prefetches.
+//! in the KV storage (L3) and reads them back for prefetches.
 
 use serde::{Deserialize, Serialize};
 
@@ -253,7 +253,7 @@ pub enum Request {
         numa_node: Option<u32>,
     },
     /// The lengths of the leading runs of `keys` committed in the pool
-    /// (L2), and committed in the pool or in the distributed tier (L3).
+    /// (L2), and committed in the pool or in the KV storage (L3).
     Lookup { pool: u64, keys: Vec<Key> },
     /// A slot for each key the pool holds no page of, to be written by the
     /// worker of `writer`.
@@ -399,7 +399,7 @@ pub struct ListedPool {
     pub pinned: u64,
     /// Slots the connector is reading pages into.
     pub fetching: u64,
-    /// Committed pages the connector is writing to the distributed tier.
+    /// Committed pages the connector is writing to the KV storage.
     pub uploading: u64,
 }
 
@@ -450,20 +450,20 @@ pub enum Event {
         shape: PageShape,
         slots: u64,
     },
-    /// To the connector: which pages of `keys` the distributed tier holds.
+    /// To the connector: which pages of `keys` the KV storage holds.
     Exists {
         task: u64,
         pool: u64,
         keys: Vec<Key>,
     },
     /// To the connector: write the committed pages in these slots to the
-    /// distributed tier.
+    /// KV storage.
     Upload {
         task: u64,
         pool: u64,
         pages: Vec<(Key, u64)>,
     },
-    /// To the connector: read these pages from the distributed tier into
+    /// To the connector: read these pages from the KV storage into
     /// their slots.
     Download {
         task: u64,

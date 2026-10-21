@@ -19,7 +19,7 @@ fn defaults() -> Value {
             "socket": "/run/uniserve/storage.sock",
             "deployment": "model",
             "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "page_tier": false,
+            "host_kv_cache": false,
             "standby": false,
         },
         "host": "localhost",

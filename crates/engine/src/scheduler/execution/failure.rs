@@ -119,10 +119,10 @@ impl Scheduler {
                 cache.block_pool.invalidate_source(endpoint);
             }
         }
-        // The failed worker's page writes are aborted and its admission pins
+        // The failed worker's page offloads are aborted and its admission pins
         // released.
-        if let Some(tiers) = self.tiers.as_mut() {
-            tiers.worker_failed(&loss.worker_id);
+        if let Some(kv_offload) = self.kv_offload.as_mut() {
+            kv_offload.worker_failed(&loss.worker_id);
         }
 
         // Close the affected set over work not yet submitted: a queued call

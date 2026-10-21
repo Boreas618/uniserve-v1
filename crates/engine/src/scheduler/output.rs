@@ -1663,24 +1663,24 @@ impl Scheduler {
             ) && prefix_cache.coordinator.release_window(allocation, visible)
         });
         if advanced
-            && let (Some(tiers), Some(worker)) = (
-                self.tiers.as_mut(),
+            && let (Some(kv_offload), Some(worker)) = (
+                self.kv_offload.as_mut(),
                 self.placement
                     .affinity
                     .get(&(key, DEFAULT_COMPONENT.to_owned())),
             )
-            && tiers.serves(worker)
+            && kv_offload.serves(worker)
         {
-            // Pages published now are written to the host page tier, but
-            // for the tier's own hit, whose reads are now done.
-            let hit = tiers.hit_pages(id);
+            // Pages published now are written to the host KV cache, but
+            // for the host KV cache's own hit, whose reads are now done.
+            let hit = kv_offload.hit_pages(id);
             let end = published.first().copied().unwrap_or(0);
             let mut keys = Vec::new();
             let mut pages = Vec::new();
             let page_keys = std::mem::take(&mut state.page_keys);
             if let (Some(allocation), Some(group_hashes)) =
                 (state.prefix_cache_mut(), hashes.first())
-                && let Some(block_size) = tiers.block_size(worker)
+                && let Some(block_size) = kv_offload.block_size(worker)
             {
                 let table = &allocation.tables[0];
                 for page in published_before..end {
@@ -1708,8 +1708,8 @@ impl Scheduler {
                 }
             }
             state.page_keys = page_keys;
-            tiers.write(worker, keys, pages);
-            tiers.read_done(id);
+            kv_offload.offload(worker, keys, pages);
+            kv_offload.loaded(id);
         }
         state.req.prompt_token_ids = prompt;
         state.prefix_page_hashes = hashes;

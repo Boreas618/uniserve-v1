@@ -39,7 +39,7 @@ pub use crate::core::{
 pub use crate::deployment::Deployment;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
-    ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageWrites,
+    ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
     ParallelConfig, PoolPlacement, RankBuffer, RequestPlacement, SequenceParallel, TransferBackend,
     TransferConfig, TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure,
     WorkerGroupId, WorkerResult,

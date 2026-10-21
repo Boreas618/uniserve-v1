@@ -145,79 +145,80 @@ impl EngineConfig {
         let max_num_batched_tokens = scheduling
             .max_num_batched_tokens
             .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize);
-        let page_tier = kv_cache.prefix_caching && kv_cache.host_tier;
-        let worker_process =
-            WorkerProcessArgs {
-                executable: PathBuf::from(&workers.executable),
-                // A deployment is what one daemon serves under its served name.
-                deployment: spec.deployment.clone(),
-                page_tier,
-                storage_connector: kv_cache.mooncake.as_ref().filter(|_| page_tier).map(
-                    |mooncake| storage::connector::Settings {
-                        master: mooncake.master.clone(),
-                        metadata: mooncake.metadata_server.clone(),
-                        protocol: mooncake.protocol.clone(),
-                        device: mooncake.device.clone(),
-                        // Each host names itself to Mooncake.
-                        hostname: None,
-                        segment_bytes: mooncake.segment_bytes,
-                        library: stated(&mooncake.library).map(PathBuf::from),
-                    },
-                ),
-                keep_standby: workers.standby,
-                standby: false,
-                cache_units: None,
-                model: spec.model.clone(),
-                host: spec.host.clone(),
-                queue_depth: placement.queue_depth.max(1) as usize,
-                watchdog_timeout: Duration::from_millis(workers.watchdog_timeout_ms),
-                max_total_tokens: kv_cache
-                    .max_tokens
-                    .and_then(NonZeroU64::new)
-                    .map(NonZeroU64::get),
-                block_size: kv_cache.block_size,
-                attention_backend: workers.attention_backend.clone(),
-                expert_microbatches: experts.microbatches.max(1),
-                load_format: named(&workers.load_format, "load_config.format")?,
-                download_dir: stated(&workers.download_dir).map(PathBuf::from),
-                load_threads: workers.load_threads,
-                dtype: named(&workers.dtype, "dtype")?,
-                quantization_config,
-                kv_cache_dtype: stated(&kv_cache.dtype)
-                    .map(|dtype| named(&dtype, "kv_cache_config.dtype"))
-                    .transpose()?,
-                mem_fraction_static: placement.mem_fraction_static,
-                worker_mesh: stated(&workers.mesh),
-                distributed_backend: stated(&workers.distributed_backend),
-                lanes,
-                max_model_len: facts.max_model_len,
-                canvas_sampling: facts
-                    .canvas_sampling
-                    .as_ref()
-                    .map(|canvas| ipc::CanvasSampling {
-                        canvas_length: canvas.canvas_length,
-                        max_steps: canvas.max_steps,
-                        entropy_bound: canvas.entropy_bound,
-                        t_min: canvas.t_min,
-                        t_max: canvas.t_max,
-                        confidence_threshold: canvas.confidence_threshold,
-                        stability_threshold: canvas.stability_threshold,
-                    }),
-                prefill_outputs: facts.prefill_outputs,
-                video_text_capacities: sizes(&video.text_capacities),
-                ffmpeg: PathBuf::from(&video.ffmpeg),
-                // Each forward batch is bounded by the scheduler's batch and
-                // token budgets, which the worker's launch descriptor carries.
-                max_batch_calls: scheduling.max_batch,
-                max_batch_tokens: u32::try_from(max_num_batched_tokens)
-                    .context("`max_num_batched_tokens` exceeds the worker field width")?,
-                max_video_seconds: video.max_seconds,
-                min_video_seconds: (video.min_seconds > 0.0).then_some(video.min_seconds),
-                max_condition_rows: video.max_condition_rows,
-                video_resolutions: video.resolutions.clone(),
-                video_aspect_ratios: video.aspect_ratios.clone(),
-                ..graph_arguments(graphs, flashinfer)?
-            };
+        let host_kv_cache = kv_cache.prefix_caching && kv_cache.host_tier;
+        let worker_process = WorkerProcessArgs {
+            executable: PathBuf::from(&workers.executable),
+            // A deployment is what one daemon serves under its served name.
+            deployment: spec.deployment.clone(),
+            host_kv_cache,
+            kv_storage: kv_cache
+                .mooncake
+                .as_ref()
+                .filter(|_| host_kv_cache)
+                .map(|mooncake| storage::connector::Settings {
+                    master: mooncake.master.clone(),
+                    metadata: mooncake.metadata_server.clone(),
+                    protocol: mooncake.protocol.clone(),
+                    device: mooncake.device.clone(),
+                    // Each host names itself to Mooncake.
+                    hostname: None,
+                    segment_bytes: mooncake.segment_bytes,
+                    library: stated(&mooncake.library).map(PathBuf::from),
+                }),
+            keep_standby: workers.standby,
+            standby: false,
+            cache_units: None,
+            model: spec.model.clone(),
+            host: spec.host.clone(),
+            queue_depth: placement.queue_depth.max(1) as usize,
+            watchdog_timeout: Duration::from_millis(workers.watchdog_timeout_ms),
+            max_total_tokens: kv_cache
+                .max_tokens
+                .and_then(NonZeroU64::new)
+                .map(NonZeroU64::get),
+            block_size: kv_cache.block_size,
+            attention_backend: workers.attention_backend.clone(),
+            expert_microbatches: experts.microbatches.max(1),
+            load_format: named(&workers.load_format, "load_config.format")?,
+            download_dir: stated(&workers.download_dir).map(PathBuf::from),
+            load_threads: workers.load_threads,
+            dtype: named(&workers.dtype, "dtype")?,
+            quantization_config,
+            kv_cache_dtype: stated(&kv_cache.dtype)
+                .map(|dtype| named(&dtype, "kv_cache_config.dtype"))
+                .transpose()?,
+            mem_fraction_static: placement.mem_fraction_static,
+            worker_mesh: stated(&workers.mesh),
+            distributed_backend: stated(&workers.distributed_backend),
+            lanes,
+            max_model_len: facts.max_model_len,
+            canvas_sampling: facts
+                .canvas_sampling
+                .as_ref()
+                .map(|canvas| ipc::CanvasSampling {
+                    canvas_length: canvas.canvas_length,
+                    max_steps: canvas.max_steps,
+                    entropy_bound: canvas.entropy_bound,
+                    t_min: canvas.t_min,
+                    t_max: canvas.t_max,
+                    confidence_threshold: canvas.confidence_threshold,
+                    stability_threshold: canvas.stability_threshold,
+                }),
+            prefill_outputs: facts.prefill_outputs,
+            video_text_capacities: sizes(&video.text_capacities),
+            ffmpeg: PathBuf::from(&video.ffmpeg),
+            // Each forward batch is bounded by the scheduler's batch and
+            // token budgets, which the worker's launch descriptor carries.
+            max_batch_calls: scheduling.max_batch,
+            max_batch_tokens: u32::try_from(max_num_batched_tokens)
+                .context("`max_num_batched_tokens` exceeds the worker field width")?,
+            max_video_seconds: video.max_seconds,
+            min_video_seconds: (video.min_seconds > 0.0).then_some(video.min_seconds),
+            max_condition_rows: video.max_condition_rows,
+            video_resolutions: video.resolutions.clone(),
+            video_aspect_ratios: video.aspect_ratios.clone(),
+            ..graph_arguments(graphs, flashinfer)?
+        };
 
         Ok(Self {
             generation_limits: facts.limits.map(GenerationLimits::from).unwrap_or_default(),

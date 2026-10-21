@@ -509,14 +509,14 @@ impl Scheduler {
         if batch_complete && !calls_complete {
             invalid_result = true;
         }
-        // The page writes the batch carried are committed when every call
+        // The page offloads the batch carried are committed when every call
         // ran, and aborted otherwise.
-        if batch_complete && let Some(tiers) = self.tiers.as_mut() {
+        if batch_complete && let Some(kv_offload) = self.kv_offload.as_mut() {
             let succeeded = report
                 .results
                 .iter()
                 .all(|result| result.output.status != ipc::CallStatus::Error);
-            tiers.completed(result_batch_id, succeeded && !invalid_result);
+            kv_offload.completed(result_batch_id, succeeded && !invalid_result);
         }
         if invalid_result {
             self.fatal = true;
