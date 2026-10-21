@@ -2,12 +2,18 @@
 
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 
 import pytest
 import torch
 
-from uniserve.cuda_graph import capture, export, pool
+from uniserve.cuda_graph import (
+    break_graph,
+    capture,
+    capture_begin,
+    capture_end,
+    export,
+    pool,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -135,41 +141,6 @@ def test_replay_advances_registered_generators():
         graph.release()
 
 
-@torch.inference_mode()
-def test_segmented_capture_replays_eager_submissions_in_order():
-    """Work a graph cannot record runs between segments at replay."""
-    device = torch.device("cuda:0")
-    stream = torch.cuda.Stream(device=device)
-    value = torch.ones(16, device=device)
-    submissions = []
-
-    @contextmanager
-    def segments(submit):
-        submissions.append(submit)
-        yield
-
-    def body():
-        value.add_(1)
-        # The eager call doubles the value between the two segments.
-        submissions[-1](lambda: value.mul_(2))
-        value.add_(3)
-        return value
-
-    with torch.cuda.stream(stream):
-        value.fill_(1)
-    graph = capture(body, stream=stream, segments=segments)
-    try:
-        with torch.cuda.stream(stream):
-            value.fill_(1)
-            graph.replay()
-        stream.synchronize()
-        # (1 + 1) * 2 + 3: the capture itself ran only the graph segments'
-        # recording, so the replay alone produced this value.
-        assert torch.equal(value, torch.full_like(value, 7))
-    finally:
-        graph.release()
-
-
 class _Executable:
     """A graph executable instantiated through the driver.
 
@@ -243,26 +214,28 @@ def test_exported_graphs_launch_to_the_replayed_output():
 
 @torch.inference_mode()
 def test_export_names_one_graph_per_segment():
-    """A segmented graph exports one captured graph per segment."""
+    """A graph broken once exports two segments, which only Rust launches.
+
+    The work between them is a break op the worker notes and performs, so
+    torch replays no graph with breaks.
+    """
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
     value = torch.ones(16, device=device)
-    submissions = []
 
-    @contextmanager
-    def segments(submit):
-        submissions.append(submit)
-        yield
-
-    def body():
-        value.add_(1)
-        submissions[-1](lambda: value.mul_(2))
-        value.add_(3)
-
-    graph = capture(body, stream=stream, segments=segments)
+    recording = capture_begin(None, stream.cuda_stream, device.index)
     try:
-        exported, graphs = export(graph)
-        assert exported is graph
+        with torch.cuda.stream(stream):
+            value.add_(1)
+            break_graph()
+            value.add_(3)
+    except BaseException as error:
+        recording.end(failure=error)
+        raise
+    graph, graphs = capture_end(recording, instantiate=True)
+    try:
         assert len(graphs) == 2 and len(set(graphs)) == 2
+        with pytest.raises(RuntimeError, match="break ops"):
+            graph.replay()
     finally:
         graph.release()

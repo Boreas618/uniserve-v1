@@ -15,6 +15,7 @@
 //! The pieces are independent of any runner:
 //!
 //! - [`CUDAGraph`]: one captured forward;
+//! - [`BreakOp`]: the native work a graph break performs;
 //! - [`GraphBreaks`]: the graph breaks noted while a forward is captured;
 //! - [`bucket`]: the smallest configured size that holds a live count;
 //! - [`capture_order`]: shapes largest footprint first, so later captures
@@ -67,9 +68,33 @@ impl GraphMode {
     }
 }
 
-/// Work a graph cannot record, performed between two of its segments at
-/// every launch.
-pub(crate) type GraphBreak = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+/// Work a graph cannot record, performed natively between two of its
+/// segments at every launch.
+///
+/// Every graph break is one of these operations: capture ends a segment
+/// where the forward reaches the operation, notes it and begins the next
+/// segment, and the execution thread that launches the graph performs it
+/// after the segment before it, on the thread's own stream order. The
+/// operation addresses only memory its owner keeps for the graph's life.
+#[derive(Clone)]
+pub(crate) enum BreakOp {
+    /// Copy expert layer `layer`'s weight shards from the peers' memory
+    /// into the layer's slot on the prefetch stream (weight data
+    /// parallelism), ordered after the slot's previous reads.
+    WeightCopy {
+        weights: Arc<crate::parallel::ExpertWeights>,
+        layer: usize,
+    },
+}
+
+impl BreakOp {
+    /// Perform the operation between two segments of a launch.
+    pub(crate) fn perform(&self) -> Result<()> {
+        match self {
+            Self::WeightCopy { weights, layer } => weights.copy(*layer),
+        }
+    }
+}
 
 /// The graph breaks noted while a forward is captured.
 ///
@@ -78,16 +103,16 @@ pub(crate) type GraphBreak = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 /// whoever captures the forward takes the notes for its graph
 /// ([`CUDAGraph::with_breaks`]).
 #[derive(Clone, Default)]
-pub(crate) struct GraphBreaks(Arc<Mutex<Vec<GraphBreak>>>);
+pub(crate) struct GraphBreaks(Arc<Mutex<Vec<BreakOp>>>);
 
 impl GraphBreaks {
     /// Note the break between the segment that just ended and the next.
-    pub(crate) fn note(&self, work: GraphBreak) {
+    pub(crate) fn note(&self, work: BreakOp) {
         lock(&self.0).push(work);
     }
 
     /// The breaks noted since the last call, in capture order.
-    pub(crate) fn take(&self) -> Vec<GraphBreak> {
+    pub(crate) fn take(&self) -> Vec<BreakOp> {
         std::mem::take(&mut *lock(&self.0))
     }
 }
@@ -107,7 +132,7 @@ pub(crate) struct CUDAGraph {
     segments: Arc<[GraphExec]>,
     /// The work between segments `i` and `i + 1`, for a graph whose breaks
     /// Rust noted at capture.
-    breaks: Arc<[GraphBreak]>,
+    breaks: Arc<[BreakOp]>,
     /// The Python graph, which keeps the step's output alive and is passed
     /// back to release it. Shared, so that a launch which holds the graph
     /// for a job gives up no Python reference when it ends.
@@ -141,7 +166,7 @@ impl CUDAGraph {
 
     /// The graph with the breaks noted during its capture, one between
     /// every two segments.
-    pub(crate) fn with_breaks(mut self, breaks: Vec<GraphBreak>) -> Self {
+    pub(crate) fn with_breaks(mut self, breaks: Vec<BreakOp>) -> Self {
         self.breaks = breaks.into();
         self
     }
@@ -164,7 +189,7 @@ impl CUDAGraph {
         for (index, segment) in self.segments.iter().enumerate() {
             segment.launch(stream)?;
             if let Some(work) = self.breaks.get(index) {
-                work()?;
+                work.perform()?;
             }
         }
         Ok(())
