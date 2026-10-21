@@ -189,6 +189,37 @@ pub enum Event {
         /// Human-readable failure reason.
         message: String,
     },
+    /// Ends a token request on this engine without finishing it: every token
+    /// it generated here was sent before, and the daemon may submit it again
+    /// with those tokens (`GenerationRequest::generated_token_ids`) to the
+    /// engine that serves next.
+    Migratable {
+        /// Why the request leaves its engine.
+        cause: MigrationCause,
+    },
+}
+
+/// Why a request leaves the engine that served it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationCause {
+    /// The engine drains for a hot update.
+    Drain,
+    /// The workers that held the request were lost.
+    Loss,
+}
+
+impl Event {
+    /// Whether the event ends its request's stream.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Finished { .. }
+                | Self::Rejected { .. }
+                | Self::Error { .. }
+                | Self::Migratable { .. }
+        )
+    }
 }
 
 /// Why admission refused a request.

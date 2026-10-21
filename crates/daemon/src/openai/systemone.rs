@@ -196,5 +196,6 @@ fn readout_request(prompt: &ReadoutPrompt, images: &[media::ImageInput]) -> Gene
         include_stop_token: false,
         image_generation: ImageGenerationConfig::default(),
         readout: prompt.rows.clone(),
+        generated_token_ids: Vec::new(),
     }
 }

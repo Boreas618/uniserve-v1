@@ -77,6 +77,9 @@ enum EngineState {
   ENGINE_STATE_READY = 2;
   // Its start failed or its workers are lost; it serves nothing more.
   ENGINE_STATE_FAILED = 3;
+  // Draining: it admits nothing more, has ended its token requests as
+  // migratable and finishes the rest.
+  ENGINE_STATE_DRAINING = 4;
 }
 
 // What a ready engine serves.
@@ -157,10 +160,14 @@ message EngineCommand {
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
+    // Admit nothing more and end every token request that resumes from its
+    // generated tokens as migratable; the other requests finish.
+    Drain drain = 2;
   }
 }
 
 message Shutdown {}
+message Drain {}
 
 // One scheduler's statistics of the last reporting interval.
 message Stats {
@@ -187,6 +194,11 @@ message GenerationRequest {
   bool include_stop_token = 12;
   ImageGenerationConfig image_generation = 13;
   repeated ReadoutRow readout = 14;
+  // The tokens a migrated request generated on the engines that served it
+  // before, in order; empty for a new request. They continue its prompt, and
+  // the engine counts them as generated: against `max_und_tokens` and
+  // `min_tokens`, in its penalties and bad words, and in its usage.
+  repeated uint32 generated_token_ids = 15;
 }
 
 enum GenerationConstraint {
@@ -370,7 +382,22 @@ message Event {
     Finished finished = 15;
     Rejected rejected = 16;
     Failed error = 17;
+    Migratable migratable = 18;
   }
+}
+
+// The request ends on this engine without finishing: every token it
+// generated here has been sent, and the daemon may submit it again, with
+// those tokens, to the engine that serves next. A terminal event.
+message Migratable {
+  MigrationCause cause = 1;
+}
+
+enum MigrationCause {
+  // The engine drains for a hot update.
+  MIGRATION_CAUSE_DRAIN = 0;
+  // The workers that held the request were lost.
+  MIGRATION_CAUSE_LOSS = 1;
 }
 
 message Scheduled {

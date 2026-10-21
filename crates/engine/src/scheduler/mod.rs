@@ -99,7 +99,7 @@ use ipc::{
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 use ipc::{SharedMedia, TokenLogprob};
-use proto::request::SchedulingPolicy;
+use proto::request::{MigrationCause, SchedulingPolicy};
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
@@ -186,6 +186,9 @@ pub(crate) enum TerminalIntent {
     #[default]
     None,
     Finish(FinishReason),
+    /// The request leaves the scheduler without finishing, for the cause
+    /// given, once its calls in flight drain (`Scheduler::migrate_requests`).
+    Migrate(MigrationCause),
     Failure(String),
     /// A worker refused the request itself, for the reason its input-error
     /// completion states; the client receives an invalid-request rejection.

@@ -1487,6 +1487,13 @@ pub(crate) struct RequestState {
 }
 
 impl RequestState {
+    /// The prompt tokens the request's usage charges: its prompt without the
+    /// tokens it generated before it migrated, which its prompt continues
+    /// with (`Scheduler::request_state`) and its usage counts as generated.
+    pub(crate) fn charged_prompt_tokens(&self) -> usize {
+        self.req.prompt_token_ids.len() - self.req.generated_token_ids.len()
+    }
+
     /// Returns the request allocations, which admission installs.
     pub(super) fn allocations(&self) -> Option<&RequestAllocations> {
         self.allocations.as_ref()

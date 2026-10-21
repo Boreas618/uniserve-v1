@@ -20,7 +20,7 @@ pub use convert::WireError;
 pub use dtype::{ModelDtype, ModelDtypeParseError};
 pub use event::{
     ArtifactEvent, ArtifactMedia, ConditionExtent, DiffusionRequest, DiffusionRequestError, Event,
-    FinishReason, MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
+    FinishReason, MediaKind, MigrationCause, PositionLogprobs, RejectionKind, Request, StopReason,
 };
 pub use generation::{
     CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,

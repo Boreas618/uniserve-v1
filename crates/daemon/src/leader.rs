@@ -9,15 +9,16 @@
 //!
 //! 1. its images are fetched on the async runtime and its prompt rendered and
 //!    tokenized on the blocking pool ([`InputProcessor`]);
-//! 2. [`Leader::submit`] hands the tokenized request to the engine process,
-//!    which routes it to one of its schedulers and returns its events
-//!    ([`EventStream`]);
+//! 2. [`Leader::submit`] hands the tokenized request through the migrator
+//!    to the engine process, which routes it to one of its schedulers and
+//!    returns its events ([`RequestEvents`]), across the engines that serve
+//!    it when it migrates;
 //! 3. the events are assembled into public [`RequestOutput`] events
 //!    ([`output::generation_output`], [`output::media_output`]) and wrapped
 //!    in [`RequestStats`], which records the request's metrics once.
 //!
-//! Dropping the returned stream drops its `EventStream`, which cancels the
-//! request in the engine; that is the only cancellation path.
+//! Dropping the returned stream drops its `RequestEvents`, which cancels the
+//! request in the engine that serves it; that is the only cancellation path.
 //!
 //! [`RequestOutput`]: crate::output::RequestOutput
 //! [`output::generation_output`]: crate::output::generation_output
@@ -34,9 +35,7 @@ use proto::request::{GenerationLimits, Request};
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::engine::client::{
-    EngineClient, EngineInfo, EngineState, EventStream, StatsSink, SubmitError,
-};
+use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::RequestHold;
 use crate::input::media::MediaConnector;
@@ -48,8 +47,9 @@ use crate::input::{
 };
 use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
+use crate::migration::{Migrator, RequestEvents};
 use crate::model::{ModelConfig, ModelParameters};
-use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
+use crate::options::{ReasoningParser, ServeConfig, Stated};
 use crate::output::RequestOutputStream;
 
 /// One model served over its engine process.
@@ -64,8 +64,8 @@ pub struct Leader {
     processor: Arc<InputProcessor>,
     /// What the engine the model was bound to reported it serves.
     info: EngineInfo,
-    /// Every request's way to the engine that serves.
-    hold: Arc<RequestHold>,
+    /// Every request's way to the engine that serves, across engines.
+    migrator: Migrator,
     /// What started the engine process; `None` for an engine run elsewhere.
     control: Option<EngineControl>,
     images: MediaConnector,
@@ -292,7 +292,7 @@ impl Leader {
             processor,
             images,
             readout,
-            &config.logging_config,
+            config,
         );
         engine.control = Some(control);
         Ok(engine)
@@ -302,7 +302,9 @@ impl Leader {
     /// `client` connects to, labelling metrics with `model_name`.
     ///
     /// `images` resolves the image references of every request, and
-    /// `readout` serves `POST /v1/systemone` for a model that has one.
+    /// `readout` serves `POST /v1/systemone` for a model that has one;
+    /// `options` states the request and statistics logging
+    /// (`logging_config`) and request migration (`migration_config`).
     pub fn new(
         served_model_name: String,
         model_name: String,
@@ -310,8 +312,9 @@ impl Leader {
         processor: InputProcessor,
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
-        logging: &LoggingOptions,
+        options: &ServeConfig,
     ) -> Self {
+        let logging = &options.logging_config;
         let info = client.info().clone();
         let stats_logger = logging
             .log_stats
@@ -329,7 +332,7 @@ impl Leader {
             model_name,
             processor: Arc::new(processor),
             info,
-            hold,
+            migrator: Migrator::new(hold, options.migration_config.max_migrations),
             control: None,
             images,
             readout: readout.map(Arc::new),
@@ -383,7 +386,7 @@ impl Leader {
     /// Whether the engine can accept requests: whether a ready engine
     /// serves them.
     pub fn is_healthy(&self) -> bool {
-        self.hold.is_serving()
+        self.migrator.hold().is_serving()
     }
 
     /// The connector every request's image references go through.
@@ -516,8 +519,11 @@ impl Leader {
     /// # Errors
     ///
     /// Fails when the engine serves no requests.
-    pub(crate) async fn submit(&self, request: Request) -> Result<(EventStream, u32), SubmitError> {
-        let (events, scheduler) = self.hold.submit(request).await?;
+    pub(crate) async fn submit(
+        &self,
+        request: Request,
+    ) -> Result<(RequestEvents, u32), SubmitError> {
+        let (events, scheduler) = self.migrator.submit(request).await?;
         // A request the engine ended at submission names no scheduler; its
         // stream holds its terminal event.
         Ok((events, scheduler.unwrap_or(0)))
@@ -532,8 +538,9 @@ impl Leader {
     /// Fails when the blocking shutdown task does not complete, which happens
     /// only if it panics or its runtime is shutting down.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        let client = self.hold.client();
-        self.hold.close("the daemon is shutting down");
+        let hold = self.migrator.hold();
+        let client = hold.client();
+        hold.close("the daemon is shutting down");
         let Some(client) = client else {
             return Ok(());
         };
@@ -555,7 +562,8 @@ async fn close_on_loss(
 ) {
     let reason = loop {
         match states.borrow_and_update().clone() {
-            EngineState::Ready => {}
+            // A draining engine is no loss: the hold serves the next engine.
+            EngineState::Ready | EngineState::Draining => {}
             EngineState::Failed(error) => break format!("the engine failed: {error}"),
             EngineState::Closed => break "the engine process ended".to_owned(),
         }
@@ -724,6 +732,7 @@ mod tests {
             cache: Default::default(),
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         }
         .into()
     }
@@ -737,7 +746,7 @@ mod tests {
         assert!(engine.is_healthy());
 
         // The engine process ends without the leader asking it to.
-        let client = engine.hold.client().expect("an engine serves");
+        let client = engine.migrator.hold().client().expect("an engine serves");
         tokio::task::spawn_blocking(move || client.shutdown())
             .await
             .unwrap();

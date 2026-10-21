@@ -149,6 +149,7 @@ mod tests {
             cache: Default::default(),
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         }
         .into()
     }

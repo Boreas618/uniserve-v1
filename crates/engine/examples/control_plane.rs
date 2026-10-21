@@ -95,6 +95,7 @@ fn main() -> anyhow::Result<()> {
             cache,
             image_generation: policy,
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         };
         request.validate_resources(&limits)?;
         anyhow::Ok((id, request))

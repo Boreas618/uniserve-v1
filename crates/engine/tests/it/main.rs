@@ -7,6 +7,7 @@ mod canvas;
 mod control_plane;
 mod image_ipc;
 mod media_lanes;
+mod migration;
 mod multiproc_ipc;
 mod readout;
 mod support;

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Event, Request};
 use ipc::RequestId;
+use proto::request::MigrationCause;
 use tokio::sync::mpsc;
 
 use crate::lock;
@@ -359,9 +360,7 @@ impl EventRx {
             Event::TextTokens { ids } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(ids.len());
             }
-            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. } => {
-                self.finish();
-            }
+            event if event.is_terminal() => self.finish(),
             _ => {}
         }
     }
@@ -489,6 +488,9 @@ pub enum Command {
     },
     /// Aborts a request immediately at the server boundary.
     Abort(RequestId),
+    /// Ends every token request that resumes from its generated tokens as
+    /// migratable, for the cause given; other requests go on.
+    Migrate(MigrationCause),
     /// Requests orderly engine shutdown.
     Shutdown,
 }
@@ -622,6 +624,12 @@ impl CommandSender {
         let _ = self.send(Command::Abort(id));
     }
 
+    /// Ends every token request that resumes from its generated tokens as
+    /// migratable, for `cause`.
+    pub fn migrate(&self, cause: MigrationCause) {
+        let _ = self.send(Command::Migrate(cause));
+    }
+
     /// Requests orderly scheduler shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
@@ -655,6 +663,7 @@ mod tests {
             cache: Default::default(),
             image_generation: policy,
             readout: Vec::new(),
+            generated_token_ids: Vec::new(),
         }
     }
 

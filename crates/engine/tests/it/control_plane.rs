@@ -465,6 +465,7 @@ fn generation_request(
         cache,
         image_generation: policy,
         readout: Vec::new(),
+        generated_token_ids: Vec::new(),
     };
     request
         .validate_resources(&limits)

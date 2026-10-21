@@ -28,6 +28,17 @@ enum TokenOutcome {
     Finish(FinishReason),
 }
 
+/// How a token request ends on this scheduler.
+enum TokenTerminal {
+    /// It finished, with its final usage.
+    Finished {
+        reason: FinishReason,
+        stop_reason: Option<crate::StopReason>,
+    },
+    /// It leaves for another engine, for the cause given.
+    Migratable(MigrationCause),
+}
+
 /// Builds the terminal `Finished` event of a token request with its final
 /// usage.
 fn terminal_event(
@@ -38,7 +49,7 @@ fn terminal_event(
     Event::Finished {
         reason,
         stop_reason,
-        prompt_tokens: state.req.prompt_token_ids.len(),
+        prompt_tokens: state.charged_prompt_tokens(),
         completion_tokens: state.num_generated_tokens,
         images: state.num_generated_images,
     }
@@ -1444,6 +1455,28 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<crate::StopReason>,
     ) {
+        self.retire_token_request(
+            id,
+            TokenTerminal::Finished {
+                reason,
+                stop_reason,
+            },
+        );
+    }
+
+    /// Ends a token request as migratable for `cause`, releasing what it
+    /// owns as `finish_with` does; its terminal event is `Migratable`.
+    pub(super) fn migrate_request(&mut self, id: RequestId, cause: MigrationCause) {
+        self.retire_token_request(id, TokenTerminal::Migratable(cause));
+    }
+
+    /// Publishes `terminal` and releases every resource owned by one token
+    /// request; see `finish_with`.
+    fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
+        let reason = match &terminal {
+            TokenTerminal::Finished { reason, .. } => Some(reason.clone()),
+            TokenTerminal::Migratable(_) => None,
+        };
         let terminal_published = self
             .inflight
             .pending_finishes
@@ -1451,7 +1484,7 @@ impl Scheduler {
             .is_some_and(|finish| finish.terminal_published);
 
         // Report accepted request progress before error teardown removes it.
-        if reason == FinishReason::Error
+        if reason == Some(FinishReason::Error)
             && let Some(state) = self.running.get(&id)
         {
             tracing::error!(
@@ -1539,11 +1572,14 @@ impl Scheduler {
             // closed receiver drops the terminal event with the journal. A
             // terminal event published by `finish_after_inflight` may still
             // be journaled, and it is the only one the request publishes.
-            let accepted = terminal_published
-                || st
-                    .output
-                    .events
-                    .enqueue(terminal_event(&st, reason, stop_reason));
+            let event = match terminal {
+                TokenTerminal::Finished {
+                    reason,
+                    stop_reason,
+                } => terminal_event(&st, reason, stop_reason),
+                TokenTerminal::Migratable(cause) => Event::Migratable { cause },
+            };
+            let accepted = terminal_published || st.output.events.enqueue(event);
             if accepted {
                 self.output.retire(id, st.output.events);
             }

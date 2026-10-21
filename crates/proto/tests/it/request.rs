@@ -106,6 +106,7 @@ fn generation() -> GenerationRequest {
                 candidates: vec![30, 31],
             }],
         }],
+        generated_token_ids: Vec::new(),
     }
 }
 

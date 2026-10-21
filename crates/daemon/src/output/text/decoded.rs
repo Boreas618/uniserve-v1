@@ -1,6 +1,6 @@
 //! Incremental conversion from engine events to decoded text events.
 //!
-//! [`decoded_text_event_stream`] consumes one generation request's `EventStream`,
+//! [`decoded_text_event_stream`] consumes one generation request's `RequestEvents`,
 //! checks the engine event protocol, detokenizes generated tokens with the
 //! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
 //! strings, and passes image events through in order. `output::assembly`
@@ -9,11 +9,11 @@
 //! The decoder also reports its stop-string decisions to the engine: it
 //! acknowledges each token only after checking that it completes no stop
 //! string, and on a match stops generation with
-//! `EventStream::cancel_at_consumed_prefix`.
+//! `RequestEvents::cancel_at_consumed_prefix`.
 
 use std::sync::Arc;
 
-use crate::engine::client::EventStream;
+use crate::migration::RequestEvents;
 use asynk_strim_attr::{TryYielder, try_stream};
 use proto::request::{Event, PositionLogprobs, RejectionKind};
 use serde::{Deserialize, Serialize};
@@ -250,7 +250,7 @@ impl DecodeState<'_> {
         prompt_tokens: usize,
         token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
-        raw_stream: &mut EventStream,
+        raw_stream: &mut RequestEvents,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
         // Images completed before these tokens stay ordered ahead of them.
@@ -364,7 +364,7 @@ pub async fn decoded_text_event_stream(
     prompt_token_ids: Vec<u32>,
     prompt_logprobs_requested: bool,
     generated_logprobs_requested: bool,
-    mut raw_stream: EventStream,
+    mut raw_stream: RequestEvents,
     decode_options: TextDecodeOptions,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::output::text::Result<()> {
@@ -626,6 +626,14 @@ pub async fn decoded_text_event_stream(
                 state.flush_images(&mut y).await;
                 y.yield_ok(DecodedTextEvent::Failed { message }).await;
                 return Ok(());
+            }
+            // A request's events migrate with it (`crate::migration`), which
+            // carries a migratable end over to the next engine.
+            Event::Migratable { .. } => {
+                return Err(Error::MalformedOutput {
+                    request_id: request_id.clone(),
+                    message: "a migratable end reached the decoder".to_string(),
+                });
             }
             // Media artifacts belong to diffusion requests, and readout
             // answers to readout requests, which other consumers collect.

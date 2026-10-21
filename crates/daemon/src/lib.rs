@@ -16,6 +16,8 @@
 //!   inputs, each model family's request lowering) into engine requests;
 //! - `output`: output processing (detokenization, stop strings, reasoning
 //!   and tool parsing) of engine events into public events;
+//! - `migration`: moving token requests between engines with the tokens
+//!   they generated, behind one stream of events per request;
 //! - `engine`: starting the engine process and the client of the request
 //!   interface it serves;
 //! - `model`: the served checkpoint: its files, configuration and family
@@ -28,6 +30,7 @@ pub mod http;
 pub mod input;
 mod leader;
 pub mod metrics;
+pub mod migration;
 pub mod model;
 pub mod openai;
 pub mod options;
