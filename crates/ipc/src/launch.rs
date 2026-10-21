@@ -154,10 +154,8 @@ pub struct LaunchDescriptor {
     pub graph_policy: String,
     /// Strictly increasing bucket lists; `None` keeps the rank's catalog.
     pub decode_graph_batch_sizes: Option<Vec<u32>>,
-    pub prefill_cuda_graph: bool,
     pub prefill_outputs: bool,
     pub prefill_graph_token_sizes: Option<Vec<u32>>,
-    pub flow_cuda_graph: bool,
     pub flow_graph_batch_sizes: Option<Vec<u32>>,
     /// Distinct `[height, width]` image capture sizes in pixels.
     pub flow_graph_shapes: Option<Vec<[u32; 2]>>,

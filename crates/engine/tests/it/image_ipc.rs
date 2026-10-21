@@ -89,7 +89,6 @@ fn engine() -> anyhow::Result<SchedulerHandle> {
         // The stub rank encodes many small images, so it keeps a larger
         // encoder cache than a served model's default.
         encoder_cache_entries: 1024,
-        prefill_cuda_graph: false,
         ranks: config.worker_groups[0].ranks.clone(),
         components,
         queue_depth: 2,

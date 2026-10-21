@@ -160,9 +160,6 @@ pub struct WorkerProcessArgs {
     /// Strictly increasing decode batch sizes captured as CUDA graphs;
     /// `None` keeps the rank's catalog.
     pub decode_graph_batch_sizes: Option<Vec<u32>>,
-    /// Whether every prefill call replays a CUDA graph captured at
-    /// startup; without it prefill runs eagerly, for debugging.
-    pub prefill_cuda_graph: bool,
     /// Whether any prefill call of the deployment samples a token or scores
     /// its prompt. Without it every prefill only writes the prefix cache, and
     /// the worker's prefill graphs stop at the final layer's cache write.
@@ -170,9 +167,6 @@ pub struct WorkerProcessArgs {
     /// Strictly increasing prefill token counts captured as CUDA graphs;
     /// `None` keeps the rank's catalog.
     pub prefill_graph_token_sizes: Option<Vec<u32>>,
-    /// Whether image denoising calls capture and replay CUDA graphs at the
-    /// configured flow shapes.
-    pub flow_cuda_graph: bool,
     /// Strictly increasing image denoising batch sizes captured as CUDA
     /// graphs; `None` keeps the rank's catalog.
     pub flow_graph_batch_sizes: Option<Vec<u32>>,

@@ -311,9 +311,7 @@ fn graph_arguments(
     Ok(WorkerProcessArgs {
         graph_policy: named(&graphs.policy, "cuda_graph_config.policy")?,
         decode_graph_batch_sizes: sizes(&graphs.decode_batch_sizes),
-        prefill_cuda_graph: graphs.capture_prefill,
         prefill_graph_token_sizes: sizes(&graphs.prefill_token_sizes),
-        flow_cuda_graph: graphs.capture_flow,
         flow_graph_batch_sizes: sizes(&graphs.flow_batch_sizes),
         flow_graph_shapes: graphs.flow_shapes.as_ref().map(|shapes| {
             shapes

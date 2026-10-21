@@ -98,9 +98,6 @@ def production_server(
         "--set",
         "max_num_batched_tokens=4096",
         "--set",
-        "cuda_graph_config.capture_prefill="
-        + ("true" if graph_policy == "full" else "false"),
-        "--set",
         f"cuda_graph_config.policy={graph_policy}",
         "--tensor-parallel-size",
         str(ranks or len(devices.split(","))),

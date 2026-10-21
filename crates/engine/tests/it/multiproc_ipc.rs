@@ -2503,7 +2503,6 @@ fn worker_group_args() -> WorkerProcessArgs {
         // The stub rank encodes many small images, so it keeps a larger
         // encoder cache than a served model's default.
         encoder_cache_entries: 1024,
-        prefill_cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
     WorkerProcessArgs {
@@ -2635,10 +2634,8 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         min_video_seconds: None,
         graph_policy: "off".into(),
         decode_graph_batch_sizes: None,
-        prefill_cuda_graph: false,
         prefill_outputs: true,
         prefill_graph_token_sizes: None,
-        flow_cuda_graph: false,
         flow_graph_batch_sizes: None,
         flow_graph_shapes: None,
         video_text_capacities: None,

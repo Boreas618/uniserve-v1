@@ -172,11 +172,9 @@ A token request that generates text moves to the engine that serves next when it
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `policy` | `"auto"` | `auto` captures graphs unless serving does not capture the attention provider's calls, `full` requires them, `off` serves every call eagerly |
-| `capture_prefill` | `true` | Replay a captured graph for every prefill call |
-| `capture_flow` | `true` | Capture and replay image denoising calls |
-| `decode_batch_sizes` | Worker catalog | Decode batch sizes captured, strictly increasing |
-| `prefill_token_sizes` | Worker catalog | Prefill token counts captured, strictly increasing |
+| `policy` | `"auto"` | Whether a worker group runs every call with CUDA graphs or every call eagerly, chosen when its workers load and never mixed: `auto` captures graphs unless serving does not capture the attention provider's calls, and then serves eagerly; `full` requires graphs; `off` serves every call eagerly (CPU workers always do). Under graphs the text buckets hold every decode and prefill batch the worker admits; prefill and image denoising are always captured |
+| `decode_batch_sizes` | Worker catalog | Decode batch sizes captured, strictly increasing; the largest decode batch the worker admits is captured besides them |
+| `prefill_token_sizes` | Worker catalog | Prefill token counts captured, strictly increasing; the batch token bound is captured besides them, for every row bucket up to the largest batch the worker admits |
 | `flow_batch_sizes` | `[1, 2, 3, 4]` | Image denoising batch sizes captured, strictly increasing |
 | `flow_shapes` | `["1152x2048", "2048x1152"]` | Distinct `HEIGHTxWIDTH` image sizes captured |
 

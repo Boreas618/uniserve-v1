@@ -19,8 +19,8 @@ prints both.
 The count is a continuation that no near tie decides, so rounding
 differences between the drained engine's decode of the generated tokens and
 the new engine's prefill of them cannot change it. The deployment captures
-few graphs (decode batches up to 8, no prefill graphs), so that the standby
-starts while the count streams.
+few graphs (decode batches up to 8, prefill buckets of 512 tokens and the
+batch bound), so that the standby starts while the count streams.
 
 The standby parks with the device memory of its graph pools and scratch
 resident, or suspended (``worker_config.standby_memory``): copied to host
@@ -214,7 +214,7 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
         "--set",
         "chat_config.reasoning_parser=none",
         "--set",
-        "cuda_graph_config.capture_prefill=false",
+        "cuda_graph_config.prefill_token_sizes=[512]",
         "--set",
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
         "--set",

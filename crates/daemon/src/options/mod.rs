@@ -501,10 +501,6 @@ pub struct CudaGraphOptions {
     /// `auto` captures graphs unless serving does not capture the attention
     /// provider's calls, `full` requires them, `off` serves eagerly.
     pub policy: GraphPolicy,
-    /// Replay a captured graph for every prefill call.
-    pub capture_prefill: bool,
-    /// Capture and replay image denoising calls.
-    pub capture_flow: bool,
     /// Decode batch sizes captured, strictly increasing; the worker's
     /// catalog when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
@@ -527,8 +523,6 @@ impl Default for CudaGraphOptions {
     fn default() -> Self {
         Self {
             policy: GraphPolicy::Auto,
-            capture_prefill: true,
-            capture_flow: true,
             decode_batch_sizes: None,
             prefill_token_sizes: None,
             flow_batch_sizes: None,
@@ -1098,8 +1092,6 @@ impl ServeConfig {
             }),
             cuda_graphs: Some(wire::CudaGraphs {
                 policy: word(&graphs.policy),
-                capture_prefill: graphs.capture_prefill,
-                capture_flow: graphs.capture_flow,
                 decode_batch_sizes: increasing(
                     "cuda_graph_config.decode_batch_sizes",
                     &graphs.decode_batch_sizes,

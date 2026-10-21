@@ -511,7 +511,6 @@ impl ImageOwners {
         let mut flow_pools = Vec::new();
         if let (Some((_, runner)), Some(latents)) = (&diffusion, &latents)
             && config.graph_policy != "off"
-            && config.flow_cuda_graph
             && let Some(ordinal) = runner.device().cuda()
         {
             flow = flow_shapes(
