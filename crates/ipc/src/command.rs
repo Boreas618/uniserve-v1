@@ -176,17 +176,14 @@ impl CanvasSampling {
 /// What a video request admits besides its sampling controls.
 ///
 /// The engine forms it from the `DiffusionRequest` it admits; the conditions'
-/// media stay published by the engine until the request retires, so a
-/// worker reads them by locator while the request lives.
+/// media stay published until the request retires, so a worker reads them by
+/// locator while the request lives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoAdmission {
-    /// The task the request runs.
-    pub task: models::video::VideoTask,
-    /// The denoiser's AdaLN tag of each prompt token: 0 for a vision token
-    /// or vision marker, 1 for text.
-    pub text_tags: Vec<u8>,
-    /// The conditions in request order.
-    pub conditions: Vec<models::video::VideoCondition>,
+    /// The request's task, presentation tags and conditions as the model
+    /// family plans them (`models::video::Conditioning`, JSON), which the
+    /// workers decode and check.
+    pub conditioning: Vec<u8>,
 }
 
 /// Request-start framing. Carries the per-domain parameters a request
@@ -309,18 +306,9 @@ impl NewRequest {
         );
         if let Some(video) = &self.video {
             ensure_valid!(
-                video.text_tags.len() == self.prompt_token_ids.len(),
-                "every video prompt token requires one tag"
+                !video.conditioning.is_empty(),
+                "a video admission carries its conditioning"
             );
-            ensure_valid!(
-                (video.task == models::video::VideoTask::T2va) == video.conditions.is_empty(),
-                "only a conditioned video task carries conditions"
-            );
-            for condition in &video.conditions {
-                if let Err(message) = condition.validate() {
-                    bail_invalid!("{message}");
-                }
-            }
         }
         Ok(())
     }

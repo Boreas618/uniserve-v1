@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
+use ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo, VideoTaskInfo};
 use models::video::{Canvas, FrameClips, ReferenceLimits, ServedCanvas};
 use tvm_ffi::Any;
 
@@ -429,8 +429,14 @@ impl VideoModel {
 
     /// The handshake's description of the denoiser on a deployment that
     /// prepares and admits `canvases`: its tasks as it states them.
-    pub(crate) fn denoiser_info(&self, canvases: &[ServedCanvas]) -> VideoDenoiserInfo {
-        VideoDenoiserInfo {
+    /// The denoiser as the worker reports it at the `canvases` it prepared:
+    /// its tasks and step count for the engine to schedule by, and the model
+    /// family's full description for the frontend.
+    ///
+    /// Fails when the model names a task the family does not define or
+    /// describes an invalid denoiser.
+    pub(crate) fn denoiser_info(&self, canvases: &[ServedCanvas]) -> Result<VideoDenoiserInfo> {
+        let description = models::video::DenoiserInfo {
             tasks: self.facts.tasks.clone(),
             schedule_points: self.facts.num_steps + 1,
             video_shift: self.facts.video_shift,
@@ -440,7 +446,31 @@ impl VideoModel {
             frames: self.facts.frames,
             canvases: canvases.to_vec(),
             references: self.facts.references,
-        }
+        };
+        description
+            .validate()
+            .map_err(|message| Error::Invalid(message.into()))?;
+        let tasks = self
+            .facts
+            .tasks
+            .iter()
+            .map(|name| {
+                let task = models::video::VideoTask::from_name(name).ok_or_else(|| {
+                    Error::Invalid(format!("the video denoiser serves unknown task {name:?}"))
+                })?;
+                Ok(VideoTaskInfo {
+                    name: name.clone(),
+                    conditioned: task.conditioned(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(VideoDenoiserInfo {
+            tasks,
+            denoise_steps: self.facts.num_steps,
+            description: description
+                .encode()
+                .map_err(|error| Error::Invalid(format!("encoding the denoiser: {error}")))?,
+        })
     }
 
     /// Packed rows of the largest condition set a request generating

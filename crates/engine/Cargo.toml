@@ -12,7 +12,6 @@ bitflags.workspace = true
 crossbeam-channel.workspace = true
 fnv.workspace = true
 ipc.workspace = true
-models.workspace = true
 proto.workspace = true
 png = { workspace = true, optional = true }
 serde.workspace = true
@@ -39,6 +38,8 @@ daemon.workspace = true
 storage-server.workspace = true
 base64.workspace = true
 engine = { path = ".", features = ["testing"] }
+# Tests state video requests as the frontend plans them.
+models.workspace = true
 png.workspace = true
 tracing-subscriber.workspace = true
 

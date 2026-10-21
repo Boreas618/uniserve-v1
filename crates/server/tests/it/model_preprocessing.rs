@@ -7,9 +7,9 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use engine::VideoDenoiserInfo;
 use engine::{GenerationLimits, GenerationRequest};
 use ipc::MediaCall;
+use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
 use server::openai::ApiError;
@@ -55,8 +55,8 @@ const SPECIAL_TOKENS: &[&str] = &[
 
 /// What a released base denoiser reports in its handshake: text-to-video
 /// over every canvas of the canvas rule, on the 50-point schedule.
-fn base_denoiser() -> VideoDenoiserInfo {
-    VideoDenoiserInfo {
+fn base_denoiser() -> DenoiserInfo {
+    DenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 50,
         video_shift: 12.0,
@@ -85,7 +85,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
 /// released checkpoint's Qwen3-VL processor geometry, a one-rank latent
 /// encoder and the default media policy.
 fn video_service(
-    denoiser: VideoDenoiserInfo,
+    denoiser: DenoiserInfo,
     max_video_seconds: f64,
     tokenizer: &DynTokenizer,
 ) -> VideoService {
@@ -734,7 +734,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         canvas: canvas(width, height),
     };
     // 768p 16:9, then 480p 21:9 and 16:9.
-    let denoiser = VideoDenoiserInfo {
+    let denoiser = DenoiserInfo {
         tasks: vec!["t2va".to_owned()],
         schedule_points: 9,
         video_shift: 10.0,

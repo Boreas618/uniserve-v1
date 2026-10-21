@@ -782,11 +782,11 @@ impl VideoRequests {
             width: media.width,
             height: media.height,
         };
-        if (video.task == models::video::VideoTask::T2va) != video.conditions.is_empty() {
-            return Err(Error::Invalid(
-                "a video request's task disagrees with its conditions".into(),
-            ));
-        }
+        let conditioning = models::video::Conditioning::decode(&video.conditioning)
+            .map_err(|error| Error::Invalid(format!("a video request's conditioning: {error}")))?;
+        conditioning
+            .validate(admission.prompt_token_ids.len())
+            .map_err(|message| Error::Invalid(message.into()))?;
         let Some(duration) = self
             .durations
             .get(&media.num_frames)
@@ -798,13 +798,13 @@ impl VideoRequests {
         // frame rule this rank declared, so they need no comparison with the
         // units of its own decoder's slicing.
         let units = Arc::clone(&duration.units);
-        let conditions: Arc<[VideoCondition]> = video.conditions.clone().into();
+        let conditions: Arc<[VideoCondition]> = conditioning.conditions.into();
         let size = VideoSize {
             frames: media.num_frames,
             canvas,
             tokens: admission.prompt_token_ids.len() as u32,
             conditions: condition_shapes(&conditions),
-            spans: vision_spans(&video.text_tags).into(),
+            spans: vision_spans(&conditioning.text_tags).into(),
         };
         let request = VideoRequest {
             key: admission.request_key,

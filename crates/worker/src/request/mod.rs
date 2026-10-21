@@ -492,9 +492,13 @@ mod tests {
                     height: 16,
                 }),
                 video: Some(VideoAdmission {
-                    task: VideoTask::T2va,
-                    text_tags: vec![1],
-                    conditions: Vec::new(),
+                    conditioning: models::video::Conditioning {
+                        task: VideoTask::T2va,
+                        text_tags: vec![1],
+                        conditions: Vec::new(),
+                    }
+                    .encode()
+                    .unwrap(),
                 }),
                 prompt_token_ids: vec![1],
                 ..admission(7, 1, 1)

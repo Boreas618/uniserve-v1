@@ -18,6 +18,8 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::shared_memory::SharedMemory;
 
 /// Why a shared-storage media export could not be claimed.
@@ -188,6 +190,16 @@ impl Drop for SharedMedia {
 /// publisher keeps the name: dropping the value unlinks it, and the kernel
 /// frees the storage once no reader still maps it. The engine holds a
 /// request's exports until the request retires, after its last call.
+/// Where published media lies: a POSIX shared-memory object, by its name
+/// without the leading `/`, and the byte count published in it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MediaLocator {
+    /// The object's name without its leading `/`.
+    pub name: String,
+    /// The published bytes.
+    pub bytes: u64,
+}
+
 #[derive(Debug)]
 pub struct MediaSource {
     storage: SharedMemory,
@@ -216,8 +228,8 @@ impl MediaSource {
     }
 
     /// The object's name without its leading `/` and its byte count.
-    pub fn locator(&self) -> models::video::MediaLocator {
-        models::video::MediaLocator {
+    pub fn locator(&self) -> MediaLocator {
+        MediaLocator {
             name: self.storage.name().to_owned(),
             bytes: self.storage.size() as u64,
         }
@@ -226,8 +238,8 @@ impl MediaSource {
     /// Hand the named object to its receiving process. The receiver must
     /// claim it with `SharedMedia::open`, which unlinks it on receipt.
     /// Dropping this publisher afterwards leaves the name available.
-    pub fn into_locator(self) -> models::video::MediaLocator {
-        models::video::MediaLocator {
+    pub fn into_locator(self) -> MediaLocator {
+        MediaLocator {
             bytes: self.storage.size() as u64,
             name: self.storage.into_name(),
         }

@@ -175,7 +175,7 @@ impl ExecutorInfo {
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
-            let missing = crate::scheduler::graph::task_calls(models::video::VideoTask::T2va)
+            let missing = crate::scheduler::graph::video_calls(false)
                 .into_iter()
                 .filter(|call| !routing.contains_key(call))
                 .map(|call| format!("{call:?}"))
@@ -467,18 +467,16 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
     let Some(denoiser) = info.video_denoiser.as_ref() else {
         return Ok(());
     };
-    for name in &denoiser.tasks {
-        let Some(task) = models::video::VideoTask::from_name(name) else {
-            anyhow::bail!("the video denoiser serves unknown task {name:?}");
-        };
-        let missing = crate::scheduler::graph::task_calls(task)
+    for task in &denoiser.tasks {
+        let missing = crate::scheduler::graph::video_calls(task.conditioned)
             .into_iter()
             .filter(|call| !info.media_components.contains_key(call))
             .map(|call| format!("{call:?}"))
             .collect::<Vec<_>>();
         anyhow::ensure!(
             missing.is_empty(),
-            "the deployment serves {name} but places no component for {}",
+            "the deployment serves {} but places no component for {}",
+            task.name,
             missing.join(", ")
         );
     }
@@ -1421,27 +1419,12 @@ mod tests {
                 .map(|(call, _)| CallKind::Media(*call))
                 .collect(),
             video_denoiser: denoises.then(|| VideoDenoiserInfo {
-                tasks: vec!["t2va".to_owned()],
-                schedule_points: 5,
-                video_shift: 12.0,
-                audio_shift: 3.0,
-                frame_rate: 24,
-                audio_sample_rate: 32_000,
-                frames: models::video::FrameClips {
-                    min_frames: 22,
-                    clip_frames: 17,
-                    clip_latent_frames: 5,
-                    tail_latent_frames: 2,
-                },
-                canvases: vec![models::video::ServedCanvas {
-                    short_edge: 480,
-                    aspect_ratio: "16:9".to_owned(),
-                    canvas: models::video::Canvas {
-                        width: 832,
-                        height: 480,
-                    },
+                tasks: vec![ipc::VideoTaskInfo {
+                    name: "t2va".to_owned(),
+                    conditioned: false,
                 }],
-                references: models::video::ReferenceLimits::default(),
+                denoise_steps: 4,
+                description: b"{}".to_vec(),
             }),
             ..WorkerInfo::default()
         }
@@ -1665,27 +1648,15 @@ mod tests {
         let serving = |tasks: &[&str], routes: &[(MediaCall, &str)]| {
             let mut info = media_info(routes);
             info.video_denoiser = Some(VideoDenoiserInfo {
-                tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
-                schedule_points: 5,
-                video_shift: 12.0,
-                audio_shift: 3.0,
-                frame_rate: 24,
-                audio_sample_rate: 32_000,
-                frames: models::video::FrameClips {
-                    min_frames: 22,
-                    clip_frames: 17,
-                    clip_latent_frames: 5,
-                    tail_latent_frames: 2,
-                },
-                canvases: vec![models::video::ServedCanvas {
-                    short_edge: 480,
-                    aspect_ratio: "16:9".to_owned(),
-                    canvas: models::video::Canvas {
-                        width: 832,
-                        height: 480,
-                    },
-                }],
-                references: models::video::ReferenceLimits::default(),
+                tasks: tasks
+                    .iter()
+                    .map(|task| ipc::VideoTaskInfo {
+                        name: (*task).to_owned(),
+                        conditioned: *task != "t2va",
+                    })
+                    .collect(),
+                denoise_steps: 4,
+                description: b"{}".to_vec(),
             });
             ExecutorInfo {
                 workers: vec![(WorkerGroupId("model".to_owned()), info)],

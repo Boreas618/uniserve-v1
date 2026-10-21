@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Context as _;
-use engine::{EventRx, SchedulerHandle, SubmitError, VideoDenoiserInfo};
+use engine::{EventRx, SchedulerHandle, SubmitError};
 use engine::{GenerationLimits, Request};
 use observability::{EngineLabels, METRICS};
 use tokio_util::task::AbortOnDropHandle;
@@ -200,11 +200,16 @@ impl Engine {
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video(vision) => {
-                let denoiser = first
+                let reported = first
                     .info()
                     .video_denoiser
-                    .clone()
+                    .as_ref()
                     .context("the video worker reported no video denoiser")?;
+                let denoiser = models::video::DenoiserInfo::decode(&reported.description)
+                    .context("the video worker described its denoiser unreadably")?;
+                denoiser
+                    .validate()
+                    .map_err(|message| anyhow::anyhow!("the video worker's denoiser: {message}"))?;
                 // Reference images are banded to the units one latent
                 // encoding round covers on the deployment's latent encoder
                 // while a request's prompt is encoded.
@@ -374,7 +379,7 @@ impl Engine {
 
     /// The video denoiser this deployment serves; `None` for a model that
     /// generates no video.
-    pub fn video_denoiser(&self) -> Option<&VideoDenoiserInfo> {
+    pub fn video_denoiser(&self) -> Option<&models::video::DenoiserInfo> {
         self.processor.video_service().map(VideoService::denoiser)
     }
 

@@ -209,7 +209,7 @@ pub(crate) fn engine_over(
 /// processor geometry and the default media policy.
 pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     VideoService::new(
-        engine::VideoDenoiserInfo {
+        models::video::DenoiserInfo {
             tasks: vec!["t2va".to_owned()],
             schedule_points: 5,
             video_shift: 12.0,

@@ -2088,11 +2088,16 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         for index in 0..2 {
             let request_id = RequestId(10_000 + index as u64);
             let prompt_token_ids = vec![100_000 + index as u32];
-            let events = engine.submit(Request::Diffusion(DiffusionRequest {
-                request_id,
+            let conditioning = models::video::Conditioning {
                 task: models::video::VideoTask::T2va,
                 text_tags: vec![1; prompt_token_ids.len()],
+                conditions: Vec::new(),
+            };
+            let events = engine.submit(Request::Diffusion(DiffusionRequest {
+                request_id,
+                task: "t2va".to_owned(),
                 prompt_token_ids,
+                conditioning: conditioning.encode()?,
                 conditions: Vec::new(),
                 media: Vec::new(),
                 priority: 0,
@@ -2736,9 +2741,12 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
             height: 768,
         },
         ipc::VideoAdmission {
-            task: models::video::VideoTask::T2va,
-            text_tags: vec![1],
-            conditions: Vec::new(),
+            conditioning: models::video::Conditioning {
+                task: models::video::VideoTask::T2va,
+                text_tags: vec![1],
+                conditions: Vec::new(),
+            }
+            .encode()?,
         },
     )?;
     let value = scalar_product(key, CallId::new(1, 0), 1, DType::F32);

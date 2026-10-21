@@ -1,10 +1,10 @@
 //! The call graph of one video request.
 //!
-//! Admission builds a [`VideoGraph`] from the request's task and conditions:
-//! which media calls the request runs, the products each one publishes with
-//! their exact leading extents, and which calls read them. A `t2va` request
-//! is text encoding, latent preparation, denoising, both decoders,
-//! both encoders and the muxer. A conditioned request first reads its
+//! Admission builds a [`VideoGraph`] from the request's conditions: which
+//! media calls the request runs, the products each one publishes with their
+//! exact leading extents, and which calls read them. A request without
+//! conditions is text encoding, latent preparation, denoising, both
+//! decoders, both encoders and the muxer. A conditioned request first reads its
 //! condition media on a CPU worker (`MediaReading`), encodes the vision blocks
 //! the presentation names (`VisionEncoding`) ahead of the text encoding that
 //! splices them in, and encodes its visual conditions by temporal units and
@@ -19,7 +19,13 @@
 
 use crate::DiffusionRequest;
 use ipc::MediaCall;
-use models::video::{Canvas, VideoTask};
+
+/// A video raster in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Canvas {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
 
 /// Product names, as the worker's components declare their outputs.
 pub(crate) mod product {
@@ -90,18 +96,18 @@ const GENERATION_CALLS: [MediaCall; 8] = [
     MediaCall::Muxing,
 ];
 
-/// The media calls a request of `task` runs: the generation calls, and for a
-/// conditioned task the calls reading and encoding its conditions. Every
-/// keyframe and every `ref2va` request presents vision blocks, so a
-/// conditioned task always encodes vision.
-pub(crate) fn task_calls(task: VideoTask) -> Vec<MediaCall> {
-    let conditions: &[MediaCall] = match task {
-        VideoTask::T2va => &[],
-        VideoTask::Fl2va | VideoTask::Ref2va => &[
+/// The media calls a request runs: the generation calls, and for a request
+/// with conditions the calls reading and encoding them. Every conditioned
+/// request presents vision blocks, so it always encodes vision.
+pub(crate) fn video_calls(conditioned: bool) -> Vec<MediaCall> {
+    let conditions: &[MediaCall] = if conditioned {
+        &[
             MediaCall::MediaReading,
             MediaCall::VisionEncoding,
             MediaCall::LatentEncoding,
-        ],
+        ]
+    } else {
+        &[]
     };
     conditions
         .iter()
@@ -132,22 +138,19 @@ impl VideoGraph {
         let conditions = &request.conditions;
         let pixels: u64 = conditions
             .iter()
-            .map(|condition| condition.pixel_bytes() / 3)
+            .map(|condition| condition.pixel_bytes / 3)
             .sum();
         let samples: u64 = conditions
             .iter()
-            .filter_map(|condition| condition.media.audio())
-            .map(|track| track.samples)
+            .map(|condition| condition.audio_samples)
             .sum();
         let patches: u64 = conditions
             .iter()
-            .filter_map(|condition| condition.vision.as_ref())
-            .map(|vision| vision.grid.patches())
+            .map(|condition| condition.vision_patches)
             .sum();
         let tokens: u64 = conditions
             .iter()
-            .filter_map(|condition| condition.vision.as_ref())
-            .map(|vision| u64::from(vision.tokens))
+            .map(|condition| u64::from(condition.vision_tokens))
             .sum();
         let video_rows: u64 = conditions.iter().map(|c| c.video_rows()).sum();
         let audio_rows: u64 = conditions.iter().map(|c| u64::from(c.audio_rows)).sum();
@@ -157,7 +160,7 @@ impl VideoGraph {
         let mut produce = |call: MediaCall, name: &'static str, extent: Option<u32>| {
             products.push(GraphProduct { call, name, extent });
         };
-        if request.task != VideoTask::T2va {
+        if !conditions.is_empty() {
             calls.push(MediaCall::MediaReading);
             if pixels > 0 {
                 produce(
@@ -305,21 +308,27 @@ mod tests {
     use std::sync::Arc;
 
     use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
-    use models::video::{
-        AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
-        VideoCondition, VisionGrid,
-    };
 
     use super::*;
+    use crate::ConditionExtent;
 
-    fn request(task: VideoTask, conditions: Vec<VideoCondition>) -> DiffusionRequest {
+    fn request(conditions: Vec<ConditionExtent>) -> DiffusionRequest {
+        let media = conditions
+            .iter()
+            .map(|_| Arc::new(MediaSource::publish(b"media").unwrap()))
+            .collect();
         DiffusionRequest {
             request_id: RequestId(1),
-            task,
+            task: if conditions.is_empty() {
+                "t2va"
+            } else {
+                "ref2va"
+            }
+            .to_owned(),
             prompt_token_ids: vec![1; 40],
-            text_tags: vec![1; 40],
+            conditioning: b"{}".to_vec(),
             conditions,
-            media: Vec::new(),
+            media,
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: 124,
@@ -331,22 +340,11 @@ mod tests {
         }
     }
 
-    fn source() -> Arc<MediaSource> {
-        Arc::new(MediaSource::publish(b"media").unwrap())
-    }
-
-    fn canvas() -> Canvas {
-        Canvas {
-            width: 1344,
-            height: 768,
-        }
-    }
-
     /// A text request runs the generation calls alone and reserves only the
     /// prompt features, the latents and the media output products.
     #[test]
     fn a_text_request_runs_the_generation_calls_alone() {
-        let graph = VideoGraph::new(&request(VideoTask::T2va, Vec::new())).unwrap();
+        let graph = VideoGraph::new(&request(Vec::new())).unwrap();
         assert!(!graph.reads_media());
         assert!(!graph.runs(MediaCall::LatentEncoding));
         assert_eq!(
@@ -380,51 +378,24 @@ mod tests {
     /// soundtrack separately; the products carry the request's exact sizes.
     #[test]
     fn a_reference_request_reads_and_encodes_its_conditions() {
-        let media = source();
-        let soundtrack = AudioClip {
-            sample_rate: 48_000,
-            start_sample: 0,
-            source_samples: 248_000,
-            samples: 165_334,
-        };
-        let condition = VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Video {
-                clip: VideoClip {
-                    canvas: canvas(),
-                    start_frame: 0,
-                    frames: 124,
-                    vae_frames: 124,
-                },
-                soundtrack: Some(soundtrack),
-            },
-            vision: Some(ConditionVision {
-                grid: VisionGrid { t: 6, h: 42, w: 24 },
-                tokens: 1512,
-                frame_indices: vec![0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120],
-            }),
+        // 124 frames of 1344x768 with a soundtrack, sampled by the
+        // conditioner on a 6x42x24 grid, and one 1344x768 image.
+        let video = ConditionExtent {
+            pixel_bytes: 124 * 1344 * 768 * 3,
+            audio_samples: 165_334,
+            vision_patches: 6 * 42 * 24,
+            vision_tokens: 1512,
             latent_units: [vec![5040; 7], vec![2016]].concat(),
             audio_rows: 414,
         };
-        let image = VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Image(ImageFit {
-                resized: canvas(),
-                left: 0,
-                top: 0,
-                size: canvas(),
-            }),
-            vision: Some(ConditionVision {
-                grid: VisionGrid { t: 1, h: 48, w: 84 },
-                tokens: 1008,
-                frame_indices: Vec::new(),
-            }),
+        let image = ConditionExtent {
+            pixel_bytes: 1344 * 768 * 3,
+            vision_patches: 48 * 84,
+            vision_tokens: 1008,
             latent_units: vec![1008],
-            audio_rows: 0,
+            ..ConditionExtent::default()
         };
-        let graph = VideoGraph::new(&request(VideoTask::Ref2va, vec![condition, image])).unwrap();
+        let graph = VideoGraph::new(&request(vec![video, image])).unwrap();
 
         assert_eq!(
             graph.calls()[..3],
@@ -464,21 +435,12 @@ mod tests {
     /// An audio reference adds only audio products: no pixels, no vision.
     #[test]
     fn an_audio_reference_adds_no_visual_products() {
-        let media = source();
-        let audio = VideoCondition {
-            role: ConditionRole::Reference,
-            source: media.locator(),
-            media: ConditionMedia::Audio(AudioClip {
-                sample_rate: 32_000,
-                start_sample: 0,
-                source_samples: 165_600,
-                samples: 165_600,
-            }),
-            vision: None,
-            latent_units: Vec::new(),
+        let audio = ConditionExtent {
+            audio_samples: 165_600,
             audio_rows: 414,
+            ..ConditionExtent::default()
         };
-        let graph = VideoGraph::new(&request(VideoTask::Ref2va, vec![audio])).unwrap();
+        let graph = VideoGraph::new(&request(vec![audio])).unwrap();
         assert!(!graph.encodes_vision());
         assert!(graph.product(product::CONDITION_PIXELS).is_none());
         assert!(graph.product(product::CONDITION_VIDEO_LATENTS).is_none());
