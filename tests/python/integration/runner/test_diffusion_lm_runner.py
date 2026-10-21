@@ -653,7 +653,7 @@ def _capture(
     torch.cuda.synchronize()
     recording = cuda_graph.capture_begin(pool, session.stream.cuda_stream, 0)
     method(*arguments)
-    graph, _ = cuda_graph.capture_end(recording)
+    graph, _ = cuda_graph.capture_end(recording, instantiate=True)
     torch.cuda.synchronize()
     return graph
 

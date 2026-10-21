@@ -249,8 +249,9 @@ impl ProcessClient {
             // The engine states whether its workers use the host KV cache.
             host_kv_cache: false,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
-            // The engine states whether a group stands by.
+            // The engine states whether a group stands by, and how.
             standby: false,
+            standby_memory: proto::request::StandbyMemory::Auto,
         })
     }
 

@@ -22,6 +22,12 @@ the new engine's prefill of them cannot change it. The deployment captures
 few graphs (decode batches up to 8, no prefill graphs), so that the standby
 starts while the count streams.
 
+The standby parks with the device memory of its graph pools and scratch
+resident, or suspended (``worker_config.standby_memory``): copied to host
+memory and released on the device at unchanged addresses, then mapped back
+with its contents at the promotion, before its graphs run. Either way the
+new engine's graphs decode the same count.
+
 The test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemon at a directory of the test's, and the server the daemon starts there
 is stopped at the end. ``UNISERVE_UPDATE_EXECUTABLE`` names the ``uniserve``
@@ -144,8 +150,9 @@ def _engine_builds(lines: list[str]) -> set[str]:
     }
 
 
+@pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
 def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
-    tmp_path: Path,
+    tmp_path: Path, standby_memory: str
 ):
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
@@ -172,6 +179,8 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
         "cuda_graph_config.capture_prefill=false",
         "--set",
         "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+        "--set",
+        f"worker_config.standby_memory={standby_memory}",
     ]
     env = {"CUDA_VISIBLE_DEVICES": "0", "XDG_RUNTIME_DIR": str(runtime)}
     update_body = {}
@@ -239,5 +248,19 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
     if "executable" in update_body:
         builds = _engine_builds(lines)
         assert len(builds) == 2, f"the engines ran the builds {builds}"
+    if standby_memory == "suspended":
+        assert any(
+            "the standby worker suspended its graph memory" in line
+            for line in lines
+        ), "the standby worker kept its graph memory"
+        assert any(
+            "the promoted standby worker restored its graph memory" in line
+            for line in lines
+        ), "the promoted standby worker did not restore its graph memory"
+    else:
+        assert any(
+            "the standby worker keeps its graph memory resident" in line
+            for line in lines
+        ), "the standby worker suspended its graph memory"
     assert streamed == reference
     assert usage == reference_usage

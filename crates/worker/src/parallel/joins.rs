@@ -25,8 +25,11 @@ use crate::{Error, Result};
 pub(crate) struct GraphFunctions {
     /// `capture_begin(pool, stream, device) -> capture`.
     pub begin: Function,
-    /// `capture_end(capture) -> [graph, executables]`.
+    /// `capture_end(capture) -> [graph, graphs]`.
     pub end: Function,
+    /// `handover(graph)`: Python releases its captured graphs once Rust
+    /// instantiated them.
+    pub handover: Function,
     /// `release(graph)`.
     pub release: Function,
 }
@@ -37,6 +40,7 @@ impl GraphFunctions {
         Ok(Self {
             begin: Interpreter::import("uniserve.cuda_graph.capture_begin")?,
             end: Interpreter::import("uniserve.cuda_graph.capture_end")?,
+            handover: Interpreter::import("uniserve.cuda_graph.handover")?,
             release: Interpreter::import("uniserve.cuda_graph.release")?,
         })
     }
@@ -56,7 +60,9 @@ impl GraphFunctions {
 
     /// [`Self::capture`] of work whose modules also run on other devices
     /// (a generation tower): `peers` pairs each such device with the pool
-    /// receiving the work's allocations there.
+    /// receiving the work's allocations there. Rust instantiates the
+    /// captured segments and Python then releases its graph objects; the
+    /// graph's step output stays with the Python graph until its release.
     pub(crate) fn capture_with_peers(
         &self,
         pool: &Handle,
@@ -78,10 +84,22 @@ impl GraphFunctions {
             Any::from(peers),
         ])?)?;
         let ran = body();
-        let ended = self
-            .end
-            .call(&[capture.view()])
-            .and_then(CUDAGraph::captured);
+        let ended = self.end.call(&[capture.view()]).and_then(|result| {
+            let handle = tvm_ffi::Array::<Any>::try_from(result.clone())
+                .ok()
+                .and_then(|fields| fields.get(0).ok());
+            let captured = CUDAGraph::captured(result, device);
+            // Python releases its captured graphs whether or not Rust could
+            // instantiate them; a failed instantiation leaves nothing to
+            // launch.
+            let handed = match &handle {
+                Some(graph) => self.handover.invoke(&[graph.into()]),
+                None => Ok(()),
+            };
+            let graph = captured?;
+            handed?;
+            Ok(graph)
+        });
         match ran {
             Ok(()) => ended,
             Err(error) => {

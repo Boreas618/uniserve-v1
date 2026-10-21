@@ -678,6 +678,8 @@ message Workers {
   // Empty when unset.
   string download_dir = 10;
   optional uint32 load_threads = 11;
+  // `auto`, `resident` or `suspended`; empty for `auto`.
+  string standby_memory = 12;
 }
 
 message CudaGraphs {

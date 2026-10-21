@@ -170,11 +170,14 @@ class Scratch:
 
     One backing list per (role, device, schema): a request reuses the newest
     backing that fits; a larger request allocates a new backing in front and
-    keeps the older ones, which already captured graphs still address.
+    keeps the older ones, which already captured graphs still address. In a
+    worker, device backings allocate from ``pool``, the allocator pool of
+    the device memory the worker owns for this scratch.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pool: torch.cuda.MemPool | None = None) -> None:
         self._backings: dict[tuple, list[TensorBuffers]] = {}
+        self._pool = pool
 
     def view(
         self,
@@ -195,7 +198,13 @@ class Scratch:
             raise RuntimeError(
                 f"prepare {role!r} scratch for this size before capture"
             )
-        backing = TensorBuffers.allocate(requirements, device=device)
+        pool = (
+            contextlib.nullcontext()
+            if self._pool is None or device.type != "cuda"
+            else torch.cuda.use_mem_pool(self._pool, device)
+        )
+        with pool:
+            backing = TensorBuffers.allocate(requirements, device=device)
         backings.insert(0, backing)
         return backing.view(requirements)
 

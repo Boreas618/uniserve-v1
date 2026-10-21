@@ -151,12 +151,13 @@ mod tests {
         )
     }
 
-    /// A one-segment capture result whose Python graph is `value`.
+    /// A capture result whose Python graph is `value`, of no segment, so
+    /// that no device instantiates it.
     fn graph(value: i64) -> CUDAGraph {
-        CUDAGraph::captured(Any::from(list([
-            Any::from(value),
-            Any::from(integer_list([0x1000 + value])),
-        ])))
+        CUDAGraph::captured(
+            Any::from(list([Any::from(value), Any::from(integer_list([]))])),
+            cuda::DeviceId(0),
+        )
         .unwrap()
     }
 

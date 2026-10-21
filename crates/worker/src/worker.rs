@@ -48,7 +48,7 @@ use crate::capacity::plan::Plan;
 use crate::config::placement::{Components, GroupPlacement};
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::reserve_pools;
-use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
+use crate::cuda_graph::{GraphPool, GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
@@ -79,7 +79,7 @@ use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
-use crate::service::{Ending, Service};
+use crate::service::{Ending, Parked, Service};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
@@ -133,7 +133,9 @@ pub(crate) struct Worker {
     graphs: GraphStorage,
     /// The shared work areas of every stream runners construct their
     /// execution contexts on.
-    _scratches: Scratches,
+    scratches: Scratches,
+    /// How the worker, parked as a standby, keeps its graph memory.
+    standby_memory: ipc::StandbyMemory,
     executor: Executor,
     hooks: Vec<Box<dyn WarmupHooks>>,
     /// Retained for the rank's lifetime: torch, the driver owners and the
@@ -667,7 +669,8 @@ impl Worker {
             budget,
             streams,
             graphs,
-            _scratches: scratches,
+            scratches,
+            standby_memory: launch.storage.standby_memory,
             executor,
             hooks,
             context,
@@ -760,10 +763,15 @@ impl Worker {
             cache.scratch_units = scratch;
         }
         // A standby worker parks with its exclusive storages read-only until
-        // the engine promotes it.
+        // the engine promotes it, and with the memory its graphs address
+        // released when keeping it would crowd the workers it stands by for.
         let standby = if self.retained.standing_by() {
+            let suspended = self.park_graph_memory()?;
             self.retained.park()?;
-            Some(Arc::clone(&self.retained))
+            Some(Parked {
+                retained: Arc::clone(&self.retained),
+                suspended,
+            })
         } else {
             None
         };
@@ -775,6 +783,65 @@ impl Worker {
         let served = Service::new(executor, channel, info, experts, stall_bound, standby).run();
         executor.backend().set_storage_wake(None);
         served
+    }
+
+    /// How a parked standby keeps the device memory its graphs and scratch
+    /// address, as `worker_config.standby_memory` says: resident or
+    /// suspended (copied to host memory, its device memory released, its
+    /// addresses kept, restored at the promotion); with `auto`, resident when
+    /// every device keeps, beside it, the share of its memory a serving
+    /// worker's capacity plan leaves for graphs and activations
+    /// ([`graph_storage_budget_bytes`]), and suspended otherwise. Returns the
+    /// pools it suspended.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a device lacks that share even once the memory is
+    /// suspended: the standby does not fit beside the workers it stands by
+    /// for, and none is kept.
+    fn park_graph_memory(&mut self) -> std::result::Result<Vec<Arc<GraphPool>>, WorkerError> {
+        let mut pools = self.graphs.pools();
+        pools.extend(self.scratches.pools());
+        let mut devices: Vec<DeviceId> = pools.iter().map(|pool| pool.device).collect();
+        devices.sort_unstable();
+        devices.dedup();
+        let short = |device: DeviceId| -> Result<bool> {
+            let memory = device.memory_info()?;
+            Ok(memory.free < graph_storage_budget_bytes(memory.total as i64))
+        };
+        let bytes: usize = pools.iter().map(|pool| pool.memory.mapped_bytes()).sum();
+        let crowded = match self.standby_memory {
+            ipc::StandbyMemory::Resident => false,
+            ipc::StandbyMemory::Suspended => true,
+            ipc::StandbyMemory::Auto => {
+                let mut crowded = false;
+                for &device in &devices {
+                    crowded |= short(device).map_err(phase("standby"))?;
+                }
+                crowded
+            }
+        };
+        if !crowded {
+            tracing::info!(bytes, "the standby worker keeps its graph memory resident");
+            return Ok(Vec::new());
+        }
+
+        // Warmup ended: no work runs on the streams once they drained.
+        for stream in self.streams.iter() {
+            stream.synchronize().map_err(phase("standby"))?;
+        }
+        for pool in &pools {
+            pool.suspend().map_err(phase("standby"))?;
+        }
+        tracing::info!(bytes, "the standby worker suspended its graph memory");
+        for &device in &devices {
+            if short(device).map_err(phase("standby"))? {
+                return Err(phase("standby")(Error::Invalid(format!(
+                    "the standby worker does not fit beside the workers it stands by for on {device}"
+                ))));
+            }
+        }
+        Ok(pools)
     }
 
     /// Release every owner in dependency order. An aborted close never

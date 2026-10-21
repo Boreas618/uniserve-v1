@@ -63,17 +63,17 @@ class _TileReplay:
 
     Called with one tile's native input, it returns a new tensor equal to the
     tiled encoder's encoding of that tile: a tile of the captured input's
-    shape, dtype and device is copied into that input, the graph replayed on
-    the current stream (the one stream every runner of a rank's video encoder
-    computes on) and its output copied out; any other tile is encoded
-    eagerly.
+    shape, dtype and device is copied into that input, the graph launched by
+    the worker on the stream every runner of a rank's video encoder computes
+    on (``launch``, which takes no arguments) and its output copied out; any
+    other tile is encoded eagerly.
     """
 
-    def __init__(self, runner: EncoderRunner, graph) -> None:
+    def __init__(self, runner: EncoderRunner, launch) -> None:
         self._encoder = runner._tile_encoder
         self._input = runner._tile_input
         self._output = runner._tile_output
-        self._graph = graph
+        self._launch = launch
 
     def __call__(self, tile: torch.Tensor) -> torch.Tensor:
         static, output = self._input, self._output
@@ -86,7 +86,7 @@ class _TileReplay:
         ):
             return self._encoder(tile)
         static.copy_(tile)
-        self._graph.replay()
+        self._launch()
         # The next replay overwrites the output.
         return output.clone()
 
@@ -144,10 +144,9 @@ class EncoderRunner:
             3]`` of each visual unit of a video encoder's call, ``[samples,
             2]`` of each track of an audio encoder's call.
         tile_runner: A video encoder's tile runner (:meth:`tile`), whose
-            captured still-frame tile encoding ``tile_graph`` (a
-            ``uniserve.cuda_graph.BreakableCUDAGraph``) this runner replays
-            for every tile of that shape; both borrowed, both ``None`` to
-            encode every tile eagerly.
+            captured still-frame tile encoding the worker's ``tile_launch``
+            launches for every tile of that shape this runner encodes; both
+            borrowed, both ``None`` to encode every tile eagerly.
     """
 
     # The encoder, of one of the capability classes :meth:`encode` lists.
@@ -169,7 +168,7 @@ class EncoderRunner:
         scratch,
         size: Sequence[int],
         tile_runner: EncoderRunner | None = None,
-        tile_graph: Any = None,
+        tile_launch: Any = None,
     ) -> None:
         path, attention = str(path), str(attention)
         module = loaded.module.get_submodule(path) if path else loaded.module
@@ -190,8 +189,8 @@ class EncoderRunner:
                 f"{type(module).__qualname__} is not constructed with a size"
             )
         tiles = None
-        if tile_runner is not None and tile_graph is not None:
-            replay = _TileReplay(tile_runner, tile_graph)
+        if tile_runner is not None and tile_launch is not None:
+            replay = _TileReplay(tile_runner, tile_launch)
             tiles = {tile_runner._tile_encoder: replay}
         context = execution_context(
             module, int(stream), attention, scratch, tiles=tiles
