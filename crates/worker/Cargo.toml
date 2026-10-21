@@ -18,6 +18,7 @@ crossbeam-channel.workspace = true
 indexmap.workspace = true
 libc.workspace = true
 libloading.workspace = true
+models.workspace = true
 nvtx.workspace = true
 png.workspace = true
 # The C API types of the interpreter a worker hosts; its functions are
@@ -34,7 +35,6 @@ time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tvm-ffi.workspace = true
-uniserve-core.workspace = true
 uniserve-cuda.workspace = true
 uniserve-ipc.workspace = true
 uniserve-storage.workspace = true

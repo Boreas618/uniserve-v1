@@ -84,19 +84,21 @@ use crate::prefix_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoo
 use crate::storage::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
-use crossbeam_channel::Receiver;
-use uniserve_core::RequestId;
-use uniserve_core::{
+use crate::{
     ArtifactEvent, DiffusionRequest, EngineCoreOutput, FinishReason, GenerationRequest,
-    GenerationRequestError, MediaKind, PositionLogprobs, Request, SharedMedia, TokenLogprob,
+    GenerationRequestError, MediaKind, PositionLogprobs, Request,
 };
-use uniserve_core::{RejectionKind, UnitId, encoder_cache_key};
+use crate::{RejectionKind, encoder_cache_key};
+use crossbeam_channel::Receiver;
+use uniserve_ipc::RequestId;
+use uniserve_ipc::UnitId;
 use uniserve_ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
     Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange, DimBound,
     ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
+use uniserve_ipc::{SharedMedia, TokenLogprob};
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
@@ -371,7 +373,7 @@ pub struct Scheduler {
     placement: placement::Placement,
     /// Aggregate capacity view of the loaded workers.
     info: WorkerInfo,
-    generation_limits: uniserve_core::GenerationLimits,
+    generation_limits: crate::GenerationLimits,
     special_tokens: SpecialTokenIds,
     /// Token requests awaiting admission, in admission order: arrival order,
     /// or priority then arrival under the priority policy.
@@ -436,20 +438,20 @@ impl Scheduler {
 
 /// Returns wall-clock seconds since the Unix epoch.
 ///
-/// Uses the shared `uniserve_core::now_unix_secs` so scheduler timestamps
+/// Uses the shared `crate::clock::now_unix_secs` so scheduler timestamps
 /// match other components'. The clock is not monotonic; a time before the
 /// epoch reads as zero instead of panicking.
 fn now() -> f64 {
-    uniserve_core::now_unix_secs()
+    crate::clock::now_unix_secs()
 }
 
 /// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
 /// `None`.
-fn worker_float_dtype(value: Option<uniserve_core::ModelDtype>) -> Option<uniserve_ipc::DType> {
+fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<uniserve_ipc::DType> {
     match value {
-        Some(uniserve_core::ModelDtype::Float16) => Some(uniserve_ipc::DType::F16),
-        Some(uniserve_core::ModelDtype::BFloat16) => Some(uniserve_ipc::DType::BF16),
-        Some(uniserve_core::ModelDtype::Float32) => Some(uniserve_ipc::DType::F32),
+        Some(crate::ModelDtype::Float16) => Some(uniserve_ipc::DType::F16),
+        Some(crate::ModelDtype::BFloat16) => Some(uniserve_ipc::DType::BF16),
+        Some(crate::ModelDtype::Float32) => Some(uniserve_ipc::DType::F32),
         None => None,
     }
 }

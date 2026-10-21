@@ -14,12 +14,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
+use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
-use uniserve_core::ModelDtype;
-use uniserve_core::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
+use uniserve_engine::ModelDtype;
 use uniserve_engine::{EngineConfig, EngineCore, SimEngine, SimExecutor};
 
 use crate::engine::Engine;
@@ -216,7 +216,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             audio_shift: 3.0,
             frame_rate: 24,
             audio_sample_rate: 32_000,
-            frames: uniserve_core::FrameClips {
+            frames: models::video::FrameClips {
                 min_frames: 22,
                 clip_frames: 17,
                 clip_latent_frames: 5,
@@ -224,13 +224,13 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
             },
             // The base checkpoint's canvas of each named ratio at 768p.
             canvases: [(21, 9), (16, 9), (4, 3), (1, 1), (3, 4), (9, 16)]
-                .map(|(width, height): (u32, u32)| uniserve_core::ServedCanvas {
+                .map(|(width, height): (u32, u32)| models::video::ServedCanvas {
                     short_edge: 768,
                     aspect_ratio: format!("{width}:{height}"),
                     canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
                 })
                 .to_vec(),
-            references: uniserve_core::ReferenceLimits::default(),
+            references: models::video::ReferenceLimits::default(),
         },
         ProcessorConfig {
             patch_size: 16,
@@ -245,7 +245,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         1,
         &crate::options::MediaOptions::default(),
         // A text-to-video denoiser takes no references to size.
-        uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
+        models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
         configured_tokenizer(),
     )
     .unwrap()

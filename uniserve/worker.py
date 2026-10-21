@@ -7,7 +7,7 @@ on a Python thread of its own and calls :func:`attach` once it is up.
 numerical library by its import path. Everything else is the library's:
 descriptor parsing, registration, model loading, serving and shutdown.
 
-The same library exports the video request rules of ``uniserve-core``,
+The same library exports the video request rules of the ``models`` crate,
 which the numerical library plans MiniMax-H3 requests with
 (:func:`library`).
 """

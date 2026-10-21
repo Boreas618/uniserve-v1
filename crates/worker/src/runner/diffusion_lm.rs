@@ -55,8 +55,8 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_core::CanvasSampling;
 use uniserve_cuda::Stream;
+use uniserve_ipc::CanvasSampling;
 
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, Methods};

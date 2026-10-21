@@ -4,8 +4,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_core::ComponentConfig;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::ComponentConfig;
 use uniserve_ipc::{CallKind, MediaCall, WorkerInfo};
 
 use crate::capacity::video::VideoCapacity;
@@ -159,7 +159,7 @@ pub(crate) fn cuda_device(device: Device) -> Result<DeviceId> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{ComponentDistribution, ParallelConfig};
+    use uniserve_ipc::{ComponentDistribution, ParallelConfig};
 
     use super::*;
 

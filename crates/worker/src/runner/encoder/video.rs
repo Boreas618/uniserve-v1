@@ -6,9 +6,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use models::video::plan::CANVAS_MULTIPLE;
+use models::video::{Canvas, VideoCondition};
 use tvm_ffi::Any;
-use uniserve_core::video::plan::CANVAS_MULTIPLE;
-use uniserve_core::{Canvas, VideoCondition};
 use uniserve_cuda::{DeviceId, Stream};
 use uniserve_ipc::{Batch as BatchPlan, CallKind, MediaCall};
 
@@ -769,7 +769,7 @@ fn vision_grids(conditions: &[VideoCondition]) -> (Vec<[u32; 3]>, Vec<[u32; 3]>)
         };
         let grid = [vision.grid.t, vision.grid.h, vision.grid.w];
         match condition.media {
-            uniserve_core::ConditionMedia::Video { .. } => videos.push(grid),
+            models::video::ConditionMedia::Video { .. } => videos.push(grid),
             _ => images.push(grid),
         }
     }
@@ -1023,7 +1023,7 @@ fn condition_input(
 /// A still frame planned as several units is encoded in bands of its patch
 /// rows, each band reading the whole frame: the head deals the patch rows in
 /// order, so a band's first row follows the rows of the bands before it
-/// (`uniserve_core::video::plan::ConditionPlan::latent_units`). Any other
+/// (`models::video::plan::ConditionPlan::latent_units`). Any other
 /// unit is its encoder window, over every patch row.
 fn unit_rows(
     condition: &VideoCondition,

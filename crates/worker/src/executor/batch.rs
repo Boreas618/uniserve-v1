@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use uniserve_core::CallId;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::CallId;
 use uniserve_ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
     ForwardStats, MediaCall, RequestKey, TensorRef,
@@ -951,9 +951,9 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use uniserve_core::{RequestId, SamplingParams};
     use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
     use uniserve_ipc::{BufferAllocation, GenerationParams, NewRequest, RequestKey, ShapeBound};
+    use uniserve_ipc::{RequestId, SamplingParams};
 
     use super::*;
     use crate::storage::BufferPool;

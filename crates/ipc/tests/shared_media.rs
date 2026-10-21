@@ -1,7 +1,7 @@
 //! Claim semantics of `SharedMedia` exports.
 
 use std::sync::Arc;
-use uniserve_core::{MediaSource, SharedMedia};
+use uniserve_ipc::{MediaSource, SharedMedia};
 
 #[test]
 fn claimed_media_remains_readable_after_its_name_and_first_consumer_are_gone() {

@@ -514,7 +514,7 @@ impl Scheduler {
         } else {
             None
         };
-        let submitted_us = uniserve_core::now_monotonic_us();
+        let submitted_us = crate::clock::now_monotonic_us();
         self.register_inflight(
             call.clone(),
             InflightInput::Generation { image_cache },

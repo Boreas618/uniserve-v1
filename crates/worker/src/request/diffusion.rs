@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use uniserve_ipc::RequestKey;
 
-use uniserve_core::ImageParams;
+use uniserve_ipc::ImageParams;
 
 use crate::{Error, Result};
 
@@ -477,7 +477,7 @@ impl crate::executor::lifecycle::RequestStorage for Trajectories {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::RequestId;
+    use uniserve_ipc::RequestId;
 
     use super::*;
 

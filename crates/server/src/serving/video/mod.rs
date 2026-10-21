@@ -36,7 +36,7 @@
 //! and 5 are CPU work, the planning, the tokenization and the copies into
 //! shared memory, and run on the blocking pool ([`Presenter`]).
 //!
-//! The request rules are `uniserve-core`'s ([`plan`], [`presentation`]); the
+//! The request rules are the `models` crate's ([`plan`], [`presentation`]); the
 //! model package reads the canvas rule and the frame counts from them through
 //! the worker library, and plans no request.
 //! [`VideoService::capabilities`] describes the same contract for
@@ -52,17 +52,18 @@ pub mod probe;
 
 use std::sync::Arc;
 
-use serde::Deserialize;
-use serde_json::{Value, json};
-use uniserve_core::video::plan::{
-    self, CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
+use models::video::plan;
+use models::video::plan::{
+    CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
     MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig, Role, Target, VideoInputError,
 };
-use uniserve_core::video::presentation;
-use uniserve_core::{
-    Canvas, DiffusionRequest, DiffusionSamplingParams, MediaSource, RequestId, VideoTask,
-};
+use models::video::presentation;
+use models::video::{Canvas, VideoTask};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use uniserve_engine::DiffusionRequest;
 use uniserve_engine::VideoDenoiserInfo;
+use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 
 use crate::options::MediaOptions;
 use crate::profile::tokenizer::DynTokenizer;
@@ -522,15 +523,15 @@ mod tests {
 
     use base64::Engine as _;
     use image::ImageEncoder as _;
-    use serde_json::Value;
-    use tokenizers::models::bpe::{BPE, Vocab};
-    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::video::plan::{ProcessorConfig, ReferenceConfig, RequestField};
-    use uniserve_core::video::presentation::{TEXT_TAG, VIDEO_TAG};
-    use uniserve_core::{
+    use models::video::plan::{ProcessorConfig, ReferenceConfig, RequestField};
+    use models::video::presentation::{TEXT_TAG, VIDEO_TAG};
+    use models::video::{
         Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, ReferenceLimits,
         ServedCanvas, VideoTask, VisionGrid,
     };
+    use serde_json::Value;
+    use tokenizers::models::bpe::{BPE, Vocab};
+    use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_engine::VideoDenoiserInfo;
 
     use super::{VideoGenerationRequest, VideoService};
@@ -652,7 +653,7 @@ mod tests {
                 audio_shift: 3.0,
                 frame_rate: 24,
                 audio_sample_rate: 32_000,
-                frames: uniserve_core::FrameClips {
+                frames: models::video::FrameClips {
                     min_frames: 22,
                     clip_frames: 17,
                     clip_latent_frames: 5,
@@ -948,7 +949,7 @@ mod tests {
     /// the vision markers and placeholders to the reference's ids.
     #[tokio::test]
     async fn checkpoint_tokenizer_matches_the_reference() {
-        use uniserve_core::video::presentation::Tokenizer as _;
+        use models::video::presentation::Tokenizer as _;
 
         let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
             eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
@@ -972,7 +973,7 @@ mod tests {
                 let Some(text) = segment.get("text") else {
                     continue;
                 };
-                let ids: Vec<u64> = uniserve_core::video::presentation::Tokenizer::encode(
+                let ids: Vec<u64> = models::video::presentation::Tokenizer::encode(
                     &tokenizer,
                     text.as_str().unwrap(),
                 )

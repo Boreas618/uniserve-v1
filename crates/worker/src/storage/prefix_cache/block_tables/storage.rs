@@ -336,8 +336,8 @@ impl BlockTableStorage {
 mod tests {
     use super::*;
     use crate::storage::BlockTables;
-    use uniserve_core::UnitId;
     use uniserve_ipc::BlockTable;
+    use uniserve_ipc::UnitId;
 
     fn read(view: &StorageView) -> Vec<i32> {
         let count = view.numel() as usize;

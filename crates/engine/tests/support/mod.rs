@@ -6,10 +6,10 @@
 
 #![allow(dead_code)]
 
-use uniserve_core::{GenerationFeatures, GenerationLimits, ModelDtype};
 use uniserve_engine::{
     Executor, Scheduler, SchedulerConfig, SchedulingPolicy, SimEngine, SpecialTokenIds,
 };
+use uniserve_engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
 
 /// Builds a scheduler whose model limits follow from `executor`'s call kinds.

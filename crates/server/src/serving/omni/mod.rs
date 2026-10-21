@@ -25,10 +25,10 @@ use base64::Engine as _;
 
 use crate::profile::omni::OmniProfile;
 use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
-use uniserve_core::{
-    GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, ImageParams,
-    MultimodalInputs,
+use uniserve_engine::{
+    GenerationConstraint, GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs,
 };
+use uniserve_ipc::ImageParams;
 
 use crate::profile::tokenizer::DynTokenizer;
 use crate::serving::TokenizeError;
@@ -451,7 +451,7 @@ fn replace_chat_images(
 fn image_placeholder(request_id: &str, index: usize) -> String {
     format!(
         "[IMAGE_SLOT_{:016x}_{index}]",
-        uniserve_core::Fnv1a::hash(request_id.as_bytes())
+        crate::serving::stable_hash(request_id.as_bytes())
     )
 }
 
@@ -518,5 +518,5 @@ fn combine_cache_keys(key: u64, value: u64) -> u64 {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&key.to_le_bytes());
     bytes[8..].copy_from_slice(&value.to_le_bytes());
-    uniserve_core::Fnv1a::hash(&bytes)
+    crate::serving::stable_hash(&bytes)
 }

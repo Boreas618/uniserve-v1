@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use models::video::{Canvas, FrameClips, ReferenceLimits, ServedCanvas};
 use tvm_ffi::Any;
-use uniserve_core::{Canvas, FrameClips, ReferenceLimits, ServedCanvas};
 use uniserve_ipc::{DimBound, OutputInfo, RasterAxes, ShapeBound, VideoDenoiserInfo};
 
 use super::{DECODER, DENOISER, OUTPUTS};

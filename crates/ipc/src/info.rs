@@ -322,14 +322,14 @@ pub struct VideoDenoiserInfo {
     pub audio_sample_rate: u32,
     /// How the VAE divides a video's frames into clips, which counts the
     /// frames the deployment generates and their decode units.
-    pub frames: uniserve_core::FrameClips,
+    pub frames: models::video::FrameClips,
     /// The only canvases the deployment serves: those it prepares, each
     /// with the `(short_edge, aspect_ratio)` its model names it by, in the
     /// order the deployment names them.
-    pub canvases: Vec<uniserve_core::ServedCanvas>,
+    pub canvases: Vec<models::video::ServedCanvas>,
     /// The references one request may carry and the largest short edge an
     /// image reference is encoded at; zeros for a denoiser that takes none.
-    pub references: uniserve_core::ReferenceLimits,
+    pub references: models::video::ReferenceLimits,
 }
 
 impl VideoDenoiserInfo {

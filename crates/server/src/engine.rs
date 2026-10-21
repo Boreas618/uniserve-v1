@@ -30,8 +30,8 @@ use std::time::Instant;
 use anyhow::Context as _;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::info;
-use uniserve_core::{GenerationLimits, Request};
 use uniserve_engine::{EngineCore, EventRx, SubmitError, VideoDenoiserInfo};
+use uniserve_engine::{GenerationLimits, Request};
 use uniserve_observability::{EngineLabels, METRICS};
 
 use crate::options::{LoggingOptions, ReasoningParser, ServeConfig, Stated};
@@ -206,7 +206,7 @@ impl Engine {
                     .unwrap_or(1);
                 // The video processor's options are its reference sizing,
                 // within what the denoiser declares.
-                let references = uniserve_core::video::plan::ReferenceConfig::from_kwargs(
+                let references = models::video::plan::ReferenceConfig::from_kwargs(
                     &config.mm_processor_kwargs,
                     &denoiser.references,
                 )
@@ -648,11 +648,11 @@ mod tests {
     use std::time::Duration;
 
     use futures::{StreamExt as _, poll};
-    use uniserve_core::{
-        EngineCoreOutput, GenerationConstraint, GenerationRequest, ImageGenerationConfig,
-        ImageParams, Request, SamplingParams,
-    };
     use uniserve_engine::{EngineConfig, EngineCore, Executor, SimEngine, SimExecutor};
+    use uniserve_engine::{
+        EngineCoreOutput, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
+    };
+    use uniserve_ipc::{ImageParams, SamplingParams};
     use uniserve_observability::METRICS;
 
     use super::Engine;
@@ -766,7 +766,7 @@ mod tests {
         for stream in &mut streams {
             while let Some(event) = stream.next().await {
                 if let EngineCoreOutput::Finished { reason, .. } = event {
-                    assert_eq!(reason, uniserve_core::FinishReason::Eos);
+                    assert_eq!(reason, uniserve_engine::FinishReason::Eos);
                     break;
                 }
             }

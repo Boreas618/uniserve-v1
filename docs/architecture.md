@@ -71,7 +71,7 @@ Each capability has one runner in two halves with the same class and file name: 
 | Image and video denoisers | `DenoiserRunner` | `draw_noise`, `prepare_latents`, `encode_conditions`, `denoise`, and for images `plan`, `plan_denoise` and `step` | prefix cache units, latent pages, per-slot state rows |
 | Image, video and audio decoders | `DecoderRunner` | `decode`, `quantize` | latent pages, products |
 
-Host media on CPU workers has no model: the Rust `MediaRunner` calls the functions of `uniserve.media` directly. Video request rules (canvases, frame counts, how each condition is prepared and the conditioner's presentation) are implemented once, in `uniserve-core`: the head plans and presents every request with them before admission, and the worker derives the frame counts it admits from them. Python reaches the canvas rule, the training buckets, the canvas a target names and the frame count of a duration through functions the worker library exports (`rules.rs`); it does not plan or present requests.
+Host media on CPU workers has no model: the Rust `MediaRunner` calls the functions of `uniserve.media` directly. Video request rules (canvases, frame counts, how each condition is prepared and the conditioner's presentation) are implemented once, in the `models` crate: the head plans and presents every request with them before admission, and the worker derives the frame counts it admits from them. Python reaches the canvas rule, the training buckets, the canvas a target names and the frame count of a duration through functions the worker library exports (`rules.rs`); it does not plan or present requests.
 
 A method that can be captured meets four conditions: its shapes are fixed by its scalar arguments; every value that changes between forwards enters as tensor contents; it performs no host planning or synchronization; it draws no random numbers, because draws and noise are inputs the control plane generates (for example a latent encoder's posterior noise, drawn by `draw_noise` from the request's seed).
 
@@ -177,7 +177,7 @@ A worker's orderly close ends with a reset of its primary contexts before the pr
 ## Repository layout
 
 ```text
-crates/core/        uniserve-core: shared domain values (ids, sampling, generation, media, parallel placement) and the video request rules
+crates/models/      models: the model families' request semantics (the MiniMax-H3 video rules)
 crates/ipc/         uniserve-ipc: head-to-worker messages, the channel, registration, launch descriptor, launcher messages
 crates/cuda/        uniserve-cuda: CUDA driver, VMM, NVML and NCCL bindings and graph launch, loaded at run time
 crates/engine/      uniserve-engine: scheduler, prefix cache allocation, worker groups and process launch
@@ -190,7 +190,7 @@ uniserve_kernels/   Triton, CuTe and CUDA kernels, and the vendored DeepEP and D
 uniserve_eval/      HTTP evaluation client
 ```
 
-Dependency direction: `core <- ipc <- {engine, worker, uniserve-launcher}`, `cuda <- worker`, `{core, engine, observability} <- server <- uniserve`. The worker never depends on the engine or server, and the engine never links CUDA.
+Dependency direction: `models <- ipc <- {engine, worker, uniserve-launcher}`, `cuda <- worker`, `{models, ipc, engine, observability} <- server <- uniserve`. The worker never depends on the engine or server, and the engine never links CUDA.
 
 | Worker runtime module (`crates/worker/src`) | Responsibility |
 | --- | --- |

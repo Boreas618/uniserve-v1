@@ -26,7 +26,7 @@
 //! for masks, repeated tokens dropped.
 
 use indexmap::IndexMap;
-use uniserve_core::SamplingParams;
+use uniserve_ipc::SamplingParams;
 
 use super::{SamplingControls, SamplingPath, TOKEN_VALUE_MASK, top_k_width};
 use crate::storage::LogprobLayout;

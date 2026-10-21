@@ -10,7 +10,7 @@
 
 use std::ops::ControlFlow;
 
-use uniserve_core::{ArtifactEvent, RejectionKind};
+use uniserve_engine::{ArtifactEvent, RejectionKind};
 
 use crate::serving::{FinishReason, RequestOutput};
 

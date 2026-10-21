@@ -9,8 +9,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use uniserve_core::CallId;
 use uniserve_cuda::Stream;
+use uniserve_ipc::CallId;
 use uniserve_ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
 
 use super::cache_width;

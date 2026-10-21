@@ -18,33 +18,33 @@ use uniserve_ipc::{ForwardMode, MediaCall};
 /// are clamped to the reported latent, batch-token, encoder-entry,
 /// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
-    mut limits: uniserve_core::GenerationLimits,
+    mut limits: crate::GenerationLimits,
     info: &WorkerInfo,
-) -> uniserve_core::GenerationLimits {
+) -> crate::GenerationLimits {
     let supports = |kind| info.supported_calls.contains(&kind);
-    let mut available = uniserve_core::GenerationFeatures::empty();
+    let mut available = crate::GenerationFeatures::empty();
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::Decode))
     {
-        available.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
+        available.insert(crate::GenerationFeatures::UNDERSTANDING);
     }
     if supports(CallKind::Media(MediaCall::VisionEncoding)) {
-        available.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
+        available.insert(crate::GenerationFeatures::VISION_ENCODE);
     }
     if supports(CallKind::Media(MediaCall::LatentEncoding)) {
-        available.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
+        available.insert(crate::GenerationFeatures::LATENT_ENCODE);
     }
     if supports(CallKind::Media(MediaCall::LatentPreparation))
         && supports(CallKind::Media(MediaCall::Denoising))
         && supports(CallKind::Media(MediaCall::ImageDecoding))
     {
-        available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
+        available.insert(crate::GenerationFeatures::IMAGE_GENERATION);
     }
     // A canvas denoises over a prompt the same worker's prefill cached.
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::TokenDenoising))
     {
-        available.insert(uniserve_core::GenerationFeatures::TOKEN_DENOISING);
+        available.insert(crate::GenerationFeatures::TOKEN_DENOISING);
     }
     limits.features = available;
 
@@ -99,8 +99,8 @@ impl Scheduler {
         executor: Box<dyn Executor>,
         special_tokens: SpecialTokenIds,
         mut config: SchedulerConfig,
-        model_dtype: uniserve_core::ModelDtype,
-        generation_limits: uniserve_core::GenerationLimits,
+        model_dtype: crate::ModelDtype,
+        generation_limits: crate::GenerationLimits,
     ) -> anyhow::Result<Self> {
         let info = executor.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
@@ -289,7 +289,7 @@ impl Scheduler {
     }
 
     /// Returns the model limits supported by the loaded execution workers.
-    pub fn generation_limits(&self) -> &uniserve_core::GenerationLimits {
+    pub fn generation_limits(&self) -> &crate::GenerationLimits {
         &self.generation_limits
     }
 

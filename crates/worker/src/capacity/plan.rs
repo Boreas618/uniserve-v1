@@ -580,7 +580,7 @@ pub(crate) mod tests {
             quantized: false,
             // Key and value planes, each with one initialization flag.
             unit_bytes: 2 * (plane_bytes + 1),
-            dtype: uniserve_core::PrefixCacheDtype::BFloat16,
+            dtype: uniserve_ipc::PrefixCacheDtype::BFloat16,
             groups: vec![crate::storage::CacheGroupPlan {
                 window: None,
                 block_size: 64,

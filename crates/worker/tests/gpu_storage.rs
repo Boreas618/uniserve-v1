@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_core::{PrefixCacheDtype, UnitId};
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8, memset_d32};
 use uniserve_ipc::BlockTable;
+use uniserve_ipc::{PrefixCacheDtype, UnitId};
 use uniserve_worker::ffi::{Backing, DType, Handle};
 use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{

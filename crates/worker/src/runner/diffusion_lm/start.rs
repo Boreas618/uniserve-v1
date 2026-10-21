@@ -11,8 +11,8 @@
 //! context over the stream's scratch, the prefix cache pool and the model's
 //! stream collectives.
 
-use uniserve_core::CanvasSampling;
 use uniserve_cuda::{DeviceId, Stream};
+use uniserve_ipc::CanvasSampling;
 use uniserve_ipc::{CallKind, ForwardMode};
 
 use super::buffers::{BankLayout, Banks, DenoiseLayout, DenoiseViews, Dimensions};

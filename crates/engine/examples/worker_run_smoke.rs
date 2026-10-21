@@ -16,15 +16,13 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::EngineCoreOutput;
-use uniserve_core::{
-    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ModelDtype,
-    RequestId, SamplingParams,
-};
+use uniserve_engine::EngineCoreOutput;
 use uniserve_engine::{
     Command, EngineHandle, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup,
     WorkerGroupId, WorkerProcessArgs,
 };
+use uniserve_engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig, ModelDtype};
+use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
 

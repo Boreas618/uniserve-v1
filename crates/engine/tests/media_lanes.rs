@@ -19,20 +19,21 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use uniserve_core::{
-    AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, DiffusionRequest,
-    DiffusionSamplingParams, EngineCoreOutput, FinishReason, ImageFit, MediaSource, RejectionKind,
-    Request, RequestId, VideoClip, VideoCondition, VideoTask, VisionGrid,
+use models::video::{
+    AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
+    VideoCondition, VideoTask, VisionGrid,
 };
 use uniserve_engine::{
     BatchEvent, BatchResult, ComponentConfig, ComponentDistribution, EngineHandle, ExecutionBatch,
     Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PoolPlacement, RequestPlacement,
     SchedulerConfig, SimEngine, SimExecutor, VideoDenoiserInfo, WorkerGroupId,
 };
+use uniserve_engine::{DiffusionRequest, EngineCoreOutput, FinishReason, RejectionKind, Request};
 use uniserve_ipc::{
     BufferId, Call, CallKind, ComponentInfo, DType, DimBound, MediaCall, OutputInfo, RasterAxes,
     ShapeBound,
 };
+use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 
 /// Denoising steps the simulated model advertises and every request follows.
 const STEPS: u32 = 3;
@@ -154,18 +155,18 @@ fn video_worker(decoder_ranks: usize, host_lane_capacity: u32) -> SimEngine {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
-        frames: uniserve_core::FrameClips {
+        frames: models::video::FrameClips {
             min_frames: 22,
             clip_frames: 17,
             clip_latent_frames: 5,
             tail_latent_frames: 2,
         },
-        canvases: vec![uniserve_core::ServedCanvas {
+        canvases: vec![models::video::ServedCanvas {
             short_edge: MAX_RASTER.height,
             aspect_ratio: "1:1".to_owned(),
             canvas: MAX_RASTER,
         }],
-        references: uniserve_core::ReferenceLimits::default(),
+        references: models::video::ReferenceLimits::default(),
     });
     // The denoiser's latent pool holds the reserved sentinel page plus two
     // pages of samples per request slot.

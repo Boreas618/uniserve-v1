@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use uniserve_core::ComponentConfig;
 use uniserve_cuda::DeviceId;
+use uniserve_ipc::ComponentConfig;
 use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransport};
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};

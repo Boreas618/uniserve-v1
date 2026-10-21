@@ -44,8 +44,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use uniserve_core::{RequestId, UnitId};
 use uniserve_ipc::{PageCopy, PrefixCacheInfo};
+use uniserve_ipc::{RequestId, UnitId};
 use uniserve_storage::protocol::{Event, PageSlot, Reply, Request};
 use uniserve_storage::{Client, Key, Role, Scope};
 
@@ -345,7 +345,7 @@ impl Tiers {
         for tokens in prompt.chunks_exact(group.block_size).take(pages) {
             let mut digest = Sha256::new();
             digest.update(chain);
-            // The only cache group, and text (`Modality::Und`, tag 0).
+            // The only cache group, and text (`TEXT_MODALITY_TAG`).
             digest.update(0_u32.to_le_bytes());
             digest.update([0_u8]);
             for token in tokens {
@@ -1081,8 +1081,8 @@ mod tests {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use uniserve_core::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
     use uniserve_ipc::PagePoolInfo;
+    use uniserve_ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
     use uniserve_storage::protocol::PageShape;
     use uniserve_storage::{Claim, Server};
 

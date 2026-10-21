@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
 
+use crate::CommandWaker;
 use crate::executor::{
     BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
     PoolPlacement, WorkerFailure, WorkerGroupId, logical_result,
@@ -27,12 +28,12 @@ use crate::executor::{
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_core::philox;
-use uniserve_core::{CommandWaker, ImageParams, RequestId, SamplingParams, TokenLogprob};
+use uniserve_ipc::philox;
 use uniserve_ipc::{
     BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, NewRequest,
     SamplingState, TensorRef, TimingCounters, WorkerInfo,
 };
+use uniserve_ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
 
 const DEFAULT_TEXT_LEN: usize = 8;
 /// Default EOS id the simulator samples after `text_len` tokens.
@@ -734,7 +735,7 @@ pub struct SimEngine {
     non_finite_candidate: Option<u32>,
     /// Block-diffusion sampling the simulated worker is launched with, as a
     /// rank's launch configuration states it.
-    canvas_sampling: Option<uniserve_core::CanvasSampling>,
+    canvas_sampling: Option<uniserve_ipc::CanvasSampling>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -762,8 +763,8 @@ impl SimEngine {
     ///
     /// The scheduler takes the served features from the call kinds the
     /// simulated worker reports and clamps these limits to its capacities.
-    pub fn generation_limits() -> uniserve_core::GenerationLimits {
-        uniserve_core::GenerationLimits {
+    pub fn generation_limits() -> crate::GenerationLimits {
+        crate::GenerationLimits {
             max_latent_units: u64::MAX,
             latent_downsample: 16,
             max_vae_grid_tokens: u32::MAX,
@@ -946,7 +947,7 @@ impl SimEngine {
         text_len: usize,
         fake_eos: u32,
         non_finite_candidate: Option<u32>,
-        canvas_sampling: Option<uniserve_core::CanvasSampling>,
+        canvas_sampling: Option<uniserve_ipc::CanvasSampling>,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<CallOutput> {
@@ -1329,7 +1330,7 @@ impl SimEngine {
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
     )]
-    pub fn set_groups(&mut self, groups: Vec<uniserve_core::CacheGroup>) {
+    pub fn set_groups(&mut self, groups: Vec<uniserve_ipc::CacheGroup>) {
         self.info
             .prefix_cache
             .as_mut()
@@ -1377,7 +1378,7 @@ impl SimEngine {
 
     /// Launches the simulated worker with block-diffusion sampling: a canvas
     /// step stops its block no later than the sampling's step limit.
-    pub fn set_canvas_sampling(&mut self, sampling: uniserve_core::CanvasSampling) {
+    pub fn set_canvas_sampling(&mut self, sampling: uniserve_ipc::CanvasSampling) {
         self.canvas_sampling = Some(sampling);
     }
 

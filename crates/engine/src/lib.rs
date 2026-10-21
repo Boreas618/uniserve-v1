@@ -14,11 +14,19 @@
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
+mod clock;
 mod core;
 mod deployment;
+mod dtype;
 mod executor;
+/// Tokenized generation requests, image configuration, and capacity
+/// calculations.
+pub mod generation;
 mod handle;
 mod prefix_cache;
+/// Serializable scheduler, cache, and worker performance snapshots.
+pub mod report;
+mod request;
 mod scheduler;
 #[cfg(feature = "testing")]
 mod sim;
@@ -30,6 +38,7 @@ mod worker;
 
 pub use crate::core::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::deployment::Deployment;
+pub use crate::dtype::{ModelDtype, ModelDtypeParseError};
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageWrites,
@@ -37,9 +46,19 @@ pub use crate::executor::{
     TransferConfig, TransferConfigError, TransferEdge, WorkerExecError, WorkerFailure,
     WorkerGroupId, WorkerResult,
 };
+pub use crate::generation::{
+    CachePolicy, FeedbackNextToken, FeedbackSource, GenerationConstraint,
+    GenerationConstraintParseError, GenerationFeatures, GenerationLimits, GenerationRequest,
+    GenerationRequestError, GenerationResourceError, ImageEncoderInput, ImageGenerationConfig,
+    ImageInput, ImageTrigger, MultimodalInputs, ReadoutRow, ReadoutSlot, encoder_cache_key,
+};
 pub use crate::handle::{
-    Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
-    StreamCancelCause, Submission, SubmitError,
+    Command, CommandWaker, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
+    StreamCancelCause, Submission, SubmitError, Wake,
+};
+pub use crate::request::{
+    ArtifactEvent, DiffusionRequest, DiffusionRequestError, EngineCoreOutput, FinishReason,
+    MediaKind, PositionLogprobs, RejectionKind, Request, StopReason,
 };
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{

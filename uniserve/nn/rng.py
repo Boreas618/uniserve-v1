@@ -1,7 +1,7 @@
 """Schedule-stable seeds of a request's noise draws.
 
 The rank's token sampler draws its uniforms in Rust
-(``uniserve_core::philox``); the Python library draws only normal noise,
+(``uniserve_ipc::philox``); the Python library draws only normal noise,
 from ``torch`` generators seeded here. A seed is a SplitMix64 fold of the
 request's seed and a semantic coordinate, so a draw depends on which image
 or encoding it belongs to, never on batch order, execution depth or replay.

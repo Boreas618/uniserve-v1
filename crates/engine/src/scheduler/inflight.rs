@@ -49,7 +49,7 @@ pub(super) struct PendingCompletion {
 #[derive(Clone)]
 pub(super) struct PendingFinish {
     pub(super) reason: FinishReason,
-    pub(super) stop_reason: Option<uniserve_core::StopReason>,
+    pub(super) stop_reason: Option<crate::StopReason>,
     /// Whether the terminal `Finished` event is already published: a finish
     /// decided by the request's own output is final once no decoder decision
     /// is pending, since the calls still in flight are discarded

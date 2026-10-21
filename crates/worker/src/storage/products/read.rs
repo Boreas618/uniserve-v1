@@ -8,8 +8,8 @@ use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
-use uniserve_core::CallId;
 use uniserve_cuda::{DeviceId, Event, Stream};
+use uniserve_ipc::CallId;
 use uniserve_ipc::TensorRef;
 
 /// One consumer's lease of a product. The value view stays stable even when

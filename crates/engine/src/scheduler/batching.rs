@@ -296,7 +296,7 @@ impl Scheduler {
                         }
                         _ => None,
                     };
-                let planned_us = uniserve_core::now_monotonic_us();
+                let planned_us = crate::clock::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the
                 // pass. A call that cannot run now leaves the budget to later
@@ -712,10 +712,10 @@ impl Scheduler {
             .image_generation
             .feedback_next_token;
         match next {
-            uniserve_core::FeedbackNextToken::None => None,
-            uniserve_core::FeedbackNextToken::Bos => Some(self.special_tokens.bos),
-            uniserve_core::FeedbackNextToken::EndOfImage => Some(self.special_tokens.end_of_image),
-            uniserve_core::FeedbackNextToken::Token { token_id } => Some(token_id),
+            crate::FeedbackNextToken::None => None,
+            crate::FeedbackNextToken::Bos => Some(self.special_tokens.bos),
+            crate::FeedbackNextToken::EndOfImage => Some(self.special_tokens.end_of_image),
+            crate::FeedbackNextToken::Token { token_id } => Some(token_id),
         }
     }
 

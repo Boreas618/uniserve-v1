@@ -33,7 +33,7 @@ enum TokenOutcome {
 fn terminal_event(
     state: &RequestState,
     reason: FinishReason,
-    stop_reason: Option<uniserve_core::StopReason>,
+    stop_reason: Option<crate::StopReason>,
 ) -> EngineCoreOutput {
     EngineCoreOutput::Finished {
         reason,
@@ -763,14 +763,13 @@ impl Scheduler {
                     // device image product or the published PNG artifact.
                     let source_product = call.image_output.clone();
 
-                    if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
+                    if feedback_source == crate::FeedbackSource::DeviceProduct
                         && source_product.is_none()
                     {
                         return self.finish(id, FinishReason::Error);
                     }
 
-                    if feedback_source == uniserve_core::FeedbackSource::ArtifactProduct
-                        && image.is_none()
+                    if feedback_source == crate::FeedbackSource::ArtifactProduct && image.is_none()
                     {
                         return self.finish(id, FinishReason::Error);
                     }
@@ -1206,10 +1205,7 @@ impl Scheduler {
                     {
                         visible.push(token_id);
                     }
-                    finish = Some((
-                        FinishReason::Stop,
-                        Some(uniserve_core::StopReason::Token(token_id)),
-                    ));
+                    finish = Some((FinishReason::Stop, Some(crate::StopReason::Token(token_id))));
                     break;
                 }
                 TokenOutcome::Finish(reason) => {
@@ -1319,7 +1315,7 @@ impl Scheduler {
                 self.finish_after_inflight(
                     id,
                     FinishReason::Stop,
-                    Some(uniserve_core::StopReason::Token(token_id)),
+                    Some(crate::StopReason::Token(token_id)),
                 );
                 return true;
             }
@@ -1369,7 +1365,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         reason: FinishReason,
-        stop_reason: Option<uniserve_core::StopReason>,
+        stop_reason: Option<crate::StopReason>,
     ) {
         let decoder_pending = !matches!(reason, FinishReason::Error)
             && self
@@ -1450,7 +1446,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         reason: FinishReason,
-        stop_reason: Option<uniserve_core::StopReason>,
+        stop_reason: Option<crate::StopReason>,
     ) {
         let terminal_published = self
             .inflight

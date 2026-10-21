@@ -6,10 +6,11 @@
 //! to the fixed resolution buckets in `resolution_policy`.
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{
+use uniserve_engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
-    ImageGenerationConfig, ImageTrigger, MediaCall, ModelDtype,
+    ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
+use uniserve_ipc::MediaCall;
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
@@ -157,7 +158,7 @@ impl SenseNovaProfile {
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
-                cfg_renorm_type: uniserve_core::CfgRenorm::None,
+                cfg_renorm_type: uniserve_ipc::CfgRenorm::None,
                 cfg_renorm_min: 0.0,
                 cfg_interval: (0.0, 1.0),
                 timestep_shift: 3.0,

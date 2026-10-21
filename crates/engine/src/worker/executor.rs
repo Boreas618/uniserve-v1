@@ -28,12 +28,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
+use crate::CommandWaker;
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
     RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerGroupId,
 };
 use anyhow::Context;
-use uniserve_core::CommandWaker;
 use uniserve_ipc::{
     BatchCommand, BufferAllocation, BufferId, CacheTransfer, Call, NewRequest, RequestKey,
     TensorExport, TensorRef,
@@ -1440,7 +1440,7 @@ impl Executor for WorkerExecutor {
 mod dependency_span_tests {
     use super::dependency_spans;
     use crate::executor::RankBuffer;
-    use uniserve_core::RequestId;
+    use uniserve_ipc::RequestId;
     use uniserve_ipc::{BufferAllocation, BufferId, CallId, RequestKey};
 
     fn span(rank: u32, offset: u64) -> RankBuffer {

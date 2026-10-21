@@ -222,7 +222,7 @@ impl Scheduler {
                 let encoder_index = self.scheduled_feedback(id)?.0;
                 let encoder = feedback.feedback_encoders.get(encoder_index)?.encoder;
                 let source = (feedback.feedback_source
-                    == Some(uniserve_core::FeedbackSource::DeviceProduct))
+                    == Some(crate::FeedbackSource::DeviceProduct))
                 .then(|| {
                     self.pending_output(id, |call| call.image_output.as_ref())
                         .or(st.feedback_source.as_ref())

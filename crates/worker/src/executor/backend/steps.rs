@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use uniserve_core::CallId;
+use uniserve_ipc::CallId;
 use uniserve_ipc::{Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity};
 
 use super::{WorkerBackend, kernel_calls};

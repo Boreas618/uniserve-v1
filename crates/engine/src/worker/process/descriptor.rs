@@ -131,7 +131,6 @@ impl WorkerProcessArgs {
             EXECUTABLE.into()
         }
     }
-
 }
 
 impl WorkerProcessArgs {
@@ -156,7 +155,7 @@ impl WorkerProcessArgs {
     /// Independent microbatches of attention and remote experts.
     pub const DEFAULT_EXPERT_MICROBATCHES: u32 = 1;
     /// Numeric data type of model parameters and activations.
-    pub const DEFAULT_DTYPE: uniserve_core::ModelDtype = uniserve_core::ModelDtype::BFloat16;
+    pub const DEFAULT_DTYPE: crate::ModelDtype = crate::ModelDtype::BFloat16;
     /// Whether every prefill call replays a CUDA graph.
     pub const DEFAULT_PREFILL_CUDA_GRAPH: bool = true;
     /// Whether image denoising calls replay CUDA graphs.
@@ -237,7 +236,7 @@ impl Default for WorkerProcessArgs {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_split_kv: true,
             max_model_len: 8192,
-            max_video_seconds: uniserve_core::video::plan::MAX_VIDEO_SECONDS,
+            max_video_seconds: models::video::plan::MAX_VIDEO_SECONDS,
             max_condition_rows: None,
             encoder_cache_entries: 256,
             ffmpeg: Self::DEFAULT_FFMPEG.into(),

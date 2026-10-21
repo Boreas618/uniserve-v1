@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use uniserve_core::SharedMemory;
 use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
+use uniserve_ipc::SharedMemory;
 use uniserve_ipc::{Locator, TransferTransport};
 
 use super::backing::TransportBuffer;

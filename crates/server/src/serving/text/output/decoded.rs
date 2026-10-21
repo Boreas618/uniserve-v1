@@ -16,8 +16,8 @@ use std::sync::Arc;
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{EngineCoreOutput, PositionLogprobs, RejectionKind};
 use uniserve_engine::EventRx;
+use uniserve_engine::{EngineCoreOutput, PositionLogprobs, RejectionKind};
 
 use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};

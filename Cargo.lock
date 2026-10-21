@@ -1928,6 +1928,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "models"
+version = "2.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3715,17 +3724,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-core"
-version = "2.0.0"
-dependencies = [
- "bitflags",
- "libc",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "uniserve-cuda"
 version = "2.0.0"
 dependencies = [
@@ -3740,8 +3738,11 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bitflags",
  "crossbeam-channel",
+ "fnv",
  "libc",
+ "models",
  "png",
  "serde",
  "serde_json",
@@ -3752,7 +3753,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "uniserve-core",
  "uniserve-engine",
  "uniserve-ipc",
  "uniserve-storage",
@@ -3764,6 +3764,7 @@ name = "uniserve-ipc"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "models",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -3771,7 +3772,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "uniserve-core",
 ]
 
 [[package]]
@@ -3808,6 +3808,7 @@ dependencies = [
  "criterion",
  "expect-test",
  "fastokens",
+ "fnv",
  "futures",
  "hf-hub 0.5.0",
  "http-body",
@@ -3819,6 +3820,7 @@ dependencies = [
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
+ "models",
  "reqwest",
  "serde",
  "serde-json-fmt",
@@ -3837,7 +3839,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-futures",
- "uniserve-core",
  "uniserve-engine",
  "uniserve-ipc",
  "uniserve-observability",
@@ -3888,6 +3889,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "libloading",
+ "models",
  "nvtx",
  "png",
  "pyo3-ffi",
@@ -3902,7 +3904,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tvm-ffi",
- "uniserve-core",
  "uniserve-cuda",
  "uniserve-ipc",
  "uniserve-storage",

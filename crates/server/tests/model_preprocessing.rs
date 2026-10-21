@@ -9,12 +9,14 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use models::video::ServedCanvas;
+use models::video::plan::{ProcessorConfig, canvas};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-use uniserve_core::video::plan::{ProcessorConfig, canvas};
-use uniserve_core::{GenerationLimits, GenerationRequest, MediaCall, ServedCanvas};
 use uniserve_engine::VideoDenoiserInfo;
+use uniserve_engine::{GenerationLimits, GenerationRequest};
+use uniserve_ipc::MediaCall;
 use uniserve_server::openai::ApiError;
 use uniserve_server::options::{ImageFetchOptions, MediaOptions};
 use uniserve_server::profile::assets::ResolvedModelFiles;
@@ -63,7 +65,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
-        frames: uniserve_core::FrameClips {
+        frames: models::video::FrameClips {
             min_frames: 22,
             clip_frames: 17,
             clip_latent_frames: 5,
@@ -77,7 +79,7 @@ fn base_denoiser() -> VideoDenoiserInfo {
                 canvas: canvas(f64::from(width), f64::from(height)).unwrap(),
             })
             .to_vec(),
-        references: uniserve_core::ReferenceLimits::default(),
+        references: models::video::ReferenceLimits::default(),
     }
 }
 
@@ -104,7 +106,7 @@ fn video_service(
         1,
         &MediaOptions::default(),
         // A text-to-video denoiser takes no references to size.
-        uniserve_core::video::plan::ReferenceConfig::new(&uniserve_core::ReferenceLimits::default()),
+        models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
         Arc::clone(tokenizer),
     )
     .unwrap()
@@ -256,7 +258,7 @@ fn try_resolved_model(
 /// request reaches.
 fn runtime_limits() -> GenerationLimits {
     GenerationLimits {
-        features: uniserve_core::GenerationFeatures::all(),
+        features: uniserve_engine::GenerationFeatures::all(),
         max_latent_units: 1_000_000,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
@@ -353,7 +355,7 @@ async fn preprocess_video(
     request: &VideoGenerationRequest,
 ) -> Result<
     (
-        uniserve_core::DiffusionRequest,
+        uniserve_engine::DiffusionRequest,
         uniserve_server::serving::video::ProcessedVideo,
     ),
     ApiError,
@@ -494,7 +496,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(uniserve_core::GenerationFeatures::UNDERSTANDING);
+                    .remove(uniserve_engine::GenerationFeatures::UNDERSTANDING);
             },
         ),
         (
@@ -504,7 +506,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(uniserve_core::GenerationFeatures::VISION_ENCODE);
+                    .remove(uniserve_engine::GenerationFeatures::VISION_ENCODE);
             },
         ),
         (
@@ -514,7 +516,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(uniserve_core::GenerationFeatures::LATENT_ENCODE);
+                    .remove(uniserve_engine::GenerationFeatures::LATENT_ENCODE);
             },
         ),
         (
@@ -524,7 +526,7 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             |limits: &mut GenerationLimits| {
                 limits
                     .features
-                    .remove(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
+                    .remove(uniserve_engine::GenerationFeatures::IMAGE_GENERATION);
             },
         ),
     ];
@@ -734,7 +736,7 @@ async fn minimax_video_preprocessing_preserves_tokens_seed_and_frame_alignment()
 #[tokio::test]
 async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
     let (_directory, tokenizer, loaded) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
-    let canvas = |width, height| uniserve_core::Canvas { width, height };
+    let canvas = |width, height| models::video::Canvas { width, height };
     let served = |short_edge, aspect_ratio: &str, width, height| ServedCanvas {
         short_edge,
         aspect_ratio: aspect_ratio.to_owned(),
@@ -748,7 +750,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
         audio_shift: 3.0,
         frame_rate: 24,
         audio_sample_rate: 32_000,
-        frames: uniserve_core::FrameClips {
+        frames: models::video::FrameClips {
             min_frames: 22,
             clip_frames: 17,
             clip_latent_frames: 5,
@@ -759,7 +761,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             served(480, "21:9", 992, 416),
             served(480, "16:9", 832, 480),
         ],
-        references: uniserve_core::ReferenceLimits::default(),
+        references: models::video::ReferenceLimits::default(),
     };
     let model = InputProcessor::new(
         loaded.config().clone(),
@@ -979,7 +981,7 @@ fn image_api_preserves_requested_dimensions_seed_and_guidance() {
         let generation = request(Some("blur"));
         assert_eq!(
             generation.constraint,
-            uniserve_core::GenerationConstraint::GenOnly
+            uniserve_engine::GenerationConstraint::GenOnly
         );
         assert_eq!(
             (generation.image.width, generation.image.height),

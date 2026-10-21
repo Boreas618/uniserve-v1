@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_core::{CallId, RequestId};
 use uniserve_cuda::Stream;
 use uniserve_ipc::{
     BufferAllocation, BufferId, Call, CallKind, DType as WireDType, DimBound, MediaCall,
     RequestKey, ShapeBound, TensorRef, TransferHandle, WorkerEndpoint,
 };
+use uniserve_ipc::{CallId, RequestId};
 use uniserve_worker::ffi::MemoryKind;
 use uniserve_worker::storage::LocalMemory;
 use uniserve_worker::storage::{

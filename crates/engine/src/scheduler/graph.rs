@@ -17,7 +17,8 @@
 //! admission binds to the graph's canvas. The graph holds sizes only: it never
 //! inspects media.
 
-use uniserve_core::{Canvas, DiffusionRequest, VideoTask};
+use crate::DiffusionRequest;
+use models::video::{Canvas, VideoTask};
 use uniserve_ipc::MediaCall;
 
 /// Product names, as the worker's components declare their outputs.
@@ -303,10 +304,11 @@ impl VideoGraph {
 mod tests {
     use std::sync::Arc;
 
-    use uniserve_core::{
-        AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, DiffusionSamplingParams,
-        ImageFit, MediaSource, RequestId, VideoClip, VideoCondition, VisionGrid,
+    use models::video::{
+        AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
+        VideoCondition, VisionGrid,
     };
+    use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 
     use super::*;
 

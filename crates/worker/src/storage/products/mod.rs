@@ -57,8 +57,8 @@ use crate::transfer::exports::{self, Location};
 use crate::{Error, EventPool, Result, lock};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use uniserve_core::CallId;
 use uniserve_cuda::Event;
+use uniserve_ipc::CallId;
 use uniserve_ipc::{BufferId, RequestKey, TensorRef};
 
 /// The rank's cross-call tensor store.

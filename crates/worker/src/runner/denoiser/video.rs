@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_core::Canvas;
 use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use uniserve_ipc::{Call, LatentParams};
 

@@ -30,7 +30,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use uniserve_core::video::plan::{
+use models::video::plan::{
     AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, VideoFacts, VideoInputError,
 };
 
@@ -804,7 +804,7 @@ mod tests {
     use image::{ImageEncoder as _, RgbImage};
     use serde_json::json;
 
-    use uniserve_core::video::plan::RequestField;
+    use models::video::plan::RequestField;
 
     use super::{
         AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, MediaProber, ProbeConfig,

@@ -783,3 +783,89 @@ impl Call {
         Ok(())
     }
 }
+
+/// A concrete media-input, encoder, diffusion, decoder, or media-output
+/// computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum MediaCall {
+    /// Decodes a video request's condition media on a CPU worker into the
+    /// inputs of the vision and latent encoders.
+    MediaReading,
+    VisionEncoding,
+    LatentEncoding,
+    TextEncoding,
+    LatentPreparation,
+    Denoising,
+    ImageDecoding,
+    VideoDecoding,
+    AudioDecoding,
+    VideoEncoding,
+    AudioEncoding,
+    Muxing,
+}
+
+impl MediaCall {
+    /// Every media call in declaration order.
+    pub const ALL: [Self; 12] = [
+        Self::MediaReading,
+        Self::VisionEncoding,
+        Self::LatentEncoding,
+        Self::TextEncoding,
+        Self::LatentPreparation,
+        Self::Denoising,
+        Self::ImageDecoding,
+        Self::VideoDecoding,
+        Self::AudioDecoding,
+        Self::VideoEncoding,
+        Self::AudioEncoding,
+        Self::Muxing,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaReading => "media_reading",
+            Self::VisionEncoding => "vision_encoding",
+            Self::LatentEncoding => "latent_encoding",
+            Self::TextEncoding => "text_encoding",
+            Self::LatentPreparation => "latent_preparation",
+            Self::Denoising => "denoising",
+            Self::ImageDecoding => "image_decoding",
+            Self::VideoDecoding => "video_decoding",
+            Self::AudioDecoding => "audio_decoding",
+            Self::VideoEncoding => "video_encoding",
+            Self::AudioEncoding => "audio_encoding",
+            Self::Muxing => "muxing",
+        }
+    }
+
+    /// The calls that read this call's products in a video request's graph,
+    /// in the order the graph consumes them.
+    ///
+    /// The engine plans a request's consumption from this table, and both
+    /// the engine and the worker derive from it which ranks back a
+    /// component's persistent products: the ranks that execute the
+    /// component and those that execute a reader of its products. A reader
+    /// of resident state ([`Self::reads_resident_state`]) reads the
+    /// denoiser's latent pages instead of a persistent product.
+    pub const fn readers(self) -> &'static [Self] {
+        match self {
+            Self::MediaReading => &[Self::VisionEncoding, Self::LatentEncoding],
+            Self::VisionEncoding => &[Self::TextEncoding],
+            Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
+            Self::LatentPreparation => &[Self::Denoising],
+            Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
+            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoEncoding => &[Self::Muxing],
+            Self::AudioDecoding => &[Self::AudioEncoding],
+            Self::ImageDecoding | Self::AudioEncoding | Self::Muxing => &[],
+        }
+    }
+
+    /// Whether this call reads its predecessor's trajectory from the
+    /// denoiser's resident latent pages instead of a persistent product.
+    pub const fn reads_resident_state(self) -> bool {
+        matches!(self, Self::Denoising)
+    }
+}

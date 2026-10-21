@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
 use crate::openai::{ErrorDetail, ErrorResponse};
-use uniserve_core::video::plan::VideoInputError;
+use models::video::plan::VideoInputError;
 
 use crate::serving::ServeError;
 use crate::serving::video::artifact::VideoStreamError;
@@ -101,10 +101,10 @@ impl ApiError {
     /// `Invalid` becomes a 400 invalid request that fails the same way on
     /// retry; `Overloaded` becomes a 503 that the same request may pass once
     /// the engine's waiting queue drains.
-    pub fn rejected(kind: uniserve_core::RejectionKind, message: impl Into<String>) -> Self {
+    pub fn rejected(kind: uniserve_engine::RejectionKind, message: impl Into<String>) -> Self {
         match kind {
-            uniserve_core::RejectionKind::Invalid => Self::invalid_request(message, None),
-            uniserve_core::RejectionKind::Overloaded => {
+            uniserve_engine::RejectionKind::Invalid => Self::invalid_request(message, None),
+            uniserve_engine::RejectionKind::Overloaded => {
                 Self::service_unavailable("server_overloaded", message)
             }
         }
@@ -265,7 +265,7 @@ impl From<VideoStreamError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RejectionKind;
+    use uniserve_engine::RejectionKind;
 
     #[test]
     fn an_overloaded_engine_is_retryable_and_an_invalid_request_is_not() {
@@ -310,7 +310,7 @@ mod tests {
         );
 
         let rejected = ApiError::from(ServeError::from(VideoInputError::invalid(
-            uniserve_core::video::plan::RequestField::TargetDuration,
+            models::video::plan::RequestField::TargetDuration,
             "is required",
         )));
         assert_eq!(

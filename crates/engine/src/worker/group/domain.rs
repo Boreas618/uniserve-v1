@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use uniserve_core::CommandWaker;
+use crate::CommandWaker;
 
 use super::spawn::launch_all;
 use crate::worker::WorkerProcess;

@@ -430,11 +430,11 @@ impl Drop for Service<'_> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use uniserve_core::{RequestId, SamplingParams};
     use uniserve_ipc::{
         Batch as Plan, BatchCommand, Channel, GenerationParams, IpcError, Listener, NewRequest,
         RequestKey, WorkerRequest, WorkerResponse,
     };
+    use uniserve_ipc::{RequestId, SamplingParams};
 
     use super::{Ending, Service};
     use crate::error::WorkerError;

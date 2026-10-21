@@ -20,10 +20,75 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::{EngineCoreOutput, Request};
 use tokio::sync::mpsc;
-use uniserve_core::{EngineCoreOutput, Request, RequestId};
+use uniserve_ipc::RequestId;
 
 use crate::lock;
+
+/// Thread-safe notification used to wake an engine after command enqueue.
+///
+/// Callers run `wake` on their own thread: `EngineHandle` right after it
+/// enqueues a command, and `EventRx` after it consumes an output event and
+/// frees channel capacity. The engine's implementations (the `WakeSignal`
+/// socket write and the simulator's progress channel send) do not block.
+pub trait Wake: Send + Sync {
+    /// Signals the waiting engine owner.
+    fn wake(&self);
+}
+
+impl<F> Wake for F
+where
+    F: Fn() + Send + Sync,
+{
+    /// Invokes the closure as a wake notification.
+    fn wake(&self) {
+        self()
+    }
+}
+
+/// Cloneable command wake backed by a live notifier or a no-op value.
+#[derive(Clone, Default)]
+pub enum CommandWaker {
+    /// Performs no notification.
+    #[default]
+    Noop,
+    /// Delegates notification to a shared [`Wake`] implementation.
+    Live(Arc<dyn Wake>),
+}
+
+impl CommandWaker {
+    /// Returns a waker that performs no notification.
+    pub fn noop() -> Self {
+        Self::Noop
+    }
+
+    /// Wraps a thread-safe wake closure.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::Live(Arc::new(wake))
+    }
+
+    /// Signals the live notifier, or returns immediately for [`Self::Noop`].
+    pub fn wake(&self) {
+        if let Self::Live(waker) = self {
+            waker.wake();
+        }
+    }
+
+    /// Returns whether this waker performs no notification.
+    pub fn is_noop(&self) -> bool {
+        matches!(self, Self::Noop)
+    }
+}
+
+impl std::fmt::Debug for CommandWaker {
+    /// Formats the waker by variant without exposing the live closure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CommandWaker")
+            .field(&if self.is_noop() { "Noop" } else { "Live" })
+            .finish()
+    }
+}
 
 /// Events a closing sender hands to its receiver, shared by the two ends of
 /// one request's event channel.
@@ -39,7 +104,7 @@ type Handoff = Arc<Mutex<VecDeque<EngineCoreOutput>>>;
 /// descriptors.
 pub(crate) struct WakeSignal {
     reader: std::os::unix::net::UnixStream,
-    waker: uniserve_core::CommandWaker,
+    waker: CommandWaker,
 }
 
 impl WakeSignal {
@@ -49,7 +114,7 @@ impl WakeSignal {
         let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
         reader.set_nonblocking(true)?;
         writer.set_nonblocking(true)?;
-        let waker = uniserve_core::CommandWaker::new(move || {
+        let waker = CommandWaker::new(move || {
             loop {
                 match (&writer).write(&[1]) {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -62,7 +127,7 @@ impl WakeSignal {
         Ok(Self { reader, waker })
     }
 
-    pub(crate) fn waker(&self) -> uniserve_core::CommandWaker {
+    pub(crate) fn waker(&self) -> CommandWaker {
         self.waker.clone()
     }
 
@@ -191,7 +256,7 @@ impl EventTx {
 pub struct EventRx {
     inner: mpsc::Receiver<EngineCoreOutput>,
     handoff: Handoff,
-    waker: uniserve_core::CommandWaker,
+    waker: CommandWaker,
     cancellation: Option<EventCancellation>,
     /// Text tokens of the received `TextToken` and `TextTokens` events.
     text_tokens_received: usize,
@@ -219,7 +284,7 @@ impl EventRx {
         Self {
             inner,
             handoff: Handoff::default(),
-            waker: uniserve_core::CommandWaker::noop(),
+            waker: CommandWaker::noop(),
             cancellation: None,
             text_tokens_received: 0,
             acknowledged_token_count: 0,
@@ -374,7 +439,7 @@ impl Drop for EventRx {
 }
 
 fn event_channel_with_waker(
-    waker: uniserve_core::CommandWaker,
+    waker: CommandWaker,
     cancellation: Option<EventCancellation>,
 ) -> (EventTx, EventRx) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
@@ -444,22 +509,19 @@ pub enum Command {
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: crossbeam_channel::Sender<Command>,
-    waker: uniserve_core::CommandWaker,
+    waker: CommandWaker,
 }
 
 impl EngineHandle {
     /// Constructs a handle with the no-op waker, for a scheduler that observes
     /// commands only through its timed executor poll.
     pub fn new(tx: crossbeam_channel::Sender<Command>) -> Self {
-        Self::with_waker(tx, uniserve_core::CommandWaker::noop())
+        Self::with_waker(tx, CommandWaker::noop())
     }
 
     /// Constructs a handle that fires `waker` after every enqueue, used when the
     /// engine drives an event-driven executor that parks between steps.
-    pub fn with_waker(
-        tx: crossbeam_channel::Sender<Command>,
-        waker: uniserve_core::CommandWaker,
-    ) -> Self {
+    pub fn with_waker(tx: crossbeam_channel::Sender<Command>, waker: CommandWaker) -> Self {
         Self { tx, waker }
     }
 
@@ -563,10 +625,8 @@ impl EngineHandle {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{
-        GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, RequestId,
-        SamplingParams,
-    };
+    use crate::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
+    use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
 
     use super::*;
 
@@ -770,7 +830,7 @@ mod tests {
             Err(EventSendError::Full(_))
         ));
         let terminal = EngineCoreOutput::Finished {
-            reason: uniserve_core::FinishReason::Aborted,
+            reason: crate::FinishReason::Aborted,
             stop_reason: None,
             prompt_tokens: 3,
             completion_tokens: EVENT_BUFFER_CAPACITY + 1,
@@ -787,7 +847,7 @@ mod tests {
         assert!(matches!(
             events.recv().await,
             Some(EngineCoreOutput::Finished {
-                reason: uniserve_core::FinishReason::Aborted,
+                reason: crate::FinishReason::Aborted,
                 ..
             })
         ));
@@ -815,7 +875,7 @@ mod tests {
 
         let wakes = Arc::new(AtomicUsize::new(0));
         let wakes_clone = Arc::clone(&wakes);
-        let waker = uniserve_core::CommandWaker::new(move || {
+        let waker = CommandWaker::new(move || {
             wakes_clone.fetch_add(1, Ordering::SeqCst);
         });
 

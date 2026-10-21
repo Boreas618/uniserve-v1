@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use uniserve_core::Canvas;
+use models::video::Canvas;
 use uniserve_ipc::{CallKind, MediaCall};
 
 use super::{ClipOutput, DecodeImage, DecoderRunner, TrackUnits, UnitShape};

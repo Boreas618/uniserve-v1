@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_core::UnitId;
+use uniserve_ipc::UnitId;
 use uniserve_ipc::{BlockTable, CacheTransfer, RequestKey};
 
 use crate::{Error, Result};
@@ -513,7 +513,7 @@ impl BlockTables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RequestId;
+    use uniserve_ipc::RequestId;
 
     #[test]
     fn visible_prefix_requires_every_group_and_fits_the_common_extent() -> Result<()> {

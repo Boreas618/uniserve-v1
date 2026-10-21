@@ -11,15 +11,15 @@
 
 use std::collections::HashMap;
 
-use uniserve_core::EngineCoreOutput;
-use uniserve_core::{
-    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams, ImageTrigger,
-    ModelDtype, RequestId, SamplingParams,
-};
+use uniserve_engine::EngineCoreOutput;
 use uniserve_engine::{
     Executor, Scheduler, SchedulerConfig, SimEngine, WorkerExecutor, WorkerGroup, WorkerGroupId,
     WorkerProcessArgs,
 };
+use uniserve_engine::{
+    GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageTrigger, ModelDtype,
+};
+use uniserve_ipc::{ImageParams, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
     // The handle keeps the sender alive, so `Scheduler::step` never sees a

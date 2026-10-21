@@ -320,7 +320,7 @@ pub(crate) fn abandon(pool: &LatentPool, input: &LatentInput) -> Result<()> {
 mod tests {
     use std::collections::HashSet;
 
-    use uniserve_core::{CallId, RequestId};
+    use uniserve_ipc::{CallId, RequestId};
     use uniserve_ipc::{
         CallKind, DType as WireDType, DimBound, RequestKey, ShapeBound, TransferMode,
         WorkerEndpoint,

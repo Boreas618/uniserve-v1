@@ -390,7 +390,8 @@ mod tests {
     use tempfile::tempdir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::{GenerationConstraint, MediaCall};
+    use uniserve_engine::GenerationConstraint;
+    use uniserve_ipc::MediaCall;
 
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::profile::assets::ResolvedModelFiles;
@@ -677,7 +678,7 @@ mod tests {
         let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
             unreachable!()
         };
-        let limits = profile.runtime_limits(uniserve_core::ModelDtype::BFloat16);
+        let limits = profile.runtime_limits(uniserve_engine::ModelDtype::BFloat16);
         for (width, height) in [(8192, 8192), (2048, 2048), (512, 512), (4096, 1024)] {
             let ingest = profile
                 .image_encoders_for_dimensions(width, height, 1)
@@ -701,7 +702,7 @@ mod tests {
         let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
             unreachable!()
         };
-        let limits = BagelProfile::runtime_limits(uniserve_core::ModelDtype::BFloat16);
+        let limits = BagelProfile::runtime_limits(uniserve_engine::ModelDtype::BFloat16);
         for (width, height) in [(8192, 8192), (1024, 1024), (1024, 512), (3000, 2000)] {
             let ingest = profile
                 .image_encoders_for_dimensions(width, height, 1)

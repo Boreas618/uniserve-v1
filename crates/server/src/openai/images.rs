@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt as _};
 
 use crate::engine::Engine;
 use crate::http::RequestId;
-use uniserve_core::GenerationConstraint;
+use uniserve_engine::GenerationConstraint;
 
 use crate::openai::{
     ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,
@@ -48,7 +48,7 @@ async fn images_generations(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    match collect_image_generation(stream, uniserve_core::now_unix_secs_u64()).await {
+    match collect_image_generation(stream, crate::openai::unix_time()).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }

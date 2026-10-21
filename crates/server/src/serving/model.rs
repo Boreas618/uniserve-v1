@@ -21,12 +21,13 @@ use crate::profile::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{ModelConfig, ModelDescription, ModelParameters};
+use models::video::plan::ProcessorConfig;
 use thiserror::Error;
-use uniserve_core::video::plan::ProcessorConfig;
-use uniserve_core::{
+use uniserve_engine::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
-    ImageGenerationConfig, ImageParams, RequestId, SamplingParams as EngineSamplingParams,
+    ImageGenerationConfig,
 };
+use uniserve_ipc::{ImageParams, RequestId, SamplingParams as EngineSamplingParams};
 
 use crate::serving::chat::template::MultimodalRenderInfo;
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest, HfChatRenderer};
@@ -56,9 +57,19 @@ pub struct InputProcessor {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// The conditioner's processor configs cannot be read or disagree.
+    /// A conditioner's processor config cannot be read.
+    #[error("reading {}", path.display())]
+    ProcessorFile {
+        /// The config file.
+        path: std::path::PathBuf,
+        /// The read's failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The conditioner's processor configs are not processor configs or
+    /// disagree.
     #[error("invalid media checkpoint contract")]
-    ProcessorConfig(#[source] uniserve_core::video::plan::ProcessorConfigError),
+    ProcessorConfig(#[source] models::video::plan::ProcessorConfigError),
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -167,7 +178,15 @@ impl ModelConfig {
                 for name in ["preprocessor_config.json", "video_preprocessor_config.json"] {
                     processor.push(pipeline.component_file("processor", name).await?);
                 }
-                let vision = ProcessorConfig::read(&processor[0], &processor[1])
+                let read = |path: &std::path::PathBuf| {
+                    std::fs::read_to_string(path).map_err(|source| {
+                        ModelResolutionError::ProcessorFile {
+                            path: path.clone(),
+                            source,
+                        }
+                    })
+                };
+                let vision = ProcessorConfig::parse(&read(&processor[0])?, &read(&processor[1])?)
                     .map_err(ModelResolutionError::ProcessorConfig)?;
                 let model = Self::from_pipeline(description, max_model_len)?;
                 return Ok(LoadedModel {
@@ -217,11 +236,11 @@ impl ModelConfig {
     /// served features are applied (`resolve_generation_limits`).
     pub(crate) fn generation_limits(
         &self,
-        model_dtype: uniserve_core::ModelDtype,
-    ) -> uniserve_core::GenerationLimits {
+        model_dtype: uniserve_engine::ModelDtype,
+    ) -> uniserve_engine::GenerationLimits {
         match &self.parameters {
             ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
-                uniserve_core::GenerationLimits {
+                uniserve_engine::GenerationLimits {
                     latent_downsample: 1,
                     max_cfg_branches: 1,
                     ..Default::default()
@@ -234,7 +253,7 @@ impl ModelConfig {
             // token; the worker's encoder entries bound the feature bytes and
             // the number of cached encodings, so the model states no bound of
             // its own for either.
-            ModelParameters::DiffusionGemma(profile) => uniserve_core::GenerationLimits {
+            ModelParameters::DiffusionGemma(profile) => uniserve_engine::GenerationLimits {
                 latent_downsample: 1,
                 max_vit_grid_tokens: profile.images.max_soft_tokens,
                 max_vision_feature_bytes: u64::MAX,
@@ -609,7 +628,7 @@ fn chat_only(prompt: Prompt) -> ChatRequest {
 /// `omni_required_features`.
 fn configured_omni_needs(
     policy: &ImageGenerationConfig,
-    image_encoders: &[uniserve_core::ImageEncoderInput],
+    image_encoders: &[uniserve_engine::ImageEncoderInput],
 ) -> GenerationFeatures {
     policy.required_features(
         GenerationConstraint::Default,
@@ -638,7 +657,7 @@ fn validate_runtime_features(
 /// `ImageGenerationConfig::required_features` adds feedback encoders independently of it.
 fn omni_required_features(
     policy: &ImageGenerationConfig,
-    image_encoders: &[uniserve_core::ImageEncoderInput],
+    image_encoders: &[uniserve_engine::ImageEncoderInput],
     has_input_image: bool,
     constraint: GenerationConstraint,
 ) -> GenerationFeatures {
@@ -746,7 +765,8 @@ mod tests {
     use tempfile::TempDir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_core::{CanvasSampling, GenerationFeatures, GenerationLimits};
+    use uniserve_engine::{GenerationFeatures, GenerationLimits};
+    use uniserve_ipc::CanvasSampling;
 
     use super::{LoadedModel, LoadedRenderer};
     use crate::options::ServeConfig;
@@ -923,7 +943,7 @@ mod tests {
         images: Vec<crate::serving::ImageInput>,
     ) -> Result<
         (
-            uniserve_core::GenerationRequest,
+            uniserve_engine::GenerationRequest,
             crate::serving::OutputParams,
         ),
         crate::openai::ApiError,

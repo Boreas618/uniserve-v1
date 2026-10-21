@@ -1,7 +1,7 @@
 """Token selection on the rank's random draws matches the simulator's rule.
 
 ``tests/python/generated/sampling_rng_parity.json`` holds two kinds of cases.
-Each RNG case records a uniform draw of ``uniserve_core::philox``, the
+Each RNG case records a uniform draw of ``uniserve_ipc::philox``, the
 generator the rank's sampler draws through, and the token the inverse-CDF
 rule selects from the shared dyadic ``probs`` at that draw. Each boundary
 case pairs its own distribution with a draw at an edge of the rule (the

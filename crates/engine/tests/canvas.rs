@@ -20,16 +20,16 @@ mod support;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::{
-    CachePolicy, CanvasSampling, EngineCoreOutput, FinishReason, GenerationConstraint,
-    GenerationRequest, ImageGenerationConfig, ImageParams, MultimodalInputs, RejectionKind,
-    RequestId, SamplingParams,
-};
 use uniserve_engine::{
     BatchEvent, EngineHandle, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimExecutor,
     sim_canvas_stop_step, sim_text_token,
 };
+use uniserve_engine::{
+    CachePolicy, EngineCoreOutput, FinishReason, GenerationConstraint, GenerationRequest,
+    ImageGenerationConfig, MultimodalInputs, RejectionKind,
+};
 use uniserve_ipc::{Call, CallKind, ForwardBatch, ForwardMode};
+use uniserve_ipc::{CanvasSampling, ImageParams, RequestId, SamplingParams};
 
 /// Tokens of one block.
 const CANVAS: u32 = 16;

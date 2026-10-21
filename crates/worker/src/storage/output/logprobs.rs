@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use uniserve_core::TokenLogprob;
+use uniserve_ipc::TokenLogprob;
 
 use crate::{Error, Result};
 

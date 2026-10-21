@@ -5,7 +5,7 @@
 //! call reads its tokens, which logits it selects, where it samples, and how
 //! its request state advances when the batch commits.
 
-use uniserve_core::SamplingParams;
+use uniserve_ipc::SamplingParams;
 use uniserve_ipc::{Call, CallKind, DType, ForwardMode};
 
 use super::context::Media;

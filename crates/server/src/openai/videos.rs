@@ -298,7 +298,7 @@ async fn videos_create(
         id: id.clone(),
         object: "video",
         model: engine.served_model_name().to_owned(),
-        created_at: uniserve_core::now_unix_secs_u64(),
+        created_at: crate::openai::unix_time(),
         completed_at: None,
         expires_at: None,
         seconds: prepared.duration_seconds,
@@ -559,7 +559,7 @@ mod tests {
         let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
 
         assert_eq!(left, right);
-        assert_eq!(left.task, uniserve_core::VideoTask::Fl2va);
+        assert_eq!(left.task, models::video::VideoTask::Fl2va);
         assert_eq!(left.conditions[0].frame_index, Some(0));
         assert_eq!(left.target.duration_seconds, Some(5.5));
         assert_eq!(left.seed, 7);

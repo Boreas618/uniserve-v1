@@ -25,7 +25,7 @@ use uniserve_observability::{
 };
 
 use crate::serving::{RequestOutput, RequestOutputStream, RequestUsage};
-use uniserve_core::codec::stats::SchedulerStats;
+use uniserve_engine::report::SchedulerStats;
 
 /// Records the scheduler-stats-backed metrics for one engine at one point in
 /// time.
@@ -514,7 +514,7 @@ fn seconds(microseconds: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::codec::stats::DomainSchedulerStats;
+    use uniserve_engine::report::DomainSchedulerStats;
     use uniserve_observability::Metrics;
 
     // Per-domain scheduler statistics reach the rendered exposition under

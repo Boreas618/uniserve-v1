@@ -308,17 +308,17 @@ impl LoadedModel {
 /// The Ulysses head projection of a placement: its mode name and exchange
 /// step in rows. Kinds other than `ulysses` gather.
 pub(crate) fn head_projection(
-    placement: &uniserve_core::ComponentConfig,
+    placement: &uniserve_ipc::ComponentConfig,
 ) -> (&'static str, Option<usize>) {
     match placement.parallel_config.sequence_parallel {
-        uniserve_core::SequenceParallel::Ulysses {
+        uniserve_ipc::SequenceParallel::Ulysses {
             projection,
             projection_rows,
             ..
         } => (
             match projection {
-                uniserve_core::HeadProjection::Gather => "gather",
-                uniserve_core::HeadProjection::Exchange => "exchange",
+                uniserve_ipc::HeadProjection::Gather => "gather",
+                uniserve_ipc::HeadProjection::Exchange => "exchange",
             },
             projection_rows,
         ),
@@ -327,11 +327,11 @@ pub(crate) fn head_projection(
 }
 
 /// The sequence-parallel kind name of a placement.
-pub(crate) fn sequence_kind(placement: &uniserve_core::ComponentConfig) -> &'static str {
+pub(crate) fn sequence_kind(placement: &uniserve_ipc::ComponentConfig) -> &'static str {
     match placement.parallel_config.sequence_parallel {
-        uniserve_core::SequenceParallel::Local => "local",
-        uniserve_core::SequenceParallel::Ulysses { .. } => "ulysses",
-        uniserve_core::SequenceParallel::Allgather { .. } => "allgather",
-        uniserve_core::SequenceParallel::Hybrid { .. } => "hybrid",
+        uniserve_ipc::SequenceParallel::Local => "local",
+        uniserve_ipc::SequenceParallel::Ulysses { .. } => "ulysses",
+        uniserve_ipc::SequenceParallel::Allgather { .. } => "allgather",
+        uniserve_ipc::SequenceParallel::Hybrid { .. } => "hybrid",
     }
 }

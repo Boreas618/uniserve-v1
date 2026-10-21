@@ -21,13 +21,13 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use uniserve_core::{
-    ComponentConfig, EngineCoreOutput, FeedbackNextToken, FeedbackSource, FinishReason,
-    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
-    ImageEncoderInput, ImageGenerationConfig, ImageInput, ImageParams, ImageTrigger, MediaCall,
-    MultimodalInputs, Request, RequestId, SamplingParams,
-};
 use uniserve_engine::{EngineConfig, EngineCore, WorkerGroupConfig, WorkerProcessArgs};
+use uniserve_engine::{
+    EngineCoreOutput, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
+    GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
+    ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs, Request,
+};
+use uniserve_ipc::{ComponentConfig, ImageParams, MediaCall, RequestId, SamplingParams};
 
 /// The stub's end-of-image marker, which its head maps to end of sequence.
 const END_OF_IMAGE: u32 = 1007;
