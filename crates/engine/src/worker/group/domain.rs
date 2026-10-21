@@ -34,13 +34,13 @@ use super::spawn::launch_all;
 use crate::worker::WorkerProcess;
 use crate::worker::WorkerProcessArgs;
 use crate::worker::claims::StorageClaims;
-use crate::worker::launcher::Launchers;
+use crate::worker::processes::Processes;
 use crate::worker::registry::Registry;
 
 /// The groups replaced together, and their replacement rounds.
 pub(super) struct FailureDomain {
     registry: Registry,
-    launchers: Option<Launchers>,
+    processes: Processes,
     claims: StorageClaims,
     /// Each group's wake, in domain order: a failure and a finished
     /// relaunch wake every group's scheduler.
@@ -75,17 +75,17 @@ struct Relaunch {
 
 impl FailureDomain {
     /// A domain of `wakers.len()` groups, which relaunches through the
-    /// deployment's `registry`, `launchers` and `claims`.
+    /// deployment's `registry`, `processes` and `claims`.
     pub(super) fn new(
         registry: Registry,
-        launchers: Option<Launchers>,
+        processes: Processes,
         claims: StorageClaims,
         wakers: Vec<CommandWaker>,
     ) -> Self {
         let groups = wakers.len();
         Self {
             registry,
-            launchers,
+            processes,
             claims,
             wakers,
             round: Mutex::new(Round {
@@ -191,25 +191,25 @@ impl FailureDomain {
         let relaunched = launch_all(
             &mut arguments,
             &self.registry,
-            self.launchers.clone(),
+            &self.processes,
             &self.claims,
             cancel,
         );
         let mut round = self.round();
         if round.closing {
             drop(round);
-            for (mut workers, _) in relaunched.into_iter().flatten() {
+            for mut workers in relaunched.into_iter().flatten() {
                 workers.iter_mut().for_each(WorkerProcess::terminate);
+            }
+            if let Ok(mut processes) = crate::worker::processes::lock(&self.processes) {
+                for args in &arguments {
+                    let _ = processes.stop(&args.worker_id);
+                }
             }
             return;
         }
         round.relaunch = None;
-        Self::post(
-            &mut round,
-            relaunched
-                .map(|groups| groups.into_iter().map(|(workers, _)| workers).collect())
-                .map_err(|error| format!("{error:#}")),
-        );
+        Self::post(&mut round, relaunched.map_err(|error| format!("{error:#}")));
         drop(round);
         self.wake_all();
     }

@@ -1,13 +1,11 @@
-//! The first frame on a connection to the head.
+//! The first frame on a worker's connection to its engine.
 //!
-//! A worker is started with the head's address, its own identity and the
-//! launch it belongs to, and a host's launcher with the head's address and
-//! its host identity. Each connects, and the first frame it sends is its
-//! [`Registration`]. The head answers a worker with its
+//! A worker is started with the engine's address, its own identity and the
+//! launch it belongs to. It connects, and the first frame it sends is its
+//! [`Registration`]. The engine answers with the worker's
 //! [`LaunchDescriptor`](crate::LaunchDescriptor), which carries every other
 //! launch value, and the connection then carries requests and responses
-//! until it closes. A launcher's connection carries the messages of
-//! [`launcher`](crate::launcher) from then on.
+//! until it closes.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,19 +17,17 @@ use serde::{Deserialize, Serialize};
 /// The message types are the only definition of the protocol and their
 /// encoding is positional, so the two ends of a connection must be the same
 /// build: a message type reordered or retyped between two builds would fail
-/// to decode or, worse, decode into other fields. The head, a launcher and a
-/// worker are installed as separate artifacts, so the head refuses a
+/// to decode or, worse, decode into other fields. The engine and a worker
+/// library may be installed from different trees, so the engine refuses a
 /// registration that states another version. The digest tells apart two
-/// builds of one package version, such as a head and a worker library
-/// compiled from different trees.
+/// builds of one package version.
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "+",
     env!("UNISERVE_SOURCE_DIGEST")
 );
 
-/// The first frame a worker or a launcher sends: who it is and what it was
-/// built as.
+/// The first frame a worker sends: who it is and what it was built as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Registration {
@@ -42,28 +38,12 @@ pub enum Registration {
         /// The worker's rank within that group.
         rank: u32,
         /// The launch of the worker group the worker was started for. The
-        /// head numbers each group's launches from 1, and a relaunch after
+        /// engine numbers each group's launches from 1, and a relaunch after
         /// the group lost a worker takes the next number, so a registration
         /// of another launch than the group's current one is a worker of an
-        /// earlier launch, which the head refuses.
+        /// earlier launch, which the engine refuses.
         generation: u64,
         /// [`VERSION`] of the build the worker runs.
         version: String,
     },
-    /// The launcher of one host, which starts the workers placed there.
-    Launcher {
-        /// The host identity the launcher owns, as the placement names it.
-        host: String,
-        /// [`VERSION`] of the build the launcher runs.
-        version: String,
-    },
-}
-
-impl Registration {
-    /// Returns the build version the registration states.
-    pub fn version(&self) -> &str {
-        match self {
-            Self::Worker { version, .. } | Self::Launcher { version, .. } => version,
-        }
-    }
 }

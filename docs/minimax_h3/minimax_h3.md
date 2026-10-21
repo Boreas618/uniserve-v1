@@ -151,10 +151,10 @@ The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves re
 
 ### Two hosts
 
-The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the head's own). Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this head does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build; the head refuses a launcher or rank compiled from other sources and names both builds:
+The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the leader's own). Start the leader on `rank-0` with `--host-identity rank-0 --nnodes 2 --dist-init-addr <rank-0 address>:<port>`, a port free on `rank-0`; it logs `awaiting the deployment's other nodes` and binds that port on every interface. Then start the daemon of `rank-1` with the same environment and build; it takes no model and joins the leader, and the leader starts its workers on `rank-1` once its own start completes. A worker compiled from other sources than the leader is refused at registration, naming both builds:
 
 ```bash
-NCCL_NVLS_ENABLE=0 uniserve launcher --head <rank-0 address>:<port> --host-identity rank-1
+NCCL_NVLS_ENABLE=0 uniserve serve --nnodes 2 --node-rank 1 --dist-init-addr <rank-0 address>:<port> --host-identity rank-1
 ```
 
 ## Startup and capacity

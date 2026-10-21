@@ -3,12 +3,11 @@
 //! `main` parses the command line and runs its command. `serve` installs
 //! tracing and builds the Tokio runtime; `async_main` hands the resolved
 //! configuration to `server::serve` together with a cancellation token that
-//! fires on Ctrl-C or SIGTERM. `launcher`, `worker` and `storage` run before
-//! any thread exists: a worker loads the Python runtime on the main thread,
+//! fires on Ctrl-C or SIGTERM. `worker` and `storage` run before any thread
+//! exists: a worker loads the Python runtime on the main thread,
 //! and a Storage Server started with `--daemon` forks.
 
 mod cli;
-mod launcher;
 mod logging;
 mod storage;
 mod worker;
@@ -109,10 +108,6 @@ fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     let args = match cli.command {
         Command::Serve(args) => args,
-        Command::Launcher(args) => {
-            launcher::run(args)?;
-            return Ok(std::process::ExitCode::SUCCESS);
-        }
         Command::Worker { arguments } => worker::run(arguments),
         Command::Storage(args) => return Ok(storage::run(args)),
     };

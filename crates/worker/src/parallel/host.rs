@@ -9,7 +9,7 @@
 //! collectives never use it.
 //!
 //! Rendezvous: the group's first member holds a listening socket its
-//! launcher bound before the process existed (inherited as a descriptor), so
+//! daemon bound before the process existed (inherited as a descriptor), so
 //! the address every member was given is live from the start. Every other
 //! member binds an ephemeral listener, connects to the first member and
 //! reports its member index and listener address. The first member then
@@ -75,7 +75,7 @@ impl Rendezvous {
     pub(crate) unsafe fn inherited(address: impl Into<String>, fd: RawFd) -> Result<Self> {
         // SAFETY: forwarded from the caller.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        // The launcher cleared close-on-exec only for this process's exec;
+        // The daemon cleared close-on-exec only for this process's exec;
         // nothing this rank starts may inherit the socket.
         rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::CLOEXEC)
             .map_err(|error| Error::transport_source("rendezvous socket", error))?;

@@ -21,9 +21,9 @@
 //! the group's scheduler serves its other groups, and the group installs the
 //! relaunched ranks on a later poll.
 //!
-//! The module also launches groups: `spawn_all` starts every group's ranks,
-//! locally or through the host launchers in `launcher`, before any group
-//! waits for its ranks' registrations and startup capabilities.
+//! The module also launches groups: `spawn_all` has the daemons start every
+//! group's ranks on their nodes before any group waits for its ranks'
+//! registrations and startup capabilities.
 
 mod domain;
 mod reports;
@@ -102,11 +102,11 @@ pub struct WorkerGroup {
     /// While the group waits for its failure domain's relaunch: the info
     /// its workers reported, which their replacements must match.
     awaiting: Option<Vec<WorkerInfo>>,
-    /// The deployment's launchers of the hosts this head does not run
-    /// on, shared with the other groups. A launcher terminates the ranks it
-    /// started when the registry's last owner closes the connection, so the
-    /// group holds it for as long as it holds those ranks.
-    launchers: Option<super::launcher::Launchers>,
+    /// The deployment's connection to its daemons, shared with the other
+    /// groups. A daemon ends the processes an engine started when the
+    /// connection closes, so the group holds it for as long as it holds those
+    /// ranks.
+    processes: super::processes::Processes,
     /// The deployment's listener, which a relaunch's ranks connect to.
     registry: Registry,
     /// The deployment's storage claims, which a relaunch's workers start
@@ -346,16 +346,14 @@ impl WorkerGroup {
             None => {}
         }
 
-        // The group's workers on other hosts are stopped before the domain
-        // relaunches them through the same launchers, which stay connected
-        // for the deployment's other groups.
-        if let Some(registry) = &self.launchers
-            && let Err(error) = super::launcher::lock(registry)
-                .and_then(|mut hosts| hosts.stop_worker(&self.process_args.worker_id))
+        // The group's workers are stopped on every node before the domain
+        // relaunches them through the same daemons.
+        if let Err(error) = super::processes::lock(&self.processes)
+            .and_then(|mut processes| processes.stop(&self.process_args.worker_id))
         {
             tracing::warn!(
                 worker = %self.process_args.worker_id,
-                "stopping remote workers: {error:#}"
+                "stopping the group's workers: {error:#}"
             );
         }
         let _ = self.failure_wake.drain();
@@ -1058,9 +1056,10 @@ impl WorkerGroup {
     /// The ranks are closed together (`close_workers`): each is asked to shut
     /// down before any is waited for, since a rank's teardown retires the
     /// communicators it shares with the others and completes only once all
-    /// of them take part. Ranks on other hosts are followed until their
-    /// launchers report their exits. Failures to reach or stop a rank are
-    /// absorbed, so this returns `Ok`.
+    /// of them take part. Each rank is followed until its daemon reports its
+    /// exit, and the group's processes still running at the deadline are
+    /// stopped. Failures to reach or stop a rank are absorbed, so this
+    /// returns `Ok`.
     pub fn close(&mut self) -> anyhow::Result<()> {
         self.closed = true;
         self.drop_standby();
@@ -1069,27 +1068,23 @@ impl WorkerGroup {
         }
         let (domain, _) = &self.failure_domain;
         if domain.failing() || self.awaiting.is_some() {
-            // A failed collective cannot drain. Terminate the local readers
-            // and ask remote launchers to do the same before dropping storage;
-            // a relaunch the domain runs is cancelled and its ranks
-            // terminated.
+            // A failed collective cannot drain. Terminate the ranks and stop
+            // their processes before dropping storage; a relaunch the domain
+            // runs is cancelled and its ranks terminated.
             for worker in &mut self.workers {
                 worker.terminate();
             }
             domain.cancel_relaunch();
-            if let Some(registry) = &self.launchers {
-                let _ = super::launcher::lock(registry)
-                    .and_then(|mut hosts| hosts.stop_worker(&self.process_args.worker_id));
-            }
+            let _ = super::processes::lock(&self.processes)
+                .and_then(|mut processes| processes.stop(&self.process_args.worker_id));
             self.release_closed_resources();
             return Ok(());
         }
-        super::process::close_workers(
-            &mut self.workers,
-            self.launchers
-                .as_ref()
-                .map(|launchers| (launchers, self.process_args.worker_id.as_str())),
-        );
+        let (processes, worker_id) = (&self.processes, &self.process_args.worker_id);
+        super::process::close_workers(&mut self.workers, || {
+            let _ = super::processes::lock(processes)
+                .and_then(|mut processes| processes.stop(worker_id));
+        });
         self.release_closed_resources();
         Ok(())
     }

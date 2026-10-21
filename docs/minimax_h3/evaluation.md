@@ -23,7 +23,7 @@ export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
 
-The `gb200-8` suites start the head on `rank-0`; start `uniserve launcher` on `rank-1` for each server the suite starts, as in [Two hosts](minimax_h3.md#two-hosts).
+The `gb200-8` suites start the leader on `rank-0` with `--dist-init-addr $UNISERVE_DIST_INIT_ADDR`; set it to `rank-0`'s address and a free port, and start the daemon of `rank-1` against the same address for each server the suite starts, as in [Two hosts](minimax_h3.md#two-hosts).
 
 The `gb200-4-bf16-w1-w2` suite of the same profile runs the W1 and W2 workloads of [MiniMax-H3 workloads](#minimax-h3-workloads) on FastH3 8-Step V2, on the `gb200-4-bf16` deployment.
 
@@ -119,7 +119,7 @@ export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Ste
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs-enlarged --reuse-deployment
 ```
 
-Start `uniserve launcher` on `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
+Start the daemon of `rank-1` for the two-host server, as in [Two hosts](minimax_h3.md#two-hosts). The `sglang-gb200-8-reference` suite measures SGLang's base Ref2VA on the same cells and hosts with the base schedule (50 sigma points), one measured request per cell after its warmup; start SGLang's node rank 1 on `rank-1` beside the head, as for `sglang-gb200-8`. SGLang enlarges every reference image, so its results compare with the enlarged suite.
 
 ## OmniRef on H200
 

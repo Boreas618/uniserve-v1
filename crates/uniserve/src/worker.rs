@@ -2,7 +2,7 @@
 //!
 //! The `uniserve` executable is installed into a Python environment's
 //! `bin/`, beside the environment's interpreter, and its `worker` command
-//! takes the arguments the head and the launchers start a worker with. It
+//! takes the arguments a node's daemon starts a worker with. It
 //! does not link the worker runtime. It finds its environment from its own
 //! path, asks the
 //! environment's interpreter where three files are, loads them and calls the

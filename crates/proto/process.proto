@@ -1,0 +1,243 @@
+// The process interface: how daemons and engine processes start, stop and
+// supervise the processes of a deployment.
+//
+// Every node runs one daemon (`uniserve serve`). The leader (node rank 0)
+// accepts two kinds of peers on its process socket: the other nodes'
+// daemons, which join it, and the engine processes, which ask it to start
+// their workers on any node. The leader serves an engine's requests for its
+// own node and forwards the others to the node's daemon; exits come back the
+// same way.
+//
+// The interface is versioned across builds: a persistent daemon serves
+// engines of successive builds. Messages change only by additions: a new
+// field has a default, a peer skips fields it does not know, and the hello
+// exchange compares major versions.
+
+syntax = "proto3";
+
+package uniserve.process;
+
+// The first message on a connection, from the connecting side.
+message Hello {
+  // `PROTOCOL_MAJOR` of the sender's build; the peers refuse each other on a
+  // difference.
+  uint32 major = 1;
+  // `PROTOCOL_MINOR` of the sender's build: which additions it knows.
+  uint32 minor = 2;
+  // The sender's build: package version and source digest.
+  string build = 3;
+  oneof peer {
+    // A daemon of another node joining the leader.
+    Join join = 4;
+    // An engine process asking the leader to supervise its processes.
+    Engine engine = 5;
+  }
+}
+
+// A daemon of another node joining the leader.
+message Join {
+  // The node's rank; the leader is rank 0.
+  uint32 node_rank = 1;
+  // The node's host identity, as placements name it.
+  string host = 2;
+}
+
+// An engine process of a deployment.
+message Engine {
+  // The deployment: the served model name.
+  string deployment = 1;
+}
+
+// The answer to a `Hello`.
+message Welcome {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string build = 3;
+  // Why the peer is refused; empty when it is accepted.
+  string refusal = 4;
+  // Every node of the deployment, by rank (to an engine).
+  repeated Node nodes = 5;
+}
+
+// One node as the leader knows it.
+message Node {
+  uint32 node_rank = 1;
+  string host = 2;
+  // The address other nodes reach this node at (an IP address without a
+  // port); empty for a deployment of one node, whose processes reach each
+  // other over loopback.
+  string address = 3;
+}
+
+// A request to a daemon. The leader forwards a request for another node to
+// that node's daemon, which answers it.
+message Request {
+  // Chosen by the sender; the reply repeats it.
+  uint64 id = 1;
+  oneof kind {
+    Spawn spawn = 2;
+    Stop stop = 3;
+    Reserve reserve = 4;
+    Claim claim = 5;
+  }
+}
+
+// The answer to one request.
+message Reply {
+  uint64 id = 1;
+  // Why the request failed; empty when it succeeded.
+  string error = 2;
+  oneof kind {
+    Spawned spawned = 3;
+    Stopped stopped = 4;
+    Reserved reserved = 5;
+    Claimed claimed = 6;
+  }
+}
+
+// Start one process of a worker group on a node, as a child of its daemon.
+message Spawn {
+  // The node, by host identity.
+  string host = 1;
+  // The worker group, its rank within the group and the generation of the
+  // group's launch the process belongs to; its exit names them.
+  string group = 2;
+  uint32 rank = 3;
+  uint64 generation = 4;
+  // The executable and its arguments, after the program name.
+  string executable = 5;
+  repeated string arguments = 6;
+  // Variables set over the daemon's environment; an empty value is set
+  // empty rather than removed.
+  map<string, string> environment = 7;
+  // Reservations of this node whose sockets the process inherits, each at
+  // the descriptor number its `Reserved` named.
+  repeated uint64 inherit = 8;
+}
+
+message Spawned {
+  // The process id on its node.
+  uint32 pid = 1;
+}
+
+// Stop every process of one worker group on every node; their exits are not
+// reported.
+message Stop {
+  string group = 1;
+}
+
+message Stopped {}
+
+// Bind and hold a listening TCP socket on a node for a worker group, which a
+// process the group spawns there inherits.
+message Reserve {
+  string host = 1;
+  string group = 2;
+  // Whether processes on other nodes connect to it: it then binds every
+  // interface, and loopback otherwise.
+  bool routable = 3;
+}
+
+message Reserved {
+  // Names the reservation in a `Spawn` of the same node.
+  uint64 reservation = 1;
+  // `address:port`, at the node's address when routable and loopback
+  // otherwise.
+  string address = 2;
+  // The descriptor number a process that inherits the socket finds it at.
+  int32 descriptor = 3;
+}
+
+// Have a node's daemon hold the deployment's claim at its Storage Server,
+// starting the server when the node has none. The claim lasts as long as the
+// daemon: a later claim of the same scopes answers the claim held.
+message Claim {
+  string host = 1;
+  string deployment = 2;
+  // The `(worker group, rank)` scopes the deployment keeps on the node; the
+  // server releases every other scope of the deployment.
+  repeated Scope scopes = 3;
+  // Arguments a server the daemon starts is given beyond its socket: the
+  // deployment's Mooncake connector settings.
+  repeated string server_arguments = 4;
+}
+
+message Scope {
+  string group = 1;
+  uint32 rank = 2;
+}
+
+message Claimed {
+  // The server's socket on the node.
+  string socket = 1;
+  // The claim's token, which the deployment's workers state.
+  bytes claim = 2;
+  // `address:port` other nodes reach the server's page requests at; empty
+  // when it accepts none.
+  string tcp = 3;
+}
+
+// What a daemon tells an engine, unasked.
+message Event {
+  oneof kind {
+    Exit exit = 1;
+  }
+}
+
+// A supervised process exited.
+message Exit {
+  string host = 1;
+  string group = 2;
+  uint32 rank = 3;
+  uint64 generation = 4;
+  // Its exit status, or why the status could not be read.
+  string status = 5;
+}
+
+// What travels from a connecting peer after its `Hello`.
+message Upstream {
+  oneof kind {
+    Request request = 1;
+  }
+}
+
+// What travels to a connecting peer after its `Welcome`.
+message Downstream {
+  oneof kind {
+    Reply reply = 1;
+    Event event = 2;
+  }
+}
+
+// What travels from the leader to a member daemon: the engines' requests for
+// the member's node, each tagged with the engine connection it serves.
+message ToMember {
+  oneof kind {
+    Forwarded forwarded = 1;
+    // An engine connection closed: the member terminates its processes.
+    uint64 released = 2;
+  }
+}
+
+message Forwarded {
+  uint64 engine = 1;
+  Request request = 2;
+}
+
+// What travels from a member daemon to the leader.
+message FromMember {
+  oneof kind {
+    Answered answered = 1;
+    Exited exited = 2;
+  }
+}
+
+message Answered {
+  uint64 engine = 1;
+  Reply reply = 2;
+}
+
+message Exited {
+  uint64 engine = 1;
+  Exit exit = 2;
+}

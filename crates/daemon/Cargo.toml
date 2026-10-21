@@ -1,0 +1,22 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The persistent process of one node: process supervision, the node's
+# Storage Server claim and the process interface between nodes and engines.
+[dependencies]
+anyhow.workspace = true
+cuda.workspace = true
+libc.workspace = true
+proto.workspace = true
+storage.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

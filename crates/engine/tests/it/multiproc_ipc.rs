@@ -637,32 +637,16 @@ fn a_worker_group_reports_its_capacities_and_refuses_work_after_close() -> anyho
 /// during startup to fail its launch.
 #[test]
 fn a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow::Result<()> {
-    // Under the launch lock, snapshot this thread's children, launch the
-    // group, and take rank 1 from the children that were not there before.
-    let launch_guard = CHILD_LAUNCH_ENV_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("child launch lock poisoned"))?;
-    let child_ids = || -> anyhow::Result<Vec<u32>> {
-        Ok(std::fs::read_to_string("/proc/thread-self/children")?
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<_, _>>()?)
-    };
-    let before = child_ids()?;
-    let mut executor = spawn_worker_group()?;
-    let victim = child_ids()?
+    // The group's name is this test's own, so its rank 1 is found among the
+    // daemon's children by its group and rank.
+    let mut args = worker_group_args();
+    args.worker_id = "relaunched".into();
+    let mut executor = WorkerGroup::spawn(args)?;
+    let victim = crate::support::group_processes("relaunched")
         .into_iter()
-        .find(|pid| {
-            if before.contains(pid) {
-                return false;
-            }
-            let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            let args = args.split(|byte| *byte == 0).collect::<Vec<_>>();
-            args.windows(2)
-                .any(|pair| pair == [b"--rank".as_slice(), b"1".as_slice()])
-        })
+        .find(|(_, rank, _)| *rank == 1)
+        .map(|(pid, _, _)| pid)
         .context("rank child was not found")?;
-    drop(launch_guard);
 
     // Batch 1 admits requests 21 and 20 together; batch 2 finishes request 20,
     // so only 21 and 22 (admitted by batch 3) are resident when rank 1 dies.
@@ -692,7 +676,7 @@ fn a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow
     let loss = loss
         .downcast_ref::<WorkerFailure>()
         .context("expected scoped WorkerGroup loss")?;
-    assert_eq!(loss.worker_id.0, WorkerProcessArgs::default().worker_id);
+    assert_eq!(loss.worker_id.0, "relaunched");
     assert_eq!(loss.endpoints.len(), WORLD_SIZE);
     assert!(loss.endpoints.contains(&initial_endpoint));
     let requests = loss
@@ -758,44 +742,15 @@ fn a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails() -> anyhow
 /// A child rank process: its pid, `--rank` and `--generation`.
 type LaunchedRank = (u32, u32, u64);
 
-/// The children of this thread started by `launch`: each with the value of
-/// its `--rank` and `--generation` arguments.
+/// The processes of group `worker_id` the daemon started once `launch`
+/// returns: each with the value of its `--rank` and `--generation`
+/// arguments.
 fn launched_ranks(
+    worker_id: &str,
     launch: impl FnOnce() -> anyhow::Result<WorkerGroup>,
 ) -> anyhow::Result<(WorkerGroup, Vec<LaunchedRank>)> {
-    let launch_guard = CHILD_LAUNCH_ENV_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("child launch lock poisoned"))?;
-    let child_ids = || -> anyhow::Result<Vec<u32>> {
-        Ok(std::fs::read_to_string("/proc/thread-self/children")?
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<_, _>>()?)
-    };
-    let before = child_ids()?;
     let group = launch()?;
-    let mut ranks = Vec::new();
-    for pid in child_ids()? {
-        if before.contains(&pid) {
-            continue;
-        }
-        let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        let args = args
-            .split(|byte| *byte == 0)
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect::<Vec<_>>();
-        let value = |name: &str| {
-            args.iter()
-                .position(|arg| arg == name)
-                .and_then(|index| args.get(index + 1))
-                .and_then(|value| value.parse::<u64>().ok())
-        };
-        if let (Some(rank), Some(generation)) = (value("--rank"), value("--generation")) {
-            ranks.push((pid, rank as u32, generation));
-        }
-    }
-    drop(launch_guard);
-    Ok((group, ranks))
+    Ok((group, crate::support::group_processes(worker_id)))
 }
 
 /// A group that keeps a standby is replaced by promoting it: the lost
@@ -805,7 +760,8 @@ fn launched_ranks(
 fn a_lost_worker_group_is_replaced_by_its_standby() -> anyhow::Result<()> {
     let mut args = worker_group_args();
     args.keep_standby = true;
-    let (mut executor, ranks) = launched_ranks(|| WorkerGroup::spawn(args))?;
+    args.worker_id = "promoted".into();
+    let (mut executor, ranks) = launched_ranks("promoted", || WorkerGroup::spawn(args))?;
     // The serving ranks are the group's first launch, the standby's its
     // second.
     let rank_of = |rank: u32, generation: u64| {
@@ -2036,15 +1992,12 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
 /// `hg`), so khugepaged never collapses a serving rank's memory.
 #[test]
 fn launched_workers_hold_no_huge_page_advised_memory() -> anyhow::Result<()> {
-    let worker = spawn_worker_group()?;
-    // The ranks are this thread's children, each launched with `--rank`.
-    let ranks: Vec<String> = std::fs::read_to_string("/proc/thread-self/children")?
-        .split_whitespace()
-        .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|args| args.split(|byte| *byte == 0).any(|arg| arg == b"--rank"))
-        })
-        .map(str::to_owned)
+    let mut args = worker_group_args();
+    args.worker_id = "huge-pages".into();
+    let worker = WorkerGroup::spawn(args)?;
+    let ranks: Vec<u32> = crate::support::group_processes("huge-pages")
+        .into_iter()
+        .map(|(pid, _, _)| pid)
         .collect();
     anyhow::ensure!(ranks.len() == WORLD_SIZE, "found rank processes {ranks:?}");
     for pid in &ranks {
@@ -2193,12 +2146,13 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         "the placement shorthand must place ranks on the host it is given"
     );
 
-    // A rank placed on another host is started by that host's launcher, which
-    // connects to the head and presents the host it owns. No launcher presents
-    // here, so the launch fails naming the host whose ranks never started
-    // rather than waiting for them or starting them in the wrong place.
+    // A rank placed on another host is started by that host's daemon, which
+    // joined the leader. No daemon runs on that host here, so the launch
+    // fails naming the host whose ranks cannot start rather than waiting for
+    // them or starting them in the wrong place.
     let spawned = WorkerGroup::spawn(WorkerProcessArgs {
         executable: worker_executable(),
+        daemon: crate::support::daemon(),
         model: String::new(),
         host: "compute-0".into(),
         ranks: WorkerGroupConfig::placed(
@@ -2211,16 +2165,15 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
         .ranks,
         components: named.components.clone(),
         stub: true,
-        launcher_timeout: std::time::Duration::from_secs(2),
         ..WorkerProcessArgs::default()
     });
     let Err(error) = spawned else {
-        panic!("a rank whose host never presented a launcher must not launch");
+        panic!("a rank on a host no daemon runs on must not launch");
     };
     let message = format!("{error:#}");
     assert!(
         message.contains("compute-1"),
-        "the refusal must name the host whose launcher never presented: {message}"
+        "the refusal must name the host no daemon runs on: {message}"
     );
 }
 
@@ -2335,6 +2288,7 @@ fn worker_group_args() -> WorkerProcessArgs {
     };
     WorkerProcessArgs {
         executable,
+        daemon: crate::support::daemon(),
         model: String::new(),
         ranks: WorkerGroupConfig::placed(
             &["localhost".to_owned()],
@@ -2748,22 +2702,27 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
 {
     use engine::{WorkerExecutor, WorkerGroupId};
 
-    let transfer = engine::TransferConfig::parse("worker:1->worker:0=posix_shm")?;
+    // The group's name is this test's own, so its rank 0 is found among the
+    // daemon's children by its group and rank.
+    let transfer = engine::TransferConfig::parse("failed-producer:1->failed-producer:0=posix_shm")?;
     let mut args = worker_group_args();
+    args.worker_id = "failed-producer".into();
     args.queue_depth = 3;
     args.transfer = transfer.clone();
     args.components = split_components();
     let mut executor = WorkerExecutor::try_new(
-        vec![(WorkerGroupId("worker".into()), WorkerGroup::spawn(args)?)],
+        vec![(
+            WorkerGroupId("failed-producer".into()),
+            WorkerGroup::spawn(args)?,
+        )],
         transfer,
     )?;
     // Delay the command-only rank until the producer's completion is
     // observed. Its later acknowledgment must retire the same batch exactly
     // once. Rank 0 holds only the patch encoder, so batch 1, whose call runs
     // on the backbone's rank 1, reaches it only as the request's `Start`
-    // command. The ranks are this thread's children; rank 0 is the one
-    // launched with `--rank 0`.
-    let rank = worker_pid(0)?;
+    // command.
+    let rank = worker_pid("failed-producer", 0)?;
     let mut delayed_rank = PausedProcess::new(rank)?;
     let key = RequestKey::new(1, RequestId(71), 1);
     let admission = NewRequest::new_media(
@@ -2836,9 +2795,9 @@ fn failed_producer_retires_waiting_consumers_and_preserves_independent_work() ->
         0,
     );
 
-    executor.submit(place(source, "worker", Vec::new()))?;
-    executor.submit(place(consumer, "worker", Vec::new()))?;
-    executor.submit(place(independent, "worker", Vec::new()))?;
+    executor.submit(place(source, "failed-producer", Vec::new()))?;
+    executor.submit(place(consumer, "failed-producer", Vec::new()))?;
+    executor.submit(place(independent, "failed-producer", Vec::new()))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut failed = false;
@@ -5066,21 +5025,14 @@ fn single_worker_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs 
     args
 }
 
-/// The process id of this thread's child worker launched with `--rank <rank>`.
-fn worker_pid(rank: usize) -> anyhow::Result<i32> {
-    let flag = rank.to_string();
-    std::fs::read_to_string("/proc/thread-self/children")?
-        .split_whitespace()
-        .find_map(|pid| {
-            let args = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-            args.split(|byte| *byte == 0)
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| pair == [b"--rank".as_slice(), flag.as_bytes()])
-                .then(|| pid.parse::<i32>().ok())
-                .flatten()
-        })
-        .context("worker process was not found")
+/// The process id of rank `rank` of group `worker_id`, which the daemon
+/// started.
+fn worker_pid(worker_id: &str, rank: u32) -> anyhow::Result<i32> {
+    crate::support::group_processes(worker_id)
+        .into_iter()
+        .find(|(_, launched, _)| *launched == rank)
+        .map(|(pid, _, _)| pid as i32)
+        .with_context(|| format!("rank {rank} of worker group {worker_id} was not found"))
 }
 
 /// Lifts a single-call worker batch into the logical form the executor

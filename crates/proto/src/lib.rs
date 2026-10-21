@@ -1,0 +1,41 @@
+//! UniServe's interfaces across builds.
+//!
+//! A deployment's daemons outlive its engines: a hot update replaces the
+//! engine with one of another build while the daemons serve on. The
+//! interfaces between them are therefore Protobuf schemas that change only by
+//! additions (`process.proto`), compiled into this crate:
+//!
+//! - [`process`]: how daemons and engine processes start, stop and supervise
+//!   the processes of a deployment.
+//!
+//! Each connection opens with a hello exchange that compares
+//! [`PROTOCOL_MAJOR`]; a peer never sends a field the other's
+//! [`PROTOCOL_MINOR`] does not know. [`Connection`] carries the messages,
+//! one frame each, over a Unix socket on one node or TCP between nodes.
+
+mod connection;
+
+pub use connection::{Connection, Error, Listener, Result};
+
+/// The messages of the process interface (`process.proto`).
+#[allow(clippy::all, reason = "code generated from the schema")]
+pub mod process {
+    include!(concat!(env!("OUT_DIR"), "/uniserve.process.rs"));
+}
+
+/// The interfaces' major version: peers of different majors refuse each
+/// other. It changes only when a field is removed or changes meaning, which
+/// takes a planned restart of every daemon.
+pub const PROTOCOL_MAJOR: u32 = 1;
+
+/// The interfaces' minor version: the additions this build knows.
+pub const PROTOCOL_MINOR: u32 = 0;
+
+/// The build this crate is compiled in: the package version, then `+` and a
+/// digest of the workspace sources every artifact of the build is compiled
+/// from, as the engine interface's registration states it.
+pub const BUILD: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("UNISERVE_SOURCE_DIGEST")
+);

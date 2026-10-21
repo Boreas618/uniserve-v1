@@ -1,22 +1,21 @@
 //! One rank's process and channel, from spawn to shutdown.
 //!
-//! `PendingWorker::spawn` derives the rank's launch descriptor and starts
-//! the rank process here, or hands the launch to the host's launcher
-//! (`launcher::RemoteHost`) when the placement puts the rank on another host.
-//! The rank connects to the head and registers (`registry::WorkerRegistry`);
+//! `PendingWorker::spawn` derives the rank's launch descriptor and has the
+//! daemon of the rank's node start the rank process (`processes`). The rank
+//! connects to the engine and registers (`registry::WorkerRegistry`);
 //! `PendingWorker::adopt` answers on that connection with the descriptor and
 //! yields a `WorkerProcess`, which `WorkerGroup` (in `group`) drives:
 //! `finish_startup` validates the ranks' startup reports, `submit_batch` and
 //! `poll_batch` exchange batches and results, and `close_workers` or
 //! `terminate` retires the rank.
 //!
-//! A rank's connection is its liveness: the head treats a rank whose
-//! connection has closed as dead. A rank whose lane stays inside one job
-//! reports it unasked (`WorkerResponse::Stalled`), and the head fails that
-//! rank as it fails a dead one. A rank this head started is its child, a
-//! `WorkerChild`, so whichever path reaps it (an observed exit, a kill at a
-//! deadline, a termination) first removes the CUDA driver memory a rank that
-//! did not end in order left behind.
+//! A rank's connection is its liveness: the engine treats a rank whose
+//! connection has closed as dead, and a rank exits when its connection to
+//! the engine closes. A rank that has not registered yet is known lost by
+//! its daemon's exit report. A rank whose lane stays inside one job reports
+//! it unasked (`WorkerResponse::Stalled`), and the engine fails that rank as
+//! it fails a dead one. The daemon that started a rank reaps it and removes
+//! the CUDA driver memory a rank that did not end in order left behind.
 //!
 //! The head exchanges batch descriptors and bounded result values while
 //! tensors, cache pages, and latent storage remain worker-resident.
@@ -28,17 +27,17 @@
 mod descriptor;
 
 use crate::executor::WorkerResult;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::BatchSubmitError;
 use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use ipc::Channel;
-use ipc::launch::WorkerChild;
 use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
 
 use crate::worker::WorkerProcessArgs;
+use crate::worker::processes::Processes;
 
 use descriptor::worker_environment;
 pub use descriptor::{FlashInferBackend, FlashInferBackendParseError, GraphPolicy, LoadFormat};
@@ -53,8 +52,7 @@ const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// its teardown had not yet released.
 const WORKER_EXIT_GRACE: Duration = Duration::from_secs(30);
 /// Longest wait between checks for the exit of a rank `close_workers` is
-/// closing. A local process exit raises no wake, and a launcher reports a
-/// remote exit within its own 100-millisecond read timeout.
+/// closing. A daemon reports an exit within its own 100-millisecond poll.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Interval between progress logs while a rank prepares during startup.
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -65,8 +63,8 @@ const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub use ipc::{LaneConfig, LaneSpec};
 
-/// One adopted rank: its channel, its process when this engine started it,
-/// and the requests outstanding on it.
+/// One adopted rank: its channel, the report of its process's exit, and the
+/// requests outstanding on it.
 ///
 /// Dropping it closes the rank alone through `close_workers`.
 pub(super) struct WorkerProcess {
@@ -78,11 +76,8 @@ pub(super) struct WorkerProcess {
     /// which the teardown of any of them sets. `WorkerGroup` detaches it
     /// with `set_startup_cancel(None)` once the group is ready.
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// The rank's process, when this engine started it. A rank placed on
-    /// another host is started by that host's launcher and its process is
-    /// never visible here; its exit surfaces through the channel once the
-    /// connection closes, as a transport error from a receive.
-    child: Option<WorkerChild>,
+    /// The rank's process, which its node's daemon supervises.
+    process: ExitWatch,
     /// Most requests outstanding at once on the rank.
     depth: usize,
     rank: u32,
@@ -117,11 +112,10 @@ enum Retirement {
 /// One launched rank between its start and its registration.
 ///
 /// The rank's channel exists once the rank has connected and registered, so
-/// everything the rank is answered with is retained here meanwhile.
+/// everything the rank is answered with is retained here meanwhile. A launch
+/// that fails stops its group's ranks through their daemons.
 pub(super) struct PendingWorker {
-    /// Released by adoption; a local rank still held here is killed when
-    /// this value drops, as it does when the launch fails.
-    child: PendingChild,
+    process: ExitWatch,
     rank: u32,
     /// Most requests outstanding at once on the rank.
     depth: usize,
@@ -131,14 +125,21 @@ pub(super) struct PendingWorker {
     descriptor: LaunchDescriptor,
 }
 
-/// The process of a launched rank that has not been adopted yet, when this
-/// engine started it.
-struct PendingChild(Option<WorkerChild>);
+/// A rank's process as its daemon reports it: whether it exited.
+#[derive(Clone)]
+pub(super) struct ExitWatch {
+    processes: Processes,
+    group: String,
+    generation: u64,
+    rank: u32,
+}
 
-impl PendingChild {
-    /// Hands the process to the adopting rank, which owns its termination.
-    fn release(mut self) -> Option<WorkerChild> {
-        self.0.take()
+impl ExitWatch {
+    /// The rank's exit status, once its daemon reported it.
+    fn exited(&self) -> Option<String> {
+        crate::worker::processes::lock(&self.processes)
+            .ok()?
+            .exited(&self.group, self.generation, self.rank)
     }
 }
 
@@ -148,36 +149,33 @@ enum OutstandingKind {
     Batch { batch_id: u64 },
 }
 
-/// Bound listening sockets a rank inherits and serves collective stores on.
+/// Sockets a rank inherits from its daemon and serves collective stores on,
+/// as reservations of its node.
 #[derive(Default)]
 pub(crate) struct WorkerSockets {
     /// The group's rendezvous store, served by the group's first rank.
-    pub(crate) group: Option<std::net::TcpListener>,
+    pub(crate) group: Option<(u64, i32)>,
     /// The expert-parallel world's store, served by that world's rank 0.
-    pub(crate) experts: Option<std::net::TcpListener>,
+    pub(crate) experts: Option<(u64, i32)>,
 }
 
 impl PendingWorker {
-    /// Spawns one rank, which connects to the head at `head` and registers as
-    /// a member of its group's launch `generation`.
+    /// Has the daemon of the rank's node start one rank, which connects to
+    /// the engine at `head` and registers as a member of its group's launch
+    /// `generation`.
     ///
     /// Nothing here waits for the rank. `rendezvous` is the group's
-    /// collective store address, and `sockets.group` the socket this rank
-    /// serves that store on when it is the group's first rank and this
-    /// process spawns it; the rank inherits the socket and this process keeps
-    /// no copy. `store_fd` is the descriptor number a first rank on another
-    /// host inherits that socket at, as its launcher reported it. With
-    /// `remote`, the launch goes to that host's launcher and no process is
-    /// started here. `startup_abort` is the startup cancellation flag shared
-    /// by the ranks launched together. `sockets.experts` is the socket this
-    /// rank serves its expert-parallel world's store on, when it is that
-    /// world's rank 0.
+    /// collective store address, and `sockets` name the reservations of the
+    /// rank's node whose sockets it inherits and serves stores on: the
+    /// group's store when it is the group's first rank, its expert-parallel
+    /// world's store when it is that world's rank 0. `startup_abort` is the
+    /// startup cancellation flag shared by the ranks launched together.
     ///
     /// Fails when the rank's host-relative values or its descriptor cannot
-    /// be built, the remote delivery fails, or the process cannot be spawned.
+    /// be built, or its daemon cannot start it.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one rank's launch: its arguments, sockets, host and generation"
+        reason = "one rank's launch: its arguments, sockets, daemons and generation"
     )]
     pub(crate) fn spawn(
         args: &WorkerProcessArgs,
@@ -185,8 +183,7 @@ impl PendingWorker {
         storage: ipc::StorageLaunch,
         rendezvous: Option<&str>,
         sockets: WorkerSockets,
-        store_fd: Option<std::os::fd::RawFd>,
-        remote: Option<&mut super::launcher::RemoteHost<'_>>,
+        processes: &Processes,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         head: &str,
         generation: u64,
@@ -194,67 +191,81 @@ impl PendingWorker {
         let depth = args.queue_depth.max(1);
         let world_size = args.world_size();
 
-        let mut cmd =
-            ipc::launch::worker_command(&args.executable, head, &args.worker_id, rank, generation);
+        // argv carries the address of the engine the worker connects to and
+        // what its registration states: its worker group and its rank, and
+        // the generation of the group's launch it belongs to. They are the
+        // worker's only statement of its identity; the launch descriptor
+        // repeats none of them.
+        let arguments = vec![
+            "worker".to_owned(),
+            "--head".to_owned(),
+            head.to_owned(),
+            "--worker-id".to_owned(),
+            args.worker_id.clone(),
+            "--rank".to_owned(),
+            rank.to_string(),
+            "--generation".to_owned(),
+            generation.to_string(),
+        ];
 
         // Torch and the numerical libraries read the host-relative pair; the
-        // global pair names the rank's place in the whole process world.
+        // global pair names the rank's place in the whole process world. The
+        // daemon applies the variables over its own environment.
         let (local_rank, local_world_size) = args.host_slot(rank)?;
-        cmd.env("RANK", rank.to_string())
-            .env("WORLD_SIZE", world_size.to_string())
-            .env("LOCAL_RANK", local_rank.to_string())
-            .env("LOCAL_WORLD_SIZE", local_world_size.to_string());
-
-        // The environment is stated even for a local child, which
-        // would inherit them, so that a remote launch carries them as well.
-        cmd.envs(worker_environment(|name| std::env::var_os(name)));
-
-        // The engine's working directory leads the worker's import path.
+        let mut environment = std::collections::HashMap::from([
+            ("RANK".to_owned(), rank.to_string()),
+            ("WORLD_SIZE".to_owned(), world_size.to_string()),
+            ("LOCAL_RANK".to_owned(), local_rank.to_string()),
+            ("LOCAL_WORLD_SIZE".to_owned(), local_world_size.to_string()),
+        ]);
+        for (name, value) in worker_environment(|name| std::env::var_os(name)) {
+            environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
+        }
+        // The engine's working directory leads the worker's import path; the
+        // worker runs in its daemon's.
         if let Ok(cwd) = std::env::current_dir() {
-            let pp = std::env::var("PYTHONPATH").unwrap_or_default();
-            cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
+            let path = std::env::var("PYTHONPATH").unwrap_or_default();
+            environment.insert("PYTHONPATH".to_owned(), format!("{}:{path}", cwd.display()));
         }
 
-        // The command owns the store socket from here and closes this
-        // process's copy when it is dropped, after the spawn below.
-        let rendezvous_listen_fd = sockets
-            .group
-            .map(|listener| ipc::launch::inherit_listener(&mut cmd, listener))
-            .or(store_fd);
-        let expert_listen_fd = sockets
-            .experts
-            .map(|listener| ipc::launch::inherit_listener(&mut cmd, listener));
-
-        // One typed descriptor carries every launch value. The head keeps it
-        // and answers the rank's registration with it.
+        // One typed descriptor carries every launch value. The engine keeps
+        // it and answers the rank's registration with it.
         let descriptor = args.launch_descriptor(
             rank,
             storage,
             rendezvous,
-            rendezvous_listen_fd,
-            expert_listen_fd,
+            sockets.group.map(|(_, descriptor)| descriptor),
+            sockets.experts.map(|(_, descriptor)| descriptor),
         )?;
 
-        // A rank placed on another host is started by that host's launcher,
-        // which needs the same command and environment this process would
-        // have used. The head derives both once, here, for either path.
-        let child = match remote {
-            Some(remote) => {
-                remote.deliver(
-                    rank,
-                    &args.executable,
-                    &args.worker_id,
-                    generation,
-                    head,
-                    &cmd,
-                )?;
-                None
-            }
-            None => Some(WorkerChild::spawn(&mut cmd).context("spawning the rank process")?),
-        };
+        let executable = args
+            .executable
+            .to_str()
+            .context("the worker executable's path is not valid text")?
+            .to_owned();
+        crate::worker::processes::lock(processes)?.spawn(proto::process::Spawn {
+            host: args.ranks[rank as usize].host.clone(),
+            group: args.worker_id.clone(),
+            rank,
+            generation,
+            executable,
+            arguments,
+            environment,
+            inherit: sockets
+                .group
+                .into_iter()
+                .chain(sockets.experts)
+                .map(|(reservation, _)| reservation)
+                .collect(),
+        })?;
 
         Ok(Self {
-            child: PendingChild(child),
+            process: ExitWatch {
+                processes: std::sync::Arc::clone(processes),
+                group: args.worker_id.clone(),
+                generation,
+                rank,
+            },
             rank,
             depth,
             startup_abort,
@@ -266,8 +277,7 @@ impl PendingWorker {
     /// launch's startup was cancelled.
     ///
     /// `registry::collect` calls this, through the `alive` callback `adopt_workers`
-    /// passes it, while the launch is incomplete. Reaps the process when it
-    /// has exited.
+    /// passes it, while the launch is incomplete.
     pub(crate) fn check_alive(&mut self) -> anyhow::Result<()> {
         if self
             .startup_abort
@@ -275,38 +285,30 @@ impl PendingWorker {
         {
             bail!("rank {} was cancelled before registering", self.rank);
         }
-        // A rank started by another host's launcher has no process here. Its
-        // exit before registration reaches the head as a report from the
-        // launcher that owns it, which `adopt_workers` checks separately.
-        let Some(child) = self.child.0.as_mut() else {
-            return Ok(());
-        };
-        match child.try_wait() {
-            Ok(None) => Ok(()),
-            Ok(Some(status)) => Err(anyhow::anyhow!(
+        match self.process.exited() {
+            None => Ok(()),
+            Some(status) => Err(anyhow::anyhow!(
                 "rank {} exited with {status} before registering",
                 self.rank
             )),
-            Err(error) => Err(error).context("checking a launched rank"),
         }
     }
 
     /// Answers the rank's registration on `channel` with its launch
     /// descriptor and takes the connection as the rank's channel.
     ///
-    /// The returned `WorkerProcess` owns the rank's process, when this engine
-    /// spawned it. Its `info` stays the default until `finish_startup` runs.
+    /// The returned `WorkerProcess`'s `info` stays the default until
+    /// `finish_startup` runs.
     pub(crate) fn adopt(self, mut channel: Channel) -> anyhow::Result<WorkerProcess> {
         let PendingWorker {
-            child,
+            process,
             rank,
             depth,
             startup_abort,
             descriptor,
         } = self;
 
-        // The process stays owned by `child` until the answer is sent, so a
-        // failed send terminates the rank instead of orphaning it.
+        // A failed send closes the connection, which ends the rank.
         channel
             .send(&descriptor)
             .with_context(|| format!("sending rank {rank} its launch descriptor"))?;
@@ -316,7 +318,7 @@ impl PendingWorker {
             client: channel,
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
-            child: child.release(),
+            process,
             depth,
             rank,
             pending: HashMap::new(),
@@ -325,17 +327,6 @@ impl PendingWorker {
             retirement: Retirement::Serving,
             starting: false,
         })
-    }
-}
-
-impl Drop for PendingChild {
-    /// A rank that never registered has no channel to close through, so a
-    /// failed launch terminates its process here rather than leaking it.
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -399,14 +390,6 @@ impl WorkerProcess {
         self.info = info;
         self.starting = false;
         tracing::info!(?self.info, "worker ready");
-        // Warmup and capture have connected every communicator of a ready
-        // rank, so the NCCL names it maps now are those its reaping removes
-        // should it die without destroying them.
-        if let Some(child) = self.child.as_mut()
-            && let Err(error) = child.note_nccl_segments()
-        {
-            tracing::debug!(rank = self.rank, %error, "the rank's NCCL names could not be noted");
-        }
         Ok(true)
     }
 
@@ -481,28 +464,23 @@ impl WorkerProcess {
         }
     }
 
-    /// Terminates a failed or cancelled rank and waits for process-owned resources to retire.
+    /// Terminates a failed or cancelled rank.
     ///
     /// Sends no shutdown request and discards outstanding and routed results.
+    /// The rank's channel closes, which ends the rank; `WorkerGroup` also
+    /// stops the group's processes through their daemons
+    /// (`ProcessClient::stop`), which kill a rank that did not end.
     pub(crate) fn terminate(&mut self) {
         self.retirement = Retirement::Retired;
-        // A rank this engine started is killed and reaped here. A rank
-        // elsewhere has no process here: `WorkerGroup` recovery stops it
-        // through `LauncherRegistry::stop_worker`, and a launcher terminates
-        // every rank it started when its connection to the head closes.
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.client.shutdown();
         self.pending.clear();
         self.ready.clear();
     }
 
-    /// Checks child liveness and cancellation of an unfinished startup.
+    /// Checks the rank's liveness and cancellation of an unfinished startup.
     ///
-    /// Fails when the startup cancellation flag is set, when the local
-    /// process has exited (reaping it), or when querying the process fails. A
-    /// rank on another host is checked for cancellation only.
+    /// Fails when the startup cancellation flag is set, or when the rank's
+    /// daemon reported its exit.
     pub(super) fn check_worker(&mut self, context: &str) -> anyhow::Result<()> {
         if self
             .startup_cancel
@@ -511,9 +489,7 @@ impl WorkerProcess {
         {
             bail!("worker startup cancelled during {context}");
         }
-        if let Some(child) = self.child.as_mut()
-            && let Some(status) = child.try_wait()?
-        {
+        if let Some(status) = self.process.exited() {
             bail!("worker process exited during {context}: {status}");
         }
         Ok(())
@@ -733,12 +709,7 @@ impl WorkerProcess {
         }
 
         let mut acknowledgment = None;
-        // A rank started elsewhere is never observed to have exited here, so
-        // shutdown drains its channel as it would a live local rank.
-        let exited = matches!(
-            self.child.as_mut().map(WorkerChild::try_wait),
-            Some(Ok(Some(_)))
-        );
+        let exited = self.process.exited().is_some();
         if !exited {
             // Bound response draining so shutdown can advance to graceful termination
             // and, if necessary, forced process cleanup.
@@ -765,10 +736,7 @@ impl WorkerProcess {
             }
 
             // A rank still running after the drain is asked to shut down.
-            if !matches!(
-                self.child.as_mut().map(WorkerChild::try_wait),
-                Some(Ok(Some(_)))
-            ) {
+            if self.process.exited().is_none() {
                 let message_id = self.alloc_call_id();
                 let mut req = WorkerRequest::close();
                 req.set_message_id(Some(message_id));
@@ -778,21 +746,19 @@ impl WorkerProcess {
         self.retirement = Retirement::Closing { acknowledgment };
     }
 
-    /// Waits until `deadline` for a rank `request_close` asked to shut down,
-    /// then kills its local process if it is still running.
+    /// Waits until `deadline` for a rank `request_close` asked to shut down
+    /// to exit, which its daemon reports.
     ///
     /// The shutdown request stays outstanding until the rank answers it, so
     /// the answer, which the rank sends before its teardown begins, always
-    /// has a receiver. A local rank is retired once its process exits,
-    /// answered or not. The process of a rank elsewhere belongs to its
-    /// launcher, so that rank is retired once it answers or its channel
-    /// fails; `close_workers` then follows it to its exit. Acts only on a rank
-    /// that is closing.
-    fn await_close(&mut self, deadline: Instant) {
+    /// has a receiver. The rank is retired once its daemon reports its exit.
+    /// Returns whether it was; the caller stops the group's processes still
+    /// running at the deadline. Acts only on a rank that is closing.
+    fn await_close(&mut self, deadline: Instant) -> bool {
         let Retirement::Closing { mut acknowledgment } =
             std::mem::replace(&mut self.retirement, Retirement::Retired)
         else {
-            return;
+            return true;
         };
 
         loop {
@@ -806,17 +772,17 @@ impl WorkerProcess {
                     Ok(Some(_)) | Err(_) => acknowledgment = None,
                 }
             }
-            let retired = match self.child.as_mut() {
-                Some(child) => !matches!(child.try_wait(), Ok(None)),
-                None => acknowledgment.is_none(),
-            };
-            if retired {
-                return;
+            if self.process.exited().is_some() {
+                return true;
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break;
+                tracing::warn!(
+                    rank = self.rank,
+                    "worker did not exit before the shutdown deadline; stopping it"
+                );
+                return false;
             }
             // A response ends the wait; a process exit does not, so the wait
             // is also bounded by the exit poll interval. A closed channel
@@ -826,15 +792,6 @@ impl WorkerProcess {
             if self.client.wait(interval).is_err() {
                 std::thread::sleep(interval);
             }
-        }
-
-        if let Some(child) = self.child.as_mut() {
-            tracing::warn!(
-                rank = self.rank,
-                "worker did not exit before the shutdown deadline; killing it"
-            );
-            let _ = child.kill();
-            let _ = child.wait();
         }
     }
 }
@@ -901,93 +858,30 @@ pub(super) fn finish_startup(ranks: &mut [&mut WorkerProcess]) -> anyhow::Result
 /// and that retirement completes on any rank only once every rank has
 /// reached it. Every rank is therefore asked to shut down, after draining its
 /// outstanding calls, before any is waited for, and all of them then share
-/// one `WORKER_EXIT_GRACE` deadline, after which a local process still
-/// running is killed. Asking one rank at a time would leave the first one
-/// waiting on peers that have not been asked, until it is killed with its
-/// communicators unreleased.
-///
-/// `launchers` names the registry that started the group's ranks on other
-/// hosts, and the group's worker id. A rank answers its shutdown request
-/// before its teardown begins, and a launcher kills the ranks it still runs
-/// once the head lets go of the registry, so the ranks elsewhere are held
-/// until their launchers report their exits, against the same deadline.
-pub(super) fn close_workers(
-    ranks: &mut [WorkerProcess],
-    launchers: Option<(&super::launcher::Launchers, &str)>,
-) {
+/// one `WORKER_EXIT_GRACE` deadline. A rank still running then is stopped
+/// with its group through its daemon (`stop`), which abandons whatever its
+/// teardown had not yet released. Asking one rank at a time would leave the
+/// first one waiting on peers that have not been asked, until it is killed
+/// with its communicators unreleased.
+pub(super) fn close_workers(ranks: &mut [WorkerProcess], stop: impl FnOnce()) {
     for rank in ranks.iter_mut() {
         rank.request_close();
     }
-
-    // The ranks elsewhere that were asked to shut down. A rank whose request
-    // could not be sent is unreachable, and nothing it could still release
-    // waits on this process.
-    let remote: BTreeSet<u32> = ranks
-        .iter()
-        .filter(|rank| {
-            rank.child.is_none()
-                && matches!(
-                    rank.retirement,
-                    Retirement::Closing {
-                        acknowledgment: Some(_)
-                    }
-                )
-        })
-        .map(|rank| rank.rank)
-        .collect();
-
     let deadline = Instant::now() + WORKER_EXIT_GRACE;
+    let mut exited = true;
     for rank in ranks.iter_mut() {
-        rank.await_close(deadline);
+        exited &= rank.await_close(deadline);
     }
-    if let Some((registry, worker_id)) = launchers {
-        await_remote_exits(registry, worker_id, remote, deadline);
-    }
-}
-
-/// Waits until `deadline` for the launchers to report the exit of each rank
-/// in `remote`, all ranks of `worker_id` on other hosts.
-///
-/// Gives up when the registry cannot be locked. A rank still running at the
-/// deadline is left to its launcher, which kills it once the head releases
-/// the registry.
-fn await_remote_exits(
-    registry: &super::launcher::Launchers,
-    worker_id: &str,
-    mut remote: BTreeSet<u32>,
-    deadline: Instant,
-) {
-    while !remote.is_empty() {
-        let Ok(mut hosts) = super::launcher::lock(registry) else {
-            return;
-        };
-        for (_, exit) in hosts.drain_exits(worker_id) {
-            remote.remove(&exit.rank);
-        }
-        drop(hosts);
-        if remote.is_empty() {
-            return;
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            tracing::warn!(
-                worker = worker_id,
-                ranks = ?remote,
-                "ranks on other hosts did not exit before the shutdown deadline"
-            );
-            return;
-        }
-        std::thread::sleep(remaining.min(EXIT_POLL_INTERVAL));
+    if !exited {
+        stop();
     }
 }
 
 impl Drop for WorkerProcess {
-    /// Closes the rank as `close_workers` would close it alone. A rank on
-    /// another host is not followed to its exit, since no launcher registry
-    /// is at hand.
+    /// Closes the rank as `close_workers` would close it alone; a rank still
+    /// running at the deadline ends with its channel's close.
     fn drop(&mut self) {
         self.cancel_startup();
-        close_workers(std::slice::from_mut(self), None);
+        close_workers(std::slice::from_mut(self), || {});
     }
 }

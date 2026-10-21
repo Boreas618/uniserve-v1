@@ -24,10 +24,11 @@ mod values;
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use daemon::DaemonOptions;
 use engine::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_COMPONENT, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, Deployment, EngineConfig,
@@ -189,9 +190,18 @@ pub struct ServeConfig {
     pub data_parallel_size: NonZeroUsize,
     /// Deployment file placing worker groups and their components.
     pub worker_groups: Option<PathBuf>,
-    /// This process's host name; it runs the ranks placed on this host, and
-    /// a deployment rank entry without a host names it.
+    /// This node's host name; its daemon runs the ranks placed on this
+    /// host, and a deployment rank entry without a host names it.
     pub host_identity: String,
+    /// Nodes of the deployment, each running one `uniserve serve`.
+    pub nnodes: NonZeroU32,
+    /// This node's rank among `nnodes`. The leader, rank 0, serves the API
+    /// and runs the engine; every other node runs only its daemon, which
+    /// joins the leader's.
+    pub node_rank: u32,
+    /// The leader's `host:port`, which the other nodes' daemons join at and
+    /// the leader binds; required with several nodes.
+    pub dist_init_addr: Option<String>,
     /// Execution lanes, each a stream with its own SM partition.
     pub lanes: Vec<LaneSpec>,
     pub server_config: ServerOptions,
@@ -230,6 +240,9 @@ impl Default for ServeConfig {
             data_parallel_size: NonZeroUsize::MIN,
             worker_groups: None,
             host_identity: "localhost".to_owned(),
+            nnodes: NonZeroU32::MIN,
+            node_rank: 0,
+            dist_init_addr: None,
             lanes: Vec::new(),
             server_config: ServerOptions::default(),
             load_config: LoadOptions::default(),
@@ -814,7 +827,17 @@ impl ServeConfig {
     /// admits.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.model.is_some(),
+            self.node_rank < self.nnodes.get(),
+            "`node_rank` {} lies outside the {} nodes `nnodes` states",
+            self.node_rank,
+            self.nnodes
+        );
+        anyhow::ensure!(
+            self.nnodes.get() == 1 || self.dist_init_addr.is_some(),
+            "a deployment of several nodes needs the leader's address: set `dist_init_addr`"
+        );
+        anyhow::ensure!(
+            !self.leads() || self.model.is_some(),
             "`model` is required: name MODEL on the command line or set `model` in --config"
         );
         WorkerGroupConfig::validate_mem_fraction_static(self.mem_fraction_static)
@@ -851,6 +874,30 @@ impl ServeConfig {
             self.video_config.max_seconds
         );
         Ok(())
+    }
+
+    /// Whether this node is the leader, which serves the API and runs the
+    /// engine.
+    pub fn leads(&self) -> bool {
+        self.node_rank == 0
+    }
+
+    /// The options of this node's daemon. The leader's process socket is
+    /// this process's own, in the user's runtime directory; `executable`
+    /// starts the node's Storage Server when it has none.
+    pub fn daemon_options(&self) -> DaemonOptions {
+        let directory = storage::socket::default_socket()
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf);
+        DaemonOptions {
+            nnodes: self.nnodes.get(),
+            node_rank: self.node_rank,
+            host: self.host_identity.clone(),
+            dist_init_addr: self.dist_init_addr.clone(),
+            socket: directory.join(format!("process-{}.sock", std::process::id())),
+            executable: self.worker_config.executable.clone(),
+            join_timeout: daemon::JOIN_TIMEOUT,
+        }
     }
 
     /// Derives the engine configuration these options state.

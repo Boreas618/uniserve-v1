@@ -302,7 +302,7 @@ impl Drop for World {
 
 fn rendezvous(config: &RendezvousConfig) -> Result<Rendezvous> {
     match config.listen_fd {
-        // SAFETY: the launcher passed this descriptor for this process
+        // SAFETY: the daemon passed this descriptor for this process
         // alone; the launch configuration hands it out once.
         Some(fd) => unsafe { Rendezvous::inherited(config.address.clone(), fd) },
         None => Ok(Rendezvous::connect(config.address.clone())),

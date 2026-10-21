@@ -97,3 +97,88 @@ pub(crate) fn scheduler_with_policy(
         },
     )
 }
+
+/// The leader daemon this test process runs for the worker groups its tests
+/// launch, as a deployment of one node whose host is `localhost`; returns
+/// its process socket. The workers it starts are children of its service
+/// thread and end with the test process.
+pub(crate) fn daemon() -> String {
+    static DAEMON: std::sync::OnceLock<(daemon::Daemon, String)> = std::sync::OnceLock::new();
+    DAEMON
+        .get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let daemon = daemon::Daemon::start(daemon::DaemonOptions {
+                nnodes: 1,
+                node_rank: 0,
+                host: "localhost".into(),
+                dist_init_addr: None,
+                socket: directory.join("daemon.sock"),
+                executable: uniserve_executable(),
+                join_timeout: daemon::JOIN_TIMEOUT,
+            })
+            .unwrap();
+            let address = daemon.address().unwrap().to_owned();
+            (daemon, address)
+        })
+        .1
+        .clone()
+}
+
+/// The `uniserve` executable the workers run as, and that starts the node's
+/// Storage Server: `UNISERVE_WORKER_EXECUTABLE`, or else the repository
+/// environment's.
+pub(crate) fn uniserve_executable() -> std::path::PathBuf {
+    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(".venv/bin/uniserve")
+        })
+}
+
+/// Every process the threads of this test process started, with its
+/// arguments: the daemon's workers among them.
+pub(crate) fn child_processes() -> Vec<(u32, Vec<String>)> {
+    let mut children = Vec::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return children;
+    };
+    for task in tasks.flatten() {
+        let Ok(pids) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        for pid in pids.split_whitespace().filter_map(|pid| pid.parse().ok()) {
+            let arguments = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .unwrap_or_default()
+                .split(|byte| *byte == 0)
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect();
+            children.push((pid, arguments));
+        }
+    }
+    children
+}
+
+/// The worker processes of group `worker_id` this test process's daemon
+/// started: each process id with the value of its `--rank` and
+/// `--generation` arguments.
+pub(crate) fn group_processes(worker_id: &str) -> Vec<(u32, u32, u64)> {
+    child_processes()
+        .into_iter()
+        .filter_map(|(pid, arguments)| {
+            let value = |name: &str| {
+                arguments
+                    .iter()
+                    .position(|argument| argument == name)
+                    .and_then(|index| arguments.get(index + 1))
+            };
+            if value("--worker-id").map(String::as_str) != Some(worker_id) {
+                return None;
+            }
+            let rank = value("--rank")?.parse().ok()?;
+            let generation = value("--generation")?.parse().ok()?;
+            Some((pid, rank, generation))
+        })
+        .collect()
+}

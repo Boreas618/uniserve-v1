@@ -1,54 +1,43 @@
-//! The deployment's claims at the Storage Servers of its hosts.
+//! The deployment's claims at the Storage Servers of its nodes.
 //!
-//! Before any worker starts, the head claims the deployment at the Storage
-//! Server of every host the deployment places a worker on: its own host's,
-//! which it starts when the host has none, and through each other host's
-//! launcher that host's. A claim names the scopes the deployment keeps there
-//! and holds for as long as the claiming connection does, so it ends with
-//! the head, or with the launcher that holds it for the head. Each worker
-//! starts with its host's socket and claim token ([`StorageLaunch`]), by
-//! which the server tells it belongs to the current head.
+//! Before any worker starts, the engine has the daemon of every node the
+//! deployment places a worker on claim the deployment at that node's Storage
+//! Server (`ProcessClient::claim`), naming the scopes the deployment keeps
+//! there. The daemon holds the claim for as long as it runs, so the claim
+//! outlives the engine. Each worker starts with its node's socket and claim
+//! token ([`StorageLaunch`]), by which the server tells it belongs to the
+//! deployment's current claim.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use anyhow::Context;
 use ipc::StorageLaunch;
-use ipc::launcher::StorageClaim;
-use storage::{Client, Role, Scope};
 
 use crate::worker::WorkerProcessArgs;
-use crate::worker::launcher::Launchers;
-
-/// Longest a Storage Server the head starts takes to listen.
-const START_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::worker::processes::Processes;
 
 /// The deployment's claims, shared by every group of the deployment.
 pub(crate) type StorageClaims = Arc<Claims>;
 
 pub(crate) struct Claims {
-    /// The connection that holds the claim at this host's server, when the
-    /// deployment places a worker here.
-    _local: Option<Mutex<Client>>,
-    /// The storage launch of each host's workers.
+    /// The storage launch of each node's workers, by host.
     launches: BTreeMap<String, StorageLaunch>,
 }
 
 impl Claims {
-    /// Claim `arguments`' deployment at the server of every host their
+    /// Claims `arguments`' deployment at the server of every node their
     /// groups place a worker on, keeping exactly the scopes they place
-    /// there. `launchers` reaches the hosts other than this one.
+    /// there.
     ///
     /// Fails when a server cannot be started or reached, or refuses the
-    /// claim because the deployment's previous head is still connected.
+    /// claim because another head of the deployment is connected.
     pub(crate) fn claim(
         arguments: &[WorkerProcessArgs],
-        launchers: Option<&Launchers>,
+        processes: &Processes,
     ) -> anyhow::Result<StorageClaims> {
         let Some(first) = arguments.first() else {
             return Ok(Arc::new(Self {
-                _local: None,
                 launches: BTreeMap::new(),
             }));
         };
@@ -73,62 +62,12 @@ impl Claims {
             .as_ref()
             .map(storage::connector::Settings::arguments)
             .unwrap_or_default();
-        let mut local = None;
         let mut launches = BTreeMap::new();
         for (host, scopes) in scopes {
-            let launch = if host == first.host {
-                let socket = storage::socket::default_socket();
-                storage::socket::ensure(
-                    &first.executable,
-                    &socket,
-                    START_TIMEOUT,
-                    &server_arguments,
-                )
-                .context("starting this host's storage server")?;
-                let mut client = Client::connect(
-                    &socket,
-                    Role::Head {
-                        deployment: deployment.clone(),
-                    },
-                )
-                .with_context(|| {
-                    format!("connecting to the storage server at {}", socket.display())
-                })?;
-                let claim = client
-                    .claim(
-                        scopes
-                            .into_iter()
-                            .map(|(group, rank)| Scope {
-                                deployment: deployment.clone(),
-                                group,
-                                rank,
-                            })
-                            .collect(),
-                    )
-                    .with_context(|| format!("claiming deployment {deployment}"))?;
-                local = Some(Mutex::new(client));
-                StorageLaunch {
-                    socket: socket.to_string_lossy().into_owned(),
-                    deployment: deployment.clone(),
-                    claim: claim.0,
-                    page_tier: first.page_tier,
-                    tcp: None,
-                    standby: false,
-                }
-            } else {
-                let registry = launchers.with_context(|| {
-                    format!("host {host} places workers but no launcher registry was bound")
-                })?;
-                crate::worker::launcher::lock(registry)?.claim_on(
-                    host,
-                    StorageClaim {
-                        deployment: deployment.clone(),
-                        scopes,
-                        arguments: server_arguments.clone(),
-                    },
-                )?
-            };
-            // The head decides whether its workers use the host page tier.
+            let launch = crate::worker::processes::lock(processes)?
+                .claim(host, deployment, scopes, server_arguments.clone())
+                .with_context(|| format!("claiming deployment {deployment} on host {host}"))?;
+            // The engine decides whether its workers use the host page tier.
             launches.insert(
                 host.to_owned(),
                 StorageLaunch {
@@ -142,10 +81,7 @@ impl Claims {
             hosts = launches.len(),
             "claimed the deployment's storage"
         );
-        Ok(Arc::new(Self {
-            _local: local,
-            launches,
-        }))
+        Ok(Arc::new(Self { launches }))
     }
 
     /// The storage launch of the workers on `host`.

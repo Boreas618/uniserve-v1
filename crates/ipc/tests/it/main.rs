@@ -3,7 +3,5 @@
 
 #![cfg(test)]
 
-mod launcher;
 mod protocol;
-mod rank_child;
 mod shared_media;
