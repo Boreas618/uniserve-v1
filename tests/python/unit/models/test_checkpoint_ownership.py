@@ -45,6 +45,45 @@ def test_module_exclusions_remove_shared_aliases():
     )
 
 
+class _Statistics(torch.nn.Module):
+    """A component whose constructor builds a tensor on the CPU.
+
+    A VAE computes its latent statistics from its configuration this way.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.projection = torch.nn.Linear(4, 4)
+        self.register_buffer(
+            "mean", torch.zeros(4, device="cpu"), persistent=False
+        )
+
+
+def test_a_component_the_rank_does_not_hold_keeps_only_meta_tensors():
+    """A module the rank does not select holds only meta placeholders.
+
+    That holds whatever device its constructor built a tensor on.
+    """
+
+    def model(_config):
+        return torch.nn.ModuleDict(
+            {"held": _Statistics(), "elsewhere": _Statistics()}
+        )
+
+    loaded = loading.load_model(
+        model,
+        None,
+        checkpoint=(),
+        mapping=lambda _model: (),
+        device="cpu",
+        modules=frozenset({"held"}),
+    )
+    elsewhere = loaded.model["elsewhere"]
+    assert elsewhere.mean.is_meta
+    assert elsewhere.projection.weight.is_meta
+    assert not loaded.model["held"].mean.is_meta
+
+
 @pytest.mark.parametrize("exclude", [False, True])
 def test_module_selection_rejects_unknown_paths(exclude):
     options = {
