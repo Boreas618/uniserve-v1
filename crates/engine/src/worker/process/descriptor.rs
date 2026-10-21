@@ -159,8 +159,8 @@ impl WorkerProcessArgs {
     /// Builds the typed launch descriptor the worker process consumes.
     ///
     /// Every launch value is stated explicitly, so the launching side is the
-    /// single source of defaults and the rank never re-derives one. The head
-    /// answers the rank's registration with it; only the head's address and
+    /// single source of defaults and the rank never re-derives one. The engine
+    /// answers the rank's registration with it; only the engine's address and
     /// the rank's identity travel on argv.
     ///
     /// `rank` must index `self.ranks`. Fails when a host-relative rank value
@@ -202,7 +202,7 @@ impl WorkerProcessArgs {
         Ok(LaunchDescriptor {
             // A rank cannot name the ranks that read what it publishes: it
             // knows its own component, not which component consumes its
-            // products. The head states a product's readers on the call that
+            // products. The engine states a product's readers on the call that
             // produces it and gives the rank its own acknowledgment slot here.
             acknowledgment_slot: self.transfer.acknowledgment_slot(&self.worker_id, rank),
             // Which of those slots are on this rank's host decides the
@@ -319,7 +319,7 @@ const ALLOCATOR_VARIABLES: [&str; 2] = ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLO
 const HOST_ALLOCATOR_THP_VARIABLE: &str = "MIMALLOC_ALLOW_THP";
 
 /// Variables a rank's CUDA and NCCL libraries read before their first use,
-/// with the value a rank runs with unless the head sets the variable itself.
+/// with the value a rank runs with unless the engine sets the variable itself.
 ///
 /// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the
 ///   context when a kernel is first used, which can deadlock against a
@@ -332,17 +332,17 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
 ];
 
 /// Returns the variables every rank is launched with, given a lookup into
-/// the head's environment.
+/// the engine's environment.
 ///
 /// Every rank serves varying shapes from expandable caching-allocator
-/// segments, unless the head's environment already configures the caching
+/// segments, unless the engine's environment already configures the caching
 /// allocator under either name, in which case each rank receives exactly
-/// the head's variables. Tensor export never depends on the caching
+/// the engine's variables. Tensor export never depends on the caching
 /// allocator: a device product is exported from the rank's own VMM arena or
 /// copied into its bounded VMM pool, both reserved outside the allocator.
 ///
 /// Every rank also keeps its host heap out of transparent huge pages unless
-/// the head sets `MIMALLOC_ALLOW_THP` itself. mimalloc otherwise advises its
+/// the engine sets `MIMALLOC_ALLOW_THP` itself. mimalloc otherwise advises its
 /// 1 GiB arenas for huge pages. On a kernel with 64 KiB base pages a huge
 /// page is 512 MiB, and each time khugepaged collapses one it holds the
 /// rank's memory map for about 90 ms, which stalls the rank's service
@@ -351,27 +351,27 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
 ///
 /// The [`RUNTIME_DEFAULTS`] are stated in the environment rather than set by
 /// the rank, so they precede any CUDA or NCCL initialization whatever the
-/// rank imports first; the head's own values win.
+/// rank imports first; the engine's own values win.
 ///
 /// The variables are set explicitly on each rank's command, because the
 /// daemon that starts the rank applies only the variables the command sets
 /// over its own environment.
 pub(super) fn worker_environment(
-    head: impl Fn(&str) -> Option<std::ffi::OsString>,
+    engine: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(&'static str, std::ffi::OsString)> {
     let mut configured: Vec<_> = ALLOCATOR_VARIABLES
         .into_iter()
-        .filter_map(|name| head(name).map(|value| (name, value)))
+        .filter_map(|name| engine(name).map(|value| (name, value)))
         .collect();
     if configured.is_empty() {
         configured.push(("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True".into()));
     }
     configured.push((
         HOST_ALLOCATOR_THP_VARIABLE,
-        head(HOST_ALLOCATOR_THP_VARIABLE).unwrap_or_else(|| "0".into()),
+        engine(HOST_ALLOCATOR_THP_VARIABLE).unwrap_or_else(|| "0".into()),
     ));
     for (name, value) in RUNTIME_DEFAULTS {
-        configured.push((name, head(name).unwrap_or_else(|| value.into())));
+        configured.push((name, engine(name).unwrap_or_else(|| value.into())));
     }
     configured
 }
@@ -395,7 +395,7 @@ mod tests {
         }
     }
 
-    /// The head answers a rank's registration with its launch descriptor as
+    /// The engine answers a rank's registration with its launch descriptor as
     /// one frame, so every field must survive the frame's encoding, with and
     /// without the values that are optional.
     #[test]
@@ -411,17 +411,17 @@ mod tests {
         }
     }
 
-    /// Every rank runs with the head's caching-allocator configuration,
-    /// under whichever names the head sets, or with expandable segments when
-    /// the head configures none, and with its host heap out of transparent
-    /// huge pages unless the head decides otherwise. The result names each
+    /// Every rank runs with the engine's caching-allocator configuration,
+    /// under whichever names the engine sets, or with expandable segments when
+    /// the engine configures none, and with its host heap out of transparent
+    /// huge pages unless the engine decides otherwise. The result names each
     /// variable, since a remote launch carries only the variables its
     /// command sets.
     #[test]
-    fn workers_run_with_the_heads_allocator_configuration() {
-        let resolve = |head: &[(&'static str, &str)]| {
-            let head: BTreeMap<_, _> = head.iter().copied().collect();
-            worker_environment(|name| head.get(name).map(OsString::from))
+    fn workers_run_with_the_engines_allocator_configuration() {
+        let resolve = |engine: &[(&'static str, &str)]| {
+            let engine: BTreeMap<_, _> = engine.iter().copied().collect();
+            worker_environment(|name| engine.get(name).map(OsString::from))
                 .into_iter()
                 .filter(|(name, _)| !name.starts_with("CUDA_") && !name.starts_with("NCCL_"))
                 .collect::<BTreeMap<_, _>>()
@@ -440,7 +440,7 @@ mod tests {
                 ("MIMALLOC_ALLOW_THP", "0"),
             ])
         );
-        for head in [
+        for engine in [
             vec![(
                 "PYTORCH_CUDA_ALLOC_CONF",
                 "garbage_collection_threshold:0.6",
@@ -451,9 +451,9 @@ mod tests {
                 ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False"),
             ],
         ] {
-            let mut ranks = head.clone();
+            let mut ranks = engine.clone();
             ranks.push(("MIMALLOC_ALLOW_THP", "0"));
-            assert_eq!(resolve(&head), expected(&ranks));
+            assert_eq!(resolve(&engine), expected(&ranks));
         }
         assert_eq!(
             resolve(&[("MIMALLOC_ALLOW_THP", "1")]),
@@ -465,12 +465,12 @@ mod tests {
     }
 
     /// Eager CUDA module loading and connect-at-startup NCCL precede any
-    /// CUDA or NCCL use in every rank, unless the head sets either itself.
+    /// CUDA or NCCL use in every rank, unless the engine sets either itself.
     #[test]
-    fn runtime_defaults_yield_to_the_heads_values() {
-        let resolve = |head: &[(&'static str, &str)]| {
-            let head: BTreeMap<_, _> = head.iter().copied().collect();
-            worker_environment(|name| head.get(name).map(OsString::from))
+    fn runtime_defaults_yield_to_the_engines_values() {
+        let resolve = |engine: &[(&'static str, &str)]| {
+            let engine: BTreeMap<_, _> = engine.iter().copied().collect();
+            worker_environment(|name| engine.get(name).map(OsString::from))
                 .into_iter()
                 .filter(|(name, _)| name.starts_with("CUDA_") || name.starts_with("NCCL_"))
                 .collect::<BTreeMap<_, _>>()

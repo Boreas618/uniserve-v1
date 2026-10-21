@@ -5,7 +5,7 @@
 //! Each wait for a request or a completion ends, at the latest, when the
 //! job in flight longest reaches the rank's stall bound: a lane that has
 //! stayed inside one job that long, such as a driver call that does not
-//! return, is reported to the head ([`WorkerResponse::Stalled`]) with the
+//! return, is reported to the engine ([`WorkerResponse::Stalled`]) with the
 //! batch the job belongs to, and the channel goes on being served.
 
 use std::cell::Cell;
@@ -28,14 +28,14 @@ const OWN_STEP_WAIT: Duration = Duration::from_millis(8);
 
 /// How a serving run ended other than by a failure of the rank's own.
 pub(crate) enum Ending {
-    /// The head closed the rank, or a fatal response ended admission.
+    /// The engine closed the rank, or a fatal response ended admission.
     Closed,
-    /// The head's channel failed (the error says how) while nothing was in
+    /// The engine's channel failed (the error says how) while nothing was in
     /// flight: no admitted batch was unfinished and no job given to a lane
     /// or the Python thread was without its completion, so nothing the rank
     /// issued can still run on a device.
     Orphaned(WorkerError),
-    /// The head's channel failed (the error says how) while work was in
+    /// The engine's channel failed (the error says how) while work was in
     /// flight. Nothing can deliver its results, and it may never complete:
     /// it may wait on a peer that stopped or abandoned its own work, and
     /// the Python thread may wait in it for good.
@@ -64,10 +64,10 @@ pub(crate) struct Service<'a> {
     last_result: Instant,
     /// How long one job may run on a lane before the lane is reported.
     stall_bound: Duration,
-    /// A stalled lane was reported. The head fails the rank on the report,
+    /// A stalled lane was reported. The engine fails the rank on the report,
     /// so it is made once.
     stalled: bool,
-    /// The head's channel failed: it closed, or a send or receive on it
+    /// The engine's channel failed: it closed, or a send or receive on it
     /// did.
     channel_failed: Cell<bool>,
     /// The Storage Server connection of a parked standby worker, which
@@ -101,10 +101,10 @@ impl<'a> Service<'a> {
         }
     }
 
-    /// Serve until the head closes the rank or a fatal response ends
+    /// Serve until the engine closes the rank or a fatal response ends
     /// admission, which is [`Ending::Closed`].
     ///
-    /// Once the head's channel fails nothing more can be admitted or
+    /// Once the engine's channel fails nothing more can be admitted or
     /// delivered: the run ends [`Ending::Orphaned`] when no admitted batch
     /// is unfinished and the jobs in flight finish before the stall bound,
     /// and [`Ending::Abandoned`] otherwise.
@@ -116,20 +116,20 @@ impl<'a> Service<'a> {
         };
         if self.settled() {
             tracing::warn!(
-                "the head's channel failed with nothing in flight; the rank closes without its peers"
+                "the engine's channel failed with nothing in flight; the rank closes without its peers"
             );
             return Ok(Ending::Orphaned(error));
         }
         tracing::warn!(
             unfinished_batches = self.executor.has_work(),
             jobs_in_flight = self.executor.backend().oldest_job().is_some(),
-            "the head's channel failed with work in flight, which the rank abandons"
+            "the engine's channel failed with work in flight, which the rank abandons"
         );
         Ok(Ending::Abandoned(error))
     }
 
     /// Whether nothing the rank issued can still run on a device once its
-    /// head is gone: no admitted batch is unfinished, and every job given
+    /// engine is gone: no admitted batch is unfinished, and every job given
     /// to a lane or the Python thread has completed.
     ///
     /// An answered batch can leave jobs in flight, such as the release of
@@ -187,7 +187,7 @@ impl<'a> Service<'a> {
 
                 // The rank closes its connection after this, which discards
                 // what is still queued: a fatal error or this acknowledgment
-                // may wait behind a large result the head is still reading.
+                // may wait behind a large result the engine is still reading.
                 self.channel.flush().map_err(|e| self.channel_error(e))?;
                 return Ok(());
             }
@@ -227,7 +227,7 @@ impl<'a> Service<'a> {
             } else if self.experts {
                 self.wait(EXPERT_POLL)?;
             } else {
-                // Nothing is owed or running, so only a request or the head's
+                // Nothing is owed or running, so only a request or the engine's
                 // close can end this wait.
                 self.wait(Duration::from_secs(60))?;
             }
@@ -303,7 +303,7 @@ impl<'a> Service<'a> {
                     let result = self.executor.poll(submission);
                     match result {
                         // The result is checked once, here, where the rank
-                        // builds its response; the head does not check it
+                        // builds its response; the engine does not check it
                         // again. A result that breaks the contract is the
                         // rank's own defect, and its media names are dropped
                         // with it.
@@ -367,8 +367,8 @@ impl<'a> Service<'a> {
 
     /// Report a lane stalled past the bound, then block until a request, a
     /// completion wake, the timeout or the moment the job in flight longest
-    /// reaches the bound. Fails once the head's connection has closed: it
-    /// is the head's liveness, and nothing this rank computes can be
+    /// reaches the bound. Fails once the engine's connection has closed: it
+    /// is the engine's liveness, and nothing this rank computes can be
     /// delivered after it.
     fn wait(&mut self, timeout: Duration) -> Result<(), WorkerError> {
         let timeout = match self.watch_lanes()? {
@@ -406,7 +406,7 @@ impl<'a> Service<'a> {
             method = ?stall.method,
             calls = stall.calls.len(),
             running_ms = stall.running_ms,
-            "a lane has stayed inside one job past the stall bound of {:?}; reporting it to the head",
+            "a lane has stayed inside one job past the stall bound of {:?}; reporting it to the engine",
             self.stall_bound,
         );
         self.stalled = true;
@@ -416,7 +416,7 @@ impl<'a> Service<'a> {
 
     fn channel_error(&self, error: IpcError) -> WorkerError {
         self.channel_failed.set(true);
-        WorkerError::classify(Error::transport_source("the head channel", error), None)
+        WorkerError::classify(Error::transport_source("the engine channel", error), None)
     }
 }
 
@@ -443,22 +443,23 @@ mod tests {
 
     type Result<T> = std::result::Result<T, WorkerError>;
 
-    /// How long the head waits for one response.
+    /// How long the engine waits for one response.
     const RESPONSE_WAIT: Duration = Duration::from_secs(30);
 
     fn transport(error: IpcError) -> WorkerError {
         Error::transport_source("the test channel", error).into()
     }
 
-    /// The rank's end of a connection whose head end runs `head` on its
-    /// own thread, and the head's outcome once `serve` returned.
+    /// The rank's end of a connection whose engine end runs `engine` on its
+    /// own thread, and the engine's outcome once `serve` returned.
     fn connect<T: Send + 'static, S>(
-        head: impl FnOnce(Channel) -> Result<T> + Send + 'static,
+        engine: impl FnOnce(Channel) -> Result<T> + Send + 'static,
         serve: impl FnOnce(&mut Channel) -> Result<S>,
     ) -> Result<(Result<S>, Result<T>)> {
         let listener = Listener::bind(&["127.0.0.1:0"]).map_err(transport)?;
         let address = listener.addresses()[0].clone();
-        let head = std::thread::spawn(move || head(Channel::connect(&address).map_err(transport)?));
+        let engine =
+            std::thread::spawn(move || engine(Channel::connect(&address).map_err(transport)?));
 
         let deadline = Instant::now() + RESPONSE_WAIT;
         let mut channel = loop {
@@ -466,20 +467,20 @@ mod tests {
                 break channel;
             }
             if Instant::now() > deadline {
-                return Err(Error::State("the head did not connect").into());
+                return Err(Error::State("the engine did not connect").into());
             }
             std::thread::sleep(Duration::from_millis(1));
         };
         let served = serve(&mut channel);
         // The rank closes its end, as it does when it exits.
         drop(channel);
-        let outcome = head
+        let outcome = engine
             .join()
-            .map_err(|_| WorkerError::from(Error::State("the head thread panicked")))?;
+            .map_err(|_| WorkerError::from(Error::State("the engine thread panicked")))?;
         Ok((served, outcome))
     }
 
-    /// The next response the head receives, or `None` once the rank has
+    /// The next response the engine receives, or `None` once the rank has
     /// closed the connection.
     fn receive(channel: &mut Channel) -> Result<Option<WorkerResponse>> {
         let deadline = Instant::now() + RESPONSE_WAIT;
@@ -537,7 +538,7 @@ mod tests {
 
     /// Serve the connection with a rank without components that queues
     /// two batches. No job of these batches stays in flight, so the stall
-    /// bound (here the default, half the head's 300 s watchdog timeout)
+    /// bound (here the default, half the engine's 300 s watchdog timeout)
     /// is never reached.
     fn serve(channel: &mut Channel) -> Result<Ending> {
         let mut executor = rank(2, false)?;
@@ -555,7 +556,7 @@ mod tests {
 
     #[test]
     fn the_service_answers_each_request_and_acknowledges_close() -> Result<()> {
-        let head = |mut channel: Channel| -> Result<()> {
+        let engine = |mut channel: Channel| -> Result<()> {
             let info = ask(
                 &mut channel,
                 WorkerRequest::Info {
@@ -621,24 +622,24 @@ mod tests {
             Ok(())
         };
 
-        let (served, head) = connect(head, serve)?;
-        head?;
+        let (served, engine) = connect(engine, serve)?;
+        engine?;
         assert!(matches!(served?, Ending::Closed));
         Ok(())
     }
 
     #[test]
-    fn the_service_stops_once_the_head_has_closed_its_connection() -> Result<()> {
-        // The head goes away without asking for anything, so nothing is in
+    fn the_service_stops_once_the_engine_has_closed_its_connection() -> Result<()> {
+        // The engine goes away without asking for anything, so nothing is in
         // flight: the rank is orphaned, and the failure names the channel.
-        let (served, head) = connect(
+        let (served, engine) = connect(
             |channel: Channel| {
                 drop(channel);
                 Ok(())
             },
             serve,
         )?;
-        head?;
+        engine?;
         let Ending::Orphaned(error) = served? else {
             return Err(Error::State("the service did not end orphaned").into());
         };
@@ -647,29 +648,29 @@ mod tests {
     }
 
     #[test]
-    fn a_head_that_closes_after_its_answer_orphans_the_worker() -> Result<()> {
-        // The head's batch was answered, so nothing is in flight when it
+    fn an_engine_that_closes_after_its_answer_orphans_the_worker() -> Result<()> {
+        // The engine's batch was answered, so nothing is in flight when it
         // goes away.
-        let head = |mut channel: Channel| -> Result<()> {
+        let engine = |mut channel: Channel| -> Result<()> {
             let result = ask(&mut channel, submit(1, 1, 7, 1)?)?;
             assert!(matches!(result, WorkerResponse::Result { .. }));
             Ok(())
         };
-        let (served, head) = connect(head, serve)?;
-        head?;
+        let (served, engine) = connect(engine, serve)?;
+        engine?;
         assert!(matches!(served?, Ending::Orphaned(_)));
         Ok(())
     }
 
     #[test]
     fn a_message_that_is_not_a_request_stops_the_service_unanswered() -> Result<()> {
-        let head = |mut channel: Channel| -> Result<bool> {
+        let engine = |mut channel: Channel| -> Result<bool> {
             // A frame whose message is no request. The rank ends the
             // connection without a response.
             channel.send(&true).map_err(transport)?;
             Ok(receive(&mut channel)?.is_none())
         };
-        let (served, unanswered) = connect(head, serve)?;
+        let (served, unanswered) = connect(engine, serve)?;
         assert!(matches!(served?, Ending::Orphaned(_)));
         assert!(unanswered?, "the rank answered a message it could not read");
         Ok(())

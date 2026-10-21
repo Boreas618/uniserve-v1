@@ -22,7 +22,7 @@
 //! which every launch path consumes. Reading checks the file's syntax and
 //! schema; placement validates the expanded groups with
 //! [`WorkerGroupConfig::validate_all`], so a file that names no host can be
-//! checked only once the head's own host identity is known.
+//! checked only once the engine's own host identity is known.
 
 use std::collections::BTreeMap;
 
@@ -101,7 +101,7 @@ struct ComponentEntry {
 ///
 /// `DEVICE` is a single device (`cuda:0`, `cpu`), an inclusive index range
 /// (`cuda:0-3`) or a repeated device (`cpu*4`). Without `HOST` the ranks run
-/// on the head's own host.
+/// on the engine's own host.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 struct RankRange {
@@ -177,10 +177,10 @@ impl Deployment {
 
     /// Places the deployment's ranks and returns its worker groups.
     ///
-    /// A rank entry without a host runs on `head`, the launching process's
-    /// own host identity. A group with `replicas = N` becomes `N` groups
-    /// named `<id>-0` through `<id>-<N-1>`, each over the next equal block
-    /// of its ranks; a component without `ranks` spans every rank of its
+    /// A rank entry without a host runs on `engine_host`, the launching
+    /// process's own host identity. A group with `replicas = N` becomes `N`
+    /// groups named `<id>-0` through `<id>-<N-1>`, each over the next equal
+    /// block of its ranks; a component without `ranks` spans every rank of its
     /// replica. The video decoder and the video codec always take one
     /// temporal unit per rank, so their distribution is completed and any
     /// other unit count refused.
@@ -190,11 +190,11 @@ impl Deployment {
     /// Fails when a group's replica count is zero or does not divide its
     /// ranks, when the decoder or codec states another unit count, or when
     /// [`WorkerGroupConfig::validate_all`] refuses the expanded groups.
-    pub fn worker_groups(&self, head: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+    pub fn worker_groups(&self, engine_host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
         let mut workers = Vec::new();
         for entry in &self.worker_groups {
             entry
-                .expand(head, &mut workers)
+                .expand(engine_host, &mut workers)
                 .with_context(|| format!("worker {}", entry.id))?;
         }
         WorkerGroupConfig::validate_all(&workers)?;
@@ -204,12 +204,16 @@ impl Deployment {
 
 impl GroupEntry {
     /// Appends this group's replicas to `workers`.
-    fn expand(&self, head: &str, workers: &mut Vec<WorkerGroupConfig>) -> anyhow::Result<()> {
+    fn expand(
+        &self,
+        engine_host: &str,
+        workers: &mut Vec<WorkerGroupConfig>,
+    ) -> anyhow::Result<()> {
         let ranks = self
             .ranks
             .iter()
             .flat_map(|range| {
-                let host = range.host.as_deref().unwrap_or(head);
+                let host = range.host.as_deref().unwrap_or(engine_host);
                 range.devices.iter().map(move |device| WorkerRank {
                     host: host.to_owned(),
                     device: device.clone(),
@@ -292,7 +296,7 @@ mod tests {
     use super::*;
 
     fn workers(text: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
-        Deployment::parse(text)?.worker_groups("head")
+        Deployment::parse(text)?.worker_groups("engine")
     }
 
     fn rank(host: &str, device: &str) -> WorkerRank {
@@ -326,7 +330,7 @@ mod tests {
         assert_eq!(placed[1].id.0, "flow-1");
         assert_eq!(
             placed[1].ranks,
-            vec![rank("head", "cuda:2"), rank("head", "cuda:3")]
+            vec![rank("engine", "cuda:2"), rank("engine", "cuda:3")]
         );
         for worker in &placed {
             assert_eq!(worker.queue_depth, 6);
@@ -337,10 +341,10 @@ mod tests {
         }
     }
 
-    /// An entry without a host runs on the head's host; a named host, a
+    /// An entry without a host runs on the engine's host; a named host, a
     /// repeated host device and a single device each place as written.
     #[test]
-    fn rank_entries_place_on_the_head_or_a_named_host() {
+    fn rank_entries_place_on_the_engines_host_or_a_named_host() {
         let placed = workers(
             r#"
             [[worker_groups]]
@@ -358,8 +362,8 @@ mod tests {
         assert_eq!(
             placed[0].ranks,
             vec![
-                rank("head", "cpu"),
-                rank("head", "cpu"),
+                rank("engine", "cpu"),
+                rank("engine", "cpu"),
                 rank("rank-1", "cpu"),
                 rank("rank-1", "cuda:1"),
             ]

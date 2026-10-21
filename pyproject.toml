@@ -107,7 +107,7 @@ binding = "NoBinding"
 debug = false
 
 # The one executable of every UniServe process, installed onto PATH as
-# `uniserve`: `serve` (the head), `launcher` (a host's launcher), `worker`
+# `uniserve`: `serve` (a node's daemon), `engine` (the engine process), `worker`
 # (one worker, in this environment) and `storage` (a host's Storage Server).
 [[tool.setuptools-rust.bins]]
 target = "uniserve"

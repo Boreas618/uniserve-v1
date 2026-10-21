@@ -4,8 +4,8 @@ A checkpoint publishes its vocabulary in several spellings: ``tokenizer.json``
 (model vocabulary and ``added_tokens``), ``vocab.json``, ``added_tokens.json``
 and the ``added_tokens_decoder`` of ``tokenizer_config.json``. Model packages
 and the checkpoint registry read them through ``read_vocabulary`` and
-``token_id`` rather than loading a tokenizer: the head tokenizes requests,
-and a rank needs only the IDs a model's configuration names.
+``token_id`` rather than loading a tokenizer: the leader's daemon tokenizes
+requests, and a rank needs only the IDs a model's configuration names.
 """
 
 from __future__ import annotations

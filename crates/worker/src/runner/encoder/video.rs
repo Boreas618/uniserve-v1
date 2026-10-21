@@ -1021,8 +1021,8 @@ fn condition_input(
 /// `canvas`.
 ///
 /// A still frame planned as several units is encoded in bands of its patch
-/// rows, each band reading the whole frame: the head deals the patch rows in
-/// order, so a band's first row follows the rows of the bands before it
+/// rows, each band reading the whole frame: the leader's daemon deals the patch
+/// rows in order, so a band's first row follows the rows of the bands before it
 /// (`models::video::plan::ConditionPlan::latent_units`). Any other
 /// unit is its encoder window, over every patch row.
 fn unit_rows(

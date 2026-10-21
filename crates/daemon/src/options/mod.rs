@@ -581,7 +581,7 @@ pub struct WorkerOptions {
     /// Torch process-group backend for the ranks' collectives.
     pub distributed_backend: Option<String>,
     /// Keep a standby rank group beside each worker group whose ranks all
-    /// run on the head's host and that shares no expert world: it maps the
+    /// run on the engine's host and that shares no expert world: it maps the
     /// group's retained weights and cache, captures its graphs and parks,
     /// and replaces the group when it fails instead of a relaunch. Each
     /// standby rank holds a CUDA context, graph pools and workspaces of its

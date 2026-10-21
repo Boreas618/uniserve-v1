@@ -49,7 +49,7 @@ pub struct PagePoolInfo {
     /// size and the cache group list), which seeds the group's page keys;
     /// equal on every rank of a group.
     pub content: [u8; 32],
-    /// Where a head on another host reaches the pool's Storage Server
+    /// Where an engine on another host reaches the pool's Storage Server
     /// (`StorageLaunch::tcp`).
     pub endpoint: Option<String>,
 }

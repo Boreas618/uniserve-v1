@@ -1,19 +1,19 @@
-"""The host page tier keeps a prompt's cache pages across a head restart.
+"""The host page tier keeps a prompt's cache pages across an engine restart.
 
-Qwen3 answers a long prompt twice, the head restarts, and the prompt is
+Qwen3 answers a long prompt twice, the engine restarts, and the prompt is
 asked again. The second answer reuses the prompt's pages from the device
-cache; the restarted head's device cache is empty, so the pages come back
+cache; the restarted engine's device cache is empty, so the pages come back
 from the host page tier of the host's Storage Server, which outlives the
-head. Both reuse every reusable prompt token, as the prefix cache's hit
+engine. Both reuse every reusable prompt token, as the prefix cache's hit
 counter reports, and both compute the same last tokens over the same cached
 keys and values, so they decode the same greedy tokens.
 
 A prompt answered with one token is written to the tier only before its
-head closes its workers: its prefill is the last batch, so no later batch
-carries its page writes. The restarted head reuses its pages all the same.
+engine closes its workers: its prefill is the last batch, so no later batch
+carries its page writes. The restarted engine reuses its pages all the same.
 
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
-heads at a directory of the test's, and the server the first head starts
+daemons at a directory of the test's, and the server the first daemon starts
 there is stopped at the end.
 """
 
@@ -103,7 +103,7 @@ def _ask(
 def _stop_storage_server(socket: Path) -> None:
     """Stop the Storage Server serving `socket`.
 
-    The server detached from the head that started it, so it is found by
+    The server detached from the daemon that started it, so it is found by
     its command line.
     """
     for entry in Path("/proc").iterdir():
@@ -142,7 +142,7 @@ def _command(checkpoint: str, port: int) -> list[str]:
 
 
 def _runtime() -> Path:
-    """A new runtime directory for the heads' sockets.
+    """A new runtime directory for the daemons' sockets.
 
     A socket path holds at most 107 bytes, so the directory is short.
     """
@@ -156,7 +156,7 @@ def _checkpoint() -> str:
     return checkpoint
 
 
-def test_a_restarted_head_reads_a_prompts_pages_from_the_host_tier(
+def test_a_restarted_engine_reads_a_prompts_pages_from_the_host_tier(
     tmp_path: Path,
 ):
     runtime = _runtime()
@@ -185,7 +185,7 @@ def test_a_restarted_head_reads_a_prompts_pages_from_the_host_tier(
     assert host and host == device
 
 
-def test_a_closing_head_writes_its_last_pages_to_the_host_tier(
+def test_a_closing_engine_writes_its_last_pages_to_the_host_tier(
     tmp_path: Path,
 ):
     # Another prompt than the other test's, whose pages a shared server

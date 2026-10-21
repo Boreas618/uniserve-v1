@@ -88,8 +88,8 @@ pub enum TransferTransport {
     ///
     /// Shared storage names a segment in one host's namespace, so a product
     /// whose consumer is on another host travels as bytes: in the producing
-    /// rank's result, into the head's custody, and out in the consuming rank's
-    /// batch. The head releases its copy when the buffer is freed.
+    /// rank's result, into the engine's custody, and out in the consuming
+    /// rank's batch. The engine releases its copy when the buffer is freed.
     Channel {
         /// Publishing address-space incarnation, for diagnostics and identity.
         endpoint: String,

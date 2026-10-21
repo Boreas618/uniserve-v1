@@ -63,7 +63,7 @@ impl CachePlanes {
     /// Device planes are exclusive storages `memory` provides, whose
     /// contents outlive the worker. Planes a predecessor left keep their
     /// contents, which are finite whatever they hold: a standby worker's
-    /// predecessor serves from them, a successor head reads the pages its
+    /// predecessor serves from them, a successor engine reads the pages its
     /// predecessor handed over, and every unit is recycled for its next
     /// owner.
     ///

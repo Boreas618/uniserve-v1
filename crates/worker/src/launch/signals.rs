@@ -4,7 +4,7 @@
 //! default signal death, so an operator or a failed launch can stop a
 //! starting rank. Once serving, both are ignored with a log line: a
 //! terminal's Ctrl-C or a service manager's stop reaches every process of the
-//! job, and only the head may close a rank, collectively with its group.
+//! job, and only the engine may close a rank, collectively with its group.
 //!
 //! The handler itself only writes the signal number to a pipe (an
 //! async-signal-safe operation); a dedicated thread applies the policy.
@@ -68,7 +68,9 @@ fn dispatch(mut signals: std::fs::File, serving: &AtomicBool) {
             "SIGTERM"
         };
         if serving.load(Ordering::Acquire) {
-            tracing::info!("ignoring {name}; the head shuts this rank down with its worker group");
+            tracing::info!(
+                "ignoring {name}; the engine shuts this rank down with its worker group"
+            );
             continue;
         }
         if signal == libc::SIGINT {

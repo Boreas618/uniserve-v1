@@ -1,7 +1,7 @@
 //! Reading a video request's condition media on a CPU worker.
 //!
 //! The server publishes every condition's fetched bytes to POSIX shared
-//! memory on the head host and plans how each is prepared
+//! memory on the engine's host and plans how each is prepared
 //! (`models::video::VideoCondition`). One media reading call per conditioned
 //! request decodes them, in request order, into the request's condition
 //! products:

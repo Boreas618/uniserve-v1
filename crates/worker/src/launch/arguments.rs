@@ -1,21 +1,21 @@
 //! The worker's command line.
 //!
-//! argv carries the head's address, the worker's identity and the launch it
-//! belongs to: the worker connects to the head, registers under that
+//! argv carries the engine's address, the worker's identity and the launch it
+//! belongs to: the worker connects to the engine, registers under that
 //! identity and launch, and receives every other launch value in the launch
-//! descriptor the head answers with.
+//! descriptor the engine answers with.
 
 use crate::config::DescriptorError;
 
 /// Usage line printed with an argument or descriptor error.
 pub(crate) const USAGE: &str =
-    "usage: uniserve worker --head ADDRESS --worker-id ID --rank R --generation G";
+    "usage: uniserve worker --engine ADDRESS --worker-id ID --rank R --generation G";
 
 /// Parsed command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arguments {
-    /// The head's address: `unix:<path>` or `<host>:<port>`.
-    pub head: String,
+    /// The engine's address: `unix:<path>` or `<host>:<port>`.
+    pub engine: String,
     /// Worker group the worker was started for.
     pub worker_id: String,
     /// The worker's rank within its group.
@@ -27,7 +27,7 @@ pub struct Arguments {
 impl Arguments {
     /// Parse `--flag value` and `--flag=value` forms.
     pub fn parse<S: AsRef<str>>(argv: &[S]) -> Result<Self, DescriptorError> {
-        let mut head = None;
+        let mut engine = None;
         let mut worker_id = None;
         let mut rank = None;
         let mut generation = None;
@@ -54,7 +54,7 @@ impl Arguments {
                 })
             }
             match flag {
-                "--head" => head = Some(value()?),
+                "--engine" => engine = Some(value()?),
                 "--worker-id" => worker_id = Some(value()?),
                 "--rank" => rank = Some(number(flag, value()?)?),
                 "--generation" => generation = Some(number(flag, value()?)?),
@@ -69,7 +69,7 @@ impl Arguments {
             DescriptorError::new(format!("the following arguments are required: {name}"))
         };
         Ok(Self {
-            head: head.ok_or_else(|| required("--head"))?,
+            engine: engine.ok_or_else(|| required("--engine"))?,
             worker_id: worker_id.ok_or_else(|| required("--worker-id"))?,
             rank: rank.ok_or_else(|| required("--rank"))?,
             generation: generation.ok_or_else(|| required("--generation"))?,
@@ -82,17 +82,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_head_and_the_identity_are_parsed_in_either_form() {
+    fn the_engine_and_the_identity_are_parsed_in_either_form() {
         let arguments = Arguments::parse(&[
             "--worker-id",
             "text",
             "--rank=1",
-            "--head",
-            "unix:/tmp/head.sock",
+            "--engine",
+            "unix:/tmp/engine.sock",
             "--generation=2",
         ])
         .unwrap();
-        assert_eq!(arguments.head, "unix:/tmp/head.sock");
+        assert_eq!(arguments.engine, "unix:/tmp/engine.sock");
         assert_eq!(arguments.worker_id, "text");
         assert_eq!(arguments.rank, 1);
         assert_eq!(arguments.generation, 2);
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn a_missing_identity_or_unknown_flag_is_a_usage_error() {
         let complete = [
-            "--head",
+            "--engine",
             "h:1",
             "--worker-id",
             "w",

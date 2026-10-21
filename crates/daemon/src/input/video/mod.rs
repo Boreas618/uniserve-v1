@@ -962,11 +962,11 @@ mod tests {
         assert!(first.vision.is_some() && last.vision.is_some());
     }
 
-    /// The head prepares a reference request whatever rows its conditions
+    /// The daemon prepares a reference request whatever rows its conditions
     /// take: the rank that denoises it counts them with the denoiser's own
     /// size rule and refuses what its provisioned capacity cannot hold.
     #[tokio::test]
-    async fn the_head_leaves_condition_rows_to_the_denoising_rank() {
+    async fn the_daemon_leaves_condition_rows_to_the_denoising_rank() {
         let body = request(serde_json::json!({
             "model": "minimax_h3",
             "prompt": "a fox",

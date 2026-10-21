@@ -154,7 +154,7 @@ pub(crate) struct MediaFacts {
     /// executes and of the components it reads.
     pub local_product_bytes: u64,
     /// Latent pool of sampled trajectories, when the worker holds the
-    /// denoiser. Every rank of the worker reports its pages, because the head
+    /// denoiser. Every rank of the worker reports its pages, because the engine
     /// schedules a request's pages by the worker's report.
     pub latent: Option<LatentPlan>,
     /// Whether this rank stores the latent pool: it holds the denoiser.
@@ -511,7 +511,7 @@ pub(crate) mod tests {
         HostGroup::single(0)
     }
 
-    /// The configuration of a one-rank CPU worker launched with the head's
+    /// The configuration of a one-rank CPU worker launched with the engine's
     /// defaults; each test states the values it plans with.
     pub(crate) fn cpu_config() -> WorkerConfig {
         WorkerConfig {
@@ -787,7 +787,7 @@ pub(crate) mod tests {
         let denoising = layout(true).unwrap();
         let other = layout(false).unwrap();
 
-        // The head compares the ranks' reports and schedules pages by them.
+        // The engine compares the ranks' reports and schedules pages by them.
         assert_eq!(other.info, denoising.info);
         assert_eq!(denoising.info.latent_pages, 17);
         assert_eq!(denoising.info.latent_page_units, 1024);

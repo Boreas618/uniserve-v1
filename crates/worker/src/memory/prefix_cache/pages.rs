@@ -3,7 +3,7 @@
 //! Each full-attention cache group copies its pages through a page pool of
 //! the host's Storage Server: a memfd of equal slots shared by every worker
 //! of the host whose pages have the same shape. The rank maps each pool
-//! writable and registers it for device copies; the head decides which
+//! writable and registers it for device copies; the engine decides which
 //! pages to copy and carries them in batches (`Batch::page_reads`,
 //! `Batch::page_writes`), and the copies run on the rank's copy lane as soon
 //! as the batch arrives (`PrefixCache::issue_pages`).
@@ -252,7 +252,7 @@ impl PageTier {
             first_unit = reads[0].units.first().map(|unit| unit.0),
             "reading pages from the host page tier"
         );
-        // SAFETY: the slots are pinned by the head until the batch's output
+        // SAFETY: the slots are pinned by the engine until the batch's output
         // arrives, and the units are the batch's new units, which no other
         // operation reads or writes before the batch's forward, which waits
         // for these copies.
@@ -290,8 +290,8 @@ impl PageTier {
             first_unit = writes[0].units.first().map(|unit| unit.0),
             "writing pages to the host page tier"
         );
-        // SAFETY: the slots are reserved for this rank until the head
-        // commits them after the batch's output, and the head holds the
+        // SAFETY: the slots are reserved for this rank until the engine
+        // commits them after the batch's output, and the engine holds the
         // published units, which no batch writes, until then.
         unsafe { stream.copy(&batch) }
     }

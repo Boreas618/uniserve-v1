@@ -190,7 +190,7 @@ impl ExecutionBatch {
     /// matching their calls, non-overlapping spans) are checked once, by
     /// `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // A batch of page writes alone writes the head's last published
+        // A batch of page writes alone writes the engine's last published
         // pages to the host page tier before it closes its workers.
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty() || self.page_writes.is_some(),

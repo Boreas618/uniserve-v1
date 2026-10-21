@@ -1,4 +1,4 @@
-//! The connection between the head and one rank.
+//! The connection between the engine and one rank.
 //!
 //! A [`Channel`] is one end of a stream connection that carries
 //! [`Frame`]s, one after another: each frame's length field tells the reader
@@ -48,7 +48,7 @@ const UNIX_PREFIX: &str = "unix:";
 /// fails.
 ///
 /// A host that dies sends no close. Without this bound its ranks' requests
-/// would wait on it, and a rank whose head's host died would
+/// would wait on it, and a rank whose engine's host died would
 /// keep its devices, for as long as the connection stayed silent. The system
 /// default, two hours, is no bound in practice; this value is chosen, not
 /// derived.
@@ -556,8 +556,8 @@ impl Channel {
     ///
     /// Dropping a channel discards what is still queued, so an owner calls
     /// this before it closes a connection on purpose: without it a rank's
-    /// last response, queued behind a large result the head is still
-    /// reading, is lost and the head reports a truncated frame instead of
+    /// last response, queued behind a large result the engine is still
+    /// reading, is lost and the engine reports a truncated frame instead of
     /// the response. Fails when the connection fails, which also ends the
     /// wait on a peer that is gone.
     pub fn flush(&mut self) -> IpcResult<()> {
@@ -1138,7 +1138,7 @@ mod tests {
         assert!(length > 64 << 20);
 
         // The sender writes the frame out while the receiver reads it, as
-        // the head and a rank on another host do.
+        // the engine and a rank on another host do.
         let sent = large.clone();
         let sender = std::thread::spawn(move || {
             near.send(&sent).unwrap();

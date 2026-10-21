@@ -470,7 +470,7 @@ impl Batch {
     /// Validates the batch, and its buffer spans when `placed`.
     fn validate_batch(&self, placed: bool) -> ValidationResult<()> {
         // Establish the batch envelope before validating relationships within it.
-        // A batch of page writes alone writes a head's last published pages
+        // A batch of page writes alone writes an engine's last published pages
         // to the host page tier before it closes its workers.
         ensure_valid!(
             !self.calls.is_empty() || !self.commands.is_empty() || !self.page_writes.is_empty(),

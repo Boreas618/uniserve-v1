@@ -1,7 +1,7 @@
 //! The launch descriptor a rank process is started with.
 //!
-//! A rank is started with the head's address, its own identity and the launch
-//! it belongs to, and the head answers the rank's registration with one
+//! A rank is started with the engine's address, its own identity and the launch
+//! it belongs to, and the engine answers the rank's registration with one
 //! [`LaunchDescriptor`], which
 //! carries every other launch value. The rank's runtime resolves the raw
 //! values once, before any model work, and reports a value it cannot run
@@ -31,12 +31,12 @@ pub struct StorageLaunch {
     /// worker states so that the server knows it belongs to the current
     /// head.
     pub claim: [u8; 16],
-    /// Whether the head copies the worker's cache pages through the host
+    /// Whether the engine copies the worker's cache pages through the host
     /// page tier: the worker then maps a page pool per full-attention cache
     /// group.
     pub page_tier: bool,
-    /// Where a head on another host reaches the server (`host:port`), for
-    /// page requests; `None` on the head's host, or when the server accepts
+    /// Where an engine on another host reaches the server (`host:port`), for
+    /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.
     pub tcp: Option<String>,
     /// Whether the worker stands by for the worker of its scope: it maps
@@ -58,11 +58,11 @@ pub struct LaunchDescriptor {
     pub products_cross_hosts: bool,
     /// Most requests outstanding on the rank's channel at once.
     pub queue_depth: usize,
-    /// The head's watchdog timeout in milliseconds (`worker_config.watchdog_timeout`):
+    /// The engine's watchdog timeout in milliseconds (`worker_config.watchdog_timeout`):
     /// how long a batch may go without progress of the group's ranks before
-    /// the head replaces them. The rank reports a lane stalled
+    /// the engine replaces them. The rank reports a lane stalled
     /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)) once one job has
-    /// run on it for half of it, so the report precedes the head's expiry;
+    /// run on it for half of it, so the report precedes the engine's expiry;
     /// at least two.
     pub watchdog_timeout_ms: u64,
 

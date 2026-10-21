@@ -52,7 +52,7 @@ pub struct WorkerProcessArgs {
     /// The deployment the group belongs to, which its workers' storage
     /// scopes name: the served model name.
     pub deployment: String,
-    /// Whether the head copies the group's cache pages through the host
+    /// Whether the engine copies the group's cache pages through the host
     /// page tier (`kv_cache_config.host_tier`).
     pub page_tier: bool,
     /// The Mooncake connector a host's Storage Server the deployment starts
@@ -249,7 +249,7 @@ pub struct ExpertParallelPlacement {
     pub attention_ranks: u32,
     /// TCP address of the world's rendezvous store. `WorkerGroup::spawn_all`
     /// reserves it once the deployment's hosts are known; world rank 0 serves
-    /// it on a socket the head binds.
+    /// it on a socket the engine binds.
     pub address: Option<String>,
     /// How the world exchanges tokens at every expert layer.
     pub exchange: ExpertExchange,

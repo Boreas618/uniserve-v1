@@ -45,7 +45,7 @@ pub struct Exclusive {
     /// uninitialized, and the owner resets them. A storage a predecessor
     /// left holds the finite values it last wrote, which its owner keeps:
     /// a standby worker's predecessor still serves from them, and a
-    /// successor head of a handover reads the pages they hold.
+    /// successor engine of a handover reads the pages they hold.
     pub created: bool,
 }
 
