@@ -1,7 +1,7 @@
 //! The head's registry of per-host launchers.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-launcher` launcher that connects to the head and registers
+//! runs one launcher (`uniserve launcher`) that connects to the head and registers
 //! its host identity; the head then sends that launcher the launches of the
 //! ranks the placement put on its host, of every worker group, and the
 //! launcher spawns them. The registry is built once per deployment and shared
@@ -12,7 +12,7 @@
 //! it terminates that host's ranks, which is how a head stops a host it
 //! can no longer reach without adding a heartbeat.
 //!
-//! The messages are `uniserve_ipc::launcher`'s, which the `uniserve-launcher`
+//! The messages are `ipc::launcher`'s, which the `uniserve launcher`
 //! binary shares, carried as frames on the connection the launcher registered
 //! on (`registry::WorkerRegistry`). Each rank's launch names the generation of
 //! its group's launch, which the rank registry numbers. A `Stop` ends a
@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use uniserve_ipc::Channel;
-use uniserve_ipc::launcher::{Instruction, Report, StorageClaim, WorkerExit, WorkerSpawn};
+use ipc::Channel;
+use ipc::launcher::{Instruction, Report, StorageClaim, WorkerExit, WorkerSpawn};
 
 /// Longest a launcher may take to answer a reservation.
 const RESERVATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -279,7 +279,7 @@ impl LauncherRegistry {
         &mut self,
         host: &str,
         claim: StorageClaim,
-    ) -> anyhow::Result<uniserve_ipc::StorageLaunch> {
+    ) -> anyhow::Result<ipc::StorageLaunch> {
         let launcher = self
             .hosts
             .get_mut(host)
@@ -442,10 +442,10 @@ impl RemoteHost<'_> {
 mod tests {
     use super::{LauncherRegistry, WorkerSpawn};
     use crate::worker::registry::{Registry, WorkerRegistry, lock};
+    use ipc::launcher::{Instruction, Report, WorkerExit};
+    use ipc::{Channel, Registration, VERSION};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
-    use uniserve_ipc::launcher::{Instruction, Report, WorkerExit};
-    use uniserve_ipc::{Channel, Registration, VERSION};
 
     /// Binds a head and connects a launcher of host `b` to its TCP port.
     fn head_and_launcher() -> (Registry, Channel) {
@@ -508,7 +508,7 @@ mod tests {
                     rank,
                     worker_id: worker_id.to_owned(),
                     generation,
-                    executable: "uniserve-worker".to_owned(),
+                    executable: "uniserve".to_owned(),
                     head: "127.0.0.1:1".to_owned(),
                     environment: HashMap::new(),
                 },

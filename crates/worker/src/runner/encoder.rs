@@ -77,20 +77,20 @@ pub(crate) mod warmup;
 
 use std::sync::Arc;
 
+use cuda::Stream;
 use tvm_ffi::Any;
-use uniserve_cuda::Stream;
 
 use crate::config::Device;
 use crate::cuda_graph::GraphPool;
 use crate::cuda_graph::{GraphMode, GraphTable, Lookup};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::PinnedPool;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::ImageSetup;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
-use crate::storage::PinnedPool;
-use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 pub(crate) use image::{EncodeResume, ImageFacts, ImagePixels, image_placement};

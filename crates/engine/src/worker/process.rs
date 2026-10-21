@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 use super::BatchSubmitError;
 use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
-use uniserve_ipc::Channel;
-use uniserve_ipc::launch::WorkerChild;
-use uniserve_ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
+use ipc::Channel;
+use ipc::launch::WorkerChild;
+use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -63,7 +63,7 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use uniserve_ipc::{LaneConfig, LaneSpec};
+pub use ipc::{LaneConfig, LaneSpec};
 
 /// One adopted rank: its channel, its process when this engine started it,
 /// and the requests outstanding on it.
@@ -182,7 +182,7 @@ impl PendingWorker {
     pub(crate) fn spawn(
         args: &WorkerProcessArgs,
         rank: u32,
-        storage: uniserve_ipc::StorageLaunch,
+        storage: ipc::StorageLaunch,
         rendezvous: Option<&str>,
         sockets: WorkerSockets,
         store_fd: Option<std::os::fd::RawFd>,
@@ -194,13 +194,8 @@ impl PendingWorker {
         let depth = args.queue_depth.max(1);
         let world_size = args.world_size();
 
-        let mut cmd = uniserve_ipc::launch::worker_command(
-            &args.executable,
-            head,
-            &args.worker_id,
-            rank,
-            generation,
-        );
+        let mut cmd =
+            ipc::launch::worker_command(&args.executable, head, &args.worker_id, rank, generation);
 
         // Torch and the numerical libraries read the host-relative pair; the
         // global pair names the rank's place in the whole process world.
@@ -224,11 +219,11 @@ impl PendingWorker {
         // process's copy when it is dropped, after the spawn below.
         let rendezvous_listen_fd = sockets
             .group
-            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener))
+            .map(|listener| ipc::launch::inherit_listener(&mut cmd, listener))
             .or(store_fd);
         let expert_listen_fd = sockets
             .experts
-            .map(|listener| uniserve_ipc::launch::inherit_listener(&mut cmd, listener));
+            .map(|listener| ipc::launch::inherit_listener(&mut cmd, listener));
 
         // One typed descriptor carries every launch value. The head keeps it
         // and answers the rank's registration with it.
@@ -607,7 +602,7 @@ impl WorkerProcess {
     ///
     /// The rank's lane stays inside one job, so the rank cannot complete
     /// the batches behind it: the group fails it as it fails a lost rank.
-    fn stalled(&self, stall: &uniserve_ipc::Stall) -> anyhow::Error {
+    fn stalled(&self, stall: &ipc::Stall) -> anyhow::Error {
         let lane = stall.lane.as_ref().map_or_else(
             || "the Python thread".to_owned(),
             |lane| format!("lane {lane}"),

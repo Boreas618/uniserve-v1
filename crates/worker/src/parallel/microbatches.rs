@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use uniserve_cuda::Stream;
+use cuda::Stream;
 
 use super::expert_union::ExpertUnion;
 use crate::ffi::{Handle, cooperative};
@@ -222,9 +222,9 @@ pub struct MicrobatchLanes {
     control: Arc<Microbatches>,
     threads: Vec<LaneThread>,
     /// Recorded on the parent stream; every microbatch stream waits on it.
-    fork: uniserve_cuda::Event,
+    fork: cuda::Event,
     /// Recorded on each microbatch stream; the parent waits on them.
-    joins: Vec<uniserve_cuda::Event>,
+    joins: Vec<cuda::Event>,
 }
 
 impl MicrobatchLanes {
@@ -249,7 +249,7 @@ impl MicrobatchLanes {
                 thread: Some(thread),
             });
         }
-        let event = || uniserve_cuda::Event::new(uniserve_cuda::EventFlags::default());
+        let event = || cuda::Event::new(cuda::EventFlags::default());
         Ok(Self {
             control,
             threads,
@@ -288,8 +288,8 @@ impl MicrobatchLanes {
     /// returned.
     pub fn run<T: Send + 'static>(
         &self,
-        parent: &uniserve_cuda::Stream,
-        streams: &[uniserve_cuda::Stream],
+        parent: &cuda::Stream,
+        streams: &[cuda::Stream],
         calls: Vec<MicrobatchCall<T>>,
     ) -> Result<Vec<T>> {
         if streams.len() != self.count() || calls.len() != self.count() {
@@ -458,9 +458,7 @@ impl ExpertUnion {
         if self.microbatches.len() < 2 {
             return Ok(());
         }
-        let event = Arc::new(uniserve_cuda::Event::new(
-            uniserve_cuda::EventFlags::default(),
-        ));
+        let event = Arc::new(cuda::Event::new(cuda::EventFlags::default()));
         job.on(Some(parent)).record(&event)?;
         for peer in &self.microbatches[1..] {
             job.on(Some(&peer.stream)).wait(&event)?;
@@ -472,9 +470,7 @@ impl ExpertUnion {
     /// stream.
     pub(crate) fn join_streams(&self, job: &crate::lane::Job, parent: &Stream) -> Result<()> {
         for peer in &self.microbatches[1..] {
-            let event = Arc::new(uniserve_cuda::Event::new(
-                uniserve_cuda::EventFlags::default(),
-            ));
+            let event = Arc::new(cuda::Event::new(cuda::EventFlags::default()));
             job.on(Some(&peer.stream)).record(&event)?;
             job.on(Some(parent)).wait(&event)?;
         }

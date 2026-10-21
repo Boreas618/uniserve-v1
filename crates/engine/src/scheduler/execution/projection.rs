@@ -4,7 +4,7 @@
 //! successor before its predecessor's result returns.
 
 use super::*;
-use uniserve_ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
+use ipc::{CallCoordinates, ForwardMode, MediaCall, TransferMode};
 
 /// A request's context projected through its in-flight calls
 /// (`Scheduler::scheduled_context`).
@@ -215,10 +215,7 @@ impl Scheduler {
     /// Returns the cache buffer the request's next call is conditioned on: the
     /// `cache_output` of its latest in-flight call that publishes one, otherwise
     /// the accepted `image_conditioning` of the running request.
-    pub(in crate::scheduler) fn cache_conditioning(
-        &self,
-        id: RequestId,
-    ) -> Option<uniserve_ipc::BufferId> {
+    pub(in crate::scheduler) fn cache_conditioning(&self, id: RequestId) -> Option<ipc::BufferId> {
         self.inflight
             .pending_calls
             .get(&id)

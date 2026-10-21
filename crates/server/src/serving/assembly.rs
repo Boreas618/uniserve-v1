@@ -17,9 +17,9 @@
 use std::time::Instant;
 
 use asynk_strim_attr::{TryYielder, try_stream};
+use engine::EngineCoreOutput;
+use engine::EventRx;
 use futures::{StreamExt as _, pin_mut};
-use uniserve_engine::EngineCoreOutput;
-use uniserve_engine::EventRx;
 
 use crate::serving::chat::output::structured::StructuredEventState;
 use crate::serving::text::output::decoded_text_event_stream;

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use tvm_ffi::{Any, AnyView};
 
-use uniserve_cuda::nccl::{self, Communicator, DataType, ReduceOp, UniqueId};
-use uniserve_cuda::{DeviceId, Event, EventFlags, Stream};
+use cuda::nccl::{self, Communicator, DataType, ReduceOp, UniqueId};
+use cuda::{DeviceId, Event, EventFlags, Stream};
 
 use crate::config::Device;
 use crate::ffi::Interpreter;

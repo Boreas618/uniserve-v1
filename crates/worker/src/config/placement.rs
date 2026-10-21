@@ -17,9 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
+use ipc::ComponentConfig;
+use ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 use tvm_ffi::Any;
-use uniserve_ipc::ComponentConfig;
-use uniserve_ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 
 use super::Device;
 use crate::ffi::{Handle, Interpreter, integers, texts};
@@ -228,7 +228,7 @@ impl CallDecl {
 pub(crate) fn host_kinds(name: &str) -> &'static [MediaCall] {
     match name {
         "media_reader" => &[MediaCall::MediaReading],
-        uniserve_ipc::VIDEO_CODEC_COMPONENT => &[MediaCall::VideoEncoding],
+        ipc::VIDEO_CODEC_COMPONENT => &[MediaCall::VideoEncoding],
         "muxer" => &[MediaCall::AudioEncoding, MediaCall::Muxing],
         _ => &[],
     }
@@ -414,7 +414,7 @@ impl Declarations {
                         "the media reader reads one request's conditions on one rank and is not distributed".into(),
                     ));
                 }
-                if name == uniserve_ipc::VIDEO_CODEC_COMPONENT
+                if name == ipc::VIDEO_CODEC_COMPONENT
                     && (!temporal || placement.units_per_rank != 1)
                 {
                     return Err(Error::Unsupported(
@@ -693,7 +693,7 @@ impl Components {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::{ComponentDistribution, ParallelConfig};
+    use ipc::{ComponentDistribution, ParallelConfig};
 
     use super::*;
 

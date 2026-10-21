@@ -1,7 +1,7 @@
 """Native cache storage driven through the real numerical cache interface.
 
 The worker's storage harness (``crates/worker/examples/storage_harness.rs``,
-built with ``cargo build -p uniserve-worker --example storage_harness``)
+built with ``cargo build -p worker --example storage_harness``)
 allocates two cache unit pools in Rust, binds this package's cache interface
 to them, lets the test write the producer's pages through DLPack views,
 exports the producer's slot through one transport, imports it into the
@@ -44,7 +44,7 @@ def _harness():
     if not path.exists():
         pytest.fail(
             f"{path} is missing: build it with "
-            "`cargo build -p uniserve-worker --example storage_harness`"
+            "`cargo build -p worker --example storage_harness`"
         )
     return tvm_ffi.load_module(str(path))
 

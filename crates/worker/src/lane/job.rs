@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use uniserve_cuda::{CopyBatch, DeviceId, Event, SourceOrder, Stream, StridedCopy};
+use cuda::{CopyBatch, DeviceId, Event, SourceOrder, Stream, StridedCopy};
 
 use crate::cuda_graph::{CUDAGraph, GraphBreaks};
 use crate::ffi::{DeferredCall, Handle};
@@ -555,12 +555,7 @@ impl Operation {
                         // the job completes; the host bytes outlive the
                         // copy, which the stream is drained for.
                         unsafe {
-                            uniserve_cuda::memcpy_async(
-                                value.as_mut_ptr() as u64,
-                                source,
-                                bytes,
-                                stream,
-                            )
+                            cuda::memcpy_async(value.as_mut_ptr() as u64, source, bytes, stream)
                         }?;
                         stream.synchronize()?;
                     }

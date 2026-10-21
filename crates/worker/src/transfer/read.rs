@@ -8,7 +8,7 @@
 //!
 //! Copies run on transfer-pool threads, on one ordinary (non-partitioned)
 //! stream per thread and device: on an SM-partition stream the driver takes
-//! copies of mapped peer windows only one call each (`uniserve_cuda::copy`).
+//! copies of mapped peer windows only one call each (`cuda::copy`).
 
 use super::{ACKNOWLEDGED, CLAIMED};
 use std::any::Any;
@@ -17,8 +17,8 @@ use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::ThreadId;
 
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
-use uniserve_ipc::Locator;
+use cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
+use ipc::Locator;
 
 use super::export_table::SourceGrant;
 use super::pool::{TransferPool, TransferRead};
@@ -28,7 +28,7 @@ use super::{
 };
 use crate::ffi::{Backing, DType, MemoryKind};
 use crate::host::HostTask;
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Outcome, Result, lock};
 

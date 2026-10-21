@@ -6,9 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
-use uniserve_ipc::{
-    BatchCommand, BufferId, CallKind, CallStatus, ForwardMode, RequestKey, TransferMode,
-};
+use ipc::{BatchCommand, BufferId, CallKind, CallStatus, ForwardMode, RequestKey, TransferMode};
 
 use super::WorkerExecutor;
 use crate::executor::WorkerResult;
@@ -34,7 +32,7 @@ impl WorkerExecutor {
         let failed_calls = report
             .results
             .iter()
-            .filter(|completion| completion.output.status == uniserve_ipc::CallStatus::Error)
+            .filter(|completion| completion.output.status == ipc::CallStatus::Error)
             .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
         // A refusal is the worker's verdict on the request itself, and its
@@ -44,8 +42,8 @@ impl WorkerExecutor {
             .results
             .iter()
             .filter(|completion| {
-                completion.output.status == uniserve_ipc::CallStatus::Error
-                    && completion.output.error_code == Some(uniserve_ipc::ErrorCode::InputError)
+                completion.output.status == ipc::CallStatus::Error
+                    && completion.output.error_code == Some(ipc::ErrorCode::InputError)
             })
             .filter_map(|completion| {
                 let reason = completion.output.error_message.clone()?;
@@ -60,7 +58,7 @@ impl WorkerExecutor {
             let failed = report
                 .results
                 .iter()
-                .filter(|completion| completion.output.status == uniserve_ipc::CallStatus::Error)
+                .filter(|completion| completion.output.status == ipc::CallStatus::Error)
                 .map(|completion| {
                     (
                         completion.output.request_key,

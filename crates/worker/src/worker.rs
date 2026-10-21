@@ -26,11 +26,11 @@
 //! ends the process at once.
 
 mod loading;
+mod memory;
 mod planning;
-mod storage;
 
 pub(crate) use loading::LoadedModel;
-pub(crate) use storage::WorkerStorage;
+pub(crate) use memory::WorkerMemory;
 
 use std::sync::Arc;
 
@@ -38,9 +38,9 @@ use std::collections::BTreeMap;
 
 use tvm_ffi::Any;
 
-use uniserve_cuda::{DeviceId, PrimaryContext};
-use uniserve_ipc::ComponentWeights;
-use uniserve_ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
+use cuda::{DeviceId, PrimaryContext};
+use ipc::ComponentWeights;
+use ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
@@ -55,6 +55,10 @@ use crate::executor::backend::WorkerBackend;
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::Interpreter;
 use crate::lane::BLOCK_ON_TIMEOUT;
+use crate::memory::PageTier;
+use crate::memory::allocation::Storage;
+use crate::memory::retained::Retained;
+use crate::memory::weights::{self, WeightKeys};
 use crate::parallel::world::{World, startup_timeout};
 use crate::parallel::{
     DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, HostRetention, HostWeights, PeerGroup,
@@ -76,18 +80,14 @@ use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
 use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
 use crate::service::{Ending, Service};
-use crate::storage::PageTier;
-use crate::storage::memory::Storage;
-use crate::storage::retained::Retained;
-use crate::storage::weights::{self, WeightKeys};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, head_projection, sequence_kind};
 
+use memory::allocate_storage;
 use planning::{cache_width, log_capacity, plan};
-use storage::allocate_storage;
 
 /// One caching-allocator segment: device, graph pool id and bytes.
 type Segment = (DeviceId, (u64, u64), u64);
@@ -755,7 +755,7 @@ impl Worker {
             .backend()
             .worker_storage()
             .and_then(|storage| storage.prefix_cache.as_ref())
-            .map_or(0, crate::storage::PrefixCache::scratch_lent);
+            .map_or(0, crate::memory::PrefixCache::scratch_lent);
         if let Some(cache) = self.info.prefix_cache.as_mut() {
             cache.scratch_units = scratch;
         }
@@ -846,10 +846,7 @@ impl Worker {
             Interpreter::synchronize();
             drop(self.context);
             // Every owner has drained its streams; deferred frees can run.
-            record(
-                uniserve_cuda::reclaim::flush()
-                    .map_err(|error| WorkerError::from(Error::from(error))),
-            );
+            record(cuda::reclaim::flush().map_err(|error| WorkerError::from(Error::from(error))));
         }
         failure.map_or(Ok(()), Err)
     }

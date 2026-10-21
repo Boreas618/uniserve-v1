@@ -1,7 +1,7 @@
 //! The messages between the head's engine and a host's launcher.
 //!
 //! The engine starts no process on another host. Each host of a deployment
-//! runs one `uniserve-launcher` launcher, which connects to the head and keeps
+//! runs one launcher (`uniserve launcher`), which connects to the head and keeps
 //! that connection for the deployment's lifetime. The connection carries
 //! frames in both directions:
 //!
@@ -58,7 +58,8 @@ pub struct WorkerSpawn {
     /// The generation of the group's launch the rank belongs to, which the
     /// rank states when it registers and its exit report carries back.
     pub generation: u64,
-    /// The `uniserve-worker` executable that runs the worker.
+    /// The `uniserve` executable that runs the worker, as its `worker`
+    /// command.
     pub executable: String,
     /// The head's address as this host reaches it, which the rank connects
     /// to and registers at.
@@ -78,9 +79,6 @@ pub struct StorageClaim {
     /// The `(worker group, rank)` scopes the deployment places on the host;
     /// the server releases every other scope of the deployment.
     pub scopes: Vec<(String, u32)>,
-    /// The `uniserve-storage-server` executable that starts the host's
-    /// server when it has none.
-    pub server: String,
     /// The arguments a server the launcher starts is given beyond its socket
     /// and its TCP address: the deployment's Mooncake connector settings.
     pub arguments: Vec<String>,

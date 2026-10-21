@@ -38,9 +38,9 @@
 use std::ops::Range;
 use std::str::FromStr;
 
+use engine::{ReadoutRow, ReadoutSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uniserve_engine::{ReadoutRow, ReadoutSlot};
 
 use crate::options::ReadoutOptions;
 use crate::profile::assets::ResolvedModelFiles;

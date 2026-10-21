@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use uniserve_ipc::{Locator, TransferTransport};
+use ipc::{Locator, TransferTransport};
 
 use super::backing::TransportBuffer;
 use super::export_table::ExportTable;

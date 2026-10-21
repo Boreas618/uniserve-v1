@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use uniserve_ipc::{Batch, BatchCommand, BufferId, CallKind, NewRequest, RequestKey};
+use ipc::{Batch, BatchCommand, BufferId, CallKind, NewRequest, RequestKey};
 
 use super::backend::Runtimes;
 use crate::lane::Job;
@@ -148,7 +148,7 @@ pub(crate) trait RequestStorage {
 
     /// Install (or clear) the service wake fired by asynchronous
     /// completions while the rank serves.
-    fn set_wake(&self, _wake: Option<uniserve_ipc::Wake>) {}
+    fn set_wake(&self, _wake: Option<ipc::Wake>) {}
 
     /// Release the owner's storage at shutdown, after the executor drained.
     /// An aborted close keeps whatever device work may still address.

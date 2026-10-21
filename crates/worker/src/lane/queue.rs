@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_cuda::{DeviceGuard, DeviceId, Event, Stream};
-use uniserve_ipc::Wake;
+use cuda::{DeviceGuard, DeviceId, Event, Stream};
+use ipc::Wake;
 
 use super::job::{Completion, Failure, Job};
 use crate::{Error, Result, lock};

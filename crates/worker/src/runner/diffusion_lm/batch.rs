@@ -33,8 +33,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{Batch as BatchPlan, BufferId, CallKind, DType, ForwardStats, RequestKey};
+use cuda::Stream;
+use ipc::{Batch as BatchPlan, BufferId, CallKind, DType, ForwardStats, RequestKey};
 
 use super::calls::{self, DenoiseRow, ReadoutPass, Readouts};
 use super::{DiffusionLMRunner, Executed, Expert, KIND, Recorded};
@@ -47,11 +47,11 @@ use crate::executor::batch::{
 };
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{Completion, Job};
+use crate::memory::{PrefixCache, ProductBuffer, ProductStore};
 use crate::parallel::ExpertUnion;
 use crate::request::RequestPool;
-use crate::storage::{PrefixCache, ProductBuffer, ProductStore};
 use crate::stream::EventPool;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Result, lock};
 
 /// What a batch borrows from the rank.
@@ -563,7 +563,7 @@ impl Owners<'_> {
             self.requests
                 .advance_canvas(call.request_key, coordinates)
                 .map_err(&execute)?;
-            attention.push(crate::storage::AttentionRow {
+            attention.push(crate::memory::AttentionRow {
                 slot: step.slot,
                 prefix: step.prefix,
                 query: length as u32,
@@ -689,7 +689,7 @@ fn context<'a>(
             None,
         ));
     };
-    let Some(WorkerStorage {
+    let Some(WorkerMemory {
         prefix_cache: Some(prefix_cache),
         tensors,
         events,

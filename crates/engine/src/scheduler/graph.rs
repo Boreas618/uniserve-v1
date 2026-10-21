@@ -18,8 +18,8 @@
 //! inspects media.
 
 use crate::DiffusionRequest;
+use ipc::MediaCall;
 use models::video::{Canvas, VideoTask};
-use uniserve_ipc::MediaCall;
 
 /// Product names, as the worker's components declare their outputs.
 pub(crate) mod product {
@@ -304,11 +304,11 @@ impl VideoGraph {
 mod tests {
     use std::sync::Arc;
 
+    use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
     use models::video::{
         AudioClip, Canvas, ConditionMedia, ConditionRole, ConditionVision, ImageFit, VideoClip,
         VideoCondition, VisionGrid,
     };
-    use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 
     use super::*;
 

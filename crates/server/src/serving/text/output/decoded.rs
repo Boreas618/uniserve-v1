@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
+use engine::EventRx;
+use engine::{EngineCoreOutput, PositionLogprobs, RejectionKind};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_engine::EventRx;
-use uniserve_engine::{EngineCoreOutput, PositionLogprobs, RejectionKind};
 
 use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
@@ -275,8 +275,7 @@ impl DecodeState<'_> {
 
             // Stop generation at exactly the tokens received so far, which
             // include this one.
-            raw_stream
-                .cancel_at_consumed_prefix(uniserve_engine::StreamCancelCause::StopStringMatched);
+            raw_stream.cancel_at_consumed_prefix(engine::StreamCancelCause::StopStringMatched);
             let truncate_to = Some(if self.options.include_stop_str_in_output {
                 offset + stop_string.len()
             } else {

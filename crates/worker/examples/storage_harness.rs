@@ -25,16 +25,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use config::Config;
+use cuda::{DeviceId, Stream};
+use ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
+use ipc::{CallId, RequestId, UnitId};
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
-use uniserve_ipc::{CallId, RequestId, UnitId};
-use uniserve_worker::ffi::{Function, Handle, Interpreter};
-use uniserve_worker::storage::LocalMemory;
-use uniserve_worker::storage::{CachePlan, PrefixCache, StorageView, UnitColumn};
-use uniserve_worker::transfer::exports;
-use uniserve_worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
-use uniserve_worker::{EventPool, Result};
+use worker::ffi::{Function, Handle, Interpreter};
+use worker::memory::LocalMemory;
+use worker::memory::{CachePlan, PrefixCache, StorageView, UnitColumn};
+use worker::transfer::exports;
+use worker::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
+use worker::{EventPool, Result};
 
 /// Named views as the map of DLPack tensors the test reads.
 fn tensor_map(views: &[(String, StorageView)]) -> Result<Map<FfiString, tvm_ffi::Tensor>> {
@@ -49,18 +49,18 @@ fn failure(error: impl std::fmt::Display) -> tvm_ffi::Error {
 }
 
 fn units(value: Any) -> Result<Vec<Vec<UnitId>>> {
-    let groups = Array::<Any>::try_from(value)
-        .map_err(|error| uniserve_worker::Error::numerical("units", &error))?;
+    let groups =
+        Array::<Any>::try_from(value).map_err(|error| worker::Error::numerical("units", &error))?;
     groups
         .iter()
         .map(|group| {
             let ids = Array::<Any>::try_from(group)
-                .map_err(|error| uniserve_worker::Error::numerical("units", &error))?;
+                .map_err(|error| worker::Error::numerical("units", &error))?;
             ids.iter()
                 .map(|id| {
                     i64::try_from(id)
                         .map(|id| UnitId(id as u32))
-                        .map_err(|error| uniserve_worker::Error::numerical("units", &error))
+                        .map_err(|error| worker::Error::numerical("units", &error))
                 })
                 .collect()
         })
@@ -105,7 +105,7 @@ fn wait(mut done: impl FnMut() -> Result<bool>, what: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !done()? {
         if Instant::now() > deadline {
-            return Err(uniserve_worker::Error::Invariant(format!(
+            return Err(worker::Error::Invariant(format!(
                 "timed out waiting for {what}"
             )));
         }
@@ -257,7 +257,7 @@ fn run(config: Any) -> Result<Map<FfiString, Any>> {
             FfiString::from("transfer"),
             Any::from(FfiString::from(
                 serde_json::to_string(&transfer)
-                    .map_err(|error| uniserve_worker::Error::Invalid(error.to_string()))?
+                    .map_err(|error| worker::Error::Invalid(error.to_string()))?
                     .as_str(),
             )),
         ),
@@ -295,7 +295,7 @@ fn lifecycle(config: Any) -> Result<Map<FfiString, Any>> {
         .map(units)
         .collect::<Result<Vec<_>>>()?;
     let [source, destination, prefix] = slots.as_slice() else {
-        return Err(uniserve_worker::Error::Interface(
+        return Err(worker::Error::Interface(
             "cache_lifecycle field `units` names three slots' units".into(),
         ));
     };

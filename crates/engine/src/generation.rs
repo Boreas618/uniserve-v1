@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use uniserve_ipc::{
+use ipc::{
     ImageParams, ImageParamsError, MediaCall, RequestId, SamplingParams, SamplingParamsError,
 };
 

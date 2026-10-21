@@ -16,22 +16,20 @@
 //! slot, same-host slots, and whether products cross hosts) and the consumer
 //! slots stated on each producing call.
 
-pub use uniserve_ipc::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
+pub use ipc::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
+#[cfg(test)]
+use ipc::VideoDenoiserInfo;
+use ipc::{ForwardMode, MediaCall};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(test)]
-use uniserve_ipc::VideoDenoiserInfo;
-use uniserve_ipc::{ForwardMode, MediaCall};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use uniserve_ipc::{
-    BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo,
-};
+use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo};
 
 mod batch;
 
@@ -89,7 +87,7 @@ pub struct ExecutorInfo {
     /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
     /// and `SimExecutor` leave it empty, which serves no pool through the
     /// host page tier.
-    pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<uniserve_ipc::PrefixCacheInfo>)>>,
+    pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
 }
 
 impl ExecutorInfo {
@@ -104,7 +102,7 @@ impl ExecutorInfo {
             "executor info must contain at least one pool"
         );
         let mut ids = std::collections::HashSet::new();
-        let mut components: BTreeMap<&str, &uniserve_ipc::ComponentInfo> = BTreeMap::new();
+        let mut components: BTreeMap<&str, &ipc::ComponentInfo> = BTreeMap::new();
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
             for component in &info.components {
@@ -491,9 +489,9 @@ fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
-    pub output: uniserve_ipc::CallOutput,
+    pub output: ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
-    pub media: Result<Option<Arc<uniserve_ipc::SharedMedia>>, uniserve_ipc::SharedMediaError>,
+    pub media: Result<Option<Arc<ipc::SharedMedia>>, ipc::SharedMediaError>,
 }
 
 /// A decoded physical result that owns media before routing or rank validation.
@@ -508,7 +506,7 @@ pub struct WorkerResult {
     /// Worker-reported execution duration in microseconds, when reported.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported.
-    pub forward_stats: Option<uniserve_ipc::ForwardStats>,
+    pub forward_stats: Option<ipc::ForwardStats>,
 }
 
 impl WorkerResult {
@@ -526,10 +524,10 @@ impl WorkerResult {
                     .media_output
                     .take()
                     .map(|media| {
-                        let uniserve_ipc::ArtifactHandle::PosixShm { name } = media.handle;
+                        let ipc::ArtifactHandle::PosixShm { name } = media.handle;
                         // SAFETY: export transfers immutable storage after the writer closes.
                         // The mapping owns the bytes even if this result is rejected downstream.
-                        unsafe { uniserve_ipc::SharedMedia::open(&name, media.bytes) }.map(Arc::new)
+                        unsafe { ipc::SharedMedia::open(&name, media.bytes) }.map(Arc::new)
                     })
                     .transpose();
                 CallResult { output, media }
@@ -585,7 +583,7 @@ pub struct BatchResult {
     /// Per-worker execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
     /// Per-worker model-forward statistics.
-    pub forward_stats: Vec<uniserve_ipc::ForwardStats>,
+    pub forward_stats: Vec<ipc::ForwardStats>,
 }
 
 /// Converts one physical result into the scheduler-facing [`BatchResult`].
@@ -1086,9 +1084,9 @@ impl TransferConfig {
     pub(crate) fn bind_inputs(
         &self,
         incarnations: &crate::worker::IncarnationRegistry,
-        products: &mut [uniserve_ipc::TensorExport],
-        cache_inputs: &mut [uniserve_ipc::CacheTransfer],
-        destination: &uniserve_ipc::WorkerEndpoint,
+        products: &mut [ipc::TensorExport],
+        cache_inputs: &mut [ipc::CacheTransfer],
+        destination: &ipc::WorkerEndpoint,
     ) -> Result<(), UnroutableInputs> {
         let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
@@ -1128,11 +1126,11 @@ impl TransferConfig {
     fn bind_locations(
         &self,
         incarnations: &crate::worker::IncarnationRegistry,
-        tensor: &mut uniserve_ipc::TensorTransfer,
-        destination: &uniserve_ipc::WorkerEndpoint,
+        tensor: &mut ipc::TensorTransfer,
+        destination: &ipc::WorkerEndpoint,
         destination_position: Option<&(WorkerGroupId, u32)>,
     ) -> bool {
-        use uniserve_ipc::TransferTransport;
+        use ipc::TransferTransport;
 
         // A product's location chose the mechanism it was published on, so a
         // location is kept where the edge carries that mechanism for either
@@ -1308,7 +1306,7 @@ pub(crate) struct UnroutableInputs {
     /// The consuming rank, as `worker:rank`.
     pub(crate) destination: String,
     /// The products left without a location the consumer can read.
-    pub(crate) buffers: Vec<uniserve_ipc::BufferId>,
+    pub(crate) buffers: Vec<ipc::BufferId>,
 }
 
 /// Error returned for an invalid transfer-transport mapping.
@@ -1337,7 +1335,7 @@ pub struct WorkerExecError {
     /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
     /// The failure's class, when the rank classified it.
-    pub code: Option<uniserve_ipc::ErrorCode>,
+    pub code: Option<ipc::ErrorCode>,
     /// Human-readable failure description.
     pub message: String,
     /// Execution phase in which the failure occurred, when known.
@@ -1346,7 +1344,7 @@ pub struct WorkerExecError {
     /// belongs to a batch with calls (see `WorkerResponseError::route`).
     pub route: Option<String>,
     /// Calls affected by the worker failure.
-    pub calls: Vec<uniserve_ipc::ErrorCallIdentity>,
+    pub calls: Vec<ipc::ErrorCallIdentity>,
 }
 
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
@@ -1356,7 +1354,7 @@ pub struct WorkerFailure {
     /// Worker group reporting the failure.
     pub worker_id: WorkerGroupId,
     /// Invalidated incarnations; empty when the group retains its allocations.
-    pub endpoints: Vec<uniserve_ipc::WorkerEndpoint>,
+    pub endpoints: Vec<ipc::WorkerEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
     /// The requests among `requests` that a worker refused, each with the
@@ -1367,7 +1365,7 @@ pub struct WorkerFailure {
     /// Accepted logical calls that will no longer produce a device completion.
     pub retired: Vec<(u64, RequestKey, CallId)>,
     /// Buffers whose published locations no longer cover their complete logical value.
-    pub buffers: Vec<uniserve_ipc::BufferId>,
+    pub buffers: Vec<ipc::BufferId>,
     /// Classified execution failure, if the ranks returned one before retirement.
     pub execution: Option<WorkerExecError>,
     /// Human-readable failure description.
@@ -1461,7 +1459,7 @@ mod tests {
             .map(|(_, component)| *component)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|name| uniserve_ipc::ComponentInfo {
+            .map(|name| ipc::ComponentInfo {
                 name: name.to_owned(),
                 outputs: Vec::new(),
             })
@@ -1565,7 +1563,7 @@ mod tests {
     fn media_units_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
         let temporal = |ranks: Vec<usize>, units_per_rank: usize| ComponentConfig {
-            distribution: Some(uniserve_ipc::ComponentDistribution::TemporalUnits),
+            distribution: Some(ipc::ComponentDistribution::TemporalUnits),
             units_per_rank,
             ..parallel(ranks)
         };
@@ -1821,7 +1819,7 @@ mod tests {
 
     #[test]
     fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
-        use uniserve_ipc::{
+        use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
             TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
         };
@@ -1846,7 +1844,7 @@ mod tests {
             device: "cpu".to_owned(),
         };
         let product = TensorRef {
-            request_key: RequestKey::new(1, uniserve_ipc::RequestId(7), 1),
+            request_key: RequestKey::new(1, ipc::RequestId(7), 1),
             producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,
@@ -1895,7 +1893,7 @@ mod tests {
     /// the same edge.
     #[test]
     fn a_replaced_worker_incarnation_no_longer_binds_to_its_edge() {
-        use uniserve_ipc::{
+        use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
             TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
         };
@@ -1915,7 +1913,7 @@ mod tests {
         incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
 
         let product = TensorRef {
-            request_key: RequestKey::new(1, uniserve_ipc::RequestId(7), 1),
+            request_key: RequestKey::new(1, ipc::RequestId(7), 1),
             producer_call_id: CallId::new(1, 0),
             output_index: 0,
             generation: 1,

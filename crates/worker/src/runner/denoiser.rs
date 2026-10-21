@@ -40,8 +40,8 @@ mod video;
 mod video_model;
 pub(crate) mod warmup;
 
+use cuda::{DeviceId, Stream};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
 
 use crate::config::Device;
 use crate::ffi::{Function, Handle, Interpreter};

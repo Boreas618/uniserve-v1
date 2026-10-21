@@ -51,7 +51,7 @@ pub struct SchedulerConfig {
     /// the ranks are launched with. A block-diffusion runtime has no
     /// autoregressive decode, so each request it does not read out runs
     /// under this sampling; without it the runtime serves readouts only.
-    pub canvas: Option<uniserve_ipc::CanvasSampling>,
+    pub canvas: Option<ipc::CanvasSampling>,
 }
 
 impl Default for SchedulerConfig {

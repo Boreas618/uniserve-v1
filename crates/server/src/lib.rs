@@ -7,7 +7,7 @@
 //! HTTP layer (`http`) exposes OpenAI-compatible routes over it.
 
 /// The serving engine over the in-process engine cores.
-pub mod engine;
+pub mod frontend;
 /// The HTTP server: router assembly, the listener, and graceful shutdown.
 pub mod http;
 /// The OpenAI-compatible API: wire schemas, errors, and the route handlers.
@@ -19,5 +19,5 @@ pub mod serving;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use crate::engine::{Engine, Task};
+pub use crate::frontend::{Engine, Task};
 pub use crate::http::serve;

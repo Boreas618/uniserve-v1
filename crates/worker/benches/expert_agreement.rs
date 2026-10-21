@@ -6,15 +6,15 @@
 //! first runs the bench and starts the others), runs warmup rounds, then
 //! times `UNISERVE_AGREEMENT_ROUNDS` agreements (default 20000) with
 //! changing token counts, and prints the latency distribution measured on
-//! member 0: `cargo bench -p uniserve-worker --bench expert_agreement`.
+//! member 0: `cargo bench -p worker --bench expert_agreement`.
 //! `UNISERVE_AGREEMENT_MEMBERS` sets the union size (default 2).
 
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use uniserve_worker::parallel::host::{HostGroup, Rendezvous};
-use uniserve_worker::parallel::{ExpertParallel, ExpertTransport};
+use worker::parallel::host::{HostGroup, Rendezvous};
+use worker::parallel::{ExpertParallel, ExpertTransport};
 
 const MEMBER: &str = "UNISERVE_AGREEMENT_MEMBER";
 const ADDRESS: &str = "UNISERVE_AGREEMENT_ADDRESS";

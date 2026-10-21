@@ -19,8 +19,8 @@ pub mod bagel;
 pub mod resolution;
 pub mod sensenova;
 
+use engine::{GenerationConstraint, ImageEncoderInput, ImageGenerationConfig};
 use serde::{Deserialize, Serialize};
-use uniserve_engine::{GenerationConstraint, ImageEncoderInput, ImageGenerationConfig};
 
 use crate::profile::assets::{self, Error as AssetError};
 use crate::profile::omni::resolution::ResolutionPolicy;
@@ -86,10 +86,10 @@ pub trait OmniProfile {
 }
 
 /// Returns the storage width in bytes for a model dtype.
-pub(super) const fn model_dtype_bytes(dtype: uniserve_engine::ModelDtype) -> u64 {
+pub(super) const fn model_dtype_bytes(dtype: engine::ModelDtype) -> u64 {
     match dtype {
-        uniserve_engine::ModelDtype::Float16 | uniserve_engine::ModelDtype::BFloat16 => 2,
-        uniserve_engine::ModelDtype::Float32 => 4,
+        engine::ModelDtype::Float16 | engine::ModelDtype::BFloat16 => 2,
+        engine::ModelDtype::Float32 => 4,
     }
 }
 
@@ -123,7 +123,7 @@ pub struct ImageGenerationDefaults {
     /// Default classifier-free guidance scale for image conditioning.
     pub cfg_img_scale: f32,
     /// Default guidance renormalization algorithm.
-    pub cfg_renorm_type: uniserve_ipc::CfgRenorm,
+    pub cfg_renorm_type: ipc::CfgRenorm,
     /// Minimum scale at which guidance renormalization applies.
     pub cfg_renorm_min: f32,
     /// Fractional diffusion interval over which guidance applies.

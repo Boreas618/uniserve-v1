@@ -7,14 +7,14 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_cuda::SourceOrder;
-use uniserve_ipc::{Locator, TransferTransport};
+use cuda::SourceOrder;
+use ipc::{Locator, TransferTransport};
 
 use super::read::{NativeRead, ReadCall, payload};
 use super::transport::{ExportView, Staged, Transport, producer, read_destination};
 use super::{Spans, copy_planner};
 use crate::ffi::{Backing, MemoryKind};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

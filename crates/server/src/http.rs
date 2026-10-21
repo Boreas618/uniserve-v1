@@ -21,14 +21,14 @@ use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use observability::METRICS;
 use serde_json::json;
 use thiserror_ext::AsReport as _;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-use uniserve_observability::METRICS;
 
-use crate::engine::{Engine, Task};
+use crate::frontend::{Engine, Task};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::openai::video_jobs::VideoJobs;

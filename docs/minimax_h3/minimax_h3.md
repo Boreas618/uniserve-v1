@@ -27,7 +27,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve`, `uniserve-launcher` and `uniserve-worker` binaries, the worker runtime library (`uniserve._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
+The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` executable, the worker runtime library (`uniserve._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
 
 ## Checkpoints
 
@@ -154,7 +154,7 @@ The GB200 measurements ran with `NCCL_NVLS_ENABLE=0`. On H200, OmniRef serves re
 The two-host files name their hosts `rank-0` and `rank-1` (a rank entry without a host runs on the head's own). Start the head on `rank-0` with `--host-identity rank-0`; it logs `awaiting a launcher for each host this head does not run on address="0.0.0.0:<port>"`. Then start the launcher on the other host with the same environment, checkpoint path and build; the head refuses a launcher or rank compiled from other sources and names both builds:
 
 ```bash
-NCCL_NVLS_ENABLE=0 uniserve-launcher --head <rank-0 address>:<port> --host-identity rank-1
+NCCL_NVLS_ENABLE=0 uniserve launcher --head <rank-0 address>:<port> --host-identity rank-1
 ```
 
 ## Startup and capacity

@@ -4,9 +4,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::ComponentConfig;
-use uniserve_ipc::{CallKind, MediaCall, WorkerInfo};
+use cuda::{DeviceId, Stream};
+use ipc::ComponentConfig;
+use ipc::{CallKind, MediaCall, WorkerInfo};
 
 use crate::capacity::video::VideoCapacity;
 use crate::config::placement::Capability;
@@ -96,7 +96,7 @@ pub(crate) struct VideoSetup<'a> {
     /// The attention backend the model loaded with.
     pub(crate) attention: String,
     /// Where the latent banks are taken.
-    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
+    pub(crate) memory: &'a mut dyn crate::memory::ExclusiveMemory,
 }
 
 impl VideoSetup<'_> {
@@ -159,7 +159,7 @@ pub(crate) fn cuda_device(device: Device) -> Result<DeviceId> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::{ComponentDistribution, ParallelConfig};
+    use ipc::{ComponentDistribution, ParallelConfig};
 
     use super::*;
 

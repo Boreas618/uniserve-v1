@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use uniserve_ipc::Locator;
+use ipc::Locator;
 
 use super::transport::{Staged, Transport, TransportKind, Transports};
 use super::vmm::Exported;
@@ -232,13 +232,13 @@ pub fn release(locations: &[Location]) -> Result<()> {
 mod tests {
     use std::collections::HashSet;
 
-    use uniserve_ipc::{TransferTransport, WorkerEndpoint};
+    use ipc::{TransferTransport, WorkerEndpoint};
 
     use super::*;
     use crate::EventPool;
     use crate::ffi::{Backing, DType};
     use crate::lane::Job;
-    use crate::storage::memory::{Storage, StorageView};
+    use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, TransportOptions};
 
     /// A rank whose only mechanism towards slot 1 is the rank channel.
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_recorded_vmm_export_carries_its_event_once_the_job_recorded_it() -> Result<()> {
-        use uniserve_cuda::{DeviceId, Stream};
+        use cuda::{DeviceId, Stream};
 
         let stream = Stream::new(DeviceId(0))?;
         let capacity = Arc::new(TransferCapacity::new(1 << 24, 8)?);

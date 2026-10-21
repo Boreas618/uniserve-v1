@@ -1,6 +1,6 @@
 //! The CPython interpreter a worker hosts on its Python thread.
 //!
-//! The `uniserve-worker` executable loads the environment's shared
+//! The `uniserve worker` command loads the environment's shared
 //! `libpython` into the process's global scope before it loads this library,
 //! and the library initializes the interpreter on a thread it created, which
 //! Python then treats as its main thread. The C API functions used here are
@@ -59,7 +59,7 @@ impl<'process> CApi<'process> {
             unsafe { process.get(name.to_bytes_with_nul()) }.map_err(|error| {
                 Error::Unsupported(format!(
                     "no CPython is loaded into this process ({name:?}: {error}); a worker \
-                     starts as the `uniserve-worker` executable, which loads the \
+                     starts as the `uniserve worker` command, which loads the \
                      environment's shared libpython"
                 ))
             })

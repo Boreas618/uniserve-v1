@@ -13,7 +13,7 @@
 //! as the producers of its tensor inputs have left the queue.
 
 use super::*;
-use uniserve_ipc::MediaCall;
+use ipc::MediaCall;
 
 /// Algorithm inputs retained until their call completes.
 pub(super) enum InflightInput {
@@ -36,7 +36,7 @@ pub(super) struct InflightCall {
 
 /// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
-    pub(super) record: uniserve_ipc::CallOutput,
+    pub(super) record: ipc::CallOutput,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     /// Engine-wide arrival order (`Inflight::next_arrival`), used to order

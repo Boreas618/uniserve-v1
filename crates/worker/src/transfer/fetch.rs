@@ -4,7 +4,7 @@ use crate::ffi::DType;
 use std::ops::Range;
 use std::sync::Arc;
 
-use uniserve_ipc::{Locator, TensorTransfer};
+use ipc::{Locator, TensorTransfer};
 
 use super::read::Read;
 use super::transport::{Transport, TransportKind, Transports};

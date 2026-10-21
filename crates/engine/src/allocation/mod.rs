@@ -1,0 +1,420 @@
+//! Scheduler-owned request slots, cache references, latent pages, and Tensor spans.
+//!
+//! Each pool allocates its actual backing. Worker addresses are assembled from
+//! these owned allocations when constructing a batch; no region copies persist.
+//!
+//! The backing storage itself lives in the worker processes, which report its
+//! capacity in `WorkerInfo`; these pools assign its rows, units, pages, and
+//! byte ranges. Row zero of the request state, unit zero of the cache pool and
+//! page zero of the latent pool are the worker's inactive sentinels, so no
+//! pool ever hands them out, and the worker IPC validation rejects a request
+//! row, cache unit or latent page of zero.
+//!
+//! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
+//! consumes; the value does not record which pool issued it, so the caller
+//! returns it to the right one. `CacheAllocation` has no `free`: its units return
+//! to the `BlockPool` when its tables drop.
+
+use ipc::{RequestKey, WorkerInfo};
+
+mod bytes;
+pub(crate) use bytes::ByteAllocator;
+
+pub(crate) use crate::kv_cache::CacheAllocation;
+use crate::kv_cache::{BlockPool, GroupShape, PrefixCacheCoordinator};
+
+/// Owned request row, returned only after its request epoch retires.
+///
+/// The row index is private so that only [`RequestPool::allocate`] can
+/// create a slot.
+#[derive(Debug)]
+pub(crate) struct RequestSlot {
+    index: u32,
+}
+
+impl RequestSlot {
+    /// Returns the request-state row this slot owns.
+    pub(crate) fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+/// Pages and capacity of a latent trajectory.
+#[derive(Debug)]
+pub(crate) struct LatentPages {
+    /// Physical page ids in logical order; never contains page zero.
+    pub(crate) pages: Vec<u32>,
+    /// Logical capacity in model-defined latent units. The pages cover at
+    /// least this many units, and more when the last page is partly used or
+    /// after a narrowing `LatentPool::grow`, which keeps its pages.
+    pub(crate) units: u64,
+}
+
+/// A byte span whose export may outlive its producing request.
+#[derive(Debug)]
+pub(crate) struct BufferSpan {
+    pub(crate) owner: RequestKey,
+    /// Byte offset, aligned as requested, into the issuing `BufferPool`.
+    pub(crate) offset: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Allocation failure identifying the exhausted resource class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OutOfStorage {
+    #[error("request slot capacity is exhausted")]
+    /// No request-state row remains available.
+    RequestSlots,
+    #[error("KV unit capacity is exhausted")]
+    /// The paged cache unit pool cannot satisfy the requested token capacity.
+    PrefixCache,
+    #[error("latent page capacity is exhausted")]
+    /// The latent page pool cannot satisfy the requested trajectory capacity.
+    Latent,
+    #[error("persistent buffer capacity is exhausted")]
+    /// The persistent-buffer arena has no suitable free span.
+    Buffer,
+    #[error("the requested allocation is invalid")]
+    /// The requested shape, count, or alignment is invalid.
+    InvalidAllocation,
+}
+
+/// Dense pool of stable request-state row identifiers.
+///
+/// Only [`RequestPool::allocate`] creates a [`RequestSlot`] and only
+/// [`RequestPool::free`] consumes one, so a slot cannot be released twice.
+/// The slot does not record its pool; the scheduler holds several pools (its
+/// main pool and one per media worker) and must free a slot into its issuer.
+pub(crate) struct RequestPool {
+    /// Unassigned rows as a LIFO stack, initially ordered so that `allocate`
+    /// hands out the lowest row first.
+    free: Vec<u32>,
+}
+
+impl RequestPool {
+    /// Creates an allocator for the supplied capacity.
+    ///
+    /// Rows are numbered `1..=capacity`, matching the worker's one-based
+    /// request rows. The capacity is clamped to `1..=u32::MAX` rows.
+    pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.clamp(1, u32::MAX as usize);
+        Self {
+            free: (1..=capacity as u32).rev().collect(),
+        }
+    }
+
+    /// Returns whether every row is assigned, so `allocate` would fail.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.free.is_empty()
+    }
+
+    /// Returns the number of request rows that can still be assigned.
+    pub(crate) fn available(&self) -> usize {
+        self.free.len()
+    }
+}
+
+/// Fixed-size page allocator for request-owned latent storage.
+pub(crate) struct LatentPool {
+    /// Model-defined latent units stored in one page.
+    page_units: u32,
+    /// Unassigned page ids as a LIFO stack.
+    free: Vec<u32>,
+}
+
+impl LatentPool {
+    /// Creates an allocator with page zero reserved for inactive input.
+    ///
+    /// `num_pages` counts that sentinel page, as `WorkerInfo::latent_pages`
+    /// does, so pages `1..num_pages` are allocatable.
+    pub(crate) fn new(num_pages: u32, page_units: u32) -> Self {
+        Self {
+            page_units,
+            free: (1..num_pages).rev().collect(),
+        }
+    }
+
+    /// Computes the number of physical pages needed for logical latent units.
+    ///
+    /// Returns `None` when nonzero units meet a zero page size or the page
+    /// count does not fit in `usize`.
+    fn pages_needed(&self, units: u64) -> Option<usize> {
+        if units == 0 {
+            return Some(0);
+        }
+        if self.page_units == 0 {
+            return None;
+        }
+        usize::try_from(units.div_ceil(u64::from(self.page_units))).ok()
+    }
+
+    /// Extends an allocation atomically; narrowing retains its backing pages.
+    ///
+    /// Returns false, leaving `pages` and the free stack unchanged, when the
+    /// page count cannot be computed or too few pages are free.
+    fn reserve(&mut self, pages: &mut Vec<u32>, units: u64) -> bool {
+        let Some(needed) = self.pages_needed(units) else {
+            return false;
+        };
+        let additional = needed.saturating_sub(pages.len());
+        // Pages come from the tail of the free stack, most recently released first.
+        let Some(retained) = self.free.len().checked_sub(additional) else {
+            return false;
+        };
+        pages.extend(self.free.drain(retained..).rev());
+        true
+    }
+
+    /// Returns exclusively owned pages after the allocation retires.
+    fn release(&mut self, pages: Vec<u32>) {
+        self.free.extend(pages.into_iter().rev());
+    }
+}
+
+/// Cache unit pool and cross-group coordination derived from worker
+/// capabilities.
+pub(crate) struct PrefixCacheManager {
+    pub(crate) block_pool: BlockPool,
+    pub(crate) coordinator: PrefixCacheCoordinator,
+}
+
+impl PrefixCacheManager {
+    /// Builds scheduler cache state when a worker advertises a paged unit pool.
+    ///
+    /// Returns `None` when `info` has no prefix cache. `BlockPool::new` panics on
+    /// a pool without an allocatable unit and `BlockTable::new` on an empty
+    /// page shape; `PrefixCacheInfo::validate` rejects each of these.
+    pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
+        info.prefix_cache
+            .as_ref()
+            .map(|prefix_cache| PrefixCacheManager {
+                block_pool: BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units),
+                coordinator: PrefixCacheCoordinator::new(
+                    prefix_cache
+                        .groups
+                        .iter()
+                        .map(GroupShape::from_group)
+                        .collect(),
+                ),
+            })
+    }
+
+    /// Returns the units the scheduler may allocate, excluding the sentinel.
+    pub(crate) fn usable_units(&self) -> usize {
+        self.block_pool.usable_units()
+    }
+}
+
+/// Aligned, byte-addressed persistent Tensor storage.
+///
+/// A first-fit allocator over free byte extents. Adjacent free extents are
+/// coalesced on release.
+pub(crate) struct BufferPool {
+    bytes: ByteAllocator,
+}
+
+impl BufferPool {
+    pub(crate) fn new(capacity: u64) -> Self {
+        Self {
+            bytes: ByteAllocator::new(capacity),
+        }
+    }
+}
+
+impl RequestPool {
+    /// Reserve one stable positive row for an admitted request epoch.
+    pub(crate) fn allocate(&mut self) -> Result<RequestSlot, OutOfStorage> {
+        let index = self.free.pop().ok_or(OutOfStorage::RequestSlots)?;
+        Ok(RequestSlot { index })
+    }
+
+    /// Return a row after all participating workers acknowledge its release.
+    ///
+    /// The caller passes the slot this pool issued; consuming it is what
+    /// retires the row, so no liveness check remains to fail.
+    pub(crate) fn free(&mut self, allocation: RequestSlot) {
+        let RequestSlot { index } = allocation;
+        self.free.push(index);
+    }
+}
+
+impl LatentPool {
+    /// Reserve the physical pages of one latent trajectory atomically.
+    pub(crate) fn allocate(&mut self, units: u64) -> Result<LatentPages, OutOfStorage> {
+        let mut pages = Vec::new();
+        if !self.reserve(&mut pages, units) {
+            return Err(OutOfStorage::Latent);
+        }
+        Ok(LatentPages { pages, units })
+    }
+
+    /// Grow without moving existing pages; failure leaves the allocation intact.
+    ///
+    /// A `requested` below the current units lowers `units` but keeps every
+    /// page.
+    pub(crate) fn grow(
+        &mut self,
+        allocation: &mut LatentPages,
+        requested: u64,
+    ) -> Result<(), OutOfStorage> {
+        let LatentPages { pages, units, .. } = allocation;
+        if !self.reserve(pages, requested) {
+            return Err(OutOfStorage::Latent);
+        }
+        *units = requested;
+        Ok(())
+    }
+
+    /// Return trajectory pages after their physical consumers have finished.
+    pub(crate) fn free(&mut self, allocation: LatentPages) {
+        let LatentPages { pages, .. } = allocation;
+        self.release(pages);
+    }
+}
+
+impl BufferPool {
+    /// Reserve an aligned nonempty span; failure does not consume capacity.
+    pub(crate) fn allocate(
+        &mut self,
+        owner: RequestKey,
+        bytes: u64,
+        alignment: u32,
+    ) -> Result<BufferSpan, OutOfStorage> {
+        if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
+            return Err(OutOfStorage::InvalidAllocation);
+        }
+        let range = self
+            .bytes
+            .allocate(bytes, alignment)
+            .ok_or(OutOfStorage::Buffer)?;
+        Ok(BufferSpan {
+            owner,
+            offset: range.start,
+            bytes,
+        })
+    }
+
+    /// Return the complete span after its export and transport readers retire.
+    pub(crate) fn free(&mut self, allocation: BufferSpan) {
+        let BufferSpan { offset, bytes, .. } = allocation;
+        self.bytes.free(offset..offset + bytes);
+    }
+}
+
+impl PrefixCacheManager {
+    /// Acquire one table per cache group holding `tokens` tokens for a read
+    /// from token zero, atomically.
+    pub(crate) fn allocate(&self, tokens: u32) -> Result<CacheAllocation, OutOfStorage> {
+        let mut allocation = self.coordinator.empty();
+        self.coordinator
+            .ensure_capacity(&self.block_pool, &mut allocation, 0, tokens as usize)
+            .ok_or(OutOfStorage::PrefixCache)?;
+        Ok(allocation)
+    }
+
+    /// Grow every cache group atomically for a call that reads from token
+    /// `read_start` and holds `tokens` tokens, retaining shared prefix
+    /// references.
+    pub(crate) fn grow(
+        &self,
+        allocation: &mut CacheAllocation,
+        read_start: u32,
+        tokens: u32,
+    ) -> Result<(), OutOfStorage> {
+        self.coordinator
+            .ensure_capacity(
+                &self.block_pool,
+                allocation,
+                read_start as usize,
+                tokens as usize,
+            )
+            .ok_or(OutOfStorage::PrefixCache)
+    }
+
+    pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
+        self.coordinator.set_prefix_enabled(enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipc::RequestId;
+
+    fn owner(id: u64) -> RequestKey {
+        RequestKey::new(1, RequestId(id), 1)
+    }
+
+    #[test]
+    fn request_rows_remain_exclusive_until_release() {
+        let mut pool = RequestPool::new(2);
+        let first = pool.allocate().unwrap();
+        let second = pool.allocate().unwrap();
+        assert_ne!(first.index, second.index);
+        assert!(first.index > 0);
+        assert!(matches!(pool.allocate(), Err(OutOfStorage::RequestSlots)));
+        pool.free(first);
+        let replacement = pool.allocate().unwrap();
+        assert_ne!(replacement.index, second.index);
+        pool.free(second);
+        pool.free(replacement);
+    }
+
+    #[test]
+    fn tensor_spans_are_aligned_exclusive_and_reclaimable() {
+        let mut pool = BufferPool::new(1024);
+        let first = pool.allocate(owner(1), 200, 256).unwrap();
+        let second = pool.allocate(owner(2), 200, 256).unwrap();
+        let BufferSpan {
+            offset: start,
+            bytes,
+            ..
+        } = &first;
+        let BufferSpan {
+            offset: other,
+            bytes: other_bytes,
+            ..
+        } = &second;
+        assert_eq!(start % 256, 0);
+        assert_eq!(other % 256, 0);
+        assert!(start + bytes <= *other || other + other_bytes <= *start);
+        assert!(matches!(
+            pool.allocate(owner(3), 1024, 256),
+            Err(OutOfStorage::Buffer)
+        ));
+        pool.free(first);
+        pool.free(second);
+        assert!(pool.allocate(owner(3), 1024, 256).is_ok());
+    }
+
+    #[test]
+    fn latent_growth_preserves_pages_and_failed_reservations() {
+        // Four pages of four units, one of them the sentinel: two one-page
+        // trajectories leave one page free, so growing the first to three
+        // pages fails until the second releases its page.
+        let mut pool = LatentPool::new(4, 4);
+        let mut first = pool.allocate(4).unwrap();
+        let second = pool.allocate(4).unwrap();
+        let LatentPages { pages, .. } = &first;
+        let held_pages = pages.clone();
+        let LatentPages {
+            pages: other_pages, ..
+        } = &second;
+        assert!(pages.iter().all(|page| !other_pages.contains(page)));
+
+        assert_eq!(pool.grow(&mut first, 12), Err(OutOfStorage::Latent));
+        let LatentPages { pages, units, .. } = &first;
+        assert_eq!(pages, &held_pages);
+        assert_eq!(*units, 4);
+
+        pool.free(second);
+        pool.grow(&mut first, 12).unwrap();
+        let LatentPages { pages, units, .. } = &first;
+        assert!(pages.starts_with(&held_pages));
+        assert_eq!(*units, 12);
+        assert_eq!(pages.len(), 3);
+
+        pool.free(first);
+        assert!(pool.allocate(12).is_ok());
+    }
+}

@@ -37,8 +37,8 @@ use crate::{
     GenerationRequest, ImageGenerationConfig, ImageTrigger, MultimodalInputs, Request,
 };
 use anyhow::Context as _;
-use uniserve_ipc::{CallKind, ForwardMode, MediaCall};
-use uniserve_ipc::{ImageParams, SamplingParams};
+use ipc::{CallKind, ForwardMode, MediaCall};
+use ipc::{ImageParams, SamplingParams};
 
 use crate::core::{EngineConfig, EngineCore};
 use crate::handle::EventRx;
@@ -198,7 +198,7 @@ pub(crate) fn warm(core: &EngineCore, config: &EngineConfig) -> anyhow::Result<(
 /// negative prompt does.
 fn warmup_request(
     config: &EngineConfig,
-    request_id: uniserve_ipc::RequestId,
+    request_id: ipc::RequestId,
     constraint: GenerationConstraint,
     tokens: usize,
     image: ImageParams,
@@ -293,8 +293,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::{GenerationFeatures, GenerationLimits};
-    use uniserve_ipc::CanvasSampling;
-    use uniserve_ipc::{BatchCommand, ImageWarmup};
+    use ipc::CanvasSampling;
+    use ipc::{BatchCommand, ImageWarmup};
 
     use super::*;
     use crate::executor::ExecutionBatch;

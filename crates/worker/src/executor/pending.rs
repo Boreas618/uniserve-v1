@@ -1,10 +1,10 @@
 //! Resolve numerical completion into accepted request progress and wire output.
 
-use uniserve_ipc::{
+use ipc::{
     ArtifactHandle, BatchOutput, Call, CallOutput, CallStatus, ErrorCode, MediaOutput, RequestKey,
     TensorExport, TensorRef, TimingCounters,
 };
-use uniserve_ipc::{CallId, MediaSource};
+use ipc::{CallId, MediaSource};
 
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
 
@@ -442,15 +442,15 @@ fn token_id(value: i64) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_ipc::{
+    use ipc::{
         BatchOutput, Call, CallKind, DType, LatentParams, Locator, MediaCall, RequestKey,
         ShapeBound, TensorExport, TensorRef, TensorTransfer, TransferHandle, TransferTransport,
         WorkerInfo,
     };
-    use uniserve_ipc::{CallId, MediaSource, RequestId, SharedMedia};
+    use ipc::{CallId, MediaSource, RequestId, SharedMedia};
 
     use super::*;
-    use crate::storage::TrajectoryVersion;
+    use crate::memory::TrajectoryVersion;
     use crate::{LatentPool, LatentUpdate};
 
     fn call() -> Call {
@@ -716,7 +716,7 @@ mod tests {
     /// `accepted` accepted drafts.
     fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
         use crate::ffi::{Backing, DType};
-        use crate::storage::{OutputStorage, Storage, StorageView};
+        use crate::memory::{OutputStorage, Storage, StorageView};
 
         let words = [1_i64, 1, token, accepted];
         let memory = Storage::host(size_of_val(&words));
@@ -738,8 +738,8 @@ mod tests {
         let mut buffer =
             OutputBuffer::new(OutputStorage::allocate(None, words.len())?, 1, &[], false);
         let events = crate::EventPool::default();
-        buffer.capture(&column, None::<&uniserve_cuda::Stream>, &events)?;
-        buffer.seal::<&uniserve_cuda::Stream>(&[], &events)?;
+        buffer.capture(&column, None::<&cuda::Stream>, &events)?;
+        buffer.seal::<&cuda::Stream>(&[], &events)?;
         buffer.copies_finished();
         buffer.readback()?;
         Ok(buffer)
@@ -754,7 +754,7 @@ mod tests {
         accepted: i64,
     ) -> Result<PendingOutput> {
         let mut call = call();
-        call.kind = CallKind::Forward(uniserve_ipc::ForwardMode::Verify);
+        call.kind = CallKind::Forward(ipc::ForwardMode::Verify);
         call.coordinates.logical_position = POSITION as u32;
         let previous = RequestProgress {
             rng_counter: DRAWS,

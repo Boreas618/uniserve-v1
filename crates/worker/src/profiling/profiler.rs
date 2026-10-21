@@ -23,8 +23,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_cuda::DeviceId;
-use uniserve_ipc::CallKind;
+use cuda::DeviceId;
+use ipc::CallKind;
 
 use crate::ffi::{Function, Handle};
 use crate::lane::{Completion, Job, JobId, JobQueues};
@@ -255,15 +255,11 @@ impl Profiler {
                 Ok(Some(jobs.call(calls, true)))
             }
             Phase::StartRange => match range {
-                Some(device) => {
-                    self.range(jobs, kind, move || uniserve_cuda::profiler_start(device))
-                }
+                Some(device) => self.range(jobs, kind, move || cuda::profiler_start(device)),
                 None => Ok(None),
             },
             Phase::StopRange => match range.filter(|_| std::mem::take(&mut self.ranging)) {
-                Some(device) => {
-                    self.range(jobs, kind, move || uniserve_cuda::profiler_stop(device))
-                }
+                Some(device) => self.range(jobs, kind, move || cuda::profiler_stop(device)),
                 None => Ok(None),
             },
             Phase::Discard => Ok(self.torch.take().map(|profile| {
@@ -286,7 +282,7 @@ impl Profiler {
         &self,
         jobs: &JobQueues,
         kind: CallKind,
-        call: impl FnOnce() -> uniserve_cuda::Result<()> + Send + 'static,
+        call: impl FnOnce() -> cuda::Result<()> + Send + 'static,
     ) -> Result<Option<JobId>> {
         let failures = self.failures.0.clone();
         let job = Job::new();
@@ -396,7 +392,7 @@ impl Profiler {
                 Phase::Start | Phase::StartRange => Ok(()),
                 Phase::StopRange => match self.device.filter(|_| std::mem::take(&mut self.ranging))
                 {
-                    Some(device) => uniserve_cuda::profiler_stop(device).map_err(Error::from),
+                    Some(device) => cuda::profiler_stop(device).map_err(Error::from),
                     None => Ok(()),
                 },
                 Phase::Discard => self.torch.take().map_or(Ok(()), |profile| {
@@ -419,8 +415,8 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    use ipc::ForwardMode;
     use tvm_ffi::{Any, AnyView};
-    use uniserve_ipc::ForwardMode;
 
     use super::*;
 

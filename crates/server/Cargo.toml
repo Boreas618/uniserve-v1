@@ -1,8 +1,9 @@
 [package]
-name = "uniserve-server"
+name = "server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -11,6 +12,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
+engine.workspace = true
 fastokens.workspace = true
 fnv.workspace = true
 futures.workspace = true
@@ -19,19 +21,22 @@ http-body.workspace = true
 humantime.workspace = true
 image.workspace = true
 indexmap.workspace = true
+ipc.workspace = true
 itertools.workspace = true
 libc.workspace = true
 llm-multimodal.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
 models.workspace = true
+observability.workspace = true
 reqwest = { workspace = true, features = ["http2", "rustls-tls"] }
 serde.workspace = true
-serde-json-fmt.workspace = true
 serde_json.workspace = true
+serde-json-fmt.workspace = true
 serde_path_to_error.workspace = true
 serde_with.workspace = true
 sha2.workspace = true
+storage.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
@@ -41,10 +46,6 @@ toml.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-uniserve-engine.workspace = true
-uniserve-ipc.workspace = true
-uniserve-observability.workspace = true
-uniserve-storage.workspace = true
 url.workspace = true
 uuid.workspace = true
 validator.workspace = true
@@ -52,10 +53,10 @@ winnow.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+engine = { workspace = true, features = ["testing"] }
 expect-test.workspace = true
 tokenizers.workspace = true
 tower.workspace = true
-uniserve-engine = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "tokenizer_hf"

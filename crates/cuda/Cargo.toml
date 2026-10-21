@@ -1,12 +1,10 @@
 [package]
-name = "uniserve-cuda"
+name = "cuda"
 description = "CUDA driver, virtual memory, NVML and NCCL bindings loaded at runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[lib]
-name = "uniserve_cuda"
+publish = false
 
 [dependencies]
 libc.workspace = true

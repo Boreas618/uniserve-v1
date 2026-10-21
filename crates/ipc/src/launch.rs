@@ -11,7 +11,7 @@
 //! source of defaults and validates the values it owns, and the rank never
 //! re-derives or re-checks one.
 //!
-//! Both launching sides, the head and a host's `uniserve-launcher` launcher, start
+//! Both launching sides, the head and a host's launcher (`uniserve launcher`), start
 //! a rank with [`worker_command`], hand it the sockets it serves with
 //! [`inherit_listener`] and own its process as a [`WorkerChild`].
 
@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::LaneConfig;
 
-/// The command that starts one worker with `executable`, the
-/// `uniserve-worker` executable of the environment it runs in.
+/// The command that starts one worker with `executable`, the `uniserve`
+/// executable of the environment it runs in, as its `worker` command.
 ///
 /// argv carries the address of the head the worker connects to and what its
 /// registration states: its worker group and its rank, and the `generation`
@@ -49,6 +49,7 @@ pub fn worker_command(
     // descriptors, and never the head's.
     command.process_group(0);
     command
+        .arg("worker")
         .arg("--head")
         .arg(head)
         .arg("--worker-id")
@@ -234,7 +235,7 @@ const SHARED_MEMORY: &str = "/dev/shm";
 /// process's (`getpid`), whichever of its threads created the event, and a
 /// process that opens another's event handle opens the other's object by
 /// that name and creates none of its own. The driver unlinks the object only
-/// when the context is destroyed (`uniserve_cuda::PrimaryContext::reset_all`),
+/// when the context is destroyed (`cuda::PrimaryContext::reset_all`),
 /// which a process that is killed or crashes never does, so the parent that
 /// reaps such a process removes it instead ([`WorkerChild`]).
 ///

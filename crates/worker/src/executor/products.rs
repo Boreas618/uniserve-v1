@@ -26,18 +26,18 @@
 
 use crate::executor::PendingOutput;
 use crate::ffi::MemoryKind;
-use crate::storage::{OutputPlacement, ProductBuffer, ProductExport, ProductStore};
+use crate::memory::{OutputPlacement, ProductBuffer, ProductExport, ProductStore};
 use crate::stream::Issue;
 use crate::transfer::Transports;
 use crate::transfer::exports::{self, Location};
 use crate::{Error, Result};
-use std::collections::HashMap;
-use std::ops::Range;
-use uniserve_cuda::Stream;
-use uniserve_ipc::{
+use cuda::Stream;
+use ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, RequestKey, TensorExport, TensorRef,
     TransferHandle,
 };
+use std::collections::HashMap;
+use std::ops::Range;
 
 /// The product exports a batch accepted before its commit point.
 #[derive(Default)]
@@ -231,7 +231,7 @@ pub(crate) fn supplied<'a>(plan: &'a BatchPlan, product: &TensorRef) -> Option<&
 }
 
 /// The published tensor of a device or encoder product export.
-pub(crate) fn tensor(export: &TensorExport) -> Result<&uniserve_ipc::TensorTransfer> {
+pub(crate) fn tensor(export: &TensorExport) -> Result<&ipc::TensorTransfer> {
     match &export.value {
         TransferHandle::DeviceProduct { tensor, .. } | TransferHandle::Encoder { tensor, .. } => {
             Ok(tensor)

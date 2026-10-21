@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use anyhow::Context;
-use uniserve_ipc::Batch;
+use ipc::Batch;
 
 use super::{CallIdentity, call_identity};
 use crate::executor::{CallResult, WorkerResult};
@@ -204,15 +204,15 @@ pub(super) fn validate_and_order_rank_report(
             })?;
         let completion = report.results.swap_remove(index);
         anyhow::ensure!(
-            completion.output.status != uniserve_ipc::CallStatus::Predicated
+            completion.output.status != ipc::CallStatus::Predicated
                 || report.products.iter().all(|export| {
                     export.product.request_key != completion.output.request_key
                         || export.product.producer_call_id != completion.output.call_id
                 }),
             "predicated call published a tensor"
         );
-        if planned.kind == uniserve_ipc::CallKind::Transfer(uniserve_ipc::TransferMode::CacheExport)
-            && completion.output.status == uniserve_ipc::CallStatus::Ok
+        if planned.kind == ipc::CallKind::Transfer(ipc::TransferMode::CacheExport)
+            && completion.output.status == ipc::CallStatus::Ok
         {
             let export = completion
                 .output
@@ -224,7 +224,7 @@ pub(super) fn validate_and_order_rank_report(
                 "cache export differs from its declared output"
             );
             let bytes = export.tensors().try_fold(0_u64, |sum, tensor| {
-                Ok::<_, uniserve_ipc::ValidationError>(sum.saturating_add(tensor.validate()?))
+                Ok::<_, ipc::ValidationError>(sum.saturating_add(tensor.validate()?))
             })?;
             anyhow::ensure!(
                 bytes <= planned.bounds.max_transfer_bytes,

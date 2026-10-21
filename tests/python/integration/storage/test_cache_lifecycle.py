@@ -1,7 +1,7 @@
 """A host prefix cache through the lifecycle of a request's pages.
 
 The worker's storage harness (``crates/worker/examples/storage_harness.rs``,
-built with ``cargo build -p uniserve-worker --example storage_harness``)
+built with ``cargo build -p worker --example storage_harness``)
 allocates one cache in host memory, binds this package's cache interface to
 it and drives it through installs, an export, an abandoned and an adopted
 import, a guidance prefix slot and the releases. After each step it reports
@@ -47,7 +47,7 @@ def _harness():
     if not path.exists():
         pytest.fail(
             f"{path} is missing: build it with "
-            "`cargo build -p uniserve-worker --example storage_harness`"
+            "`cargo build -p worker --example storage_harness`"
         )
     return tvm_ffi.load_module(str(path))
 

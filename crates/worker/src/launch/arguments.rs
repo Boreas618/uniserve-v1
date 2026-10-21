@@ -9,7 +9,7 @@ use crate::config::DescriptorError;
 
 /// Usage line printed with an argument or descriptor error.
 pub(crate) const USAGE: &str =
-    "usage: uniserve-worker --head ADDRESS --worker-id ID --rank R --generation G";
+    "usage: uniserve worker --head ADDRESS --worker-id ID --rank R --generation G";
 
 /// Parsed command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

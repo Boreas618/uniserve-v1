@@ -15,7 +15,7 @@
 //! forward's [`SamplingMetadata`], whose sampling methods follow the
 //! forward.
 
-use uniserve_ipc::{CallKind, ForwardMode};
+use ipc::{CallKind, ForwardMode};
 
 use super::CausalLMRunners;
 use super::batch::{ForwardRows, TokenBatch};
@@ -24,6 +24,7 @@ use super::context::{self, Sources};
 use super::runners::Step;
 use crate::executor::image::ImageParts;
 use crate::lane::Job;
+use crate::memory::LogprobLayout;
 use crate::runner::causal_lm::{
     Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,
 };
@@ -31,8 +32,7 @@ use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::{
     RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_count, logprob_words,
 };
-use crate::storage::LogprobLayout;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 
 /// A prefill chunk's prompt scoring.
@@ -588,9 +588,9 @@ impl TokenBatch<'_> {
 pub(super) fn condition_latents(
     runtime: &mut CausalLMRunners,
     image: &mut Option<ImageParts<'_>>,
-    storage: &mut WorkerStorage,
+    storage: &mut WorkerMemory,
     rows: &[ConditionRow],
-    stream: Option<&uniserve_cuda::Stream>,
+    stream: Option<&cuda::Stream>,
     job: &Job,
 ) -> Result<()> {
     let image = image.as_mut().ok_or_else(|| {

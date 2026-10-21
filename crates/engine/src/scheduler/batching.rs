@@ -27,7 +27,7 @@ mod call;
 mod plan;
 
 use super::*;
-use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
 /// a worker stages per call: canvas rows across its token-denoising calls,

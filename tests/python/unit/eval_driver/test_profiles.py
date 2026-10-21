@@ -149,7 +149,7 @@ root = ".."
 port = 8000
 command = [
     "target/release/uniserve", "serve", "model", "--worker-executable",
-    ".venv/bin/uniserve-worker",
+    ".venv/bin/uniserve",
 ]
 
 [benchmarks.point]
@@ -188,7 +188,7 @@ output_throughput = "higher"
     (command,) = plan["server_commands"]
     assert command[0] == str(tree / "target/release/uniserve")
     worker = command.index("--worker-executable") + 1
-    assert command[worker] == str(tree / ".venv/bin/uniserve-worker")
+    assert command[worker] == str(tree / ".venv/bin/uniserve")
     assert plan["server_working_directory"] == str(tree)
 
 

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use uniserve_ipc::{CallKind, MediaCall};
+use ipc::{CallKind, MediaCall};
 
 use super::{PreparedImage, Tower};
 use crate::error::WorkerError;

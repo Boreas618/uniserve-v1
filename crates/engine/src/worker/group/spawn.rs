@@ -15,10 +15,10 @@ use super::WorkerGroup;
 use super::domain::FailureDomain;
 use super::routing::refuse_shared_storage_off_head;
 use crate::worker::WorkerProcessArgs;
+use crate::worker::claims::{Claims, StorageClaims};
 use crate::worker::registry::Registry;
-use crate::worker::storage::{Claims, StorageClaims};
 use crate::worker::{IncarnationRegistry, PendingWorker, WorkerProcess};
-use uniserve_ipc::StorageLaunch;
+use ipc::StorageLaunch;
 
 /// Every rank of one group, with the launchers that started the remote ones.
 type LaunchedGroup = (

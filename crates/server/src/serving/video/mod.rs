@@ -52,6 +52,9 @@ pub mod probe;
 
 use std::sync::Arc;
 
+use engine::DiffusionRequest;
+use engine::VideoDenoiserInfo;
+use ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 use models::video::plan;
 use models::video::plan::{
     CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
@@ -61,9 +64,6 @@ use models::video::presentation;
 use models::video::{Canvas, VideoTask};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use uniserve_engine::DiffusionRequest;
-use uniserve_engine::VideoDenoiserInfo;
-use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId};
 
 use crate::options::MediaOptions;
 use crate::profile::tokenizer::DynTokenizer;
@@ -522,6 +522,7 @@ mod tests {
     use std::sync::Arc;
 
     use base64::Engine as _;
+    use engine::VideoDenoiserInfo;
     use image::ImageEncoder as _;
     use models::video::plan::{ProcessorConfig, ReferenceConfig, RequestField};
     use models::video::presentation::{TEXT_TAG, VIDEO_TAG};
@@ -532,7 +533,6 @@ mod tests {
     use serde_json::Value;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
-    use uniserve_engine::VideoDenoiserInfo;
 
     use super::{VideoGenerationRequest, VideoService};
     use crate::options::MediaOptions;

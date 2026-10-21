@@ -17,14 +17,14 @@ use std::ops::{Deref, Range};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use cuda::Stream;
+use ipc::{CacheTransfer, Locator, Wake};
 use tvm_ffi::{Any, AnyView};
-use uniserve_cuda::Stream;
-use uniserve_ipc::{CacheTransfer, Locator, Wake};
 
 use super::{CacheImport, CacheImporter};
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::storage::memory::{Storage, StorageView};
-use crate::storage::{CachePlanes, GroupTable, UnitColumn};
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{CachePlanes, GroupTable, UnitColumn};
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};
@@ -283,7 +283,7 @@ struct GroupCopy<'a> {
 }
 
 impl GroupCopy<'_> {
-    fn group(&self) -> &uniserve_ipc::CacheGroupTransfer {
+    fn group(&self) -> &ipc::CacheGroupTransfer {
         &self.backend.export.groups[self.index]
     }
 

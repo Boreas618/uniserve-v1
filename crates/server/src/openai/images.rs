@@ -14,9 +14,9 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use futures::{Stream, StreamExt as _};
 
-use crate::engine::Engine;
+use crate::frontend::Engine;
 use crate::http::RequestId;
-use uniserve_engine::GenerationConstraint;
+use engine::GenerationConstraint;
 
 use crate::openai::{
     ApiError, GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ValidatedJson,

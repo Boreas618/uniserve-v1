@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use uniserve_engine::{ArtifactEvent, RejectionKind};
+use engine::{ArtifactEvent, RejectionKind};
 
-pub use uniserve_engine::StopReason;
+pub use engine::StopReason;
 
 use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantToolCall};
 use crate::serving::text::{DecodedLogprobs, DecodedPromptLogprobs};
@@ -40,10 +40,10 @@ impl FinishReason {
     /// Maps the engine's finish reason and stop cause; `None` for an engine
     /// error, which fails the request.
     pub fn from_engine(
-        reason: uniserve_engine::FinishReason,
+        reason: engine::FinishReason,
         stop_reason: Option<StopReason>,
     ) -> Option<Self> {
-        use uniserve_engine::FinishReason as Engine;
+        use engine::FinishReason as Engine;
         Some(match reason {
             Engine::Completed | Engine::Eos | Engine::Stop | Engine::ImageDone => {
                 Self::Stop(stop_reason)
@@ -113,7 +113,7 @@ pub struct GeneratedImage {
 
 /// Event of a serving stream, consumed by the API layer.
 ///
-/// A stream returned by [`Engine`](crate::engine::Engine) yields at most one
+/// A stream returned by [`Engine`](crate::frontend::Engine) yields at most one
 /// terminal event (`Finished`, `Rejected`, or `Failed`) or one error, and
 /// then ends. A generation stream yields, after `Accepted` and `Scheduled`,
 /// the output of each decoded update in order: its reasoning, text and

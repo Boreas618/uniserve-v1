@@ -64,8 +64,8 @@ pub(crate) use methods::{Construction, Functions};
 pub(crate) use rows::{RowSource, TokenRow, logit_layout};
 pub(crate) use runners::{CausalLMRunners, Pending, Step, complete, forward};
 
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
-use uniserve_ipc::ForwardMode;
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use ipc::ForwardMode;
 
 use super::TokenSelection;
 use super::input_buffers::InputBuffers;
@@ -74,11 +74,11 @@ use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
 use crate::cuda_graph::{ShapeKey, TextForward, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::allocation::StorageView;
+use crate::memory::{AttentionRow, PrefixCache};
 use crate::request::decode_state::DecodeState;
 use crate::runner::attention::pack_rows;
 use crate::sampling::{RowSampling, SamplingGroup, SamplingPath, candidates};
-use crate::storage::memory::StorageView;
-use crate::storage::{AttentionRow, PrefixCache};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 use runners::COMPLETION_FIELDS;

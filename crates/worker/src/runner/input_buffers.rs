@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
+use cuda::{DeviceId, Stream};
 
 use crate::ffi::{Backing, DType};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// Byte alignment of each carved column.
@@ -76,7 +76,7 @@ impl<D: Columns> InputBuffers<D> {
             (Some(_), Some(stream)) => {
                 // SAFETY: the new allocation spans `bytes`, a multiple of
                 // the column alignment. The stream drains below.
-                unsafe { uniserve_cuda::memset_d32(memory.address(), 0, bytes / 4, stream)? };
+                unsafe { cuda::memset_d32(memory.address(), 0, bytes / 4, stream)? };
                 stream.synchronize()?;
             }
             // Host memory starts zeroed.

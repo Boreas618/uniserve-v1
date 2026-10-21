@@ -16,7 +16,7 @@ lets replicas advance independently. The tests check what a client observes:
 The checkpoint directories come from ``UNISERVE_DIFFUSION_GEMMA_MODEL``
 (BF16) and ``UNISERVE_DIFFUSION_GEMMA_NVFP4_MODEL`` (NVFP4). The worker
 executable is ``UNISERVE_WORKER_EXECUTABLE``, else the test environment's
-``uniserve-worker``. At least two GPUs must be visible.
+``uniserve``. At least two GPUs must be visible.
 """
 
 from __future__ import annotations

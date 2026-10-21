@@ -21,11 +21,11 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use uniserve_cuda::{
+use cuda::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
     Stream, memset_d32,
 };
-use uniserve_ipc::{Locator, TransferTransport, WorkerEndpoint};
+use ipc::{Locator, TransferTransport, WorkerEndpoint};
 
 use super::backing::{CudaSource, SharedPool, TransportBuffer};
 use super::export_table::ExportTable;
@@ -33,7 +33,7 @@ use super::read::{NativeRead, ReadCall};
 use super::transport::{Staged, read_destination};
 use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_planner};
 use crate::ffi::{Backing, DType, MemoryKind};
-use crate::storage::memory::{Residency, Storage, StorageView};
+use crate::memory::allocation::{Residency, Storage, StorageView};
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 use handle::AllocationHandle;

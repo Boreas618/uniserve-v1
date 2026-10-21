@@ -2,7 +2,7 @@
 
 ``logprob_details`` scores logits rows and packs every requesting row's
 fields into one int64 column that the worker reads back and decodes
-(``uniserve_worker::LogprobLayout``). ``prompt_logprobs`` scores a prompt
+(``worker::LogprobLayout``). ``prompt_logprobs`` scores a prompt
 chunk against the logits that predicted each of its tokens. Both score the
 model's distribution, the logits before any sampling control: a reported
 log probability is how likely the model found a token, whatever cutoffs,

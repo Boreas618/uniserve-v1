@@ -13,7 +13,7 @@
 //! frames over a stream connection: a Unix socket to a rank on the head's
 //! host, TCP to a rank on another host. A rank connects to the head, sends its
 //! [`Registration`] and receives its [`LaunchDescriptor`]; the worker runtime
-//! (`uniserve-worker`) then serves its end until the connection closes.
+//! (`uniserve worker`) then serves its end until the connection closes.
 
 use std::collections::{HashMap, HashSet};
 

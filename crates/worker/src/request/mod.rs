@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use indexmap::IndexMap;
-use uniserve_ipc::CallId;
-use uniserve_ipc::{CallStatus, CanvasStep, NewRequest, RequestKey};
+use ipc::CallId;
+use ipc::{CallStatus, CanvasStep, NewRequest, RequestKey};
 
 use crate::{Error, Result};
 
@@ -453,9 +453,9 @@ impl RequestPool {
 
 #[cfg(test)]
 mod tests {
+    use ipc::{DiffusionSamplingParams, RequestId, SamplingParams};
+    use ipc::{GenerationParams, VideoAdmission};
     use models::video::VideoTask;
-    use uniserve_ipc::{DiffusionSamplingParams, RequestId, SamplingParams};
-    use uniserve_ipc::{GenerationParams, VideoAdmission};
 
     use super::*;
 

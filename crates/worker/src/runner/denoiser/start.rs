@@ -1,7 +1,7 @@
 //! Startup of a video model's denoiser runner on a rank.
 
+use ipc::MediaCall;
 use tvm_ffi::Any;
-use uniserve_ipc::MediaCall;
 
 use super::runners::DenoiserRunners;
 use super::{Conditioning, DenoiserRunner};

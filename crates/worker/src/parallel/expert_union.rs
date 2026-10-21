@@ -48,8 +48,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use cuda::{DeviceId, Stream};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
 
 use super::experts::{ExpertLayer, host_bootstrap};
 use super::joins::{GraphFunctions, JoinGraphs};
@@ -315,10 +315,7 @@ pub(crate) struct ExpertStart<'a> {
 fn primary_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
     let stream = match streams.lanes() {
         [] => streams
-            .stream_for(
-                uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Prefill),
-                device,
-            )
+            .stream_for(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), device)
             .ok_or(Error::State("expert parallelism requires a CUDA stream"))?,
         [lane] => &lane.stream,
         _ => {
@@ -467,7 +464,7 @@ impl ExpertUnion {
             // address of its share; neither without mapped storage.
             let (view, pointers) = match &symmetric {
                 Some(storage) => {
-                    let view = crate::storage::memory::StorageView::whole(
+                    let view = crate::memory::allocation::StorageView::whole(
                         Arc::clone(storage.local()) as Arc<dyn crate::ffi::Backing>,
                         crate::ffi::DType::I8,
                     )?;
@@ -594,7 +591,7 @@ impl WarmupHooks for ExpertWarmup {
         let completion = backend
             .job_queues()
             .block_on(
-                uniserve_ipc::CallKind::Forward(uniserve_ipc::ForwardMode::Decode),
+                ipc::CallKind::Forward(ipc::ForwardMode::Decode),
                 job,
                 crate::lane::BLOCK_ON_TIMEOUT,
             )

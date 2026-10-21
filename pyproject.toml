@@ -95,8 +95,8 @@ include = ["uniserve", "uniserve.*"]
 uniserve = ["backends/moe/tactics.json"]
 
 # Rust worker runtime. It is a TVM-FFI library rather than a Python extension
-# module: the `uniserve-worker` executable loads it and calls its entry, and
-# Python loads the same file with `tvm_ffi.load_module`. Serving
+# module: the `uniserve` executable's `worker` command loads it and calls its
+# entry, and Python loads the same file with `tvm_ffi.load_module`. Serving
 # runs these native targets, so they build with Cargo's release profile even
 # for an editable install, where setuptools-rust would otherwise choose a
 # debug build.
@@ -106,30 +106,12 @@ path = "crates/worker/Cargo.toml"
 binding = "NoBinding"
 debug = false
 
-# Server/scheduler binary, installed onto PATH as `uniserve`.
+# The one executable of every UniServe process, installed onto PATH as
+# `uniserve`: `serve` (the head), `launcher` (a host's launcher), `worker`
+# (one worker, in this environment) and `storage` (a host's Storage Server).
 [[tool.setuptools-rust.bins]]
 target = "uniserve"
-path = "crates/bin/uniserve/Cargo.toml"
-debug = false
-
-# Per-host launcher for multi-host deployments, installed as `uniserve-launcher`.
-[[tool.setuptools-rust.bins]]
-target = "uniserve-launcher"
-path = "crates/bin/uniserve-launcher/Cargo.toml"
-debug = false
-
-# The process of one worker, installed beside the environment's interpreter as
-# `uniserve-worker`: it runs workers in this environment.
-[[tool.setuptools-rust.bins]]
-target = "uniserve-worker"
-path = "crates/bin/uniserve-worker/Cargo.toml"
-debug = false
-
-# The Storage Server of one host, which the head and the launchers start when
-# their host has none.
-[[tool.setuptools-rust.bins]]
-target = "uniserve-storage-server"
-path = "crates/bin/uniserve-storage-server/Cargo.toml"
+path = "crates/uniserve/Cargo.toml"
 debug = false
 
 [tool.pytest.ini_options]

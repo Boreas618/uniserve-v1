@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{CallKind, MediaCall};
+use cuda::Stream;
+use ipc::{CallKind, MediaCall};
 
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
@@ -16,6 +16,7 @@ use crate::executor::batch::decodes_video;
 use crate::ffi::Interpreter;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
+use crate::memory::{LatentCache, LatentPlan, LatentPool, LatentStorage, OutputPool};
 use crate::request::diffusion::BranchSource;
 use crate::runner::ImageSetup;
 use crate::runner::causal_lm::model_dtype;
@@ -31,10 +32,9 @@ use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
-use crate::storage::{LatentCache, LatentPlan, LatentPool, LatentStorage, OutputPool};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 
 /// The configured denoising steps that fit the denoiser's columns and the
@@ -98,7 +98,7 @@ pub(crate) struct Startup<'a> {
     pub(crate) host_capacity: usize,
     pub(crate) model: &'a LoadedModel,
     pub(crate) streams: &'a Streams,
-    pub(crate) storage: &'a WorkerStorage,
+    pub(crate) storage: &'a WorkerMemory,
     pub(crate) latent: Option<LatentPlan>,
     pub(crate) components: &'a Components,
     /// The shared work areas of the rank's streams.
@@ -107,7 +107,7 @@ pub(crate) struct Startup<'a> {
     /// The device's startup stream for resets.
     pub(crate) preparation: Option<&'a Stream>,
     /// Where the latent banks are taken.
-    pub(crate) memory: &'a mut dyn crate::storage::ExclusiveMemory,
+    pub(crate) memory: &'a mut dyn crate::memory::ExclusiveMemory,
 }
 
 /// One call startup binds.
@@ -197,7 +197,7 @@ impl ImageOwners {
         &self,
         request_slots: u32,
         latent_units: u64,
-    ) -> Result<Vec<uniserve_ipc::ImageWarmup>> {
+    ) -> Result<Vec<ipc::ImageWarmup>> {
         let Some(layout) = self
             .model
             .denoiser
@@ -231,7 +231,7 @@ impl ImageOwners {
             } else {
                 Vec::new()
             };
-            warmups.push(uniserve_ipc::ImageWarmup {
+            warmups.push(ipc::ImageWarmup {
                 height,
                 width,
                 branches: branches as u8,

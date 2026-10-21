@@ -38,7 +38,7 @@ mod projection;
 mod results;
 
 use super::*;
-use uniserve_ipc::{BufferId, MediaCall};
+use ipc::{BufferId, MediaCall};
 
 pub(super) use media::LaneLedger;
 
@@ -463,7 +463,7 @@ impl Scheduler {
     }
 
     /// Counts one backpressure event against the metrics domain of `kind`.
-    pub(super) fn record_domain_backpressure(&self, kind: uniserve_ipc::CallKind) {
+    pub(super) fn record_domain_backpressure(&self, kind: ipc::CallKind) {
         self.stats
             .domains
             .get(kind)
@@ -488,11 +488,7 @@ impl Scheduler {
 
     /// Counts one returned call, and a predicated or failed status, against
     /// the metrics domain of `kind`.
-    pub(super) fn record_domain_completion(
-        &self,
-        kind: uniserve_ipc::CallKind,
-        status: CallStatus,
-    ) {
+    pub(super) fn record_domain_completion(&self, kind: ipc::CallKind, status: CallStatus) {
         let stats = self.stats.domains.get(kind);
         stats.completed_calls.fetch_add(1, Ordering::Relaxed);
         match status {
@@ -511,7 +507,7 @@ impl Scheduler {
     ///
     /// A reclaim with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(&self, kind: uniserve_ipc::CallKind, failed: bool) {
+    pub(super) fn reclaim_domain_credit(&self, kind: ipc::CallKind, failed: bool) {
         let stats = self.stats.domains.get(kind);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {

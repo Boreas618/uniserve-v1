@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_engine::EngineCoreOutput;
-use uniserve_engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
-use uniserve_engine::{
+use engine::EngineCoreOutput;
+use engine::{EngineHandle, Scheduler, SchedulerConfig, SimEngine, SimExecutor};
+use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use uniserve_ipc::{ImageParams, MediaCall, RequestId, SamplingParams};
+use ipc::{ImageParams, MediaCall, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));
 
-    let mut rxs: HashMap<RequestId, (String, uniserve_engine::EventRx)> = HashMap::new();
+    let mut rxs: HashMap<RequestId, (String, engine::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
     let mut mk = |constraint: GenerationConstraint| {
         let id = RequestId(next_id);
@@ -67,8 +67,8 @@ fn main() -> anyhow::Result<()> {
         // These limits only check the request locally before submission; the
         // scheduler resolves its limits separately against the executor.
         let limits = GenerationLimits {
-            features: uniserve_engine::GenerationFeatures::UNDERSTANDING
-                | uniserve_engine::GenerationFeatures::IMAGE_GENERATION,
+            features: engine::GenerationFeatures::UNDERSTANDING
+                | engine::GenerationFeatures::IMAGE_GENERATION,
             max_latent_units: 64,
             latent_downsample: 16,
             max_vae_grid_tokens: 64,

@@ -10,9 +10,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cuda::DeviceId;
 use tvm_ffi::tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, DLTensor};
 use tvm_ffi::{Any, Tensor};
-use uniserve_cuda::DeviceId;
 
 use crate::{Error, Result};
 
@@ -175,23 +175,23 @@ impl DType {
 
 /// The storage element type of a head-to-rank message's dtype; messages keep
 /// their own serialized enum, converted here once.
-impl From<uniserve_ipc::DType> for DType {
-    fn from(dtype: uniserve_ipc::DType) -> Self {
+impl From<ipc::DType> for DType {
+    fn from(dtype: ipc::DType) -> Self {
         match dtype {
-            uniserve_ipc::DType::U8 => Self::U8,
-            uniserve_ipc::DType::I16 => Self::I16,
-            uniserve_ipc::DType::I32 => Self::I32,
-            uniserve_ipc::DType::I64 => Self::I64,
-            uniserve_ipc::DType::F16 => Self::F16,
-            uniserve_ipc::DType::BF16 => Self::BF16,
-            uniserve_ipc::DType::F32 => Self::F32,
+            ipc::DType::U8 => Self::U8,
+            ipc::DType::I16 => Self::I16,
+            ipc::DType::I32 => Self::I32,
+            ipc::DType::I64 => Self::I64,
+            ipc::DType::F16 => Self::F16,
+            ipc::DType::BF16 => Self::BF16,
+            ipc::DType::F32 => Self::F32,
         }
     }
 }
 
 /// The message dtype of a storage element type, for the element types
 /// messages carry.
-impl TryFrom<DType> for uniserve_ipc::DType {
+impl TryFrom<DType> for ipc::DType {
     type Error = Error;
 
     fn try_from(dtype: DType) -> Result<Self> {

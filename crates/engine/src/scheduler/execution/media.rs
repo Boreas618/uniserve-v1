@@ -8,7 +8,7 @@
 //! dispatches.
 
 use super::*;
-use uniserve_ipc::MediaCall;
+use ipc::MediaCall;
 
 /// The lanes one media call occupies while it is in flight.
 ///
@@ -1036,7 +1036,7 @@ impl Scheduler {
             request_pool_idx: Some(request_pool_idx),
             block_tables: Vec::new(),
             new_cache_units: Vec::new(),
-            forward: uniserve_ipc::ForwardBatch::default(),
+            forward: ipc::ForwardBatch::default(),
             latent: None,
             decode,
             buffers,

@@ -1,0 +1,27 @@
+[package]
+name = "storage-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Storage Server of one host and its Mooncake connector. It links no
+# CUDA runtime: it holds device memory only through descriptors, and asks
+# NVML (`cuda`) which processes a GPU still lists.
+[dependencies]
+anyhow.workspace = true
+cuda.workspace = true
+libc.workspace = true
+mooncake_store.workspace = true
+rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
+signal-hook-registry.workspace = true
+storage.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -6,12 +6,12 @@
 //! (`uniserve/models/bagel/processing.py`) uses with the default vision
 //! `image_size` of 980 and `patch_size` of 14.
 
-use serde::{Deserialize, Serialize};
-use uniserve_engine::{
+use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, ImageEncoderInput,
     ImageGenerationConfig, ImageTrigger, ModelDtype,
 };
-use uniserve_ipc::MediaCall;
+use ipc::MediaCall;
+use serde::{Deserialize, Serialize};
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
@@ -201,7 +201,7 @@ impl BagelProfile {
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
-                cfg_renorm_type: uniserve_ipc::CfgRenorm::Global,
+                cfg_renorm_type: ipc::CfgRenorm::Global,
                 cfg_renorm_min: 0.0,
                 cfg_interval: (0.0, 1.0),
                 timestep_shift: 1.0,

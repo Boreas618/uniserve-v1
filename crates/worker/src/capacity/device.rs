@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Nvml};
+use cuda::{DeviceId, Nvml};
 
 use crate::ffi::Function;
-use crate::storage::retained::Retained;
+use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
 /// Per-process device storage measurements.
@@ -77,7 +77,7 @@ impl DeviceBudget {
             .nvml
             .process_memory(device)
             .map_err(|error| match error {
-                uniserve_cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
+                cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                     "NVML reports no device storage for this process on {device}"
                 )),
                 error => Error::Cuda(error),

@@ -6,14 +6,14 @@
 //! tables register exported storage until its readers finished; the cache
 //! importer retains import destinations through their physical reads. All of
 //! them move Rust-owned storage ([`Spans`] of
-//! [`crate::storage::memory::StorageView`]s) with driver copies ordered by the
+//! [`crate::memory::allocation::StorageView`]s) with driver copies ordered by the
 //! rank's [`crate::EventPool`].
 
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uniserve_cuda::Event;
+use cuda::Event;
 
 use crate::{Completion, Error, Result};
 
@@ -125,9 +125,7 @@ pub(crate) fn plan_reads(
         let (location, covered) = location?;
         let mut remaining = Vec::new();
         for required in missing {
-            if let Some(overlap) =
-                uniserve_ipc::subtract_region(&required, &covered, &mut remaining)
-            {
+            if let Some(overlap) = ipc::subtract_region(&required, &covered, &mut remaining) {
                 reads.push(ReadRegion {
                     location,
                     source: relative_region(&overlap, &covered),

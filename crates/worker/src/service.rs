@@ -13,11 +13,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uniserve_ipc::{Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerResponse};
+use ipc::{Channel, IpcError, RequestKind, WorkerInfo, WorkerRequest, WorkerResponse};
 
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBatch;
-use crate::storage::retained::Retained;
+use crate::memory::retained::Retained;
 use crate::{Batch, Error, Executor, Submission};
 
 const EXPERT_POLL: Duration = Duration::from_micros(200);
@@ -430,11 +430,11 @@ impl Drop for Service<'_> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use uniserve_ipc::{
+    use ipc::{
         Batch as Plan, BatchCommand, Channel, GenerationParams, IpcError, Listener, NewRequest,
         RequestKey, WorkerRequest, WorkerResponse,
     };
-    use uniserve_ipc::{RequestId, SamplingParams};
+    use ipc::{RequestId, SamplingParams};
 
     use super::{Ending, Service};
     use crate::error::WorkerError;

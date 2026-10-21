@@ -15,7 +15,7 @@ pub use launch::{
     RendezvousConfig, WorkerLaunch, resolve,
 };
 
-use uniserve_ipc::{CanvasSampling, LaneConfig};
+use ipc::{CanvasSampling, LaneConfig};
 
 use crate::{Error, Result};
 

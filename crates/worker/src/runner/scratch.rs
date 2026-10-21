@@ -7,8 +7,8 @@
 //! passes it to every runner constructed on that stream, so their contexts
 //! share it.
 
+use cuda::DeviceId;
 use std::collections::BTreeMap;
-use uniserve_cuda::DeviceId;
 
 use crate::Result;
 use crate::ffi::{Handle, Interpreter};

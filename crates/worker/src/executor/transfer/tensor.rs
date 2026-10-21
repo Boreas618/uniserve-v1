@@ -18,14 +18,14 @@
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use uniserve_ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
+use ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
 
 use super::TransferBatch;
 use super::latents;
 use crate::executor::image::ImageParts;
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::{OutputPlacement, ProductBuffer, TrajectoryVersion};
-use crate::worker::WorkerStorage;
+use crate::memory::{OutputPlacement, ProductBuffer, TrajectoryVersion};
+use crate::worker::WorkerMemory;
 use crate::{Error, Result};
 
 /// How a transfer's output product is stored.
@@ -104,7 +104,7 @@ impl TransferBatch<'_> {
             self.storage
                 .tensors
                 .write(&write, read.value(), issue, read.metadata())?;
-            let WorkerStorage {
+            let WorkerMemory {
                 tensors,
                 transports,
                 ..

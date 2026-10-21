@@ -8,8 +8,8 @@
 //! delta. [`ForwardStats`] also travels from workers to the engine in batch
 //! results that report it.
 
+use ipc::ForwardStats;
 use serde::{Deserialize, Serialize};
-use uniserve_ipc::ForwardStats;
 
 /// Cache query and hit counters for one reporting interval.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

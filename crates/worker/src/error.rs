@@ -6,7 +6,7 @@
 //! codes are a wire contract: the engine matches on them (for example it
 //! escalates `InvariantViolation` like a fatal error).
 
-use uniserve_ipc::{ErrorCallIdentity, WorkerResponseError};
+use ipc::{ErrorCallIdentity, WorkerResponseError};
 
 /// Invalid submissions and operations on unavailable worker state.
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +24,7 @@ pub enum Error {
     },
     /// A CUDA driver or NCCL call failed.
     #[error(transparent)]
-    Cuda(#[from] uniserve_cuda::Error),
+    Cuda(#[from] cuda::Error),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -101,7 +101,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The failure classes a rank reports: the protocol's one vocabulary, used
 /// as they are in completions and error responses.
-pub use uniserve_ipc::ErrorCode;
+pub use ipc::ErrorCode;
 
 /// Whether a failure of class `code` is worth a full traceback in the rank's
 /// log.
@@ -327,7 +327,7 @@ fn traceback(error: &Error) -> Option<String> {
 }
 
 /// The CUDA failure an error is, directly or as a shared failure.
-fn driver_failure(error: &Error) -> Option<&uniserve_cuda::Error> {
+fn driver_failure(error: &Error) -> Option<&cuda::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
         Error::Shared(shared) => driver_failure(shared),
@@ -336,7 +336,7 @@ fn driver_failure(error: &Error) -> Option<&uniserve_cuda::Error> {
 }
 
 /// The code of a CUDA failure, by the result its call returned.
-fn driver_code(failure: &uniserve_cuda::Error) -> ErrorCode {
+fn driver_code(failure: &cuda::Error) -> ErrorCode {
     if failure.is_unrecoverable() {
         ErrorCode::FatalWorkerFailure
     } else if failure.is_out_of_memory() {
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn driver_failures_are_classified_by_their_result_code() {
         let driver = |code, message| {
-            Error::Cuda(uniserve_cuda::Error::Driver {
+            Error::Cuda(cuda::Error::Driver {
                 call: "cuMemcpyBatchAsync_v2",
                 code,
                 name: "CUDA_ERROR",

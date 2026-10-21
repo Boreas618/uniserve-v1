@@ -37,8 +37,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{BufferId, CallKind, ForwardMode, ForwardStats, RequestKey};
+use cuda::{DeviceId, Stream};
+use ipc::{BufferId, CallKind, ForwardMode, ForwardStats, RequestKey};
 
 use crate::cuda_graph::GraphMode;
 use crate::error::WorkerError;
@@ -46,6 +46,7 @@ use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::batch::{Failure, Stage, StreamOrder, fail, unsupported};
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{Completion, ExpertStep, ExpertVariant, Job};
+use crate::memory::{OutputPool, PrefixCache, UnitColumn};
 use crate::parallel::{ExpertUnion, MicrobatchForward};
 use crate::profiling::kernels::KernelCalls;
 use crate::request::decode_state::DecodeState;
@@ -53,7 +54,6 @@ use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{
     CausalLMRunner, Executed, PromptChunks, RowSource, Staged, StepContext, StepRequest, TokenRow,
 };
-use crate::storage::{OutputPool, PrefixCache, UnitColumn};
 use crate::{Error, Result};
 
 use super::batch::{Opening, Owners, Parked, TokenBatch};

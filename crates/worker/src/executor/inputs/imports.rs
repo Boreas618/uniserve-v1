@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uniserve_ipc::{
+use ipc::{
     Batch as BatchPlan, BufferId, CacheTransfer, CallKind, MediaCall, TensorExport, TensorRef,
     TransferHandle, TransferTransport,
 };
@@ -15,7 +15,7 @@ use super::{Input, component_device, installs};
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::transfer::latents::{self};
 use crate::lane::Job;
-use crate::storage::{Metadata, OutputPlacement, ValueRange};
+use crate::memory::{Metadata, OutputPlacement, ValueRange};
 use crate::{Error, Result};
 
 /// The calls reading each supplied product, as an input or a predicate.
@@ -107,7 +107,7 @@ pub(super) fn import_products(
         return Ok(true);
     }
     let readers = consumers(plan);
-    let allocations: HashMap<BufferId, uniserve_ipc::BufferAllocation> = plan
+    let allocations: HashMap<BufferId, ipc::BufferAllocation> = plan
         .buffer_allocations
         .iter()
         .map(|allocation| (allocation.buffer, *allocation))
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn image_products_carry_their_value_range() -> Result<()> {
-        let tensor = uniserve_ipc::TensorTransfer {
+        let tensor = ipc::TensorTransfer {
             shape: vec![1],
             locations: Vec::new(),
         };

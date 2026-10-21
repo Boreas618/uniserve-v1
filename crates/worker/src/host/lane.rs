@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 
-use uniserve_ipc::Wake;
+use ipc::Wake;
 
 use crate::{Completion, Error, Outcome, Result, lock};
 

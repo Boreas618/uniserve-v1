@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use ipc::Batch as BatchPlan;
 use models::video::Canvas;
 use tvm_ffi::Any;
-use uniserve_cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
-use uniserve_ipc::Batch as BatchPlan;
 
 use super::DECODER;
 use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
@@ -18,11 +18,11 @@ use crate::executor::video::MediaBatch;
 use crate::executor::video::{Parts, decode_range, publish_bound, stream_of};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::allocation::StorageView;
+use crate::memory::{RequestSlots, SlotField};
 use crate::parallel::joins::GraphFunctions;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
 use crate::runner::{RunnerSetup, device_buffer};
-use crate::storage::memory::StorageView;
-use crate::storage::{RequestSlots, SlotField};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 

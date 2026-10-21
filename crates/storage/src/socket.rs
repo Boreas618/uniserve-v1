@@ -87,9 +87,10 @@ pub fn serving(socket: &Path) -> bool {
     UnixStream::connect(socket).is_ok()
 }
 
-/// Make sure a Storage Server serves on `socket`: when none does, start
-/// `executable` (`uniserve-storage-server`) in a session of its own, not as
-/// a child of this process, so that this process's end never ends it.
+/// Make sure a Storage Server serves on `socket`: when none does, start one
+/// with `executable`'s `storage serve` command (`uniserve storage serve`) in
+/// a session of its own, not as a child of this process, so that this
+/// process's end never ends it.
 ///
 /// A server this starts is given `arguments` after its socket, such as
 /// `--tcp` to accept other hosts' heads or its Mooncake connector's
@@ -111,7 +112,7 @@ pub fn ensure(
     }
     let mut command = Command::new(executable);
     command
-        .arg("serve")
+        .args(["storage", "serve"])
         .arg("--socket")
         .arg(socket)
         .arg("--daemon")

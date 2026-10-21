@@ -15,7 +15,7 @@
 //! fatal, because slot state on the device may have advanced
 //! ([`crate::executor::batch::Failure`]).
 
-use uniserve_cuda::{CopyBatch, SourceOrder};
+use cuda::{CopyBatch, SourceOrder};
 
 use super::batch::{TokenBatch, TokenCall};
 use super::calls;
@@ -24,8 +24,8 @@ use crate::cuda_graph::{GraphMode, ShapeKey};
 use crate::executor::batch::{Batch, CallState, Failure};
 use crate::lane::Completion;
 use crate::lock;
+use crate::memory::{LogprobLayout, ProductBuffer};
 use crate::runner::causal_lm::Executed;
-use crate::storage::{LogprobLayout, ProductBuffer};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

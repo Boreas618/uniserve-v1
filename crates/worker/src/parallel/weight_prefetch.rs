@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use indexmap::IndexMap;
-use uniserve_cuda::{
+use cuda::{
     CaptureStatus, CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, SourceOrder, Stream,
 };
-use uniserve_ipc::ComponentWeights;
+use indexmap::IndexMap;
+use ipc::ComponentWeights;
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use crate::config::placement::Components;
 use crate::config::{Device, WorkerLaunch};
 use crate::cuda_graph::GraphBreaks;
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
 use crate::{Error, Result, lock};
@@ -345,8 +345,8 @@ pub(crate) struct ShardField {
 /// mappings.
 pub(crate) struct WeightStorage {
     published: Vec<crate::transfer::PeerStorage>,
-    slots: Vec<uniserve_cuda::DeviceAllocation>,
-    composites: Vec<std::sync::Arc<crate::storage::memory::Storage>>,
+    slots: Vec<cuda::DeviceAllocation>,
+    composites: Vec<std::sync::Arc<crate::memory::allocation::Storage>>,
 }
 
 /// Distributed expert weights: every rank keeps its expert shard resident
@@ -386,7 +386,7 @@ impl ExpertWeights {
         host: &str,
         layers: &[Vec<ShardField>],
         stream: &Stream,
-    ) -> Result<(Self, Vec<Vec<crate::storage::memory::StorageView>>)> {
+    ) -> Result<(Self, Vec<Vec<crate::memory::allocation::StorageView>>)> {
         let mut storage = WeightStorage {
             published: Vec::new(),
             slots: Vec::new(),
@@ -425,16 +425,16 @@ impl ExpertWeights {
         storage: &mut WeightStorage,
     ) -> Result<(
         Vec<Vec<(usize, usize, usize, usize)>>,
-        Vec<Vec<crate::storage::memory::StorageView>>,
+        Vec<Vec<crate::memory::allocation::StorageView>>,
         (usize, usize, usize),
     )> {
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        use uniserve_cuda::{DeviceAllocation, PeerMapping, memcpy_async};
+        use cuda::{DeviceAllocation, PeerMapping, memcpy_async};
 
         use crate::ffi::{Backing, DType};
-        use crate::storage::memory::{Storage, StorageView};
+        use crate::memory::allocation::{Storage, StorageView};
 
         let (rank, size) = (group.rank(), group.size());
         let page = DeviceAllocation::granularity(device)?;
@@ -603,7 +603,7 @@ impl ExpertWeights {
         compute: &Stream,
         mut record: impl FnMut(usize) -> Result<()>,
     ) -> Result<()> {
-        let capturing = compute.capture_status()? != uniserve_cuda::CaptureStatus::None;
+        let capturing = compute.capture_status()? != cuda::CaptureStatus::None;
         self.prefetch.before(layer, compute, |index| {
             if capturing {
                 record(index)
@@ -970,7 +970,7 @@ pub(crate) enum HostRetention<'a> {
     None,
     /// The worker loaded: each region is new retained host memory that joins
     /// its published weights, filled by binding.
-    Publish(&'a mut crate::storage::weights::Published),
+    Publish(&'a mut crate::memory::weights::Published),
     /// The worker bound retained weights: each region is a retained host
     /// storage among these, already holding the matrices.
     Bound(&'a [Arc<Storage>]),

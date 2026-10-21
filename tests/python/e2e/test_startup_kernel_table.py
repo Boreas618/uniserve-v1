@@ -11,7 +11,7 @@ native kernel would fail startup instead of its first request.
 
 The checkpoint directory comes from ``UNISERVE_BAGEL_MODEL``; the worker
 executable is ``UNISERVE_WORKER_EXECUTABLE``, else the test environment's
-``uniserve-worker``.
+``uniserve``.
 """
 
 from __future__ import annotations

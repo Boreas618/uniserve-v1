@@ -4,7 +4,7 @@
 //! request's results advance its media flow until it finishes.
 
 use super::*;
-use uniserve_ipc::{ForwardMode, MediaCall};
+use ipc::{ForwardMode, MediaCall};
 
 /// Describes a rejected worker result for the request's terminal error and
 /// its error finish's log line: the rejection, then the call it answered.
@@ -25,8 +25,8 @@ impl Scheduler {
     /// through `Inflight::take_ready_completions`.
     pub(in crate::scheduler) fn queue_completion(
         &mut self,
-        mut record: uniserve_ipc::CallOutput,
-        media: Result<Option<Arc<SharedMedia>>, uniserve_ipc::SharedMediaError>,
+        mut record: ipc::CallOutput,
+        media: Result<Option<Arc<SharedMedia>>, ipc::SharedMediaError>,
     ) {
         let id = record.request_key.request_id;
         let call_id = record.call_id;
@@ -65,7 +65,7 @@ impl Scheduler {
                     self.emit(id, event);
                 }
                 record.status = CallStatus::Error;
-                record.error_code = Some(uniserve_ipc::ErrorCode::ResourceError);
+                record.error_code = Some(ipc::ErrorCode::ResourceError);
                 None
             }
         };
@@ -102,7 +102,7 @@ impl Scheduler {
         &mut self,
         call: Call,
         decode: Option<DecodeRange>,
-        record: uniserve_ipc::CallOutput,
+        record: ipc::CallOutput,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
@@ -143,7 +143,7 @@ impl Scheduler {
         // worker that refuses the request states why, and the client is told.
         if !already_failed {
             if !valid {
-                let refusal = (record.error_code == Some(uniserve_ipc::ErrorCode::InputError))
+                let refusal = (record.error_code == Some(ipc::ErrorCode::InputError))
                     .then(|| record.error_message.clone())
                     .flatten();
                 if let Some(state) = self.media_state_mut(id) {
@@ -398,7 +398,7 @@ impl Scheduler {
     /// pending there is an accounting defect that latches engine-fatal.
     pub(in crate::scheduler) fn free_buffers(
         &mut self,
-        buffers: impl IntoIterator<Item = uniserve_ipc::BufferId>,
+        buffers: impl IntoIterator<Item = ipc::BufferId>,
     ) {
         let mut released = HashSet::new();
         for buffer in buffers {
@@ -515,7 +515,7 @@ impl Scheduler {
             let succeeded = report
                 .results
                 .iter()
-                .all(|result| result.output.status != uniserve_ipc::CallStatus::Error);
+                .all(|result| result.output.status != ipc::CallStatus::Error);
             tiers.completed(result_batch_id, succeeded && !invalid_result);
         }
         if invalid_result {

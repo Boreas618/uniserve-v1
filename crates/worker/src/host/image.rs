@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::ffi::DType;
 use crate::host::HostAction;
+use crate::memory::allocation::StorageView;
+use crate::memory::{OutputLease, PinnedPool};
 use crate::runner::encoder::{ImagePreparation, PreparedImage, Tower};
-use crate::storage::memory::StorageView;
-use crate::storage::{OutputLease, PinnedPool};
 use crate::{Error, Outcome, Result, lock};
 
 /// Encode `pixels` (`height * width * 3` bytes, HWC) as a base64 PNG of at

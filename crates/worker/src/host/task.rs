@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex};
 use models::video::VideoCondition;
 use tvm_ffi::{Any, AnyView};
 
-use uniserve_cuda::{CopyBatch, SourceOrder};
+use cuda::{CopyBatch, SourceOrder};
 
 use super::HostAction;
 use super::mux::{MuxSession, frame_unit};
 use super::reader::{ConditionProducts, ConditionReader};
 use crate::ffi::{Backing, DType, Function, Interpreter, MemoryKind};
-use crate::storage::memory::StorageView;
+use crate::memory::allocation::StorageView;
 use crate::stream::CUDAStream;
 use crate::transfer::{SharedMapping, SharedRead};
 use crate::{Error, Outcome, Result, lock};

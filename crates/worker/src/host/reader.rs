@@ -30,12 +30,12 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use ipc::SharedMemory;
 use models::video::{AudioClip, ConditionMedia, MediaLocator, VideoClip, VideoCondition};
 use tvm_ffi::{Any, AnyView};
-use uniserve_ipc::SharedMemory;
 
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list};
-use crate::storage::memory::{Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// The model functions condition reading calls.

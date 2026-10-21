@@ -5,15 +5,15 @@
 //! call reads its tokens, which logits it selects, where it samples, and how
 //! its request state advances when the batch commits.
 
-use uniserve_ipc::SamplingParams;
-use uniserve_ipc::{Call, CallKind, DType, ForwardMode};
+use ipc::SamplingParams;
+use ipc::{Call, CallKind, DType, ForwardMode};
 
 use super::context::Media;
 use crate::executor::PendingOutput;
+use crate::memory::BlockTables;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE as CACHE, FINISH_IDS, RowSource, TokenRow};
 use crate::sampling::{SamplingControls, SamplingPath};
-use crate::storage::BlockTables;
 use crate::{Error, Result};
 
 /// Commit modes of the slot-state commit (`uniserve.sampling.state`).
@@ -48,7 +48,7 @@ pub(super) fn kind(call: &Call) -> Result<ForwardMode> {
 }
 
 /// The admitted sampling parameters of a call's request.
-pub(super) fn parameters(admission: &uniserve_ipc::NewRequest) -> Result<&SamplingParams> {
+pub(super) fn parameters(admission: &ipc::NewRequest) -> Result<&SamplingParams> {
     admission
         .generation
         .as_ref()

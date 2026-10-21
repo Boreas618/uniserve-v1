@@ -1,18 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/cuda",
+    "crates/engine",
+    "crates/ipc",
     "crates/models",
     "crates/observability",
-    "crates/ipc",
-    "crates/cuda",
-    "crates/storage",
-    "crates/worker",
-    "crates/engine",
     "crates/server",
-    "crates/bin/uniserve",
-    "crates/bin/uniserve-launcher",
-    "crates/bin/uniserve-storage-server",
-    "crates/bin/uniserve-worker",
+    "crates/storage",
+    "crates/storage-server",
+    "crates/uniserve",
+    "crates/worker",
 ]
 
 [workspace.package]
@@ -23,14 +21,15 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
+cuda = { path = "crates/cuda" }
+engine = { path = "crates/engine" }
+ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
-uniserve-observability = { path = "crates/observability" }
-uniserve-ipc = { path = "crates/ipc" }
-uniserve-cuda = { path = "crates/cuda" }
-uniserve-storage = { path = "crates/storage" }
-uniserve-worker = { path = "crates/worker" }
-uniserve-engine = { path = "crates/engine" }
-uniserve-server = { path = "crates/server" }
+observability = { path = "crates/observability" }
+server = { path = "crates/server" }
+storage = { path = "crates/storage" }
+storage-server = { path = "crates/storage-server" }
+worker = { path = "crates/worker" }
 
 # ---- engine third-party deps ----
 crossbeam-channel = "0.5"

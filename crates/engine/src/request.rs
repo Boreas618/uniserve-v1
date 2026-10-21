@@ -8,9 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use ipc::{DiffusionSamplingParams, MediaSource, RequestId, SharedMedia, TokenLogprob};
 use models::video::{VideoCondition, VideoTask};
 use std::sync::Arc;
-use uniserve_ipc::{DiffusionSamplingParams, MediaSource, RequestId, SharedMedia, TokenLogprob};
 
 /// Terminal cause for one generation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

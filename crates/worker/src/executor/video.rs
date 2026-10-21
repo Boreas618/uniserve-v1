@@ -35,12 +35,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_cuda::Stream;
-use uniserve_ipc::{
+use cuda::Stream;
+use ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, CallStatus, ErrorCode,
     ForwardStats, MediaCall, TensorRef, WorkerInfo,
 };
-use uniserve_ipc::{CallId, MediaSource};
+use ipc::{CallId, MediaSource};
 
 use crate::config::Device;
 use crate::config::placement::GroupPlacement;
@@ -57,6 +57,7 @@ use crate::ffi::MemoryKind;
 use crate::host::HostTask;
 use crate::host::task::{MediaTask, TaskOutput};
 use crate::lane::{Completion, Job};
+use crate::memory::ProductExport;
 use crate::request::RequestPool;
 use crate::request::video::VideoRequests;
 use crate::runner::decoder::runners::DecoderRunners;
@@ -65,9 +66,8 @@ use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::ConditionSetup;
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
-use crate::storage::ProductExport;
 use crate::stream::{CUDAStream, Issue};
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, ProductRead, ProductStore, Result};
 
 /// The step a media batch's failure is reported in.
@@ -222,7 +222,7 @@ impl MediaBatch {
     fn issue_commit(
         &mut self,
         plan: &BatchPlan,
-        storage: &WorkerStorage,
+        storage: &WorkerMemory,
         requests: &RequestPool,
         trajectories: Option<&DenoiserRunner>,
         job: &Job,
@@ -289,7 +289,7 @@ impl MediaBatch {
     /// writes and seal and abandon the lease. A running task keeps its
     /// inputs and outputs to completion, so the products host tasks write
     /// stay deferred rather than abandoned under it.
-    fn discard(&mut self, storage: &WorkerStorage, job: &Job) -> Result<()> {
+    fn discard(&mut self, storage: &WorkerMemory, job: &Job) -> Result<()> {
         for state in &mut self.batch.calls {
             withdraw(&state.forward.tasks);
             state
@@ -519,7 +519,7 @@ enum Step {
 /// The parts of the backend a media batch executes with.
 pub(crate) struct Parts<'a> {
     pub(crate) requests: &'a mut RequestPool,
-    pub(crate) storage: &'a WorkerStorage,
+    pub(crate) storage: &'a WorkerMemory,
     pub(crate) info: &'a WorkerInfo,
     pub(crate) placement: &'a GroupPlacement,
     pub(crate) rank: usize,
@@ -538,7 +538,7 @@ impl<'a> Parts<'a> {
     /// The product owners, borrowed for the parts' lifetime rather than
     /// from the parts themselves.
     pub(crate) fn owners(&self) -> ProductOwners<'a> {
-        let storage: &'a WorkerStorage = self.storage;
+        let storage: &'a WorkerMemory = self.storage;
         ProductOwners {
             store: &storage.tensors,
             transports: &storage.transports,
@@ -866,7 +866,7 @@ fn ended(job: Job, failure: Failure) -> Step {
 
 /// Retire what a failed batch reserved, recording in `job` the fences that
 /// end it.
-fn retire(storage: &WorkerStorage, mut media: MediaBatch, job: Job, failure: Failure) -> Step {
+fn retire(storage: &WorkerMemory, mut media: MediaBatch, job: Job, failure: Failure) -> Step {
     let failure = match media.discard(storage, &job) {
         Ok(()) => failure,
         // Storage the cleanup could not retire stays reserved; the rank
@@ -962,10 +962,7 @@ pub(crate) fn complete(
     }
 }
 
-pub(crate) fn decode_range<'a>(
-    plan: &'a BatchPlan,
-    call: &Call,
-) -> Result<&'a uniserve_ipc::DecodeRange> {
+pub(crate) fn decode_range<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a ipc::DecodeRange> {
     plan.decode_ranges
         .iter()
         .find(|range| range.request_key == call.request_key && range.call_id == call.call_id)
@@ -982,11 +979,9 @@ pub(crate) fn stream_of(batch: &MediaBatch) -> Result<Stream> {
 }
 
 /// The most elements a product holds along one dimension.
-pub(crate) fn extent(dim: &uniserve_ipc::DimBound) -> u64 {
+pub(crate) fn extent(dim: &ipc::DimBound) -> u64 {
     match dim {
-        uniserve_ipc::DimBound::Static(extent) | uniserve_ipc::DimBound::Device { max: extent } => {
-            u64::from(*extent)
-        }
+        ipc::DimBound::Static(extent) | ipc::DimBound::Device { max: extent } => u64::from(*extent),
     }
 }
 

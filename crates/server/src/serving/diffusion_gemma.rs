@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use uniserve_engine::{GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs};
-use uniserve_ipc::MediaCall;
+use engine::{GenerationRequest, ImageEncoderInput, ImageInput, MultimodalInputs};
+use ipc::MediaCall;
 
 use crate::profile::diffusion_gemma::{DiffusionGemmaProfile, ImagePlacement};
 use crate::serving::chat::{ChatOutputProcessor, ChatRequest};
@@ -235,14 +235,14 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    use engine::ModelDtype;
+    use engine::{EngineConfig, SimEngine};
     use futures::StreamExt;
+    use ipc::CanvasSampling;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer};
-    use uniserve_engine::ModelDtype;
-    use uniserve_engine::{EngineConfig, SimEngine};
-    use uniserve_ipc::CanvasSampling;
 
-    use crate::engine::Engine;
+    use crate::frontend::Engine;
     use crate::profile::diffusion_gemma::{ControlTokens, DiffusionGemmaProfile, PatchBudget};
     use crate::profile::tokenizer::HuggingFaceTokenizer;
     use crate::profile::{ModelConfig, ModelParameters, SamplingDefaults};

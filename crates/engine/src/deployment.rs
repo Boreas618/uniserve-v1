@@ -27,11 +27,11 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context as _;
-use serde::Deserialize;
-use uniserve_ipc::{
+use ipc::{
     ComponentConfig, ComponentDistribution, ComponentWeights, ParallelConfig, SequenceParallel,
 };
-use uniserve_ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
+use ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
+use serde::Deserialize;
 
 use crate::core::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use crate::executor::WorkerGroupId;

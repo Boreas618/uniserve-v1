@@ -5,9 +5,9 @@
 //! head's own.
 
 use anyhow::{Context, bail};
+use ipc::{DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uniserve_ipc::{DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -87,16 +87,16 @@ pub enum LoadFormat {
 }
 
 impl WorkerProcessArgs {
-    /// The `uniserve-worker` executable that runs workers when none is
-    /// configured: the one installed next to the running binary, when that
-    /// directory is a Python environment's `bin/`; then the active virtual
-    /// environment's; then `uniserve-worker` on `PATH`.
+    /// The `uniserve` executable that runs workers when none is configured:
+    /// the one installed next to the running binary, when that directory is a
+    /// Python environment's `bin/`; then the active virtual environment's;
+    /// then `uniserve` on `PATH`.
     ///
     /// The executable runs workers in the environment it is installed in,
     /// so a head built outside one, such as a development build, takes the
     /// active environment's.
     pub fn default_executable() -> std::path::PathBuf {
-        const EXECUTABLE: &str = "uniserve-worker";
+        const EXECUTABLE: &str = "uniserve";
         let environment_bin = |directory: &std::path::Path| {
             ["python", "python3"]
                 .iter()
@@ -117,19 +117,6 @@ impl WorkerProcessArgs {
             return candidate;
         }
         EXECUTABLE.into()
-    }
-
-    /// The `uniserve-storage-server` executable installed beside the worker
-    /// executable `executable`, the environment's; `uniserve-storage-server`
-    /// on `PATH` when none is.
-    pub fn storage_server_beside(executable: &std::path::Path) -> std::path::PathBuf {
-        const EXECUTABLE: &str = "uniserve-storage-server";
-        let beside = executable.with_file_name(EXECUTABLE);
-        if beside.is_file() {
-            beside
-        } else {
-            EXECUTABLE.into()
-        }
     }
 }
 
@@ -171,7 +158,6 @@ impl Default for WorkerProcessArgs {
         Self {
             worker_id: "worker".into(),
             executable: Self::default_executable(),
-            storage_server: Self::storage_server_beside(&Self::default_executable()),
             // A launch the server does not name serves a deployment of its
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
@@ -287,7 +273,7 @@ impl WorkerProcessArgs {
     pub(crate) fn launch_descriptor(
         &self,
         rank: u32,
-        storage: uniserve_ipc::StorageLaunch,
+        storage: ipc::StorageLaunch,
         rendezvous: Option<&str>,
         rendezvous_listen_fd: Option<std::os::fd::RawFd>,
         expert_listen_fd: Option<std::os::fd::RawFd>,
@@ -500,9 +486,9 @@ pub(super) fn worker_environment(
 #[cfg(test)]
 mod tests {
     use super::{WorkerProcessArgs, worker_environment};
+    use ipc::{LaneConfig, LaneSpec, StorageLaunch};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use uniserve_ipc::{LaneConfig, LaneSpec, StorageLaunch};
 
     /// A storage launch as a claim at a host's server states it.
     fn storage() -> StorageLaunch {
@@ -526,8 +512,8 @@ mod tests {
             let descriptor = args
                 .launch_descriptor(0, storage(), rendezvous, generation, None)
                 .expect("descriptor");
-            let frame = uniserve_ipc::Frame::encode(&descriptor).expect("a frame");
-            let received: uniserve_ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
+            let frame = ipc::Frame::encode(&descriptor).expect("a frame");
+            let received: ipc::LaunchDescriptor = frame.decode().expect("a descriptor");
             assert_eq!(received, descriptor);
         }
     }

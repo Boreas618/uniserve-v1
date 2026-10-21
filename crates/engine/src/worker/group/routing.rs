@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::Context;
-use uniserve_ipc::Batch;
+use ipc::Batch;
 
 use super::WorkerGroup;
 use crate::executor::RankBuffer;
@@ -25,9 +25,9 @@ pub(crate) fn refuse_shared_storage_off_head(
     head: &str,
     ranks: &[crate::WorkerRank],
     components: &BTreeMap<String, crate::executor::ComponentConfig>,
-    media_components: &BTreeMap<uniserve_ipc::MediaCall, String>,
+    media_components: &BTreeMap<ipc::MediaCall, String>,
 ) -> anyhow::Result<()> {
-    use uniserve_ipc::MediaCall;
+    use ipc::MediaCall;
 
     for (call, work, object) in [
         (
@@ -96,8 +96,8 @@ pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Opti
     reason = "the consuming worker's routing, components, peers and transfer placement"
 )]
 pub(crate) fn media_consumer_slots(
-    consuming: &[uniserve_ipc::MediaCall],
-    routing: &BTreeMap<uniserve_ipc::MediaCall, String>,
+    consuming: &[ipc::MediaCall],
+    routing: &BTreeMap<ipc::MediaCall, String>,
     routed: &BTreeMap<String, crate::WorkerGroupId>,
     worker: &str,
     components: &BTreeMap<String, crate::ComponentConfig>,
@@ -173,21 +173,21 @@ impl WorkerGroup {
     /// of the rank's transfer edges.
     pub(super) fn consumer_slots(
         &self,
-        call: &uniserve_ipc::Call,
+        call: &ipc::Call,
         routed: Option<&BTreeMap<String, crate::WorkerGroupId>>,
         members: &[usize],
         rank: usize,
     ) -> Vec<u32> {
         let transfer = &self.process_args.transfer;
         let worker = &self.process_args.worker_id;
-        let consuming: Vec<uniserve_ipc::MediaCall> = match (routed, call.kind) {
+        let consuming: Vec<ipc::MediaCall> = match (routed, call.kind) {
             (Some(readers), _) => self
                 .media_routing
                 .iter()
                 .filter(|(_, component)| readers.contains_key(*component))
                 .map(|(media_call, _)| *media_call)
                 .collect(),
-            (None, uniserve_ipc::CallKind::Media(media_call)) => {
+            (None, ipc::CallKind::Media(media_call)) => {
                 match crate::scheduler::generation_consuming_calls(media_call) {
                     Some(consuming) => consuming.to_vec(),
                     None => return transfer.product_consumers(worker, rank as u32),
@@ -250,7 +250,7 @@ impl WorkerGroup {
     }
 
     /// States the deployment-wide media routing once every worker reported.
-    pub fn set_media_routing(&mut self, routing: BTreeMap<uniserve_ipc::MediaCall, String>) {
+    pub fn set_media_routing(&mut self, routing: BTreeMap<ipc::MediaCall, String>) {
         self.media_routing = routing;
     }
 }
@@ -266,7 +266,7 @@ pub(super) fn rank_projection(
     components: &BTreeMap<String, crate::ComponentConfig>,
     rank_count: usize,
     placed: &[RankBuffer],
-    consumer_slots: impl Fn(&uniserve_ipc::Call, &[usize], usize) -> Vec<u32>,
+    consumer_slots: impl Fn(&ipc::Call, &[usize], usize) -> Vec<u32>,
 ) -> anyhow::Result<Vec<(usize, Batch)>> {
     anyhow::ensure!(
         batch.buffer_allocations.is_empty(),
@@ -351,9 +351,8 @@ pub(super) fn rank_projection(
         let transfers_cache = projection.calls.iter().any(|call| {
             matches!(
                 call.kind,
-                uniserve_ipc::CallKind::Transfer(
-                    uniserve_ipc::TransferMode::CacheExport
-                        | uniserve_ipc::TransferMode::CacheInstall
+                ipc::CallKind::Transfer(
+                    ipc::TransferMode::CacheExport | ipc::TransferMode::CacheInstall
                 )
             )
         });
@@ -434,8 +433,8 @@ mod tests {
     use super::{output_owner, refuse_shared_storage_off_head};
     use crate::WorkerRank;
     use crate::executor::ComponentConfig;
+    use ipc::MediaCall;
     use std::collections::BTreeMap;
-    use uniserve_ipc::MediaCall;
 
     #[test]
     fn a_call_joins_on_the_first_component_rank_it_is_planned_on() {

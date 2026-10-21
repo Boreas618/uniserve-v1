@@ -1,7 +1,7 @@
 //! The UniServe worker runtime.
 //!
 //! A worker is a Rust process that hosts the Python interpreter: the
-//! `uniserve-worker` executable loads this library and calls its exported
+//! `uniserve worker` command loads this library and calls its exported
 //! [`worker_main`], which runs the control plane on the process's main
 //! thread and the interpreter on a Python thread of its own. Rust owns
 //! request state, storage, streams, graphs policy, transfers and the IPC
@@ -29,6 +29,7 @@ mod host;
 mod lane;
 pub mod launch;
 mod logging;
+pub mod memory;
 pub mod parallel;
 mod profiling;
 mod request;
@@ -36,7 +37,6 @@ mod rules;
 mod runner;
 mod sampling;
 mod service;
-pub mod storage;
 mod stream;
 pub mod transfer;
 mod warmup;
@@ -57,11 +57,11 @@ pub use stream::{CUDAStream, EventPool, Fill, Issue, RowFill};
 
 pub(crate) use executor::{Batch, Executor, Submission};
 pub(crate) use host::HostTask;
-pub(crate) use request::{RequestPool, RequestProgress};
-pub(crate) use storage::{
+pub(crate) use memory::{
     BlockTables, BufferBinding, LatentPool, LatentStorage, LatentUpdate, OutputBuffer, OutputPool,
     ProductBuffer, ProductRead, ProductStore,
 };
+pub(crate) use request::{RequestPool, RequestProgress};
 pub(crate) use transfer::DescriptorGrants;
 
 /// Lock `mutex`, keeping the state a panicking holder left.
@@ -91,7 +91,7 @@ pub(crate) fn leak<T>(value: T) {
     std::mem::forget(value);
 }
 
-/// The worker's entry: the `uniserve-worker` executable calls it once, on
+/// The worker's entry: the `uniserve worker` command calls it once, on
 /// the process's main thread, and exits with the status it returns, without
 /// Python finalization.
 ///

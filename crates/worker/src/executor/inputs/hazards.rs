@@ -8,13 +8,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::{
-    Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, MediaCall, TransferMode,
-};
+use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, MediaCall, TransferMode};
 
 use super::{BatchInputs, Hazard};
 use crate::executor::backend::WorkerBackend;
-use crate::storage::PrefixCache;
+use crate::memory::PrefixCache;
 use crate::transfer::Retirement;
 use crate::{Error, Outcome, Result};
 
@@ -85,7 +83,7 @@ pub(super) fn latent_hazards(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
 ) -> Result<Vec<Arc<Retirement>>> {
-    let writes: Vec<(usize, &uniserve_ipc::LatentParams, bool)> = plan
+    let writes: Vec<(usize, &ipc::LatentParams, bool)> = plan
         .latent_params
         .iter()
         .filter_map(|params| {

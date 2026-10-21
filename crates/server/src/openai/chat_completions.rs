@@ -28,15 +28,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
+use engine::GenerationConstraint;
 use futures::{Stream, StreamExt as _, pin_mut};
 use itertools::Itertools as _;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
 use tracing_futures::Instrument as _;
-use uniserve_engine::GenerationConstraint;
 
-use crate::engine::Engine;
+use crate::frontend::Engine;
 use crate::http::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{

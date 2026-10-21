@@ -16,7 +16,7 @@ mod steps;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use uniserve_ipc::{
+use ipc::{
     Batch as BatchPlan, BatchCommand, CallKind, ForwardMode, RequestKind, Stall, WorkerInfo,
     WorkerResponseError,
 };
@@ -28,6 +28,7 @@ use crate::error::WorkerError;
 use crate::host::HostLane;
 use crate::host::image::ImageTask;
 use crate::lane::{Job, JobId, JobQueues};
+use crate::memory::LatentCache;
 use crate::profiling::kernels::{KernelCalls, KernelRecord, KernelWatch};
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
@@ -40,8 +41,7 @@ use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::media::MediaRunner;
 use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
-use crate::storage::LatentCache;
-use crate::worker::WorkerStorage;
+use crate::worker::WorkerMemory;
 use crate::{Error, OutputPool, Result};
 
 pub(crate) use steps::WorkerBatch;
@@ -80,7 +80,7 @@ pub(crate) struct WorkerBackend {
 #[derive(Default)]
 pub(crate) struct Runtimes {
     /// The rank's storage owners (events, products, transports, prefix cache).
-    worker_storage: Option<WorkerStorage>,
+    worker_storage: Option<WorkerMemory>,
     /// The text runtime, on ranks holding a causal language model.
     text: Option<crate::runner::causal_lm::CausalLMRunners>,
     /// An image model's facts and host policy, on ranks holding encoders,
@@ -176,7 +176,7 @@ pub(crate) struct Parts<'a> {
     pub placement: &'a GroupPlacement,
     pub rank: usize,
     pub requests: &'a mut RequestPool,
-    pub storage: Option<&'a mut WorkerStorage>,
+    pub storage: Option<&'a mut WorkerMemory>,
     pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
     pub image: Option<ImageParts<'a>>,
     pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
@@ -325,16 +325,16 @@ impl WorkerBackend {
     }
 
     /// Install the rank's storage owners.
-    pub(crate) fn set_worker_storage(&mut self, storage: WorkerStorage) {
+    pub(crate) fn set_worker_storage(&mut self, storage: WorkerMemory) {
         self.runtimes.worker_storage = Some(storage);
         self.serve_events();
     }
 
-    pub(crate) fn worker_storage(&self) -> Option<&WorkerStorage> {
+    pub(crate) fn worker_storage(&self) -> Option<&WorkerMemory> {
         self.runtimes.worker_storage.as_ref()
     }
 
-    pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerStorage> {
+    pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerMemory> {
         self.runtimes.worker_storage.as_mut()
     }
 
@@ -531,7 +531,7 @@ impl WorkerBackend {
         &self,
         kind: CallKind,
         device: crate::ffi::MemoryKind,
-    ) -> Result<Option<uniserve_cuda::Stream>> {
+    ) -> Result<Option<cuda::Stream>> {
         if !matches!(device, crate::ffi::MemoryKind::Cuda(_)) {
             return Ok(None);
         }
@@ -747,7 +747,7 @@ impl WorkerBackend {
 
     /// Install (or clear) the service's completion wake on every storage
     /// owner.
-    pub(crate) fn set_storage_wake(&self, wake: Option<uniserve_ipc::Wake>) {
+    pub(crate) fn set_storage_wake(&self, wake: Option<ipc::Wake>) {
         self.jobs.set_wake(wake.clone());
         if let Some(storage) = &self.runtimes.worker_storage {
             storage.set_wake(wake.clone());
@@ -1026,8 +1026,8 @@ impl WorkerBackend {
 fn after(
     jobs: &JobQueues,
     kind: Option<CallKind>,
-    device: uniserve_cuda::DeviceId,
-    events: Vec<Arc<uniserve_cuda::Event>>,
+    device: cuda::DeviceId,
+    events: Vec<Arc<cuda::Event>>,
 ) -> Result<JobId> {
     match kind {
         Some(kind) => jobs.after(kind, device, events),

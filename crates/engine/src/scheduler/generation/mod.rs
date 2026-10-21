@@ -19,16 +19,16 @@
 //! are resolved afterwards in `output`.
 
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
-use crate::prefix_cache::{BlockTable, CacheAllocation};
+use crate::kv_cache::{BlockTable, CacheAllocation};
 
-use uniserve_ipc::{ForwardMode, MediaCall, TransferMode};
+use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
-use uniserve_ipc::{
+use ipc::{
     Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
     Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
-use uniserve_ipc::{CanvasSampling, RequestId, SamplingParams};
+use ipc::{CanvasSampling, RequestId, SamplingParams};
 
 /// Builds an unstamped product reference for a planned call output.
 ///
@@ -1422,7 +1422,7 @@ pub(crate) struct RequestState {
     /// Solver progress of the current image's latent trajectory.
     pub(super) denoising: super::Denoising,
     /// Exact generations retained for conditioning, denoising, and feedback.
-    pub(super) image_conditioning: Option<uniserve_ipc::BufferId>,
+    pub(super) image_conditioning: Option<ipc::BufferId>,
     /// Next feedback encoder of the generated image.
     pub(super) feedback_encoder_index: usize,
     /// Device image product of the last image decode, when feedback reads
@@ -1449,7 +1449,7 @@ pub(crate) struct RequestState {
     pub(super) prefix_published: Vec<usize>,
     /// The host page tier's keys of the request's reusable prompt pages,
     /// when the tier serves its prefill worker (`Tiers::page_keys`).
-    pub(super) page_keys: Vec<uniserve_storage::Key>,
+    pub(super) page_keys: Vec<storage::Key>,
     /// Accepted text and control tokens used by penalties and trigger matching.
     pub(super) generated_token_ids: Vec<u32>,
     /// Tokens since the last model round boundary, used by suffix-trigger matching.

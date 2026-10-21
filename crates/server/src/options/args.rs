@@ -74,7 +74,7 @@ pub struct ServeArgs {
     /// (`host_identity`).
     #[arg(long)]
     pub host_identity: Option<String>,
-    /// The `uniserve-worker` executable that runs the workers
+    /// The `uniserve` executable that runs the workers
     /// (`worker_config.executable`).
     #[arg(long, value_name = "PATH")]
     pub worker_executable: Option<PathBuf>,
@@ -378,10 +378,7 @@ mod tests {
         let (config, _) = resolved(&["--config", file]).unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/file"));
         assert_eq!(config.max_running_requests.get(), 4);
-        assert_eq!(
-            config.cuda_graph_config.policy,
-            uniserve_engine::GraphPolicy::Full
-        );
+        assert_eq!(config.cuda_graph_config.policy, engine::GraphPolicy::Full);
 
         let (config, _) = resolved(&[
             "/models/flag",
@@ -397,13 +394,10 @@ mod tests {
         .unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/flag"));
         assert_eq!(config.max_running_requests.get(), 1);
-        assert_eq!(
-            config.cuda_graph_config.policy,
-            uniserve_engine::GraphPolicy::Off
-        );
+        assert_eq!(config.cuda_graph_config.policy, engine::GraphPolicy::Off);
         assert_eq!(
             config.scheduler_config.policy,
-            uniserve_engine::SchedulingPolicy::Priority
+            engine::SchedulingPolicy::Priority
         );
         assert_eq!(config.server_config.port, 8000);
     }
@@ -441,10 +435,7 @@ mod tests {
         assert_eq!(config.video_config.aspect_ratios, ["16:9"]);
         assert_eq!(config.quantization_config["mode"], "balanced");
         assert!(config.moe_config.expert_parallel);
-        assert_eq!(
-            config.moe_config.exchange,
-            uniserve_engine::ExpertExchange::DeepEp
-        );
+        assert_eq!(config.moe_config.exchange, engine::ExpertExchange::DeepEp);
         assert_eq!(
             config.server_config.request_timeout,
             Some(Duration::from_secs(120))
@@ -540,7 +531,7 @@ mod tests {
             "--host-identity",
             "rank-0",
             "--worker-executable",
-            "/opt/env/bin/uniserve-worker",
+            "/opt/env/bin/uniserve",
             "--set",
             "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"] }]",
         ])
@@ -550,7 +541,7 @@ mod tests {
         }
         assert_eq!(
             config.worker_config.executable,
-            PathBuf::from("/opt/env/bin/uniserve-worker")
+            PathBuf::from("/opt/env/bin/uniserve")
         );
 
         let text = printed(&config).unwrap();
@@ -560,7 +551,7 @@ mod tests {
 
     /// Resolves `args`, checks them, and derives the engine configuration
     /// they state.
-    fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, uniserve_engine::EngineConfig)> {
+    fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, engine::EngineConfig)> {
         let (config, stated) = resolved(args)?;
         config.validate(&stated)?;
         let engine = config.engine_config()?;
@@ -711,19 +702,16 @@ mod tests {
         let worker = &engine.worker_process;
         assert_eq!(worker.lanes.len(), 1);
         assert_eq!(worker.quantization_config["mode"], "performance");
-        assert_eq!(
-            engine.expert_parallel,
-            Some(uniserve_engine::ExpertExchange::Dwdp)
-        );
+        assert_eq!(engine.expert_parallel, Some(engine::ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
         assert_eq!(engine.chunked_prefill_size, 512);
         assert_eq!(
             engine.max_num_batched_tokens,
-            uniserve_engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
+            engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
         assert_eq!(
             worker.max_batch_tokens as usize,
-            uniserve_engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
+            engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
 
         let lane = "lanes=[{ lane_id = \"decode\", sm_budget = 0, domains = [\"decode\"] }]";

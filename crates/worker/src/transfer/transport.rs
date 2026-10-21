@@ -19,8 +19,8 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
-use uniserve_cuda::{DeviceId, Event, Stream};
-use uniserve_ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
+use cuda::{DeviceId, Event, Stream};
+use ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::backing::TransportBuffer;
 use super::export_table::ExportTable;
@@ -31,7 +31,7 @@ use super::{
     ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
 use crate::ffi::{DType, MemoryKind};
-use crate::storage::memory::Storage;
+use crate::memory::allocation::Storage;
 use crate::stream::Issue;
 use crate::{Error, EventPool, Result, lock};
 

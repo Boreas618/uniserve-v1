@@ -5,7 +5,7 @@
 //! sampling position.
 
 use super::*;
-use uniserve_ipc::{ForwardMode, VisionInput};
+use ipc::{ForwardMode, VisionInput};
 
 impl Scheduler {
     /// Builds a call and records the cache units owned by its next dispatch.

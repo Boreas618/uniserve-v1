@@ -25,9 +25,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use uniserve_cuda::DeviceId;
-use uniserve_ipc::ComponentConfig;
-use uniserve_ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransport};
+use cuda::DeviceId;
+use ipc::ComponentConfig;
+use ipc::{Batch as BatchPlan, Call, DimBound, TensorRef, TransferTransport};
 
 use crate::executor::products::{OutputShape, Placement, bind_outputs, supplied};
 use crate::executor::video::{MediaBatch, Parts, Publication, product_name};
@@ -36,9 +36,9 @@ use crate::host::mux::{MuxFunctions, read_unit};
 use crate::host::reader::{ConditionProducts, ConditionReader, ReaderFunctions};
 use crate::host::task::{MediaTask, UnitFrames, Upload};
 use crate::host::{HostLane, HostTask};
+use crate::memory::PinnedPool;
+use crate::memory::allocation::StorageView;
 use crate::runner::component::units;
-use crate::storage::PinnedPool;
-use crate::storage::memory::StorageView;
 use crate::stream::CUDAStream;
 use crate::transfer::TransportKind;
 use crate::{Error, ProductBuffer, Result};

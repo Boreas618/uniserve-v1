@@ -15,12 +15,12 @@ pub mod config;
 use std::sync::Arc;
 
 use config::Config;
+use cuda::{DeviceId, Stream};
 use tvm_ffi::{Any, Array, Map, String as FfiString, Tensor};
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_worker::config::Device;
-use uniserve_worker::ffi::{Backing, DType, Handle, Interpreter};
-use uniserve_worker::storage::{Storage, StorageView};
-use uniserve_worker::{
+use worker::config::Device;
+use worker::ffi::{Backing, DType, Handle, Interpreter};
+use worker::memory::{Storage, StorageView};
+use worker::{
     DecodeImage, DecoderRunner, EncoderConfig, EncoderInfo, EncoderRunner, GraphPool,
     ImagePreparation, ImageSetup, Result, Tower,
 };
@@ -96,9 +96,9 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                 .list("orders")?
                 .into_iter()
                 .map(|order| {
-                    uniserve_worker::ffi::integers(order)
+                    worker::ffi::integers(order)
                         .map(|order| order.into_iter().map(|index| index as usize).collect())
-                        .map_err(|error| uniserve_worker::Error::numerical("orders", &error))
+                        .map_err(|error| worker::Error::numerical("orders", &error))
                 })
                 .collect::<Result<_>>()?,
             None => vec![(0..payloads.len()).collect()],
@@ -131,7 +131,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let mut runner = EncoderRunner::image(&setup, info, &settings)?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
             let Device::Cuda(cuda) = device else {
-                return Err(uniserve_worker::Error::Invalid(
+                return Err(worker::Error::Invalid(
                     "capture requires a CUDA device".into(),
                 ));
             };
@@ -147,7 +147,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let preparation = ImagePreparation::new(loaded.clone())?;
         let dtype = runner
             .pixel_dtype()
-            .ok_or_else(|| uniserve_worker::Error::Invalid("the harness encodes images".into()))?;
+            .ok_or_else(|| worker::Error::Invalid("the harness encodes images".into()))?;
         let images = payloads
             .iter()
             .map(|payload| {
@@ -165,9 +165,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             EncoderInfo::Latent(latent) => latent.output_dtype,
             EncoderInfo::Text(text) => text.output_dtype,
             EncoderInfo::Condition => {
-                return Err(uniserve_worker::Error::Invalid(
-                    "the harness encodes images".into(),
-                ));
+                return Err(worker::Error::Invalid("the harness encodes images".into()));
             }
         };
         let mut results = Vec::new();
@@ -185,7 +183,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             for (shape, output) in encoded.shapes.iter().zip(&outputs) {
                 results.push(Any::from(view(output, shape)?));
             }
-            results.push(Any::from(uniserve_worker::ffi::integer_list([
+            results.push(Any::from(worker::ffi::integer_list([
                 encoded.replays as i64,
                 encoded.eager as i64,
             ])));
@@ -204,19 +202,21 @@ fn pool(device: DeviceId) -> Result<Arc<GraphPool>> {
     let value: Array<Any> = Interpreter::import("uniserve.cuda_graph.pool")?
         .call_as(&[(&Any::from(i64::from(device.0))).into()])?;
     let number = |index: usize| -> Result<u64> {
-        let value = value.get(index).map_err(|error| {
-            uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error)
-        })?;
+        let value = value
+            .get(index)
+            .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))?;
         i64::try_from(value)
             .map(|value| value as u64)
-            .map_err(|error| uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error))
+            .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))
     };
     Ok(Arc::new(GraphPool {
         device,
         id: (number(1)?, number(2)?),
-        value: Handle::new(value.get(0).map_err(|error| {
-            uniserve_worker::Error::numerical("uniserve.cuda_graph.pool", &error)
-        })?)?,
+        value: Handle::new(
+            value
+                .get(0)
+                .map_err(|error| worker::Error::numerical("uniserve.cuda_graph.pool", &error))?,
+        )?,
     }))
 }
 
@@ -245,9 +245,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         };
         let products = arena(Device::Cpu)?;
         let [units, width] = latents.shape()[..] else {
-            return Err(uniserve_worker::Error::Invalid(
-                "latents are [units, width]".into(),
-            ));
+            return Err(worker::Error::Invalid("latents are [units, width]".into()));
         };
         let bytes = (units * width) as usize * 2;
         let memory = Storage::host(bytes);
@@ -264,8 +262,8 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let mut images = Vec::new();
         let mut sample = 0;
         for (index, size) in sizes.iter().enumerate() {
-            let size = uniserve_worker::ffi::integers(size.clone())
-                .map_err(|error| uniserve_worker::Error::numerical("sizes", &error))?;
+            let size = worker::ffi::integers(size.clone())
+                .map_err(|error| worker::Error::numerical("sizes", &error))?;
             let (height, width) = (size[0] as u32, size[1] as u32);
             let rows = (height / 16) * (width / 16);
             images.push(DecodeImage {
@@ -284,7 +282,7 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         for (image, pixels) in images.iter().zip(staged) {
             results.push(Any::from(pixels.to_tensor()?));
             let product = image.product.as_ref().ok_or_else(|| {
-                uniserve_worker::Error::Invariant("a decoded image lost its product".into())
+                worker::Error::Invariant("a decoded image lost its product".into())
             })?;
             results.push(Any::from(view(
                 product,

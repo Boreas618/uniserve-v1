@@ -22,7 +22,7 @@
 //! The serving path of these graphs is warmed by the engine, with a real
 //! request through its scheduler once the rank reported.
 
-use uniserve_ipc::{CallKind, ForwardMode};
+use ipc::{CallKind, ForwardMode};
 
 use std::sync::Arc;
 
@@ -33,13 +33,13 @@ use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::Backing;
 use crate::lane::{BLOCK_ON_TIMEOUT, Job, JobQueues};
+use crate::memory::PrefixCache;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::sampling::RowSampling;
-use crate::storage::PrefixCache;
-use crate::storage::memory::{Storage, StorageView};
 use crate::stream::Issue;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
@@ -289,7 +289,7 @@ impl CausalLMRunners {
         kind: CallKind,
         prefix_cache: &mut PrefixCache,
         lengths: &[usize],
-        stream: Option<&uniserve_cuda::Stream>,
+        stream: Option<&cuda::Stream>,
         steps: impl FnOnce(&mut Self, &mut PrefixCache, &Job) -> Result<()>,
     ) -> Result<()> {
         let perform = |job: Job| -> Result<()> {

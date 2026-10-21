@@ -1,6 +1,6 @@
 //! Startup of a video model's encoder runners on a rank.
 
-use uniserve_ipc::MediaCall;
+use ipc::MediaCall;
 
 use super::runners::EncoderRunners;
 use super::{EncoderConfig, EncoderRunner, TextSetup};

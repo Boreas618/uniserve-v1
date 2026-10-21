@@ -6,7 +6,7 @@
 //! step of its fixed schedule, and the worker reports the steps it has
 //! accepted. [`Denoising`] owns that progress for both.
 
-use uniserve_ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
+use ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
 
 /// Where an image request's latent lives on its worker and the raster it
 /// describes.

@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use uniserve_cuda::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
-use uniserve_ipc::SharedMemory;
-use uniserve_ipc::{Locator, TransferTransport};
+use cuda::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
+use ipc::SharedMemory;
+use ipc::{Locator, TransferTransport};
 
 use super::backing::TransportBuffer;
 use super::export_table::ExportTable;
@@ -23,7 +23,7 @@ use super::{
     drain_event,
 };
 use crate::ffi::{Backing, MemoryKind};
-use crate::storage::memory::StorageView;
+use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 

@@ -6,11 +6,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use cuda::{DeviceId, Stream};
+use ipc::{Batch as BatchPlan, CallKind, MediaCall};
 use models::video::plan::CANVAS_MULTIPLE;
 use models::video::{Canvas, VideoCondition};
 use tvm_ffi::Any;
-use uniserve_cuda::{DeviceId, Stream};
-use uniserve_ipc::{Batch as BatchPlan, CallKind, MediaCall};
 
 use super::{
     ENCODER, EncoderConfig, EncoderInfo, EncoderMethods, EncoderRunner, OwnedContext, PromptVision,
@@ -26,10 +26,10 @@ use crate::executor::video::{
 };
 use crate::ffi::{Backing, DType, Function, Handle, Interpreter, integer_list, integers};
 use crate::lane::{Capture, Completion, Job};
+use crate::memory::PinnedPool;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::runner::RunnerSetup;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
-use crate::storage::PinnedPool;
-use crate::storage::memory::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// A condition encoding was recorded before the job that constructs its
@@ -908,7 +908,7 @@ pub(crate) fn encode_vision(
 fn condition_input(
     parts: &Parts<'_>,
     plan: &BatchPlan,
-    call: &uniserve_ipc::Call,
+    call: &ipc::Call,
     slot: usize,
 ) -> Result<Option<ConditionInput>> {
     if call.inputs.len() != 1 || call.outputs.len() != 1 {

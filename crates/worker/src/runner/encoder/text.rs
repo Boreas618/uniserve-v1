@@ -3,13 +3,13 @@
 //! and the encode of a prompt, natively through its capacity's graph or, with
 //! vision tokens ([`PromptVision`]), on the Python thread.
 
-use uniserve_cuda::{CopyBatch, SourceOrder};
+use cuda::{CopyBatch, SourceOrder};
 
 use super::{EncoderGraph, EncoderRunner};
 use crate::cuda_graph::GraphMode;
 use crate::lane::Job;
+use crate::memory::allocation::StorageView;
 use crate::runner::methods::{Argument, MethodCall};
-use crate::storage::memory::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
 

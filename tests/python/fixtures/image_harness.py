@@ -1,7 +1,7 @@
 """The worker's image harness library.
 
 ``crates/worker/examples/image_harness.rs`` (built with ``cargo build -p
-uniserve-worker --example image_harness``) binds image runners over the
+worker --example image_harness``) binds image runners over the
 real numerical interface and returns their Rust-owned results.
 ``UNISERVE_IMAGE_HARNESS`` overrides its path.
 """
@@ -27,6 +27,6 @@ def image_harness():
     if not path.exists():
         pytest.fail(
             f"{path} is missing: build it with "
-            "`cargo build -p uniserve-worker --example image_harness`"
+            "`cargo build -p worker --example image_harness`"
         )
     return tvm_ffi.load_module(str(path))
