@@ -240,6 +240,26 @@ class ExpertTransport:
         nothing.
         """
 
+    def release(self) -> bool:
+        """Free a workspace that cannot keep its addresses, while parked.
+
+        Collective over the group, while no step runs, for a workspace
+        :meth:`suspend` kept. A transport whose workspace the captured
+        graphs address, and which cannot be mapped back at its addresses,
+        frees it and returns ``True``: the graphs that use it are captured
+        again after :meth:`rebuild`. The default keeps it and returns
+        ``False``.
+        """
+        return False
+
+    def rebuild(self) -> None:
+        """Create the workspace :meth:`release` freed again, collectively.
+
+        The new workspace has the released one's layout at new addresses;
+        the graphs that use it are captured again afterwards. The default
+        does nothing.
+        """
+
     def close(self) -> None:
         """Release owned resources after every reader retired.
 

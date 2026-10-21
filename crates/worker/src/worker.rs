@@ -796,9 +796,10 @@ impl Worker {
     /// worker group) take one mode: one rank's crowded device suspends them
     /// all. Suspending copies the graph pools and scratch to host memory,
     /// releases the expert transports' workspaces that keep their addresses
-    /// ([`ExpertUnion::suspend`]), and suspends every NCCL communicator of
-    /// the runners' collectives and of the torch world. Returns what it
-    /// released.
+    /// ([`ExpertUnion::suspend`]) and frees those that cannot
+    /// ([`ExpertUnion::release`]), whose graphs the promotion captures
+    /// again, and suspends every NCCL communicator of the runners'
+    /// collectives and of the torch world. Returns what it released.
     ///
     /// # Errors
     ///
@@ -853,6 +854,23 @@ impl Worker {
             }
             _ => None,
         };
+        // A workspace that cannot keep its addresses is freed: the promotion
+        // rebuilds it and captures the graphs that run expert steps again,
+        // with the warmup work of their runtimes, which the worker hands
+        // over.
+        let recapture = match self.executor.backend().experts() {
+            Some(union) if union.release().map_err(phase("standby"))? => {
+                tracing::info!(
+                    "the standby worker released its expert workspaces, which its promotion rebuilds"
+                );
+                let (recapture, keep) = std::mem::take(&mut self.hooks)
+                    .into_iter()
+                    .partition(|hooks| hooks.steps_experts());
+                self.hooks = keep;
+                recapture
+            }
+            _ => Vec::new(),
+        };
         // NCCL releases its communicators' buffers; the graphs that captured
         // their collectives replay once they resume.
         for collectives in self.executor.backend().collectives() {
@@ -874,6 +892,7 @@ impl Worker {
             pools,
             experts,
             world: Some(world),
+            recapture,
         })
     }
 

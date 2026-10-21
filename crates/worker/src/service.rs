@@ -57,6 +57,11 @@ enum PendingResponse {
 /// nothing for a standby that keeps its memory resident.
 #[derive(Default)]
 pub(crate) struct Suspension {
+    /// The warmup work of the runtimes that run expert steps, when the
+    /// expert transports freed workspaces that cannot keep their
+    /// addresses: the promotion rebuilds them and captures those runtimes'
+    /// graphs again.
+    pub(crate) recapture: Vec<Box<dyn crate::warmup::WarmupHooks>>,
     /// The graph pools and scratch whose contents it moved to host memory.
     pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
     /// The expert union whose transport workspaces it released.
@@ -78,20 +83,28 @@ impl Parked {
     /// access to the retained storages: the captured graphs run again.
     /// Restoring the expert transports is collective over the union: the
     /// engine asks every rank of the standby world to promote before it
-    /// awaits any.
-    fn promote(self, backend: &crate::executor::backend::WorkerBackend) -> crate::Result<()> {
-        let Suspension {
-            pools,
-            experts,
-            world,
-        } = &self.suspension;
-        for pool in pools {
+    /// awaits any. Transports that freed their workspaces are rebuilt, and
+    /// the graphs that run expert steps captured again, as warmup captured
+    /// them: collectively, on the scratch units, with write access.
+    fn promote(self, executor: &mut Executor) -> std::result::Result<(), WorkerError> {
+        let Parked {
+            retained,
+            suspension:
+                Suspension {
+                    recapture,
+                    pools,
+                    experts,
+                    world,
+                },
+        } = self;
+        let backend = executor.backend();
+        for pool in &pools {
             pool.restore()?;
         }
         if !pools.is_empty() {
             tracing::info!("the promoted standby worker restored its graph memory");
         }
-        if let Some(world) = world {
+        if let Some(world) = &world {
             for collectives in backend.collectives() {
                 collectives.resume()?;
             }
@@ -99,11 +112,27 @@ impl Parked {
                 .invoke(&[world.view()])?;
             tracing::info!("the promoted standby worker resumed its communicators");
         }
-        if let Some(experts) = experts {
+        if let Some(experts) = &experts {
             experts.restore()?;
             tracing::info!("the promoted standby worker restored its expert transports");
         }
-        self.retained.promote()
+        retained.promote()?;
+        if recapture.is_empty() {
+            return Ok(());
+        }
+        // The union's only holder now is the backend.
+        drop(experts);
+        let backend = executor.backend_mut();
+        if let Some(union) = backend.experts_mut()? {
+            union.rebuild()?;
+        }
+        backend.reopen_expert_graphs()?;
+        for mut hooks in recapture {
+            hooks.capture(backend)?;
+        }
+        backend.seal_expert_graphs();
+        tracing::info!("the promoted standby worker captured its expert graphs again");
+        Ok(())
     }
 }
 
@@ -315,12 +344,14 @@ impl<'a> Service<'a> {
             }
             WorkerRequest::Promote { message_id } => {
                 let promoted = match self.standby.take() {
-                    Some(parked) => parked.promote(self.executor.backend()),
-                    None => Err(Error::State("only a parked standby worker is promoted")),
+                    Some(parked) => parked.promote(self.executor),
+                    None => Err(WorkerError::from(Error::State(
+                        "only a parked standby worker is promoted",
+                    ))),
                 };
                 PendingResponse::Ready(Box::new(match promoted {
                     Ok(()) => WorkerResponse::Ok { message_id },
-                    Err(error) => self.error_response(message_id, WorkerError::from(error))?,
+                    Err(error) => self.error_response(message_id, error)?,
                 }))
             }
             WorkerRequest::Submit { message_id, .. } if self.standby.is_some() => {

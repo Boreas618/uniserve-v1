@@ -33,4 +33,11 @@ pub(crate) trait WarmupHooks {
     fn capture(&mut self, _backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         Ok(())
     }
+
+    /// Whether the runtime's graphs run expert steps, and so address the
+    /// expert transports' workspaces: a promoted standby whose transports
+    /// were rebuilt captures them again.
+    fn steps_experts(&self) -> bool {
+        false
+    }
 }

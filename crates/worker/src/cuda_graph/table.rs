@@ -106,6 +106,15 @@ impl<K: Eq + Hash + std::fmt::Debug> GraphTable<K> {
         self.sealed = true;
     }
 
+    /// Release every graph, newest first, and accept captures again: the
+    /// workspaces they addressed were created anew, and warmup captures
+    /// every key again. The caller drained the streams that replay them.
+    pub(crate) fn reopen(&mut self) -> Result<()> {
+        let released = self.close(false);
+        self.sealed = false;
+        released
+    }
+
     /// Release every graph, newest first, attempting all before returning
     /// the first failure. The caller has drained the streams that replay
     /// them. An aborted close keeps the Python graphs (and the inputs and
@@ -197,6 +206,27 @@ mod tests {
         aborted.insert(1, None, graph(9))?;
         aborted.close(true)?;
         assert!(released.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// A sealed table that reopens releases its graphs, captures every key
+    /// again, and seals again.
+    #[test]
+    fn a_reopened_table_releases_its_graphs_and_captures_again() -> Result<()> {
+        let (release, released) = recorder();
+        let mut table = GraphTable::new("text", release);
+        table.insert(8, None, graph(1))?;
+        table.insert(4, None, graph(2))?;
+        table.seal();
+
+        table.reopen()?;
+        assert_eq!(*released.lock().unwrap(), vec![2, 1]);
+        assert!(matches!(table.lookup(&8, None)?, Lookup::Capture));
+        table.insert(8, None, graph(3))?;
+        assert!(matches!(table.lookup(&8, None)?, Lookup::Replay(_)));
+
+        table.seal();
+        assert!(table.lookup(&4, None).is_err());
         Ok(())
     }
 }

@@ -294,6 +294,25 @@ def restore_exchange(exchange) -> None:
     exchange.restore()
 
 
+def release_exchange(exchange) -> bool:
+    """Free a parked standby's workspace that cannot keep its addresses.
+
+    Collective over the union, after :func:`suspend_exchange`, while no step
+    runs. Returns whether the transport freed it: the graphs captured over
+    it are captured again after :func:`rebuild_exchange`.
+    """
+    return bool(exchange.release())
+
+
+def rebuild_exchange(exchange) -> None:
+    """Create a released transport workspace again, collectively.
+
+    Called at the promotion of the members' standby world, after every
+    restore and before the graphs that use it are captured again.
+    """
+    exchange.rebuild()
+
+
 def _prefetched_layers(model) -> list[FusedMoE]:
     """Expert layers whose weights are distributed: partitioned and loaded."""
     return [

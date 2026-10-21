@@ -19,13 +19,16 @@ graphs (decode batches up to 8, no prefill graphs), so that the workers
 start again while the count streams.
 
 Two schedulers that share their experts (``--data-parallel-size 2`` with
-expert parallelism) form one expert world, which keeps a standby world
+expert parallelism), or attention and expert workers exchanging through
+DeepEP, form one expert world, which keeps a standby world
 (``worker_config.standby``): once both serve, each worker group is launched
 a second time beside the first, at a rendezvous of its own, and parks with
 its graphs captured, its device memory kept resident or suspended
 (``worker_config.standby_memory``: suspended, it also releases its
 all-to-all workspaces and NCCL communicators, which its ranks restore
-together at the promotion). Killing a serving rank promotes that world in
+together at the promotion, and frees DeepEP's windows, which cannot keep
+their addresses: the promotion rebuilds them and captures the graphs that
+run expert steps again). Killing a serving rank promotes that world in
 place of a relaunch, and the request continues on it.
 
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
@@ -48,6 +51,7 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    dedicated_experts,
     find_free_port,
     require_uniserve_binary,
     server_process,
@@ -283,16 +287,33 @@ def test_a_request_continues_after_its_engine_process_is_lost(tmp_path: Path):
     assert usage == reference_usage
 
 
+def _expert_world(topology: str, tmp_path: Path) -> tuple[str, ...]:
+    """The options of an expert world of two groups on two GPUs.
+
+    ``replicas``: two schedulers sharing their experts over the all-to-all.
+    ``dedicated``: attention and expert workers exchanging through DeepEP,
+    whose windows a suspended standby frees and its promotion rebuilds.
+    """
+    if topology == "replicas":
+        return ("--data-parallel-size", "2")
+    return (
+        "--worker-groups",
+        str(dedicated_experts(tmp_path)),
+        "--set",
+        "moe_config.exchange=deepep",
+    )
+
+
+@pytest.mark.parametrize("topology", ["replicas", "dedicated"])
 @pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
 def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
-    tmp_path: Path, standby_memory: str
+    tmp_path: Path, standby_memory: str, topology: str
 ):
     streamed, usage, reference, reference_usage, lines = _stream_through_a_kill(
         tmp_path,
         "worker",
         options=(
-            "--data-parallel-size",
-            "2",
+            *_expert_world(topology, tmp_path),
             "--set",
             "moe_config.expert_parallel=true",
             "--set",
@@ -310,7 +331,9 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
     assert logged("the failure domain's standby world was promoted")
     assert not logged("relaunching the failure domain's worker groups")
     assert logged("a request migrated"), "the streaming request did not migrate"
-    if standby_memory == "suspended":
+    if standby_memory == "resident":
+        assert logged("the standby worker keeps its graph memory resident")
+    elif topology == "replicas":
         for event in (
             "the standby worker suspended its expert transports",
             "the standby worker suspended its communicators",
@@ -319,6 +342,12 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
         ):
             assert logged(event), event
     else:
-        assert logged("the standby worker keeps its graph memory resident")
+        for event in (
+            "the standby worker released its expert workspaces",
+            "the standby worker suspended its communicators",
+            "the promoted standby worker resumed its communicators",
+            "the promoted standby worker captured its expert graphs again",
+        ):
+            assert logged(event), event
     assert streamed == reference
     assert usage == reference_usage

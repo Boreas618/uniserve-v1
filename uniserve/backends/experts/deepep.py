@@ -82,45 +82,7 @@ class DeepEP(ExpertTransport):
         self.local_start = (group.rank - attention_ranks) * local_experts
         self.wire_experts = group.size * local_experts
         self._native = load()
-        identity = bootstrap.bcast(
-            self._native.get_local_nccl_unique_id()
-            if group.rank == 0
-            else None,
-            root=0,
-        )
-        self._comm = self._native.create_nccl_comm(
-            identity, group.size, group.rank
-        )
-        # The elastic metadata can use one guard slot beyond a token bucket.
-        # The caller-visible capacity remains max_tokens.
-        nbytes = self._native.calculate_elastic_buffer_size(
-            self._comm,
-            max_tokens + 1,
-            self.wire_hidden,
-            top_k,
-            False,
-            True,
-            True,
-        )
-        self._buffer = self._native.ElasticBuffer(
-            group.rank,
-            group.size,
-            self._comm,
-            nbytes,
-            False,
-            True,
-            True,
-            True,
-            3,
-            129,
-            120,
-            120,
-            True,
-        )
-        torch.cuda.synchronize(group.device)
-        bootstrap.barrier()
-        self._buffer.barrier(True, False)
-        torch.cuda.synchronize(group.device)
+        self._open()
         self._sms = min(
             24,
             torch.cuda.get_device_properties(
@@ -143,6 +105,72 @@ class DeepEP(ExpertTransport):
             ]
             | None
         ) = None
+
+    def _open(self) -> None:
+        """Create the native communicator and the elastic buffer.
+
+        Collective over the group: rank 0's NCCL unique id travels through
+        the bootstrap, and every member passes the buffer's barriers.
+        """
+        group = self.group
+        identity = self.bootstrap.bcast(
+            self._native.get_local_nccl_unique_id()
+            if group.rank == 0
+            else None,
+            root=0,
+        )
+        self._comm = self._native.create_nccl_comm(
+            identity, group.size, group.rank
+        )
+        # The elastic metadata can use one guard slot beyond a token bucket.
+        # The caller-visible capacity remains max_tokens.
+        nbytes = self._native.calculate_elastic_buffer_size(
+            self._comm,
+            self.max_tokens + 1,
+            self.wire_hidden,
+            self.top_k,
+            False,
+            True,
+            True,
+        )
+        self._buffer = self._native.ElasticBuffer(
+            group.rank,
+            group.size,
+            self._comm,
+            nbytes,
+            False,
+            True,
+            True,
+            True,
+            3,
+            129,
+            120,
+            120,
+            True,
+        )
+        torch.cuda.synchronize(group.device)
+        self.bootstrap.barrier()
+        self._buffer.barrier(True, False)
+        torch.cuda.synchronize(group.device)
+
+    def release(self) -> bool:
+        """Destroy the elastic buffer and its communicator while parked.
+
+        The buffer's window addresses and device communicator are kernel
+        parameters of the captured graphs, so they cannot be mapped back:
+        :meth:`rebuild` creates new ones, over which the graphs are
+        captured again.
+        """
+        self.close()
+        return True
+
+    def rebuild(self) -> None:
+        """Create a new elastic buffer and communicator, collectively."""
+        if self._buffer is not None:
+            raise RuntimeError("only a released exchange is rebuilt")
+        self._open()
+        # The first call after a rebuild waits on the host barrier again.
+        self.ready = False
 
     def dispatch(self, hidden, topk_ids, topk_weights, *, invalid_expert):
         """Route BF16 or encoded NVFP4 rows without changing their values.

@@ -78,6 +78,10 @@ impl WarmupHooks for CausalLMWarmup {
                 WorkerError::classify(error, Some("text context warmup")).with_phase("warmup")
             })
     }
+
+    fn steps_experts(&self) -> bool {
+        true
+    }
 }
 
 /// Rows of `lengths` host tokens for consecutive slots from `first`.

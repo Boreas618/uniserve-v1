@@ -134,6 +134,14 @@ impl CausalLMRunners {
         }
     }
 
+    /// Release every runner's graphs and accept captures again.
+    pub(crate) fn reopen(&mut self) -> Result<()> {
+        for runner in &mut self.runners {
+            runner.reopen()?;
+        }
+        Ok(())
+    }
+
     /// The order of these runners' batches across streams; other runtimes
     /// reading what text batches write (their prefix cache) wait on it.
     pub(crate) fn order(&self) -> &StreamOrder {

@@ -260,6 +260,12 @@ impl DiffusionLMRunner {
         self.graphs.seal();
     }
 
+    /// Release every graph and accept captures again
+    /// ([`GraphTable::reopen`]).
+    pub(crate) fn reopen(&mut self) -> Result<()> {
+        self.graphs.reopen()
+    }
+
     /// The NCCL communicators the runner's collectives run on.
     pub(crate) fn collectives(&self) -> &[crate::parallel::StreamCollectives] {
         &self.collectives
@@ -1148,5 +1154,9 @@ impl WarmupHooks for DiffusionLMWarmup {
                 })?;
         }
         Ok(())
+    }
+
+    fn steps_experts(&self) -> bool {
+        true
     }
 }

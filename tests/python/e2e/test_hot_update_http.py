@@ -28,12 +28,14 @@ memory and released on the device at unchanged addresses, then mapped back
 with its contents at the promotion, before its graphs run. Either way the
 new engine's graphs decode the same count.
 
-The deployment runs on one GPU, or as two schedulers that share their
-experts (``--data-parallel-size 2`` with expert parallelism): the standby
+The deployment runs on one GPU, as two schedulers that share their
+experts (``--data-parallel-size 2`` with expert parallelism), or as
+attention and expert workers exchanging through DeepEP: the standby
 engine's workers then form an expert world of their own beside the running
 one, and a suspended standby also releases its all-to-all workspaces and
 NCCL communicators, which every rank of its world restores together at the
-promotion.
+promotion, and frees DeepEP's windows, which its promotion creates again
+before it captures the graphs that run expert steps anew.
 
 The test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
 daemon at a directory of the test's, and the server the daemon starts there
@@ -58,6 +60,7 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    dedicated_experts,
     find_free_port,
     require_uniserve_binary,
     server_process,
@@ -157,27 +160,38 @@ def _engine_builds(lines: list[str]) -> set[str]:
     }
 
 
-# The devices and extra options of each deployment.
-TOPOLOGIES = {
-    "single": ("0", ()),
-    "experts": (
-        "0,1",
-        (
+def _topology(topology: str, tmp_path: Path) -> tuple[str, tuple[str, ...]]:
+    """The devices and extra options of a deployment.
+
+    ``single``: one GPU. ``experts``: two schedulers sharing their experts
+    over the all-to-all. ``dedicated``: attention and expert workers
+    exchanging through DeepEP.
+    """
+    if topology == "single":
+        return "0", ()
+    if topology == "experts":
+        return "0,1", (
             "--data-parallel-size",
             "2",
             "--set",
             "moe_config.expert_parallel=true",
-        ),
-    ),
-}
+        )
+    return "0,1", (
+        "--worker-groups",
+        str(dedicated_experts(tmp_path)),
+        "--set",
+        "moe_config.expert_parallel=true",
+        "--set",
+        "moe_config.exchange=deepep",
+    )
 
 
-@pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
+@pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
 @pytest.mark.parametrize("standby_memory", ["resident", "suspended"])
 def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
     tmp_path: Path, standby_memory: str, topology: str
 ):
-    devices, options = TOPOLOGIES[topology]
+    devices, options = _topology(topology, tmp_path)
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -288,14 +302,23 @@ def test_a_hot_update_continues_a_streaming_request_on_the_new_engine(
             "the promoted standby worker restored its graph memory" in line
             for line in lines
         ), "the promoted standby worker did not restore its graph memory"
-        if topology == "experts":
-            for event in (
+        events = {
+            "single": (),
+            "experts": (
                 "the standby worker suspended its expert transports",
                 "the standby worker suspended its communicators",
                 "the promoted standby worker restored its expert transports",
                 "the promoted standby worker resumed its communicators",
-            ):
-                assert any(event in line for line in lines), event
+            ),
+            "dedicated": (
+                "the standby worker released its expert workspaces",
+                "the standby worker suspended its communicators",
+                "the promoted standby worker resumed its communicators",
+                "the promoted standby worker captured its expert graphs again",
+            ),
+        }[topology]
+        for event in events:
+            assert any(event in line for line in lines), event
     else:
         assert any(
             "the standby worker keeps its graph memory resident" in line
