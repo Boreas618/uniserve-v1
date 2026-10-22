@@ -598,6 +598,7 @@ impl CausalLMRunners {
             state,
             outputs,
             vocab,
+            prefill_outputs: config.prefill_outputs,
             order: StreamOrder::default(),
         }))
     }
