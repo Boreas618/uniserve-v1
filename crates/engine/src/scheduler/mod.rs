@@ -53,6 +53,7 @@ pub use stats_report::SchedulerStatsReporter;
 mod admission;
 mod allocation;
 mod batching;
+mod cache_memory;
 mod control;
 mod denoising;
 mod execution;
@@ -426,6 +427,12 @@ pub struct Scheduler {
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).
     closing: bool,
+    /// A shrink or sleep of the KV cache waiting for its units to be let go
+    /// (`Scheduler::resize_cache`).
+    resizing: Option<cache_memory::PendingResize>,
+    /// The workers gave back the cache and graph memory: the scheduler
+    /// admits and runs nothing until it wakes.
+    asleep: bool,
 }
 
 impl Scheduler {

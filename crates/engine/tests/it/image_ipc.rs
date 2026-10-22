@@ -178,6 +178,7 @@ fn request(
         image_generation: policy(feedback),
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
+        adapter: 0,
     }
 }
 

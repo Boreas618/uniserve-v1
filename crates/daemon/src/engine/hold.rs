@@ -4,6 +4,8 @@
 //! engine is ready, a submission goes straight to it. While none is, a
 //! submission waits until one is, instead of being refused; once the hold
 //! closes, because no engine will serve again, held and new submissions fail.
+//! While the hold is paused (`/admin/pause_generation`), submissions wait
+//! as well, and the requests the engine already serves go on.
 //! A held submission is bounded only by its HTTP request's own timeout and by
 //! its client, whose disconnect drops it.
 
@@ -28,6 +30,19 @@ enum Serving {
 /// The leader's submissions and the engine that serves them.
 pub struct RequestHold {
     serving: watch::Sender<Serving>,
+    /// Whether submissions wait although an engine serves.
+    paused: watch::Sender<bool>,
+}
+
+/// What a hold does with a submission now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldState {
+    /// It goes to an engine in this state.
+    Engine(EngineState),
+    /// It waits for an engine.
+    Holding,
+    /// It fails: no engine will serve.
+    Closed(String),
 }
 
 impl Default for RequestHold {
@@ -41,6 +56,33 @@ impl RequestHold {
     pub fn new() -> Self {
         Self {
             serving: watch::Sender::new(Serving::Holding),
+            paused: watch::Sender::new(false),
+        }
+    }
+
+    /// Holds later submissions until [`Self::resume`], whatever engine
+    /// serves; the requests the engine serves go on. Returns whether the hold
+    /// was paused already.
+    pub fn pause(&self) -> bool {
+        self.paused.send_replace(true)
+    }
+
+    /// Lets submissions through again.
+    pub fn resume(&self) {
+        self.paused.send_replace(false);
+    }
+
+    /// Whether the hold is paused.
+    pub fn is_paused(&self) -> bool {
+        *self.paused.borrow()
+    }
+
+    /// What the hold does with a submission now, paused or not.
+    pub fn state(&self) -> HoldState {
+        match &*self.serving.borrow() {
+            Serving::Engine(client) => HoldState::Engine(client.state()),
+            Serving::Holding => HoldState::Holding,
+            Serving::Closed(reason) => HoldState::Closed(reason.clone()),
         }
     }
 
@@ -76,10 +118,11 @@ impl RequestHold {
 
     /// Whether a submission now goes straight to a ready engine.
     pub fn is_serving(&self) -> bool {
-        matches!(
-            &*self.serving.borrow(),
-            Serving::Engine(client) if client.state() == EngineState::Ready
-        )
+        !self.is_paused()
+            && matches!(
+                &*self.serving.borrow(),
+                Serving::Engine(client) if client.state() == EngineState::Ready
+            )
     }
 
     /// Submits `request` to the engine that serves, once one is ready, and
@@ -97,10 +140,12 @@ impl RequestHold {
         request: Request,
     ) -> Result<(EventStream, Option<u32>), SubmitError> {
         let mut serving = self.serving.subscribe();
+        let mut paused = self.paused.subscribe();
         loop {
+            let held = *paused.borrow_and_update();
             let current = serving.borrow_and_update().clone();
             match current {
-                Serving::Engine(client) if client.state() == EngineState::Ready => {
+                Serving::Engine(client) if !held && client.state() == EngineState::Ready => {
                     return client.submit(request).await;
                 }
                 Serving::Closed(reason) => return Err(SubmitError::Unavailable(reason)),
@@ -108,7 +153,11 @@ impl RequestHold {
                 // watches it replaces it or closes the hold.
                 Serving::Engine(_) | Serving::Holding => {}
             }
-            if serving.changed().await.is_err() {
+            let changed = tokio::select! {
+                changed = serving.changed() => changed,
+                changed = paused.changed() => changed,
+            };
+            if changed.is_err() {
                 return Err(SubmitError::Unavailable(
                     "the daemon stopped serving requests".to_owned(),
                 ));
@@ -150,6 +199,7 @@ mod tests {
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }
         .into()
     }
@@ -224,5 +274,28 @@ mod tests {
         hold.serve(client());
         let (_events, scheduler) = submission.await.unwrap().expect("the next engine serves");
         assert_eq!(scheduler, Some(0));
+    }
+
+    /// A paused hold keeps its engine but holds submissions until resumed.
+    #[tokio::test]
+    async fn a_paused_hold_holds_submissions_until_resumed() {
+        let hold = Arc::new(RequestHold::new());
+        hold.serve(client());
+        assert!(!hold.pause(), "the hold was not paused before");
+        assert!(hold.pause(), "a second pause finds it paused");
+        assert!(!hold.is_serving());
+        assert_eq!(hold.state(), HoldState::Engine(EngineState::Ready));
+
+        let submission = tokio::spawn({
+            let hold = Arc::clone(&hold);
+            async move { hold.submit(request()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!submission.is_finished(), "a paused hold holds requests");
+
+        hold.resume();
+        let (_events, scheduler) = submission.await.unwrap().expect("the engine serves");
+        assert_eq!(scheduler, Some(0));
+        assert!(hold.is_serving());
     }
 }

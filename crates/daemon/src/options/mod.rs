@@ -41,7 +41,7 @@ use serde_json::Value;
 use models::ModelDescription;
 use models::diffusion_gemma::DenoisingOverrides;
 
-pub use args::{FLAG_PATHS, ServeArgs, Stated, printed};
+pub use args::{FLAG_PATHS, ServeArgs, Stated, overridden, printed, resolve_text};
 pub use values::{
     CandidateTokens, CanvasMode, ChatTemplateContentFormatOption, ImageSize, ReadoutLayout,
 };
@@ -320,6 +320,9 @@ pub struct LoadOptions {
     pub download_dir: Option<PathBuf>,
     /// Concurrent checkpoint file readers.
     pub threads: Option<NonZeroU32>,
+    /// A plugin's weight source (`scheme://...`) that streams the
+    /// checkpoint's tensors in place of its files; the files when unset.
+    pub weights: Option<String>,
 }
 
 impl Default for LoadOptions {
@@ -328,6 +331,7 @@ impl Default for LoadOptions {
             format: LoadFormat::Auto,
             download_dir: None,
             threads: None,
+            weights: None,
         }
     }
 }
@@ -353,6 +357,10 @@ pub struct KvCacheOptions {
     /// a sliding-window group's window before each aligned boundary.
     /// Applies with `prefix_caching`.
     pub host_tier: bool,
+    /// The host KV cache each worker keeps, in GiB, split between its cache
+    /// groups (as SGLang's `--hicache-size`). The host's Storage Server
+    /// refuses a size the host's available memory cannot hold.
+    pub host_gib: NonZeroU64,
     /// Keep every page of the host KV cache in Mooncake, the KV storage,
     /// through the Storage Servers this deployment starts, and prefetch long
     /// hits back. Applies with `host_tier`; none when unset.
@@ -363,6 +371,13 @@ pub struct KvCacheOptions {
     pub boundary_interval: Option<NonZeroU32>,
 }
 
+/// The host KV cache each worker keeps when `kv_cache_config.host_gib` is
+/// unset, in GiB.
+const DEFAULT_HOST_GIB: NonZeroU64 = match NonZeroU64::new(64) {
+    Some(gib) => gib,
+    None => NonZeroU64::MIN,
+};
+
 impl Default for KvCacheOptions {
     fn default() -> Self {
         Self {
@@ -371,6 +386,7 @@ impl Default for KvCacheOptions {
             dtype: None,
             prefix_caching: true,
             host_tier: true,
+            host_gib: DEFAULT_HOST_GIB,
             mooncake: None,
             boundary_interval: None,
         }
@@ -1074,6 +1090,7 @@ impl ServeConfig {
                     library: text(&mooncake.library),
                 }),
                 boundary_interval: kv_cache.boundary_interval.map(NonZeroU32::get),
+                host_bytes: Some(kv_cache.host_gib.get() << 30),
             }),
             workers: Some(wire::Workers {
                 executable: worker.executable.to_string_lossy().into_owned(),
@@ -1089,6 +1106,7 @@ impl ServeConfig {
                 download_dir: text(&self.load_config.download_dir),
                 load_threads: self.load_config.threads.map(NonZeroU32::get),
                 standby_memory: word(&worker.standby_memory),
+                weights: self.load_config.weights.clone().unwrap_or_default(),
             }),
             cuda_graphs: Some(wire::CudaGraphs {
                 policy: word(&graphs.policy),
@@ -1167,7 +1185,7 @@ fn word<T: Serialize>(value: &T) -> String {
 /// environment variable. Each source is trimmed, and a blank value counts as
 /// unset, so a blank configured key falls through to the environment
 /// variable.
-pub(super) fn configured_api_key(configured: Option<&str>) -> Option<String> {
+pub fn configured_api_key(configured: Option<&str>) -> Option<String> {
     non_empty_secret(configured).or_else(|| {
         std::env::var(API_KEY_ENV)
             .ok()

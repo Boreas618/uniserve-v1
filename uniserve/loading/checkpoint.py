@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from safetensors import safe_open
@@ -205,6 +205,11 @@ class Source:
     headers, with safetensors dtype names such as ``"BF16"``. Such entries
     carry metadata but no values, so only dummy reads, which generate values
     from metadata alone, accept a source with headers.
+
+    ``stream`` is a plugin's weight source (``uniserve.plugins``,
+    ``Registry.weight_source``) that streams the source's tensors in place
+    of its files, which a source with a stream has none of; ``identity``
+    names what it streams, as the files' identities name theirs.
     """
 
     name: str
@@ -212,6 +217,8 @@ class Source:
     files: tuple[Path, ...]
     prefix: str = ""
     headers: tuple[tuple[str, tuple[int, ...], str], ...] = ()
+    stream: Any = None
+    identity: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "root", Path(self.root))
@@ -245,6 +252,8 @@ class Source:
 
     def open(self, *, io: IOConfig) -> Reader:
         """Verify integrity and encoding, then open a reader for the IO mode."""
+        if self.stream is not None:
+            return _StreamReader(self, io)
         if self.headers and io.mode != "dummy":
             raise ValueError(
                 "checkpoint headers describe tensors without local values; "
@@ -592,7 +601,10 @@ class Reader:
         for name, shape, dtype in self.source.headers:
             self._declare(name, shape, _dtype(dtype))
         self._weights = dict(sorted(self._weights.items()))
+        self._pair_encoded()
 
+    def _pair_encoded(self):
+        """Present encoded weights stored as several tensors as one each."""
         # ModelOpt's unified export keeps an NVFP4 weight under its ordinary
         # `.weight` name as U8 bytes holding two E2M1 values each, with one
         # E4M3 scale per K16 block in `.weight_scale`, one FP32 multiplier in
@@ -657,6 +669,7 @@ class Reader:
                 )
             count = math.prod(scale.shape)
             axis: Literal[0] | None
+            shape: tuple[int, ...]
             if count == 1:
                 axis, shape = None, ()
             elif count == value.shape[0] and all(
@@ -741,6 +754,31 @@ class _SafetensorsReader(Reader):
         if path not in self._states:
             self._states[path] = load_safetensors(path.read_bytes())
         return self._states[path][name][region]
+
+
+class _StreamReader(Reader):
+    """Read the tensors a plugin's weight source streams (``Source.stream``).
+
+    The stream lists each tensor's name, shape and dtype for the source by
+    its name (``tensors``) and reads one (``read``); encoded weights pair
+    as they do in files.
+    """
+
+    def _open(self):
+        stream = self.source.stream
+        for name, shape, dtype in stream.tensors(self.source.name):
+            logical = self._declare(
+                str(name), tuple(int(size) for size in shape), dtype
+            )
+            self._locations[logical] = (self.source.root, str(name))
+        self._weights = dict(sorted(self._weights.items()))
+        self._pair_encoded()
+
+    def _read(self, logical, region):
+        self._require_open()
+        _, name = self._locations[logical]
+        value = self.source.stream.read(self.source.name, name)
+        return value[region] if region else value
 
 
 class _TorchReader(Reader):

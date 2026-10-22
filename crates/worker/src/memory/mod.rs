@@ -6,7 +6,7 @@ mod buffer;
 pub(crate) mod latent;
 mod output;
 mod pinned_pool;
-mod prefix_cache;
+pub(crate) mod prefix_cache;
 pub(crate) mod products;
 mod request_slots;
 pub mod retained;
@@ -20,7 +20,7 @@ pub use output::{LogprobLayout, OutputBuffer, OutputStorage};
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
-pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis};
+pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, GroupAxis, StateField};
 pub use prefix_cache::planes::{CachePlanes, UnitColumn};
 pub use prefix_cache::{PendingImport, PrefixCache};
 pub use products::{

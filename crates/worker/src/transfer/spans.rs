@@ -160,9 +160,10 @@ impl Spans {
             let count = (target.shape()[0] - target_start).min(value.shape()[0] - source_start);
             let target_piece = target.narrow(0, target_start, count)?;
             let source_piece = value.narrow(0, source_start, count)?;
-            plan.plan(
+            plan.plan_within(
                 &target_piece.operand().strided(),
                 &source_piece.operand().strided(),
+                [target.copy_span(), value.copy_span()],
             )?;
 
             target_start += count;
@@ -371,6 +372,73 @@ mod tests {
         assert_eq!(&values[6..9], &[0.0, 1.0, 2.0]);
         assert_eq!(&values[0..6], &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         assert_eq!(&values[9..12], &[9.0, 10.0, 11.0]);
+        Ok(())
+    }
+
+    /// A cache page of 4 tokens of 6 columns read across segmented planes
+    /// whose tail segment of every column was given back: the copy plan keeps
+    /// each copy inside a segment, and the copy moves every column (one copy
+    /// across the columns is refused by the driver; `cuda`'s
+    /// `a_pitched_copy_across_a_released_segment_reads_its_rows`).
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_page_across_the_columns_of_planes_given_back_in_part_copies() -> Result<()> {
+        use cuda::{HandleType, PinnedBuffer, memset_d8};
+
+        let device = DeviceId(0);
+        let stream = Stream::new(device)?;
+        let granularity = HandleType::Descriptor.granularity(device)?;
+        let (tokens, columns, row) = (4_usize, 6_usize, 64_usize);
+        // Every column is two segments, back to back.
+        let planes = Storage::segmented(device, &vec![granularity; 2 * columns], &[])?;
+        for segment in 0..2 * columns {
+            drop(planes.create_segment(segment)?);
+        }
+        for column in 0..columns {
+            planes.release_segment(2 * column + 1)?;
+            // SAFETY: the column's first segment is mapped; nothing else
+            // accesses it.
+            unsafe {
+                memset_d8(
+                    planes.address() + (2 * column * granularity) as u64,
+                    column as u8 + 1,
+                    tokens * row,
+                    &stream,
+                )
+            }?;
+        }
+        let page = StorageView::strided(
+            Arc::clone(&planes) as Arc<dyn Backing>,
+            0,
+            DType::U8,
+            &[tokens as i64, columns as i64, row as i64],
+            &[row as i64, (2 * granularity) as i64, 1],
+        )?;
+        let staging = Storage::device(device, tokens * columns * row)?;
+        let frozen = StorageView::contiguous(
+            Arc::clone(&staging) as Arc<dyn Backing>,
+            0,
+            DType::U8,
+            &[tokens as i64, columns as i64, row as i64],
+        )?;
+        let host = PinnedBuffer::new(device, tokens * columns * row)?;
+        // SAFETY: the planes, the staging and the host buffer outlive the
+        // synchronization below.
+        unsafe {
+            submit_copy(&Spans::single(frozen)?, &Spans::single(page)?, &stream)?;
+            memcpy_async(host.address(), staging.address(), host.len(), &stream)?;
+        }
+        stream.synchronize()?;
+        // SAFETY: the stream that wrote the buffer is synchronized.
+        let bytes = unsafe { host.as_slice() };
+        for (index, chunk) in bytes.chunks(row).enumerate() {
+            let column = index % columns;
+            assert!(
+                chunk.iter().all(|&byte| byte == column as u8 + 1),
+                "token {} column {column}",
+                index / columns
+            );
+        }
         Ok(())
     }
 }

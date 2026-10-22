@@ -68,7 +68,7 @@ impl WorkerProcessArgs {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         crate::WorkerGroupConfig::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
-            self.components.is_empty() == (self.role == crate::WorkerGroupRole::Experts),
+            self.components.is_empty() != self.role.serves_requests(),
             "worker role disagrees with request component placement"
         );
         if self.role == crate::WorkerGroupRole::Experts {
@@ -426,6 +426,7 @@ impl WorkerGroup {
         // LM's ranks its step rows, every other rank none. The group's are
         // those its stating ranks agree on.
         let mut image_warmups = Vec::new();
+        let mut captured_images = None;
         let mut diffusion_lm_step_rows = 0;
         let mut image_unconditional = None;
         for (rank, worker) in workers.iter().enumerate() {
@@ -446,6 +447,13 @@ impl WorkerGroup {
                 );
                 image_warmups.clone_from(&stated.image_warmups);
             }
+            if let Some(shapes) = &stated.captured_images {
+                anyhow::ensure!(
+                    captured_images.as_ref().is_none_or(|known| known == shapes),
+                    "physical rank {rank} states other captured image steps than another denoiser rank"
+                );
+                captured_images = Some(shapes.clone());
+            }
             if stated.diffusion_lm_step_rows > 0 {
                 anyhow::ensure!(
                     diffusion_lm_step_rows == 0
@@ -456,6 +464,7 @@ impl WorkerGroup {
             }
         }
         info.image_warmups = image_warmups;
+        info.captured_images = captured_images;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
 

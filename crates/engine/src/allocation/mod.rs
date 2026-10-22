@@ -176,6 +176,10 @@ impl LatentPool {
 pub(crate) struct PrefixCacheManager {
     pub(crate) block_pool: BlockPool,
     pub(crate) coordinator: PrefixCacheCoordinator,
+    /// Whether a page holds all a request reached: false when the workers
+    /// also keep states per request (`PrefixCacheInfo::request_states`),
+    /// which no prefix reuse restores.
+    reusable: bool,
 }
 
 impl PrefixCacheManager {
@@ -185,23 +189,40 @@ impl PrefixCacheManager {
     /// a pool without an allocatable unit and `BlockTable::new` on an empty
     /// page shape; `PrefixCacheInfo::validate` rejects each of these.
     pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
-        info.prefix_cache
-            .as_ref()
-            .map(|prefix_cache| PrefixCacheManager {
-                block_pool: BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units),
-                coordinator: PrefixCacheCoordinator::new(
-                    prefix_cache
-                        .groups
-                        .iter()
-                        .map(GroupShape::from_group)
-                        .collect(),
-                ),
-            })
+        info.prefix_cache.as_ref().map(|prefix_cache| {
+            let block_pool = BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units);
+            // A standby adopts planes its predecessor shrank for it: the
+            // units of the segments given back stay withdrawn until they
+            // are created again.
+            let usable = prefix_cache.allocatable_units();
+            if usable < prefix_cache.num_units {
+                block_pool.withdraw(usable);
+            }
+            let mut coordinator = PrefixCacheCoordinator::new(
+                prefix_cache
+                    .groups
+                    .iter()
+                    .map(GroupShape::from_group)
+                    .collect(),
+            );
+            let reusable = !prefix_cache.request_states;
+            coordinator.set_prefix_enabled(reusable);
+            PrefixCacheManager {
+                block_pool,
+                coordinator,
+                reusable,
+            }
+        })
     }
 
     /// Returns the units the scheduler may allocate, excluding the sentinel.
     pub(crate) fn usable_units(&self) -> usize {
         self.block_pool.usable_units()
+    }
+
+    /// Returns the units the scheduler may allocate once none is withdrawn.
+    pub(crate) fn capacity_units(&self) -> usize {
+        self.block_pool.capacity_units()
     }
 }
 
@@ -331,8 +352,11 @@ impl PrefixCacheManager {
             .ok_or(OutOfStorage::PrefixCache)
     }
 
+    /// Enables or disables prefix reuse, which workers that keep states per
+    /// request never allow.
     pub(crate) fn set_prefix_reuse(&mut self, enabled: bool) {
-        self.coordinator.set_prefix_enabled(enabled);
+        self.coordinator
+            .set_prefix_enabled(enabled && self.reusable);
     }
 }
 

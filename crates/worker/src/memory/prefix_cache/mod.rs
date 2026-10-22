@@ -23,7 +23,7 @@ pub(super) mod block_tables;
 pub(crate) mod host;
 mod imports;
 pub(super) mod plan;
-pub(super) mod planes;
+pub(crate) mod planes;
 mod transfers;
 
 pub(crate) use access::UnitAccesses;
@@ -44,7 +44,8 @@ pub(crate) use self::host::HostKvCache;
 use self::plan::{CACHE, CachePlan};
 use self::planes::{CachePlanes, UnitColumn};
 use super::allocation::StorageView;
-use crate::ffi::{Handle, Interpreter};
+use super::request_slots::RequestSlots;
+use crate::ffi::{Handle, Interpreter, strings};
 use crate::host::HostLane;
 use crate::lane::Job;
 use crate::stream::Issue;
@@ -94,6 +95,33 @@ pub struct PrefixCache {
     /// The most units warmup lent as scratch (`1..=` this), which the rank
     /// reports so that a standby worker's warmup stays inside them.
     scratch_lent: u32,
+    /// The banks of the cache layers kept per request slot, when the model
+    /// has any (`CachePlan::states`).
+    request_states: Option<RequestSlots>,
+}
+
+/// The banks of `plan`'s layers kept per request slot, for
+/// `request_pool_size` slots on `device` (host memory when `None`), zeroed
+/// on `stream`; `None` without such layers.
+fn request_states(
+    plan: &CachePlan,
+    request_pool_size: u32,
+    device: Option<DeviceId>,
+    stream: Option<&Stream>,
+) -> Result<Option<RequestSlots>> {
+    if plan.states.is_empty() {
+        return Ok(None);
+    }
+    let fields: Vec<_> = plan.states.iter().map(|field| field.slot()).collect();
+    let states = RequestSlots::allocate(&fields, request_pool_size, device)?;
+    // Host banks start zeroed; device banks are zeroed in stream order.
+    if let Some(stream) = stream {
+        for (_, view) in states.views() {
+            // SAFETY: the banks are new; nothing else addresses them.
+            unsafe { cuda::memset_d8(view.address(), 0, view.nbytes() as usize, stream) }?;
+        }
+    }
+    Ok(Some(states))
 }
 
 impl PrefixCache {
@@ -103,8 +131,8 @@ impl PrefixCache {
     }
 
     /// Fixed device bytes besides the pool itself: block tables, import
-    /// scratch and per-stream unit columns (`unit_columns` streams besides
-    /// the import workers').
+    /// scratch, per-stream unit columns (`unit_columns` streams besides the
+    /// import workers') and the banks of the layers kept per request slot.
     pub(crate) fn fixed_bytes(
         plan: &CachePlan,
         num_units: u32,
@@ -115,10 +143,13 @@ impl PrefixCache {
     ) -> Result<u64> {
         let workers = Self::import_workers(import_capacity) as u64;
         let (elements, scales) = plan.page_extents();
+        let states: Vec<_> = plan.states.iter().map(|field| field.slot()).collect();
+        let (states, _) = RequestSlots::bytes(&states, request_pool_size)?;
         Ok(
             BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width)
                 + workers * ImportWorkspace::scratch_bytes(elements, scales)
-                + (workers + unit_columns as u64) * UnitColumn::bytes(num_units),
+                + (workers + unit_columns as u64) * UnitColumn::bytes(num_units)
+                + states,
         )
     }
 
@@ -142,6 +173,7 @@ impl PrefixCache {
         memory: &mut dyn crate::memory::retained::ExclusiveMemory,
     ) -> Result<Self> {
         let shapes = plan.group_shapes()?;
+        let request_states = request_states(&plan, request_pool_size, device, stream)?;
         let planes = Arc::new(CachePlanes::allocate(
             plan, device, num_units, stream, memory,
         )?);
@@ -173,7 +205,13 @@ impl PrefixCache {
             },
             pages: None,
             scratch_lent: 0,
+            request_states,
         })
+    }
+
+    /// Whether the rank copies pages through the host KV cache.
+    pub(crate) fn copies_pages(&self) -> bool {
+        self.pages.is_some()
     }
 
     /// Copy pages through `cache` from now on, on the copy lane's `stream`.
@@ -428,15 +466,23 @@ impl PrefixCache {
         Ok(views)
     }
 
-    /// The attention layers' view of the unit pool (the library's `pool`
-    /// over the plan, the unit count and the unit fields by name), which
-    /// execution contexts read prefixes through.
+    /// The cache layers' view of the unit pool and the request state banks
+    /// (the library's `pool` over the plan, the unit count and the unit
+    /// fields and banks by name), which execution contexts read prefixes
+    /// and request states through.
     pub(crate) fn pool(&self) -> Result<Handle> {
+        let mut fields = self.planes.views();
+        if let Some(states) = &self.request_states {
+            fields.extend(states.views());
+        }
         let mut arguments = vec![
             self.plan().handle.to_any(),
             Any::from(i64::from(self.planes.num_units())),
+            Any::from(strings(fields.iter().map(|(name, _)| name))),
         ];
-        arguments.extend(self.planes.field_arguments()?);
+        for (_, view) in &fields {
+            arguments.push(view.handle()?.to_any());
+        }
         Handle::new(Interpreter::import(&format!("{CACHE}.pool"))?.call_values(&arguments)?)
     }
 

@@ -12,6 +12,7 @@
 //! | `penalty_counts` | `i32` | `[S, V]` | committed generated-token counts |
 //! | `prompt_logits` | model dtype | `[S, V]` | last logits of a scored prompt chunk |
 //! | `logit_bias` | `f32` | `[S, V]` | the logit biases of the slot's request |
+//! | `adapters` | `i64` | `[S]` | the adapter pool slot the request computes with, 0 for none |
 //!
 //! The slot's verified cache length is the block tables' `verified_lengths`,
 //! shared with attention gathers. `S` is the request slot count plus one:
@@ -43,12 +44,13 @@ pub(crate) struct DecodeState {
     penalty_counts: StorageView,
     prompt_logits: StorageView,
     logit_bias: StorageView,
+    adapters: StorageView,
     /// Borrowed from the block tables.
     verified_lengths: StorageView,
 }
 
 /// Byte offsets of the carved fields and the total length.
-fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 7], usize) {
+fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 8], usize) {
     let sizes = [
         rows * 8,
         rows,
@@ -57,8 +59,9 @@ fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 7], usize) {
         rows * vocab * 4,
         rows * vocab * logits.bytes(),
         rows * vocab * 4,
+        rows * 8,
     ];
-    let mut offsets = [0; 7];
+    let mut offsets = [0; 8];
     let mut cursor = 0;
     for (offset, size) in offsets.iter_mut().zip(sizes) {
         *offset = cursor;
@@ -121,6 +124,7 @@ impl DecodeState {
             penalty_counts: view(4, DType::I32, &[slots, width])?,
             prompt_logits: view(5, logits, &[slots, width])?,
             logit_bias: view(6, DType::F32, &[slots, width])?,
+            adapters: view(7, DType::I64, &[slots])?,
             verified_lengths,
             memory,
             rows,
@@ -167,6 +171,10 @@ impl DecodeState {
         &self.logit_bias
     }
 
+    pub(crate) fn adapters(&self) -> &StorageView {
+        &self.adapters
+    }
+
     pub(crate) fn verified_lengths(&self) -> &StorageView {
         &self.verified_lengths
     }
@@ -200,7 +208,8 @@ impl DecodeState {
     }
 
     /// Reset newly admitted slots on `stream`: next token 1, no
-    /// continuation, zero coordinates, cache length and penalty counts.
+    /// continuation, zero coordinates, cache length and penalty counts, and
+    /// no adapter.
     /// The retained prompt logits are read only after a scored chunk wrote
     /// them, so they are not reset.
     pub(crate) fn reset(&self, slots: &[usize], stream: impl Issue) -> Result<()> {
@@ -231,6 +240,11 @@ impl DecodeState {
                 zeros[index..].as_ptr() as u64,
                 8,
             );
+            batch.push(
+                word(&self.adapters, slot, 8),
+                zeros[index..].as_ptr() as u64,
+                8,
+            );
         }
         // SAFETY: every destination is one element of this state for a
         // distinct slot; sources are read during the call.
@@ -255,6 +269,27 @@ impl DecodeState {
             }
         }
         Ok(())
+    }
+
+    /// Have slot `slot`'s request compute with the adapter in slot `adapter`
+    /// of the adapter pool, on `stream`.
+    pub(crate) fn select_adapter(
+        &self,
+        slot: usize,
+        adapter: u32,
+        stream: impl Issue,
+    ) -> Result<()> {
+        self.require_slot(slot)?;
+        let value = [i64::from(adapter)];
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(
+            self.adapters.address() + 8 * slot as u64,
+            value.as_ptr() as u64,
+            8,
+        );
+        // SAFETY: the destination is one element of this state; the source
+        // is read during the call.
+        unsafe { stream.copy(&batch) }
     }
 
     /// Count `tokens` in slot `slot`'s penalty counts on `stream`, after

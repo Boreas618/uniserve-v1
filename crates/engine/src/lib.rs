@@ -45,8 +45,8 @@ pub use crate::executor::{
     WorkerGroupId, WorkerResult,
 };
 pub use crate::handle::{
-    Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx, EventSendError, EventTx,
-    StreamCancelCause, Submission, SubmitError, Wake,
+    CacheChange, Command, CommandSender, CommandWaker, EVENT_BUFFER_CAPACITY, EventRx,
+    EventSendError, EventTx, StreamCancelCause, Submission, SubmitError, Wake,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.

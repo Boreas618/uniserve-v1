@@ -868,3 +868,26 @@ def test_table_batches_plan_cached_layers_beside_cacheless_layers():
         out = torch.empty_like(query)
         dense(query, key, value, single, out=out)
         torch.testing.assert_close(out, _reference(query, key, value, None))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="needs a second CUDA device"
+)
+def test_a_scratch_serves_another_device_without_its_pool() -> None:
+    # A stream's scratch allocates on its own device from its pool; a
+    # module on a generation tower takes scratch on the tower's device, in
+    # backings of every growing size.
+    pool = cuda_graph.pool(0)[0]
+    scratch = Scratch(pool, 0)
+    tower = torch.device("cuda", 1)
+    for rows in (1, 2, 4):
+        views = scratch.view(
+            "tower", {"buffer": BufferConfig((rows, 8), torch.float32)}, tower
+        )
+        assert views["buffer"].device == tower
+    own = scratch.view(
+        "stream", {"buffer": BufferConfig((4, 8), torch.float32)}, "cuda:0"
+    )
+    assert own["buffer"].device == torch.device("cuda", 0)
+    scratch.close()

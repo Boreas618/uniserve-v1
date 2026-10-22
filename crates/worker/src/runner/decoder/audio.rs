@@ -155,12 +155,14 @@ impl AudioDecoder {
 
     /// Record in `job` the forward of `units` of a track whose complete
     /// latent has `rows` rows, on the decoder's stream: the launch of the
-    /// units' captured graph, or the eager call of `DecoderRunner.decode`,
-    /// which serves units startup did not capture. With `capture`, units
-    /// not captured yet are captured instead of called (startup's capture
-    /// of warmed units): the job's completion carries the graph
-    /// ([`Self::complete_capture`]). A capture is counted when its graph is
-    /// stored.
+    /// units' captured graph, or, without graphs and while startup warms
+    /// units, the eager call of `DecoderRunner.decode`. Under graphs startup
+    /// captured the units of every track serving decodes
+    /// (`DecoderRunners::prepare_startup`), and the sealed table refuses others. With
+    /// `capture`, units not captured yet are captured instead of called
+    /// (startup's capture of warmed units): the job's completion carries the
+    /// graph ([`Self::complete_capture`]). A capture is counted when its
+    /// graph is stored.
     fn forward(
         &mut self,
         units: TrackUnits,
@@ -194,7 +196,7 @@ impl AudioDecoder {
                 });
                 GraphMode::Capture
             }
-            // Units startup did not capture run on the builder thread.
+            Err(error) if self.pool.is_some() => return Err(error),
             _ => {
                 job.call(method(self)?);
                 GraphMode::Eager

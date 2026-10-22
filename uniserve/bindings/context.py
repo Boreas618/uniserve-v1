@@ -29,6 +29,7 @@ from uniserve.bindings.workspace import (
     Workspace,
     close_resources,
 )
+from uniserve.prefix_cache import CacheBinding
 from uniserve.tensors import BufferConfig
 
 if TYPE_CHECKING:
@@ -556,6 +557,7 @@ class ExecutionContext:
             (_binding.attention_storage, self._exchange),
             (_binding.linear_chunks, self._chunks),
             (_binding.tile_operators, self._tiles),
+            (_binding.cache, self._cache),
         )
 
     # Binding tables an activation installs into context variables. They are
@@ -575,6 +577,7 @@ class ExecutionContext:
         "_exchange",
         "_chunks",
         "_gather_pools",
+        "_cache",
     )
 
     # weight or module id -> prepared matmul operator
@@ -602,6 +605,8 @@ class ExecutionContext:
     _chunks: dict[int, ChunkStorage]
     # communication group -> its standalone gather pool
     _gather_pools: dict[Any, GatherPool]
+    # module id -> the cache layer a module other than attention owns
+    _cache: dict[int, CacheBinding]
 
     def _clear_bindings(self) -> None:
         for name in self._BINDINGS:
@@ -896,6 +901,19 @@ class ExecutionContext:
                         device,
                         dtype,
                         size if text else None,
+                    )
+                elif (
+                    getattr(child, "cache_name", None) is not None
+                    and hasattr(child, "cache_state")
+                    and self.cache is not None
+                ):
+                    # Another cache layer type's owner reads its state and
+                    # block table through ``prefix_cache.bound``.
+                    name = child.cache_name
+                    paged = self.cache.paged(name)
+                    self._cache[id(child)] = CacheBinding(
+                        self.cache.state(name),
+                        self.cache.table(name) if paged else None,
                     )
 
     def _bind_matmul(self, factory, layer, dtype, rows, merged) -> None:

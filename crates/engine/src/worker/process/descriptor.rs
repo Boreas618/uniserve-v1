@@ -53,6 +53,7 @@ impl Default for WorkerProcessArgs {
             // own, so independent launches never contest one claim.
             deployment: format!("deployment-{}", uuid::Uuid::new_v4().simple()),
             host_kv_cache: false,
+            host_kv_cache_bytes: None,
             kv_storage: None,
             keep_standby: false,
             standby: false,
@@ -61,6 +62,7 @@ impl Default for WorkerProcessArgs {
             daemon: String::new(),
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
+            weights: None,
             ranks: vec![crate::WorkerRank {
                 host: "localhost".into(),
                 device: "cuda:0".into(),
@@ -213,6 +215,7 @@ impl WorkerProcessArgs {
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
+            weights: self.weights.clone(),
             storage,
             host: self.ranks[rank as usize].host.clone(),
             device: self.ranks[rank as usize].device.clone(),
@@ -383,6 +386,7 @@ mod tests {
             deployment: "model".into(),
             claim: [7; 16],
             host_kv_cache: true,
+            host_kv_cache_bytes: Some(64 << 30),
             tcp: Some("10.0.0.2:4100".into()),
             standby: false,
             standby_memory: proto::request::StandbyMemory::Suspended,

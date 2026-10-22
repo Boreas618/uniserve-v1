@@ -48,6 +48,8 @@ message FromEngine {
     Accepted accepted = 2;
     Event event = 3;
     Stats stats = 4;
+    Hooked hooked = 5;
+    Configured configured = 6;
   }
 }
 
@@ -102,6 +104,19 @@ message EngineInfo {
   // The prefix cache units of each worker group, which an engine standing
   // by for this one maps.
   repeated GroupCacheUnits cache_units = 5;
+  // The largest scheduling limits the workers were started for: the
+  // schedulers take any limits within them in place (`Configure`).
+  BatchCapacity capacity = 6;
+}
+
+// The batch an engine's workers were started for.
+message BatchCapacity {
+  // Calls one step forms; zero when the workers bound none.
+  uint32 max_batch = 1;
+  // Tokens one step forms.
+  uint64 max_num_batched_tokens = 2;
+  // Requests running at once.
+  uint32 max_running_requests = 3;
 }
 
 // The prefix cache units one worker group holds.
@@ -177,12 +192,98 @@ message EngineCommand {
     Drain drain = 2;
     // A standing-by engine's workers take write access and serve.
     Promote promote = 3;
+    // Revoke every cached prefix page; requests in flight keep theirs.
+    FlushCache flush_cache = 4;
+    // Run a worker hook on every worker; answered with `Hooked`.
+    Hook hook = 5;
+    // Take other scheduling limits and policy from each scheduler's next
+    // step; answered with `Configured`.
+    Configure configure = 6;
+    // Connect to another daemon beside the ones the engine serves, as a hot
+    // restart of the daemon starts its successor: the engine says hello to
+    // it as itself, reports itself ready there, and serves both, each its
+    // own requests, until the last closes its connection.
+    Attach attach = 7;
+    // Give back or restore KV cache memory on every scheduler; answered
+    // with `Hooked`.
+    ResizeCache resize_cache = 8;
+    // Rewrite the weights in place from another checkpoint of the same
+    // model, once no request runs; answered with `Hooked`.
+    UpdateWeights update_weights = 9;
   }
+}
+
+// A worker hook (`uniserve.hooks`), which a plugin implements.
+message Hook {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  string name = 2;
+  // A JSON value.
+  string payload = 3;
+}
+
+// The answer to a `Hook`: each worker's JSON result, or why it failed.
+message Hooked {
+  uint64 id = 1;
+  repeated string results = 2;
+  // Empty when every worker ran the hook.
+  string error = 3;
+}
+
+// Scheduling limits and policy for every scheduler of a serving engine,
+// within the batch its workers were started for.
+message Configure {
+  // Matches the `Configured` answer.
+  uint64 id = 1;
+  Scheduling scheduling = 2;
+}
+
+// The answer to a `Configure`.
+message Configured {
+  uint64 id = 1;
+  // Empty when every scheduler took the limits.
+  string error = 2;
+}
+
+// An in-place weight update: every worker rewrites its weights from the
+// checkpoint at `model_path`, which loads the same tensors.
+message UpdateWeights {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  string model_path = 2;
+}
+
+// A change to the device memory of every scheduler's KV cache.
+message ResizeCache {
+  // Matches the `Hooked` answer.
+  uint64 id = 1;
+  CacheChange change = 2;
+}
+
+enum CacheChange {
+  // Give back the tail of the KV cache until each device has as much free
+  // memory as its worker holds beside the weights and the cache, which a
+  // standby engine needs: the requests that hold the tail are recomputed.
+  CACHE_CHANGE_SHRINK = 0;
+  // Create the given-back tail again.
+  CACHE_CHANGE_RESTORE = 1;
+  // Give back the whole KV cache and the CUDA graph memory, keeping the
+  // weights, once no request runs.
+  CACHE_CHANGE_SLEEP = 2;
+  // Restore what a sleep gave back.
+  CACHE_CHANGE_WAKE = 3;
+}
+
+// Where the daemon an engine attaches to listens.
+message Attach {
+  // The daemon's request socket, `unix:<path>`.
+  string requests = 1;
 }
 
 message Shutdown {}
 message Drain {}
 message Promote {}
+message FlushCache {}
 
 // One scheduler's statistics of the last reporting interval.
 message Stats {
@@ -214,6 +315,9 @@ message GenerationRequest {
   // the engine counts them as generated: against `max_und_tokens` and
   // `min_tokens`, in its penalties and bad words, and in its usage.
   repeated uint32 generated_token_ids = 15;
+  // The LoRA adapter the request computes with: the slot of the workers'
+  // adapter pool the daemon loaded it into, or 0 for the base model alone.
+  uint32 adapter = 16;
 }
 
 enum GenerationConstraint {
@@ -650,6 +754,9 @@ message KvCache {
   // long prompt offloads its sliding windows before; absent for the
   // engine's default.
   optional uint32 boundary_interval = 7;
+  // The bytes of host KV cache each worker keeps, split between its cache
+  // groups; absent for the Storage Server's size for each pool.
+  optional uint64 host_bytes = 8;
 }
 
 message Mooncake {
@@ -680,6 +787,10 @@ message Workers {
   optional uint32 load_threads = 11;
   // `auto`, `resident` or `suspended`; empty for `auto`.
   string standby_memory = 12;
+  // A plugin's weight source (`scheme://...`) that streams the checkpoint's
+  // tensors in place of its files, as an in-place weight update from it
+  // left them; empty to read the files.
+  string weights = 13;
 }
 
 message CudaGraphs {

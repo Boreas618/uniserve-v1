@@ -238,6 +238,7 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         host_lane_capacity: 1,
         transfer_tickets: 1,
         image_warmups: Vec::new(),
+        captured_images: None,
         diffusion_lm_step_rows: 0,
         image_unconditional_token_ids: None,
     })
@@ -331,13 +332,16 @@ impl TokenLayout {
     /// A configured token capacity sizes the pool instead. `total_bytes` is
     /// the device's total memory, zero on CPU. `unit_overhead` is device
     /// storage other owners keep per unit (unit index columns), charged with
-    /// each unit.
+    /// each unit. `granularity` is the device's allocation granularity, in
+    /// whose granules a device pool splits its planes into segments; `None`
+    /// on CPU.
     pub(crate) fn fit_cache(
         &mut self,
         cache: &CachePlan,
         unit_overhead: u64,
         config: &WorkerConfig,
         total_bytes: u64,
+        granularity: Option<u64>,
         group: &HostGroup,
     ) -> Result<CacheCapacity> {
         let unit_bytes = cache.unit_bytes + unit_overhead;
@@ -373,6 +377,24 @@ impl TokenLayout {
         // Every member allocates the same logical unit ids, bounded by the
         // smallest grant.
         capacity.num_units = group.all_reduce_min(&[capacity.num_units as i64])?[0] as u64;
+        // A device pool splits its value planes into segments of whole
+        // allocation granules, which give memory back: its units round down
+        // to them, alike on every member. An adopted pool split already.
+        if let (Some(granularity), None) = (granularity, config.cache_units) {
+            let units = u32::try_from(capacity.num_units)
+                .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
+            let rounded = crate::memory::prefix_cache::planes::segmented_units(
+                units,
+                cache.plane_bytes,
+                granularity,
+            );
+            tracing::info!(
+                fitted = units,
+                units = rounded,
+                "rounded the KV cache down to whole segments"
+            );
+            capacity.num_units = u64::from(rounded);
+        }
         let num_units = u32::try_from(capacity.num_units)
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
         self.info.prefix_cache = Some(cache.info(num_units));
@@ -596,6 +618,7 @@ pub(crate) mod tests {
                 dtype: crate::ffi::DType::BF16,
                 compute_dtype: crate::ffi::DType::BF16,
             }],
+            states: Vec::new(),
             handle: crate::ffi::Handle::none(),
         }
     }
@@ -642,6 +665,13 @@ pub(crate) mod tests {
         assert!(request_slots(&requirements, 2, 50, &group()).is_err());
     }
 
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+
     #[test]
     fn the_cache_pool_takes_the_grant_left_after_reservations() {
         let gib = 1u64 << 30;
@@ -664,12 +694,16 @@ pub(crate) mod tests {
         layout.reserve(Device::Cuda(DeviceId(0)), gib);
         let cache = cache();
         let capacity = layout
-            .fit_cache(&cache, 0, &config, 100 * gib, &group())
+            .fit_cache(&cache, 0, &config, 100 * gib, Some(2 << 20), &group())
             .unwrap();
 
+        // The units round down to eight segments of whole 2 MiB granules.
         let unit = cache.unit_bytes;
         let reserved = (10 * gib).div_ceil(unit) + (fixed_before + gib).div_ceil(unit);
-        assert_eq!(capacity.num_units, 20 * gib / unit - reserved);
+        let fitted = 20 * gib / unit - reserved;
+        let granule = (2 << 20) / gcd(cache.plane_bytes, 2 << 20);
+        assert_eq!(capacity.num_units, fitted / 8 / granule * granule * 8);
+        assert!(fitted - capacity.num_units < 8 * granule);
         let plan = layout.finish(&config, Some(Arc::new(cache)));
         let info = plan.info.prefix_cache.as_ref().unwrap();
         assert_eq!(u64::from(info.num_units), capacity.num_units);
@@ -711,7 +745,9 @@ pub(crate) mod tests {
             )),
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
-        let capacity = layout.fit_cache(&cache(), 0, &config, 0, &group()).unwrap();
+        let capacity = layout
+            .fit_cache(&cache(), 0, &config, 0, None, &group())
+            .unwrap();
         assert_eq!(capacity.num_units, DEFAULT_NUM_UNITS);
         let plan = layout.finish(&config, Some(Arc::new(cache())));
         assert_eq!(plan.info.max_batch_calls, 4);

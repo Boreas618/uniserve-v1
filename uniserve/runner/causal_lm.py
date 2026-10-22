@@ -50,6 +50,7 @@ from typing import Any
 
 import torch
 
+from uniserve import adapters
 from uniserve.bindings import capturing
 from uniserve.models import (
     EmbeddingReplacement,
@@ -64,6 +65,7 @@ from uniserve.nn.attention import (
 from uniserve.nn.attention.gather import (
     gather_request_decode_inputs,
 )
+from uniserve.prefix_cache import slots as request_slots
 from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import execution_context, kernel_records
 from uniserve.sampling.greedy import greedy
@@ -221,6 +223,7 @@ class CausalLMRunner:
         penalty_counts: torch.Tensor,
         prompt_logits: torch.Tensor,
         logit_bias: torch.Tensor,
+        adapters: torch.Tensor,
     ) -> None:
         path = str(path)
         self._model = (
@@ -248,6 +251,7 @@ class CausalLMRunner:
         self._penalty_counts = penalty_counts
         self._prompt_logits = prompt_logits
         self._logit_bias = logit_bias
+        self._adapters = adapters
 
         # The state tensors live on the device the forwards compute on.
         placed = unit_tables.device
@@ -282,6 +286,14 @@ class CausalLMRunner:
             )
             self._decode_positions = torch.zeros(
                 (1, rows), dtype=torch.int64, device=placed
+            )
+            # Each token's slot and the adapter it computes with
+            # (``uniserve.adapters``).
+            self._token_slots = torch.zeros(
+                tokens, dtype=torch.int64, device=placed
+            )
+            self._token_adapters = torch.zeros(
+                tokens, dtype=torch.int64, device=placed
             )
 
     # Facts.
@@ -488,8 +500,15 @@ class CausalLMRunner:
                 attention,
                 None,
             )
+            token_adapters = adapters.gather_rows(
+                self._adapters, slots[:rows], self._token_adapters[:rows]
+            )
 
-            with self._context.expert_step(int(expert_capacity)):
+            with (
+                self._context.expert_step(int(expert_capacity)),
+                adapters.selected(token_adapters),
+                request_slots.selected(slots[:rows]),
+            ):
                 hidden = self._model(inputs)
                 indices = (
                     self._attention_metadata.query_offsets[1 : rows + 1].to(
@@ -685,8 +704,22 @@ class CausalLMRunner:
                 attention,
                 embeddings,
             )
+            metadata = self._attention_metadata
+            token_adapters = adapters.gather_tokens(
+                self._adapters,
+                row_columns,
+                metadata.block_tables.shape[1],
+                len(metadata.block_size),
+                self._token_slots[:tokens],
+                self._token_adapters[:tokens],
+            )
 
-            with self._context.expert_step(int(expert_capacity)):
+            # The first section of the row columns is each row's slot.
+            with (
+                self._context.expert_step(int(expert_capacity)),
+                adapters.selected(token_adapters),
+                request_slots.selected(row_columns[:rows]),
+            ):
                 if not outputs:
                     self._model.fill_cache(inputs)
                     return

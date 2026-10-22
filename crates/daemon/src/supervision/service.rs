@@ -11,24 +11,32 @@
 //! One thread does all of it, waiting on every connection and a wake pipe
 //! at once and polling its children for exits at a short interval, so no
 //! request waits behind another node's.
+//!
+//! A hot restart of the daemon stops the thread between two rounds and
+//! hands everything it serves to the successor daemon: its listeners and
+//! connections as descriptors, with the bytes each received and has not
+//! taken, its pending stops, its processes and its claims
+//! ([`HandedService`]). The successor's thread goes on from there; no peer
+//! sees a connection close.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use prost::Message as _;
 use proto::process::{
     Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, Node, Reply, Request,
     Spawned, Stopped, ToMember, Upstream, Welcome, downstream, event, from_member, hello, reply,
     request, to_member, upstream,
 };
-use proto::{Connection, Listener};
+use proto::{Connection, Handed, Listener};
 
-use crate::supervision::claims::ClaimHolder;
-use crate::supervision::supervisor::Supervisor;
+use crate::supervision::claims::{ClaimHolder, HandedClaims};
+use crate::supervision::supervisor::{HandedProcesses, Supervisor};
 
 /// How often children are polled for exits while nothing else happens.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -36,12 +44,19 @@ const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// What the service thread reads its stop from.
 pub(crate) struct Stop {
     pub(crate) requested: Arc<AtomicBool>,
+    /// Set to stop for a hot restart: the thread hands what it serves over
+    /// instead of ending its processes.
+    pub(crate) handoff: Arc<AtomicBool>,
     pub(crate) wake: UnixStream,
 }
 
 impl Stop {
     fn requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    fn handoff(&self) -> bool {
+        self.handoff.load(Ordering::Acquire)
     }
 
     /// Consumes the wake bytes the stop wrote.
@@ -67,6 +82,50 @@ pub(crate) struct Local {
 }
 
 impl Local {
+    /// Hands the supervisor's processes and the claims over: their state,
+    /// and their descriptors appended to `descriptors`.
+    fn hand_over(&mut self, descriptors: &mut Vec<OwnedFd>) -> anyhow::Result<HandedLocal> {
+        let (claims, claim_descriptors) = self.claims.hand_over()?;
+        let (processes, process_descriptors) = self.supervisor.hand_over()?;
+        let handed = HandedLocal {
+            claims,
+            claim_descriptors: claim_descriptors.len(),
+            processes,
+            process_descriptors: process_descriptors.len(),
+            address: self.address,
+        };
+        descriptors.extend(claim_descriptors);
+        descriptors.extend(process_descriptors);
+        Ok(handed)
+    }
+
+    /// Goes on with what [`Local::hand_over`] handed, taking its
+    /// descriptors from `descriptors`.
+    fn adopt(
+        host: String,
+        handed: HandedLocal,
+        descriptors: &mut std::vec::IntoIter<OwnedFd>,
+    ) -> anyhow::Result<Self> {
+        let claims: Vec<OwnedFd> = descriptors
+            .by_ref()
+            .take(handed.claim_descriptors)
+            .collect();
+        let processes: Vec<OwnedFd> = descriptors
+            .by_ref()
+            .take(handed.process_descriptors)
+            .collect();
+        anyhow::ensure!(
+            claims.len() == handed.claim_descriptors
+                && processes.len() == handed.process_descriptors,
+            "the handed-over service lacks descriptors"
+        );
+        Ok(Self {
+            supervisor: Supervisor::adopt(host, handed.processes, processes)?,
+            claims: ClaimHolder::adopt(handed.address, handed.claims, claims),
+            address: handed.address,
+        })
+    }
+
     /// Answers one request for this node on behalf of `engine`.
     fn answer(&mut self, engine: u64, request: &Request) -> Reply {
         let mut reply = Reply {
@@ -113,14 +172,15 @@ struct EngineConnection {
 }
 
 /// Runs the leader's service until `stop`: engines connect on `listener`,
-/// and `members` joined before.
+/// and `members` joined before. Returns what it served when `stop` asks
+/// for a hot restart's handoff, and `None` once it stopped.
 pub(crate) fn serve_leader(
     host: &str,
-    mut local: Local,
+    local: Local,
     listener: Listener,
-    mut members: Vec<Membership>,
+    members: Vec<Membership>,
     stop: &Stop,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut nodes = vec![Node {
         node_rank: 0,
         host: host.to_owned(),
@@ -141,15 +201,68 @@ pub(crate) fn serve_leader(
         });
     }
     nodes.sort_by_key(|node| node.node_rank);
+    run_leader(
+        LeaderService {
+            host: host.to_owned(),
+            local,
+            listener,
+            members,
+            nodes,
+            engines: HashMap::new(),
+            next_engine: 1,
+            stops: HashMap::new(),
+        },
+        stop,
+    )
+}
 
-    let mut engines: HashMap<u64, EngineConnection> = HashMap::new();
-    let mut next_engine = 1_u64;
-    // Stops of an engine, by its request id, awaiting the members' answers.
-    let mut stops: HashMap<(u64, u64), PendingStop> = HashMap::new();
+/// Everything the leader's service holds between two rounds.
+pub(crate) struct LeaderService {
+    host: String,
+    local: Local,
+    listener: Listener,
+    members: Vec<Membership>,
+    nodes: Vec<Node>,
+    engines: HashMap<u64, EngineConnection>,
+    next_engine: u64,
+    /// Stops of an engine, by its request id, awaiting the members'
+    /// answers.
+    stops: HashMap<(u64, u64), PendingStop>,
+}
+
+/// Runs the leader's service from `service` until `stop`.
+pub(crate) fn run_leader(
+    service: LeaderService,
+    stop: &Stop,
+) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+    let LeaderService {
+        host,
+        mut local,
+        listener,
+        mut members,
+        mut nodes,
+        mut engines,
+        mut next_engine,
+        mut stops,
+    } = service;
+    let host = host.as_str();
     loop {
+        if stop.handoff() {
+            let service = LeaderService {
+                host: host.to_owned(),
+                local,
+                listener,
+                members,
+                nodes,
+                engines,
+                next_engine,
+                stops,
+            };
+            return service.hand_over().map(Some);
+        }
         if stop.requested() {
             local.supervisor.terminate_all();
-            return Ok(());
+            return Ok(None);
         }
         while let Some(connection) = listener.try_accept()? {
             engines.insert(
@@ -386,15 +499,29 @@ fn route(
 }
 
 /// Runs a member's service until the leader's connection closes or `stop`.
+/// Returns what it served when `stop` asks for a hot restart's handoff, and
+/// `None` once it stopped.
 pub(crate) fn serve_member(
     mut local: Local,
     mut leader: Connection,
     stop: &Stop,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     loop {
+        if stop.handoff() {
+            let mut descriptors = Vec::new();
+            let local = local.hand_over(&mut descriptors)?;
+            let leader = leader.hand_over();
+            let handed = HandedService::Member {
+                local,
+                leader: HandedConnection::of(&leader),
+            };
+            let mut ordered = vec![leader.descriptor];
+            ordered.extend(descriptors);
+            return Ok(Some((handed, ordered)));
+        }
         if stop.requested() {
             local.supervisor.terminate_all();
-            return Ok(());
+            return Ok(None);
         }
         loop {
             match leader.try_recv::<ToMember>() {
@@ -421,7 +548,7 @@ pub(crate) fn serve_member(
                 Err(error) => {
                     tracing::info!(%error, "the leader's connection closed; ending this node's processes");
                     local.supervisor.terminate_all();
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -438,6 +565,215 @@ pub(crate) fn serve_member(
             EXIT_POLL_INTERVAL,
         );
         stop.drain();
+    }
+}
+
+/// What a daemon's service hands its successor in a hot restart: its state,
+/// beside the descriptors that travel with it in the order the fields name
+/// them.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum HandedService {
+    Leader {
+        host: String,
+        /// The process socket: its address and whether it is a Unix
+        /// socket; its descriptor comes first.
+        listener: (String, bool),
+        /// Each engine connection, by its identity, after the listener.
+        engines: Vec<(u64, bool, HandedConnection)>,
+        next_engine: u64,
+        /// Each member's connection, after the engines'.
+        members: Vec<(u32, String, HandedConnection)>,
+        /// The deployment's nodes (`proto::process::Node`, encoded).
+        nodes: Vec<Vec<u8>>,
+        /// Each pending stop: its engine and request, this node's reply
+        /// (encoded) and the members that have not answered.
+        stops: Vec<(u64, u64, Vec<u8>, Vec<u32>)>,
+        /// The claims' and processes' descriptors follow the members'.
+        local: HandedLocal,
+    },
+    Member {
+        /// The leader's connection, whose descriptor comes first.
+        leader: HandedConnection,
+        local: HandedLocal,
+    },
+}
+
+/// A connection's state, its descriptor travelling apart.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedConnection {
+    unix: bool,
+    received: Vec<u8>,
+}
+
+impl HandedConnection {
+    fn of(handed: &Handed) -> Self {
+        Self {
+            unix: handed.unix,
+            received: handed.received.clone(),
+        }
+    }
+
+    fn resume(self, descriptor: OwnedFd) -> anyhow::Result<Connection> {
+        Ok(Connection::resume(Handed {
+            descriptor,
+            unix: self.unix,
+            received: self.received,
+        })?)
+    }
+}
+
+/// The supervisor's processes and the node's claims, as handed over.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedLocal {
+    claims: HandedClaims,
+    claim_descriptors: usize,
+    processes: HandedProcesses,
+    process_descriptors: usize,
+    address: Option<IpAddr>,
+}
+
+impl LeaderService {
+    /// The handoff of everything the service holds.
+    fn hand_over(self) -> anyhow::Result<(HandedService, Vec<OwnedFd>)> {
+        let Self {
+            host,
+            mut local,
+            listener,
+            members,
+            nodes,
+            engines,
+            next_engine,
+            stops,
+        } = self;
+        let (listener_descriptor, unix, address) = listener.hand_over();
+        let mut descriptors = vec![listener_descriptor];
+        let mut handed_engines = Vec::with_capacity(engines.len());
+        for (id, engine) in engines {
+            let handed = engine.connection.hand_over();
+            handed_engines.push((id, engine.welcomed, HandedConnection::of(&handed)));
+            descriptors.push(handed.descriptor);
+        }
+        let mut handed_members = Vec::with_capacity(members.len());
+        for member in members {
+            let handed = member.connection.hand_over();
+            handed_members.push((member.node_rank, member.host, HandedConnection::of(&handed)));
+            descriptors.push(handed.descriptor);
+        }
+        let local = local.hand_over(&mut descriptors)?;
+        Ok((
+            HandedService::Leader {
+                host,
+                listener: (address, unix),
+                engines: handed_engines,
+                next_engine,
+                members: handed_members,
+                nodes: nodes.iter().map(prost::Message::encode_to_vec).collect(),
+                stops: stops
+                    .into_iter()
+                    .map(|((engine, request), pending)| {
+                        (
+                            engine,
+                            request,
+                            pending.reply.encode_to_vec(),
+                            pending.awaiting,
+                        )
+                    })
+                    .collect(),
+                local,
+            },
+            descriptors,
+        ))
+    }
+}
+
+/// Goes on with the service a predecessor handed over, with its
+/// descriptors in the handoff's order, until `stop`.
+pub(crate) fn resume(
+    host: String,
+    handed: HandedService,
+    descriptors: Vec<OwnedFd>,
+    stop: &Stop,
+) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+    let mut descriptors = descriptors.into_iter();
+    let mut next = || {
+        descriptors
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the handed-over service lacks a descriptor"))
+    };
+    match handed {
+        HandedService::Leader {
+            host: leader_host,
+            listener: (address, unix),
+            engines,
+            next_engine,
+            members,
+            nodes,
+            stops,
+            local,
+        } => {
+            let listener = Listener::resume(next()?, unix, address)?;
+            let mut adopted_engines = HashMap::new();
+            for (id, welcomed, connection) in engines {
+                adopted_engines.insert(
+                    id,
+                    EngineConnection {
+                        connection: connection.resume(next()?)?,
+                        welcomed,
+                    },
+                );
+            }
+            let mut adopted_members = Vec::with_capacity(members.len());
+            for (node_rank, member_host, connection) in members {
+                adopted_members.push(Membership {
+                    node_rank,
+                    host: member_host,
+                    connection: connection.resume(next()?)?,
+                });
+            }
+            let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
+            let local = Local::adopt(host, local, &mut rest)?;
+            let nodes = nodes
+                .iter()
+                .map(|node| Node::decode(node.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let stops = stops
+                .into_iter()
+                .map(|(engine, request, reply, awaiting)| {
+                    Ok((
+                        (engine, request),
+                        PendingStop {
+                            reply: Reply::decode(reply.as_slice())?,
+                            awaiting,
+                        },
+                    ))
+                })
+                .collect::<anyhow::Result<HashMap<_, _>>>()?;
+            tracing::info!(
+                engines = adopted_engines.len(),
+                members = adopted_members.len(),
+                "the service goes on from the previous daemon"
+            );
+            run_leader(
+                LeaderService {
+                    host: leader_host,
+                    local,
+                    listener,
+                    members: adopted_members,
+                    nodes,
+                    engines: adopted_engines,
+                    next_engine,
+                    stops,
+                },
+                stop,
+            )
+        }
+        HandedService::Member { leader, local } => {
+            let leader = leader.resume(next()?)?;
+            let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
+            let local = Local::adopt(host, local, &mut rest)?;
+            tracing::info!("the service goes on from the previous daemon");
+            serve_member(local, leader, stop)
+        }
     }
 }
 

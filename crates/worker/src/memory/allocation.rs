@@ -25,7 +25,7 @@ use std::os::fd::OwnedFd;
 
 use cuda::{
     CopyBatch, DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
-    ShareableHandle, SourceOrder, Strided,
+    SegmentedMapping, ShareableHandle, SourceOrder, Strided,
 };
 use tvm_ffi::{Any, AnyView};
 
@@ -56,6 +56,22 @@ enum Kind {
     /// Host memory the Storage Server retains: a memfd mapped into this
     /// process and registered for device copies.
     Retained(HostMapping),
+    /// Device memory in segments mapped back to back in one reserved range,
+    /// each a physical allocation of its own that the Storage Server retains
+    /// by its descriptor, released and mapped again at its place: a KV cache
+    /// plane that gives part of its memory back while every address stays
+    /// valid.
+    Segmented(Segments),
+}
+
+/// A segmented storage's mapping.
+struct Segments {
+    device: DeviceId,
+    address: u64,
+    bytes: usize,
+    /// The shortest segment's length, the most one copy may address.
+    segment_bytes: u64,
+    mapping: Mutex<SegmentedMapping>,
 }
 
 /// A shared mapping of a host memfd, registered with CUDA so device copies
@@ -253,6 +269,56 @@ impl Storage {
         })
     }
 
+    /// Device memory of segments of `lengths` bytes back to back, each a
+    /// multiple of the allocation granularity, none mapped yet
+    /// ([`Storage::create_segment`], [`Storage::import_segment`]), addressed
+    /// by `device` and every device in `access` once mapped. Other
+    /// processes cannot map it as one allocation, so it is not exportable in
+    /// place: an export of it is a copy.
+    pub(crate) fn segmented(
+        device: DeviceId,
+        lengths: &[usize],
+        access: &[DeviceId],
+    ) -> Result<Arc<Self>> {
+        let mapping = SegmentedMapping::reserve(device, lengths, access)?;
+        let address = mapping.address();
+        let bytes = mapping.len();
+        Ok(Arc::new(Self {
+            kind: Kind::Segmented(Segments {
+                device,
+                address,
+                bytes,
+                segment_bytes: lengths.iter().min().map_or(0, |&length| length as u64),
+                mapping: Mutex::new(mapping),
+            }),
+        }))
+    }
+
+    fn segments(&self) -> Result<&Segments> {
+        match &self.kind {
+            Kind::Segmented(segments) => Ok(segments),
+            _ => Err(Error::Invariant("the storage is not segmented".into())),
+        }
+    }
+
+    /// Creates the memory of segment `index` and returns its descriptor for
+    /// the Storage Server to retain. Contents are uninitialized.
+    pub(crate) fn create_segment(&self, index: usize) -> Result<OwnedFd> {
+        Ok(lock(&self.segments()?.mapping).create(index)?)
+    }
+
+    /// Maps segment `index` from the descriptor of memory another process
+    /// created and the Storage Server retains.
+    pub(crate) fn import_segment(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
+        Ok(lock(&self.segments()?.mapping).import(index, descriptor)?)
+    }
+
+    /// Unmaps segment `index` at once, as its memory is given back: no
+    /// device work may access it any more.
+    pub(crate) fn release_segment(&self, index: usize) -> Result<()> {
+        Ok(lock(&self.segments()?.mapping).release(index)?)
+    }
+
     /// Map an allocation the host's Storage Server retains, `bytes` long,
     /// through its `descriptor`, with `protection` for `device` and every
     /// device in `access`. The mapping is registered as resident exportable
@@ -380,6 +446,7 @@ impl Storage {
         match &self.kind {
             Kind::Device(allocation) => Ok(allocation.protect(protection)?),
             Kind::Mapped { mapping, .. } => Ok(mapping.protect(protection)?),
+            Kind::Segmented(segments) => Ok(lock(&segments.mapping).protect(protection)?),
             Kind::Retained(mapping) if protection == Protection::ReadOnly => mapping.seal(),
             Kind::Retained(_) | Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
                 "only device memory changes its protection, and retained host memory \
@@ -414,7 +481,7 @@ impl Storage {
     /// slice is alive.
     pub unsafe fn host_bytes(&self) -> Option<&[u8]> {
         match &self.kind {
-            Kind::Device(_) | Kind::Mapped { .. } => None,
+            Kind::Device(_) | Kind::Mapped { .. } | Kind::Segmented(_) => None,
             Kind::Pinned(buffer) => {
                 // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which
                 // the slice borrows; the caller excludes concurrent writers.
@@ -461,6 +528,7 @@ impl Backing for Storage {
         match &self.kind {
             Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
             Kind::Mapped { mapping, .. } => MemoryKind::Cuda(mapping.device()),
+            Kind::Segmented(segments) => MemoryKind::Cuda(segments.device),
             Kind::Pinned(_) | Kind::Retained(_) => MemoryKind::PinnedHost,
             Kind::Host(_) => MemoryKind::Host,
         }
@@ -470,6 +538,7 @@ impl Backing for Storage {
         match &self.kind {
             Kind::Device(allocation) => allocation.address(),
             Kind::Mapped { mapping, .. } => mapping.address(),
+            Kind::Segmented(segments) => segments.address,
             Kind::Pinned(buffer) => buffer.address(),
             Kind::Host(bytes) => bytes.as_ptr() as u64,
             Kind::Retained(mapping) => mapping.address as u64,
@@ -480,9 +549,17 @@ impl Backing for Storage {
         match &self.kind {
             Kind::Device(allocation) => allocation.len(),
             Kind::Mapped { mapping, .. } => mapping.len(),
+            Kind::Segmented(segments) => segments.bytes,
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),
             Kind::Retained(mapping) => mapping.bytes,
+        }
+    }
+
+    fn copy_span(&self) -> u64 {
+        match &self.kind {
+            Kind::Segmented(segments) => segments.segment_bytes,
+            _ => u64::MAX,
         }
     }
 }
@@ -738,6 +815,12 @@ impl StorageView {
     }
 
     /// The view as a strided copy operand.
+    /// The most bytes one copy may address in the view's memory
+    /// ([`Backing::copy_span`]).
+    pub(crate) fn copy_span(&self) -> u64 {
+        self.memory.copy_span()
+    }
+
     pub(crate) fn operand(&self) -> CopyOperand {
         CopyOperand {
             address: self.address(),

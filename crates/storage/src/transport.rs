@@ -108,6 +108,54 @@ impl Connection {
         &self.stream
     }
 
+    /// The connection's socket and the bytes received and not yet taken
+    /// as frames, for another process to go on with ([`Self::resume`]),
+    /// once nothing waits to be written and no descriptor is held: a
+    /// Storage Server's hot restart hands its clients' connections to its
+    /// successor.
+    ///
+    /// # Errors
+    ///
+    /// Fails when frames wait to be written or descriptors are held.
+    pub fn hand_over(self) -> io::Result<(Socket, Vec<u8>)> {
+        if !self.descriptors.is_empty() || !self.outbox.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a connection with frames to write cannot be handed over",
+            ));
+        }
+        Ok((self.stream, self.inbox))
+    }
+
+    /// Goes on with a connection another process handed over, with the
+    /// bytes it had received.
+    pub fn resume(stream: Socket, inbox: Vec<u8>) -> Self {
+        Self {
+            stream,
+            inbox,
+            descriptors: VecDeque::new(),
+            outbox: VecDeque::new(),
+            closed: false,
+        }
+    }
+
+    /// The connection's socket, for another process to go on with, once
+    /// nothing is buffered either way: a daemon's hot restart hands its
+    /// idle connections to its successor.
+    ///
+    /// # Errors
+    ///
+    /// Fails when bytes or descriptors are buffered.
+    pub fn into_socket(self) -> io::Result<Socket> {
+        if !self.inbox.is_empty() || !self.descriptors.is_empty() || !self.outbox.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a connection with buffered frames cannot be handed over",
+            ));
+        }
+        Ok(self.stream)
+    }
+
     /// Whether frames wait to be written.
     pub fn wants_write(&self) -> bool {
         !self.outbox.is_empty()

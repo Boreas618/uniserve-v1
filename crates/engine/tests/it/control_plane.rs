@@ -466,6 +466,7 @@ fn generation_request(
         image_generation: policy,
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
+        adapter: 0,
     };
     request
         .validate_resources(&limits)
@@ -1655,6 +1656,145 @@ fn prefix_cache_configuration_controls_reuse() {
         engine.shutdown();
     }
     assert_eq!(outputs[0], outputs[1]);
+}
+
+/// Workers that denoise images under CUDA graphs report the steps they
+/// captured; the engine admits an image request only when its size is
+/// captured at every guidance branch count up to its own, and refuses the
+/// others with the sizes it serves.
+#[test]
+fn image_requests_are_admitted_only_at_captured_steps() {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().captured_images = Some(vec![
+        ipc::CapturedImage {
+            height: 512,
+            width: 512,
+            branches: 1,
+        },
+        ipc::CapturedImage {
+            height: 512,
+            width: 512,
+            branches: 2,
+        },
+        ipc::CapturedImage {
+            height: 256,
+            width: 512,
+            branches: 1,
+        },
+    ]);
+    let scheduler =
+        support::scheduler(Box::new(SimExecutor::new(sim)), special_tokens(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let terminal = |id: u64, height: u32, cfg_text_scale: f32| {
+        let request = generation_request(
+            RequestId(id),
+            text_input(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 2,
+                cfg_text_scale,
+                height,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        );
+        let mut events = handle.submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
+                    return Some(event);
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        None
+    };
+    // Guided 512x512 steps evaluate one and two branches, both captured.
+    let guided = terminal(1, 512, 4.0);
+    // 256x512 is captured unguided only.
+    let unguided = terminal(2, 256, 1.0);
+    let uncaptured_guidance = terminal(3, 256, 4.0);
+    // 768x512 is not captured at all.
+    let uncaptured_size = terminal(4, 768, 1.0);
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+
+    for admitted in [&guided, &unguided] {
+        assert!(
+            matches!(
+                admitted,
+                Some(Event::Finished {
+                    reason: FinishReason::ImageDone,
+                    ..
+                })
+            ),
+            "{admitted:?}"
+        );
+    }
+    for refused in [&uncaptured_guidance, &uncaptured_size] {
+        let Some(Event::Rejected {
+            kind: RejectionKind::Invalid,
+            message,
+        }) = refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            message.contains("only at the sizes they captured"),
+            "{message}"
+        );
+    }
+}
+
+/// Workers that keep cache layers per request slot (a recurrent state) reuse
+/// no prefix and retain no reusable page, although the deployment enables
+/// prefix caching: a page does not hold the state its request reached.
+#[test]
+fn request_states_disable_prefix_reuse() {
+    use engine::{EngineConfig, SchedulerHandle};
+    use std::sync::atomic::Ordering;
+
+    let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
+    let mut sim = SimEngine::new();
+    sim.set_text_len(4);
+    sim.set_request_states(true);
+    let config = EngineConfig {
+        prefix_cache: true,
+        ..EngineConfig::sim("sim-model")
+    };
+    let engine = SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+    let stats = engine.stats();
+    for rid in 1..=2 {
+        let mut events = engine
+            .submit(generation_request(
+                RequestId(rid),
+                text_input(prompt.clone()),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                8,
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut finish = None;
+        while finish.is_none() && Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(Event::Finished { reason, .. }) => finish = Some(reason),
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(finish, Some(FinishReason::Eos));
+    }
+    assert_eq!(stats.prefix.hit_tokens.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.prefix_cache.pages_stored.load(Ordering::Relaxed), 0);
+    engine.shutdown();
 }
 
 /// Per-request `CachePolicy` governs prefix reuse: isolation keys partition the
@@ -3548,4 +3688,90 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
         }
         other => panic!("the stream did not end with its terminal event: {other:?}"),
     }
+}
+
+/// A scheduler takes scheduling limits in place within its workers' batch
+/// and refuses limits beyond it, keeping its own. A change of policy orders
+/// the requests already waiting by it.
+#[test]
+fn scheduler_takes_limits_in_place_within_its_workers_batch() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1 << 20);
+    let executor = Box::new(SimExecutor::new(sim));
+    let base = SchedulerConfig {
+        max_batch: 32,
+        ..Default::default()
+    };
+    let sched = support::scheduler_with(executor, special_tokens(), base).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let refused = handle
+        .configure(SchedulerConfig {
+            max_running_requests: 1 << 30,
+            ..base
+        })
+        .recv()
+        .unwrap()
+        .unwrap_err();
+    assert!(refused.contains("max_running_requests"), "{refused}");
+    // One request runs at a time.
+    handle
+        .configure(SchedulerConfig {
+            max_running_requests: 1,
+            ..base
+        })
+        .recv()
+        .unwrap()
+        .unwrap();
+
+    let request = |id: u64, priority: i32, tokens: usize| GenerationRequest {
+        priority,
+        ..generation_request(
+            RequestId(id),
+            text_input(vec![1, 2, 3, 4, 5]),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            tokens,
+        )
+    };
+    // The first request runs until it is aborted: its events are not read,
+    // so it stops once its output window is full. The other two wait behind
+    // it, in arrival order.
+    let mut first = handle.submit(request(1, 0, 1024)).unwrap();
+    let scheduled = |events: &mut engine::EventRx| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match events.try_recv() {
+                Ok(Event::Scheduled { scheduled_at, .. }) => return scheduled_at,
+                Ok(Event::Finished { reason, .. }) => panic!("finished unscheduled: {reason:?}"),
+                Ok(_) => {}
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("no scheduling event: {error:?}"),
+            }
+        }
+    };
+    scheduled(&mut first);
+    let mut low = handle.submit(request(2, 5, 4)).unwrap();
+    let mut high = handle.submit(request(3, 1, 4)).unwrap();
+    handle
+        .configure(SchedulerConfig {
+            max_running_requests: 1,
+            policy: SchedulingPolicy::Priority,
+            ..base
+        })
+        .recv()
+        .unwrap()
+        .unwrap();
+    handle.abort(RequestId(1));
+    let high_at = scheduled(&mut high);
+    let low_at = scheduled(&mut low);
+    assert!(high_at < low_at, "{high_at} {low_at}");
+
+    handle.shutdown();
+    let _ = jh.join();
 }

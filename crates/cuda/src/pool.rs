@@ -9,6 +9,10 @@
 //! chunks stay mapped and are given out again by the same pool, so the
 //! physical memory returns to the driver only when the pool is dropped.
 //!
+//! Every device that can access the pool's device's memory may read and
+//! write the chunks: a module placed on another device (a generation tower)
+//! copies its inputs from tensors a capture allocated in the pool.
+//!
 //! [`VirtualPool::suspend`] copies every chunk's contents to page-locked
 //! host memory and releases the physical memory while keeping the
 //! reservation; [`VirtualPool::restore`] maps new physical memory at the
@@ -40,6 +44,9 @@ struct Chunk {
 pub struct VirtualPool {
     context: PrimaryContext,
     device: DeviceId,
+    /// The ordinals granted access to the chunks: the device's, then each
+    /// peer's that can access its memory.
+    access: Vec<i32>,
     address: u64,
     reserved: usize,
     granularity: usize,
@@ -59,6 +66,12 @@ impl VirtualPool {
     pub fn reserve(device: DeviceId, bytes: usize) -> Result<Self> {
         let context = PrimaryContext::retain(device)?;
         let ordinal = device.handle()?;
+        let mut access = vec![ordinal];
+        for peer in (0..DeviceId::count()?).map(DeviceId) {
+            if peer != device && peer.can_access_peer(device)? {
+                access.push(peer.handle()?);
+            }
+        }
         let (address, reserved, granularity) = in_context(context.raw(), |driver| {
             let properties = MemAllocationProp::device(ordinal, CU_MEM_HANDLE_TYPE_NONE);
             let mut granularity = 0;
@@ -88,6 +101,7 @@ impl VirtualPool {
         Ok(Self {
             context,
             device,
+            access,
             address,
             reserved,
             granularity,
@@ -113,7 +127,8 @@ impl VirtualPool {
     }
 
     /// A chunk of at least `bytes`, readable and writable by the pool's
-    /// device, at an address it keeps for the pool's life: a freed chunk of
+    /// device and its peers, at an address it keeps for the pool's life: a
+    /// freed chunk of
     /// the same rounded size, or new physical memory mapped after the
     /// chunks given out so far.
     ///
@@ -167,7 +182,7 @@ impl VirtualPool {
     }
 
     /// Creates `bytes` of physical memory and maps it at `offset`, readable
-    /// and writable by the pool's device. Returns its handle.
+    /// and writable by the pool's device and its peers. Returns its handle.
     fn map(&self, offset: u64, bytes: usize) -> Result<u64> {
         let ordinal = self.device.handle()?;
         let address = self.address + offset;
@@ -190,16 +205,20 @@ impl VirtualPool {
                 let _ = unsafe { (driver.mem_release)(handle) };
                 return Err(error);
             }
-            let access = MemAccessDesc {
-                location: MemLocation {
-                    kind: CU_MEM_LOCATION_TYPE_DEVICE,
-                    id: ordinal,
-                },
-                flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-            };
-            // SAFETY: the range was mapped above; the descriptor is live.
+            let access: Vec<MemAccessDesc> = self
+                .access
+                .iter()
+                .map(|&id| MemAccessDesc {
+                    location: MemLocation {
+                        kind: CU_MEM_LOCATION_TYPE_DEVICE,
+                        id,
+                    },
+                    flags: CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+                })
+                .collect();
+            // SAFETY: the range was mapped above; the descriptors are live.
             let granted = driver.check(
-                unsafe { (driver.mem_set_access)(address, bytes, &access, 1) },
+                unsafe { (driver.mem_set_access)(address, bytes, access.as_ptr(), access.len()) },
                 "cuMemSetAccess",
             );
             if let Err(error) = granted {

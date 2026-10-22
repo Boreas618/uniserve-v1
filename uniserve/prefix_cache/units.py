@@ -272,13 +272,16 @@ class UnitPool:
         configs: Mapping[str, mha.Config],
         *,
         num_units: int,
+        states: Mapping[str, State] | None = None,
     ) -> None:
         """Bind every layer's state over already allocated ``fields``.
 
         ``configs`` gives each resident layer's MHA layout; ``allocate``
         also allocates the fields. Dense layers bind their group's stored
         dtype as their logical storage dtype; FP8 layers encode their
-        compute dtype.
+        compute dtype. ``states`` are the states of the layers kept per
+        request slot (``uniserve.prefix_cache.slots``), which ``state``
+        serves too; they have no block table.
 
         Raises:
             ValueError: A field disagrees with the planes' layout.
@@ -338,6 +341,7 @@ class UnitPool:
                 )
                 self._tables[name] = first_table + row
             first_table += group.units_per_page
+        self._states.update(states or {})
 
     @classmethod
     def allocate(
@@ -390,6 +394,13 @@ class UnitPool:
     def state(self, name: str) -> State:
         """Borrow one layer's state; the fields' owner outlives its use."""
         return self._states[name]
+
+    def paged(self, name: str) -> bool:
+        """Whether one layer's state lies in the pool's pages (it has a
+        block table) rather than in its request slots.
+        """  # noqa: D205
+        self.state(name)
+        return name in self._tables
 
     def table(self, name: str) -> int:
         """Return the ID of the block table addressing one layer's units.

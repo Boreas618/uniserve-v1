@@ -142,10 +142,12 @@ impl ModelConfig {
             ModelDescription::SenseNova => {
                 ModelParameters::SenseNova(SenseNovaProfile::resolve(tokenizer)?)
             }
-            ModelDescription::Bagel => ModelParameters::Bagel(BagelProfile::resolve(
-                tokenizer,
-                read_bagel_max_latent_size(model).await?,
-            )?),
+            ModelDescription::Bagel => {
+                // Read before the vocabulary is borrowed, which a task's
+                // future may not hold across an await.
+                let max_latent_size = read_bagel_max_latent_size(model).await?;
+                ModelParameters::Bagel(BagelProfile::resolve(tokenizer, max_latent_size)?)
+            }
             ModelDescription::DiffusionGemma => {
                 let config_path = files.config_path.as_deref().ok_or_else(|| {
                     assets::Error::invalid(

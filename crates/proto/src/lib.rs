@@ -22,7 +22,7 @@ pub mod report;
 pub mod request;
 mod shared_memory;
 
-pub use connection::{Connection, Error, Listener, Result};
+pub use connection::{Connection, Error, Handed, Listener, Result};
 pub use media::{MappedMedia, MediaLocator, MediaSource};
 pub use shared_memory::SharedMemory;
 

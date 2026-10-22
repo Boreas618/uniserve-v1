@@ -5,6 +5,7 @@ members = [
     "crates/daemon",
     "crates/engine",
     "crates/ipc",
+    "crates/manager",
     "crates/models",
     "crates/proto",
     "crates/storage",

@@ -135,6 +135,19 @@ pub struct GenerateRequest {
     /// Salt that isolates the request's prefix-cache and encoder-cache
     /// entries from other salts.
     pub cache_salt: Option<String>,
+    /// The LoRA adapter the request computes with; `None` for the base
+    /// model alone.
+    pub adapter: Option<AdapterSelection>,
+}
+
+/// The LoRA adapter a request computes with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSelection {
+    /// The slot of the workers' adapter pool it lies in.
+    pub slot: u32,
+    /// What keeps its cache entries apart from every other adapter's, one
+    /// loaded into the same slot before included.
+    pub identity: String,
 }
 
 /// Image-generation controls: dimensions, denoise steps, guidance controls,

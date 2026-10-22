@@ -92,8 +92,8 @@ pub(crate) struct Construction<'a> {
     /// `start_pages`, `table_shapes`, `verified_lengths`,
     /// `future_input_tokens`, `logical_lengths`, `predicates`,
     /// `sampling_positions`, `penalty_counts`, `prompt_logits`,
-    /// `logit_bias`.
-    pub(crate) state: [&'a StorageView; 11],
+    /// `logit_bias`, `adapters`.
+    pub(crate) state: [&'a StorageView; 12],
 }
 
 /// Construct the Python runner. Pipeline stages share the last stage's

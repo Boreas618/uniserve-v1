@@ -290,6 +290,12 @@ impl Scheduler {
                     }
                 }
                 CallKind::Forward(ForwardMode::Prefill) => Phase::PublishCache,
+                // A hand-off's export or install leaves the request handing
+                // off until the install is accepted.
+                CallKind::Transfer(TransferMode::CacheExport) if state.phase == Phase::HandOff => {
+                    Phase::HandOff
+                }
+                CallKind::Transfer(TransferMode::CacheInstall) => Phase::HandOff,
                 CallKind::Transfer(TransferMode::CacheExport) => Phase::LatentPreparation,
                 CallKind::Media(MediaCall::LatentPreparation)
                 | CallKind::Media(MediaCall::Denoising) => Phase::Denoising,
@@ -319,6 +325,8 @@ impl Scheduler {
                     Phase::Readout
                 } else if self.config.canvas.is_some() {
                     Phase::Canvas
+                } else if self.decodes_elsewhere(id) {
+                    Phase::HandOff
                 } else {
                     Phase::DecodeUnd
                 }
@@ -463,10 +471,13 @@ impl Scheduler {
             return false;
         };
 
-        // A cache export is never queued behind an unresolved call, and a
-        // request with a `RoundCloseThenSuffix` image trigger queues no
-        // successor at all.
-        if target == CallKind::Transfer(TransferMode::CacheExport) {
+        // A cache export or install is never queued behind an unresolved
+        // call, and a request with a `RoundCloseThenSuffix` image trigger
+        // queues no successor at all.
+        if matches!(
+            target,
+            CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
+        ) {
             return false;
         }
         if matches!(
@@ -611,6 +622,13 @@ impl Scheduler {
         }
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
+            Phase::HandOff
+                if state.handoff_export.is_some()
+                    || last.kind == CallKind::Transfer(TransferMode::CacheExport) =>
+            {
+                CallKind::Transfer(TransferMode::CacheInstall)
+            }
+            Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
             Phase::CloseCache | Phase::FeedbackState => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
             Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),
@@ -667,6 +685,20 @@ impl Scheduler {
                 && (!state.req.generates_images()
                     || state.req.image_generation.trigger.direct_token().is_some())
         })
+    }
+
+    /// Whether the request's prompt was prefilled on a group that does not
+    /// decode (`WorkerGroupRole::Prefill`): it decodes on a decode group,
+    /// to which `Phase::HandOff` moves its KV cache.
+    pub(in crate::scheduler) fn decodes_elsewhere(&self, id: RequestId) -> bool {
+        let Some(state) = self.running.get(&id) else {
+            return false;
+        };
+        let key = RequestKey::new(self.engine_id, id, state.request_epoch);
+        self.placement
+            .affinity
+            .get(&(key, DEFAULT_COMPONENT.to_owned()))
+            .is_some_and(|owner| self.placement.prefill_groups.contains(owner))
     }
 
     /// Returns whether the next call can be scheduled.

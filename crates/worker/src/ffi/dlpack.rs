@@ -222,6 +222,12 @@ pub trait Backing: Send + Sync + 'static {
     fn address(&self) -> u64;
     /// Length of the allocation in bytes.
     fn bytes(&self) -> usize;
+    /// The most bytes one copy may address in this memory: the length of a
+    /// segment of memory mapped in segments that are unmapped apart, where
+    /// the driver refuses a copy whose range holds an unmapped segment.
+    fn copy_span(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 #[repr(C)]

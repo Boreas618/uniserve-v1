@@ -61,14 +61,12 @@ fn page_bytes(plan: &CachePlan, group: &CacheGroupPlan) -> u64 {
     2 * layers * plan.plane_bytes + scales
 }
 
-/// The digest of what determines the encoding of `group`'s pages: the
-/// model fingerprint, the page encoding, the cache dtype and every group's
-/// shape, and the group itself.
-fn content(fingerprint: &str, plan: &CachePlan, group: usize) -> [u8; 32] {
+/// The digest of the byte layout of `group`'s pages: the page encoding,
+/// the cache dtype and every group's shape, and the group itself. It
+/// identifies the group's page pool (`PageShape::layout`).
+fn layout(plan: &CachePlan, group: usize) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"uniserve-page-content\0");
-    digest.update((fingerprint.len() as u64).to_le_bytes());
-    digest.update(fingerprint.as_bytes());
+    digest.update(b"uniserve-page-layout\0");
     digest.update(PAGE_ENCODING.to_le_bytes());
     digest.update([u8::from(plan.quantized)]);
     digest.update(plan.plane_bytes.to_le_bytes());
@@ -89,13 +87,34 @@ fn content(fingerprint: &str, plan: &CachePlan, group: usize) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// The digest of what determines the values of `group`'s pages: the model
+/// fingerprint and the pages' layout. It seeds the group's page keys.
+fn content(fingerprint: &str, layout: &[u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"uniserve-page-content\0");
+    digest.update((fingerprint.len() as u64).to_le_bytes());
+    digest.update(fingerprint.as_bytes());
+    digest.update(layout);
+    digest.finalize().into()
+}
+
+/// The key seed of each of `plan`'s groups' page pools for a model of
+/// `fingerprint` (`HostKvCache::start` reports them).
+pub(crate) fn page_contents(plan: &CachePlan, fingerprint: &str) -> Vec<[u8; 32]> {
+    (0..plan.groups.len())
+        .map(|group| content(fingerprint, &layout(plan, group)))
+        .collect()
+}
+
 impl HostKvCache {
     /// Map a page pool for every cache group of `plan` at the rank's host's
     /// Storage Server, registered with `device`. A sliding-window group's
     /// pool holds the windows the engine offloads before aligned
     /// boundaries, page by page, as a full-attention group's holds every
     /// published page. `fingerprint`
-    /// is the model fingerprint (`uniserve.loading.retained.fingerprint`).
+    /// is the pages' key digest (`Fingerprints::pages`).
+    /// The pools share `bytes` so that each holds as many pages as the
+    /// others; each takes the server's size when `None`.
     /// Returns the host KV cache and what the rank reports of each pool.
     pub(crate) fn start(
         retained: &Retained,
@@ -103,11 +122,31 @@ impl HostKvCache {
         device: DeviceId,
         fingerprint: &str,
         endpoint: Option<&str>,
+        bytes: Option<u64>,
     ) -> Result<(Self, Vec<PagePoolInfo>)> {
         let mut pools = BTreeMap::new();
         let mut infos = Vec::new();
+        // One page of every group per slot of the shared budget.
+        let slots = match bytes {
+            Some(bytes) => {
+                let page_set: u64 = plan
+                    .groups
+                    .iter()
+                    .map(|group| page_bytes(plan, group))
+                    .sum();
+                let slots = bytes.checked_div(page_set).unwrap_or(0);
+                if slots == 0 {
+                    return Err(Error::Resource(
+                        "the host KV cache holds no page of each cache group",
+                    ));
+                }
+                Some(slots)
+            }
+            None => None,
+        };
         for (index, group) in plan.groups.iter().enumerate() {
-            let content = content(fingerprint, plan, index);
+            let layout = layout(plan, index);
+            let content = content(fingerprint, &layout);
             // The pool lies on the host NUMA node closest to the device, so
             // the copies between them cross no inter-node link.
             let numa_node = device
@@ -115,13 +154,21 @@ impl HostKvCache {
                 .ok()
                 .and_then(|node| u32::try_from(node).ok());
             let shape = PageShape {
-                content: Key(content),
+                layout: Key(layout),
                 kv_head_offset: group.kv_head_offset,
                 kv_head_count: group.num_kv_heads,
                 page_bytes: page_bytes(plan, group),
             };
+            let bytes = slots.map(|slots| slots * shape.page_bytes);
             let answer = retained.call("mapping a page pool", |client| {
-                client.call(&Request::PagePool { shape, numa_node }, &[])
+                client.call(
+                    &Request::PagePool {
+                        shape,
+                        numa_node,
+                        bytes,
+                    },
+                    &[],
+                )
             })?;
             let Reply::PagePool {
                 pool,

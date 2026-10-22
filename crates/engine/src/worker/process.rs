@@ -452,6 +452,57 @@ impl WorkerProcess {
         }
     }
 
+    /// Asks the rank to run the worker hook `name` with `payload`
+    /// (`WorkerRequest::Hook`). Returns the request's message, whose answer
+    /// [`Self::await_hook`] waits for. The engine asks only while the rank
+    /// runs no batch, so no other answer is outstanding.
+    pub(super) fn request_hook(&mut self, name: &str, payload: &str) -> anyhow::Result<u64> {
+        let message_id = self.alloc_call_id();
+        let mut request = WorkerRequest::hook(name, payload);
+        request.set_message_id(Some(message_id));
+        self.client.send(&request)?;
+        Ok(message_id)
+    }
+
+    /// Waits at most `timeout` for the rank's answer to the hook
+    /// `message_id`: the hook's JSON result.
+    ///
+    /// Fails when the hook fails, the rank dies, or it does not answer in
+    /// time.
+    pub(super) fn await_hook(
+        &mut self,
+        message_id: u64,
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let response = self
+                .client
+                .try_recv::<WorkerResponse>()
+                .with_context(|| format!("rank {} was lost", self.rank))?;
+            match response {
+                Some(WorkerResponse::Hooked {
+                    message_id: Some(id),
+                    result,
+                }) if id == message_id => return Ok(result),
+                Some(WorkerResponse::Error { error, .. }) => {
+                    bail!("rank {}: {}", self.rank, error.message)
+                }
+                Some(WorkerResponse::Stalled { stall }) => return Err(self.stalled(&stall)),
+                Some(other) => bail!("unexpected hook response: {:?}", other.kind()),
+                None => {}
+            }
+            self.check_worker("a worker hook")?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "rank {} did not run the hook within {timeout:?}",
+                self.rank
+            );
+            let _ = self.client.wait(remaining.min(WORKER_CHECK_INTERVAL));
+        }
+    }
+
     /// The generation of the group's launch the rank belongs to.
     pub(super) fn generation(&self) -> u64 {
         self.process.generation
@@ -912,6 +963,26 @@ impl Drop for WorkerProcess {
 /// # Errors
 ///
 /// Fails at the first rank that refuses, dies, or does not answer in time.
+/// Runs the worker hook `name` on every rank in `workers`, asking each
+/// before awaiting any (a hook may communicate between the ranks), and
+/// returns each rank's result in order.
+pub(in crate::worker) fn hook_all(
+    workers: &mut [WorkerProcess],
+    name: &str,
+    payload: &str,
+    timeout: Duration,
+) -> anyhow::Result<Vec<String>> {
+    let requests = workers
+        .iter_mut()
+        .map(|worker| worker.request_hook(name, payload))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    workers
+        .iter_mut()
+        .zip(requests)
+        .map(|(worker, message_id)| worker.await_hook(message_id, timeout))
+        .collect()
+}
+
 pub(in crate::worker) fn promote_all(
     workers: &mut [WorkerProcess],
     timeout: Duration,

@@ -469,6 +469,7 @@ mod tests {
                 finish_token_ids: Vec::new(),
                 initial_position: 5,
                 generated_token_ids: Vec::new(),
+                adapter: 0,
             }),
             image: None,
             diffusion: None,

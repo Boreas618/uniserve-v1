@@ -15,8 +15,11 @@
 //! exclusive storages it took. Exclusive storages a predecessor left that
 //! the worker has not taken yet are about to be reused or released by its
 //! owners, so they count as free. Other scopes' retained memory is used
-//! memory the device no longer reports free.
+//! memory the device no longer reports free. So does the part of the
+//! plugins' communication buffers NVML attributes to no process, which
+//! counts as the worker's own too.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cuda::{DeviceId, Nvml};
@@ -29,6 +32,9 @@ use crate::{Error, Result};
 pub(crate) struct DeviceBudget {
     nvml: Nvml,
     retained: Arc<Retained>,
+    /// The plugins' communication buffers NVML attributes to no process,
+    /// by device.
+    unattributed: BTreeMap<DeviceId, u64>,
     /// `torch.cuda.synchronize(device)` and `torch.cuda.empty_cache()`,
     /// called before a measurement so blocks freed by completed work are
     /// returned to the device and process memory excludes reusable cache.
@@ -55,10 +61,12 @@ impl DeviceBudget {
         synchronize: Function,
         empty_cache: Function,
         retained: Arc<Retained>,
+        unattributed: BTreeMap<DeviceId, u64>,
     ) -> Result<Self> {
         Ok(Self {
             nvml: Nvml::init()?,
             retained,
+            unattributed,
             synchronize,
             empty_cache,
         })
@@ -82,7 +90,9 @@ impl DeviceBudget {
                 )),
                 error => Error::Cuda(error),
             })?;
-        Ok(process + self.retained.scope_bytes(device)?.held)
+        Ok(process
+            + self.retained.scope_bytes(device)?.held
+            + self.unattributed.get(&device).copied().unwrap_or(0))
     }
 
     /// The storage grant on `device` for a rank allowed `fraction` of it.

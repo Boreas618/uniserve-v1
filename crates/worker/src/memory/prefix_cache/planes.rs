@@ -19,8 +19,18 @@
 //! costs a constant few kernels however the units are scattered, while
 //! native fills would cost one or more driver calls per run of consecutive
 //! units. Contiguous resets (startup scratch) are native fills.
+//!
+//! On a device, each value plane is made of [`SEGMENTS`] segments along the
+//! units, each column's part of a segment one allocation, mapped back to
+//! back so the plane keeps its layout and addresses
+//! ([`segment_layout`]). The last segments are given back to the device
+//! when a standby engine needs their memory, or all of them while the
+//! deployment sleeps ([`CachePlanes::release_segments`]), and created again
+//! at their addresses after ([`CachePlanes::restore_segments`]); the engine
+//! allocates none of their units meanwhile.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use tvm_ffi::Any;
@@ -30,7 +40,7 @@ use crate::ffi::{
     Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
 };
 use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::{ExclusiveMemory, ExclusiveSpec};
+use crate::memory::retained::{ExclusiveMemory, ExclusiveSpec, SegmentedSpec};
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
 
@@ -40,11 +50,72 @@ pub(crate) const FIELDS: [&str; 2] = ["key", "value"];
 /// The bit pattern of `1.0f32`, the neutral FP8 scale.
 const UNIT_SCALE: u32 = 0x3F80_0000;
 
+/// The segments a device value plane is made of along its units: the
+/// granularity in which the cache gives memory back, an eighth of it.
+pub(crate) const SEGMENTS: u32 = 8;
+
+/// How a pool of `num_units` units splits its value planes into segments
+/// whose every column's part is whole allocation granules of
+/// `granularity` bytes, with planes of `plane_bytes` per unit: the segments'
+/// count and the units each holds. `None` when the pool is too small to
+/// split, or not a multiple of the split ([`segmented_units`] rounds it).
+pub(crate) fn segment_layout(
+    num_units: u32,
+    plane_bytes: u64,
+    granularity: u64,
+) -> Option<(u32, u32)> {
+    let granule = granule_units(plane_bytes, granularity)?;
+    let segments = SEGMENTS.min(num_units / granule);
+    if segments == 0 {
+        return None;
+    }
+    let units = num_units / segments / granule * granule;
+    (units * segments == num_units).then_some((segments, units))
+}
+
+/// `num_units` rounded down to the largest pool whose planes split into
+/// segments ([`segment_layout`]); `num_units` itself when it is too small to
+/// split.
+pub(crate) fn segmented_units(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
+    let Some(granule) = granule_units(plane_bytes, granularity) else {
+        return num_units;
+    };
+    let segments = SEGMENTS.min(num_units / granule);
+    if segments == 0 {
+        return num_units;
+    }
+    num_units / segments / granule * granule * segments
+}
+
+/// The fewest units whose planes of `plane_bytes` fill whole granules.
+fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
+    if plane_bytes == 0 || granularity == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (plane_bytes, granularity);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    u32::try_from(granularity / a).ok()
+}
+
+/// The segments of a device pool's value planes: their count, the units
+/// each holds, and the first one given back (`count` while none is).
+struct Segmenting {
+    count: u32,
+    units: u32,
+    released_from: AtomicU32,
+    /// Each value plane's segment lengths, column-major: segment `k` of
+    /// column `c` is `c * count + k`.
+    lengths: Vec<usize>,
+}
 /// The pool's storage on one device (or host memory for CPU lanes).
 pub struct CachePlanes {
     plan: Arc<CachePlan>,
     device: Option<DeviceId>,
     num_units: u32,
+    /// The value planes' segments, on a device whose pool splits into them.
+    segmenting: Option<Segmenting>,
     values: [Arc<Storage>; 2],
     scales: Option<[Arc<Storage>; 2]>,
     initialized: [Arc<Storage>; 2],
@@ -67,10 +138,10 @@ impl CachePlanes {
     /// predecessor handed over, and every unit is recycled for its next
     /// owner.
     ///
-    /// A dense cache export aliases the live pages, so the values are
-    /// exported where they lie, whatever the pool's size, and every local
-    /// peer device may address them, because readers on those devices in
-    /// this process copy from the pages directly.
+    /// Every local peer device may address the values, because readers on
+    /// those devices in this process copy from the pages directly; other
+    /// ranks read a frozen copy of the pages of segmented planes
+    /// (`cache_export`).
     pub fn allocate(
         plan: Arc<CachePlan>,
         device: Option<DeviceId>,
@@ -92,6 +163,10 @@ impl CachePlanes {
         let plane_bytes = cells * plan.plane_bytes as usize;
         // Whether each field's storages (values, flags, scales) are new.
         let mut created = [true; 3];
+        let mut segmenting = None;
+        // Segments created beside ones a predecessor left: their units are
+        // reset alone.
+        let mut fresh_segments: Vec<u32> = Vec::new();
         let (values, initialized, scales) = match device {
             Some(device) => {
                 let peers = Storage::peers(device)?;
@@ -101,35 +176,101 @@ impl CachePlanes {
                     bytes,
                     access: &peers,
                 };
-                let mut specs = vec![
-                    spec("prefix_cache.key.values", plane_bytes),
-                    spec("prefix_cache.value.values", plane_bytes),
-                    spec("prefix_cache.key.initialized", cells),
-                    spec("prefix_cache.value.initialized", cells),
-                ];
+                let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
+                let layout = segment_layout(num_units, plan.plane_bytes, granularity);
+                let mut specs = Vec::new();
+                if layout.is_none() {
+                    specs.push(spec("prefix_cache.key.values", plane_bytes));
+                    specs.push(spec("prefix_cache.value.values", plane_bytes));
+                }
+                specs.push(spec("prefix_cache.key.initialized", cells));
+                specs.push(spec("prefix_cache.value.initialized", cells));
                 if plan.quantized {
                     specs.push(spec("prefix_cache.key.scale", cells * 4));
                     specs.push(spec("prefix_cache.value.scale", cells * 4));
                 }
                 let taken = memory.exclusive(&specs)?;
-                for (index, created) in created.iter_mut().enumerate() {
-                    *created = taken
-                        .iter()
-                        .skip(2 * index)
-                        .take(2)
-                        .any(|storage| storage.created);
-                }
                 let mut taken = taken.into_iter();
                 let mut next = || {
                     taken
                         .next()
-                        .map(|taken| taken.storage)
                         .ok_or_else(|| Error::Invariant("an exclusive storage is missing".into()))
                 };
-                let values = [next()?, next()?];
-                let initialized = [next()?, next()?];
+                let values = match layout {
+                    None => {
+                        let (key, value) = (next()?, next()?);
+                        created[0] = key.created || value.created;
+                        [key.storage, value.storage]
+                    }
+                    Some((count, units)) => {
+                        let lengths = vec![
+                            units as usize * plan.plane_bytes as usize;
+                            plan.columns as usize * count as usize
+                        ];
+                        let mut take = |name| {
+                            memory.segmented(&SegmentedSpec {
+                                name,
+                                device,
+                                segments: &lengths,
+                                access: &peers,
+                            })
+                        };
+                        let key = take("prefix_cache.key.values")?;
+                        let value = take("prefix_cache.value.values")?;
+                        // Segments created for this pool, of every column;
+                        // all of them make the values new as a whole.
+                        let made: Vec<u32> = (0..count)
+                            .filter(|segment| {
+                                (0..plan.columns).any(|column| {
+                                    let index = (column * count + segment) as usize;
+                                    key.created[index] || value.created[index]
+                                })
+                            })
+                            .collect();
+                        created[0] = made.len() == count as usize;
+                        if !created[0] {
+                            fresh_segments = made;
+                        }
+                        // A standby finds none of the segments its
+                        // predecessor gave back: the same ones of every
+                        // column, from one segment on.
+                        let absent = |segment: u32| {
+                            (0..plan.columns).all(|column| {
+                                let index = (column * count + segment) as usize;
+                                key.absent[index] && value.absent[index]
+                            })
+                        };
+                        let released_from =
+                            (0..count).find(|segment| absent(*segment)).unwrap_or(count);
+                        for column in 0..plan.columns {
+                            for segment in 0..count {
+                                let index = (column * count + segment) as usize;
+                                let gone = key.absent[index] || value.absent[index];
+                                if gone != (segment >= released_from) {
+                                    return Err(Error::Invalid(format!(
+                                        "the cache planes' segment {segment} of column {column} is \
+                                         {} while the planes are given back from segment {released_from}",
+                                        if gone { "absent" } else { "present" }
+                                    )));
+                                }
+                            }
+                        }
+                        segmenting = Some(Segmenting {
+                            count,
+                            units,
+                            released_from: AtomicU32::new(released_from),
+                            lengths,
+                        });
+                        [key.storage, value.storage]
+                    }
+                };
+                let (key, value) = (next()?, next()?);
+                created[1] = key.created || value.created;
+                let initialized = [key.storage, value.storage];
                 let scales = if plan.quantized {
-                    Some([next()?, next()?])
+                    let (key, value) = (next()?, next()?);
+                    created[2] = key.created || value.created;
+                    Some([key.storage, value.storage])
                 } else {
                     None
                 };
@@ -146,6 +287,7 @@ impl CachePlanes {
             plan,
             device,
             num_units,
+            segmenting,
             values,
             scales,
             initialized,
@@ -180,10 +322,197 @@ impl CachePlanes {
                 }
             }
         }
+        if let (Some(segmenting), Some(stream)) = (&planes.segmenting, stream) {
+            for segment in fresh_segments {
+                planes.reset_units(segment * segmenting.units, segmenting.units, true, stream)?;
+            }
+        }
         if let Some(stream) = stream {
             stream.synchronize()?;
         }
         Ok(planes)
+    }
+
+    /// The segments the value planes are made of and the units each holds;
+    /// `None` for planes that are not split.
+    pub(crate) fn segments(&self) -> Option<(u32, u32)> {
+        self.segmenting
+            .as_ref()
+            .map(|segmenting| (segmenting.count, segmenting.units))
+    }
+
+    /// The units the engine may allocate: those below the first segment
+    /// given back, or all of them.
+    pub(crate) fn usable_units(&self) -> u32 {
+        self.segmenting
+            .as_ref()
+            .map_or(self.num_units, |segmenting| {
+                segmenting.released_from.load(Ordering::Acquire) * segmenting.units
+            })
+    }
+
+    /// Gives back the memory of the value planes' segments from `first` on,
+    /// every column's, through `memory`, which retained them. The engine
+    /// allocates none of their units and no device work accesses them any
+    /// more.
+    ///
+    /// # Errors
+    ///
+    /// Fails for planes that are not split, or when `memory` fails.
+    pub(crate) fn release_segments(
+        &self,
+        first: u32,
+        memory: &mut dyn ExclusiveMemory,
+    ) -> Result<()> {
+        let (segmenting, device) = self.segmented()?;
+        let from = segmenting.released_from.load(Ordering::Acquire);
+        if first >= from {
+            return Ok(());
+        }
+        let peers = Storage::peers(device)?;
+        let indices: Vec<usize> = (0..self.plan.columns)
+            .flat_map(|column| {
+                (first..from).map(move |segment| (column * segmenting.count + segment) as usize)
+            })
+            .collect();
+        for (name, storage) in ["prefix_cache.key.values", "prefix_cache.value.values"]
+            .into_iter()
+            .zip(&self.values)
+        {
+            memory.release_segments(
+                &SegmentedSpec {
+                    name,
+                    device,
+                    segments: &segmenting.lengths,
+                    access: &peers,
+                },
+                storage,
+                &indices,
+            )?;
+        }
+        segmenting.released_from.store(first, Ordering::Release);
+        tracing::info!(
+            first,
+            segments = from - first,
+            units = (from - first) * segmenting.units,
+            "gave back cache segments"
+        );
+        Ok(())
+    }
+
+    /// Creates the segments given back again at their addresses, through
+    /// `memory`, and resets their units on `stream`, which is synchronized
+    /// before returning: values and flags zero, scales one.
+    ///
+    /// # Errors
+    ///
+    /// Fails for planes that are not split, or when `memory` or the stream
+    /// fails.
+    pub(crate) fn restore_segments(
+        &self,
+        memory: &mut dyn ExclusiveMemory,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (segmenting, device) = self.segmented()?;
+        let from = segmenting.released_from.load(Ordering::Acquire);
+        if from == segmenting.count {
+            return Ok(());
+        }
+        let peers = Storage::peers(device)?;
+        let indices: Vec<usize> = (0..self.plan.columns)
+            .flat_map(|column| {
+                (from..segmenting.count)
+                    .map(move |segment| (column * segmenting.count + segment) as usize)
+            })
+            .collect();
+        for (name, storage) in ["prefix_cache.key.values", "prefix_cache.value.values"]
+            .into_iter()
+            .zip(&self.values)
+        {
+            memory.restore_segments(
+                &SegmentedSpec {
+                    name,
+                    device,
+                    segments: &segmenting.lengths,
+                    access: &peers,
+                },
+                storage,
+                &indices,
+            )?;
+        }
+        let first_unit = from * segmenting.units;
+        self.reset_units(first_unit, self.num_units - first_unit, true, Some(stream))?;
+        stream.synchronize()?;
+        segmenting
+            .released_from
+            .store(segmenting.count, Ordering::Release);
+        tracing::info!(
+            first = from,
+            segments = segmenting.count - from,
+            "created the cache segments again"
+        );
+        Ok(())
+    }
+
+    fn segmented(&self) -> Result<(&Segmenting, DeviceId)> {
+        match (&self.segmenting, self.device) {
+            (Some(segmenting), Some(device)) => Ok((segmenting, device)),
+            _ => Err(Error::Invalid(format!(
+                "the cache planes of {} units are not split into segments, which give \
+                 memory back",
+                self.num_units
+            ))),
+        }
+    }
+
+    /// Resets units `[first, first + count)` of every column with native
+    /// fills issued to `stream`: values (when `values`) and flags zero,
+    /// scales one. The values of segmented planes fill column by column: a
+    /// fill's rows may not span a segment given back, which the driver
+    /// refuses although no row touches it.
+    fn reset_units(&self, first: u32, count: u32, values: bool, stream: impl Issue) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.require_unit(first + count - 1)?;
+        let units = self.num_units as usize;
+        let columns = self.plan.columns as usize;
+        let plane = self.plan.plane_bytes as usize;
+        let (first, count) = (first as usize, count as usize);
+        // Units `[first, first + count)` of every column: one row per
+        // column, a column's units apart.
+        let rows = |address: u64, value: u32, width: usize, cell: usize| RowFill {
+            address: address + (first * cell * width) as u64,
+            pitch: units * cell * width,
+            value,
+            width,
+            count: count * cell,
+            height: columns,
+        };
+        for field in 0..2 {
+            // SAFETY: the rows lie inside the field allocations owned by
+            // this pool, whose units the caller has mapped; the caller
+            // orders the fills.
+            unsafe {
+                if values && self.segmenting.is_some() {
+                    let fill = rows(self.values[field].address(), 0, 1, plane);
+                    for column in 0..columns {
+                        stream.memset_2d(RowFill {
+                            address: fill.address + (column * fill.pitch) as u64,
+                            height: 1,
+                            ..fill
+                        })?;
+                    }
+                } else if values {
+                    stream.memset_2d(rows(self.values[field].address(), 0, 1, plane))?;
+                }
+                stream.memset_2d(rows(self.initialized[field].address(), 0, 1, 1))?;
+                if let Some(scales) = &self.scales {
+                    stream.memset_2d(rows(scales[field].address(), UNIT_SCALE, 4, 1))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
@@ -371,36 +700,7 @@ impl CachePlanes {
     /// Reset units `1..=count` (contiguous startup scratch) with native
     /// fills issued to `stream`: values and flags zero, scales one.
     pub fn zero_leading(&self, count: u32, stream: impl Issue) -> Result<()> {
-        if count == 0 {
-            return Ok(());
-        }
-        self.require_unit(count)?;
-        let units = self.num_units as usize;
-        let columns = self.plan.columns as usize;
-        let plane = self.plan.plane_bytes as usize;
-        let count = count as usize;
-        // Units `[1, count]` of every column: one row per column, a
-        // column's units apart.
-        let leading = |address: u64, value: u32, width: usize, cell: usize| RowFill {
-            address: address + (cell * width) as u64,
-            pitch: units * cell * width,
-            value,
-            width,
-            count: count * cell,
-            height: columns,
-        };
-        for field in 0..2 {
-            // SAFETY: rows `[1, count]` of each column lie inside the field
-            // allocations owned by this pool; the caller orders the fills.
-            unsafe {
-                stream.memset_2d(leading(self.values[field].address(), 0, 1, plane))?;
-                stream.memset_2d(leading(self.initialized[field].address(), 0, 1, 1))?;
-                if let Some(scales) = &self.scales {
-                    stream.memset_2d(leading(scales[field].address(), UNIT_SCALE, 4, 1))?;
-                }
-            }
-        }
-        Ok(())
+        self.reset_units(1, count, true, stream)
     }
 }
 

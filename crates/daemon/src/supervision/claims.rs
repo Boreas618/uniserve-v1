@@ -11,6 +11,7 @@
 //! and shoots down the workers of the previous claim.
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use proto::process::{Claim, Claimed};
@@ -21,7 +22,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// One deployment's claim on this node.
 struct Held {
     /// The connection that holds the claim; the claim ends with it.
-    _client: storage::Client,
+    client: storage::Client,
     /// The scopes claimed, sorted.
     scopes: Vec<(String, u32)>,
     claimed: Claimed,
@@ -127,11 +128,93 @@ impl ClaimHolder {
         self.held.insert(
             claim.deployment.clone(),
             Held {
-                _client: client,
+                client,
                 scopes,
                 claimed: claimed.clone(),
             },
         );
         Ok(claimed)
+    }
+}
+
+/// A node's claims as a daemon hands them to its successor in a hot
+/// restart: each claiming connection crosses as a descriptor, so the
+/// Storage Server sees the same head throughout.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedClaims {
+    executable: std::path::PathBuf,
+    remote_pages: bool,
+    claims: Vec<HandedClaim>,
+}
+
+/// One handed-over claim.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HandedClaim {
+    deployment: String,
+    scopes: Vec<(String, u32)>,
+    socket: String,
+    claim: Vec<u8>,
+    tcp: String,
+    /// The connection's next request identity.
+    next: u64,
+}
+
+impl ClaimHolder {
+    /// Hands every claim to this daemon's successor ([`ClaimHolder::adopt`]):
+    /// their state, and each claiming connection's descriptor in
+    /// `descriptors`, in the same order. This daemon holds no claim
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a claiming connection has unread messages.
+    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(HandedClaims, Vec<OwnedFd>)> {
+        let mut claims = Vec::with_capacity(self.held.len());
+        let mut descriptors = Vec::with_capacity(self.held.len());
+        for (deployment, held) in self.held.drain() {
+            let (descriptor, next) = held.client.hand_over()?;
+            descriptors.push(descriptor);
+            claims.push(HandedClaim {
+                deployment,
+                scopes: held.scopes,
+                socket: held.claimed.socket,
+                claim: held.claimed.claim,
+                tcp: held.claimed.tcp,
+                next,
+            });
+        }
+        Ok((
+            HandedClaims {
+                executable: self.executable.clone(),
+                remote_pages: self.remote_pages,
+                claims,
+            },
+            descriptors,
+        ))
+    }
+
+    /// Goes on with the claims a predecessor handed over, with their
+    /// connections' descriptors in its order; `address` is this node's.
+    pub(crate) fn adopt(
+        address: Option<std::net::IpAddr>,
+        handed: HandedClaims,
+        descriptors: Vec<OwnedFd>,
+    ) -> Self {
+        let mut holder = Self::new(handed.executable, handed.remote_pages, address);
+        for (claim, descriptor) in handed.claims.into_iter().zip(descriptors) {
+            holder.held.insert(
+                claim.deployment,
+                Held {
+                    client: storage::Client::resume(descriptor, claim.next),
+                    scopes: claim.scopes,
+                    claimed: Claimed {
+                        socket: claim.socket,
+                        claim: claim.claim,
+                        tcp: claim.tcp,
+                    },
+                },
+            );
+        }
+        holder
     }
 }

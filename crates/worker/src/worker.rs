@@ -28,6 +28,7 @@
 mod loading;
 mod memory;
 mod planning;
+pub(crate) mod update;
 
 pub(crate) use loading::LoadedModel;
 pub(crate) use memory::WorkerMemory;
@@ -53,7 +54,7 @@ use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
 use crate::executor::transfer::TransferRuntime;
-use crate::ffi::Interpreter;
+use crate::ffi::{Handle, Interpreter};
 use crate::lane::BLOCK_ON_TIMEOUT;
 use crate::memory::HostKvCache;
 use crate::memory::allocation::Storage;
@@ -145,7 +146,17 @@ pub(crate) struct Worker {
     retained: Arc<Retained>,
     /// The retained storages of the model's weights, mapped for the
     /// worker's lifetime.
-    _weights: Vec<Arc<Storage>>,
+    weights: Vec<Arc<Storage>>,
+    /// Their keys; `None` for weights the worker does not retain.
+    weight_keys: Option<WeightKeys>,
+    /// The digest of the code the worker loaded its weights with
+    /// ([`weights::Fingerprints::numerics`]).
+    weight_numerics: Option<String>,
+    /// The launch the worker loaded its model with.
+    launch: WorkerLaunch,
+    /// What holds the plugins' communication buffers, which serve for the
+    /// worker's lifetime.
+    _plugin_buffers: Option<Handle>,
     warmed: bool,
 }
 
@@ -240,7 +251,8 @@ impl Worker {
             weights::Load::Tensors(names) => (found, names),
             weights::Load::All => (None, Default::default()),
         };
-        if found.is_none() && keys.is_some() {
+        // Weights the worker reads take the place of the scope's others.
+        if keys.is_some() && (found.is_none() || !load.is_empty()) {
             retained.release_read_only().map_err(phase("load"))?;
         }
         let binding = found
@@ -293,6 +305,7 @@ impl Worker {
             .iter()
             .find(|placed| placed.config.weights == ComponentWeights::Host)
             .map(|placed| placed.name.as_str());
+        plugin_graph_policy(&mut launch.execution).map_err(phase("load"))?;
         launch.execution.graph_policy =
             graph_policy(&launch.execution.graph_policy, &model, host_component)
                 .map_err(phase("load"))?;
@@ -347,12 +360,17 @@ impl Worker {
             }
             None => bound,
         };
+        // Plugins allocate the memory their kernels communicate through
+        // before capacity planning measures free memory.
+        let (plugin_buffers, unattributed) =
+            allocate_plugin_buffers(device).map_err(phase("capacity"))?;
         let budget = match device {
             Device::Cuda(_) => Some(
                 DeviceBudget::new(
                     Interpreter::import("torch.cuda.synchronize").map_err(phase("capacity"))?,
                     Interpreter::import("torch.cuda.empty_cache").map_err(phase("capacity"))?,
                     Arc::clone(&retained),
+                    unattributed,
                 )
                 .map_err(phase("capacity"))?,
             ),
@@ -399,8 +417,13 @@ impl Worker {
         let mut storage = allocate_storage(&launch, &config, &plan, &streams, &mut &*retained)
             .map_err(phase("storage"))?;
         // The engine copies the cache's pages through the host KV cache when
-        // it says so; pages are keyed by the whole model's fingerprint.
-        let model_fingerprint = fingerprints.as_ref().map(weights::Fingerprints::model);
+        // it says so; pages are keyed by the whole model's fingerprint and
+        // all the numerical code installed.
+        let model_fingerprint = fingerprints
+            .as_ref()
+            .map(weights::Fingerprints::pages)
+            .transpose()
+            .map_err(phase("storage"))?;
         if let (true, Some(fingerprint), Some(prefix_cache), Some(cuda), Some(reported)) = (
             launch.storage.host_kv_cache,
             model_fingerprint.as_deref(),
@@ -414,6 +437,7 @@ impl Worker {
                 cuda,
                 fingerprint,
                 launch.storage.tcp.as_deref(),
+                launch.storage.host_kv_cache_bytes,
             )
             .map_err(phase("storage"))?;
             // The host KV cache's copies run on a copy lane of the cache's device,
@@ -559,6 +583,7 @@ impl Worker {
                 info.image_warmups = image
                     .warmups(info.request_slots, info.latent_capacity_units())
                     .map_err(phase("bind"))?;
+                info.captured_images = image.captured_images();
                 info.image_unconditional_token_ids =
                     image.image_unconditional_prefix().map_err(phase("bind"))?;
             }
@@ -679,7 +704,11 @@ impl Worker {
             hooks,
             context,
             retained,
-            _weights: weight_storages,
+            weights: weight_storages,
+            weight_keys: keys,
+            weight_numerics: fingerprints.map(|fingerprints| fingerprints.numerics),
+            launch,
+            _plugin_buffers: plugin_buffers,
             warmed: false,
         })
     }
@@ -757,21 +786,45 @@ impl Worker {
         self.warmup()?;
         // The rank reports the scratch units its warmup used, which a
         // standby worker's warmup stays inside while its predecessor serves.
-        let scratch = self
+        let prefix_cache = self
             .executor
             .backend()
             .worker_storage()
-            .and_then(|storage| storage.prefix_cache.as_ref())
-            .map_or(0, crate::memory::PrefixCache::scratch_lent);
+            .and_then(|storage| storage.prefix_cache.as_ref());
+        let scratch = prefix_cache.map_or(0, crate::memory::PrefixCache::scratch_lent);
+        // The planes' segments, and the units below the first one a
+        // predecessor gave back, which alone the engine allocates.
+        let segments = prefix_cache.map(|cache| {
+            let planes = cache.planes();
+            (
+                planes.segments().map_or(0, |(_, units)| units),
+                planes.usable_units(),
+            )
+        });
         if let Some(cache) = self.info.prefix_cache.as_mut() {
             cache.scratch_units = scratch;
+            if let Some((segment_units, usable_units)) = segments {
+                cache.segment_units = segment_units;
+                cache.usable_units = usable_units;
+            }
         }
         // A standby worker parks with its exclusive storages read-only until
         // the engine promotes it, and with the memory its graphs address
         // released when keeping it would crowd the workers it stands by for.
         let standby = if self.retained.standing_by() {
-            let suspension = self.park_memory()?;
-            self.retained.park()?;
+            // A standby that cannot park fails its startup: the engine,
+            // still awaiting its startup report, names the error.
+            let parked = self.park_memory().and_then(|suspension| {
+                self.retained.park().map_err(phase("standby"))?;
+                Ok(suspension)
+            });
+            let suspension = match parked {
+                Ok(suspension) => suspension,
+                Err(error) => {
+                    crate::launch::report_startup_failure(channel, &error);
+                    return Err(error);
+                }
+            };
             Some(Parked {
                 retained: Arc::clone(&self.retained),
                 suspension,
@@ -779,12 +832,39 @@ impl Worker {
         } else {
             None
         };
-        let info = self.info.clone();
+        // The engine routes the calls the rank's role leaves to the groups
+        // of the other role; the rank serves them all.
+        let mut info = self.info.clone();
+        info.supported_calls
+            .retain(|&kind| !left_to_other_role(&self.config.role, kind));
         let executor = &mut self.executor;
         // Ranks of an expert union join every step outside their own.
         let experts = executor.backend().experts().is_some();
         executor.backend().set_storage_wake(Some(channel.wake()));
-        let served = Service::new(executor, channel, info, experts, stall_bound, standby).run();
+        let mut pools = self.graphs.pools();
+        pools.extend(self.scratches.pools());
+        let maintenance = crate::service::Maintenance {
+            retained: Some(Arc::clone(&self.retained)),
+            weights: Some(update::WeightUpdate {
+                launch: self.launch.clone(),
+                model: self.model.handle().clone(),
+                storages: self.weights.clone(),
+                keys: self.weight_keys.clone(),
+                numerics: self.weight_numerics.clone(),
+            }),
+            pools,
+            asleep: false,
+        };
+        let served = Service::new(
+            executor,
+            channel,
+            info,
+            experts,
+            stall_bound,
+            standby,
+            maintenance,
+        )
+        .run();
         executor.backend().set_storage_wake(None);
         served
     }
@@ -887,8 +967,15 @@ impl Worker {
         tracing::info!("the standby worker suspended its communicators");
         for &device in &devices {
             if short(device).map_err(phase("standby"))? {
+                let memory = device
+                    .memory_info()
+                    .map_err(|error| phase("standby")(error.into()))?;
                 return Err(phase("standby")(Error::Invalid(format!(
-                    "the standby worker does not fit beside the workers it stands by for on {device}"
+                    "the standby worker does not fit beside the workers it stands by for on \
+                     {device}: {} bytes are free once its graph memory is suspended, below \
+                     the {} bytes of graph memory its promotion maps",
+                    memory.free,
+                    graph_storage_budget_bytes(memory.total as i64)
                 ))));
             }
         }
@@ -1097,7 +1184,7 @@ impl Worker {
         }
         if let Some(image) = executor.backend_mut().parts().image {
             image.encoders.seal_image();
-            image.denoisers.seal_image();
+            image.denoisers.seal_image().map_err(phase("warmup"))?;
         }
         let kernel_choices =
             Interpreter::import("uniserve.backends.kernel_choices").map_err(phase("warmup"))?;
@@ -1114,6 +1201,47 @@ impl Worker {
     }
 }
 
+/// Allocate every plugin's communication buffer on the rank's CUDA device
+/// (`uniserve.plugins.allocate_buffers`), and measure what NVML attributes
+/// to no process of what they took: the device's free memory falls by more
+/// than the process's grows. Returns the objects that hold the buffers,
+/// which the rank keeps, and those bytes by device; nothing for a CPU rank
+/// or without buffers.
+fn allocate_plugin_buffers(device: Device) -> Result<(Option<Handle>, BTreeMap<DeviceId, u64>)> {
+    let Device::Cuda(index) = device else {
+        return Ok((None, BTreeMap::new()));
+    };
+    let nvml = cuda::Nvml::init()?;
+    let free = || -> Result<u64> { Ok(index.memory_info()?.free) };
+    let process = || -> Result<u64> {
+        nvml.process_memory(index).map_err(|error| match error {
+            cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
+                "NVML reports no device storage for this process on {index}"
+            )),
+            error => Error::Cuda(error),
+        })
+    };
+    let before = (free()?, process()?);
+    let held = Handle::new(
+        Interpreter::import("uniserve.plugins.allocate_buffers")?
+            .call_values(&[Any::from(i64::from(index.0))])?,
+    )?;
+    let count: usize = Interpreter::import("builtins.len")?.call_as(&[held.view()])?;
+    if count == 0 {
+        return Ok((None, BTreeMap::new()));
+    }
+    let after = (free()?, process()?);
+    let taken = before.0.saturating_sub(after.0);
+    let unattributed = taken.saturating_sub(after.1.saturating_sub(before.1));
+    tracing::info!(
+        buffers = count,
+        bytes = taken,
+        unattributed,
+        "allocated the plugins' communication buffers"
+    );
+    Ok((Some(held), BTreeMap::from([(index, unattributed)])))
+}
+
 /// The model fingerprints of a rank that holds CUDA weights
 /// (`uniserve.loading.retained.fingerprints`), which key its retained
 /// weights and its cache pages; `None` for the stub model and a rank
@@ -1127,7 +1255,7 @@ fn model_fingerprints(
         return Ok(None);
     }
     let started = std::time::Instant::now();
-    let fingerprints = LoadedModel::fingerprint(description, launch)?;
+    let fingerprints = LoadedModel::fingerprint(description, launch, None)?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "fingerprinted the model's weights"
@@ -1257,6 +1385,119 @@ fn graph_policy(
     Ok("off".to_owned())
 }
 
+/// A rank's graph mode and the buckets each execution path captures, as a
+/// plugin's graph policy reads and chooses them
+/// (`uniserve.plugins.Registry.graph_policy`).
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphChoice {
+    mode: String,
+    decode: Vec<usize>,
+    prefill: Vec<usize>,
+    flow_batches: Vec<usize>,
+    flow_shapes: Vec<[usize; 2]>,
+}
+
+impl GraphChoice {
+    /// The configured mode and buckets of `config`.
+    fn of(config: &WorkerConfig) -> Self {
+        Self {
+            mode: config.graph_policy.clone(),
+            decode: config.decode_graph_batch_sizes.clone(),
+            prefill: config.prefill_graph_token_sizes.clone(),
+            flow_batches: config.flow_graph_batch_sizes.clone(),
+            flow_shapes: config
+                .flow_graph_shapes
+                .iter()
+                .map(|&(height, width)| [height, width])
+                .collect(),
+        }
+    }
+
+    /// Checks a choice as the daemon checks the configuration: a known
+    /// mode, positive and strictly increasing sizes, positive and distinct
+    /// shapes.
+    fn check(&self) -> Result<()> {
+        let invalid =
+            |message: String| Err(Error::Invalid(format!("a plugin's graph policy {message}")));
+        if !["auto", "full", "off"].contains(&self.mode.as_str()) {
+            return invalid(format!("chooses the unknown mode {:?}", self.mode));
+        }
+        for (name, sizes) in [
+            ("decode", &self.decode),
+            ("prefill", &self.prefill),
+            ("flow_batches", &self.flow_batches),
+        ] {
+            if sizes.first() == Some(&0) || !sizes.windows(2).all(|pair| pair[0] < pair[1]) {
+                return invalid(format!(
+                    "chooses {name} sizes that are not positive and strictly increasing: {sizes:?}"
+                ));
+            }
+        }
+        let shapes: std::collections::BTreeSet<_> = self.flow_shapes.iter().collect();
+        if shapes.len() != self.flow_shapes.len() || shapes.iter().any(|shape| shape.contains(&0)) {
+            return invalid(format!(
+                "chooses flow shapes that are not positive and distinct: {:?}",
+                self.flow_shapes
+            ));
+        }
+        Ok(())
+    }
+
+    /// States the choice in `config`.
+    fn apply(self, config: &mut WorkerConfig) {
+        config.graph_policy = self.mode;
+        config.decode_graph_batch_sizes = self.decode;
+        config.prefill_graph_token_sizes = self.prefill;
+        config.flow_graph_batch_sizes = self.flow_batches;
+        config.flow_graph_shapes = self
+            .flow_shapes
+            .into_iter()
+            .map(|[height, width]| (height, width))
+            .collect();
+    }
+}
+
+/// Lets a plugin choose the rank's graph mode and capture buckets
+/// (`uniserve.plugins.graph_policy`) from the loaded models and the
+/// configured ones, before the rank resolves its policy; the configured
+/// ones stand without such a plugin.
+fn plugin_graph_policy(config: &mut WorkerConfig) -> Result<()> {
+    let configured = GraphChoice::of(config);
+    let function = "uniserve.plugins.graph_policy";
+    let configured_json = serde_json::to_string(&configured)
+        .map_err(|error| Error::Invalid(format!("graph policy: {error}")))?;
+    let chosen: tvm_ffi::String = Interpreter::import(function)?
+        .call_values(&[Any::from(tvm_ffi::String::from(configured_json))])?
+        .try_into()
+        .map_err(|error| Error::numerical(function, &error))?;
+    if chosen.as_str().is_empty() {
+        return Ok(());
+    }
+    let chosen: GraphChoice = serde_json::from_str(chosen.as_str())
+        .map_err(|error| Error::Invalid(format!("a plugin's graph policy: {error}")))?;
+    chosen.check()?;
+    if chosen != configured {
+        tracing::info!(?chosen, "a plugin chose the graph policy");
+    }
+    chosen.apply(config);
+    Ok(())
+}
+
+/// Whether a rank of `role` leaves calls of `kind` to the groups of the
+/// other role: a prefill group's requests decode on a decode group, which
+/// installs the KV cache the prefill exported (`WorkerGroupRole`).
+fn left_to_other_role(role: &str, kind: CallKind) -> bool {
+    match role {
+        "prefill" => matches!(
+            kind,
+            CallKind::Forward(ipc::ForwardMode::Decode | ipc::ForwardMode::Verify)
+        ),
+        "decode" => kind == CallKind::Forward(ipc::ForwardMode::Prefill),
+        _ => false,
+    }
+}
+
 /// Whether the rank publishes device products over CUDA VMM.
 fn exports_device_products(launch: &WorkerLaunch) -> bool {
     launch
@@ -1284,4 +1525,48 @@ fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
             },
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The configured choice states the configuration unchanged, and the
+    /// check refuses what the daemon refuses in the configuration.
+    #[test]
+    fn a_graph_choice_is_checked_as_the_configuration() -> Result<()> {
+        let config = crate::capacity::plan::tests::cpu_config();
+        let configured = GraphChoice::of(&config);
+        configured.check()?;
+        let mut stated = config.clone();
+        GraphChoice::of(&config).apply(&mut stated);
+        assert_eq!(GraphChoice::of(&stated), configured);
+
+        let refused = [
+            GraphChoice {
+                mode: "eager".to_owned(),
+                ..GraphChoice::of(&config)
+            },
+            GraphChoice {
+                decode: vec![1, 4, 4],
+                ..GraphChoice::of(&config)
+            },
+            GraphChoice {
+                prefill: vec![0, 16],
+                ..GraphChoice::of(&config)
+            },
+            GraphChoice {
+                flow_shapes: vec![[1024, 1024], [1024, 1024]],
+                ..GraphChoice::of(&config)
+            },
+            GraphChoice {
+                flow_shapes: vec![[0, 1024]],
+                ..GraphChoice::of(&config)
+            },
+        ];
+        for choice in refused {
+            assert!(choice.check().is_err(), "{choice:?}");
+        }
+        Ok(())
+    }
 }

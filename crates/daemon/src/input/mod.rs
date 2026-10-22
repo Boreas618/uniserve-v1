@@ -23,7 +23,7 @@ pub use error::{ServeError, TokenizeError};
 pub use media::ImageInput;
 pub use processor::{InputProcessor, ModelResolutionError, RequestRenderer};
 pub(crate) use processor::{LoadedModel, LoadedRenderer};
-pub use request::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
+pub use request::{AdapterSelection, GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;
@@ -39,11 +39,24 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Folds a request's cache salt into a stable isolation key.
+/// Folds a request's cache salt and the identity of the LoRA adapter it
+/// computes with into a stable isolation key.
 ///
-/// Returns `None` when the salt is absent, which leaves the request in the shared cache
-/// partition. Otherwise the key is the 64-bit FNV-1a hash of the salt, which is
-/// deterministic across processes.
-pub(crate) fn cache_isolation_key(salt: Option<&str>) -> Option<u64> {
-    salt.map(|salt| stable_hash(salt.as_bytes()))
+/// Returns `None` when both are absent, which leaves the request in the
+/// shared cache partition. A salt alone keys by its 64-bit FNV-1a hash, which
+/// is deterministic across processes; an adapter keys apart from every salt
+/// and every other adapter, since its cache entries differ from the base
+/// model's.
+pub(crate) fn cache_isolation_key(salt: Option<&str>, adapter: Option<&str>) -> Option<u64> {
+    match (salt, adapter) {
+        (None, None) => None,
+        (Some(salt), None) => Some(stable_hash(salt.as_bytes())),
+        (salt, Some(adapter)) => {
+            let mut bytes = b"uniserve-adapter\0".to_vec();
+            bytes.extend_from_slice(adapter.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(salt.unwrap_or_default().as_bytes());
+            Some(stable_hash(&bytes))
+        }
+    }
 }

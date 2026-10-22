@@ -14,6 +14,7 @@ cuda.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
+serde.workspace = true
 signal-hook-registry.workspace = true
 storage.workspace = true
 thiserror.workspace = true

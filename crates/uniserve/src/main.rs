@@ -105,10 +105,31 @@ fn shutdown_signal() -> CancellationToken {
 /// `serve --print-config` prints the resolved serving configuration, and
 /// nothing else, to stdout and exits before tracing or the runtime starts.
 fn main() -> Result<std::process::ExitCode> {
+    let lifeline = take_lifeline();
     let cli = Cli::parse();
     let args = match cli.command {
         Command::Serve(args) => args,
+        Command::Node(node) => {
+            logging::init_tracing(
+                "Daemon",
+                cli.log.log_level.as_deref(),
+                cli.log.log_level_http.as_deref(),
+            );
+            runtime()?.block_on(async {
+                let server = options::ServerOptions {
+                    host: node.host,
+                    port: node.port,
+                    uds: node.uds,
+                    api_key: options::configured_api_key(None),
+                    shutdown_timeout: std::time::Duration::from_secs(node.shutdown_timeout),
+                    ..options::ServerOptions::default()
+                };
+                daemon::node(server, shutdown_signal()).await
+            })?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
         Command::Engine(engine) => {
+            follow_lifeline(lifeline);
             logging::init_tracing(
                 "Engine",
                 cli.log.log_level.as_deref(),
@@ -117,9 +138,23 @@ fn main() -> Result<std::process::ExitCode> {
             engine::run_engine(&engine.requests, &engine.processes, engine.engine)?;
             return Ok(std::process::ExitCode::SUCCESS);
         }
-        Command::Worker { arguments } => worker::run(arguments),
+        Command::Worker { arguments } => {
+            follow_lifeline(lifeline);
+            worker::run(arguments)
+        }
         Command::Storage(args) => return Ok(storage::run(args)),
     };
+    if let Some(descriptor) = args.takeover {
+        logging::init_tracing(
+            "Daemon",
+            cli.log.log_level.as_deref(),
+            cli.log.log_level_http.as_deref(),
+        );
+        runtime()?.block_on(async move {
+            daemon::restart::take_over(descriptor, shutdown_signal()).await
+        })?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     if args.print_config {
         let (config, _) = args.resolve()?;
         print!("{}", options::printed(&config)?);
@@ -132,6 +167,61 @@ fn main() -> Result<std::process::ExitCode> {
         cli.log.log_level_http.as_deref(),
     );
 
+    runtime()?.block_on(async_main(*args))?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The lifeline this process inherited from the daemon that supervises it
+/// (`daemon::supervision::LIFELINE_ENV`): the read end of a pipe whose write
+/// end the daemon holds. The variable leaves the environment and the
+/// descriptor turns close-on-exec, so no process this one starts takes
+/// either for its own. Runs before any thread starts.
+fn take_lifeline() -> Option<i32> {
+    let descriptor = std::env::var(daemon::supervision::LIFELINE_ENV)
+        .ok()?
+        .parse::<i32>()
+        .ok()?;
+    // SAFETY: no other thread exists yet to read the environment.
+    unsafe { std::env::remove_var(daemon::supervision::LIFELINE_ENV) };
+    // SAFETY: fcntl takes integers only; the descriptor is this process's.
+    unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(descriptor)
+}
+
+/// Ends this process once its daemon is gone: the end of the lifeline's
+/// pipe arrives once the daemon, and every successor a hot restart handed
+/// its processes to, ended, however they ended.
+fn follow_lifeline(lifeline: Option<i32>) {
+    let Some(descriptor) = lifeline else {
+        return;
+    };
+    let watching = std::thread::Builder::new()
+        .name("lifeline".to_owned())
+        .spawn(move || {
+            let mut byte = [0_u8; 1];
+            loop {
+                // SAFETY: reads into a local byte from this process's
+                // descriptor.
+                let read = unsafe { libc::read(descriptor, byte.as_mut_ptr().cast(), 1) };
+                if read == 0 {
+                    eprintln!("the daemon that supervised this process is gone; exiting");
+                    // SAFETY: ends the process at once, as a signal would.
+                    unsafe { libc::_exit(1) };
+                }
+                if read < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    return;
+                }
+            }
+        });
+    if let Err(error) = watching {
+        eprintln!("the lifeline's watch did not start: {error}");
+    }
+}
+
+/// The daemon's Tokio runtime.
+fn runtime() -> Result<tokio::runtime::Runtime> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     // Chat-template rendering runs on Tokio's blocking pool. Complex model
@@ -140,12 +230,7 @@ fn main() -> Result<std::process::ExitCode> {
     if let Some(worker_threads) = tokio_worker_threads() {
         runtime.worker_threads(worker_threads);
     }
-
-    runtime
-        .build()
-        .context("failed to build Tokio runtime")?
-        .block_on(async_main(*args))?;
-    Ok(std::process::ExitCode::SUCCESS)
+    runtime.build().context("failed to build Tokio runtime")
 }
 
 /// Serves the configuration `args` resolve until Ctrl-C or SIGTERM.

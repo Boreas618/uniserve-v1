@@ -23,7 +23,9 @@
 //! - `model`: the served checkpoint: its files, configuration and family
 //!   profile; `tokenizer`: its tokenizer;
 //! - `options`: the serving option tree (`options::ServeConfig`);
-//! - `metrics`: the Prometheus registry the daemon exports.
+//! - `metrics`: the Prometheus registry the daemon exports;
+//! - `restart`: the hot restart that hands a deployment to a successor
+//!   daemon.
 
 pub mod engine;
 pub mod http;
@@ -35,11 +37,12 @@ pub mod model;
 pub mod openai;
 pub mod options;
 pub mod output;
+pub mod restart;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tokenizer;
 
-pub use crate::http::serve;
+pub use crate::http::{node, serve};
 pub use crate::leader::{Leader, Task};
 pub use crate::supervision::{Daemon, DaemonOptions, JOIN_TIMEOUT};

@@ -92,6 +92,14 @@ impl Storage {
         self.cache.as_ref()
     }
 
+    /// Revokes the prefix identity of every cached page (`BlockPool::flush`);
+    /// returns how many pages it revoked.
+    pub(super) fn flush_prefix_cache(&self) -> usize {
+        self.cache
+            .as_ref()
+            .map_or(0, |cache| cache.block_pool.flush())
+    }
+
     /// Returns the queued cache units, including cached ones allocation evicts.
     pub(super) fn free_units(&self) -> usize {
         self.cache
@@ -104,6 +112,15 @@ impl Storage {
         self.cache
             .as_ref()
             .map_or(0, PrefixCacheManager::usable_units)
+    }
+
+    /// Returns the cache units the scheduler may allocate once none is
+    /// withdrawn: a request that needs more is refused, and one that needs
+    /// fewer waits while the cache is shrunk.
+    pub(super) fn capacity_units(&self) -> usize {
+        self.cache
+            .as_ref()
+            .map_or(0, PrefixCacheManager::capacity_units)
     }
 
     /// Transfer the existing Tensor allocation to encoder-cache retention.

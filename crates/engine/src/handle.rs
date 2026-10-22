@@ -494,8 +494,54 @@ pub enum Command {
     /// Promotes the executor's standing-by workers (`Executor::promote`)
     /// and answers with the outcome.
     Promote(crossbeam_channel::Sender<Result<(), String>>),
+    /// Revokes every cached prefix page, so that later prompts compute
+    /// their prefixes anew; requests in flight keep their pages.
+    FlushCache,
+    /// Runs the worker hook `name` with `payload` on every worker once the
+    /// batches in flight complete, and answers with each worker's result.
+    Hook {
+        name: String,
+        payload: String,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
+    /// Takes other scheduling limits and policy from the next step on
+    /// (`Scheduler::reconfigure`), and answers whether it did.
+    Configure {
+        limits: crate::scheduler::SchedulerConfig,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// Gives back or restores KV cache memory (`Scheduler::resize_cache`),
+    /// and answers with what each worker reported.
+    ResizeCache {
+        change: CacheChange,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
+    /// Rewrites the weights in place from the checkpoint at `model_path`
+    /// (`Scheduler::update_weights`), and answers with what each worker
+    /// reported.
+    UpdateWeights {
+        model_path: String,
+        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
     /// Requests orderly engine shutdown.
     Shutdown,
+}
+
+/// A change to the device memory of a scheduler's KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheChange {
+    /// Gives back the tail of the cache until each device has as much free
+    /// memory as its worker holds beside the weights and the cache, which a
+    /// standby engine needs; the requests that hold the tail are recomputed.
+    Shrink,
+    /// Creates the given-back tail again.
+    Restore,
+    /// Gives back the whole cache and the CUDA graph memory, keeping the
+    /// weights, once no request runs; the scheduler admits nothing until
+    /// it wakes.
+    Sleep,
+    /// Restores what a sleep gave back.
+    Wake,
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
@@ -633,6 +679,76 @@ impl CommandSender {
         let _ = self.send(Command::Migrate(cause));
     }
 
+    /// Revokes every cached prefix page (`Command::FlushCache`).
+    pub fn flush_cache(&self) {
+        let _ = self.send(Command::FlushCache);
+    }
+
+    /// Runs the worker hook `name` (`Command::Hook`); the receiver gets
+    /// each worker's result, or why the hook failed.
+    pub fn hook(
+        &self,
+        name: String,
+        payload: String,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::Hook {
+            name,
+            payload,
+            answer,
+        }) && let Command::Hook { answer, .. } = error.0
+        {
+            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+        }
+        receiver
+    }
+
+    /// Takes other scheduling limits and policy from the next step on
+    /// (`Command::Configure`); the receiver gets whether the scheduler did.
+    pub fn configure(
+        &self,
+        limits: crate::scheduler::SchedulerConfig,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::Configure { limits, answer })
+            && let Command::Configure { answer, .. } = error.0
+        {
+            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+        }
+        receiver
+    }
+
+    /// Gives back or restores KV cache memory (`Command::ResizeCache`); the
+    /// receiver gets what each worker reported, or why the change failed.
+    pub fn resize_cache(
+        &self,
+        change: CacheChange,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::ResizeCache { change, answer })
+            && let Command::ResizeCache { answer, .. } = error.0
+        {
+            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+        }
+        receiver
+    }
+
+    /// Rewrites the weights in place from the checkpoint at `model_path`
+    /// (`Command::UpdateWeights`); the receiver gets what each worker
+    /// reported, or why the update failed.
+    pub fn update_weights(
+        &self,
+        model_path: String,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        let (answer, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::UpdateWeights { model_path, answer })
+            && let Command::UpdateWeights { answer, .. } = error.0
+        {
+            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+        }
+        receiver
+    }
+
     /// Requests orderly scheduler shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
@@ -667,6 +783,7 @@ mod tests {
             image_generation: policy,
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }
     }
 

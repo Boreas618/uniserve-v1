@@ -233,6 +233,8 @@ impl Scheduler {
             fatal: false,
             kv_offload: None,
             closing: false,
+            resizing: None,
+            asleep: false,
             stats,
         })
     }
@@ -240,6 +242,89 @@ impl Scheduler {
     /// Returns the effective scheduler configuration.
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
+    }
+
+    /// Takes `limits`' scheduling limits and policy from the next step on;
+    /// the canvas stays. The limits must lie within the batch the workers
+    /// were started for: the running requests within their request rows,
+    /// a step's tokens and calls within their batch. A change of policy
+    /// reorders the waiting queue by it, as if each request had been queued
+    /// under it.
+    ///
+    /// # Errors
+    ///
+    /// Names the first limit beyond the workers' batch, or the canvas the
+    /// step budget no longer holds; the scheduler keeps its limits.
+    pub(super) fn reconfigure(&mut self, limits: SchedulerConfig) -> Result<(), String> {
+        let info = &self.info;
+        let running = (info.request_slots as usize)
+            .saturating_sub(guidance_prefix_rows(info))
+            .max(1);
+        let beyond = |name: &str, value: usize, capacity: usize| {
+            format!(
+                "scheduler_config.{name} = {value} exceeds the {capacity} the workers were \
+                 started for; a hot update starts workers for it"
+            )
+        };
+        if limits.max_running_requests > running {
+            return Err(beyond(
+                "max_running_requests",
+                limits.max_running_requests,
+                running,
+            ));
+        }
+        let tokens = info.max_batch_tokens as usize;
+        if limits.max_num_batched_tokens > tokens {
+            return Err(beyond(
+                "max_num_batched_tokens",
+                limits.max_num_batched_tokens,
+                tokens,
+            ));
+        }
+        let calls = info.max_batch_calls as usize;
+        if calls > 0 && limits.max_batch > calls {
+            return Err(beyond("max_batch", limits.max_batch, calls));
+        }
+        if let Some(canvas) = self.config.canvas
+            && canvas.canvas_length as usize > limits.max_num_batched_tokens.max(1)
+        {
+            return Err(format!(
+                "a {}-token generation canvas exceeds the {}-token step budget",
+                canvas.canvas_length, limits.max_num_batched_tokens
+            ));
+        }
+        if limits.policy != self.config.policy {
+            let mut waiting = Vec::from(std::mem::take(&mut self.waiting));
+            match limits.policy {
+                SchedulingPolicy::Fcfs => {
+                    waiting.sort_by(|a, b| a.queued_at.total_cmp(&b.queued_at))
+                }
+                SchedulingPolicy::Priority => waiting.sort_by(|a, b| {
+                    a.req
+                        .priority
+                        .cmp(&b.req.priority)
+                        .then(a.queued_at.total_cmp(&b.queued_at))
+                }),
+            }
+            self.waiting = waiting.into();
+        }
+        self.config = SchedulerConfig {
+            policy: limits.policy,
+            max_batch: limits.max_batch.max(1),
+            max_num_batched_tokens: limits.max_num_batched_tokens.max(1),
+            max_running_requests: limits.max_running_requests.max(1),
+            chunked_prefill_size: limits.chunked_prefill_size.max(1),
+            max_queued_requests: limits.max_queued_requests.map(|bound| bound.max(1)),
+            canvas: self.config.canvas,
+        };
+        tracing::info!(config = ?self.config, "the scheduler took new limits");
+        Ok(())
+    }
+
+    /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
+    /// whose requests hand their KV cache to a decode group.
+    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+        self.placement.prefill_groups = groups.into_iter().collect();
     }
 
     /// Enables or disables reusable prefix caching.
@@ -479,6 +564,31 @@ impl Scheduler {
                 self.park_for_progress();
             }
         }
+    }
+
+    /// Runs the worker hook `name` with `payload` on every worker
+    /// (`Executor::hook`) once the batches in flight complete, admitting
+    /// and scheduling nothing meanwhile, and returns each worker's result.
+    pub(super) fn run_hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
+        let closing = std::mem::replace(&mut self.closing, true);
+        while !(self.inflight.pending_batches.is_empty()
+            && self.inflight.pending_submissions.is_empty())
+        {
+            if self.fatal {
+                self.closing = closing;
+                return Err("the engine failed before the hook ran".to_owned());
+            }
+            if !self.step_nonblocking() {
+                self.park_for_progress();
+            }
+        }
+        self.closing = closing;
+        let results = self
+            .executor
+            .hook(name, payload)
+            .map_err(|error| format!("{error:#}"))?;
+        tracing::info!(hook = name, workers = results.len(), "ran the worker hook");
+        Ok(results)
     }
 
     /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.

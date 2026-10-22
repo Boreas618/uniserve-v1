@@ -112,6 +112,11 @@ pub(crate) fn router_with(engine: Leader, server: &ServerOptions) -> Router {
         Arc::new(jobs),
         server,
         crate::http::BODY_LIMIT,
+        crate::http::admin::Admin::new(
+            CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ),
+        None,
     )
 }
 
@@ -180,6 +185,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
                 units: *units,
             })
             .collect(),
+        capacity: None,
     };
     let model_name = first.model_name().to_owned();
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");

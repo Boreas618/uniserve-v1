@@ -159,9 +159,13 @@ impl EngineControl {
                             // The process lives as long as its control
                             // connection.
                             Some(control),
-                        );
+                        )
+                        .map(|client| client.numbered(engine));
                     }
                     Ok(wire::EngineState::Failed) => {
+                        // The failed engine closes its workers and exits;
+                        // their memory is free once it has.
+                        await_exit(&mut control, FAILED_EXIT);
                         anyhow::bail!("the engine failed to start: {}", state.error);
                     }
                     _ => {}
@@ -171,6 +175,93 @@ impl EngineControl {
                     exited(&mut control)?;
                     reader.wait(POLL_INTERVAL)?;
                 }
+            }
+        }
+    }
+
+    /// The request socket's address, which an engine attaches to
+    /// (`EngineClient::attach`).
+    pub fn request_address(&self) -> &str {
+        &self.request_address
+    }
+
+    /// The identity the next engine this control starts takes.
+    pub fn next_engine(&self) -> u64 {
+        self.next_engine.load(Ordering::Relaxed)
+    }
+
+    /// Takes over the engine `engine` a daemon this one replaced started,
+    /// which serves `served` and lives under `control`: the engine connects
+    /// to this daemon's request socket, as the replaced daemon commanded it
+    /// (`EngineClient::attach`), is welcomed, and reports itself ready.
+    /// Later engines this control starts take the identities from
+    /// `next_engine` on. `stats` receives its schedulers' statistics.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the engine does not connect in time, speaks another major
+    /// version, is another engine, or reports anything but ready.
+    pub fn adopt(
+        &self,
+        engine: u64,
+        next_engine: u64,
+        served: wire::EngineSpec,
+        mut control: Connection,
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
+        self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
+        let stream = self.accept(engine, &mut control)?;
+        let mut reader = Connection::from_unix(stream.try_clone()?)?;
+        let mut writer = Connection::from_unix(stream)?;
+        let hello: wire::Hello = reader
+            .recv(CONNECT_TIMEOUT)?
+            .context("the engine said no hello")?;
+        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+            format!(
+                "the engine speaks major version {} and this daemon {}",
+                hello.major,
+                proto::PROTOCOL_MAJOR
+            )
+        } else if hello.engine != engine {
+            format!(
+                "engine {} attached in place of engine {engine}",
+                hello.engine
+            )
+        } else {
+            String::new()
+        };
+        writer.send(&wire::Welcome {
+            major: proto::PROTOCOL_MAJOR,
+            minor: proto::PROTOCOL_MINOR,
+            build: proto::BUILD.to_owned(),
+            refusal: refusal.clone(),
+            spec: refusal.is_empty().then_some(served),
+        })?;
+        anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "engine {engine} reported no state");
+            let Some(message) = reader.recv::<wire::FromEngine>(remaining)? else {
+                continue;
+            };
+            if let Some(wire::from_engine::Kind::State(state)) = message.kind {
+                anyhow::ensure!(
+                    state.state == wire::EngineState::Ready as i32,
+                    "engine {engine} attached while it does not serve: {}",
+                    state.error
+                );
+                let info = state.info.context("the engine reported no info")?;
+                tracing::info!(engine, build = %hello.build, "the engine attached");
+                return EngineClient::new(
+                    reader,
+                    writer,
+                    info.into(),
+                    EngineState::Ready,
+                    stats,
+                    Some(control),
+                )
+                .map(|client| client.numbered(engine));
             }
         }
     }
@@ -269,6 +360,22 @@ impl Drop for EngineControl {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+/// How long a failed engine takes to close its workers and exit, at most.
+const FAILED_EXIT: Duration = Duration::from_secs(120);
+
+/// Waits up to `timeout` for the daemon to report the engine process's exit
+/// on its control connection; a wait that times out is logged.
+fn await_exit(control: &mut Connection, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match exited(control) {
+            Ok(()) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => return,
+        }
+    }
+    tracing::warn!("the failed engine process did not exit within {timeout:?}");
 }
 
 /// Fails when the daemon reported the engine process's exit on its control

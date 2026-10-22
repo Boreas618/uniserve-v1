@@ -216,11 +216,17 @@ impl ImageOwners {
             if branches > 1 && request_slots < 2 {
                 continue;
             }
-            let (height, width) = captured
+            let shape = captured
                 .iter()
                 .rev()
                 .find(|shape| shape.branches == branches)
-                .map_or((side, side), |shape| (shape.height, shape.width));
+                .map(|shape| (shape.height, shape.width));
+            // Under graphs only a captured step is served.
+            let (height, width) = match shape {
+                Some(shape) => shape,
+                None if self.denoisers.image_graphs() => continue,
+                None => (side, side),
+            };
             // Text guidance (every guided shape) conditions on the negative
             // prompt, here an empty one, as the server renders a client's.
             let negative_token_ids = if branches > 1 {
@@ -239,6 +245,30 @@ impl ImageOwners {
             });
         }
         Ok(warmups)
+    }
+
+    /// The image denoising steps this rank captured
+    /// (`WorkerInfo::captured_images`): one image of every captured size and
+    /// branch count, as the engine forms one denoising call per batch;
+    /// `None` when the image denoiser serves eagerly or the rank holds none.
+    pub(crate) fn captured_images(&self) -> Option<Vec<ipc::CapturedImage>> {
+        if !self.denoisers.image_graphs() {
+            return None;
+        }
+        let mut shapes: Vec<ipc::CapturedImage> = self
+            .denoisers
+            .flow_shapes()
+            .iter()
+            .filter(|shape| shape.images == 1)
+            .map(|shape| ipc::CapturedImage {
+                height: shape.height,
+                width: shape.width,
+                branches: shape.branches as u8,
+            })
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        Some(shapes)
     }
 
     /// The tokens this rank's image denoiser's image-unconditional branch
@@ -512,8 +542,14 @@ impl ImageOwners {
         // generation tower's, reached through transfers.
         let mut flow = Vec::new();
         let mut flow_pools = Vec::new();
+        // Under graphs the image denoiser denoises only the steps captured
+        // here.
+        let graphs = config.graph_policy != "off"
+            && diffusion
+                .as_ref()
+                .is_some_and(|(_, runner)| runner.device().cuda().is_some());
         if let (Some((_, runner)), Some(latents)) = (&diffusion, &latents)
-            && config.graph_policy != "off"
+            && graphs
             && let Some(ordinal) = runner.device().cuda()
         {
             flow = flow_shapes(
@@ -577,7 +613,7 @@ impl ImageOwners {
             model: facts,
             policy,
             encoders: EncoderRunners::image(encoders, encoder_routes, pools),
-            denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, units),
+            denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, graphs, units),
             decoders: DecoderRunners::image(decoder, max_pixel_words),
             latents,
             order,

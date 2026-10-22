@@ -7,9 +7,14 @@ stores bytes; this module defines what they are:
 - :func:`fingerprints` digests what determines a model's loaded bytes
   besides the worker's placement and GPUs. The structure fingerprint covers
   the normalized configuration, the module selection, the weight choices,
-  the load mode, which kernels read the routed experts, and the numerics
-  digest (:func:`numerics`) of the code that loads and converts weights;
-  each checkpoint source's fingerprint adds that source's files. A tensor
+  the load mode, which kernels read the routed experts, and the digest of
+  the numerical code the process has loaded (:func:`loaded_numerics`):
+  code it never loaded cannot have computed the bytes, so a change to it
+  keeps them. Each checkpoint source's fingerprint adds that source's
+  files. Loading may import modules the fingerprint did not cover; the
+  manifest records the digest of every module loaded by the time the
+  bytes were published, and the weights bind only while each module still
+  has it (:func:`modules_current`). A tensor
   loaded from a source is keyed by its source's fingerprint, so a change to
   one source's files reloads only its tensors; the manifest and the tensors
   no source loads are keyed by the structure. The worker adds its
@@ -41,7 +46,11 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import re
 import struct
+import sys
+import time
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,11 +59,15 @@ from typing import Any
 import torch
 from torch import nn
 
+from uniserve import plugins
 from uniserve.quantization import QuantizedTensor, Quantizer
 from uniserve.quantization.tensor import RowOrder, ScaleLayout
 
 # The manifest's format; a manifest of another version is not bound.
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
+
+# The numerical packages whose code loads, converts and lays out weights.
+_PACKAGES = ("uniserve", "uniserve_kernels")
 
 # The field name of a dense tensor's data.
 _DATA = "data"
@@ -74,6 +87,14 @@ _LIBRARIES = (
     "safetensors",
 )
 
+# How long ago a checkpoint file must have last changed for its identity to
+# name its contents: longer than the kernel's timestamp resolution.
+_SETTLED_NS = 1_000_000_000
+
+# The name of a Hugging Face cache blob: the SHA-256 or git SHA-1 of its
+# contents, in lowercase hexadecimal.
+_BLOB_NAME = re.compile(r"[0-9a-f]{64}|[0-9a-f]{40}")
+
 # Torch allocator cache a publish may hold before returning it to the
 # driver, which the retained allocations that follow draw from.
 _RELEASE_BYTES = 1 << 30
@@ -86,41 +107,149 @@ def _hash(digest, text: str) -> None:
     digest.update(data)
 
 
-@functools.cache
-def numerics() -> str:
-    """The digest of the code that loads, converts and lays out weights.
+def _root(package: str) -> Path | None:
+    """The directory of an installed package, an editable one included."""
+    spec = importlib.util.find_spec(package)
+    if spec is None or spec.origin is None:
+        return None
+    return Path(spec.origin).parent
 
-    Covers the sources of the installed ``uniserve`` and
-    ``uniserve_kernels`` packages as they are on disk, an editable install
-    included, and the versions of the kernel libraries in ``_LIBRARIES``.
-    Computed once per process.
-    """
-    digest = hashlib.sha256()
-    _hash(digest, "uniserve-numerics")
-    for package in ("uniserve", "uniserve_kernels"):
-        spec = importlib.util.find_spec(package)
-        if spec is None or spec.origin is None:
-            _hash(digest, f"{package}: absent")
+
+def _sources(package: str, python: bool) -> Iterator[tuple[str, Path]]:
+    """A numerical package's source files on disk, Python or not, each
+    by its package-qualified relative name.
+    """  # noqa: D205
+    root = _root(package)
+    if root is None:
+        return
+    for path in sorted(root.rglob("*")):
+        if (
+            path.suffix not in _SOURCES
+            or (path.suffix == ".py") != python
+            or "__pycache__" in path.parts
+            or not path.is_file()
+        ):
             continue
-        root = Path(spec.origin).parent
-        for path in sorted(root.rglob("*")):
-            if (
-                path.suffix not in _SOURCES
-                or "__pycache__" in path.parts
-                or not path.is_file()
-            ):
-                continue
-            _hash(digest, f"{package}/{path.relative_to(root).as_posix()}")
-            contents = path.read_bytes()
-            digest.update(struct.pack("<Q", len(contents)))
-            digest.update(contents)
+        yield f"{package}/{path.relative_to(root).as_posix()}", path
+
+
+def _add_file(digest, name: str, path: Path) -> None:
+    """Add a file's name and contents to ``digest``."""
+    _hash(digest, name)
+    contents = path.read_bytes()
+    digest.update(struct.pack("<Q", len(contents)))
+    digest.update(contents)
+
+
+@functools.cache
+def _beside_modules() -> str:
+    """The digest of what determines computed bytes besides Python
+    modules: the numerical packages' other sources (kernels and the data
+    their code reads), the versions of the kernel libraries in
+    ``_LIBRARIES`` and those of the installed plugins
+    (``uniserve.plugins``). Computed once per process.
+    """  # noqa: D205
+    digest = hashlib.sha256()
+    _hash(digest, "uniserve-numerics-beside-modules")
+    for package in _PACKAGES:
+        if _root(package) is None:
+            _hash(digest, f"{package}: absent")
+        for name, path in _sources(package, python=False):
+            _add_file(digest, name, path)
     for name in _LIBRARIES:
         try:
             version = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             version = "absent"
         _hash(digest, f"{name}=={version}")
+    # A plugin's providers declare the layout of the weights they serve.
+    for version in plugins.versions():
+        _hash(digest, f"plugin {version}")
     return digest.hexdigest()
+
+
+@functools.cache
+def numerics() -> str:
+    """The digest of all the numerical code installed.
+
+    Covers every source of the installed ``uniserve`` and
+    ``uniserve_kernels`` packages as they are on disk, an editable install
+    included, and :func:`_beside_modules`. What a forward computes, such
+    as the KV cache's pages, is keyed by it: a forward may run code loaded
+    after any point of the process. Computed once per process.
+    """
+    digest = hashlib.sha256()
+    _hash(digest, "uniserve-numerics")
+    for package in _PACKAGES:
+        for name, path in _sources(package, python=True):
+            _add_file(digest, name, path)
+    _hash(digest, _beside_modules())
+    return digest.hexdigest()
+
+
+def _loaded_modules() -> dict[str, Path]:
+    """The source file of every module of the numerical packages this
+    process has loaded, by its package-qualified relative name.
+    """  # noqa: D205
+    roots = {package: _root(package) for package in _PACKAGES}
+    loaded = {}
+    for module in list(sys.modules.values()):
+        file = getattr(module, "__file__", None)
+        if not file or not file.endswith(".py"):
+            continue
+        path = Path(file)
+        for package, root in roots.items():
+            if root is not None and path.is_relative_to(root):
+                name = f"{package}/{path.relative_to(root).as_posix()}"
+                loaded[name] = path
+    return loaded
+
+
+def loaded_numerics() -> str:
+    """The digest of the numerical code this process has loaded so far.
+
+    Covers the source of every loaded module of ``uniserve`` and
+    ``uniserve_kernels`` and :func:`_beside_modules`; code the process has
+    not loaded cannot have computed anything yet.
+    """
+    digest = hashlib.sha256()
+    _hash(digest, "uniserve-loaded-numerics")
+    for name, path in sorted(_loaded_modules().items()):
+        _add_file(digest, name, path)
+    _hash(digest, _beside_modules())
+    return digest.hexdigest()
+
+
+def module_digests() -> dict[str, str]:
+    """The SHA-256 digest of every loaded numerical module's source, by
+    its package-qualified relative name: what a manifest records.
+    """  # noqa: D205
+    return {
+        name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for name, path in sorted(_loaded_modules().items())
+    }
+
+
+def modules_current(manifest: str) -> bool:
+    """Whether every module a manifest records still has the source it
+    had when the weights were published, so the weights are what loading
+    them now would compute.
+    """  # noqa: D205
+    recorded = json.loads(manifest).get("modules")
+    if not isinstance(recorded, dict):
+        return False
+    roots = {package: _root(package) for package in _PACKAGES}
+    for name, digest in recorded.items():
+        package, _, relative = str(name).partition("/")
+        root = roots.get(package)
+        if root is None:
+            return False
+        path = root / relative
+        if not path.is_file():
+            return False
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            return False
+    return True
 
 
 def _name(value: Any) -> str:
@@ -179,8 +308,45 @@ def _header(path: Path) -> str:
         return file.read(length).decode("utf-8", errors="replace")
 
 
+def _identity(path: Path) -> str:
+    """The identity of the file ``path`` names, a link followed.
+
+    A file of a Hugging Face cache is a link to a blob named by a digest of
+    its contents (SHA-256 for a large file, the git blob SHA-1 otherwise),
+    and the cache writes a blob once: the blob's name is its identity.
+
+    Any other file's identity is its device, inode, modification time and
+    status change time. The kernel sets a file's status change time on
+    every write, and no process can set it back, so a file rewritten after
+    it was read has another identity, and a file at another path is
+    another file. The time has the resolution of the kernel's clock tick,
+    though: a file written within the last :data:`_SETTLED_NS` may be
+    written again under the same time, so its identity is unique to this
+    read and its weights match no later load.
+    """
+    resolved = path.resolve()
+    if resolved.parent.name == "blobs" and _BLOB_NAME.fullmatch(resolved.name):
+        return f"blob:{resolved.name}"
+    status = resolved.stat()
+    if time.time_ns() - status.st_ctime_ns < _SETTLED_NS:
+        return f"unsettled:{uuid.uuid4().hex}"
+    return ":".join(
+        str(value)
+        for value in (
+            status.st_dev,
+            status.st_ino,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+    )
+
+
 def fingerprints(
-    source, io, model_dtype: str, expert_kernels: str
+    source,
+    io,
+    model_dtype: str,
+    expert_kernels: str,
+    numerics: str | None = None,
 ) -> dict[str, Any]:
     """The digests of what determines a model's loaded bytes.
 
@@ -193,15 +359,23 @@ def fingerprints(
         model_dtype: The compute element type's name.
         expert_kernels: Which kernels read the routed experts
             (``uniserve.loading.layout.ExpertKernels``).
+        numerics: The digest of the numerical code the weights are
+            computed with, :func:`loaded_numerics` before loading; None for
+            the code this process has loaded so far. A rank that rewrites
+            its weights after loading passes the digest it loaded them
+            with, which a new process computes again before loading.
 
     Returns:
-        ``{"structure": digest, "sources": {name: digest}}``: the structure
-        fingerprint, and each checkpoint source's, as lowercase
-        hexadecimal SHA-256 digests.
+        ``{"structure": digest, "sources": {name: digest}, "numerics":
+        digest}``: the structure fingerprint, each checkpoint source's and
+        that of the numerical code the structure covers, as lowercase
+        hexadecimal SHA-256 digests. A source's digest covers each of its
+        files' name, size, header and identity (:func:`_identity`).
     """
+    code = numerics or loaded_numerics()
     structure = hashlib.sha256()
     _hash(structure, "uniserve-model-structure")
-    _hash(structure, numerics())
+    _hash(structure, code)
     for part in (
         source.model_class,
         source.model,
@@ -229,9 +403,13 @@ def fingerprints(
             _hash(digest, path.relative_to(checkpoint.root).as_posix())
             _hash(digest, str(path.stat().st_size))
             _hash(digest, _header(path))
+            _hash(digest, _identity(path))
+        if checkpoint.stream is not None:
+            # A plugin's weight source names what it streams.
+            _hash(digest, f"stream:{checkpoint.identity}")
         _hash(digest, json.dumps(_canonical(checkpoint.headers)))
         sources[checkpoint.name] = digest.hexdigest()
-    return {"structure": structure_digest, "sources": sources}
+    return {"structure": structure_digest, "sources": sources, "numerics": code}
 
 
 @dataclass
@@ -250,7 +428,8 @@ class _Entry:
     host: bool = False
 
 
-def _entry(identity: str, tensor: torch.Tensor) -> _Entry:
+def tensor_entry(identity: str, tensor: torch.Tensor) -> _Entry:
+    """The fields and representation of tensor ``identity``."""
     if isinstance(tensor, QuantizedTensor):
         quantizer = tensor.quantizer
         representation = {
@@ -358,7 +537,7 @@ class Layout:
                     f"{identity} lies in {tensor.device.type} memory; "
                     "only CUDA weights are retained"
                 )
-            entry = _entry(identity, tensor)
+            entry = tensor_entry(identity, tensor)
             entry.source = origins.get(id(tensor), "")
             entry.host = id(tensor) in host
             layout.entries.append(entry)
@@ -383,6 +562,7 @@ class Layout:
         return json.dumps(
             {
                 "version": MANIFEST_VERSION,
+                "modules": module_digests(),
                 "tensors": [
                     {
                         "id": entry.id,

@@ -37,9 +37,13 @@ impl Scratches {
         }
         let pool = device.map(GraphPool::new).transpose()?.map(Arc::new);
         let scratch = Handle::new(
-            Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[pool
-                .as_ref()
-                .map_or_else(tvm_ffi::Any::default, |pool| pool.value.to_any())])?,
+            Interpreter::import("uniserve.bindings.context.Scratch")?.call_values(&[
+                pool.as_ref()
+                    .map_or_else(tvm_ffi::Any::default, |pool| pool.value.to_any()),
+                device.map_or_else(tvm_ffi::Any::default, |device| {
+                    tvm_ffi::Any::from(i64::from(device.0))
+                }),
+            ])?,
         )?;
         self.scratches.insert(key, (scratch.clone(), pool));
         Ok(scratch)

@@ -34,6 +34,10 @@ pub struct StorageLaunch {
     /// Whether the engine copies the worker's cache pages through the host
     /// KV cache: the worker then maps a page pool per cache group.
     pub host_kv_cache: bool,
+    /// The bytes of host KV cache the worker keeps over its page pools,
+    /// split between its cache groups; the Storage Server's size for each
+    /// pool when `None`.
+    pub host_kv_cache_bytes: Option<u64>,
     /// Where an engine on another host reaches the server (`host:port`), for
     /// page requests; `None` on the engine's host, or when the server accepts
     /// no other host.
@@ -70,6 +74,10 @@ pub struct LaunchDescriptor {
 
     /// Checkpoint path or repository; empty for the stub model.
     pub model: String,
+    /// A plugin's weight source (`scheme://...`) that streams the
+    /// checkpoint's tensors in place of its files; `None` reads the files.
+    #[serde(default)]
+    pub weights: Option<String>,
     /// Where the worker retains its weights and exclusive storages.
     pub storage: StorageLaunch,
     /// The deployment's name of the node the worker runs on: the node's

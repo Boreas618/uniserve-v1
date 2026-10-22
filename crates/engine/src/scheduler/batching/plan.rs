@@ -171,6 +171,22 @@ impl Scheduler {
                     request,
                 )
             }),
+            // The prefill group exports the request's cache, then the decode
+            // group installs it.
+            Phase::HandOff => {
+                let export = self.running.get(&id)?.handoff_export;
+                self.plan_call(id, |scheduler, request| {
+                    let bytes = scheduler
+                        .info
+                        .prefix_cache
+                        .as_ref()
+                        .map_or(0, |cache| cache.transfer_bytes(cache_visible_len));
+                    match export {
+                        None => generation::plan_cache_export(bytes, request),
+                        Some(export) => generation::plan_cache_install(bytes, export, request),
+                    }
+                })
+            }
             Phase::LatentPreparation => {
                 let conditioning = self.cache_conditioning(id)?;
                 self.plan_call(id, |scheduler, request| {

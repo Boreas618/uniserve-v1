@@ -165,6 +165,17 @@ impl WorkerGroup {
         Ok(())
     }
 
+    /// Runs the worker hook `name` on the group's serving ranks; each rank's
+    /// result, in rank order.
+    pub(crate) fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
+        crate::worker::process::hook_all(
+            &mut self.workers,
+            name,
+            payload,
+            self.process_args.watchdog_timeout,
+        )
+    }
+
     /// Promote the parked standby in place of the failed ranks, which the
     /// caller terminated, and start a new standby. Returns `None` without a
     /// parked standby; otherwise whether the promotion succeeded, after

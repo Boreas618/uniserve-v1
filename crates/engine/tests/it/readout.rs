@@ -88,6 +88,7 @@ fn readout_request(
         image_generation: ImageGenerationConfig::default(),
         readout,
         generated_token_ids: Vec::new(),
+        adapter: 0,
     }
 }
 

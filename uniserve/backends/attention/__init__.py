@@ -8,6 +8,7 @@ from importlib import import_module
 
 import torch as torch_lib
 
+from uniserve import plugins
 from uniserve.models.inputs import TextSize
 from uniserve.nn.attention.inputs import (
     AttentionInput,
@@ -452,10 +453,19 @@ def resolve(
         return _Auto(device, flashinfer=flashinfer)
 
     if backend not in PROVIDERS:
-        raise ValueError(
-            f"unknown attention backend {backend!r}; accepted names are "
-            + ", ".join(("auto", *PROVIDERS))
-        )
+        factory = plugins.provider("attention", backend)
+        if factory is None:
+            raise ValueError(
+                f"unknown attention backend {backend!r}; accepted names are "
+                + ", ".join(
+                    (
+                        "auto",
+                        *PROVIDERS,
+                        *plugins.registry().providers["attention"],
+                    )
+                )
+            )
+        return factory()
 
     if backend == "flashinfer" and flashinfer is not None:
         return flashinfer

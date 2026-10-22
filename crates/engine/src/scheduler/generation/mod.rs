@@ -149,6 +149,11 @@ pub(crate) enum GenerationPhase {
     /// input images between them, encoding each block first
     /// (`Scheduler::next_context_call`).
     Prefill,
+    /// Move the request's KV cache from the prefill group that prefilled its
+    /// prompt to a decode group (`WorkerGroupRole::Decode`): export it on
+    /// the prefill group (`RequestState::handoff_export`), then install it
+    /// on the decode group, which decodes the request from then on.
+    HandOff,
     /// Decode understanding (text) tokens.
     DecodeUnd,
     /// Write the pending token (`RequestState::next_token`) into the prefix cache without
@@ -383,9 +388,20 @@ impl RequestState {
                 self.readout_logprobs
                     .extend_from_slice(&record.candidate_logprobs);
             }
+            CallKind::Transfer(TransferMode::CacheExport)
+                if self.phase == GenerationPhase::HandOff =>
+            {
+                self.handoff_export = call.cache_output;
+            }
             CallKind::Transfer(TransferMode::CacheExport) => {
                 self.image_conditioning = call.cache_output;
                 self.phase = GenerationPhase::LatentPreparation;
+            }
+            // The decode group holds the request's cache: it decodes from
+            // the committed token on.
+            CallKind::Transfer(TransferMode::CacheInstall) => {
+                self.handoff_export = None;
+                self.phase = GenerationPhase::DecodeUnd;
             }
             CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => {
@@ -764,6 +780,32 @@ pub(super) fn plan_cache_export(
     call.bounds.max_transfer_bytes = transfer_bytes;
     // Owner and producer are the placeholders from `new_call`;
     // `register_call` stamps them.
+    call.cache_output = Some(BufferId {
+        owner: call.request_key,
+        producer_call_id: call.call_id,
+        output_index: 0,
+        generation: 0,
+    });
+    call.completion_output = Some(output_tensor(1, DType::U8));
+    finish_plan(request, call, 0)
+}
+
+/// Installs the KV cache the prefill group exported (`export`) on the
+/// decode group that decodes the request from now on
+/// (`GenerationPhase::HandOff`). `transfer_bytes` bounds the export, as
+/// for `plan_cache_export`.
+pub(super) fn plan_cache_install(
+    transfer_bytes: u64,
+    export: BufferId,
+    request: &GenerationRequest,
+) -> Result<Call, PlanningError> {
+    if transfer_bytes == 0 {
+        return Err(PlanningError::MissingProductBound);
+    }
+    let mut call = new_call(request, CallKind::Transfer(TransferMode::CacheInstall));
+    call.bounds.max_tokens = 0;
+    call.bounds.max_transfer_bytes = transfer_bytes;
+    call.cache_input = Some(export);
     call.cache_output = Some(BufferId {
         owner: call.request_key,
         producer_call_id: call.call_id,
@@ -1423,6 +1465,9 @@ pub(crate) struct RequestState {
     pub(super) denoising: super::Denoising,
     /// Exact generations retained for conditioning, denoising, and feedback.
     pub(super) image_conditioning: Option<ipc::BufferId>,
+    /// The prefill group's export of the request's KV cache during
+    /// `HandOff`, which the decode group installs.
+    pub(super) handoff_export: Option<ipc::BufferId>,
     /// Next feedback encoder of the generated image.
     pub(super) feedback_encoder_index: usize,
     /// Device image product of the last image decode, when feedback reads

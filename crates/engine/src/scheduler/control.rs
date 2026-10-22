@@ -112,6 +112,24 @@ impl Scheduler {
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(promoted);
             }
+            Command::FlushCache => {
+                let pages = self.storage.flush_prefix_cache();
+                tracing::info!(pages, "flushed the prefix cache");
+            }
+            Command::Hook {
+                name,
+                payload,
+                answer,
+            } => {
+                let _ = answer.send(self.run_hook(&name, &payload));
+            }
+            Command::Configure { limits, answer } => {
+                let _ = answer.send(self.reconfigure(limits));
+            }
+            Command::ResizeCache { change, answer } => self.resize_cache(change, answer),
+            Command::UpdateWeights { model_path, answer } => {
+                self.update_weights(model_path, answer);
+            }
             Command::Shutdown => return true,
         }
         false
@@ -262,8 +280,23 @@ impl Scheduler {
                 let _ = st.output.events.event_tx.send(Event::Migratable { cause });
             }
         }
+        self.migrate_running(cause, |_| true);
+    }
+
+    /// Ends as migratable, for `cause`, every running token request that
+    /// `select` picks and that resumes from its generated tokens, as
+    /// `migrate_requests` ends a running one.
+    pub(super) fn migrate_running(
+        &mut self,
+        cause: MigrationCause,
+        select: impl Fn(RequestId) -> bool,
+    ) {
+        if self.config.canvas.is_some() {
+            return;
+        }
         for (id, st) in &mut self.running {
-            if st.req.is_migratable()
+            if select(*id)
+                && st.req.is_migratable()
                 && !st.terminal_intent.is_terminal()
                 && !self.inflight.pending_finishes.contains_key(id)
             {

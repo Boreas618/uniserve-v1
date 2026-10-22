@@ -3,6 +3,7 @@
 
 #![cfg(test)]
 
+mod cache_memory;
 mod canvas;
 mod control_plane;
 mod image_ipc;

@@ -39,17 +39,27 @@ pub(crate) enum StorageCommand {
         /// the starter once listening.
         #[arg(long)]
         daemon: bool,
-        /// The size of each host page pool, in GiB. The workers that copy
-        /// through a pool pin it, so it is allocated whole when the first
-        /// one maps it.
+        /// The size of a host page pool whose worker states none, in GiB.
+        /// The workers that copy through a pool pin it, so it is allocated
+        /// whole when the first one maps it.
         #[arg(long, default_value_t = storage_server::DEFAULT_POOL_BYTES >> 30)]
         page_pool_gib: u64,
+        /// Host memory, in GiB, that a new page pool leaves available to the
+        /// host's other processes: a pool the host's available memory less
+        /// this reserve cannot hold is refused (SGLang's host KV cache keeps
+        /// 10 GiB the same way).
+        #[arg(long, default_value_t = 10)]
+        host_reserve_gib: u64,
         /// Also accept other hosts' heads, for page requests, on this TCP
         /// address (`host:port`; port 0 picks one, which `Endpoint` names).
         #[arg(long)]
         tcp: Option<String>,
         #[command(flatten)]
         mooncake: Mooncake,
+        /// Go on with the server the predecessor of a hot restart hands over
+        /// on the handoff socket at this descriptor (`storage restart`).
+        #[arg(long, hide = true)]
+        takeover: Option<i32>,
     },
     /// The Mooncake connector a server runs as its child.
     #[command(hide = true)]
@@ -71,6 +81,17 @@ pub(crate) enum StorageCommand {
         socket: Option<PathBuf>,
         #[arg(long)]
         deployment: String,
+    },
+    /// Hand the running server to a successor, of this build or the one
+    /// `--executable` names, which goes on with every connection, tensor and
+    /// page pool once nothing is in flight (a hot restart).
+    Restart {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The `uniserve` executable the successor runs; the running
+        /// server's own when unset.
+        #[arg(long)]
+        executable: Option<String>,
     },
 }
 
@@ -135,17 +156,21 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
             socket,
             daemon,
             page_pool_gib,
+            host_reserve_gib,
             tcp,
             mooncake,
+            takeover,
         } => mooncake.settings().and_then(|connector| {
             let executable = std::env::current_exe().context("locating this executable")?;
             storage_server::serve(storage_server::ServeOptions {
                 socket: socket.unwrap_or_else(socket::default_socket),
                 daemon,
                 page_pool_bytes: page_pool_gib << 30,
+                host_reserve_bytes: host_reserve_gib << 30,
                 tcp,
                 connector,
                 connector_command: vec![executable.into(), "storage".into(), "connector".into()],
+                takeover,
             })
         }),
         StorageCommand::Connector { socket, mooncake } => mooncake
@@ -158,6 +183,15 @@ pub(crate) fn run(args: StorageArgs) -> ExitCode {
         }
         StorageCommand::Retire { socket, deployment } => {
             storage_server::retire(&socket.unwrap_or_else(socket::default_socket), &deployment)
+                .map_err(anyhow::Error::from)
+        }
+        StorageCommand::Restart { socket, executable } => {
+            let socket = socket.unwrap_or_else(socket::default_socket);
+            storage::Client::connect(&socket, storage::Role::Operator)
+                .and_then(|mut operator| operator.restart(executable))
+                .map(|pid| {
+                    println!("the successor server {pid} takes over once nothing is in flight")
+                })
                 .map_err(anyhow::Error::from)
         }
     };

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from uniserve.bindings.matmul import MatmulBinding
     from uniserve.bindings.moe import MoEBinding
     from uniserve.bindings.vsa import VsaBinding
+    from uniserve.prefix_cache import CacheBinding
 
 # Branch (name, weight id) pairs and the interleaved branch width.
 MergedKey = tuple[tuple[tuple[str, int], ...], int | None]
@@ -70,3 +71,9 @@ moe: ContextVar[Mapping[int, MoEBinding]] = ContextVar(
 tile_operators: ContextVar[
     Mapping[int, Callable[[torch.Tensor], torch.Tensor]]
 ] = ContextVar("uniserve_tile_operators", default={})
+
+# module id -> the cache layer a module other than attention owns, its
+# state and block table (``uniserve.prefix_cache.bound``)
+cache: ContextVar[Mapping[int, CacheBinding]] = ContextVar(
+    "uniserve_cache_layers", default={}
+)
