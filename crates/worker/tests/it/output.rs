@@ -48,15 +48,16 @@ fn entry(token_id: u32, logprob: f32, rank: u32) -> TokenLogprob {
 
 #[test]
 fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
-    // Two scored rows from a larger batch. The second requests fewer top
-    // tokens, while the first repeats its selection among its top tokens.
+    // Two scored rows from a larger batch. The second reports fewer top
+    // tokens, which follow the first's, while the first repeats its
+    // selection among its top tokens.
     let words = [
         vec![5, 9],
         vec![score(-0.5), score(-2.0)],
         vec![1, 4],
-        vec![5, 7, 2, 8],
-        vec![score(-0.5), score(-0.5), score(-1.0), score(-1.5)],
-        vec![1, 1, 1, 2],
+        vec![5, 7, 2],
+        vec![score(-0.5), score(-0.5), score(-1.0)],
+        vec![1, 1, 1],
     ]
     .concat();
     let count = words.len();
@@ -67,7 +68,6 @@ fn scores_preserve_requested_row_order_ranks_and_unique_tokens() -> Result<()> {
         LogprobLayout {
             rows: vec![4, 1],
             counts: vec![2, 1],
-            max_count: 2,
         },
     )?;
     complete(&mut output)?;
@@ -92,7 +92,6 @@ fn selected_score_needs_no_top_columns() -> Result<()> {
         LogprobLayout {
             rows: vec![6],
             counts: vec![0],
-            max_count: 0,
         },
     )?;
     complete(&mut output)?;
@@ -114,11 +113,11 @@ fn readback_rejects_unfinished_copies_and_out_of_range_reads() -> Result<()> {
 }
 
 #[test]
-fn score_layout_must_fit_its_capture_and_row_widths() -> Result<()> {
+fn score_layout_must_fit_its_capture() -> Result<()> {
     let mut output = buffer(vec![0; 6])?;
-    // A row of one top token fills the capture; a missing or excess count,
-    // or a width that does not, is refused.
-    for (counts, max_count) in [(vec![], 1), (vec![2], 1), (vec![1], 2), (vec![0], 0)] {
+    // A row of one top token fills the capture; a missing count, or a count
+    // whose words do not fill it, is refused.
+    for counts in [vec![], vec![2], vec![0], vec![1, 0]] {
         assert!(
             output
                 .register_logprobs(
@@ -127,7 +126,6 @@ fn score_layout_must_fit_its_capture_and_row_widths() -> Result<()> {
                     LogprobLayout {
                         rows: vec![0],
                         counts,
-                        max_count,
                     },
                 )
                 .is_err()

@@ -95,6 +95,7 @@ if triton is not None:
             "logits_stride",
             "counts_stride",
             "params_stride",
+            "extra_stride",
             "out_stride",
         ]
     )
@@ -103,20 +104,26 @@ if triton is not None:
         counts_ptr,
         slots_ptr,
         params_ptr,
+        extra_ptr,
         out_ptr,
         vocab,
         logits_stride,
         counts_stride,
         params_stride,
+        extra_stride,
         out_stride,
         block: tl.constexpr,
+        extras: tl.constexpr,
+        divide: tl.constexpr,
     ):
-        """Penalize and scale one block of one row's logits.
+        """Penalize, and with ``divide`` scale, one block of one row's logits.
 
-        The program of row ``r`` reads the counts of slot ``slots[r]``.
-        Every float32 operation is a separately rounded intrinsic, as each
-        step of :func:`penalize` and the temperature division is one tensor
-        operation, so the result equals theirs bit for bit.
+        The program of row ``r`` reads the counts of slot ``slots[r]``, plus
+        one per occurrence of a column among the row's ``extras`` tokens
+        (``-1`` counts nothing). Every float32 operation is a separately
+        rounded intrinsic, as each step of :func:`penalize` and the
+        temperature division is one tensor operation, so the result equals
+        theirs bit for bit.
         """
         row = tl.program_id(0)
         columns = tl.program_id(1) * block + tl.arange(0, block)
@@ -129,6 +136,9 @@ if triton is not None:
         counts = tl.load(
             counts_ptr + slot * counts_stride + columns, mask=mask, other=0
         ).to(tl.float32)
+        for index in tl.static_range(extras):
+            token = tl.load(extra_ptr + row * extra_stride + index)
+            counts += (columns == token).to(tl.float32)
         parameters = params_ptr + row * params_stride
         temperature = tl.load(parameters + 0)
         repetition = tl.load(parameters + 4)
@@ -146,12 +156,10 @@ if triton is not None:
         )
         apply = (counts > 0.0) & (current != float("-inf"))
         penalized = tl.where(apply, adjusted, current)
-        divisor = tl.where(temperature > 0.0, temperature, 1.0)
-        tl.store(
-            out_ptr + row * out_stride + columns,
-            libdevice.div_rn(penalized, divisor),
-            mask=mask,
-        )
+        if divide:
+            divisor = tl.where(temperature > 0.0, temperature, 1.0)
+            penalized = libdevice.div_rn(penalized, divisor)
+        tl.store(out_ptr + row * out_stride + columns, penalized, mask=mask)
 
 
 def shape_rows(
@@ -159,6 +167,9 @@ def shape_rows(
     params: torch.Tensor,
     counts: torch.Tensor,
     slots: torch.Tensor,
+    extra: torch.Tensor | None = None,
+    *,
+    divide: bool = True,
 ) -> torch.Tensor:
     """Penalize and temperature-scale logits rows in one pass.
 
@@ -168,12 +179,18 @@ def shape_rows(
         counts: ``[slots, vocab]`` int32 committed token counts of every
             request slot.
         slots: ``[rows]`` int64, the slot whose counts each row reads.
+        extra: ``[rows, E]`` int64 tokens each row counts besides its
+            slot's (a verification row's draft tokens before it), ``-1``
+            counting nothing; ``None`` for none.
+        divide: Whether the rows are divided by their temperatures; without
+            it the penalized rows are returned.
 
     Returns:
-        ``[rows, vocab]`` float32 logits: :func:`penalize`, then division by
-        :func:`temperature_divisors`.
+        ``[rows, vocab]`` float32 logits: :func:`penalize`, then, with
+        ``divide``, division by :func:`temperature_divisors`.
     """
     rows, vocab = int(logits.shape[0]), int(logits.shape[1])
+    extras = 0 if extra is None else int(extra.shape[1])
     if launchable(logits.device) and rows > 0:
         params = params.contiguous()
         out = torch.empty(
@@ -184,20 +201,28 @@ def shape_rows(
             counts,
             slots,
             params,
+            slots if extra is None else extra,
             out,
             vocab,
             logits.stride(0),
             counts.stride(0),
             params.stride(0),
+            0 if extra is None else extra.stride(0),
             out.stride(0),
             block=_SHAPE_BLOCK,
+            extras=extras,
+            divide=divide,
         )
         return out
-    work = penalize(
-        logits.to(dtype=torch.float32),
-        params,
-        counts.index_select(0, slots),
-    )
+    seen = counts.index_select(0, slots)
+    if extras:
+        assert extra is not None
+        seen = seen.scatter_add(
+            1, extra.clamp_min(0), (extra >= 0).to(dtype=seen.dtype)
+        )
+    work = penalize(logits.to(dtype=torch.float32), params, seen)
+    if not divide:
+        return work
     return work / temperature_divisors(params).unsqueeze(1)
 
 

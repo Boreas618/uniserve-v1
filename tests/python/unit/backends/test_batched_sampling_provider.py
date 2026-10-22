@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from uniserve.sampling import sample_top_k
-from uniserve.sampling.select import select_categorical
+from uniserve.sampling.select import CATEGORICAL, Controls, select
 from uniserve.sampling.top_k import (
     FREQUENCY,
     MIN_P,
@@ -188,31 +188,33 @@ def test_the_top_k_sampler_selects_what_the_general_path_selects(
     tokens, valid = sample_top_k(
         logits, draws, params, width, counts, torch.arange(rows)
     )
-    general = select_categorical(
+    # One categorical task per row in its own slot, without token sets.
+    words = (vocab + 31) // 32
+    controls = Controls(
+        rows=torch.arange(rows).unsqueeze(1),
+        paths=torch.full((rows,), CATEGORICAL),
+        params=params,
+        draws=draws,
+        slots=torch.arange(rows),
+        active=torch.ones(rows, dtype=torch.bool),
+        masks=torch.zeros((1, words), dtype=torch.int32),
+        mask_rows=torch.full((rows,), -1),
+        biased=torch.zeros(rows, dtype=torch.bool),
+        force=torch.zeros(rows, dtype=torch.bool),
+        finish=torch.zeros((rows, words), dtype=torch.int32),
+        transitions=torch.zeros((rows, words), dtype=torch.int32),
+        drafts=torch.empty((rows, 0), dtype=torch.int64),
+        terminal=torch.zeros(rows, dtype=torch.int64),
+    )
+    general = select(
         logits,
-        draws,
-        params,
-        torch.ones(rows, dtype=torch.bool),
-        row_counts=[1] * rows,
-        drafts=[],
-        terminal_prefixes=[0] * rows,
+        controls,
         candidates=width,
-        top_ks=top_ks.tolist(),
-        top_p_rows=[],
-        min_p_rows=list(range(rows)),
-        typical_p_rows=[],
-        allowed_rows=[],
-        allowed=[],
-        suppressed=[],
-        penalty_rows=list(range(rows)),
-        penalty_counts=counts,
-        bias=[],
-        bias_values=[],
-        logprob_tasks=[],
-        logprob_counts=[],
-        force_finish=[0] * rows,
-        finish_ids=[-1] * rows,
-        transition_ids=[-1] * rows,
+        top_k=False,
+        categorical=True,
+        sorts=False,
+        counts=counts,
+        bias=torch.zeros((rows, vocab)),
     )
 
     assert valid.all()

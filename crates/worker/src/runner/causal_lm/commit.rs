@@ -217,30 +217,27 @@ impl TokenBatch<'_> {
                 }
             }
         }
-        if let Some(sampling) = &invoked.sampling {
-            for group in sampling.logprobs.iter().flatten() {
-                let words = runner.column("logprobs")?.narrow(
-                    0,
-                    group.offset as i64,
-                    group.words as i64,
-                )?;
-                let (offset, count) = output.capture(&words, stream, events)?;
-                output.register_logprobs(
-                    offset,
-                    count,
-                    LogprobLayout {
-                        rows: group.layout.rows.clone(),
-                        counts: group.layout.counts.clone(),
-                        max_count: group.layout.max_count,
-                    },
-                )?;
-                for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {
-                    if let Some(task) = state.forward.task
-                        && let Some((first, _, row)) = sampling.logprob_span(task)
-                        && first == group.offset
-                    {
-                        state.output.logprob_range = Some((offset, count, row));
-                    }
+        if let Some(sampling) = &invoked.sampling
+            && let Some(layout) = &sampling.logprobs
+        {
+            // The reporting tasks' compact words start the column.
+            let words = runner
+                .column("logprobs")?
+                .narrow(0, 0, sampling.logprob_end() as i64)?;
+            let (offset, count) = output.capture(&words, stream, events)?;
+            output.register_logprobs(
+                offset,
+                count,
+                LogprobLayout {
+                    rows: layout.rows.clone(),
+                    counts: layout.counts.clone(),
+                },
+            )?;
+            for state in self.batch.calls.iter_mut().filter(|state| mine(state)) {
+                if let Some(task) = state.forward.task
+                    && let Some(row) = sampling.logprob_row(task)
+                {
+                    state.output.logprob_range = Some((offset, count, row));
                 }
             }
         }

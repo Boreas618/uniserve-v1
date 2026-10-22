@@ -1,7 +1,7 @@
 //! Token sampling: a sampled call's controls ([`SamplingControls`]) and a
 //! forward's sampling metadata ([`SamplingMetadata`], or [`RowSampling`]
 //! for a decode forward that samples its rows itself), which fill the
-//! sampler's parameter tensors.
+//! selection's input columns.
 
 use std::collections::BTreeSet;
 
@@ -14,7 +14,8 @@ use crate::Result;
 mod metadata;
 
 pub(crate) use metadata::{
-    RowSampling, SampleTask, SamplingGroup, SamplingMetadata, logprob_count, logprob_words,
+    GREEDY, NEUTRAL, RowSampling, SampleTask, SamplingMetadata, bitmask_words, least_top,
+    logprob_count, logprob_words, task_bucket, top_bucket,
 };
 
 /// The most candidates the top-k sampler keeps per row: a row samples from

@@ -17,11 +17,10 @@ pub(crate) struct Functions {
     pub(crate) plan_decode: Function,
     pub(crate) prefill: Function,
     pub(crate) plan_prefill: Function,
-    pub(crate) sample: Function,
-    pub(crate) sample_top_k: Function,
-    pub(crate) sample_greedy: Function,
+    pub(crate) select: Function,
+    pub(crate) score: Function,
     pub(crate) verify: Function,
-    pub(crate) prompt_logprobs: Function,
+    pub(crate) score_prompt: Function,
     pub(crate) commit: Function,
     pub(crate) kernels: Function,
     pub(crate) close: Function,
@@ -36,11 +35,10 @@ impl Functions {
             plan_decode: method("plan_decode")?,
             prefill: method("prefill")?,
             plan_prefill: method("plan_prefill")?,
-            sample: method("sample")?,
-            sample_top_k: method("sample_top_k")?,
-            sample_greedy: method("sample_greedy")?,
+            select: method("select")?,
+            score: method("score")?,
             verify: method("verify")?,
-            prompt_logprobs: method("prompt_logprobs")?,
+            score_prompt: method("score_prompt")?,
             commit: method("commit")?,
             kernels: method("kernels")?,
             close: method("close")?,
@@ -93,8 +91,9 @@ pub(crate) struct Construction<'a> {
     /// The constructor's tensors in parameter order: `unit_tables`,
     /// `start_pages`, `table_shapes`, `verified_lengths`,
     /// `future_input_tokens`, `logical_lengths`, `predicates`,
-    /// `sampling_positions`, `penalty_counts`, `prompt_logits`.
-    pub(crate) state: [&'a StorageView; 10],
+    /// `sampling_positions`, `penalty_counts`, `prompt_logits`,
+    /// `logit_bias`.
+    pub(crate) state: [&'a StorageView; 11],
 }
 
 /// Construct the Python runner. Pipeline stages share the last stage's

@@ -548,7 +548,7 @@ impl RequestStorage for CausalLMRunners {
         let slots: Vec<usize> = admitted.iter().map(|admitted| admitted.slot).collect();
         self.state.reset(&slots, issue)?;
         // A request resumed from a predecessor engine counts the tokens it
-        // generated there.
+        // generated there; a request with logit biases installs them.
         for admitted in admitted {
             if let Some(generation) = &admitted.request.generation {
                 self.state.count_generated(
@@ -556,6 +556,13 @@ impl RequestStorage for CausalLMRunners {
                     &generation.generated_token_ids,
                     issue,
                 )?;
+                if !generation.sampling.logit_bias.is_empty() {
+                    self.state.install_bias(
+                        admitted.slot,
+                        &generation.sampling.logit_bias,
+                        issue,
+                    )?;
+                }
             }
         }
         self.order.record(issue)

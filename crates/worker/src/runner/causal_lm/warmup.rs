@@ -19,6 +19,15 @@
 //! of the lane: one installs them before the bucket's steps, one clears
 //! them and resets the scratch units after.
 //!
+//! A runner whose binding holds more rows than its largest decode bucket
+//! then captures the commit graph of its rows, over padding rows.
+//!
+//! Then each runner captures its selection graphs, each alone, over the
+//! inputs of padding tasks and prompt rows: a `select` graph per task
+//! bucket and set of samplers, a `score` graph per bucket of reporting
+//! tasks and top width that a forward may report, and a `score_prompt`
+//! graph per top width a prompt row may report, over its block of rows.
+//!
 //! The serving path of these graphs is warmed by the engine, with a real
 //! request through its scheduler once the rank reported.
 
@@ -28,7 +37,7 @@ use std::sync::Arc;
 
 use super::context::{block_row, next_position, text_row};
 use super::{CausalLMRunners, Embeddings};
-use crate::cuda_graph::capture_order;
+use crate::cuda_graph::{ShapeKey, capture_order};
 use crate::error::WorkerError;
 use crate::executor::backend::WorkerBackend;
 use crate::ffi::Backing;
@@ -39,7 +48,7 @@ use crate::parallel::ExpertUnion;
 use crate::runner::TokenSelection;
 use crate::runner::causal_lm::{COMMIT_CACHE, PromptChunks, RowSource, StepRequest, TokenRow};
 use crate::runner::denoiser::image_model::ImageModel;
-use crate::sampling::RowSampling;
+use crate::sampling::{RowSampling, least_top, logprob_words};
 use crate::stream::Issue;
 use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
@@ -67,6 +76,12 @@ impl WarmupHooks for CausalLMWarmup {
             .map_err(|error| {
                 WorkerError::classify(error, Some("text graph capture")).with_phase("warmup")
             })?;
+        runtime.capture_commits(&lanes).map_err(|error| {
+            WorkerError::classify(error, Some("commit graph capture")).with_phase("warmup")
+        })?;
+        runtime.capture_selections(&lanes).map_err(|error| {
+            WorkerError::classify(error, Some("selection graph capture")).with_phase("warmup")
+        })?;
         // Dedicated expert ranks follow these eager steps as announced
         // warmup steps, as they follow the captures' eager warmups.
         let Some(image) = image else {
@@ -81,6 +96,40 @@ impl WarmupHooks for CausalLMWarmup {
 
     fn steps_experts(&self) -> bool {
         true
+    }
+}
+
+/// The samplers a selection graph may serve: the top-k one, and the
+/// general one with whether it sorts whole vocabulary rows.
+const SAMPLERS: [(bool, Option<bool>); 6] = [
+    (true, Some(true)),
+    (false, Some(true)),
+    (true, Some(false)),
+    (false, Some(false)),
+    (true, None),
+    (false, None),
+];
+
+/// The top widths of reported logprobs over a `vocab`-token vocabulary:
+/// zero, the powers of two below the vocabulary, then the vocabulary
+/// (`crate::sampling::logprob_shape`).
+fn top_buckets(vocab: usize) -> Vec<usize> {
+    let mut buckets = vec![0];
+    buckets.extend(
+        (0..)
+            .map(|power| 1_usize << power)
+            .take_while(|&top| top < vocab),
+    );
+    buckets.push(vocab);
+    buckets
+}
+
+/// The least count bucket `position` of ascending `buckets` holds: one
+/// past the bucket before it, or the first bucket, at most one.
+fn least(buckets: &[usize], position: usize) -> usize {
+    match position {
+        0 => buckets[0].min(1),
+        _ => buckets[position - 1] + 1,
     }
 }
 
@@ -316,6 +365,87 @@ impl CausalLMRunners {
         Ok(())
     }
 
+    /// Capture every runner's selection and scoring graphs, each alone as
+    /// a job of its lane, largest first, over the inputs of padding tasks
+    /// and prompt rows (`CausalLMRunner::pad_selection`). A `score` graph
+    /// is captured when the least reporting tasks and top tokens its bucket
+    /// holds fit the words a forward may report (`SamplingMetadata::build`),
+    /// and, when the runners' prefills keep the hidden states prompt
+    /// scoring projects, a `score_prompt` graph when one row of its
+    /// bucket's least top tokens fits them.
+    fn capture_selections(&mut self, lanes: &JobQueues) -> Result<()> {
+        for index in 0..self.runners.len() {
+            if self.runners[index].pool().is_none() {
+                continue;
+            }
+            let (group, _) = self.locate(index)?;
+            let kind = self.kind(group)?;
+            let padded = Job::new();
+            self.runners[index].pad_selection(&padded)?;
+            lanes
+                .block_on(kind, padded, BLOCK_ON_TIMEOUT)?
+                .check()
+                .map_err(|failure| failure.error)?;
+
+            let buckets = self.runners[index].task_buckets();
+            for &tasks in buckets.iter().rev() {
+                for (top_k, categorical) in SAMPLERS {
+                    let key = ShapeKey::Select {
+                        tasks,
+                        top_k,
+                        categorical,
+                    };
+                    self.capture_selection(index, kind, key, lanes)?;
+                }
+            }
+            let words = self.runners[index].dimensions().logprob_words();
+            let tops = top_buckets(self.vocab);
+            for (place, &rows) in buckets.iter().enumerate().rev() {
+                for (position, &top) in tops.iter().enumerate().rev() {
+                    if logprob_words(least(&buckets, place), least(&tops, position)) > words {
+                        continue;
+                    }
+                    self.capture_selection(index, kind, ShapeKey::Score { rows, top }, lanes)?;
+                }
+            }
+            let dimensions = self.runners[index].dimensions();
+            for &top in tops.iter().rev() {
+                if !self.prefill_outputs || logprob_words(1, least_top(top)) > words {
+                    continue;
+                }
+                let rows = dimensions.prompt_block(top);
+                self.capture_selection(index, kind, ShapeKey::Prompt { rows, top }, lanes)?;
+            }
+            tracing::info!(
+                "captured {} text graphs with selections",
+                self.runners[index].captured(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Capture runner `index`'s graph of `key`, a selection or a scoring,
+    /// alone as a job of `kind`'s lane, and store it.
+    fn capture_selection(
+        &mut self,
+        index: usize,
+        kind: CallKind,
+        key: ShapeKey,
+        lanes: &JobQueues,
+    ) -> Result<()> {
+        let runner = &self.runners[index];
+        let call = |key: &ShapeKey| match key {
+            ShapeKey::Select { .. } => runner.select_call(key),
+            ShapeKey::Prompt { .. } => runner.score_prompt_call(key),
+            _ => runner.score_call(key),
+        };
+        let job = Job::new();
+        runner.capture_alone(call(&key)?, call(&key)?, &job)?;
+        let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
+        let mut completion = completion.check().map_err(|failure| failure.error)?;
+        self.runners[index].store_alone(key, &mut completion)
+    }
+
     /// Run a capture bucket's `steps` over scratch tables of `lengths`
     /// tokens for slots `1..`. One job of `kind`'s lane installs the tables
     /// before the steps; one clears them and resets the scratch units after
@@ -538,6 +668,23 @@ impl CausalLMRunners {
         let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(step, &mut completion).map(drop)
+    }
+
+    /// Capture the commit graph of every runner's binding rows where no
+    /// decode bucket holds them (`CausalLMRunner::commit_bucket`), over
+    /// padding rows, which store the padding slot's zero cache length.
+    fn capture_commits(&mut self, lanes: &JobQueues) -> Result<()> {
+        for index in 0..self.runners.len() {
+            let runner = &self.runners[index];
+            let rows = runner.dimensions().rows;
+            if runner.pool().is_none() || runner.shapes().decode().contains(&rows) {
+                continue;
+            }
+            let (group, _) = self.locate(index)?;
+            let padding = vec![[0, COMMIT_CACHE, -1, 0, 0, 0, 0, 0]; rows];
+            self.warmup_commit(lanes, index, group, &padding)?;
+        }
+        Ok(())
     }
 
     /// Commit `rows` on runner `index` of `group` as a job of its lane,

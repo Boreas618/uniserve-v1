@@ -6,26 +6,28 @@ use ipc::TokenLogprob;
 
 use crate::{Error, Result};
 
-/// Row selection and padded width of one packed logprob column: per row
-/// the selected token, its score and rank, then `max_count` top tokens,
-/// scores and ranks, of which a row's own count is visible. Scores carry
+/// Row selection of one compact logprob column: field by field over its
+/// rows, each row's selected token, its score and its rank, then each
+/// row's own top tokens, scores and ranks, `counts[i]` of them for row `i`
+/// ([`Self::words`]). Packed row `i` reports for `rows[i]`. Scores carry
 /// float32 bits in the low half of each int64 word.
 pub struct LogprobLayout {
     pub rows: Vec<usize>,
     pub counts: Vec<usize>,
-    pub max_count: usize,
 }
 
 impl LogprobLayout {
+    /// Words of the column: three per row, and three per top token.
+    pub fn words(&self) -> Option<usize> {
+        let tops = self
+            .counts
+            .iter()
+            .try_fold(self.rows.len(), |total, &count| total.checked_add(count))?;
+        tops.checked_mul(3)
+    }
+
     pub(super) fn validate(&self, words: usize) -> Result<()> {
-        let width = self
-            .max_count
-            .checked_mul(3)
-            .and_then(|top| top.checked_add(3));
-        if width.and_then(|width| self.rows.len().checked_mul(width)) != Some(words)
-            || self.counts.len() != self.rows.len()
-            || self.counts.iter().any(|&count| count > self.max_count)
-        {
+        if self.counts.len() != self.rows.len() || self.words() != Some(words) {
             return Err(Error::Invariant(
                 "logprob completion does not match its row layout".into(),
             ));
@@ -35,14 +37,16 @@ impl LogprobLayout {
 
     pub(super) fn decode(&self, words: &[i64]) -> Result<HashMap<usize, Vec<TokenLogprob>>> {
         let rows = self.rows.len();
+        let total: usize = self.counts.iter().sum();
 
-        // Each field contains all rows before the next field begins. Top
-        // fields are padded; only a row's own count of them is visible.
+        // Each field contains all rows before the next field begins; a
+        // row's top tokens follow those of the rows before it.
         let top_ids = rows * 3;
-        let top_values = top_ids + rows * self.max_count;
-        let top_ranks = top_values + rows * self.max_count;
+        let top_values = top_ids + total;
+        let top_ranks = top_values + total;
         let mut result = HashMap::with_capacity(rows);
 
+        let mut first = 0;
         for (local, &row) in self.rows.iter().enumerate() {
             let mut entries = Vec::with_capacity(1 + self.counts[local]);
             let mut seen = HashSet::with_capacity(entries.capacity());
@@ -61,14 +65,14 @@ impl LogprobLayout {
             };
 
             append(words[local], words[rows + local], words[rows * 2 + local])?;
-            for index in 0..self.counts[local] {
-                let column = local * self.max_count + index;
+            for column in first..first + self.counts[local] {
                 append(
                     words[top_ids + column],
                     words[top_values + column],
                     words[top_ranks + column],
                 )?;
             }
+            first += self.counts[local];
             result.insert(row, entries);
         }
         Ok(result)

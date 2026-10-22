@@ -26,11 +26,12 @@ use crate::executor::image::ImageParts;
 use crate::lane::Job;
 use crate::memory::LogprobLayout;
 use crate::runner::causal_lm::{
-    Embeddings, FINISH_IDS, PromptChunks, SamplingColumns, StepRequest, TokenRow, logit_layout,
+    Embeddings, FINISH_IDS, PromptChunks, StepRequest, TokenRow, logit_layout,
 };
 use crate::runner::denoiser::image::ConditionRow;
 use crate::sampling::{
     RowSampling, SampleTask, SamplingControls, SamplingMetadata, logprob_count, logprob_words,
+    top_bucket,
 };
 use crate::worker::WorkerMemory;
 use crate::{Error, Result};
@@ -140,13 +141,7 @@ impl Planned {
             rows: &self.rows,
             finish_ids: &self.finish_ids,
             row_sampling: self.row_sampling.as_ref(),
-            sampling: self.sampling.as_ref().map(|metadata| SamplingColumns {
-                groups: &metadata.groups,
-                draws: &metadata.draws,
-                params: &metadata.params,
-                slots: &metadata.slots,
-                gates: &metadata.gates,
-            }),
+            sampling: self.sampling.as_ref(),
             prompt: &self.prompt,
             embeddings: &self.embeddings,
         }
@@ -518,26 +513,39 @@ impl TokenBatch<'_> {
             Some(SamplingMetadata::build(
                 &tasks,
                 vocab,
-                0,
+                dimensions.rows,
                 dimensions.logprob_words(),
             )?)
         };
 
-        // Prompt words follow the sampled tasks' logprobs.
-        let mut cursor = sampling
-            .as_ref()
-            .and_then(SamplingMetadata::logprob_end)
-            .unwrap_or(0);
-        let mut prompt_chunks = PromptChunks::default();
-        for (tail, &(index, span, token, continued)) in prompts.iter().enumerate() {
+        // Prompt words follow the sampled tasks' compact words; the words
+        // the forward reports are bounded.
+        let mut cursor = sampling.as_ref().map_or(0, SamplingMetadata::logprob_end);
+        // Every chunk reports its own top tokens, compactly, and is scored
+        // at the forward's top bucket, that of its widest chunk that scores
+        // a token. A first chunk has no prediction for its first token.
+        let mut tops = Vec::with_capacity(prompts.len());
+        for &(index, span, _, continued) in &prompts {
             let admission = self
                 .requests
                 .get(plan.calls[index].request_key.request_id.0)?
                 .admission();
             let admitted = calls::parameters(admission)?;
-            let top = logprob_count(admitted.n_prompt_logprobs, vocab);
-            // A first chunk has no prediction for its first token.
             let scored = span.1.saturating_sub(usize::from(continued == 0));
+            tops.push((scored, logprob_count(admitted.n_prompt_logprobs, vocab)));
+        }
+        let widest = tops
+            .iter()
+            .filter(|&&(scored, _)| scored > 0)
+            .map(|&(_, top)| top)
+            .max();
+        let mut prompt_chunks = PromptChunks {
+            top: top_bucket(widest.unwrap_or(0), vocab),
+            ..PromptChunks::default()
+        };
+        for (tail, (&(index, span, token, continued), &(scored, top))) in
+            prompts.iter().zip(&tops).enumerate()
+        {
             let score = PromptScore {
                 span,
                 token,
@@ -549,7 +557,6 @@ impl TokenBatch<'_> {
                 layout: (scored > 0).then(|| LogprobLayout {
                     rows: (0..scored).collect(),
                     counts: vec![top; scored],
-                    max_count: top,
                 }),
             };
             score.record(&mut prompt_chunks, top);

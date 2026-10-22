@@ -70,7 +70,7 @@ use ipc::ForwardMode;
 use super::TokenSelection;
 use super::input_buffers::InputBuffers;
 use super::methods::{Argument, MethodCall, Methods};
-use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket};
+use crate::cuda_graph::{GraphBreaks, GraphMode, GraphTable, Lookup, bucket, task_buckets};
 use crate::cuda_graph::{PrefillVariant, ShapeKey, TextForward, TextShapes};
 use crate::ffi::{DType, Handle};
 use crate::lane::{Capture, Completion, Job};
@@ -78,7 +78,9 @@ use crate::memory::allocation::StorageView;
 use crate::memory::{AttentionRow, PrefixCache};
 use crate::request::decode_state::DecodeState;
 use crate::runner::attention::pack_rows;
-use crate::sampling::{RowSampling, SamplingGroup, SamplingPath, candidates};
+use crate::sampling::{
+    GREEDY, NEUTRAL, RowSampling, SamplingMetadata, bitmask_words, candidates, task_bucket,
+};
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
 use runners::COMPLETION_FIELDS;
@@ -94,8 +96,8 @@ pub(crate) struct TableShape {
     pub(crate) windowed: bool,
 }
 
-/// The prompt chunks a prefill forward scores: the lists of the runner's
-/// `prompt_logprobs`, one entry per chunk.
+/// The prompt chunks a prefill forward scores, one entry per chunk, which
+/// the runner expands into prompt rows ([`prompt_rows`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PromptChunks {
     /// The chunk's first candidate row and its candidate rows; a chunk of
@@ -112,21 +114,148 @@ pub(crate) struct PromptChunks {
     pub(crate) offsets: Vec<i64>,
     /// The row of the tail tensor its last logits go to.
     pub(crate) tails: Vec<i64>,
-    /// Its top count.
+    /// Its top count, which its words report.
     pub(crate) tops: Vec<i64>,
+    /// The top bucket every chunk is scored at: that of its widest chunk.
+    pub(crate) top: usize,
 }
 
-/// The sampling inputs of one forward (see [`crate::sampling::SamplingMetadata`]).
-pub(crate) struct SamplingColumns<'a> {
-    /// The tasks of each sampler.
-    pub(crate) groups: &'a [SamplingGroup],
-    /// One draw per candidate row.
-    pub(crate) draws: &'a [f32],
-    /// Eight parameters per candidate row.
-    pub(crate) params: &'a [f32],
-    /// Each task's slot, then each task's gate (1 when gated).
-    pub(crate) slots: &'a [i64],
-    pub(crate) gates: &'a [i64],
+/// The prompt rows of `chunks`, which `score_prompt` scores: per row its
+/// hidden position (the token position of a candidate row of
+/// `logit_rows`), its retained slot (or -1), its target token's index in
+/// the forward, its chunk's first word, its index in the chunk, the chunk's
+/// scored rows and their top count, and its tail row. A chunk's scored rows
+/// predict its tokens in order, a first chunk's from its second token: the
+/// first from what its `continued` names, each next from the candidate row
+/// before it. Its last candidate row then retains its logits in its tail
+/// row. A row without a target has the count -1 and reports nothing, and a
+/// row without a tail copies into the `spare` tail row.
+fn prompt_rows(chunks: &PromptChunks, logit_rows: &[i64], spare: i64) -> Result<Vec<[i64; 8]>> {
+    let position = |row: i64| -> Result<i64> {
+        usize::try_from(row)
+            .ok()
+            .and_then(|row| logit_rows.get(row).copied())
+            .ok_or_else(|| {
+                Error::Invariant("a prompt chunk names a row its forward does not project".into())
+            })
+    };
+    let mut rows = Vec::new();
+    for chunk in 0..chunks.rows.len() {
+        let (first, count) = (chunks.rows[chunk], chunks.row_counts[chunk]);
+        let (token, continued) = (chunks.tokens[chunk], chunks.continued[chunk]);
+        // A first chunk scores its tokens after the first.
+        let fresh = i64::from(continued == 0);
+        let scored = (count - fresh).max(0);
+        for index in 0..scored {
+            // The candidate row predicting the chunk's token `index + fresh`,
+            // counted from the chunk's first; -1 is what precedes it.
+            let before = index + fresh - 1;
+            let (hidden, slot) = match before {
+                0.. => (position(first + before)?, -1),
+                _ if continued == 1 => (0, chunks.slots[chunk]),
+                _ => (position(continued - 2)?, -1),
+            };
+            rows.push([
+                hidden,
+                slot,
+                token + index + fresh,
+                chunks.offsets[chunk],
+                index,
+                scored,
+                chunks.tops[chunk],
+                spare,
+            ]);
+        }
+        let last = first + (count - 1).max(0);
+        rows.push([position(last)?, -1, 0, 0, 0, 0, -1, chunks.tails[chunk]]);
+    }
+    Ok(rows)
+}
+
+/// A forward's selection inputs padded to its task bucket
+/// ([`CausalLMRunner::select`]): padding tasks select greedily over row 0
+/// in slot 0, every token allowed, and their results are not read. A
+/// verification, which selects eagerly, is not padded.
+struct Selection {
+    tasks: usize,
+    rows: Vec<i64>,
+    paths: Vec<i64>,
+    draws: Vec<f32>,
+    params: Vec<f32>,
+    slots: Vec<i64>,
+    gates: Vec<i64>,
+    mask_rows: Vec<i64>,
+    biased: Vec<u8>,
+    force: Vec<u8>,
+    drafts: Vec<i64>,
+    terminal: Vec<i64>,
+    /// The reporting tasks and their top counts, padded to their bucket
+    /// with rows of task zero and count -1, which report nothing.
+    logprob_tasks: Vec<i64>,
+    logprob_counts: Vec<i64>,
+}
+
+impl Selection {
+    /// `metadata`'s inputs on a binding of `capacity` rows.
+    fn pad(metadata: &SamplingMetadata, capacity: usize) -> Self {
+        let tasks = if metadata.width == 1 {
+            task_bucket(metadata.tasks, capacity)
+        } else {
+            metadata.tasks
+        };
+        let width = metadata.width;
+        let extra = tasks - metadata.tasks;
+        fn padded<T: Copy>(values: &[T], fill: T, count: usize) -> Vec<T> {
+            let mut values = values.to_vec();
+            values.resize(values.len() + count, fill);
+            values
+        }
+        let mut params = metadata.params.clone();
+        for _ in 0..extra * width {
+            params.extend_from_slice(&NEUTRAL);
+        }
+        let (rows, _) = metadata.logprob_bucket;
+        let reporting = metadata.logprob_tasks.len();
+        let counts: Vec<i64> = metadata.logprobs.as_ref().map_or_else(Vec::new, |layout| {
+            layout.counts.iter().map(|&count| count as i64).collect()
+        });
+        Self {
+            tasks,
+            rows: padded(&metadata.rows, 0, extra * width),
+            paths: padded(&metadata.paths, GREEDY, extra),
+            draws: padded(&metadata.draws, 0.0, extra * width),
+            params,
+            slots: padded(&metadata.slots, 0, extra),
+            gates: padded(&metadata.gates, 0, extra),
+            mask_rows: padded(&metadata.mask_rows, -1, extra * width),
+            biased: padded(&metadata.biased, 0, extra),
+            force: padded(&metadata.force, 0, extra),
+            drafts: padded(&metadata.drafts, -1, extra * (width - 1)),
+            terminal: padded(&metadata.terminal, 0, extra),
+            logprob_tasks: padded(&metadata.logprob_tasks, 0, rows - reporting),
+            logprob_counts: padded(&counts, -1, rows - reporting),
+        }
+    }
+
+    /// The inputs of `tasks` padding tasks, none reporting.
+    fn padding(tasks: usize) -> Self {
+        Self {
+            tasks,
+            rows: vec![0; tasks],
+            paths: vec![GREEDY; tasks],
+            draws: vec![0.0; tasks],
+            params: NEUTRAL.repeat(tasks),
+            slots: vec![0; tasks],
+            gates: vec![0; tasks],
+            mask_rows: vec![-1; tasks],
+            biased: vec![0; tasks],
+            force: vec![0; tasks],
+            drafts: Vec::new(),
+            terminal: vec![0; tasks],
+            logprob_tasks: vec![0; tasks],
+            logprob_counts: vec![-1; tasks],
+        }
+    }
 }
 
 /// Precomputed embeddings replacing the token embeddings of consecutive
@@ -150,9 +279,9 @@ pub(crate) struct StepRequest<'a> {
     /// The rows' draws and parameters of a decode forward that samples its
     /// rows itself; absent when its own selection is greedy.
     pub(crate) row_sampling: Option<&'a RowSampling>,
-    /// The tasks the runner's sampling methods select; absent when no row
+    /// The tasks the runner's selection selects; absent when no row
     /// samples or a decode forward's own selections are final.
-    pub(crate) sampling: Option<SamplingColumns<'a>>,
+    pub(crate) sampling: Option<&'a SamplingMetadata>,
     /// The prompt chunks the forward scores.
     pub(crate) prompt: &'a PromptChunks,
     /// Vision features placed over some of the rows' tokens.
@@ -235,6 +364,8 @@ struct Plan {
     draws: Vec<f32>,
     params: Vec<f32>,
     logit_rows: Vec<i64>,
+    /// The prompt rows the forward scores ([`prompt_rows`]).
+    prompt: Vec<[i64; 8]>,
     /// `(token offset, slot)` device copies of a prefill row's first token
     /// from its slot's next input token.
     relays: Vec<(usize, u32)>,
@@ -458,135 +589,174 @@ impl CausalLMRunner {
             .unwrap_or(Argument::None))
     }
 
-    /// The eager methods that follow a staged forward, as `request` asks:
-    /// one sampling method per group of tasks sharing a sampler (`verify`
-    /// for a verification, which projects every candidate position), and
-    /// `prompt_logprobs` for scored prompt chunks.
-    fn selection(&self, staged: &Staged, request: &StepRequest<'_>) -> Result<Vec<MethodCall>> {
-        let plan = &staged.plan;
-        let outputs = [
+    /// The task buckets of the runner's selections.
+    pub(crate) fn task_buckets(&self) -> Vec<usize> {
+        task_buckets(self.buffers.dimensions.rows)
+    }
+
+    /// The key of the selection graph of `metadata`'s tasks: their task
+    /// bucket and the samplers they take.
+    fn selection_key(&self, metadata: &SamplingMetadata) -> ShapeKey {
+        ShapeKey::Select {
+            tasks: task_bucket(metadata.tasks, self.buffers.dimensions.rows),
+            top_k: metadata.top_k,
+            categorical: metadata.categorical.then_some(metadata.sorts),
+        }
+    }
+
+    /// The runner's `select` of `key`'s tasks (a [`ShapeKey::Select`]).
+    pub(crate) fn select_call(&self, key: &ShapeKey) -> Result<MethodCall> {
+        let ShapeKey::Select {
+            tasks,
+            top_k,
+            categorical,
+        } = *key
+        else {
+            return Err(Error::Invariant("a selection has a select key".into()));
+        };
+        let mut arguments: Vec<Argument> = vec![
+            tasks.into(),
+            candidates(self.buffers.dimensions.vocab).into(),
+            top_k.into(),
+            categorical.is_some().into(),
+            categorical.unwrap_or(false).into(),
+        ];
+        arguments.extend(self.tensors(&[
+            "logits",
+            "select_rows",
+            "select_paths",
+            "draws",
+            "params",
             "tasks",
+            "select_masks",
+            "select_mask_rows",
+            "select_biased",
+            "select_force",
+            "select_finish",
+            "select_transitions",
             "completion",
             "continuation",
             "tagged",
             "points",
             "transition",
+            "scored",
+        ])?);
+        Ok(self.methods.call(&self.functions.select, arguments))
+    }
+
+    /// The runner's `score` of `key`'s rows (a [`ShapeKey::Score`]).
+    pub(crate) fn score_call(&self, key: &ShapeKey) -> Result<MethodCall> {
+        let ShapeKey::Score { rows, top } = *key else {
+            return Err(Error::Invariant("a scoring has a score key".into()));
+        };
+        let dump = self.buffers.dimensions.dump_words();
+        let mut arguments: Vec<Argument> = vec![rows.into(), top.into(), dump.into()];
+        arguments.extend(self.tensors(&[
+            "logits",
+            "logprob_tasks",
+            "logprob_counts",
+            "scored",
+            "completion",
+            "logprobs",
+        ])?);
+        Ok(self.methods.call(&self.functions.score, arguments))
+    }
+
+    /// The runner's `score_prompt` of `key`'s block of prompt rows (a
+    /// [`ShapeKey::Prompt`]), from the block column's first row.
+    pub(crate) fn score_prompt_call(&self, key: &ShapeKey) -> Result<MethodCall> {
+        let ShapeKey::Prompt { rows, top } = *key else {
+            return Err(Error::Invariant("a prompt scoring has a prompt key".into()));
+        };
+        let dump = self.buffers.dimensions.dump_words();
+        let mut arguments: Vec<Argument> = vec![rows.into(), top.into(), dump.into()];
+        arguments.extend(self.tensors(&[
+            "hidden",
+            "prompt_rows",
+            "prompt_block",
+            "input_ids",
+            "logprobs",
+            "prompt_tail",
+        ])?);
+        Ok(self.methods.call(&self.functions.score_prompt, arguments))
+    }
+
+    /// The runner's `verify` of a verification forward's tasks, which
+    /// projects every candidate position and selects eagerly.
+    fn verify_call(&self, plan: &Plan, metadata: &SamplingMetadata) -> Result<MethodCall> {
+        let (reported, top) = metadata.logprob_bucket;
+        let mut arguments: Vec<Argument> = vec![
+            plan.logit_count.into(),
+            metadata.tasks.into(),
+            metadata.width.into(),
+            candidates(self.buffers.dimensions.vocab).into(),
+            metadata.sorts.into(),
+            top.into(),
+            reported.into(),
+            self.buffers.dimensions.dump_words().into(),
         ];
-        // The top-k sampler's candidate width. The general samplers cut a
-        // row whose top-k width is at most it the way the top-k sampler
-        // does, so every sampler keeps the same tokens for it.
-        let width = candidates(self.buffers.dimensions.vocab);
-        let groups = request
-            .sampling
-            .as_ref()
-            .map_or(&[][..], |sampling| sampling.groups);
-        let mut calls = Vec::new();
-        for group in groups {
-            // What decides finish and transition, and what a group that
-            // reports logprobs or shapes its logits takes.
-            let decisions = [
-                group.force_finish.as_slice(),
-                &group.finish_ids,
-                &group.transition_ids,
-            ];
-            let logprobs = [group.logprob_tasks.as_slice(), &group.logprob_counts];
-            let shaping = |drafts: bool| {
-                let mut arguments = lists(&[
-                    &group.top_ks,
-                    &group.top_p_rows,
-                    &group.min_p_rows,
-                    &group.typical_p_rows,
-                    &group.allowed_rows,
-                    &group.allowed,
-                    &group.suppressed,
-                    &group.penalty_rows,
-                    &group.penalty_slots,
-                ]);
-                if drafts {
-                    arguments.push(group.penalty_drafts.as_slice().into());
-                }
-                arguments.push(group.bias.as_slice().into());
-                arguments.push(Argument::Floats(group.bias_values.clone()));
-                arguments.extend(lists(&logprobs));
-                arguments.push(group.logprob_offset.into());
-                arguments.extend(lists(&decisions));
-                arguments
-            };
+        arguments.extend(self.tensors(&[
+            "hidden",
+            "logit_rows",
+            "select_rows",
+            "draws",
+            "params",
+            "tasks",
+            "select_masks",
+            "select_mask_rows",
+            "select_biased",
+            "select_force",
+            "select_finish",
+            "select_transitions",
+            "select_drafts",
+            "select_terminal",
+            "logprob_tasks",
+            "logprob_counts",
+            "completion",
+            "continuation",
+            "tagged",
+            "points",
+            "transition",
+            "scored",
+            "logprobs",
+        ])?);
+        Ok(self.methods.call(&self.functions.verify, arguments))
+    }
 
-            let mut arguments: Vec<Argument>;
-            let method = if plan.mode == ForwardMode::Verify {
-                arguments = vec![plan.logit_count.into(), group.first.into()];
-                arguments.extend(lists(&[
-                    &group.rows,
-                    &group.row_counts,
-                    &group.drafts,
-                    &group.terminal_prefixes,
-                ]));
-                arguments.push(group.parameters.into());
-                arguments.push(width.into());
-                arguments.extend(shaping(true));
-                arguments.extend(self.tensors(&["hidden", "logit_rows", "draws", "params"])?);
-                arguments.extend(self.tensors(&outputs)?);
-                arguments.extend(self.tensors(&["logprobs"])?);
-                &self.functions.verify
-            } else {
-                arguments = vec![group.first.into(), group.rows.as_slice().into()];
-                match group.path {
-                    SamplingPath::Greedy { .. } => {
-                        arguments.push(group.suppressed.as_slice().into());
-                        arguments.extend(lists(&decisions));
-                        arguments.extend(self.tensors(&["logits"])?);
-                        arguments.extend(self.tensors(&outputs)?);
-                        &self.functions.sample_greedy
-                    }
-                    SamplingPath::TopK => {
-                        arguments.push(width.into());
-                        arguments.push(group.parameters.into());
-                        arguments.extend(lists(&decisions));
-                        arguments.extend(self.tensors(&["logits", "draws", "params"])?);
-                        arguments.extend(self.tensors(&outputs)?);
-                        &self.functions.sample_top_k
-                    }
-                    SamplingPath::Categorical => {
-                        arguments.push(group.parameters.into());
-                        arguments.push(width.into());
-                        arguments.extend(shaping(false));
-                        arguments.extend(self.tensors(&["logits", "draws", "params"])?);
-                        arguments.extend(self.tensors(&outputs)?);
-                        arguments.extend(self.tensors(&["logprobs"])?);
-                        &self.functions.sample
-                    }
-                }
-            };
-            calls.push(self.methods.call(method, arguments));
+    /// Record in `job` the launch of `key`'s resident graph, or, without a
+    /// pool, `call` eagerly. Selections are captured at startup
+    /// ([`Self::capture_alone`]), so a key without a graph is an error.
+    fn alone(&self, key: &ShapeKey, call: MethodCall, job: &Job) -> Result<()> {
+        if self.pool.is_none() {
+            job.call(call);
+            return Ok(());
         }
+        match self.graphs.lookup(key, None)? {
+            Lookup::Replay(graph) => job.on(self.stream.as_ref()).launch(graph),
+            Lookup::Capture => Err(Error::Invariant(format!(
+                "the {key:?} graph is captured at startup"
+            ))),
+        }
+    }
 
-        let prompt = request.prompt;
-        if !prompt.rows.is_empty() {
-            let mut arguments = vec![plan.logit_count.into()];
-            arguments.extend(lists(&[
-                &prompt.rows,
-                &prompt.row_counts,
-                &prompt.tokens,
-                &prompt.continued,
-                &prompt.slots,
-                &prompt.offsets,
-                &prompt.tails,
-                &prompt.tops,
-            ]));
-            arguments.extend(self.tensors(&[
-                "hidden",
-                "logit_rows",
-                "input_ids",
-                "logprobs",
-                "prompt_tail",
-            ])?);
-            calls.push(
-                self.methods
-                    .call(&self.functions.prompt_logprobs, arguments),
-            );
-        }
-        Ok(calls)
+    /// Record in `job` the eager run of `call`, then its capture, which the
+    /// job's completion carries ([`Self::store_alone`]); `capture` is the
+    /// same call.
+    pub(crate) fn capture_alone(
+        &self,
+        call: MethodCall,
+        capture: MethodCall,
+        job: &Job,
+    ) -> Result<()> {
+        job.call(call);
+        job.capture(self.capture(capture)?);
+        Ok(())
+    }
+
+    /// Store the graph of `key` the completed job of [`Self::capture_alone`]
+    /// carries.
+    pub(crate) fn store_alone(&mut self, key: ShapeKey, completion: &mut Completion) -> Result<()> {
+        self.graphs.insert(key, None, completion.captured()?)
     }
 
     /// Record a staged forward at `capacity` in `job`: the launch of its
@@ -637,17 +807,59 @@ impl CausalLMRunner {
         Ok(mode)
     }
 
-    /// Record in `job` the eager selection of a staged forward's rows that
-    /// sample, verify drafts or score their prompt, as `request` asks. It
-    /// reads the logits the forward left, at whatever capacity it ran.
+    /// Record in `job` the selection of a staged forward's sampled tasks
+    /// and the scoring its reporting tasks and prompt chunks ask, which
+    /// read the logits and hidden states the forward left: the launches of
+    /// the runner's `select` and `score` graphs and of its `score_prompt`
+    /// graph once per block of prompt rows, or their eager calls without a
+    /// pool. A verification projects and selects eagerly, which graphs
+    /// refuse.
     pub(crate) fn select(
         &self,
         staged: &Staged,
         request: &StepRequest<'_>,
         job: &Job,
     ) -> Result<()> {
-        for call in self.selection(staged, request)? {
-            job.call(call);
+        let plan = &staged.plan;
+        if let Some(metadata) = request.sampling {
+            if plan.mode == ForwardMode::Verify {
+                if self.pool.is_some() {
+                    return Err(Error::Unsupported(
+                        "a verification's selection has no captured graph".into(),
+                    ));
+                }
+                job.call(self.verify_call(plan, metadata)?);
+            } else {
+                let key = self.selection_key(metadata);
+                self.alone(&key, self.select_call(&key)?, job)?;
+                if metadata.logprobs.is_some() {
+                    let (rows, top) = metadata.logprob_bucket;
+                    let key = ShapeKey::Score { rows, top };
+                    self.alone(&key, self.score_call(&key)?, job)?;
+                }
+            }
+        }
+
+        // The prompt rows score in calls of one block each, the call's first
+        // row written to the block column before it.
+        if !plan.prompt.is_empty() {
+            let top = request.prompt.top;
+            let rows = self.buffers.dimensions.prompt_block(top);
+            let key = ShapeKey::Prompt { rows, top };
+            let block = self.buffers.column("prompt_block")?.address();
+            for first in (0..plan.prompt.len()).step_by(rows) {
+                // SAFETY: the binding's block column, ordered on its stream
+                // before the call that reads it.
+                unsafe {
+                    job.on(self.stream.as_ref()).fill(Fill {
+                        address: block,
+                        value: first as u32,
+                        width: 4,
+                        count: 1,
+                    })
+                }?;
+                self.alone(&key, self.score_prompt_call(&key)?, job)?;
+            }
         }
         Ok(())
     }
@@ -989,6 +1201,12 @@ impl CausalLMRunner {
             }
         }
 
+        let prompt = prompt_rows(
+            request.prompt,
+            &logit_rows,
+            self.buffers.dimensions.rows as i64,
+        )?;
+
         // A forward that only writes the cache keeps no outputs, unless the
         // graph serving it computes them.
         let outputs = !cache_only
@@ -1030,6 +1248,7 @@ impl CausalLMRunner {
             draws,
             params,
             logit_rows,
+            prompt,
             relays,
             slot_words,
         })
@@ -1046,7 +1265,6 @@ impl CausalLMRunner {
         job: &Job,
     ) -> Result<()> {
         let column = |name: &str| self.buffers.column(name).map(StorageView::address);
-        let rows = self.buffers.dimensions.rows as u64;
         let mut entries: Vec<(u64, u64, usize)> = Vec::new();
         let mut push = |destination: u64, source: &[u8]| {
             entries.push((destination, source.as_ptr() as u64, source.len()));
@@ -1100,14 +1318,39 @@ impl CausalLMRunner {
                 bytemuck::cast_slice(&plan.logit_rows),
             );
         }
-        if let Some(sampling) = &request.sampling {
-            push(column("draws")?, bytemuck::cast_slice(sampling.draws));
-            push(column("params")?, bytemuck::cast_slice(sampling.params));
-            push(column("tasks")?, bytemuck::cast_slice(sampling.slots));
-            push(
-                column("tasks")? + 8 * rows,
-                bytemuck::cast_slice(sampling.gates),
-            );
+        // The selection's inputs, padded to its task bucket: padding tasks
+        // select greedily over row 0 in slot 0, and their results are not
+        // read. Token sets start empty; their set words follow.
+        let selection = request
+            .sampling
+            .map(|metadata| Selection::pad(metadata, self.buffers.dimensions.rows));
+        let sets = match &selection {
+            Some(selection) => self.push_selection(selection, request.sampling, &mut push)?,
+            None => Vec::new(),
+        };
+        // The prompt rows, padded to whole calls with rows that score and
+        // copy into the spare words and tail row, field by field.
+        let mut prompt_fields: [Vec<i64>; 8] = Default::default();
+        if !plan.prompt.is_empty() {
+            let dimensions = &self.buffers.dimensions;
+            let block = dimensions.prompt_block(request.prompt.top);
+            let calls = plan.prompt.len().div_ceil(block);
+            let padding = self.prompt_padding();
+            for row in plan.prompt.iter().chain(std::iter::repeat_n(
+                &padding,
+                calls * block - plan.prompt.len(),
+            )) {
+                for (field, &value) in prompt_fields.iter_mut().zip(row) {
+                    field.push(value);
+                }
+            }
+            let stride = 8 * dimensions.prompt_rows() as u64;
+            for (index, field) in prompt_fields.iter().enumerate() {
+                push(
+                    column("prompt_rows")? + index as u64 * stride,
+                    bytemuck::cast_slice(field),
+                );
+            }
         }
 
         // Vision features replace their tokens' embeddings: the mask is
@@ -1148,6 +1391,18 @@ impl CausalLMRunner {
         }
 
         let stream = job.on(self.stream.as_ref());
+        for &(address, count) in &sets {
+            // SAFETY: a token set column of this binding, ordered on its
+            // stream before the set words the batch below writes.
+            unsafe {
+                stream.fill(Fill {
+                    address,
+                    value: 0,
+                    width: 4,
+                    count,
+                })
+            }?;
+        }
         let mut batch = CopyBatch::new(SourceOrder::DuringCall);
         for &(destination, source, size) in &entries {
             batch.push(destination, source, size);
@@ -1188,10 +1443,154 @@ impl CausalLMRunner {
         unsafe { stream.copy(&leased) }
     }
 
+    /// Push the column writes of `selection`, and of `metadata`'s token
+    /// sets; returns the set regions, `(address, words)`, which are cleared
+    /// before the set words are written.
+    fn push_selection(
+        &self,
+        selection: &Selection,
+        metadata: Option<&SamplingMetadata>,
+        push: &mut dyn FnMut(u64, &[u8]),
+    ) -> Result<Vec<(u64, usize)>> {
+        let column = |name: &str| self.buffers.column(name).map(StorageView::address);
+        let rows = self.buffers.dimensions.rows as u64;
+        push(column("draws")?, bytemuck::cast_slice(&selection.draws));
+        push(column("params")?, bytemuck::cast_slice(&selection.params));
+        push(column("tasks")?, bytemuck::cast_slice(&selection.slots));
+        push(
+            column("tasks")? + 8 * rows,
+            bytemuck::cast_slice(&selection.gates),
+        );
+        push(
+            column("select_rows")?,
+            bytemuck::cast_slice(&selection.rows),
+        );
+        push(
+            column("select_paths")?,
+            bytemuck::cast_slice(&selection.paths),
+        );
+        push(
+            column("select_mask_rows")?,
+            bytemuck::cast_slice(&selection.mask_rows),
+        );
+        push(column("select_biased")?, &selection.biased);
+        push(column("select_force")?, &selection.force);
+        push(
+            column("select_drafts")?,
+            bytemuck::cast_slice(&selection.drafts),
+        );
+        push(
+            column("select_terminal")?,
+            bytemuck::cast_slice(&selection.terminal),
+        );
+        push(
+            column("logprob_tasks")?,
+            bytemuck::cast_slice(&selection.logprob_tasks),
+        );
+        push(
+            column("logprob_counts")?,
+            bytemuck::cast_slice(&selection.logprob_counts),
+        );
+        let mut sets = Vec::new();
+        if let Some(metadata) = metadata {
+            push(
+                column("select_masks")?,
+                bytemuck::cast_slice(&metadata.masks),
+            );
+            let words = bitmask_words(self.buffers.dimensions.vocab);
+            for (name, values) in [
+                ("select_finish", &metadata.finish),
+                ("select_transitions", &metadata.transitions),
+            ] {
+                let base = column(name)?;
+                sets.push((base, selection.tasks * words));
+                for (index, word) in values.iter().enumerate() {
+                    if *word != 0 {
+                        push(
+                            base + 4 * index as u64,
+                            bytemuck::cast_slice(std::slice::from_ref(word)),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(sets)
+    }
+
+    /// A prompt row that pads a forward's rows to whole calls: it reports
+    /// nothing and copies into the spare tail row.
+    fn prompt_padding(&self) -> [i64; 8] {
+        [0, -1, 0, 0, 0, 0, -1, self.buffers.dimensions.rows as i64]
+    }
+
+    /// Record in `job` the inputs of a selection whose every task pads (as
+    /// [`Selection::pad`] pads), and of prompt rows that all pad, over
+    /// cleared logits, token sets, scored rows and hidden states.
+    /// Startup captures the selection and scoring graphs over them: the
+    /// values do not choose their kernels.
+    pub(crate) fn pad_selection(&self, job: &Job) -> Result<()> {
+        let selection = Selection::padding(self.buffers.dimensions.rows);
+        let mut entries: Vec<(u64, u64, usize)> = Vec::new();
+        self.push_selection(&selection, None, &mut |destination, source| {
+            entries.push((destination, source.as_ptr() as u64, source.len()));
+        })?;
+        let rows = self.buffers.dimensions.prompt_rows();
+        let fields: Vec<Vec<i64>> = self
+            .prompt_padding()
+            .iter()
+            .map(|&value| vec![value; rows])
+            .collect();
+        let prompt = self.buffers.column("prompt_rows")?.address();
+        for (index, field) in fields.iter().enumerate() {
+            let source: &[u8] = bytemuck::cast_slice(field);
+            entries.push((
+                prompt + (8 * rows * index) as u64,
+                source.as_ptr() as u64,
+                source.len(),
+            ));
+        }
+        let stream = job.on(self.stream.as_ref());
+        for name in [
+            "logits",
+            "select_masks",
+            "select_finish",
+            "select_transitions",
+            "scored",
+            "hidden",
+            "prompt_block",
+        ] {
+            let view = self.buffers.column(name)?;
+            // SAFETY: a column of this binding, ordered on its stream before
+            // the batch below.
+            unsafe {
+                stream.fill(Fill {
+                    address: view.address(),
+                    value: 0,
+                    width: 1,
+                    count: view.nbytes() as usize,
+                })
+            }?;
+        }
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        for &(destination, source, size) in &entries {
+            batch.push(destination, source, size);
+        }
+        // SAFETY: destinations are distinct columns of this binding, ordered
+        // on its stream; sources are host vectors read during the call.
+        unsafe { stream.copy(&batch) }
+    }
+
+    /// The commit bucket of `rows` rows: the smallest decode bucket holding
+    /// them, else the binding's rows, which a batch of more calls than a
+    /// decode batch holds commits at.
+    fn commit_bucket(&self, rows: usize) -> usize {
+        bucket(self.shapes.decode(), rows).unwrap_or(self.buffers.dimensions.rows)
+    }
+
     /// Record the installation of `rows` commit rows (`[slot, mode, task,
     /// cache, logical, sampling, visible, penalties]` each) into the slot
-    /// state: the launch of the commit graph of the smallest decode bucket
-    /// holding them, or the runner's `commit` where no graph serves.
+    /// state: the launch of the commit graph of their bucket
+    /// ([`Self::commit_bucket`]), or the runner's `commit` without a pool.
     ///
     /// Before the runner is sealed, a bucket without a graph commits
     /// eagerly and captures it: the bucket's key is returned, and the job's
@@ -1204,11 +1603,9 @@ impl CausalLMRunner {
         if rows.len() > capacity {
             return Err(Error::Invariant("commit rows exceed the binding".into()));
         }
-        let key = self
-            .pool
-            .as_ref()
-            .and_then(|_| bucket(self.shapes.decode(), rows.len()))
-            .map(|rows| ShapeKey::Commit { rows });
+        let key = self.pool.as_ref().map(|_| ShapeKey::Commit {
+            rows: self.commit_bucket(rows.len()),
+        });
 
         // A bucket pads with rows that store the padding slot's zero cache
         // length again.
@@ -1276,11 +1673,6 @@ impl CausalLMRunner {
     }
 }
 
-/// Integer lists as method arguments, in order.
-fn lists(values: &[&[i64]]) -> Vec<Argument> {
-    values.iter().map(|&list| Argument::from(list)).collect()
-}
-
 /// The element type of a model dtype name.
 pub(crate) fn model_dtype(name: &str) -> Result<DType> {
     let dtype = DType::from_name(name.trim_start_matches("torch."))
@@ -1291,4 +1683,65 @@ pub(crate) fn model_dtype(name: &str) -> Result<DType> {
         )));
     }
     Ok(dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PromptChunks, prompt_rows};
+    use crate::Result;
+
+    #[test]
+    fn prompt_rows_predict_each_chunks_tokens_in_order() -> Result<()> {
+        // Candidate rows 0-2 project positions 10-12, a first chunk of three
+        // tokens from token 0; rows 3-4 project 20-21, a chunk from token 3
+        // continued from slot 5's retained logits; rows 5-6 project 30-31,
+        // a chunk from token 5 continued from candidate row 4 (the last row
+        // of a vision block); row 7 projects 40, a chunk that only retains.
+        // The chunks report 4, 2, 1 and no top tokens.
+        let logit_rows = [10, 11, 12, 20, 21, 30, 31, 40];
+        let chunks = PromptChunks {
+            rows: vec![0, 3, 5, 7],
+            row_counts: vec![3, 2, 2, 0],
+            tokens: vec![0, 3, 5, 0],
+            continued: vec![0, 1, 2 + 4, 0],
+            slots: vec![1, 5, 1, 1],
+            offsets: vec![100, 200, 300, 400],
+            tails: vec![0, 1, 2, 3],
+            tops: vec![4, 2, 1, 0],
+            top: 4,
+        };
+        let spare = 64;
+
+        let rows = prompt_rows(&chunks, &logit_rows, spare)?;
+
+        // Per row: hidden position, retained slot, target token, chunk
+        // words, index, scored rows, their top count and tail row.
+        assert_eq!(
+            rows,
+            vec![
+                // The first chunk's first two rows score its second and
+                // third tokens; its last row retains its logits.
+                [10, -1, 1, 100, 0, 2, 4, spare],
+                [11, -1, 2, 100, 1, 2, 4, spare],
+                [12, -1, 0, 0, 0, 0, -1, 0],
+                // The slot's retained logits score the next chunk's first
+                // token.
+                [0, 5, 3, 200, 0, 2, 2, spare],
+                [20, -1, 4, 200, 1, 2, 2, spare],
+                [21, -1, 0, 0, 0, 0, -1, 1],
+                // The vision block's last row scores the first token after
+                // it.
+                [21, -1, 5, 300, 0, 2, 1, spare],
+                [30, -1, 6, 300, 1, 2, 1, spare],
+                [31, -1, 0, 0, 0, 0, -1, 2],
+                [40, -1, 0, 0, 0, 0, -1, 3],
+            ]
+        );
+
+        // A chunk naming a row its forward does not project is refused.
+        let mut beyond = chunks;
+        beyond.rows[0] = 8;
+        assert!(prompt_rows(&beyond, &logit_rows, spare).is_err());
+        Ok(())
+    }
 }
