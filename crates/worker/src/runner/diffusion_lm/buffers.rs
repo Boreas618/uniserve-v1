@@ -216,6 +216,9 @@ pub(super) struct Dimensions {
     /// Per-token widths of the attend state (final stage only).
     pub(super) attend_widths: Vec<usize>,
     pub(super) attend_dtype: DType,
+    /// Width of the outputs `finish` writes for slot rows (final stage
+    /// only), in the attend state's dtype.
+    pub(super) finished: Option<usize>,
     pub(super) denoise: Option<DenoiseLayout>,
 }
 
@@ -255,10 +258,13 @@ impl Columns for Dimensions {
                 DType::I32,
                 vec![tables, rows],
             ),
+            // The packed token row of each slot, which `finish` completes.
+            ("slot_rows".to_owned(), DType::I64, vec![tokens]),
+            // The finished rows one `readout` projects.
             (
-                "slot_rows".to_owned(),
+                "finished_rows".to_owned(),
                 DType::I64,
-                vec![tokens.max(self.slot_rows as i64)],
+                vec![self.slot_rows as i64],
             ),
             ("candidate_index".to_owned(), DType::I64, vec![candidates]),
             (
@@ -270,6 +276,13 @@ impl Columns for Dimensions {
         for (index, &width) in self.attend_widths.iter().enumerate() {
             columns.push((
                 format!("attend_state.{index}"),
+                self.attend_dtype,
+                vec![tokens, width as i64],
+            ));
+        }
+        if let Some(width) = self.finished {
+            columns.push((
+                "finished".to_owned(),
                 self.attend_dtype,
                 vec![tokens, width as i64],
             ));
@@ -626,6 +639,7 @@ mod tests {
                 candidates: 8,
                 attend_widths: vec![2],
                 attend_dtype: DType::F32,
+                finished: Some(2),
                 denoise: Some(DenoiseLayout {
                     rows: 3,
                     banks: layout,
@@ -664,6 +678,7 @@ mod tests {
                 candidates: 1,
                 attend_widths: Vec::new(),
                 attend_dtype: DType::F32,
+                finished: None,
                 denoise: None,
             },
             None,

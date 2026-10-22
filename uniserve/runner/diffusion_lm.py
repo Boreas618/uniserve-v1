@@ -8,10 +8,10 @@ forward:
   log-probability of candidate tokens under the log-softmax over the full
   vocabulary of the soft-capped logits. :meth:`DiffusionLMRunner.attend`
   evaluates every token up to the final layer's attention into the caller's
-  ``attend_state`` rows; :meth:`DiffusionLMRunner.readout` completes the
-  final layer, the output norm, the head and the log-softmax for slot rows
-  alone and selects the candidates. A forward with many slots calls
-  ``readout`` once per slot chunk over one ``attend``.
+  ``attend_state`` rows; :meth:`DiffusionLMRunner.finish` completes the
+  final layer and the output norm for slot rows alone, once per readout;
+  :meth:`DiffusionLMRunner.readout` applies the head and the log-softmax to
+  finished rows and selects the candidates, once per slot chunk.
 - :meth:`DiffusionLMRunner.denoise` denoises each row's block by one step of
   block diffusion: rows at step zero start their block, the head projects
   the blocks in chunks, the sampler of ``uniserve.diffusion.canvas``
@@ -68,7 +68,7 @@ __all__ = [
     "attend_widths",
     "compute_dtype",
     "embedding_dtype",
-    "exchanges_readout",
+    "exchanges_finish",
     "generates",
     "hidden_size",
     "sequence_length",
@@ -99,16 +99,15 @@ def _table(embedding: nn.Module) -> torch.Tensor:
 def _tail_exchanges(
     model: DiffusionLM, *, exchange: bool, attention_ranks: int
 ) -> bool:
-    """Whether a model's ``readout`` exchanges tokens across ranks.
+    """Whether a model's ``finish`` exchanges tokens across ranks.
 
-    ``readout`` completes the final layer, the output norm and the head for
-    slot rows. An expert-parallel ``FusedMoE`` in the final layer exchanges
-    tokens with its expert group, whose ranks read different calls and must
-    join each exchange once per expert step at the step's agreed capacity; a
-    captured ``readout`` would carry its capture capacity, and one launch
-    per slot chunk would add exchanges the other ranks never join.
-    Tensor-parallel collectives are joined alike by ranks that read the same
-    slots, so they keep ``readout`` local.
+    ``finish`` completes the final layer and the output norm for slot rows.
+    An expert-parallel ``FusedMoE`` in the final layer exchanges tokens with
+    its expert group, whose ranks read different calls and must join each
+    exchange once per expert step at the step's agreed capacity, so such a
+    ``finish`` completes the expert step of its readout's ``attend`` and is
+    captured per capacity. Tensor-parallel collectives are joined alike by
+    ranks that read the same slots, so they keep ``finish`` local.
     """
     if not exchange:
         return False
@@ -174,16 +173,16 @@ def generates(loaded, path: str) -> bool:
     return _placed(loaded, path).generates()
 
 
-def exchanges_readout(
+def exchanges_finish(
     loaded, path: str, exchange: bool, attention_ranks: int
 ) -> bool:
-    """Whether ``readout`` of the model exchanges tokens across ranks.
+    """Whether ``finish`` of the model exchanges tokens across ranks.
 
     ``exchange`` says routed experts communicate through an expert exchange
     and ``attention_ranks`` counts the attention ranks of a disaggregated
-    expert union (zero when every rank holds its experts). A ``readout``
-    that exchanges runs once over every slot of a forward; one that does
-    not runs once per slot chunk and is captured per slot bucket.
+    expert union (zero when every rank holds its experts). A ``finish``
+    that exchanges completes the expert step of its readout's ``attend``;
+    one that does not follows the step and has no expert capacity.
     """
     return _tail_exchanges(
         _placed(loaded, path),
@@ -343,8 +342,8 @@ class DiffusionLMRunner:
         self._length = self._model.canvas.length
 
         # With an exchanging final layer, a readout's expert step spans
-        # ``attend`` and ``readout``: ``attend`` leaves the final layer's
-        # experts to ``readout``, which starts with every earlier expert
+        # ``attend`` and ``finish``: ``attend`` leaves the final layer's
+        # experts to ``finish``, which starts with every earlier expert
         # layer reached.
         exchange = context.experts
         self._exchanging = _tail_exchanges(
@@ -601,7 +600,7 @@ class DiffusionLMRunner:
             expert_capacity: The agreed per-rank token capacity of the
                 readout's expert step; zero for a model without
                 expert-parallel layers. With an exchanging final layer the
-                step continues in :meth:`readout`.
+                step continues in :meth:`finish`.
             input_ids, positions: ``[T]`` int64 packed tokens and their
                 positions.
             query_lengths, prefix_lengths: ``[R]`` int32.
@@ -610,7 +609,7 @@ class DiffusionLMRunner:
             start_pages: ``[tables, R]`` int32.
             *attend_state: Outputs on the final pipeline stage, one
                 ``[T, width]`` tensor per ``attend_widths`` entry: the
-                per-token state :meth:`readout` completes. Earlier stages
+                per-token state :meth:`finish` completes. Earlier stages
                 forward their activations and pass none.
 
         The host mirrors serve an eager forward and the capture; a launched
@@ -647,59 +646,85 @@ class DiffusionLMRunner:
 
         self._forward(batch, body)
 
-    def readout(
+    def finish(
         self,
         slots: int,
-        candidates: int,
         expert_capacity: int,
         slot_rows: torch.Tensor,
-        candidate_index: torch.Tensor,
-        candidate_logprobs: torch.Tensor,
+        finished: torch.Tensor,
         *attend_state: torch.Tensor,
     ) -> None:
-        """Read candidate log-probabilities at slot rows of an ``attend``.
+        """Complete the final layer and the output norm at slot rows.
+
+        Called on the final pipeline stage, once per readout.
 
         Args:
             slots: Slot rows completed.
-            candidates: Candidates selected.
             expert_capacity: The capacity :meth:`attend` ran at; read when
                 the final layer exchanges tokens, where this call completes
                 the readout's expert step.
             slot_rows: ``[S]`` int64, the packed token row of each slot in
                 ``attend_state``. Rows past a forward's live slots are
                 padding whose results are not read.
+            finished: ``[S, hidden]`` output, each slot's normalized final
+                hidden state, which :meth:`readout` projects.
+            *attend_state: The state :meth:`attend` wrote.
+        """
+        slots = int(slots)
+        capacity = int(expert_capacity) if self._exchanging else 0
+
+        def body() -> None:
+            with self._context.expert_step(capacity, reached=self._attended):
+                hidden = self._model.finish(attend_state, slot_rows[:slots])
+            finished[:slots].copy_(hidden)
+
+        self._forward(None, body)
+
+    def readout(
+        self,
+        slots: int,
+        candidates: int,
+        rows: torch.Tensor,
+        finished: torch.Tensor | None,
+        candidate_index: torch.Tensor,
+        candidate_logprobs: torch.Tensor,
+    ) -> None:
+        """Read candidate log-probabilities of finished slot rows.
+
+        Args:
+            slots: Finished rows projected.
+            candidates: Candidates selected.
+            rows: ``[S]`` int64, the projected rows of ``finished``. Rows
+                past a chunk's live slots are padding whose results are
+                not read.
+            finished: The hidden states :meth:`finish` wrote, on the final
+                stage; ``None`` on the other stages.
             candidate_index: ``[K]`` int64, each candidate's flat index
                 ``slot * vocab + token`` into the ``[slots, vocab]``
-                log-probabilities.
+                log-probabilities of the projected rows.
             candidate_logprobs: ``[K]`` FP32 output, one value per
                 candidate. Every pipeline stage receives the final stage's
                 values.
-            *attend_state: The state :meth:`attend` wrote, on the final
-                stage.
         """
         slots, candidates = int(slots), int(candidates)
-        capacity = int(expert_capacity) if self._exchanging else 0
         pipeline = self._pipeline
 
         def body() -> None:
             if self._last:
-                rows = slot_rows[:slots]
-                with self._context.expert_step(
-                    capacity, reached=self._attended
-                ):
-                    hidden = self._model.finish(attend_state, rows)
-                    logits = self._model.compute_logits(
-                        hidden,
-                        token_indices=torch.arange(
-                            slots, dtype=torch.int64, device=rows.device
-                        ),
-                    )
-                    # The softmax normalizes over the whole vocabulary, so
-                    # tensor shards gather their columns for the slot rows
-                    # alone.
-                    logprobs = torch.log_softmax(
-                        cast(Logits, logits).gather().float(), dim=-1
-                    )
+                assert finished is not None
+                hidden = finished.index_select(0, rows[:slots])
+                logits = self._model.compute_logits(
+                    hidden,
+                    token_indices=torch.arange(
+                        slots, dtype=torch.int64, device=hidden.device
+                    ),
+                )
+                # The softmax normalizes over the whole vocabulary, so
+                # tensor shards gather their columns for the slot rows
+                # alone.
+                logprobs = torch.log_softmax(
+                    cast(Logits, logits).gather().float(), dim=-1
+                )
                 torch.index_select(
                     logprobs.reshape(-1),
                     0,
