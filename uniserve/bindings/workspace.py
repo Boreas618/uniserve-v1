@@ -171,13 +171,26 @@ class Scratch:
     One backing list per (role, device, schema): a request reuses the newest
     backing that fits; a larger request allocates a new backing in front and
     keeps the older ones, which already captured graphs still address. In a
-    worker, device backings allocate from ``pool``, the allocator pool of
-    the device memory the worker owns for this scratch.
+    worker, backings on ``device`` allocate from ``pool``, the allocator pool
+    of the device memory the worker owns for this scratch. A context whose
+    module computes on another device (a generation tower) takes backings
+    there from torch's own allocator: a pool's use count lives on the
+    device that created it, so using it on another device would release it
+    there at the end of each allocation.
     """
 
-    def __init__(self, pool: torch.cuda.MemPool | None = None) -> None:
+    def __init__(
+        self,
+        pool: torch.cuda.MemPool | None = None,
+        device: int | None = None,
+    ) -> None:
+        if pool is not None and device is None:
+            raise ValueError("a scratch pool needs the device it belongs to")
         self._backings: dict[tuple, list[TensorBuffers]] = {}
         self._pool = pool
+        self._device = (
+            None if device is None else torch.device("cuda", int(device))
+        )
 
     def view(
         self,
@@ -199,9 +212,9 @@ class Scratch:
                 f"prepare {role!r} scratch for this size before capture"
             )
         pool = (
-            contextlib.nullcontext()
-            if self._pool is None or device.type != "cuda"
-            else torch.cuda.use_mem_pool(self._pool, device)
+            torch.cuda.use_mem_pool(self._pool, device)
+            if self._pool is not None and device == self._device
+            else contextlib.nullcontext()
         )
         with pool:
             backing = TensorBuffers.allocate(requirements, device=device)

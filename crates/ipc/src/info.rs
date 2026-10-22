@@ -34,6 +34,34 @@ pub struct PrefixCacheInfo {
     /// forwards. A standby worker warms up on them while its predecessor
     /// serves, so the engine never allocates them.
     pub scratch_units: u32,
+    /// The units of each segment the rank's value planes are made of, which
+    /// give memory back and are created again whole; zero for planes not
+    /// split.
+    #[serde(default)]
+    pub segment_units: u32,
+    /// The units below the first segment the planes gave back, which alone
+    /// the engine allocates; `num_units` while none is given back. A standby
+    /// adopts planes its predecessor shrank for it.
+    #[serde(default)]
+    pub usable_units: u32,
+    /// Whether the rank also keeps cache layers per request slot (a cache
+    /// layer type indexed by request, as a recurrent state): a page does not
+    /// hold the state a request reached, so no prefix is reused and no page
+    /// is copied through the host KV cache.
+    #[serde(default)]
+    pub request_states: bool,
+}
+
+impl PrefixCacheInfo {
+    /// The units the engine may allocate (`usable_units`, all of them when
+    /// unset).
+    pub fn allocatable_units(&self) -> u32 {
+        if self.usable_units == 0 {
+            self.num_units
+        } else {
+            self.usable_units.min(self.num_units)
+        }
+    }
 }
 
 /// The host page pool of one cache group on one rank: the Storage Server
@@ -201,6 +229,14 @@ impl PrefixCacheInfo {
             page_pools: Vec::new(),
             // A unit the warmup of any stage lends stays out of the pool.
             scratch_units: self.scratch_units.max(other.scratch_units),
+            // Stages whose planes split alike give memory back together.
+            segment_units: if self.segment_units == other.segment_units {
+                self.segment_units
+            } else {
+                0
+            },
+            usable_units: self.allocatable_units().min(other.allocatable_units()),
+            request_states: self.request_states || other.request_states,
         };
         merged.validate()?;
         Ok(merged)
@@ -397,6 +433,18 @@ impl ImageWarmup {
     }
 }
 
+/// An image denoising step a rank captured: one image of `height` x
+/// `width` pixels evaluating `branches` guidance branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CapturedImage {
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Guidance branches the step evaluates, one to three.
+    pub branches: u8,
+}
+
 /// Post-load worker geometry, limits and supported work.
 ///
 /// [`WorkerInfo::validate`] checks only internal consistency; the rank runs it
@@ -414,6 +462,13 @@ pub struct WorkerInfo {
     /// captured guidance-branch count, each of which the engine warms with a
     /// real request before serving.
     pub image_warmups: Vec<ImageWarmup>,
+    /// The image denoising steps this rank captured, which alone it
+    /// denoises under CUDA graphs: the engine admits an image request only
+    /// when its size is captured at every guidance branch count up to its
+    /// own. `None` for a rank that denoises eagerly (graph policy `off`, a
+    /// CPU rank) or holds no image denoiser.
+    #[serde(default)]
+    pub captured_images: Option<Vec<CapturedImage>>,
     /// Blocks one sampler chunk of this rank's diffusion LM denoising step
     /// covers, every row count of which the engine warms; zero when the rank
     /// generates no blocks.
@@ -536,6 +591,12 @@ impl WorkerInfo {
         for shape in &self.image_warmups {
             shape.validate()?;
         }
+        ensure_valid!(
+            self.captured_images.iter().flatten().all(|shape| {
+                shape.height > 0 && shape.width > 0 && (1..=3).contains(&shape.branches)
+            }),
+            "a captured image step is empty or has no valid guidance branches"
+        );
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
         }
@@ -581,6 +642,7 @@ impl Default for WorkerInfo {
             media_components: Default::default(),
             video_denoiser: None,
             image_warmups: Vec::new(),
+            captured_images: None,
             diffusion_lm_step_rows: 0,
             image_unconditional_token_ids: None,
             fabric_handles: false,
@@ -614,6 +676,9 @@ impl Default for WorkerInfo {
                 }],
                 page_pools: Vec::new(),
                 scratch_units: 0,
+                segment_units: 0,
+                usable_units: 0,
+                request_states: false,
             }),
             latent_page_units: 0,
             latent_pages: 0,

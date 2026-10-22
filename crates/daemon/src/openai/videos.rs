@@ -296,7 +296,7 @@ async fn videos_create(
     let id = format!("video_{}", uuid::Uuid::new_v4().simple());
     let record = VideoJob {
         id: id.clone(),
-        object: "video",
+        object: "video".to_owned(),
         model: engine.served_model_name().to_owned(),
         created_at: crate::openai::unix_time(),
         completed_at: None,
@@ -305,7 +305,7 @@ async fn videos_create(
         actual_seconds: prepared.actual_seconds,
         num_frames: prepared.num_frames,
         size: format!("{}x{}", prepared.canvas.width, prepared.canvas.height),
-        status: "queued",
+        status: "queued".to_owned(),
         phase: "queued".to_owned(),
         completed_steps: 0,
         // The deployment's denoiser fixes every request's step count.
@@ -332,7 +332,7 @@ async fn videos_create(
                 Ok(event) => event,
                 Err(error) => {
                     break Err(VideoFailure {
-                        code: "generation_failed",
+                        code: "generation_failed".to_owned(),
                         message: error.to_string(),
                     });
                 }

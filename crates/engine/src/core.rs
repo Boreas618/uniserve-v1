@@ -13,7 +13,6 @@
 //! per DP rank; `SchedulerHandle::with_executor` accepts an executor built
 //! elsewhere, such as the CPU simulation backend.
 
-#[cfg(any(feature = "testing", test))]
 use ipc::DEFAULT_COMPONENT;
 use ipc::MediaCall;
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,8 +61,22 @@ pub enum WorkerGroupRole {
     /// Model capabilities, request state, and (when present) attention/KV.
     #[default]
     Model,
+    /// A model group that prefills prompts only: a request continues on a
+    /// `Decode` group of its scheduler, which installs the KV cache the
+    /// prefill exported (prefill/decode disaggregation).
+    Prefill,
+    /// A model group that decodes only, continuing requests a `Prefill`
+    /// group prefilled.
+    Decode,
     /// Routed experts shared by the deployment's schedulers.
     Experts,
+}
+
+impl WorkerGroupRole {
+    /// Whether the group serves requests: every role but `Experts`.
+    pub fn serves_requests(self) -> bool {
+        self != Self::Experts
+    }
 }
 
 /// Static computation components and their ordered physical rank membership.
@@ -115,7 +128,7 @@ impl WorkerGroupConfig {
         }
         Self::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
-            self.components.is_empty() == (self.role == WorkerGroupRole::Experts),
+            self.components.is_empty() != self.role.serves_requests(),
             "model workers require components; expert workers have no request components"
         );
         Ok(())
@@ -194,6 +207,25 @@ impl WorkerGroupConfig {
         for worker in workers {
             worker.validate()?;
             anyhow::ensure!(ids.insert(&worker.id), "WorkerGroup identity is repeated");
+        }
+        // A request prefilled on a prefill group decodes on a decode group,
+        // which holds the same text model and nothing else.
+        let has = |role| workers.iter().any(|worker| worker.role == role);
+        anyhow::ensure!(
+            has(WorkerGroupRole::Prefill) == has(WorkerGroupRole::Decode),
+            "prefill groups and decode groups are configured together"
+        );
+        for worker in workers {
+            if matches!(
+                worker.role,
+                WorkerGroupRole::Prefill | WorkerGroupRole::Decode
+            ) {
+                anyhow::ensure!(
+                    worker.components.keys().eq([DEFAULT_COMPONENT]),
+                    "worker {}: a prefill or decode group places the `{DEFAULT_COMPONENT}` component alone",
+                    worker.id
+                );
+            }
         }
         Ok(())
     }
@@ -503,7 +535,7 @@ impl SchedulerHandle {
             .worker_groups
             .iter()
             .cloned()
-            .partition(|worker| worker.role == WorkerGroupRole::Model);
+            .partition(|worker| worker.role.serves_requests());
         anyhow::ensure!(
             size > 0 && !model_workers.is_empty() && model_workers.len().is_multiple_of(size),
             "{} worker groups do not form {size} equal schedulers",
@@ -788,6 +820,13 @@ impl SchedulerHandle {
             config.generation_limits,
         )?;
         scheduler.set_prefix_reuse(config.prefix_cache);
+        scheduler.set_prefill_groups(
+            config
+                .worker_groups
+                .iter()
+                .filter(|group| group.role == WorkerGroupRole::Prefill)
+                .map(|group| group.id.clone()),
+        );
         if config.prefix_cache && config.worker_process.host_kv_cache {
             scheduler.enable_kv_offload(
                 &config.worker_process.deployment,
@@ -979,6 +1018,50 @@ impl SchedulerHandle {
     /// flight drain, after every token it generated. Other requests go on.
     pub fn migrate(&self, cause: MigrationCause) {
         self.commands.migrate(cause);
+    }
+
+    /// Revokes every cached prefix page; requests in flight keep theirs.
+    pub fn flush_cache(&self) {
+        self.commands.flush_cache();
+    }
+
+    /// Runs the worker hook `name` with the JSON `payload` on every worker
+    /// once the batches in flight complete; the receiver gets each worker's
+    /// result, or why the hook failed.
+    pub fn hook(
+        &self,
+        name: String,
+        payload: String,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.hook(name, payload)
+    }
+
+    /// Takes other scheduling limits and policy from the next step on; the
+    /// receiver gets whether the scheduler did.
+    pub fn configure(
+        &self,
+        limits: SchedulerConfig,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.configure(limits)
+    }
+
+    /// Rewrites the weights in place from the checkpoint at `model_path`;
+    /// the receiver gets what each worker reported, or why the update
+    /// failed.
+    pub fn update_weights(
+        &self,
+        model_path: String,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.update_weights(model_path)
+    }
+
+    /// Gives back or restores KV cache memory; the receiver gets what each
+    /// worker reported, or why the change failed.
+    pub fn resize_cache(
+        &self,
+        change: crate::handle::CacheChange,
+    ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.resize_cache(change)
     }
 
     /// Shuts down the scheduler, tears down its executor, and joins its

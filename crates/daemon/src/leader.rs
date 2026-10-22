@@ -24,7 +24,9 @@
 //! [`output::generation_output`]: crate::output::generation_output
 //! [`output::media_output`]: crate::output::media_output
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::metrics::{EngineLabels, METRICS};
@@ -37,7 +39,7 @@ use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
-use crate::engine::hold::RequestHold;
+use crate::engine::hold::{HoldState, RequestHold};
 use crate::input::media::MediaConnector;
 use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
@@ -99,6 +101,16 @@ pub(crate) fn stats_sink(model_name: String) -> StatsSink {
     })
 }
 
+/// What a leader prepares before it has an engine (`Leader::prepare`).
+pub(crate) struct Prepared {
+    model_config: ModelConfig,
+    tokenizer: crate::tokenizer::DynTokenizer,
+    renderer: LoadedRenderer,
+    /// The spec of the engine that serves the model.
+    pub(crate) spec: wire::EngineSpec,
+    max_model_len: u32,
+}
+
 impl Leader {
     /// Loads the configured model and starts the engine process that serves
     /// it, with its schedulers and worker processes.
@@ -122,6 +134,34 @@ impl Leader {
         stated: &Stated,
         daemon: String,
     ) -> anyhow::Result<Self> {
+        let prepared = Self::prepare(config, stated).await?;
+        info!(placement = ?prepared.spec.placement, "starting the engine process");
+        let control = EngineControl::new(
+            &config.request_socket(),
+            daemon,
+            config.host_identity.clone(),
+            config.served_model_name().to_owned(),
+        )?;
+        let sink = stats_sink(config.model().to_owned());
+        let spec = prepared.spec.clone();
+        let (client, control) = tokio::task::spawn_blocking(move || {
+            control.start(spec, sink).map(|client| (client, control))
+        })
+        .await
+        .context("the engine startup task did not complete")?
+        .context("failed to start the UniServe engine")?;
+        let served = prepared.spec.clone();
+        Self::finish(config, prepared, control, client, served)
+    }
+
+    /// What a leader prepares before it has an engine: the model's files
+    /// and the spec of the engine that serves it, as [`Leader::start`]
+    /// describes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Leader::start`], before the engine starts.
+    pub(crate) async fn prepare(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Prepared> {
         let LoadedModel {
             config: mut model_config,
             tokenizer,
@@ -184,22 +224,37 @@ impl Leader {
             video.aspect_ratios.clear();
         }
 
-        info!(placement = ?spec.placement, "starting the engine process");
-        let control = EngineControl::new(
-            &config.request_socket(),
-            daemon,
-            config.host_identity.clone(),
-            config.served_model_name().to_owned(),
-        )?;
-        let model_name = config.model().to_owned();
-        let sink = stats_sink(model_name.clone());
-        let served = spec.clone();
-        let (client, control) = tokio::task::spawn_blocking(move || {
-            control.start(spec, sink).map(|client| (client, control))
+        Ok(Prepared {
+            model_config,
+            tokenizer,
+            renderer,
+            spec,
+            max_model_len,
         })
-        .await
-        .context("the engine startup task did not complete")?
-        .context("failed to start the UniServe engine")?;
+    }
+
+    /// The leader of `prepared`'s model over the engine `client` serves,
+    /// which `control` started (or adopted) with the spec `served`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the model cannot be bound to the capabilities the
+    /// engine's workers report.
+    pub(crate) fn finish(
+        config: &ServeConfig,
+        prepared: Prepared,
+        control: EngineControl,
+        client: EngineClient,
+        served: wire::EngineSpec,
+    ) -> anyhow::Result<Self> {
+        let Prepared {
+            model_config,
+            tokenizer,
+            renderer,
+            spec: _,
+            max_model_len,
+        } = prepared;
+        let model_name = config.model().to_owned();
         let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
@@ -294,7 +349,8 @@ impl Leader {
             readout,
             config,
         );
-        let _ = engine.engines.control.set((Arc::new(control), served));
+        let _ = engine.engines.control.set(Arc::new(control));
+        *locked(&engine.engines.served) = Some(served);
         Ok(engine)
     }
 
@@ -323,8 +379,13 @@ impl Leader {
         let engines = Arc::new(Engines {
             hold: Arc::clone(&hold),
             control: std::sync::OnceLock::new(),
+            served: std::sync::Mutex::new(None),
+            config: std::sync::Mutex::new(options.clone()),
             model_name: model_name.clone(),
             replacing: tokio::sync::Mutex::new(()),
+            asleep: AtomicBool::new(false),
+            sleep_paused: AtomicBool::new(false),
+            adapters: std::sync::Mutex::new(BTreeMap::new()),
         });
         let client = Arc::new(client);
         tokio::spawn(watch_engine(Arc::clone(&engines), Arc::downgrade(&client)));
@@ -550,11 +611,137 @@ impl Leader {
             .await
             .context("engine shutdown did not complete")
     }
+
+    /// Lets go of the engine without shutting it down, as the daemon a hot
+    /// restart replaced does once its requests ended: the successor serves
+    /// the engine from then on.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the client's close does not complete.
+    pub async fn detach(&self) -> anyhow::Result<()> {
+        let hold = self.migrator.hold();
+        let client = hold.client();
+        hold.close("the daemon handed the deployment to its successor");
+        let Some(client) = client else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || client.detach())
+            .await
+            .context("the engine connection's close did not complete")
+    }
+
+    /// Holds off engine replacements (hot updates and relaunches) while the
+    /// guard lives, as a hot restart hands the engine over.
+    pub(crate) async fn quiesce(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.engines.replacing.lock().await
+    }
+
+    /// What a hot restart hands the successor of this leader's engine: its
+    /// client, its identity and the next engine identity, the spec it
+    /// serves and the options it was made from.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no engine this leader started serves.
+    pub(crate) fn engine_handoff(&self) -> anyhow::Result<EngineHandoff> {
+        let client = self
+            .migrator
+            .hold()
+            .client()
+            .context("no engine serves the deployment")?;
+        let engine = client
+            .engine()
+            .context("the serving engine is not one this daemon started")?;
+        let control = self
+            .engines
+            .control
+            .get()
+            .context("this leader starts no engine of its own")?;
+        let served = locked(&self.engines.served)
+            .clone()
+            .context("this leader starts no engine of its own")?;
+        Ok(EngineHandoff {
+            next_engine: control.next_engine(),
+            client,
+            engine,
+            served,
+            config: locked(&self.engines.config).clone(),
+            paused: self.migrator.hold().is_paused(),
+            asleep: self.engines.asleep.load(Ordering::Acquire),
+            sleep_paused: self.engines.sleep_paused.load(Ordering::Acquire),
+            adapters: locked(&self.engines.adapters).clone(),
+        })
+    }
+
+    /// Takes over the pause, the sleep and the adapters of the leader a hot
+    /// restart replaced (`EngineHandoff`).
+    pub(crate) fn adopt_pause(
+        &self,
+        paused: bool,
+        asleep: bool,
+        sleep_paused: bool,
+        adapters: BTreeMap<String, Adapter>,
+    ) {
+        if paused {
+            self.migrator.hold().pause();
+        }
+        self.engines.asleep.store(asleep, Ordering::Release);
+        self.engines
+            .sleep_paused
+            .store(sleep_paused, Ordering::Release);
+        *locked(&self.engines.adapters) = adapters;
+    }
 }
 
-/// What a hot update did, and how long each stage of its pause took.
+/// A leader's engine as a hot restart hands it over (`Leader::engine_handoff`).
+pub(crate) struct EngineHandoff {
+    pub(crate) client: Arc<EngineClient>,
+    pub(crate) engine: u64,
+    pub(crate) next_engine: u64,
+    pub(crate) served: wire::EngineSpec,
+    pub(crate) config: ServeConfig,
+    /// New requests wait (`Leader::pause`).
+    pub(crate) paused: bool,
+    /// The engine sleeps, and whether its sleep paused new requests.
+    pub(crate) asleep: bool,
+    pub(crate) sleep_paused: bool,
+    /// The LoRA adapters the workers hold, by name.
+    pub(crate) adapters: BTreeMap<String, Adapter>,
+}
+
+/// What the leader serves, for `GET /admin/status`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LeaderStatus {
+    /// The served model name, the deployment's name.
+    pub deployment: String,
+    /// The model the deployment serves.
+    pub model: String,
+    /// `ready`, `standby`, `draining`, `failed` or `closed` for the engine
+    /// that serves; `holding` while an engine is being replaced; `stopped`
+    /// once none will serve.
+    pub engine: String,
+    /// Why the engine failed or no engine will serve.
+    pub reason: Option<String>,
+    /// Whether new requests wait (`/admin/pause_generation`).
+    pub paused: bool,
+    /// Whether the engine gave back its KV cache and graph memory
+    /// (`/admin/sleep`).
+    pub asleep: bool,
+    /// Whether an engine is being replaced: by an update or a relaunch.
+    pub replacing: bool,
+    /// The requests the serving engine has in flight.
+    pub in_flight: usize,
+    /// The executable the serving engine and its workers run.
+    pub executable: Option<String>,
+}
+
+/// What an update did, and how long each stage of its pause took.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineUpdate {
+    /// The schedulers took the new limits in place, at their next step;
+    /// nothing paused, and the stages below are zero.
+    pub in_place: bool,
     /// How long requests waited for an engine: from holding them until the
     /// promoted engine served them; the sum of the three stages below.
     pub pause: std::time::Duration,
@@ -568,12 +755,30 @@ pub struct EngineUpdate {
     pub promotion: std::time::Duration,
 }
 
+/// What a hot update changes: the build, and options of the engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequest {
+    /// The `uniserve` executable of the build to update to; the running
+    /// engine's executable when unset.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// `PATH=VALUE` assignments over the serving options, as `--set` states
+    /// them; each must change only what a standby engine may serve with
+    /// differently ([`updated_spec`]).
+    #[serde(default)]
+    pub set: Vec<String>,
+}
+
 /// Why a hot update did not happen or did not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// Another update is in progress.
     #[error("an engine update is in progress")]
     InProgress,
+    /// The update asks for what a hot update cannot change.
+    #[error("{0}")]
+    Refused(String),
     /// The leader runs no engine process of its own to update.
     #[error("this leader runs no engine process of its own")]
     NoEngine,
@@ -603,31 +808,108 @@ impl Leader {
     /// when the standby does not start, after which the running engine
     /// serves on; and when the standby's promotion fails, after which no
     /// engine serves and held requests fail.
-    pub async fn update(&self, executable: Option<String>) -> Result<EngineUpdate, UpdateError> {
+    pub async fn update(&self, request: UpdateRequest) -> Result<EngineUpdate, UpdateError> {
         let _replacing = self
             .engines
             .replacing
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
-        let (control, served) = self.engines.control.get().ok_or(UpdateError::NoEngine)?;
+        let control = self.engines.control.get().ok_or(UpdateError::NoEngine)?;
+        let served = locked(&self.engines.served)
+            .clone()
+            .ok_or(UpdateError::NoEngine)?;
         let hold = Arc::clone(self.migrator.hold());
         let running = hold.client().ok_or(UpdateError::NoEngine)?;
+        if self.engines.asleep.load(Ordering::Acquire) {
+            return Err(UpdateError::Refused(
+                "the engine sleeps: wake it (/admin/wake_up) before updating it".to_owned(),
+            ));
+        }
 
-        let mut spec = served.clone();
-        if let (Some(executable), Some(workers)) = (executable, spec.workers.as_mut()) {
+        // The options the standby serves with, over those the running engine
+        // was started with.
+        let (config, mut spec) = if request.set.is_empty() {
+            (locked(&self.engines.config).clone(), served.clone())
+        } else {
+            let (config, paths) =
+                crate::options::overridden(&locked(&self.engines.config), &request.set)
+                    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let recomputed = config
+                .engine_spec()
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let spec = updated_spec(&served, &recomputed).map_err(UpdateError::Refused)?;
+            if spec == served {
+                return Err(UpdateError::Refused(format!(
+                    "{} change nothing the engine serves with: the daemon reads them, \
+                     and changing them takes a restart of the daemon",
+                    paths.join(", ")
+                )));
+            }
+            (config, spec)
+        };
+        // Scheduling alone, within the batch the running engine's workers
+        // were started for, changes in place at the schedulers' next step.
+        if request.executable.is_none()
+            && configurable(&served, &spec, running.info().capacity.as_ref())
+        {
+            let scheduling = spec.scheduling.clone().unwrap_or_default();
+            running
+                .configure(scheduling)
+                .await
+                .map_err(|error| anyhow::anyhow!("the engine did not take the limits: {error}"))?;
+            info!("the engine took the new scheduling limits in place");
+            *locked(&self.engines.served) = Some(spec);
+            *locked(&self.engines.config) = config;
+            return Ok(EngineUpdate {
+                in_place: true,
+                pause: std::time::Duration::ZERO,
+                drain: std::time::Duration::ZERO,
+                close: std::time::Duration::ZERO,
+                promotion: std::time::Duration::ZERO,
+            });
+        }
+        if let (Some(executable), Some(workers)) = (request.executable, spec.workers.as_mut()) {
             workers.executable = executable;
         }
+        // Relaunches and later updates start from what the updated engine
+        // serves with.
+        let updated = spec.clone();
         spec.standby = Some(wire::Standby {
             cache_units: running.info().cache_units.clone(),
         });
+        // The standby needs as much device memory beside the weights and the
+        // cache as the running engine's workers hold: the tail of the KV
+        // cache makes room for it, and the updated engine creates it again.
+        running
+            .resize_cache(wire::CacheChange::Shrink)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "the KV cache did not make room for the standby engine; the running engine \
+                     serves on: {error}"
+                )
+            })?;
         let control = Arc::clone(control);
         let sink = stats_sink(self.model_name.clone());
         info!("starting a standby engine for a hot update");
-        let standby = tokio::task::spawn_blocking(move || control.start(spec, sink))
+        let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
             .await
-            .context("the standby engine's start did not complete")?
-            .context("the standby engine did not start; the running engine serves on")?;
-        let standby = Arc::new(standby);
+            .context("the standby engine's start did not complete")
+            .and_then(|started| started.context("the standby engine did not start"));
+        let standby = match started {
+            Ok(standby) => Arc::new(standby),
+            Err(error) => {
+                let restored = running.resize_cache(wire::CacheChange::Restore).await;
+                return Err(match restored {
+                    Ok(_) => error.context("the running engine serves on"),
+                    Err(restoring) => error.context(format!(
+                        "the running engine serves on without the tail of its KV cache, \
+                         which it did not create again: {restoring}"
+                    )),
+                }
+                .into());
+            }
+        };
 
         // Requests wait from here until the standby serves.
         let paused = Instant::now();
@@ -659,11 +941,14 @@ impl Leader {
             hold.close(format!("the updated engine did not serve: {error}"));
             return Err(anyhow::anyhow!("promoting the standby engine: {error}").into());
         }
+        *locked(&self.engines.served) = Some(updated);
+        *locked(&self.engines.config) = config;
         tokio::spawn(watch_engine(
             Arc::clone(&self.engines),
             Arc::downgrade(&standby),
         ));
-        hold.serve(standby);
+        reload_adapters(&self.engines, &standby).await;
+        hold.serve(Arc::clone(&standby));
         let pause = paused.elapsed();
         let promotion = pause - drain - close;
         info!(
@@ -673,12 +958,507 @@ impl Leader {
             promotion_ms = promotion.as_millis() as u64,
             "the updated engine serves"
         );
+        // The drained engine's memory is free: the updated engine creates
+        // the tail of the KV cache the standby went without.
+        standby
+            .resize_cache(wire::CacheChange::Restore)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "the updated engine serves without the tail of its KV cache, which it did \
+                     not create again: {error}"
+                )
+            })?;
         Ok(EngineUpdate {
+            in_place: false,
             pause,
             drain,
             close,
             promotion,
         })
+    }
+}
+
+/// The spec a standby engine serves with: `served`, with what `recomputed`
+/// (the spec of the overridden options) states for the parts a standby may
+/// serve with differently. A standby maps the running engine's weights and
+/// cache planes and serves its placement, so the model, the placement, the
+/// KV cache, the experts and how weights load and are stored stay; the
+/// scheduling, CUDA graphs, FlashInfer, the lanes and the workers' other
+/// options may change.
+///
+/// # Errors
+///
+/// Names the parts `recomputed` changes that a standby must keep.
+fn updated_spec(
+    served: &wire::EngineSpec,
+    recomputed: &wire::EngineSpec,
+) -> Result<wire::EngineSpec, String> {
+    let mut kept = Vec::new();
+    let mut differs = |name: &str, same: bool| {
+        if !same {
+            kept.push(name.to_owned());
+        }
+    };
+    differs("the deployment", served.deployment == recomputed.deployment);
+    differs("the model", served.model == recomputed.model);
+    differs("the host", served.host == recomputed.host);
+    differs("the placement", served.placement == recomputed.placement);
+    differs(
+        "the product transport",
+        served.transfer == recomputed.transfer,
+    );
+    differs("the KV cache", served.kv_cache == recomputed.kv_cache);
+    differs("the experts", served.experts == recomputed.experts);
+    // The daemon clears the video canvases of models whose denoiser names
+    // them, as it starts the engine.
+    let video = |spec: &wire::EngineSpec| {
+        spec.video.clone().map(|mut video| {
+            if served.video.as_ref().is_some_and(|served| {
+                served.resolutions.is_empty() && served.aspect_ratios.is_empty()
+            }) {
+                video.resolutions.clear();
+                video.aspect_ratios.clear();
+            }
+            video
+        })
+    };
+    differs("the video options", video(served) == video(recomputed));
+    if let (Some(old), Some(new)) = (&served.workers, &recomputed.workers) {
+        differs("the worker mesh", old.mesh == new.mesh);
+        differs("the dtype", old.dtype == new.dtype);
+        differs(
+            "the quantization",
+            old.quantization_config == new.quantization_config,
+        );
+        differs("the load format", old.load_format == new.load_format);
+        differs("the standby groups", old.standby == new.standby);
+    }
+    if !kept.is_empty() {
+        return Err(format!(
+            "a hot update keeps {}: the standby engine maps the running engine's \
+             weights and caches and serves its placement",
+            kept.join(", ")
+        ));
+    }
+    let mut spec = served.clone();
+    spec.scheduling = recomputed.scheduling.clone();
+    spec.cuda_graphs = recomputed.cuda_graphs.clone();
+    spec.flashinfer = recomputed.flashinfer.clone();
+    spec.lanes = recomputed.lanes.clone();
+    if let (Some(workers), Some(new)) = (spec.workers.as_mut(), &recomputed.workers) {
+        workers.executable = new.executable.clone();
+        workers.watchdog_timeout_ms = new.watchdog_timeout_ms;
+        workers.distributed_backend = new.distributed_backend.clone();
+        workers.attention_backend = new.attention_backend.clone();
+        workers.download_dir = new.download_dir.clone();
+        workers.load_threads = new.load_threads;
+        workers.standby_memory = new.standby_memory.clone();
+    }
+    Ok(spec)
+}
+
+/// Whether `updated` differs from `served` in its scheduling alone, within
+/// `capacity`, the batch the running engine's workers were started for: at
+/// most as many calls and tokens a step and running requests. The
+/// schedulers take such limits in place; any other change starts a standby
+/// engine.
+fn configurable(
+    served: &wire::EngineSpec,
+    updated: &wire::EngineSpec,
+    capacity: Option<&wire::BatchCapacity>,
+) -> bool {
+    let (Some(new), Some(capacity)) = (updated.scheduling.as_ref(), capacity) else {
+        return false;
+    };
+    let same_otherwise = wire::EngineSpec {
+        scheduling: served.scheduling.clone(),
+        ..updated.clone()
+    } == *served;
+    // A step's tokens left to the engine's default stay as they were.
+    let tokens = match new.max_num_batched_tokens {
+        Some(tokens) => u64::from(tokens) <= capacity.max_num_batched_tokens,
+        None => served
+            .scheduling
+            .as_ref()
+            .is_some_and(|served| served.max_num_batched_tokens.is_none()),
+    };
+    same_otherwise
+        && served.scheduling.as_ref() != Some(new)
+        && tokens
+        && (capacity.max_batch == 0 || new.max_batch <= capacity.max_batch)
+        && new.max_running_requests <= capacity.max_running_requests
+}
+
+/// Whether the daemon processes requests for the checkpoint at `path` as
+/// it does for the served model at `served`: the same tokenizer, tokenizer
+/// settings, generation defaults and chat template, byte for byte.
+async fn same_processing(served: &str, path: &str) -> Result<(), String> {
+    use crate::model::assets::model_files::ResolvedModelFiles;
+    let resolve = |model: &str| {
+        let model = model.to_owned();
+        async move {
+            ResolvedModelFiles::new(&model)
+                .await
+                .map_err(|error| format!("resolving the files of {model}: {error}"))
+        }
+    };
+    let (old, new) = (resolve(served).await?, resolve(path).await?);
+    let read = |file: Option<&std::path::Path>| -> Result<Option<Vec<u8>>, String> {
+        file.map(|file| std::fs::read(file).map_err(|error| format!("{}: {error}", file.display())))
+            .transpose()
+    };
+    for (name, old, new) in [
+        (
+            "tokenizer.json",
+            Some(old.tokenizer_path.as_path()),
+            Some(new.tokenizer_path.as_path()),
+        ),
+        (
+            "tokenizer_config.json",
+            old.tokenizer_config_path.as_deref(),
+            new.tokenizer_config_path.as_deref(),
+        ),
+        (
+            "generation_config.json",
+            old.generation_config_path.as_deref(),
+            new.generation_config_path.as_deref(),
+        ),
+        (
+            "the chat template",
+            old.chat_template_path.as_deref(),
+            new.chat_template_path.as_deref(),
+        ),
+    ] {
+        if read(old)? != read(new)? {
+            return Err(format!(
+                "the checkpoint at {path} has another {name} than the served model, which \
+                 changes how requests are processed: deploy it instead"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The value behind `mutex`; every holder replaces whole values.
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Leader {
+    /// What the leader serves now.
+    pub fn status(&self) -> LeaderStatus {
+        let hold = self.migrator.hold();
+        let (engine, reason) = match hold.state() {
+            HoldState::Engine(state) => match state {
+                EngineState::Ready => ("ready", None),
+                EngineState::Standby => ("standby", None),
+                EngineState::Draining => ("draining", None),
+                EngineState::Failed(reason) => ("failed", Some(reason)),
+                EngineState::Closed => ("closed", None),
+            },
+            HoldState::Holding => ("holding", None),
+            HoldState::Closed(reason) => ("stopped", Some(reason)),
+        };
+        LeaderStatus {
+            deployment: self.served_model_name.clone(),
+            model: self.model_name.clone(),
+            engine: engine.to_owned(),
+            reason,
+            paused: hold.is_paused(),
+            asleep: self.engines.asleep.load(Ordering::Acquire),
+            replacing: self.engines.replacing.try_lock().is_err(),
+            in_flight: hold.client().map_or(0, |client| client.in_flight()),
+            executable: locked(&self.engines.served)
+                .as_ref()
+                .and_then(|spec| spec.workers.as_ref())
+                .map(|workers| workers.executable.clone()),
+        }
+    }
+
+    /// Holds new requests until [`Self::resume`]; the requests in flight go
+    /// on. Returns whether requests were held already.
+    pub fn pause(&self) -> bool {
+        let paused = self.migrator.hold().pause();
+        if !paused {
+            info!("new requests wait: generation paused");
+        }
+        paused
+    }
+
+    /// Lets new requests reach the engine again.
+    pub fn resume(&self) {
+        self.migrator.hold().resume();
+        info!("generation continues");
+    }
+
+    /// Has the serving engine give back its KV cache and CUDA graph memory
+    /// and keep its weights, as vLLM's `sleep` does: new requests wait, the
+    /// token requests in flight are recomputed once it wakes, and the other
+    /// requests finish first. Returns what each worker reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no engine serves, or with the reason the engine did not
+    /// sleep; requests wait until a wake all the same.
+    pub async fn sleep(&self) -> Result<Vec<String>, UpdateError> {
+        let _replacing = self.engines.replacing.lock().await;
+        let hold = self.migrator.hold();
+        let client = hold.client().ok_or(UpdateError::NoEngine)?;
+        if self.engines.asleep.swap(true, Ordering::AcqRel) {
+            return Ok(Vec::new());
+        }
+        if !hold.pause() {
+            self.engines.sleep_paused.store(true, Ordering::Release);
+        }
+        let results = client
+            .resize_cache(wire::CacheChange::Sleep)
+            .await
+            .map_err(|error| {
+                UpdateError::Failed(anyhow::anyhow!(
+                    "the engine did not sleep, and requests wait until /admin/wake_up: {error}"
+                ))
+            })?;
+        info!("the engine sleeps: its KV cache and graph memory are given back");
+        Ok(results)
+    }
+
+    /// Restores what [`Self::sleep`] gave back, and lets the requests it
+    /// held through. Returns what each worker reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no engine serves, or with the reason the engine did not
+    /// wake; requests keep waiting then.
+    pub async fn wake(&self) -> Result<Vec<String>, UpdateError> {
+        let _replacing = self.engines.replacing.lock().await;
+        let hold = self.migrator.hold();
+        let client = hold.client().ok_or(UpdateError::NoEngine)?;
+        let results = client
+            .resize_cache(wire::CacheChange::Wake)
+            .await
+            .map_err(|error| {
+                UpdateError::Failed(anyhow::anyhow!("the engine did not wake: {error}"))
+            })?;
+        self.engines.asleep.store(false, Ordering::Release);
+        if self.engines.sleep_paused.swap(false, Ordering::AcqRel) {
+            hold.resume();
+        }
+        info!("the engine woke");
+        Ok(results)
+    }
+
+    /// Runs the worker hook `name` with the JSON `payload` on every worker
+    /// (`uniserve.hooks`), which a plugin implements, at the engine's next
+    /// step boundary, and returns each worker's JSON result.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no engine serves, or with the reason a worker gave.
+    pub async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, UpdateError> {
+        let _replacing = self.engines.replacing.lock().await;
+        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let results = client
+            .hook(name, payload)
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("worker hook {name}: {error}")))?;
+        info!(hook = name, workers = results.len(), "ran the worker hook");
+        Ok(results)
+    }
+
+    /// The LoRA adapter named `name` the workers hold, which a request
+    /// naming it as its model computes with.
+    pub fn adapter(&self, name: &str) -> Option<crate::input::AdapterSelection> {
+        locked(&self.engines.adapters)
+            .get(name)
+            .map(|adapter| crate::input::AdapterSelection {
+                slot: adapter.slot,
+                identity: adapter.identity.clone(),
+            })
+    }
+
+    /// The names of the LoRA adapters the workers hold.
+    pub fn adapter_names(&self) -> Vec<String> {
+        locked(&self.engines.adapters).keys().cloned().collect()
+    }
+
+    /// Loads the LoRA adapter `body` names (`lora_name`, and what the
+    /// plugin reads, such as `lora_path`) into a free slot of the workers'
+    /// adapter pool, as vLLM's `load_lora_adapter` does: every worker runs
+    /// the plugin hook `load_lora_adapter` with the body and the slot
+    /// (`adapter`), and requests naming the adapter as their model compute
+    /// with it from then on (`uniserve.adapters`). A new engine, after a hot
+    /// update or a relaunch, loads it again before it serves.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a body without a name, the served model's name and an
+    /// adapter loaded already; fails when no engine serves, or with the
+    /// reason a worker gave.
+    pub async fn load_adapter(
+        &self,
+        mut body: serde_json::Value,
+    ) -> Result<Vec<String>, UpdateError> {
+        let name = body["lora_name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| UpdateError::Refused("load_lora_adapter names no lora_name".to_owned()))?
+            .to_owned();
+        if name == self.served_model_name {
+            return Err(UpdateError::Refused(format!(
+                "{name} is the served model's name"
+            )));
+        }
+        let _replacing = self.engines.replacing.lock().await;
+        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let slot = {
+            let adapters = locked(&self.engines.adapters);
+            if adapters.contains_key(&name) {
+                return Err(UpdateError::Refused(format!(
+                    "the adapter {name} is loaded already"
+                )));
+            }
+            (1..)
+                .find(|slot| adapters.values().all(|adapter| adapter.slot != *slot))
+                .unwrap_or(u32::MAX)
+        };
+        body["adapter"] = slot.into();
+        let payload = body.to_string();
+        let results = client
+            .hook("load_lora_adapter", &payload)
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("load_lora_adapter: {error}")))?;
+        let identity = format!("{name}#{}", uuid::Uuid::new_v4().simple());
+        locked(&self.engines.adapters).insert(
+            name.clone(),
+            Adapter {
+                slot,
+                identity,
+                payload,
+            },
+        );
+        info!(adapter = name, slot, "loaded the adapter");
+        Ok(results)
+    }
+
+    /// Unloads the LoRA adapter `body` names (`lora_name`): requests stop
+    /// naming it at once, and every worker runs the plugin hook
+    /// `unload_lora_adapter` with the body and the adapter's slot.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a name no loaded adapter has; fails when no engine serves, or
+    /// with the reason a worker gave, after which the adapter stays loaded.
+    pub async fn unload_adapter(
+        &self,
+        mut body: serde_json::Value,
+    ) -> Result<Vec<String>, UpdateError> {
+        let name = body["lora_name"].as_str().unwrap_or_default().to_owned();
+        let _replacing = self.engines.replacing.lock().await;
+        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        let adapter = locked(&self.engines.adapters)
+            .remove(&name)
+            .ok_or_else(|| UpdateError::Refused(format!("no adapter {name:?} is loaded")))?;
+        body["adapter"] = adapter.slot.into();
+        match client.hook("unload_lora_adapter", &body.to_string()).await {
+            Ok(results) => {
+                info!(adapter = name, slot = adapter.slot, "unloaded the adapter");
+                Ok(results)
+            }
+            Err(error) => {
+                locked(&self.engines.adapters).insert(name, adapter);
+                Err(UpdateError::Failed(anyhow::anyhow!(
+                    "unload_lora_adapter: {error}"
+                )))
+            }
+        }
+    }
+
+    /// Rewrites the engine's weights in place from the checkpoint at
+    /// `model_path`, another checkpoint of the served model, as SGLang's
+    /// `update_weights_from_disk` does, or from a plugin's weight source
+    /// (`scheme://...`) that streams the served checkpoint's tensors, and
+    /// returns what each worker reported. New requests wait; the token requests in flight are
+    /// recomputed with the new weights, and the others finish first. A
+    /// relaunch or an update after loads the new checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a checkpoint the daemon would process requests of
+    /// differently (another tokenizer, chat template, generation defaults
+    /// or model facts); fails when no engine serves, or with the reason a
+    /// worker did not update, after which the weights are those of before.
+    pub async fn update_weights(&self, model_path: &str) -> Result<Vec<String>, UpdateError> {
+        let _replacing = self.engines.replacing.lock().await;
+        let hold = self.migrator.hold();
+        let client = hold.client().ok_or(UpdateError::NoEngine)?;
+        let mut config = locked(&self.engines.config).clone();
+        // A plugin's weight source streams the tensors of the served
+        // checkpoint, whose configuration and tokenizer stay; a directory
+        // is another checkpoint of the model, checked to process requests
+        // alike.
+        let streamed = model_path.contains("://");
+        if streamed {
+            config.load_config.weights = Some(model_path.to_owned());
+        } else {
+            same_processing(config.model(), model_path)
+                .await
+                .map_err(UpdateError::Refused)?;
+            config.model = Some(model_path.to_owned());
+            config.load_config.weights = None;
+            let prepared = Leader::prepare(&config, &Stated::from_paths(Vec::new()))
+                .await
+                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let facts = locked(&self.engines.served)
+                .as_ref()
+                .map(|spec| spec.model_facts.clone());
+            if facts.is_some_and(|facts| facts != prepared.spec.model_facts) {
+                return Err(UpdateError::Refused(format!(
+                    "the checkpoint at {model_path} has other model facts (generation limits, \
+                     special tokens or context length) than the served model: deploy it instead"
+                )));
+            }
+        }
+
+        let paused = !hold.pause();
+        let started = Instant::now();
+        let results = client.update_weights(model_path).await;
+        if paused {
+            hold.resume();
+        }
+        let results = results.map_err(|error| {
+            UpdateError::Failed(anyhow::anyhow!("the weights were not updated: {error}"))
+        })?;
+        if let Some(spec) = locked(&self.engines.served).as_mut() {
+            if !streamed {
+                spec.model = model_path.to_owned();
+            }
+            if let Some(workers) = spec.workers.as_mut() {
+                workers.weights = config.load_config.weights.clone().unwrap_or_default();
+            }
+        }
+        *locked(&self.engines.config) = config;
+        info!(
+            model = model_path,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "the engine updated its weights in place"
+        );
+        Ok(results)
+    }
+
+    /// Has the serving engine revoke every cached prefix page; the
+    /// requests in flight keep theirs.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no engine serves.
+    pub fn flush_cache(&self) -> Result<(), UpdateError> {
+        let client = self.migrator.hold().client().ok_or(UpdateError::NoEngine)?;
+        client.flush_cache();
+        info!("flushed the prefix cache");
+        Ok(())
     }
 }
 
@@ -695,14 +1475,69 @@ const DRAINED_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
 struct Engines {
     /// The hold every request passes.
     hold: Arc<RequestHold>,
-    /// What starts the leader's engine processes, and the spec they serve;
-    /// unset for an engine run elsewhere.
-    control: std::sync::OnceLock<(Arc<EngineControl>, wire::EngineSpec)>,
+    /// What starts the leader's engine processes; unset for an engine run
+    /// elsewhere.
+    control: std::sync::OnceLock<Arc<EngineControl>>,
+    /// The spec the serving engine serves with: the one it was started with
+    /// and the scheduling it took in place since, which a relaunch and the
+    /// next update start from; unset with `control`.
+    served: std::sync::Mutex<Option<wire::EngineSpec>>,
+    /// The options the serving engine's spec was made from, which an update
+    /// overrides.
+    config: std::sync::Mutex<ServeConfig>,
     /// The model their statistics are labelled with.
     model_name: String,
     /// Held while an engine is replaced, by a hot update or a relaunch, so
     /// that replacements do not overlap.
     replacing: tokio::sync::Mutex<()>,
+    /// The engine gave back its KV cache and graph memory (`Leader::sleep`).
+    asleep: AtomicBool,
+    /// The sleep paused new requests, which the wake lets through.
+    sleep_paused: AtomicBool,
+    /// The LoRA adapters the workers hold, by name (`Leader::load_adapter`).
+    adapters: std::sync::Mutex<BTreeMap<String, Adapter>>,
+}
+
+/// A LoRA adapter the workers hold.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Adapter {
+    /// The slot of the workers' adapter pool it lies in.
+    pub(crate) slot: u32,
+    /// What keeps its cache entries apart from every other adapter's, one
+    /// loaded into the same slot before included: its name and a load's
+    /// random identity.
+    pub(crate) identity: String,
+    /// The load's JSON payload, with which a new engine's workers load it
+    /// again.
+    pub(crate) payload: String,
+}
+
+/// Loads every adapter of `engines` into `client`'s workers, as an engine
+/// that replaces another starts without them. An adapter that does not load
+/// leaves the registry, so that requests naming it are refused instead of
+/// computing without it.
+async fn reload_adapters(engines: &Engines, client: &EngineClient) {
+    let adapters: Vec<(String, Adapter)> = locked(&engines.adapters)
+        .iter()
+        .map(|(name, adapter)| (name.clone(), adapter.clone()))
+        .collect();
+    for (name, adapter) in adapters {
+        match client.hook("load_lora_adapter", &adapter.payload).await {
+            Ok(_) => info!(
+                adapter = name,
+                slot = adapter.slot,
+                "loaded the adapter again"
+            ),
+            Err(error) => {
+                locked(&engines.adapters).remove(&name);
+                warn!(
+                    adapter = name,
+                    "the adapter did not load into the new engine, and requests naming it are \
+                     refused: {error}"
+                );
+            }
+        }
+    }
 }
 
 /// Watches the engine `client` names while the hold serves it, and starts
@@ -729,7 +1564,8 @@ async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineC
         {
             return;
         }
-        let Some((control, spec)) = engines.control.get() else {
+        let (Some(control), Some(spec)) = (engines.control.get(), locked(&engines.served).clone())
+        else {
             tracing::error!(%reason, "no engine serves requests");
             engines.hold.close(reason);
             return;
@@ -737,7 +1573,6 @@ async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineC
         tracing::error!(%reason, "the engine was lost; starting another");
         engines.hold.hold();
         let control = Arc::clone(control);
-        let spec = spec.clone();
         let sink = stats_sink(engines.model_name.clone());
         let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
             .await
@@ -747,6 +1582,7 @@ async fn watch_engine(engines: Arc<Engines>, mut client: std::sync::Weak<EngineC
             Ok(relaunched) => {
                 let relaunched = Arc::new(relaunched);
                 client = Arc::downgrade(&relaunched);
+                reload_adapters(&engines, &relaunched).await;
                 engines.hold.serve(relaunched);
                 info!("the relaunched engine serves");
             }
@@ -932,6 +1768,7 @@ mod tests {
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }
         .into()
     }
@@ -1282,5 +2119,68 @@ mod tests {
             );
         }
         engine.shutdown().await.unwrap();
+    }
+
+    /// Scheduling alone, within the batch the workers were started for, is
+    /// taken in place; a limit beyond it, any other change, or no change
+    /// starts a standby engine.
+    #[test]
+    fn scheduling_within_the_workers_batch_changes_in_place() {
+        use super::configurable;
+        use proto::request::wire;
+
+        let scheduling = |policy: &str, batch, tokens: Option<u32>, running| wire::Scheduling {
+            policy: policy.to_owned(),
+            max_batch: batch,
+            max_num_batched_tokens: tokens,
+            max_running_requests: running,
+            ..Default::default()
+        };
+        let spec = |scheduling| wire::EngineSpec {
+            scheduling: Some(scheduling),
+            ..Default::default()
+        };
+        let served = spec(scheduling("fcfs", 128, None, 128));
+        let capacity = wire::BatchCapacity {
+            max_batch: 128,
+            max_num_batched_tokens: 8192,
+            max_running_requests: 128,
+        };
+        let within = [
+            spec(scheduling("fcfs", 64, Some(4096), 64)),
+            spec(scheduling("priority", 128, None, 128)),
+            spec(scheduling("fcfs", 128, Some(8192), 128)),
+        ];
+        for updated in &within {
+            assert!(
+                configurable(&served, updated, Some(&capacity)),
+                "{updated:?}"
+            );
+            assert!(!configurable(&served, updated, None), "{updated:?}");
+        }
+        let beyond = [
+            spec(scheduling("fcfs", 256, None, 128)),
+            spec(scheduling("fcfs", 128, Some(16384), 128)),
+            spec(scheduling("fcfs", 128, None, 256)),
+            served.clone(),
+            wire::EngineSpec {
+                cuda_graphs: Some(wire::CudaGraphs::default()),
+                ..within[0].clone()
+            },
+        ];
+        for updated in &beyond {
+            assert!(
+                !configurable(&served, updated, Some(&capacity)),
+                "{updated:?}"
+            );
+        }
+        // A step's tokens the served spec states cannot return to the
+        // engine's default in place.
+        let stated = spec(scheduling("fcfs", 128, Some(4096), 128));
+        assert!(!configurable(
+            &stated,
+            &spec(scheduling("priority", 128, None, 128)),
+            Some(&capacity)
+        ));
     }
 }

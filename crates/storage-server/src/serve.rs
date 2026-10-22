@@ -32,8 +32,11 @@ pub struct ServeOptions {
     /// Leave the starter's session, log beside the socket, and return to the
     /// starter once listening.
     pub daemon: bool,
-    /// The size of each host page pool, in bytes.
+    /// The size of each host page pool whose worker states none, in bytes.
     pub page_pool_bytes: u64,
+    /// Host memory a new page pool leaves available to the host's other
+    /// processes, in bytes.
+    pub host_reserve_bytes: u64,
     /// Also accept other hosts' page requests on this TCP address
     /// (`host:port`; port 0 picks one).
     pub tcp: Option<String>,
@@ -42,6 +45,10 @@ pub struct ServeOptions {
     /// The command that runs the connector, before its own arguments: this
     /// executable and its `storage connector` command.
     pub connector_command: Vec<OsString>,
+    /// Go on with the server the predecessor of a hot restart hands over on
+    /// the handoff socket at this descriptor, rather than binding the
+    /// socket (`crate::restart`).
+    pub takeover: Option<i32>,
 }
 
 /// Serve until stopped. Must be called before the process starts a thread:
@@ -52,14 +59,17 @@ pub struct ServeOptions {
 /// Fails when the starter cannot be left, the socket cannot be bound, the
 /// server cannot start, or it fails while serving.
 pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
-    // Forked before any thread exists.
-    let ready = if options.daemon {
+    // Forked before any thread exists. A successor runs detached already.
+    let ready = if options.daemon && options.takeover.is_none() {
         Some(detach(&options.socket)?)
     } else {
         None
     };
     init_logging();
-    let served = serve_on(&options, ready);
+    let served = match options.takeover {
+        Some(descriptor) => serve_resumed(&options, descriptor),
+        None => serve_on(&options, ready),
+    };
     if let Err(error) = &served {
         tracing::error!("storage server failed: {error:#}");
     }
@@ -118,9 +128,10 @@ pub fn list(socket: &Path) -> storage::Result<()> {
     }
     for pool in &listing.page_pools {
         println!(
-            "page pool {} kv heads {}+{} {} slots of {} bytes: {} ready, {} reserved, \
+            "page pool {} of {} kv heads {}+{} {} slots of {} bytes: {} ready, {} reserved, \
              {} pinned, {} fetching, {} uploading",
             pool.pool,
+            pool.deployment,
             pool.shape.kv_head_offset,
             pool.shape.kv_head_count,
             pool.slots,
@@ -174,7 +185,7 @@ fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()
             let _ = std::fs::File::from(ready).write_all(b"1");
         }
     };
-    let Some((listener, _lock)) =
+    let Some((listener, lock)) =
         socket::bind(socket).with_context(|| format!("binding {}", socket.display()))?
     else {
         tracing::info!(socket = %socket.display(), "another storage server serves this socket");
@@ -183,28 +194,68 @@ fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()
     };
     raise_descriptor_limit()?;
     let (wake, stop) = stop_signals()?;
-    let connector = options.connector.as_ref().map(|settings| {
-        let mut command = options.connector_command.clone();
-        let program = command.remove(0);
-        command.extend(["--socket".into(), socket.as_os_str().to_owned()]);
-        command.extend(settings.arguments().into_iter().map(Into::into));
-        ConnectorLaunch {
-            program: program.into(),
-            arguments: command,
-        }
-    });
-    let mut server = Server::new(listener, options.page_pool_bytes, connector)?;
+    let connector = connector_launch(options);
+    let mut server = Server::new(
+        listener,
+        options.page_pool_bytes,
+        options.host_reserve_bytes,
+        connector,
+    )?;
     if let Some(address) = &options.tcp {
         let listener = std::net::TcpListener::bind(address)
             .with_context(|| format!("binding {address} for other hosts"))?;
         let bound = server.listen_tcp(listener)?;
         tracing::info!(address = %bound, "accepting other hosts' page requests");
     }
+    server.set_relaunch(crate::relaunch_arguments(std::env::args_os().collect()));
     tracing::info!(socket = %socket.display(), "storage server listening");
     signal(ready);
-    server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))?;
-    tracing::info!("storage server stopped");
+    run_until_stopped(server, &wake, &stop, lock)
+}
+
+/// Go on with the server a hot restart's predecessor hands over on the
+/// handoff socket at `descriptor`, and serve until stopped.
+fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
+    raise_descriptor_limit()?;
+    let (wake, stop) = stop_signals()?;
+    let (server, lock) = Server::resume(descriptor, connector_launch(options))
+        .context("taking the server over from its predecessor")?;
+    let lock = socket::SocketLock::resume(lock, options.socket.clone());
+    tracing::info!(socket = %options.socket.display(), "storage server listening after a hot restart");
+    run_until_stopped(server, &wake, &stop, lock)
+}
+
+/// Serve until stopped, or until a hot restart handed the server over.
+fn run_until_stopped(
+    mut server: Server,
+    wake: &OwnedFd,
+    stop: &AtomicBool,
+    lock: socket::SocketLock,
+) -> anyhow::Result<()> {
+    match server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))? {
+        Some(pending) => {
+            let pid = server
+                .hand_over(pending, lock.hand_over())
+                .context("handing the server to its successor")?;
+            tracing::info!(pid, "handed the server to its successor; exiting");
+        }
+        None => tracing::info!("storage server stopped"),
+    }
     Ok(())
+}
+
+/// The connector the server runs, from `options`.
+fn connector_launch(options: &ServeOptions) -> Option<ConnectorLaunch> {
+    options.connector.as_ref().map(|settings| {
+        let mut command = options.connector_command.clone();
+        let program = command.remove(0);
+        command.extend(["--socket".into(), options.socket.as_os_str().to_owned()]);
+        command.extend(settings.arguments().into_iter().map(Into::into));
+        ConnectorLaunch {
+            program: program.into(),
+            arguments: command,
+        }
+    })
 }
 
 /// Raise the soft limit on open descriptors to the hard limit: the server

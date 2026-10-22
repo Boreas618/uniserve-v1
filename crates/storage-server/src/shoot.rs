@@ -138,6 +138,28 @@ impl ShootDowns {
     }
 
     /// Whether the process behind `pidfd` was shot down and is out.
+    /// The processes shot down that left every GPU.
+    pub(super) fn finished_pidfds(&self) -> &[Arc<OwnedFd>] {
+        &self.finished
+    }
+
+    /// The processes shot down that did not leave a GPU in time.
+    pub(super) fn failed_pidfds(&self) -> &[Arc<OwnedFd>] {
+        &self.failed
+    }
+
+    /// Records, for a server a hot restart resumes, that the process behind
+    /// `pidfd` left every GPU.
+    pub(super) fn note_finished(&mut self, pidfd: Arc<OwnedFd>) {
+        self.finished.push(pidfd);
+    }
+
+    /// Records, for a server a hot restart resumes, that the process behind
+    /// `pidfd` did not leave a GPU in time.
+    pub(super) fn note_failed(&mut self, pidfd: Arc<OwnedFd>) {
+        self.failed.push(pidfd);
+    }
+
     pub(super) fn finished(&self, pidfd: &Arc<OwnedFd>) -> bool {
         self.finished.iter().any(|other| Arc::ptr_eq(other, pidfd))
     }

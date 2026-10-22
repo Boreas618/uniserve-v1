@@ -58,6 +58,10 @@ pub(crate) struct DenoiserRunners {
     /// graphs are off.
     flow: Vec<FlowShape>,
     flow_pools: Vec<Arc<GraphPool>>,
+    /// Whether the image denoiser serves under CUDA graphs (graph policy
+    /// not `off`, on a CUDA device): it then denoises only the captured
+    /// steps.
+    image_graphs: bool,
     /// Resets newly assigned cache units on the image denoiser's stream.
     pub(crate) units: Option<UnitColumn>,
 }
@@ -65,19 +69,30 @@ pub(crate) struct DenoiserRunners {
 impl DenoiserRunners {
     /// The denoiser of an image model with the steps startup captures,
     /// their graph pools and the unit reset column of its stream.
+    /// Under `graphs` the denoiser denoises only the steps startup
+    /// captured once it is sealed ([`Self::seal_image`]).
     pub(crate) fn image(
         denoiser: Option<(String, DenoiserRunner)>,
         flow: Vec<FlowShape>,
         flow_pools: Vec<Arc<GraphPool>>,
+        graphs: bool,
         units: Option<UnitColumn>,
     ) -> Self {
+        let image_graphs = graphs && denoiser.is_some();
         Self {
             image: denoiser,
             flow,
             flow_pools,
+            image_graphs,
             units,
             ..Self::default()
         }
+    }
+
+    /// Whether the image denoiser serves under CUDA graphs, only the steps
+    /// it captured.
+    pub(crate) fn image_graphs(&self) -> bool {
+        self.image_graphs
     }
 
     /// The image denoiser's captured steps, largest first; empty without an
@@ -275,11 +290,17 @@ impl DenoiserRunners {
         stepped.and(released).and(performed)
     }
 
-    /// Seal the image denoiser's graphs.
-    pub(crate) fn seal_image(&mut self) {
+    /// Seal the image denoiser's graphs. Under CUDA graphs a step no
+    /// captured graph holds is refused from then on; the warmup before
+    /// evaluated its steps eagerly.
+    pub(crate) fn seal_image(&mut self) -> Result<()> {
         if let Some((_, runner)) = &mut self.image {
             runner.seal();
+            if self.image_graphs {
+                runner.require_graphs()?;
+            }
         }
+        Ok(())
     }
 
     /// Whether `layout` needs preparing before a request is admitted with

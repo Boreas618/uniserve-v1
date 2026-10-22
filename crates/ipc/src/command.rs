@@ -94,6 +94,10 @@ pub struct GenerationParams {
     /// migrated to this one, in order. They end its prompt, and its
     /// penalties count them as generated tokens.
     pub generated_token_ids: Vec<u32>,
+    /// The slot of the adapter pool the request's tokens compute with; 0
+    /// for none (`GenerationRequest::adapter`).
+    #[serde(default)]
+    pub adapter: u32,
 }
 
 /// What a video request admits besides its sampling controls.

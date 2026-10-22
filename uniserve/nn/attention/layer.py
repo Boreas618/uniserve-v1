@@ -13,6 +13,7 @@ from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import HeadExchange, TokenShard
 from uniserve.nn import _binding, functional
 from uniserve.nn.functional._tensors import result
+from uniserve.prefix_cache import mha
 
 from ._parallel import ParallelAttention
 from .config import AttentionParallelConfig
@@ -89,6 +90,19 @@ class Attention(nn.Module):
         self.head_indices = tuple(range(num_kv_heads))
         self.exchange = HeadExchange(Communicator())
         self.context_parallel: ParallelAttention | None = None
+
+    def cache_state(self, dtype: torch.dtype) -> mha.Config:
+        """The layout of the cache layer this attention reads and writes:
+        its local K/V heads and their global identities, in ``dtype``, with
+        its window.
+        """  # noqa: D205
+        return mha.Config(
+            self.num_kv_heads,
+            self.head_dim,
+            self.head_indices,
+            dtype,
+            window=self.window,
+        )
 
     def forward(
         self,

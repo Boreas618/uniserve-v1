@@ -366,10 +366,18 @@ impl Scheduler {
                     .unwrap_or_default();
                 let engine_id = self.engine_id;
                 let mut admitted = false;
+                // A hand-off's install admits the request on the decode
+                // group, with the token it generated on the prefill group,
+                // which its penalties count.
+                let hand_off = call.kind == CallKind::Transfer(TransferMode::CacheInstall);
                 if let Some(st) = self.running.get_mut(&id)
-                    && !st.worker_registered
+                    && (!st.worker_registered || hand_off)
                 {
                     let request_key = RequestKey::new(engine_id, id, st.request_epoch);
+                    let mut generated_token_ids = st.req.generated_token_ids.clone();
+                    if hand_off {
+                        generated_token_ids.push(st.next_token);
+                    }
                     // Admission reserved the request row, and submission
                     // validated the parameters this admission carries.
                     let admission = st
@@ -384,7 +392,8 @@ impl Scheduler {
                                     negative_token_ids: st.req.negative_prompt_token_ids.clone(),
                                     finish_token_ids,
                                     initial_position: st.num_computed_prompt_tokens,
-                                    generated_token_ids: st.req.generated_token_ids.clone(),
+                                    generated_token_ids,
+                                    adapter: st.req.adapter,
                                 }),
                                 st.req.generates_images().then(|| st.req.image.clone()),
                                 input_images,
@@ -394,14 +403,16 @@ impl Scheduler {
                         self.invariant_broken("a running request forms a valid worker admission");
                         return Vec::new();
                     };
-                    st.worker_registered = true;
-                    // Admission is the first request-state dependency.
-                    st.last_state_call_id = CallId::default();
-                    st.latest_token = None;
+                    if !hand_off {
+                        st.worker_registered = true;
+                        // Admission is the first request-state dependency.
+                        st.last_state_call_id = CallId::default();
+                        st.latest_token = None;
+                        admitted = true;
+                    }
                     batch.commands.push(BatchCommand::Start {
                         request: Box::new(admission),
                     });
-                    admitted = true;
                 }
                 let prepared = self.prepare_generation_call(
                     call,
@@ -609,6 +620,10 @@ impl Scheduler {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
+            Phase::HandOff if st.handoff_export.is_some() => {
+                CallKind::Transfer(TransferMode::CacheInstall)
+            }
+            Phase::HandOff => CallKind::Transfer(TransferMode::CacheExport),
             Phase::CloseCache => CallKind::Forward(ForwardMode::Prefill),
             Phase::PublishCache => CallKind::Transfer(TransferMode::CacheExport),
             Phase::LatentPreparation => CallKind::Media(MediaCall::LatentPreparation),

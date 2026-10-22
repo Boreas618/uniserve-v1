@@ -214,6 +214,9 @@ pub(crate) struct ImageDenoiser {
     noise: StorageView,
     pub(super) graphs: GraphTable<DiffusionShape>,
     capturing: bool,
+    /// Whether the denoiser serves under CUDA graphs: a step no captured
+    /// graph holds is refused, never evaluated eagerly.
+    graphs_only: bool,
 }
 
 fn allocate(
@@ -329,6 +332,7 @@ impl DenoiserRunner {
                 noise,
                 graphs: GraphTable::new(owner.clone(), capture.release.clone()),
                 capturing: false,
+                graphs_only: false,
             })),
             methods: Methods::import(runner)?,
             capture,
@@ -562,6 +566,15 @@ impl DenoiserRunner {
                 });
                 GraphMode::Capture
             }
+            (None, None) if image.graphs_only => {
+                return Err(Error::Invariant(format!(
+                    "{}: no captured graph holds the denoising step of {} rows \
+                     ({:?}); the engine admits only the captured image steps",
+                    self.owner,
+                    rows.len(),
+                    DiffusionShape::of(rows)
+                )));
+            }
             (None, None) => {
                 job.call(MethodCall::new(&self.methods.denoise, arguments));
                 GraphMode::Eager
@@ -728,6 +741,12 @@ impl DenoiserRunner {
         let image = self.family.image_mut()?;
         image.graphs.insert(shape, None, graph)?;
         image.capturing = true;
+        Ok(())
+    }
+
+    /// Serve under CUDA graphs: a step no captured graph holds is refused.
+    pub(crate) fn require_graphs(&mut self) -> Result<()> {
+        self.family.image_mut()?.graphs_only = true;
         Ok(())
     }
 

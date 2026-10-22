@@ -84,6 +84,24 @@ impl StridedCopy {
     /// Appends the copies of `source` into `destination`. On error nothing is
     /// appended.
     pub fn plan(&mut self, destination: &Strided<'_>, source: &Strided<'_>) -> Result<()> {
+        self.plan_within(destination, source, [u64::MAX; 2])
+    }
+
+    /// Appends the copies of `source` into `destination` as [`Self::plan`]
+    /// does, none of which addresses more than `spans[0]` bytes of the
+    /// destination or `spans[1]` bytes of the source, from its first byte to
+    /// its last. Memory mapped in segments that are unmapped apart needs
+    /// this: the driver refuses a pitched copy whose range holds an unmapped
+    /// segment, although every row it moves is mapped. An axis that would
+    /// reach farther is enumerated instead.
+    ///
+    /// Fails when a contiguous run is longer than its operand's span.
+    pub fn plan_within(
+        &mut self,
+        destination: &Strided<'_>,
+        source: &Strided<'_>,
+        spans: [u64; 2],
+    ) -> Result<()> {
         let mut axes = axes(destination, source)?;
         if axes.iter().any(|axis| axis.extent == 0) {
             return Ok(());
@@ -100,18 +118,37 @@ impl StridedCopy {
             width = mul(width, axes.remove(index).extent)?;
         }
 
+        if width > spans[0].min(spans[1]) {
+            return Err(Error::invalid(format!(
+                "a contiguous run of {width} bytes exceeds the {} bytes one copy may address",
+                spans[0].min(spans[1])
+            )));
+        }
+
+        // The bytes an axis of `extent` elements `stride` apart addresses
+        // over runs of `inner` bytes.
+        let reach =
+            |extent: u64, stride: u64, inner: u64| (extent - 1).saturating_mul(stride) + inner;
         let rows = longest(&axes, |axis| {
             axis.destination >= width
                 && axis.source >= width
                 && axis.destination <= self.max_pitch
                 && axis.source <= self.max_pitch
+                && reach(axis.extent, axis.destination, width) <= spans[0]
+                && reach(axis.extent, axis.source, width) <= spans[1]
         })
         .map(|index| axes.remove(index));
 
         let layers = rows.and_then(|rows| {
+            let inner = [
+                reach(rows.extent, rows.destination, width),
+                reach(rows.extent, rows.source, width),
+            ];
             longest(&axes, |axis| {
                 whole_rows(axis.destination, rows.destination, rows.extent)
                     && whole_rows(axis.source, rows.source, rows.extent)
+                    && reach(axis.extent, axis.destination, inner[0]) <= spans[0]
+                    && reach(axis.extent, axis.source, inner[1]) <= spans[1]
             })
             .map(|index| axes.remove(index))
         });
@@ -351,6 +388,26 @@ mod tests {
         source_strides: &[i64],
         max_pitch: usize,
     ) -> StridedCopy {
+        check_within(
+            shape,
+            element,
+            destination_strides,
+            source_strides,
+            max_pitch,
+            [u64::MAX; 2],
+        )
+    }
+
+    /// [`check`] with copies that address at most `spans` bytes of each
+    /// operand.
+    fn check_within(
+        shape: &[u64],
+        element: usize,
+        destination_strides: &[i64],
+        source_strides: &[i64],
+        max_pitch: usize,
+        spans: [u64; 2],
+    ) -> StridedCopy {
         let source: Vec<u8> = (0..extent(shape, source_strides, element))
             .map(|index| (index * 7 + 3) as u8)
             .collect();
@@ -359,7 +416,7 @@ mod tests {
         let mut expected = vec![0_u8; destination_bytes];
 
         let mut plan = StridedCopy::new(SourceOrder::Stream, max_pitch);
-        plan.plan(
+        plan.plan_within(
             &Strided {
                 address: BASE,
                 element_bytes: element,
@@ -372,6 +429,7 @@ mod tests {
                 shape,
                 strides: source_strides,
             },
+            spans,
         )
         .unwrap();
 
@@ -386,6 +444,49 @@ mod tests {
         );
         assert_eq!(planned, expected);
         plan
+    }
+
+    /// A cache page of 4 tokens of 6 columns of 8 two-byte elements, the
+    /// columns 1000 elements apart in planes whose segments are 400 bytes,
+    /// frozen into a contiguous staging: unbounded, each token is one copy
+    /// across the columns; bounded by the segment, each column is one copy
+    /// of its tokens.
+    #[test]
+    fn copies_address_no_more_than_their_spans() {
+        let (shape, destination, source) = ([4_u64, 6, 8], [48_i64, 8, 1], [8_i64, 1000, 1]);
+        let unbounded = check(&shape, 2, &destination, &source, 1 << 20);
+        assert_eq!(unbounded.pitched().len(), 4);
+        assert!(
+            unbounded
+                .pitched()
+                .copies()
+                .iter()
+                .all(|copy| copy.height == 6 && copy.source_pitch == 2000)
+        );
+
+        let bounded = check_within(&shape, 2, &destination, &source, 1 << 20, [u64::MAX, 400]);
+        let copies = bounded.pitched().copies();
+        assert_eq!(copies.len(), 6);
+        for copy in copies {
+            let reach = ((copy.depth - 1) * copy.source_layer + copy.height - 1)
+                * copy.source_pitch
+                + copy.width;
+            assert!(copy.height == 4 && reach <= 400, "{copy:?}");
+        }
+
+        let mut plan = StridedCopy::new(SourceOrder::Stream, 1 << 20);
+        let operand = |strides| Strided {
+            address: BASE,
+            element_bytes: 2,
+            shape: &shape,
+            strides,
+        };
+        assert!(
+            plan.plan_within(&operand(&destination), &operand(&destination), [32, 32])
+                .is_err(),
+            "a contiguous run of 192 bytes exceeds a 32-byte span"
+        );
+        assert!(plan.is_empty());
     }
 
     #[test]

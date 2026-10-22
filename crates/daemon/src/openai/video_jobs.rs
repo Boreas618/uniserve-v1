@@ -14,6 +14,11 @@
 //!   a job and artifacts held by an unfinished download. Retained artifacts
 //!   are shared-memory mappings, so this is the memory the store may hold.
 //! - `retention`, after which a completed or failed job's record is deleted.
+//!
+//! A hot restart hands the store's records and artifacts to the successor
+//! daemon ([`VideoJobs::hand_over`]): the jobs still generating finish on
+//! this daemon, which relays each later change of their records, and their
+//! artifacts, to the successor ([`VideoJobs::adopt`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -21,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use proto::request::ArtifactMedia;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -36,10 +41,10 @@ use crate::output::video::VideoStreamError;
 /// the video routes create the record, `in_progress` after
 /// `VideoJobs::progress`, and `completed` or `failed` after
 /// `VideoJobs::finish`.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct VideoJob {
     pub id: String,
-    pub object: &'static str,
+    pub object: String,
     pub model: String,
     pub created_at: u64,
     pub completed_at: Option<u64>,
@@ -56,7 +61,7 @@ pub(crate) struct VideoJob {
     pub num_frames: u32,
     /// The generated canvas, `WxH` in pixels.
     pub size: String,
-    pub status: &'static str,
+    pub status: String,
     /// `queued`, then the phases the generation task reports from runtime
     /// events, then `completed` or `failed`.
     pub phase: String,
@@ -154,16 +159,16 @@ impl StageClock {
 ///
 /// The code is the video stream error's (`VideoStreamError::code`), or
 /// `artifact_capacity_exceeded` from `VideoJobs::finish`.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct VideoFailure {
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
 }
 
 impl From<VideoStreamError> for VideoFailure {
     fn from(error: VideoStreamError) -> Self {
         Self {
-            code: error.code(),
+            code: error.code().to_owned(),
             message: error.to_string(),
         }
     }
@@ -189,6 +194,13 @@ pub(crate) struct RetainedMedia {
     _bytes: OwnedSemaphorePermit,
 }
 
+impl RetainedMedia {
+    /// The shared-memory object holding the bytes, when they have one.
+    pub(crate) fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.media.descriptor()
+    }
+}
+
 impl std::ops::Deref for RetainedMedia {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -202,10 +214,16 @@ impl AsRef<[u8]> for RetainedMedia {
     }
 }
 
+/// Where a daemon a hot restart replaced sends each change of a job it
+/// still generates: the record, and the artifact once it completed.
+pub(crate) type Relay = Box<dyn Fn(&VideoJob, Option<&Arc<RetainedMedia>>) + Send + Sync>;
+
 /// Process-local job table, its byte budget, and its generation tasks.
 pub(crate) struct VideoJobs {
     /// Jobs keyed by public job ID.
     entries: Mutex<BTreeMap<String, RetainedJob>>,
+    /// Set once the store was handed to a successor ([`Self::hand_over`]).
+    relay: Mutex<Option<Relay>>,
     /// One permit per retained artifact byte, up to the configured budget.
     bytes: Arc<Semaphore>,
     /// The configured retention and byte budget.
@@ -222,6 +240,7 @@ impl VideoJobs {
     pub(crate) fn new(settings: VideoJobOptions, shutdown: CancellationToken) -> Self {
         Self {
             entries: Mutex::default(),
+            relay: Mutex::new(None),
             bytes: Arc::new(Semaphore::new(settings.max_bytes)),
             settings,
             shutdown,
@@ -285,9 +304,10 @@ impl VideoJobs {
     /// An unknown or deleted ID is ignored.
     pub(crate) fn progress(&self, id: &str, phase: &str, steps: u32) {
         if let Some(job) = self.entries().get_mut(id) {
-            job.record.status = "in_progress";
+            job.record.status = "in_progress".to_owned();
             job.record.phase = phase.to_owned();
             job.record.completed_steps = steps;
+            self.relay(&job.record, None);
         }
     }
 
@@ -322,7 +342,7 @@ impl VideoJobs {
                     _bytes: permit,
                 })),
                 None => Err(VideoFailure {
-                    code: "artifact_capacity_exceeded",
+                    code: "artifact_capacity_exceeded".to_owned(),
                     message: format!(
                         "retained videos and active downloads exceed the {}-byte limit",
                         self.settings.max_bytes
@@ -339,7 +359,7 @@ impl VideoJobs {
         job.record.expires_at = Some(now + self.settings.retention.as_secs());
         match result {
             Ok(media) => {
-                job.record.status = "completed";
+                job.record.status = "completed".to_owned();
                 job.record.completed_steps = job.record.total_steps;
                 job.record.phase = "completed".to_owned();
                 if let Some(timing) = timing {
@@ -349,11 +369,13 @@ impl VideoJobs {
                 job.media = Some(media);
             }
             Err(error) => {
-                job.record.status = "failed";
+                job.record.status = "failed".to_owned();
                 job.record.phase = "failed".to_owned();
                 job.record.error = Some(error);
             }
         }
+
+        self.relay(&job.record, job.media.as_ref());
 
         // The expiry timer holds only a clone of the token and a `Weak` handle,
         // so a pending timer does not keep `VideoJobs` alive. `delete` and
@@ -371,6 +393,78 @@ impl VideoJobs {
                 jobs.delete(&id);
             }
         });
+    }
+
+    /// Every record and artifact, for the successor of a hot restart to go
+    /// on with ([`Self::adopt`]); each later change of a job, which this
+    /// store's generation tasks still make, goes to `relay`.
+    pub(crate) fn hand_over(&self, relay: Relay) -> Vec<(VideoJob, Option<Arc<RetainedMedia>>)> {
+        let entries = self.entries();
+        *self.relay.lock().unwrap_or_else(PoisonError::into_inner) = Some(relay);
+        entries
+            .values()
+            .map(|job| (job.record.clone(), job.media.clone()))
+            .collect()
+    }
+
+    /// Sends a job's change to the successor, once the store was handed
+    /// over.
+    fn relay(&self, record: &VideoJob, media: Option<&Arc<RetainedMedia>>) {
+        if let Some(relay) = self
+            .relay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            relay(record, media);
+        }
+    }
+
+    /// Takes a job a daemon a hot restart replaced holds, or a change of
+    /// it: its record, and its artifact once it completed, which then counts
+    /// against this store's byte budget. A completed or failed job expires
+    /// after the retention, as one this store finished. The generation
+    /// stays the replaced daemon's: deleting the job here forgets it.
+    ///
+    /// Must run inside a Tokio runtime, because it spawns the timer task.
+    pub(crate) fn adopt(self: &Arc<Self>, record: VideoJob, media: Option<Arc<dyn ArtifactMedia>>) {
+        let media = media.and_then(|media| {
+            let bytes = u32::try_from(media.bytes().len()).ok()?;
+            let permit = Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok()?;
+            Some(Arc::new(RetainedMedia {
+                media,
+                _bytes: permit,
+            }))
+        });
+        let ended = record.completed_at.is_some();
+        let id = record.id.clone();
+        let cancellation = {
+            let mut entries = self.entries();
+            let job = entries.entry(id.clone()).or_insert_with(|| RetainedJob {
+                record: record.clone(),
+                media: None,
+                cancellation: self.shutdown.child_token(),
+            });
+            let started_expiry = job.record.completed_at.is_some();
+            job.record = record;
+            if media.is_some() {
+                job.media = media;
+            }
+            (ended && !started_expiry).then(|| job.cancellation.clone())
+        };
+        if let Some(expiry_cancellation) = cancellation {
+            let weak = Arc::downgrade(self);
+            let retention = self.settings.retention;
+            self.tasks.spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(retention) => {}
+                    _ = expiry_cancellation.cancelled() => return,
+                }
+                if let Some(jobs) = weak.upgrade() {
+                    jobs.delete(&id);
+                }
+            });
+        }
     }
 
     /// Returns the artifact of a successfully completed job.
@@ -401,7 +495,7 @@ mod tests {
     fn record(id: &str) -> VideoJob {
         VideoJob {
             id: id.to_owned(),
-            object: "video",
+            object: "video".to_owned(),
             model: "FastH3".to_owned(),
             created_at: crate::openai::unix_time(),
             completed_at: None,
@@ -410,7 +504,7 @@ mod tests {
             actual_seconds: 124.0 / 24.0,
             num_frames: 124,
             size: "1344x768".to_owned(),
-            status: "queued",
+            status: "queued".to_owned(),
             phase: "queued".to_owned(),
             completed_steps: 0,
             total_steps: 4,
@@ -444,7 +538,7 @@ mod tests {
         jobs.progress("video-a", "denoising", 2);
         let running = jobs.get("video-a").unwrap();
         assert_eq!(
-            (running.status, running.completed_steps),
+            (running.status.as_str(), running.completed_steps),
             ("in_progress", 2)
         );
 
@@ -455,7 +549,7 @@ mod tests {
         jobs.finish(
             "video-a",
             Err(VideoFailure {
-                code: "cancelled",
+                code: "cancelled".to_owned(),
                 message: "cancelled".into(),
             }),
             None,
@@ -478,7 +572,7 @@ mod tests {
         jobs.finish(
             "video-0",
             Err(VideoFailure {
-                code: "generation_failed",
+                code: "generation_failed".to_owned(),
                 message: "decoder failed".into(),
             }),
             None,

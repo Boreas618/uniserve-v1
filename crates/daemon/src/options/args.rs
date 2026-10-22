@@ -108,6 +108,11 @@ pub struct ServeArgs {
     /// exit.
     #[arg(long)]
     pub print_config: bool,
+    /// Take a deployment over from the daemon at the other end of the
+    /// handoff socket at this descriptor, as `POST /admin/restart` starts
+    /// its successor (`daemon::restart`); every other argument is ignored.
+    #[arg(long, hide = true)]
+    pub takeover: Option<i32>,
 }
 
 /// The configuration paths an invocation stated: every table and option the
@@ -138,6 +143,16 @@ impl Stated {
     }
 
     /// Whether the option or table at `path` was stated.
+    /// The stated paths, as a hot restart hands them to the successor.
+    pub fn paths(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+
+    /// The statement of `paths`, as [`Stated::paths`] gave them.
+    pub fn from_paths(paths: Vec<String>) -> Self {
+        Self(paths.into_iter().collect())
+    }
+
     pub fn contains(&self, path: &str) -> bool {
         self.0.contains(path)
     }
@@ -179,23 +194,7 @@ impl ServeArgs {
         for (path, value) in assignments(&self.set)? {
             set(&mut tree, &path, value)?;
         }
-
-        let stated = Stated::of(&tree);
-        let mut config: ServeConfig = serde_path_to_error::deserialize(Value::Table(tree))
-            .map_err(|error| {
-                let path = error.path().to_string();
-                let cause = error.into_inner();
-                if path == "." {
-                    anyhow!("invalid configuration: {cause}")
-                } else {
-                    anyhow!("invalid option `{path}`: {cause}")
-                }
-            })?;
-        // The environment supplies the key the configuration leaves unset or
-        // blank.
-        config.server_config.api_key =
-            super::configured_api_key(config.server_config.api_key.as_deref());
-        Ok((config, stated))
+        configured(tree)
     }
 
     /// The values the flags state, by configuration path.
@@ -260,6 +259,41 @@ impl ServeArgs {
     }
 }
 
+/// The configuration of a TOML tree of options, with the paths it states.
+fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
+    let stated = Stated::of(&tree);
+    let mut config: ServeConfig =
+        serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
+            let path = error.path().to_string();
+            let cause = error.into_inner();
+            if path == "." {
+                anyhow!("invalid configuration: {cause}")
+            } else {
+                anyhow!("invalid option `{path}`: {cause}")
+            }
+        })?;
+    // The environment supplies the key the configuration leaves unset or
+    // blank.
+    config.server_config.api_key =
+        super::configured_api_key(config.server_config.api_key.as_deref());
+    Ok((config, stated))
+}
+
+/// Resolves a configuration from `text`, a TOML file's contents, overridden
+/// by the `--set` assignments `sets`, as [`ServeArgs::resolve`] does for a
+/// command line without flags.
+///
+/// # Errors
+///
+/// Fails as [`ServeArgs::resolve`] fails.
+pub fn resolve_text(text: &str, sets: &[String]) -> anyhow::Result<(ServeConfig, Stated)> {
+    let mut tree = text.parse::<Table>().context("parsing the configuration")?;
+    for (path, value) in assignments(sets)? {
+        set(&mut tree, &path, value)?;
+    }
+    configured(tree)
+}
+
 /// Prints a configuration as TOML.
 ///
 /// # Errors
@@ -267,6 +301,37 @@ impl ServeArgs {
 /// Fails when a value has no TOML form.
 pub fn printed(config: &ServeConfig) -> anyhow::Result<String> {
     toml::to_string_pretty(config).context("printing the configuration")
+}
+
+/// `config` with the `--set` assignments `texts` applied over it, as
+/// [`ServeArgs::resolve`] applies them over the file and the flags, and the
+/// paths they assign. The API key is the one `config` holds.
+///
+/// # Errors
+///
+/// Fails as [`ServeArgs::resolve`] fails on an assignment: one that is
+/// malformed or conflicts with another, a path that crosses an option that
+/// is not a table, or a value its option does not take.
+pub fn overridden(
+    config: &ServeConfig,
+    texts: &[String],
+) -> anyhow::Result<(ServeConfig, Vec<String>)> {
+    let mut tree = match Value::try_from(config).context("encoding the configuration")? {
+        Value::Table(tree) => tree,
+        _ => return Err(anyhow!("the configuration is not a table")),
+    };
+    let mut paths = Vec::new();
+    for (path, value) in assignments(texts)? {
+        paths.push(path.join("."));
+        set(&mut tree, &path, value)?;
+    }
+    let mut overridden: ServeConfig = serde_path_to_error::deserialize(Value::Table(tree))
+        .map_err(|error| {
+            let path = error.path().to_string();
+            anyhow!("invalid option `{path}`: {}", error.into_inner())
+        })?;
+    overridden.server_config.api_key = config.server_config.api_key.clone();
+    Ok((overridden, paths))
 }
 
 /// Parses `--set` assignments into paths and values.

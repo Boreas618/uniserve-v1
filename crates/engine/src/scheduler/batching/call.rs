@@ -129,7 +129,7 @@ impl Scheduler {
                 Some(CacheLengths { visible, input: 1 })
             }
             CallKind::Forward(ForwardMode::TokenDenoising)
-            | CallKind::Transfer(TransferMode::CacheExport)
+            | CallKind::Transfer(TransferMode::CacheExport | TransferMode::CacheInstall)
             | CallKind::Media(MediaCall::LatentPreparation)
             | CallKind::Media(MediaCall::Denoising) => Some(CacheLengths { visible, input: 0 }),
             _ => None,
@@ -229,10 +229,14 @@ impl Scheduler {
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.
-            if admitted {
+            // A hand-off's install declares them to the decode group, which
+            // has seen none.
+            let declares_all =
+                admitted || call.kind == CallKind::Transfer(TransferMode::CacheInstall);
+            if declares_all {
                 allocation.clear_sent();
             }
-            let fresh_since = if admitted {
+            let fresh_since = if declares_all {
                 Some(0)
             } else {
                 (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))

@@ -204,6 +204,16 @@ impl Scheduler {
                 "generation request requires worker feature `{feature}`, but the worker does not support it"
             ));
         }
+        if let Some(refusal) = self.uncaptured_image(req) {
+            return Err(refusal);
+        }
+        // A prefill group hands a request's cache to a decode group once,
+        // after its prompt: such a deployment generates text.
+        if self.splits_prefill()
+            && (req.generates_images() || req.is_readout() || self.config.canvas.is_some())
+        {
+            return Err("a deployment of prefill and decode groups generates text only".into());
+        }
         // Resource validation includes the cache bound, so a request that passes
         // it has a worst-case cache token count.
         req.validate_resources(&self.generation_limits)
@@ -264,6 +274,7 @@ impl Scheduler {
             image_reservation_pending: false,
             denoising: Denoising::new(u32::from(req.image.steps)),
             image_conditioning: None,
+            handoff_export: None,
             feedback_encoder_index: 0,
             feedback_source: None,
             feedback_features: None,
@@ -673,8 +684,8 @@ impl Scheduler {
     /// reserved, leaving it at the queue head. A broken scheduler invariant
     /// also requeues the request, latches engine-fatal, and stops.
     pub(super) fn admit_media(&mut self) {
-        // A closing scheduler admits nothing more.
-        if self.closing {
+        // A closing scheduler admits nothing more, nor does one that sleeps.
+        if self.closing || self.admission_sleeps() {
             return;
         }
         while self.running_request_count() < self.config.max_running_requests {
@@ -827,6 +838,50 @@ impl Scheduler {
     pub(super) fn num_vae(&self, ip: &ipc::ImageParams) -> u64 {
         let dl = u64::from(self.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
+    }
+
+    /// Whether some worker group prefills only (`WorkerGroupRole::Prefill`),
+    /// its requests decoding on decode groups.
+    fn splits_prefill(&self) -> bool {
+        !self.placement.prefill_groups.is_empty()
+    }
+
+    /// Why the image denoiser cannot denoise `req`'s images, if so: under
+    /// CUDA graphs it denoises only the steps it captured
+    /// (`WorkerInfo::captured_images`), and a request's steps evaluate one
+    /// guidance branch up to its own branch count.
+    fn uncaptured_image(&self, req: &GenerationRequest) -> Option<String> {
+        let captured = self.info.captured_images.as_ref()?;
+        if !req.generates_images() {
+            return None;
+        }
+        let (height, width) = (req.image.height, req.image.width);
+        let branches = req.image.cfg_branch_count();
+        let covered = (1..=branches).all(|branches| {
+            captured.contains(&ipc::CapturedImage {
+                height,
+                width,
+                branches,
+            })
+        });
+        if covered {
+            return None;
+        }
+        let mut sizes: Vec<String> = captured
+            .iter()
+            .filter(|shape| shape.branches == branches)
+            .map(|shape| format!("{}x{}", shape.width, shape.height))
+            .collect();
+        sizes.dedup();
+        Some(format!(
+            "the workers serve {width}x{height} images with {branches} guidance branches \
+             under CUDA graphs only at the sizes they captured: {}",
+            if sizes.is_empty() {
+                "none".to_owned()
+            } else {
+                sizes.join(", ")
+            }
+        ))
     }
 
     /// Returns a required runtime feature that the worker lacks.
@@ -1053,8 +1108,8 @@ impl Scheduler {
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
     pub(super) fn admit(&mut self) {
-        // A closing scheduler admits nothing more.
-        if self.closing {
+        // A closing scheduler admits nothing more, nor does one that sleeps.
+        if self.closing || self.admission_sleeps() {
             return;
         }
         loop {
@@ -1082,7 +1137,7 @@ impl Scheduler {
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
                     <= self.storage.encoder_cache.budget();
-                if need > self.storage.usable_units() {
+                if need > self.storage.capacity_units() {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
@@ -1172,7 +1227,7 @@ impl Scheduler {
                 // The prompt alone must fit the pool: every full-attention page
                 // and each sliding-window group's pages of one chunk.
                 if cache.coordinator.min_units_for_prompt(n, chunk_limit)
-                    > self.storage.usable_units()
+                    > self.storage.capacity_units()
                 {
                     let Some(st) = self.waiting.pop_front() else {
                         break;

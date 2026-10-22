@@ -496,6 +496,59 @@ fn poll(fd: RawFd, events: libc::c_short, timeout: Option<Duration>) -> std::io:
     }
 }
 
+/// A connection's socket as it crosses to another process, as a daemon's
+/// hot restart hands its connections to its successor: the socket, whether
+/// it is a Unix socket, and the bytes received and not yet taken as frames.
+pub struct Handed {
+    pub descriptor: OwnedFd,
+    pub unix: bool,
+    pub received: Vec<u8>,
+}
+
+impl Connection {
+    /// Closes the connection both ways at once, whichever handles of its
+    /// socket this process holds: the peer reads its end, and a thread
+    /// waiting on another handle of the socket wakes.
+    pub fn close(&self) {
+        let _ = match &self.stream {
+            Stream::Unix(stream) => stream.shutdown(std::net::Shutdown::Both),
+            Stream::Tcp(stream) => stream.shutdown(std::net::Shutdown::Both),
+        };
+    }
+
+    /// The connection's socket and the bytes it received and did not take,
+    /// for another process to go on with ([`Connection::resume`]). Received
+    /// descriptors not yet taken are closed: the connections a daemon hands
+    /// over carry none between messages.
+    pub fn hand_over(self) -> Handed {
+        let (descriptor, unix) = match self.stream {
+            Stream::Unix(stream) => (OwnedFd::from(stream), true),
+            Stream::Tcp(stream) => (OwnedFd::from(stream), false),
+        };
+        Handed {
+            descriptor,
+            unix,
+            received: self.received,
+        }
+    }
+
+    /// Goes on with a connection another process handed over.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be made non-blocking.
+    pub fn resume(handed: Handed) -> Result<Self> {
+        let stream = if handed.unix {
+            Stream::Unix(UnixStream::from(handed.descriptor))
+        } else {
+            Stream::Tcp(TcpStream::from(handed.descriptor))
+        };
+        let mut connection = Self::from_stream(stream)?;
+        connection.received = handed.received;
+        Ok(connection)
+    }
+}
+
 /// A listening socket that hands out connections.
 pub struct Listener {
     socket: ListeningSocket,
@@ -545,6 +598,38 @@ impl Listener {
             ListeningSocket::Unix(listener) => listener.as_raw_fd(),
             ListeningSocket::Tcp(listener) => listener.as_raw_fd(),
         }
+    }
+
+    /// The listening socket, whether it is a Unix socket, and its address,
+    /// for another process to go on with ([`Listener::resume`]).
+    pub fn hand_over(self) -> (OwnedFd, bool, String) {
+        match self.socket {
+            ListeningSocket::Unix(listener) => (OwnedFd::from(listener), true, self.address),
+            ListeningSocket::Tcp(listener) => (OwnedFd::from(listener), false, self.address),
+        }
+    }
+
+    /// Goes on with a listening socket another process handed over, bound
+    /// at `address`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be made non-blocking.
+    pub fn resume(descriptor: OwnedFd, unix: bool, address: String) -> Result<Self> {
+        let socket = if unix {
+            let listener = UnixListener::from(descriptor);
+            listener
+                .set_nonblocking(true)
+                .map_err(io("making a listener pollable"))?;
+            ListeningSocket::Unix(listener)
+        } else {
+            let listener = TcpListener::from(descriptor);
+            listener
+                .set_nonblocking(true)
+                .map_err(io("making a listener pollable"))?;
+            ListeningSocket::Tcp(listener)
+        };
+        Ok(Self { socket, address })
     }
 
     /// Accepts one waiting connection; `None` when none waits.

@@ -260,6 +260,7 @@ impl ProcessClient {
                 .map_err(|_| anyhow::anyhow!("a claim token is not 16 bytes"))?,
             // The engine states whether its workers use the host KV cache.
             host_kv_cache: false,
+            host_kv_cache_bytes: None,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
             // The engine states whether a group stands by, and how.
             standby: false,

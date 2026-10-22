@@ -601,3 +601,295 @@ impl PeerMapping {
         self.bytes == 0
     }
 }
+
+/// A reserved virtual range whose segments are physical allocations of
+/// their own, each mapped, released and mapped again at its own place:
+/// memory whose parts are given back while every address stays valid, as a
+/// KV cache that shrinks for a standby engine and grows back after.
+///
+/// Each segment a mapping creates exports a POSIX descriptor, which a
+/// Storage Server retains, and another process maps the same segment from
+/// it. Dropping the mapping queues the teardown of its mapped segments and
+/// of the range to the reclaimer.
+pub struct SegmentedMapping {
+    device: DeviceId,
+    address: u64,
+    bytes: usize,
+    /// The devices granted access, `device` first.
+    access: Vec<DeviceId>,
+    protection: Protection,
+    /// Each segment's offset and length, and its handle while mapped.
+    segments: Vec<(usize, usize, Option<u64>)>,
+    // Declared last so that the fields above stay valid until teardown.
+    range: VirtualRange,
+}
+
+impl SegmentedMapping {
+    /// Reserves a range of segments of `lengths` bytes, back to back, each
+    /// a multiple of the descriptor handles' granularity on `device`, which
+    /// `device` and every device of `access` address once mapped. No
+    /// segment is mapped yet.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a length is not a positive multiple of the granularity or
+    /// the range cannot be reserved.
+    pub fn reserve(device: DeviceId, lengths: &[usize], access: &[DeviceId]) -> Result<Self> {
+        let granularity = HandleType::Descriptor.granularity(device)?;
+        if lengths.is_empty()
+            || lengths
+                .iter()
+                .any(|bytes| *bytes == 0 || !bytes.is_multiple_of(granularity))
+        {
+            return Err(Error::invalid(format!(
+                "segments must be positive multiples of the {granularity}-byte granularity"
+            )));
+        }
+        let mut segments = Vec::with_capacity(lengths.len());
+        let mut total = 0_usize;
+        for bytes in lengths {
+            segments.push((total, *bytes, None));
+            total = total
+                .checked_add(*bytes)
+                .ok_or_else(|| Error::invalid("the segmented range's size overflows"))?;
+        }
+        let mut devices = vec![device];
+        devices.extend(access.iter().filter(|peer| **peer != device));
+        let context = PrimaryContext::retain(device)?;
+        let _guard = context.enter()?;
+        let mut range = VirtualRange::new(context.clone());
+        range.reserve(total, granularity)?;
+        Ok(Self {
+            device,
+            address: range.address(),
+            bytes: total,
+            access: devices,
+            protection: Protection::ReadWrite,
+            segments,
+            range,
+        })
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// The device address of byte 0.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// The segments' count.
+    pub fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Segment `index`'s length; zero for a segment that does not exist.
+    pub fn segment_len(&self, index: usize) -> usize {
+        self.segments.get(index).map_or(0, |(_, bytes, _)| *bytes)
+    }
+
+    /// Whether segment `index` is mapped.
+    pub fn is_mapped(&self, index: usize) -> bool {
+        self.segments
+            .get(index)
+            .is_some_and(|(_, _, handle)| handle.is_some())
+    }
+
+    /// Creates the physical memory of segment `index`, maps it with the
+    /// mapping's protection, and returns its POSIX descriptor for a Storage
+    /// Server to retain. The segment is mapped from the descriptor, as
+    /// another process maps it, and the creating handle is released: NVML
+    /// then attributes the memory to no process, as it does the other
+    /// memory a Storage Server retains.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the segment is mapped already or the driver refuses.
+    pub fn create(&mut self, index: usize) -> Result<OwnedFd> {
+        let (_, bytes) = self.unmapped(index)?;
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        let properties = MemAllocationProp::device(
+            self.device.handle()?,
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+        );
+        let driver = driver()?;
+        let mut handle = 0;
+        driver.check(
+            // SAFETY: the driver reads the borrowed properties and writes one
+            // handle to the local `handle`.
+            unsafe { (driver.mem_create)(&mut handle, bytes, &properties, 0) },
+            "cuMemCreate",
+        )?;
+        let exported = ShareableHandle::export(handle, HandleType::Descriptor);
+        let ShareableHandle::Descriptor(descriptor) = (match exported {
+            Ok(exported) => exported,
+            Err(error) => {
+                // SAFETY: the handle is this function's own reference.
+                unsafe { (driver.mem_release)(handle) };
+                return Err(error);
+            }
+        }) else {
+            // SAFETY: the handle is this function's own reference.
+            unsafe { (driver.mem_release)(handle) };
+            return Err(Error::invalid(
+                "a descriptor export returned a fabric handle",
+            ));
+        };
+        let mapped = self.import(index, &descriptor);
+        // SAFETY: the handle is this function's own reference; the mapping,
+        // when made, holds the memory through its imported handle.
+        driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease")?;
+        mapped?;
+        Ok(descriptor)
+    }
+
+    /// Maps segment `index` from the POSIX descriptor of a physical
+    /// allocation of its length, as another process created it, with the
+    /// mapping's protection.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the segment is mapped already or the driver refuses.
+    pub fn import(&mut self, index: usize, descriptor: &OwnedFd) -> Result<()> {
+        let (offset, bytes) = self.unmapped(index)?;
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        let duplicate = descriptor
+            .try_clone()
+            .map_err(|error| Error::invalid(format!("duplicating a descriptor: {error}")))?;
+        let handle = ShareableHandle::Descriptor(duplicate).import()?;
+        self.map(index, offset, bytes, handle)
+    }
+
+    /// Unmaps segment `index` and releases this process's reference to its
+    /// memory, at once: the caller has drained every device access to it.
+    /// The memory is freed once no other process maps it and no Storage
+    /// Server holds its descriptor. A segment that is not mapped is left
+    /// as it is.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver refuses.
+    pub fn release(&mut self, index: usize) -> Result<()> {
+        let Some((offset, bytes, handle)) = self.segments.get_mut(index) else {
+            return Err(Error::invalid(format!("segment {index} does not exist")));
+        };
+        let Some(handle) = handle.take() else {
+            return Ok(());
+        };
+        let address = self.address + *offset as u64;
+        let bytes = *bytes;
+        let context = PrimaryContext::retain(self.device)?;
+        in_context(context.raw(), |driver| {
+            // SAFETY: the segment was mapped by this mapping.
+            let unmapped =
+                driver.check(unsafe { (driver.mem_unmap)(address, bytes) }, "cuMemUnmap");
+            // SAFETY: the handle is this mapping's own reference.
+            let released = driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease");
+            unmapped.and(released)
+        })
+    }
+
+    /// Changes every mapped segment's access in place, at unchanged
+    /// addresses; segments mapped later take the same protection.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver refuses.
+    pub fn protect(&mut self, protection: Protection) -> Result<()> {
+        self.protection = protection;
+        let context = PrimaryContext::retain(self.device)?;
+        let _guard = context.enter()?;
+        for index in 0..self.segments.len() {
+            let (offset, bytes, handle) = self.segments[index];
+            if handle.is_some() {
+                self.grant(offset, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Segment `index`'s offset and length, when it is not mapped.
+    fn unmapped(&self, index: usize) -> Result<(usize, usize)> {
+        match self.segments.get(index) {
+            None => Err(Error::invalid(format!("segment {index} does not exist"))),
+            Some((_, _, Some(_))) => Err(Error::invalid(format!("segment {index} is mapped"))),
+            Some((offset, bytes, None)) => Ok((*offset, *bytes)),
+        }
+    }
+
+    /// Maps `handle` at segment `index` and grants its access. Runs with the
+    /// mapping's context current.
+    fn map(&mut self, index: usize, offset: usize, bytes: usize, handle: u64) -> Result<()> {
+        let driver = driver()?;
+        let address = self.address + offset as u64;
+        let mapped = driver.check(
+            // SAFETY: the target lies inside the reserved range, unmapped.
+            unsafe { (driver.mem_map)(address, bytes, 0, handle, 0) },
+            "cuMemMap",
+        );
+        if let Err(error) = mapped {
+            // SAFETY: the handle is this mapping's own reference.
+            unsafe { (driver.mem_release)(handle) };
+            return Err(error);
+        }
+        self.segments[index].2 = Some(handle);
+        self.grant(offset, bytes)
+    }
+
+    /// Grants the mapping's protection over one mapped segment to every
+    /// device of `access`. Runs with the mapping's context current.
+    fn grant(&self, offset: usize, bytes: usize) -> Result<()> {
+        let descriptors = self
+            .access
+            .iter()
+            .map(|device| {
+                Ok(MemAccessDesc {
+                    location: MemLocation {
+                        kind: CU_MEM_LOCATION_TYPE_DEVICE,
+                        id: device.handle()?,
+                    },
+                    flags: self.protection.flags(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let driver = driver()?;
+        driver.check(
+            // SAFETY: the segment is mapped; the descriptors are live.
+            unsafe {
+                (driver.mem_set_access)(
+                    self.address + offset as u64,
+                    bytes,
+                    descriptors.as_ptr(),
+                    descriptors.len(),
+                )
+            },
+            "cuMemSetAccess",
+        )
+    }
+}
+
+impl Drop for SegmentedMapping {
+    fn drop(&mut self) {
+        // The range's teardown unmaps and releases what is still mapped,
+        // before it frees the addresses.
+        for (offset, bytes, handle) in &mut self.segments {
+            if let Some(handle) = handle.take() {
+                self.range
+                    .mapped
+                    .push((self.address + *offset as u64, *bytes));
+                self.range.handles.push(handle);
+            }
+        }
+    }
+}

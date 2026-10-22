@@ -130,6 +130,7 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 })
                 .collect(),
             generated_token_ids: request.generated_token_ids.clone(),
+            adapter: request.adapter,
         }
     }
 }
@@ -185,6 +186,7 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 })
                 .collect(),
             generated_token_ids: request.generated_token_ids,
+            adapter: request.adapter,
         })
     }
 }

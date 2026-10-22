@@ -80,11 +80,19 @@ async fn chat_completions(
 ) -> Response {
     let stream = body.stream;
     let request_id = format!("chatcmpl-{base_id}");
-    let (request, response) = match lower_chat_request(request_id, engine.served_model_name(), body)
-    {
+    // A request that names a loaded LoRA adapter as its model computes with
+    // it, and its response names the adapter.
+    let adapter = engine.adapter(&body.model);
+    let model = if adapter.is_some() {
+        body.model.clone()
+    } else {
+        engine.served_model_name().to_owned()
+    };
+    let (mut request, response) = match lower_chat_request(request_id, &model, body) {
         Ok(lowered) => lowered,
         Err(error) => return error.into_response(),
     };
+    request.adapter = adapter;
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %response.request_id,
@@ -1180,6 +1188,7 @@ pub fn lower_chat_request(
         image_params: request.image_config.as_ref().map(convert_image_config),
         priority: request.priority.unwrap_or(0),
         cache_salt: request.cache_salt,
+        adapter: None,
     };
     Ok((lowered, context))
 }

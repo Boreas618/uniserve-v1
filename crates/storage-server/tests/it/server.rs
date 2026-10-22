@@ -56,7 +56,7 @@ impl Running {
         let thread = std::thread::spawn(move || {
             let _lock = lock;
             // Pools of four 16-byte pages.
-            let mut server = Server::new(listener, 64, None).unwrap();
+            let mut server = Server::new(listener, 64, 0, None).unwrap();
             server.listen_tcp(tcp).unwrap();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
@@ -274,6 +274,82 @@ fn putting_a_retained_read_only_key_again_keeps_the_retained_bytes_for_both_scop
 }
 
 #[test]
+fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
+    let server = Running::start();
+    // The head stays connected, so another deployment's claim keeps this
+    // one.
+    let mut model_head = head(&server.socket);
+    let claim = model_head
+        .claim(vec![scope("text", 0), scope("text", 1)])
+        .unwrap();
+    let mut first = worker(&server.socket, scope("text", 0), 1, claim);
+    let storage = memfd(b"abcdefgh");
+    first
+        .put(
+            vec![
+                tensor(key(1), "a", 0, 0, Access::ReadOnly),
+                tensor(key(2), "b", 0, 4, Access::ReadOnly),
+                tensor(key(3), "planes", 0, 0, Access::Exclusive),
+            ],
+            &[(host(8), storage.as_fd())],
+        )
+        .unwrap();
+    // Another rank of the deployment holds `a` too.
+    let mut second = worker(&server.socket, scope("text", 1), 1, claim);
+    second.get(vec![key(1)], Mode::Read).unwrap();
+
+    // Refused, moving none: an exclusive tensor, a retained new key, or one
+    // new key twice.
+    assert_eq!(
+        server_error(first.rekey(vec![(key(1), key(11)), (key(3), key(13))])),
+        ErrorKind::Invalid
+    );
+    assert_eq!(
+        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(1))])),
+        ErrorKind::Invalid
+    );
+    assert_eq!(
+        server_error(first.rekey(vec![(key(1), key(11)), (key(2), key(11))])),
+        ErrorKind::Invalid
+    );
+    assert_eq!(
+        first.get(vec![key(1), key(2)], Mode::Read).unwrap().missing,
+        vec![]
+    );
+
+    // The deployment's tensors move with their scopes; the old keys name
+    // nothing more and the new ones the same bytes.
+    first
+        .rekey(vec![(key(1), key(11)), (key(2), key(12))])
+        .unwrap();
+    let got = second
+        .get(vec![key(1), key(11), key(12)], Mode::Read)
+        .unwrap();
+    assert_eq!(got.missing, vec![key(1)]);
+    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    assert_eq!(contents(descriptor), b"abcdefgh");
+    let listing = first.list().unwrap();
+    let a = listing
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "a")
+        .unwrap();
+    assert_eq!(a.scopes, vec![scope("text", 0), scope("text", 1)]);
+
+    // A tensor another deployment holds as well is not the caller's to move.
+    let other = scope_of("other");
+    let other_claim = head_of(&server.socket, "other")
+        .claim(vec![other.clone()])
+        .unwrap();
+    let mut stranger = worker(&server.socket, other, 1, other_claim);
+    stranger.get(vec![key(12)], Mode::Read).unwrap();
+    assert_eq!(
+        server_error(first.rekey(vec![(key(12), key(22))])),
+        ErrorKind::Held
+    );
+}
+
+#[test]
 fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     let server = Running::start();
     let claim = head(&server.socket).claim(vec![scope("flow", 0)]).unwrap();
@@ -455,7 +531,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     // The worker maps its pool on the host.
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let shape = PageShape {
-        content: key(3),
+        layout: key(3),
         kv_head_offset: 0,
         kv_head_count: 2,
         page_bytes: 16,
@@ -465,6 +541,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             &Request::PagePool {
                 shape,
                 numa_node: None,
+                bytes: None,
             },
             &[],
         )
@@ -558,7 +635,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     let claim = head.claim(vec![scope("text", 0)]).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let shape = PageShape {
-        content: key(3),
+        layout: key(3),
         kv_head_offset: 0,
         kv_head_count: 2,
         page_bytes: 16,
@@ -568,6 +645,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
             &Request::PagePool {
                 shape,
                 numa_node: None,
+                bytes: None,
             },
             &[],
         )
@@ -723,4 +801,208 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
             levels: vec![PageLevel::Host, PageLevel::Host, PageLevel::Absent]
         }
     );
+}
+
+/// A head of `deployment`.
+fn head_of(socket: &Path, deployment: &str) -> Client {
+    Client::connect(
+        socket,
+        Role::Head {
+            deployment: deployment.into(),
+        },
+    )
+    .unwrap()
+}
+
+/// The first worker of group `text` of `deployment`.
+fn scope_of(deployment: &str) -> Scope {
+    Scope {
+        deployment: deployment.into(),
+        group: "text".into(),
+        rank: 0,
+    }
+}
+
+/// The page pool `worker` maps for pages of 16 bytes, asking for `bytes`:
+/// its id and slots.
+fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Error> {
+    use storage::protocol::{PageShape, Reply, Request};
+
+    let shape = PageShape {
+        layout: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes: 16,
+    };
+    let answer = worker.call(
+        &Request::PagePool {
+            shape,
+            numa_node: None,
+            bytes,
+        },
+        &[],
+    )?;
+    match answer.reply {
+        Reply::PagePool { pool, slots, .. } => Ok((pool, slots)),
+        reply => panic!("a page pool request answered {reply:?}"),
+    }
+}
+
+#[test]
+fn page_pools_belong_to_their_deployment_and_leave_with_it() {
+    use storage::protocol::{Reply, Request};
+
+    let server = Running::start();
+    // The head stays connected, so another deployment's claim keeps this
+    // one.
+    let mut model_head = head_of(&server.socket, "model");
+    let claim = model_head.claim(vec![scope_of("model")]).unwrap();
+    let mut first = worker(&server.socket, scope_of("model"), 1, claim);
+    // A worker sizes its pool: two pages of 16 bytes.
+    let (pool, slots) = page_pool(&mut first, Some(32)).unwrap();
+    assert_eq!(slots, 2);
+    // The deployment's other workers of the same pages share it.
+    assert_eq!(page_pool(&mut first, None).unwrap(), (pool, 2));
+
+    // Another deployment's workers of the same pages have a pool of their
+    // own, which its head alone reaches.
+    let mut other_head = head_of(&server.socket, "other");
+    let other_claim = other_head.claim(vec![scope_of("other")]).unwrap();
+    let mut second = worker(&server.socket, scope_of("other"), 1, other_claim);
+    let (other_pool, other_slots) = page_pool(&mut second, None).unwrap();
+    assert_ne!(other_pool, pool);
+    assert_eq!(other_slots, 4);
+    let lookup = other_head
+        .call(
+            &Request::Lookup {
+                pool,
+                keys: vec![key(1)],
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        lookup.reply,
+        Reply::Error {
+            kind: ErrorKind::Invalid,
+            ..
+        }
+    ));
+    let owners: Vec<(u64, String)> = other_head
+        .list()
+        .unwrap()
+        .page_pools
+        .into_iter()
+        .map(|listed| (listed.pool, listed.deployment))
+        .collect();
+    assert_eq!(
+        owners,
+        vec![(pool, "model".to_owned()), (other_pool, "other".to_owned())]
+    );
+
+    // Retiring the other deployment releases its pool.
+    drop(second);
+    drop(other_head);
+    let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
+    retry(|| operator.retire("other".into()));
+    let pools: Vec<u64> = operator
+        .list()
+        .unwrap()
+        .page_pools
+        .into_iter()
+        .map(|listed| listed.pool)
+        .collect();
+    assert_eq!(pools, vec![pool]);
+}
+
+#[test]
+fn a_claim_retires_every_deployment_whose_head_is_gone() {
+    let server = Running::start();
+    // A deployment whose head leaves keeps a tensor and a page pool.
+    let mut gone = head_of(&server.socket, "gone");
+    let claim = gone.claim(vec![scope_of("gone")]).unwrap();
+    let mut gone_worker = worker(&server.socket, scope_of("gone"), 1, claim);
+    let storage = memfd(&[1; 4]);
+    gone_worker
+        .put(
+            vec![tensor(key(1), "gone", 0, 0, Access::ReadOnly)],
+            &[(host(4), storage.as_fd())],
+        )
+        .unwrap();
+    page_pool(&mut gone_worker, None).unwrap();
+    drop(gone_worker);
+    drop(gone);
+    // A deployment whose head stays keeps its pool.
+    let mut kept = head_of(&server.socket, "kept");
+    let kept_claim = kept.claim(vec![scope_of("kept")]).unwrap();
+    let mut kept_worker = worker(&server.socket, scope_of("kept"), 1, kept_claim);
+    let (kept_pool, _) = page_pool(&mut kept_worker, None).unwrap();
+
+    // A new deployment's claim retires the one whose head left, once the
+    // server has noticed it leave.
+    let mut operator = Client::connect(&server.socket, Role::Operator).unwrap();
+    for _ in 0..200 {
+        let listing = operator.list().unwrap();
+        if listing
+            .deployments
+            .iter()
+            .any(|listed| listed.deployment == "gone" && !listed.head_connected)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    head_of(&server.socket, "new")
+        .claim(vec![scope_of("new")])
+        .unwrap();
+    let listing = operator.list().unwrap();
+    assert!(listing.tensors.is_empty());
+    let deployments: Vec<String> = listing
+        .deployments
+        .into_iter()
+        .map(|listed| listed.deployment)
+        .collect();
+    assert!(!deployments.contains(&"gone".to_owned()));
+    assert!(deployments.contains(&"kept".to_owned()));
+    let pools: Vec<u64> = listing
+        .page_pools
+        .into_iter()
+        .map(|listed| listed.pool)
+        .collect();
+    assert_eq!(pools, vec![kept_pool]);
+}
+
+#[test]
+fn a_page_pool_the_hosts_memory_cannot_hold_is_refused() {
+    use storage::protocol::{PageShape, Request};
+
+    let server = Running::start();
+    let claim = head(&server.socket).claim(vec![scope("text", 0)]).unwrap();
+    let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
+    // A million pages of a GiB: a pebibyte, beyond any host's memory.
+    let shape = PageShape {
+        layout: key(3),
+        kv_head_offset: 0,
+        kv_head_count: 2,
+        page_bytes: 1 << 30,
+    };
+    let refused = worker
+        .call(
+            &Request::PagePool {
+                shape,
+                numa_node: None,
+                bytes: Some(1 << 50),
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        refused.reply,
+        storage::protocol::Reply::Error {
+            kind: ErrorKind::Resource,
+            ..
+        }
+    ));
+    let listing = worker.list().unwrap();
+    assert!(listing.page_pools.is_empty());
 }

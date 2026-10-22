@@ -11,11 +11,7 @@ from torch import nn
 from uniserve import prefix_cache
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.distributed.tokens import TokenShard
-from uniserve.nn.attention import (
-    Attention,
-    AttentionBatch,
-    AttentionParallelConfig,
-)
+from uniserve.nn.attention import AttentionBatch, AttentionParallelConfig
 from uniserve.nn.functional import add_rms_norm
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.routing import RoutedTensor, RouteSpan
@@ -35,6 +31,22 @@ class CacheLayer:
     window: int | None
     num_kv_heads: int
     head_dim: int
+
+
+def _cache_layers(layers) -> dict[str, prefix_cache.StateConfig]:
+    """The cache layers the decoder ``layers`` own, by cache name: every
+    module with a ``cache_name`` and a ``cache_state`` method
+    (``prefix_cache.StateConfig``), in the layers' dtype.
+    """  # noqa: D205
+    result = {}
+    for layer in layers.values():
+        # Parameters expose their logical dtype even for encoded weights.
+        dtype = next(layer.parameters()).dtype
+        for child in layer.modules():
+            name = getattr(child, "cache_name", None)
+            if name is not None and hasattr(child, "cache_state"):
+                result[name] = child.cache_state(dtype)
+    return result
 
 
 class PhasedLayer(nn.Module):
@@ -141,17 +153,21 @@ class TransformerDecoder(nn.Module):
         # Logical cache identities and geometry survive pipeline pruning.
         # Resource owners use this order to describe global K/V transfers,
         # including each cache group's complete layer axis, without retaining
-        # parameters or modules belonging to another pipeline stage.
-        cached = tuple(
-            child
-            for layer in layers.values()
-            for child in layer.modules()
-            if isinstance(child, Attention) and child.cache_name is not None
-        )
-        self.cache_names = tuple(child.cache_name for child in cached)
+        # parameters or modules belonging to another pipeline stage. Only
+        # paged layers transfer; a request's per-slot states do not.
+        paged: list[tuple[str, mha.Config]] = []
+        for name, layout in _cache_layers(layers).items():
+            if layout.indexing != "tokens":
+                continue
+            if not isinstance(layout, mha.Config):
+                raise TypeError(
+                    "a paged cache layer type subclasses mha.Config"
+                )
+            paged.append((name, layout))
+        self.cache_names = tuple(name for name, _ in paged)
         self.cache_layers = tuple(
-            CacheLayer(child.window, child.num_kv_heads, child.head_dim)
-            for child in cached
+            CacheLayer(layout.window, layout.num_kv_heads, layout.head_dim)
+            for _, layout in paged
         )
         if default_route is not None and (
             not isinstance(norm, nn.ModuleDict) or default_route not in norm
@@ -164,23 +180,7 @@ class TransformerDecoder(nn.Module):
 
     @property
     def cache_config(self) -> prefix_cache.Config:
-        result = {}
-        for layer in self.layers.values():
-            # Parameters expose their logical dtype even for encoded weights.
-            dtype = next(layer.parameters()).dtype
-            for child in layer.modules():
-                if (
-                    isinstance(child, Attention)
-                    and child.cache_name is not None
-                ):
-                    result[child.cache_name] = mha.Config(
-                        child.num_kv_heads,
-                        child.head_dim,
-                        child.head_indices,
-                        dtype,
-                        window=child.window,
-                    )
-        return prefix_cache.Config(result)
+        return prefix_cache.Config(_cache_layers(self.layers))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._pipeline.rank != 0 or self.embedding is None:

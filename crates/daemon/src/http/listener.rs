@@ -14,8 +14,13 @@
 //! closes. The listener therefore owns the file of a socket it binds: binding
 //! first removes a stale socket file nobody listens on, and dropping the
 //! listener (at shutdown) removes the file again.
+//!
+//! A hot restart hands a duplicate of the listening socket to the successor
+//! daemon ([`Listener::hand_over`]), which accepts on it beside this one and
+//! owns a Unix socket's file from then on ([`Listener::resume`]).
 
 use std::io::{ErrorKind, Result};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
@@ -32,9 +37,19 @@ pub(crate) enum Listener {
     Tcp(TcpListener),
     Unix {
         listener: UnixListener,
-        /// The socket's file, removed when the listener is dropped.
-        _socket_file: SocketFile,
+        /// The socket's file, removed when the listener is dropped; `None`
+        /// once a successor owns it.
+        socket_file: Option<SocketFile>,
     },
+}
+
+/// What a successor daemon needs of a handed-over listener besides its
+/// socket: a Unix socket's file, which the successor owns from then on.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedListener {
+    unix: bool,
+    /// The socket file's path, device and inode.
+    socket_file: Option<(PathBuf, u64, u64)>,
 }
 
 /// The filesystem entry of a Unix-domain socket this process bound, removed
@@ -48,6 +63,15 @@ pub(crate) struct SocketFile {
     path: PathBuf,
     device: u64,
     inode: u64,
+}
+
+impl SocketFile {
+    /// The file's identity, for a successor to own; this process no longer
+    /// removes it.
+    fn disown(self) -> (PathBuf, u64, u64) {
+        let file = std::mem::ManuallyDrop::new(self);
+        (file.path.clone(), file.device, file.inode)
+    }
 }
 
 impl Drop for SocketFile {
@@ -84,12 +108,57 @@ impl Listener {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self::Unix {
             listener,
-            _socket_file: SocketFile {
+            socket_file: Some(SocketFile {
                 path: path.to_owned(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            },
+            }),
         })
+    }
+
+    /// A duplicate of the listening socket and what the successor of a hot
+    /// restart needs beside it ([`Listener::resume`]); the successor owns a
+    /// Unix socket's file from then on.
+    pub(crate) fn hand_over(&mut self) -> Result<(HandedListener, OwnedFd)> {
+        match self {
+            Self::Tcp(listener) => Ok((
+                HandedListener {
+                    unix: false,
+                    socket_file: None,
+                },
+                listener.as_fd().try_clone_to_owned()?,
+            )),
+            Self::Unix {
+                listener,
+                socket_file,
+            } => Ok((
+                HandedListener {
+                    unix: true,
+                    socket_file: socket_file.take().map(SocketFile::disown),
+                },
+                listener.as_fd().try_clone_to_owned()?,
+            )),
+        }
+    }
+
+    /// Accepts on a listening socket a daemon this one replaced handed over.
+    pub(crate) fn resume(handed: HandedListener, descriptor: OwnedFd) -> Result<Self> {
+        if handed.unix {
+            let listener = std::os::unix::net::UnixListener::from(descriptor);
+            listener.set_nonblocking(true)?;
+            Ok(Self::Unix {
+                listener: UnixListener::from_std(listener)?,
+                socket_file: handed.socket_file.map(|(path, device, inode)| SocketFile {
+                    path,
+                    device,
+                    inode,
+                }),
+            })
+        } else {
+            let listener = std::net::TcpListener::from(descriptor);
+            listener.set_nonblocking(true)?;
+            Ok(Self::Tcp(TcpListener::from_std(listener)?))
+        }
     }
 
     /// Returns a log-friendly local address string for either TCP or Unix

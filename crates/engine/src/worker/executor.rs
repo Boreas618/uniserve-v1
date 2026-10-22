@@ -506,17 +506,29 @@ impl WorkerExecutor {
 impl WorkerExecutor {
     /// Records the admission descriptor of each request a batch starts.
     ///
-    /// Fails when a request is admitted again, before its `Finish` completes,
-    /// with a descriptor that differs from the recorded one; descriptors
+    /// A request handed from a prefill group to a decode group is admitted
+    /// again with its progress: the position it reached and the tokens it
+    /// generated, which the groups that admit it later receive. Fails when a
+    /// request is admitted again, before its `Finish` completes, with a
+    /// descriptor that differs from the recorded one otherwise; descriptors
     /// recorded earlier in the same call stay recorded.
     fn cache_admissions(&mut self, admissions: &[NewRequest]) -> anyhow::Result<()> {
         for admission in admissions {
-            if let Some(existing) = self.admissions.get(&admission.request_key) {
+            if let Some(existing) = self.admissions.get_mut(&admission.request_key) {
+                let progressed = |descriptor: &NewRequest| {
+                    let mut descriptor = descriptor.clone();
+                    if let Some(generation) = &mut descriptor.generation {
+                        generation.initial_position = 0;
+                        generation.generated_token_ids.clear();
+                    }
+                    descriptor
+                };
                 anyhow::ensure!(
-                    existing == admission,
+                    progressed(existing) == progressed(admission),
                     "request {:?} was readmitted with a different descriptor before drop",
                     admission.request_key
                 );
+                existing.clone_from(admission);
             } else {
                 self.admissions
                     .insert(admission.request_key, admission.clone());
@@ -1433,6 +1445,28 @@ impl Executor for WorkerExecutor {
                 }
             }
             first_error.map_or(Ok(()), Err)
+        })
+    }
+
+    /// Runs the worker hook on every group, the groups together
+    /// (`WorkerGroup::hook`), and returns every rank's result, group by
+    /// group.
+    fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
+        std::thread::scope(|scope| {
+            let running = self
+                .workers
+                .iter_mut()
+                .map(|worker| scope.spawn(|| worker.1.hook(name, payload)))
+                .collect::<Vec<_>>();
+            let mut results = Vec::new();
+            for handle in running {
+                results.extend(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))??,
+                );
+            }
+            Ok(results)
         })
     }
 

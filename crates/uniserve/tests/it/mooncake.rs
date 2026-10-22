@@ -110,6 +110,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
             &Request::PagePool {
                 shape,
                 numa_node: None,
+                bytes: None,
             },
             &[],
         )
@@ -184,7 +185,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
     let mut content = [0_u8; 32];
     content[..16].copy_from_slice(&nonce.to_le_bytes());
     let shape = PageShape {
-        content: Key(content),
+        layout: Key(content),
         kv_head_offset: 0,
         kv_head_count: 8,
         page_bytes: PAGE_BYTES,

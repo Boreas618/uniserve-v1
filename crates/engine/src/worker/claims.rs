@@ -72,6 +72,7 @@ impl Claims {
                 host.to_owned(),
                 StorageLaunch {
                     host_kv_cache: first.host_kv_cache,
+                    host_kv_cache_bytes: first.host_kv_cache_bytes,
                     ..launch
                 },
             );

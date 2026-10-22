@@ -428,6 +428,35 @@ impl Executor for SimExecutor {
     fn close(&mut self) -> anyhow::Result<()> {
         self.shutdown()
     }
+
+    /// Answers the engine's own worker hooks as a worker without a device
+    /// does: its cache is not split into segments and it gives back no
+    /// memory. It loads and unloads LoRA adapters as a worker with a LoRA
+    /// plugin does, answering the slot; other plugin hooks fail, as no
+    /// plugin is loaded.
+    fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
+        let result = match name {
+            "uniserve.cache_memory" => serde_json::json!({
+                "segments": 0,
+                "segment_units": 0,
+                "segment_bytes": 0,
+                "released_from": 0,
+                "free_bytes": 0,
+                "process_bytes": 0,
+            }),
+            "uniserve.release_cache"
+            | "uniserve.restore_cache"
+            | "uniserve.sleep"
+            | "uniserve.wake" => serde_json::Value::Null,
+            "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
+            "load_lora_adapter" | "unload_lora_adapter" => {
+                let payload: serde_json::Value = serde_json::from_str(payload)?;
+                serde_json::json!({ "adapter": payload["adapter"] })
+            }
+            other => anyhow::bail!("no plugin implements the worker hook {other}"),
+        };
+        Ok(vec![result.to_string()])
+    }
 }
 
 impl Drop for SimExecutor {
@@ -1355,6 +1384,24 @@ impl SimEngine {
             .num_units = count;
     }
 
+    /// Reports cache layers kept per request slot beside the pages
+    /// (`PrefixCacheInfo::request_states`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a prefix cache.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test setter whose missing prefix cache is documented under Panics"
+    )]
+    pub fn set_request_states(&mut self, kept: bool) {
+        self.info
+            .prefix_cache
+            .as_mut()
+            .expect("sim AR worker has a prefix cache")
+            .request_states = kept;
+    }
+
     /// Sets every cache group's block size in tokens.
     ///
     /// # Panics
@@ -1688,6 +1735,7 @@ mod tests {
                 finish_token_ids: Vec::new(),
                 initial_position: 0,
                 generated_token_ids: Vec::new(),
+                adapter: 0,
             }),
             None,
             0,

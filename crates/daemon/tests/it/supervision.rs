@@ -220,10 +220,22 @@ fn a_killed_daemon_takes_its_processes_with_it() {
         .unwrap();
     assert!(eventually(|| socket.exists()), "the daemon did not start");
     let mut engine = Engine::connect(&format!("unix:{}", socket.display()));
-    let pid = engine.spawn(sleeper("node", "group", 0, 0));
+    // A process that follows its lifeline, as the engine and the workers do.
+    let pid = engine.spawn(launch(
+        "node",
+        "group",
+        0,
+        0,
+        "/usr/bin/python3",
+        &[
+            "-c",
+            "import os; os.read(int(os.environ['UNISERVE_LIFELINE']), 1)",
+        ],
+    ));
     assert!(alive(pid));
 
-    // SIGKILL skips every exit path of the daemon's own.
+    // SIGKILL skips every exit path of the daemon's own; the kernel closes
+    // the lifeline's write end with the daemon.
     host.kill().unwrap();
     host.wait().unwrap();
     assert!(eventually(|| !alive(pid)), "a process outlived its daemon");

@@ -185,6 +185,7 @@ fn fp8_plan() -> CachePlan {
             dtype: DType::F8E4M3,
             compute_dtype: DType::BF16,
         }],
+        states: Vec::new(),
         handle: Handle::none(),
     }
 }

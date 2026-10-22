@@ -369,6 +369,7 @@ mod tests {
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }
     }
 

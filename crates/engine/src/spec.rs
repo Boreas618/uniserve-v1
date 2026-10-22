@@ -13,13 +13,17 @@ use std::time::Duration;
 use anyhow::Context as _;
 use ipc::{CallKind, ForwardMode, MediaCall, TransferMode};
 use proto::request::GenerationLimits;
-use proto::request::wire::{CudaGraphs, EngineSpec, FlashInfer, Lane, Placement, Sizes};
+use proto::request::wire::{
+    CudaGraphs, EngineSpec, FlashInfer, Lane, Placement, Scheduling, Sizes,
+};
 use serde::de::DeserializeOwned;
 
 use crate::core::{EngineConfig, WorkerGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
-use crate::scheduler::{DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS};
+use crate::scheduler::{
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
+};
 use crate::worker::WorkerProcessArgs;
 use crate::{DEFAULT_COMPONENT, LaneConfig};
 
@@ -28,6 +32,30 @@ use crate::{DEFAULT_COMPONENT, LaneConfig};
 fn named<T: DeserializeOwned>(value: &str, option: &str) -> anyhow::Result<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned()))
         .with_context(|| format!("invalid `{option}`: {value:?}"))
+}
+
+/// The scheduling limits and policy `scheduling` states, with the engine's
+/// defaults for those it leaves out; the canvas is the scheduler's own.
+///
+/// # Errors
+///
+/// Fails on a policy the engine does not know.
+pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> {
+    Ok(SchedulerConfig {
+        policy: named(&scheduling.policy, "scheduler_config.policy")?,
+        max_batch: scheduling.max_batch.max(1) as usize,
+        max_num_batched_tokens: scheduling
+            .max_num_batched_tokens
+            .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize),
+        max_running_requests: scheduling.max_running_requests.max(1) as usize,
+        chunked_prefill_size: scheduling
+            .chunked_prefill_size
+            .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
+        max_queued_requests: scheduling
+            .max_queued_requests
+            .map(|requests| requests as usize),
+        canvas: None,
+    })
 }
 
 /// The lane `stated` names: the call kinds of the domains it serves
@@ -151,6 +179,7 @@ impl EngineConfig {
             // A deployment is what one daemon serves under its served name.
             deployment: spec.deployment.clone(),
             host_kv_cache,
+            host_kv_cache_bytes: kv_cache.host_bytes,
             kv_storage: kv_cache
                 .mooncake
                 .as_ref()
@@ -174,6 +203,7 @@ impl EngineConfig {
             },
             cache_units: None,
             model: spec.model.clone(),
+            weights: stated(&workers.weights),
             host: spec.host.clone(),
             queue_depth: placement.queue_depth.max(1) as usize,
             watchdog_timeout: Duration::from_millis(workers.watchdog_timeout_ms),

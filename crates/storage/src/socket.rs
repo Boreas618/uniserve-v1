@@ -34,6 +34,27 @@ pub struct SocketLock {
     socket: PathBuf,
 }
 
+impl SocketLock {
+    /// The lock's file, for a Storage Server's successor to hold
+    /// ([`SocketLock::resume`]); this process leaves the socket in place.
+    pub fn hand_over(self) -> std::os::fd::OwnedFd {
+        let lock = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `lock` is never dropped, so its file is read out once;
+        // its path is leaked with it.
+        let file = unsafe { std::ptr::read(&lock._file) };
+        std::os::fd::OwnedFd::from(file)
+    }
+
+    /// Holds the lock a predecessor handed over for the socket at `socket`,
+    /// which this process removes when it stops.
+    pub fn resume(file: std::os::fd::OwnedFd, socket: PathBuf) -> Self {
+        Self {
+            _file: File::from(file),
+            socket,
+        }
+    }
+}
+
 impl Drop for SocketLock {
     /// The owner removes its socket when it stops, so a later server binds
     /// a fresh one.

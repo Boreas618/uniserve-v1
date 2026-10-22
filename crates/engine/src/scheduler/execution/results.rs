@@ -4,7 +4,7 @@
 //! request's results advance its media flow until it finishes.
 
 use super::*;
-use ipc::{ForwardMode, MediaCall};
+use ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// Describes a rejected worker result for the request's terminal error and
 /// its error finish's log line: the rejection, then the call it answered.
@@ -775,6 +775,13 @@ impl Scheduler {
                 if let Some(Err(error)) = progress_result {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
+                }
+                // An accepted hand-off install releases the prefill group's
+                // export it read.
+                if progress_result.is_some()
+                    && call.kind == CallKind::Transfer(TransferMode::CacheInstall)
+                {
+                    self.free_buffers(call.cache_input);
                 }
                 // An accepted forward extends the request's prefix cache: publish the
                 // prompt pages it completed, then retire sliding-window pages

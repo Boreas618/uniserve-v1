@@ -320,7 +320,18 @@ pub(super) fn plan(
             + unit_columns
             + usize::from(launch.storage.host_kv_cache);
         let unit_overhead = columns as u64 * UnitColumn::bytes(1);
-        layout.fit_cache(&cache, unit_overhead, config, total, &world.host)?;
+        let granularity = match config.device {
+            Device::Cuda(device) => Some(HandleType::Descriptor.granularity(device)? as u64),
+            Device::Cpu => None,
+        };
+        layout.fit_cache(
+            &cache,
+            unit_overhead,
+            config,
+            total,
+            granularity,
+            &world.host,
+        )?;
         Some(Arc::new(cache))
     } else {
         None

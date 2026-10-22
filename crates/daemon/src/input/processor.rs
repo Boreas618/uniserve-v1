@@ -494,6 +494,7 @@ impl InputProcessor {
             image_params,
             priority,
             cache_salt,
+            adapter,
         } = request;
         let has_input_image =
             !images.is_empty() || matches!(&prompt, Prompt::Chat(chat) if chat.has_multimodal());
@@ -530,12 +531,16 @@ impl InputProcessor {
             stop_token_ids: sampling_params.stop_token_ids.clone(),
             priority,
             cache: CachePolicy {
-                isolation_key: crate::input::cache_isolation_key(cache_salt.as_deref()),
+                isolation_key: crate::input::cache_isolation_key(
+                    cache_salt.as_deref(),
+                    adapter.as_ref().map(|adapter| adapter.identity.as_str()),
+                ),
                 ..CachePolicy::default()
             },
             image_generation: ImageGenerationConfig::default(),
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: adapter.as_ref().map_or(0, |adapter| adapter.slot),
         };
         let mut decode = sampling_params.decode_options();
 

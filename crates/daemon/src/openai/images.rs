@@ -106,6 +106,7 @@ pub fn lower_image_request(
         }),
         priority: 0,
         cache_salt: None,
+        adapter: None,
     })
 }
 

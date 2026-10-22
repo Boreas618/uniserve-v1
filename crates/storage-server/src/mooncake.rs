@@ -194,6 +194,14 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                         "registered a page pool"
                     );
                 }
+                Event::PoolReleased { pool } => {
+                    // The server releases a pool once the connector has no
+                    // task on it, so no worker thread touches its memory.
+                    if let Some(mapped) = lock(&shared.pools).remove(&pool) {
+                        unmap(&shared.store, mapped);
+                        tracing::info!(pool, "unmapped a released page pool");
+                    }
+                }
                 Event::Exists { task, pool, keys } => {
                     let _ = lookups.send(Job::Exists { task, pool, keys });
                 }
@@ -347,7 +355,7 @@ impl Shared {
 }
 
 /// Map a page pool's memfd and register the mapping with Mooncake. The
-/// mapping lives for the process.
+/// mapping lives until the server releases the pool ([`unmap`]).
 fn map(
     store: &MooncakeStore,
     descriptor: OwnedFd,
@@ -367,7 +375,8 @@ fn map(
             0,
         )
     }?;
-    // SAFETY: the mapping above, which is never unmapped.
+    // SAFETY: the mapping above, which `unmap` unregisters before it unmaps
+    // it.
     unsafe { store.register_buffer(base, bytes) }.map_err(|error| {
         io::Error::other(format!("registering a page pool with Mooncake: {error}"))
     })?;
@@ -376,6 +385,21 @@ fn map(
         slots,
         shape,
     })
+}
+
+/// Unregister a released pool's mapping from Mooncake and unmap it.
+fn unmap(store: &MooncakeStore, mapped: Mapped) {
+    let base = mapped.base as *mut c_void;
+    // SAFETY: a mapping `map` registered; no task reads or writes it.
+    if let Err(error) = unsafe { store.unregister_buffer(base) } {
+        tracing::warn!(%error, "unregistering a released page pool from Mooncake failed");
+    }
+    let bytes = (mapped.slots * mapped.shape.page_bytes) as usize;
+    // SAFETY: the mapping `map` made of the whole pool, which nothing uses.
+    let unmapped = unsafe { rustix::mm::munmap(base, bytes) };
+    if let Err(error) = unmapped {
+        tracing::warn!(%error, "unmapping a released page pool failed");
+    }
 }
 
 /// Empty the wake pipe.

@@ -17,8 +17,11 @@
 //! clients compute every [`Key`] and define what the bytes mean.
 //!
 //! Besides tensors, the server keeps host page pools (L2): one memfd of
-//! equal slots per NUMA node and [`PageShape`], shared by every worker
-//! whose pages have that shape. The server indexes committed pages by key
+//! equal slots per deployment, NUMA node and [`PageShape`], shared by the
+//! deployment's workers whose pages have that shape, of the size the
+//! worker asks for. A deployment's pools are released with its tensors.
+//! The server refuses a pool the host's available memory cannot hold.
+//! The server indexes committed pages by key
 //! and tracks each slot's state; workers copy pages in and out of the slots
 //! on their own streams, at the head's direction. Behind the pools, the
 //! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
@@ -27,7 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -166,15 +169,20 @@ pub struct TensorRecord {
     pub access: Access,
 }
 
-/// What the pages of one page pool are: every worker of a host's NUMA node
-/// whose pages have this shape shares the pool, whatever its deployment,
-/// worker group or scheduler, so an identical page is stored once.
+/// What the pages of one page pool are: every worker of a deployment on a
+/// host's NUMA node whose pages have this shape shares the pool, whatever
+/// its worker group, scheduler or engine, so an identical page is stored
+/// once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageShape {
-    /// The digest of what determines a page's encoding, computed by the
-    /// worker: the model fingerprint, the page encoding version, the cache
-    /// dtype, the block size and the cache group list.
-    pub content: Key,
+    /// The digest of a page's byte layout, computed by the worker: the page
+    /// encoding version, the cache dtype, every cache group's block size,
+    /// layers and heads, and the group the pool holds. The model's weights
+    /// and code are not part of it: the pages of an engine and of its
+    /// standby with other code share their pools, and their keys differ,
+    /// since the content the worker reports (the model fingerprint with
+    /// this layout) seeds them.
+    pub layout: Key,
     /// The first kv head the pages hold.
     pub kv_head_offset: u32,
     /// The number of kv heads the pages hold.
@@ -250,7 +258,9 @@ pub enum Request {
     /// Make the caller the head of its deployment and release every scope of
     /// the deployment it does not list. Refused while a previous head of the
     /// deployment is connected. Every process of the deployment that
-    /// belongs to no current worker is shot down.
+    /// belongs to no current worker is shot down. Every other deployment
+    /// whose head is not connected is retired: a host serves the
+    /// deployments whose heads run on it.
     Claim { scopes: Vec<Scope> },
     /// Release every tensor of the caller's scope that `keys` does not list.
     Retain { keys: Vec<Key> },
@@ -272,17 +282,36 @@ pub enum Request {
     /// Give up write access: the caller has drained its streams and
     /// unmapped or downgraded its mappings.
     Release { keys: Vec<Key> },
+    /// Move read-only tensors to new keys, each `(old, new)`: the caller
+    /// rewrites their bytes in place, as an in-place weight update does, so
+    /// the old keys no longer name them. Refused, moving none, unless every
+    /// old key is a read-only tensor that the caller's deployment alone
+    /// holds and no new key is retained.
+    Rekey { moves: Vec<(Key, Key)> },
     /// Every tensor, storage and claim the server holds.
     List,
-    /// Release every tensor of `deployment` and forget its claim: the
-    /// deployment is no longer served. Refused while its head is connected.
+    /// Release every tensor and page pool of `deployment` and forget its
+    /// claim: the deployment is no longer served. Refused while its head is
+    /// connected.
     Retire { deployment: String },
+    /// Hand the server to a successor server of `executable` (this
+    /// server's own when `None`), which goes on with every connection, the
+    /// listening sockets, the tensors' memory and the page pools once no
+    /// request, shoot-down or connector task is in flight (a hot restart);
+    /// the server then exits. Answered with the successor's process id
+    /// once it started.
+    Restart { executable: Option<String> },
     /// A worker's page pool for pages of `shape` on `numa_node`: the pool
-    /// of that shape, created when absent, whose memfd travels with the
-    /// reply.
+    /// of the worker's deployment of that shape, whose memfd travels with
+    /// the reply. When absent it is created with `bytes` (the server's
+    /// default when `None`), refused when the host's available memory,
+    /// less the server's reserve and what its pools have yet to allocate,
+    /// cannot hold it.
     PagePool {
         shape: PageShape,
         numa_node: Option<u32>,
+        #[serde(default)]
+        bytes: Option<u64>,
     },
     /// Where each page of `keys` is: committed in the pool (L2), in the KV
     /// storage (L3), or absent. The pages the pool holds become its most
@@ -366,9 +395,14 @@ pub enum Reply {
     Put,
     Promoted,
     Released,
+    Rekeyed,
     Listing(Listing),
     Retired {
         released: u64,
+    },
+    /// The successor of a [`Request::Restart`] started.
+    Restarting {
+        pid: u32,
     },
     /// The page pool, whose memfd travels with the reply: `slots` slots of
     /// `page_bytes` bytes, slot `i` at byte `i * page_bytes`.
@@ -425,6 +459,9 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedPool {
     pub pool: u64,
+    /// The deployment the pool belongs to.
+    #[serde(default)]
+    pub deployment: String,
     pub shape: PageShape,
     pub numa_node: Option<u32>,
     pub slots: u64,
@@ -485,6 +522,9 @@ pub enum Event {
         shape: PageShape,
         slots: u64,
     },
+    /// To the connector: the page pool is released; the connector has no
+    /// task on it, and unmaps it.
+    PoolReleased { pool: u64 },
     /// To the connector: which pages of `keys` the KV storage holds.
     Exists {
         task: u64,

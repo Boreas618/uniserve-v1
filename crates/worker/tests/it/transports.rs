@@ -809,6 +809,7 @@ fn cache_plan(head_dim: u32) -> CachePlan {
             dtype: DType::BF16,
             compute_dtype: DType::BF16,
         }],
+        states: Vec::new(),
         handle: worker::ffi::Handle::none(),
     }
 }

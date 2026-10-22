@@ -61,12 +61,26 @@ pub(crate) struct Fingerprints {
     /// Each checkpoint source's fingerprint, by source name: it keys the
     /// tensors loaded from that source.
     pub sources: BTreeMap<String, String>,
+    /// The digest of the numerical code the structure covers: the code a
+    /// process loaded before it loaded the weights.
+    pub numerics: String,
 }
 
 impl Fingerprints {
+    /// The digest that keys the model's cache pages: the whole model's
+    /// ([`Self::model`]) and that of all the numerical code installed
+    /// (`uniserve.loading.retained.numerics`), since a forward may run code
+    /// loaded after the weights were.
+    pub(crate) fn pages(&self) -> Result<String> {
+        let numerics: tvm_ffi::String = Interpreter::import(&format!("{RETAINED}.numerics"))?
+            .call_values(&[])?
+            .try_into()
+            .map_err(|error| Error::numerical("numerics", &error))?;
+        Ok(format!("{}:{}", self.model(), numerics.as_str()))
+    }
+
     /// One digest of the whole model, its structure and every source: what
-    /// depends on all of its weights, such as its cache pages, is keyed by
-    /// it.
+    /// depends on all of its weights is keyed by it.
     pub(crate) fn model(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(b"uniserve-model\0");
@@ -271,10 +285,8 @@ impl WeightKeys {
             })
     }
 
-    /// Map the weights a predecessor retained: every tensor its manifest
-    /// names whose fields are all retained. `None` without a manifest.
-    pub(crate) fn find(&self, retained: &Retained) -> Result<Option<Found>> {
-        let started = std::time::Instant::now();
+    /// The retained manifest's text; `None` without one.
+    fn read_manifest(&self, retained: &Retained) -> Result<Option<String>> {
         let manifest_key = self.manifest();
         let got = retained.call("finding retained weights", |client| {
             client.get(vec![manifest_key], Mode::Read)
@@ -295,12 +307,76 @@ impl WeightKeys {
             .map_err(|error| {
                 Error::transport_source("reading the retained weight manifest", error)
             })?;
-        let manifest = String::from_utf8(bytes)
-            .map_err(|_| Error::Interface("the retained weight manifest is not text".into()))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::Interface("the retained weight manifest is not text".into()))
+    }
+
+    /// The moves that rename this worker's retained weights to their keys
+    /// under `to`, the keys of the same tensors loaded from another
+    /// checkpoint: the manifest's and every retained field's whose key
+    /// changes.
+    pub(crate) fn moves(&self, to: &WeightKeys, retained: &Retained) -> Result<Vec<(Key, Key)>> {
+        let manifest = self
+            .read_manifest(retained)?
+            .ok_or_else(|| Error::State("the worker's weights have no retained manifest"))?;
+        let tensors = manifest_tensors(&manifest)?.ok_or_else(|| {
+            Error::Interface("the retained weight manifest is of another version".into())
+        })?;
+        let mut moves = Vec::new();
+        if self.manifest() != to.manifest() {
+            moves.push((self.manifest(), to.manifest()));
+        }
+        let mut fields = Vec::new();
+        for tensor in &tensors {
+            for field in &tensor.fields {
+                let id = format!("{}/{field}", tensor.id);
+                let (Some(old), Some(new)) = (
+                    self.field(&tensor.source, &id),
+                    to.field(&tensor.source, &id),
+                ) else {
+                    return Err(Error::Interface(format!(
+                        "weight {id} is loaded from checkpoint source {}, which one of the \
+                         checkpoints does not have",
+                        tensor.source
+                    )));
+                };
+                fields.push((old, new));
+            }
+        }
+        // Only the fields the server retains move.
+        let got = retained.call("finding retained weights", |client| {
+            client.get(fields.iter().map(|(old, _)| *old).collect(), Mode::Read)
+        })?;
+        let held: BTreeSet<Key> = got.tensors.iter().map(|record| record.key).collect();
+        moves.extend(
+            fields
+                .into_iter()
+                .filter(|(old, new)| old != new && held.contains(old)),
+        );
+        Ok(moves)
+    }
+
+    /// Map the weights a predecessor retained: every tensor its manifest
+    /// names whose fields are all retained. `None` without a manifest.
+    pub(crate) fn find(&self, retained: &Retained) -> Result<Option<Found>> {
+        let started = std::time::Instant::now();
+        let manifest_key = self.manifest();
+        let Some(manifest) = self.read_manifest(retained)? else {
+            return Ok(None);
+        };
         let Some(tensors) = manifest_tensors(&manifest)? else {
             tracing::info!("the retained weight manifest is of another version; loading");
             return Ok(None);
         };
+        // The key covers the code loaded before loading; the manifest, every
+        // module loaded by the time the weights were published.
+        let current: bool = Interpreter::import(&format!("{RETAINED}.modules_current"))?
+            .call_as(&[(&Any::from(tvm_ffi::String::from(manifest.as_str()))).into()])?;
+        if !current {
+            tracing::info!("code that loaded the retained weights changed since; loading");
+            return Ok(None);
+        }
 
         // Every field of every tensor, keyed by the tensor's source.
         let fields: Vec<(usize, String, Option<Key>)> = tensors
@@ -757,7 +833,7 @@ fn host_bytes(bytes: &[u8]) -> Result<OwnedFd> {
 
 /// The version of the manifest `uniserve.loading.retained` writes; a
 /// manifest of another version names no tensor this worker binds.
-const MANIFEST_VERSION: u64 = 2;
+const MANIFEST_VERSION: u64 = 3;
 
 /// The tensors a manifest names, in order; `None` for a manifest of
 /// another version.

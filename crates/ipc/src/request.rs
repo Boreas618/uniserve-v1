@@ -23,6 +23,8 @@ pub enum RequestKind {
     Close,
     /// Promotes a standby worker to serving.
     Promote,
+    /// Runs a named worker hook.
+    Hook,
 }
 
 impl RequestKind {
@@ -33,6 +35,7 @@ impl RequestKind {
             Self::Submit => "submit",
             Self::Close => "close",
             Self::Promote => "promote",
+            Self::Hook => "hook",
         }
     }
 }
@@ -66,6 +69,16 @@ pub enum WorkerRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
     },
+    /// Runs the worker hook `name` (`uniserve.hooks`), which a plugin
+    /// implements, with `payload`, a JSON value. The engine sends it while
+    /// the worker runs no forward. Answered with
+    /// [`WorkerResponse::Hooked`] and the hook's JSON result.
+    Hook {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+        name: String,
+        payload: String,
+    },
 }
 
 impl WorkerRequest {
@@ -76,6 +89,7 @@ impl WorkerRequest {
             Self::Submit { .. } => RequestKind::Submit,
             Self::Close { .. } => RequestKind::Close,
             Self::Promote { .. } => RequestKind::Promote,
+            Self::Hook { .. } => RequestKind::Hook,
         }
     }
 
@@ -85,7 +99,8 @@ impl WorkerRequest {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
             | Self::Close { message_id }
-            | Self::Promote { message_id } => *message_id,
+            | Self::Promote { message_id }
+            | Self::Hook { message_id, .. } => *message_id,
         }
     }
 
@@ -95,7 +110,8 @@ impl WorkerRequest {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
             | Self::Close { message_id }
-            | Self::Promote { message_id } => *message_id = value,
+            | Self::Promote { message_id }
+            | Self::Hook { message_id, .. } => *message_id = value,
         }
     }
 
@@ -129,6 +145,15 @@ impl WorkerRequest {
     pub fn promote() -> Self {
         Self::Promote { message_id: None }
     }
+
+    /// Constructs a request that runs the worker hook `name`.
+    pub fn hook(name: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::Hook {
+            message_id: None,
+            name: name.into(),
+            payload: payload.into(),
+        }
+    }
 }
 
 /// Kind discriminator carried by each worker response frame.
@@ -145,6 +170,8 @@ pub enum ResponseKind {
     Error,
     /// A lane whose job has not completed within the rank's stall bound.
     Stalled,
+    /// A worker hook's result.
+    Hooked,
 }
 
 /// Request and call identity attached to a worker error.
@@ -234,6 +261,12 @@ pub enum WorkerResponse {
         /// Structured failure details.
         error: WorkerResponseError,
     },
+    /// Answers a [`WorkerRequest::Hook`] with the hook's JSON result.
+    Hooked {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+        result: String,
+    },
     /// Reports, unasked, a lane that stays inside one job. The rank's
     /// control thread sends it once, and goes on serving the channel; the
     /// engine fails the rank on it.
@@ -252,6 +285,7 @@ impl WorkerResponse {
             Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
             Self::Stalled { .. } => ResponseKind::Stalled,
+            Self::Hooked { .. } => ResponseKind::Hooked,
         }
     }
 
@@ -262,7 +296,8 @@ impl WorkerResponse {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
             | Self::Ok { message_id }
-            | Self::Error { message_id, .. } => *message_id,
+            | Self::Error { message_id, .. }
+            | Self::Hooked { message_id, .. } => *message_id,
             Self::Stalled { .. } => None,
         }
     }
@@ -274,7 +309,8 @@ impl WorkerResponse {
             Self::Info { message_id, .. }
             | Self::Result { message_id, .. }
             | Self::Ok { message_id }
-            | Self::Error { message_id, .. } => *message_id = value,
+            | Self::Error { message_id, .. }
+            | Self::Hooked { message_id, .. } => *message_id = value,
             Self::Stalled { .. } => {}
         }
     }

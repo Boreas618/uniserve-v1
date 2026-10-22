@@ -40,6 +40,7 @@ fn request(
         image_generation: ImageGenerationConfig::default(),
         readout: Vec::new(),
         generated_token_ids: generated,
+        adapter: 0,
     }
 }
 

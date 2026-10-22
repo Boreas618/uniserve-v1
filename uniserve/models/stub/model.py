@@ -15,11 +15,14 @@ stays inside one job until its process ends.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from types import MappingProxyType
+from typing import ClassVar, Literal
 
 import torch
 from torch import nn
 
+from uniserve import prefix_cache
 from uniserve.distributed import Communicator
 from uniserve.models import (
     DEFAULT_COMPONENT,
@@ -35,6 +38,8 @@ from uniserve.nn.attention import Attention
 from uniserve.nn.functional import patchify
 from uniserve.nn.vae.layers import DiagonalGaussian
 from uniserve.nn.vae.patch import PatchAutoencoder, RGBDecoder
+from uniserve.prefix_cache import State, StateConfig, slots
+from uniserve.tensors import BufferConfig
 
 from .config import Config
 from .denoiser import Denoiser
@@ -123,10 +128,78 @@ class _Head(nn.Module):
         return logits.scatter_(1, targets.reshape(-1, 1), 16.0)
 
 
+@dataclass(frozen=True)
+class TokenCount(StateConfig):
+    """The tokens each request processed: one int64 per request slot, a
+    cache layer type indexed by request slot (``indexing == "states"``).
+    """  # noqa: D205
+
+    indexing: ClassVar[Literal["states"]] = "states"
+
+    def buffers(self, *, num_blocks, block_size, dtype, quantizer):
+        return {
+            "count.values": BufferConfig((num_blocks,), torch.int64),
+            "count.initialized": BufferConfig((num_blocks,), torch.bool),
+        }
+
+    def bind(self, tensors, *, block_size, dtype, quantizer):
+        return State(
+            {"count": tensors["count.values"]},
+            {"count": tensors["count.initialized"]},
+            block_size,
+        )
+
+
+class _Counter(nn.Module):
+    """Count the tokens of each request in its request slot.
+
+    A forward sets every row's count to its prefix plus its query tokens,
+    row after row, as a recurrent state advances over consecutive chunks of
+    one request in one forward. On a CPU rank it first refuses a row that
+    continues a prefix from another count: the count it continues from is
+    the one the request's previous chunk left in its slot, so the forward
+    fails when a request's state did not carry from one forward to the next
+    or a prefix was reused that its slot never counted.
+    """
+
+    def __init__(self, cache_name: str):
+        super().__init__()
+        self.cache_name = cache_name
+
+    def cache_state(self, dtype: torch.dtype) -> TokenCount:
+        return TokenCount()
+
+    def forward(self, attention):
+        binding = prefix_cache.bound(self)
+        rows = slots.rows()
+        if binding is None or rows is None:
+            return
+        entry = attention.entry(None)
+        count = binding.state.tensors["count"]
+        prefixes = entry.prefixes.values[: rows.shape[0]].to(torch.int64)
+        queries = entry.queries.values[: rows.shape[0]].to(torch.int64)
+        if count.device.type == "cpu":
+            for slot, prefix, query in zip(
+                rows.tolist(), prefixes.tolist(), queries.tolist()
+            ):
+                if slot == 0:
+                    continue
+                if prefix and int(count[slot]) != prefix:
+                    raise RuntimeError(
+                        f"request slot {slot} counted {int(count[slot])} "
+                        f"tokens, not its prefix {prefix}"
+                    )
+                count[slot] = prefix + query
+            return
+        # Padding rows write zero into the padding slot.
+        live = rows > 0
+        count.index_copy_(0, rows, torch.where(live, prefixes + queries, 0))
+
+
 class _Layer(nn.Module):
     """Preserve features while publishing zero scalar K/V at supplied indices."""  # noqa: E501
 
-    def __init__(self):
+    def __init__(self, request_state: bool = False):
         super().__init__()
 
         # The layer's only parameter: ``TransformerDecoder.cache_config``
@@ -138,12 +211,17 @@ class _Layer(nn.Module):
         self.attention = Attention(
             1, 1, 1, cache_name="backbone.layers.0.attention"
         )
+        self.counter = (
+            _Counter("backbone.layers.0.counter") if request_state else None
+        )
 
     def forward(self, hidden, residual, positions, attention):
         # The layer's table entry supplies the slot mappings; an entry
         # without them publishes nothing.
         values = hidden.new_zeros((hidden.shape[0], 1, 1)) + self.scale
         self.attention.update_cache(values, values, attention)
+        if self.counter is not None:
+            self.counter(attention)
 
         # A zero residual keeps the decoder's final ``norm(hidden +
         # residual)`` equal to the embedding digits ``_Head`` decodes.
@@ -205,7 +283,9 @@ class Model(CausalLM):
 
     def __init__(self, config: Config = Config()):
         backbone = TransformerDecoder(
-            _Embedding(), nn.ModuleDict({"0": _Layer()}), nn.Identity()
+            _Embedding(),
+            nn.ModuleDict({"0": _Layer(config.request_state)}),
+            nn.Identity(),
         )
         super().__init__(backbone, _Head())
         self.config = config

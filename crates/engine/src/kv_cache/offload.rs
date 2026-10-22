@@ -433,6 +433,32 @@ impl KvOffloadManager {
         true
     }
 
+    /// Key `worker`'s pages from now on by `contents`, the seed of each of
+    /// its cache groups' pages after its weights changed: the pages written
+    /// before keep the old keys, which no later prompt finds. Does nothing
+    /// for a worker the host KV cache does not serve.
+    pub(crate) fn reseed(
+        &mut self,
+        worker: &WorkerGroupId,
+        contents: &[[u8; 32]],
+    ) -> Result<(), String> {
+        let Some(pools) = self.workers.get_mut(worker) else {
+            return Ok(());
+        };
+        if pools.groups.len() != contents.len() {
+            return Err(format!(
+                "worker group {} reports {} page key seeds for {} cache groups",
+                worker.0,
+                contents.len(),
+                pools.groups.len()
+            ));
+        }
+        for (group, content) in pools.groups.iter_mut().zip(contents) {
+            group.content = *content;
+        }
+        Ok(())
+    }
+
     /// Whether the host KV cache serves `worker`.
     pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
         self.workers.contains_key(worker)
@@ -1472,7 +1498,7 @@ mod tests {
             let stopped = Arc::clone(&stop);
             let thread = std::thread::spawn(move || {
                 let _lock = lock;
-                let mut server = Server::new(listener, 64 * 16, None).unwrap();
+                let mut server = Server::new(listener, 64 * 16, 0, None).unwrap();
                 server
                     .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                     .unwrap();
@@ -1545,7 +1571,7 @@ mod tests {
             .iter()
             .map(|content| {
                 let shape = PageShape {
-                    content: Key([*content; 32]),
+                    layout: Key([*content; 32]),
                     kv_head_offset: 0,
                     kv_head_count: 8,
                     page_bytes: 16,
@@ -1553,6 +1579,7 @@ mod tests {
                 let request = Request::PagePool {
                     shape,
                     numa_node: None,
+                    bytes: None,
                 };
                 let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
                     panic!("the page pool was refused");
@@ -1599,6 +1626,9 @@ mod tests {
                 })
                 .collect(),
             scratch_units: 0,
+            segment_units: 0,
+            usable_units: 0,
+            request_states: false,
         }
     }
 

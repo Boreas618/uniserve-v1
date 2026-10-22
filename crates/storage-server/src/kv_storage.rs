@@ -127,6 +127,17 @@ impl KvStorage {
         }
     }
 
+    /// Ends the connector and waits for it, as a hot restart does before its
+    /// successor starts one of its own; none starts here again.
+    pub(super) fn stop(&mut self) {
+        self.launch = None;
+        self.restart = None;
+        if let Some((mut child, _)) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// How long the server may sleep before a restart is due.
     pub(super) fn timeout(&self) -> Option<Duration> {
         self.restart

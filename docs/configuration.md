@@ -42,7 +42,7 @@ A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode 
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
-Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes each host page pool (64 GiB unless stated; a pool is one per KV head range of the host's workers, and is allocated and pinned whole when the first worker maps it), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the memory of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the memory it left under the same name.
+Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host memory a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available memory less the reserve cannot hold is refused), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the memory of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the memory it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, sized from `kv_cache_config.host_gib`, and a pool is allocated and pinned whole when the first worker maps it. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
 
 Some tables configure one model family: `chat_config` and `image_fetch_config` chat models (Qwen3, SenseNova, BAGEL, DiffusionGemma); `video_config`, `media_config` and `video_job_config` MiniMax-H3; `readout_config` and `diffusion_generation_config` DiffusionGemma. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
 
@@ -117,6 +117,7 @@ retention = "30m"
 | `format` | `"auto"` | Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer at a time) or `dummy` (no weights read) |
 | `download_dir` | Hugging Face default | Cache root for repository models |
 | `threads` | Loader default | Concurrent checkpoint file readers |
+| `weights` | unset | A plugin's weight source (`scheme://...`, `docs/plugins.md`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
 
 ### `kv_cache_config`
 
@@ -127,6 +128,7 @@ retention = "30m"
 | `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |
 | `host_tier` | `true` | With `prefix_caching`, offload prompt pages to the host KV cache of each host's Storage Server and load them back when a later prompt's prefix continues past the device cache's match: every published page of a full-attention cache group, and a sliding-window group's window before each aligned boundary (`boundary_interval`) |
+| `host_gib` | `64` | With `host_tier`, the host KV cache each worker keeps, in GiB, split between its cache groups so that each holds as many pages (as SGLang's `--hicache-size`). The host's Storage Server refuses a size its available memory cannot hold |
 | `mooncake` | None | With `host_tier`, keep every page of the host KV cache in Mooncake, the KV storage, and prefetch hits of at least 256 tokens back into the host KV cache at admission: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host memory each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
 | `boundary_interval` | `64` | With `host_tier`, the pages of the largest block size between the aligned boundaries a long prompt offloads its sliding windows before; a prompt also offloads them before the last boundary a reissue of it reuses and before its last full page. Larger intervals offload fewer windows, and a prompt that continues one offloaded earlier reuses less of it |
 
@@ -329,11 +331,13 @@ A `[[worker_groups]]` table takes:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `id` | Required | Group name; replica `i` of a replicated group is `<id>-<i>` |
-| `role` | `model` | `model` for a group serving model components; `experts` for dedicated expert ranks, which take no components |
+| `role` | `model` | `model` for a group serving model components; `prefill` and `decode` for a prefill group and a decode group of the text model (below); `experts` for dedicated expert ranks, which take no components |
 | `replicas` | `1` | Copies of the group, each over the next equal block of `ranks`. The copies' components are replicas of the same components under one scheduler, which binds each request to one copy |
 | `ranks` | Required | The group's ranks, every replica's together, in rank order |
 | `queue_depth` | Required | Batches in flight per rank. A rank that keeps video requests resident takes three positions per request, so such a group holds up to `queue_depth / 3` requests at once; a group serving several replicas, such as a shared text encoder, needs positions for all of them |
 | `mem_fraction_static` | Top-level `mem_fraction_static` | Each rank's device-memory share for this group |
+
+A `prefill` group prefills prompts only and a `decode` group decodes only; a deployment configures both or neither, and each places the `model` component alone. A request prefills on a prefill group; once its prompt is complete and its first token sampled, the prefill group exports its KV cache, a decode group installs it into the same cache units (`CacheExport` and `CacheInstall` transfer calls), and the request decodes there. Such a deployment generates text: image generation and canvas requests are refused.
 
 A `ranks` entry is `[HOST/]DEVICE`. `DEVICE` is one device (`cuda:0`, `cpu`), an inclusive index range (`cuda:0-3`) or a device repeated for CPU workers (`cpu*4`). Without `HOST` the ranks run on the leader's own host, the `host_identity` of the process that reads the file; `rank-1/cuda:0-3` places four ranks on the node whose `uniserve serve` starts with `--host-identity rank-1`.
 

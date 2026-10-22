@@ -153,6 +153,17 @@ fn selection<'a>(
     (modules, excluded)
 }
 
+/// The plugin weight source the launch's model streams its tensors from, as
+/// an argument: `None` reads the checkpoint's files.
+fn weights(launch: &WorkerLaunch) -> Any {
+    launch
+        .model
+        .as_ref()
+        .and_then(|model| model.weights.as_deref())
+        .map(|weights| Any::from(tvm_ffi::String::from(weights)))
+        .unwrap_or_default()
+}
+
 /// The precision selectors of the launch's model, as JSON object text.
 fn quantization(launch: &WorkerLaunch) -> &str {
     launch
@@ -164,10 +175,13 @@ fn quantization(launch: &WorkerLaunch) -> &str {
 impl LoadedModel {
     /// The digests of what determines this rank's loaded weights besides
     /// its placement and GPUs (`fingerprint`); `None` for the stub model,
-    /// whose weights are not retained.
+    /// whose weights are not retained. `numerics` is the digest of the code
+    /// the weights were loaded with ([`Fingerprints::numerics`]), `None`
+    /// before loading.
     pub(crate) fn fingerprint(
         description: &Description,
         launch: &WorkerLaunch,
+        numerics: Option<&str>,
     ) -> Result<Option<Fingerprints>> {
         let (modules, excluded) = selection(description, launch);
         let text = |value: &str| Any::from(tvm_ffi::String::from(value));
@@ -181,6 +195,8 @@ impl LoadedModel {
                 text(&launch.execution.model_dtype),
                 union.map(|union| text(&union.exchange)).unwrap_or_default(),
                 Any::from(union.map_or(0, |union| union.attention_ranks as i64)),
+                weights(launch),
+                numerics.map(text).unwrap_or_default(),
             ])?
             .try_into()
             .map_err(|error| Error::numerical("fingerprint", &error))?;
@@ -267,6 +283,7 @@ impl LoadedModel {
                 optional(attention.decode_split_tile_size.map(i64::from)),
                 optional(attention.prefill_split_tile_size.map(i64::from)),
                 attention.use_tensor_core.map(Any::from).unwrap_or_default(),
+                weights(launch),
             ])?,
         )?;
         let backend: tvm_ffi::String =

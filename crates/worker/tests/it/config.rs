@@ -20,6 +20,7 @@ fn defaults() -> Value {
             "deployment": "model",
             "claim": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             "host_kv_cache": false,
+            "host_kv_cache_bytes": null,
             "standby": false,
             "standby_memory": "auto",
         },

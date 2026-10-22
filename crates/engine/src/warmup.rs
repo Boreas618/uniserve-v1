@@ -241,6 +241,7 @@ fn warmup_request(
         },
         readout: Vec::new(),
         generated_token_ids: Vec::new(),
+        adapter: 0,
     }
 }
 

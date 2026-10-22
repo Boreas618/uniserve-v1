@@ -3,9 +3,13 @@
 //! The scheduler asks `Placement` which loaded worker replica executes a call.
 //! Candidates are the workers whose reported `supported_calls` and component
 //! bindings cover the call; once a request is placed on a replica for a
-//! component, its later calls for that component stay there.
+//! component, its later calls for that component stay there. A request's
+//! decode calls stay on the replica that took its first decode-stage call,
+//! which is its prefill replica unless that replica only prefills
+//! (`WorkerGroupRole::Prefill`): then a decode replica installs its cache.
 
 use super::*;
+use ipc::{ForwardMode, TransferMode};
 
 #[derive(Default)]
 pub(super) struct Placement {
@@ -18,6 +22,23 @@ pub(super) struct Placement {
     /// `Scheduler::refill_executor` prunes entries of requests that are no
     /// longer running or retiring.
     pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
+    /// Replica that decodes each request for one bound component name: the
+    /// replica of its decode-stage calls (`decodes`), recorded as `affinity`
+    /// is.
+    pub(super) decode_affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
+    /// The groups that prefill only (`WorkerGroupRole::Prefill`): their
+    /// requests decode on the scheduler's decode groups.
+    pub(super) prefill_groups: HashSet<crate::WorkerGroupId>,
+}
+
+/// Whether a call of `kind` belongs to a request's decode stage, which a
+/// decode replica may hold apart from its prefill replica.
+fn decodes(kind: CallKind) -> bool {
+    matches!(
+        kind,
+        CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
+            | CallKind::Transfer(TransferMode::CacheInstall)
+    )
 }
 
 impl Placement {
@@ -100,15 +121,24 @@ impl Placement {
         kind: CallKind,
         component: &'a str,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
+        // A decode-stage call runs on a replica that decodes: a cache
+        // install, which a prefill replica could serve, hands the request to
+        // a decode replica.
         let candidates = self
             .component_candidates(executor, kind, component)
+            .filter(|(id, _, _)| !decodes(kind) || !self.prefill_groups.contains(*id))
             .collect::<Vec<_>>();
         let bound = candidates.first()?.1;
 
         // Once a request has used this component, its mutable request state and
         // graph slot live on that exact replica. Queue pressure may delay the
         // next call but must never migrate it.
-        if let Some(owner) = self.affinity.get(&(request, bound.to_owned())) {
+        let pinned = if decodes(kind) {
+            &self.decode_affinity
+        } else {
+            &self.affinity
+        };
+        if let Some(owner) = pinned.get(&(request, bound.to_owned())) {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
             return executor.has_capacity(id).then_some((id, component));
         }
@@ -182,8 +212,12 @@ impl Placement {
             self.component_target(executor, call.request_key, call.kind, &call.component)
         }?;
         let target = (id.clone(), bound_component.to_owned());
-        self.affinity
-            .insert((call.request_key, target.1.clone()), target.0.clone());
+        let pinned = if decodes(call.kind) {
+            &mut self.decode_affinity
+        } else {
+            &mut self.affinity
+        };
+        pinned.insert((call.request_key, target.1.clone()), target.0.clone());
         Some(target)
     }
 
@@ -199,9 +233,14 @@ impl Placement {
             .map(|(_, placement)| placement.worker.clone())
             .collect::<HashSet<_>>();
         for command in &batch.commands {
-            targets.extend(self.affinity.iter().filter_map(|((request, _), worker)| {
-                (*request == command.request_key()).then_some(worker.clone())
-            }));
+            targets.extend(
+                self.affinity
+                    .iter()
+                    .chain(&self.decode_affinity)
+                    .filter_map(|((request, _), worker)| {
+                        (*request == command.request_key()).then_some(worker.clone())
+                    }),
+            );
         }
         targets
     }

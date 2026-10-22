@@ -6,6 +6,12 @@ the manifest and the server's records (``Retained``). The test plays the
 worker's part with one CUDA byte tensor as the retained memory.
 """
 
+import json
+import sys
+import time
+import types
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -172,3 +178,119 @@ def test_a_worker_that_read_some_tensors_publishes_only_those():
     retained.install(model, {id(module) for module in model.modules()})
     assert model.projection.weight.is_meta
     assert not model.gate.weight.is_meta
+
+
+def test_a_checkpoint_file_rewritten_in_place_has_another_identity(
+    tmp_path, monkeypatch
+):
+    from uniserve.loading import retained
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"\x00" * 64)
+    # A file written just now has an identity of this read alone.
+    assert retained._identity(shard) != retained._identity(shard)
+
+    # Once settled, the same file has one identity.
+    monkeypatch.setattr(retained, "_SETTLED_NS", 0)
+    first = retained._identity(shard)
+    assert retained._identity(shard) == first
+    # The same names, size and header with other values, written a clock
+    # tick later: another identity.
+    time.sleep(0.05)
+    shard.write_bytes(b"\x01" * 64)
+    assert retained._identity(shard) != first
+    # A link names the file it points to.
+    link = tmp_path / "link.safetensors"
+    link.symlink_to(shard)
+    assert retained._identity(link) == retained._identity(shard)
+    # A copy elsewhere is another file.
+    copy = tmp_path / "copy.safetensors"
+    copy.write_bytes(shard.read_bytes())
+    assert retained._identity(copy) != retained._identity(shard)
+
+
+def test_a_hugging_face_cache_file_is_its_blob(tmp_path):
+    from uniserve.loading import retained
+
+    # A Hugging Face cache: snapshots link to blobs named by their contents'
+    # digest, SHA-256 for a large file.
+    digest = "ab" * 32
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    (blobs / digest).write_bytes(b"\x00" * 64)
+    snapshot = tmp_path / "snapshots" / "main"
+    snapshot.mkdir(parents=True)
+    shard = snapshot / "model.safetensors"
+    shard.symlink_to(Path("..") / ".." / "blobs" / digest)
+    # Written just now, the blob still has its digest as its identity, and
+    # another cache's blob of that digest has the same.
+    assert retained._identity(shard) == f"blob:{digest}"
+    other = tmp_path / "other" / "blobs"
+    other.mkdir(parents=True)
+    (other / digest).write_bytes(b"\x00" * 64)
+    assert retained._identity(other / digest) == f"blob:{digest}"
+    # A file named otherwise in a directory named so is any other file.
+    (blobs / "notes.txt").write_text("x")
+    assert not retained._identity(blobs / "notes.txt").startswith("blob:")
+
+
+def _numerical_package(tmp_path, monkeypatch):
+    """Make a numerical package of two modules and a kernel source.
+
+    The process has loaded the first module alone.
+    """
+    from uniserve.loading import retained
+
+    root = tmp_path / "numerics"
+    root.mkdir()
+    (root / "loaded.py").write_text("SCALE = 1\n")
+    (root / "unloaded.py").write_text("SCALE = 2\n")
+    (root / "kernel.cu").write_text("// kernel\n")
+    monkeypatch.setattr(retained, "_PACKAGES", ("numerics",))
+    monkeypatch.setattr(
+        retained,
+        "_root",
+        lambda package: root if package == "numerics" else None,
+    )
+    module = types.ModuleType("numerics.loaded")
+    module.__file__ = str(root / "loaded.py")
+    monkeypatch.setitem(sys.modules, "numerics.loaded", module)
+    retained._beside_modules.cache_clear()
+    monkeypatch.setattr(retained.plugins, "versions", lambda: [])
+    return root
+
+
+def test_the_loaded_numerics_cover_the_modules_the_process_loaded(
+    tmp_path, monkeypatch
+):
+    from uniserve.loading import retained
+
+    root = _numerical_package(tmp_path, monkeypatch)
+    before = retained.loaded_numerics()
+    # A module the process never loaded computed nothing.
+    (root / "unloaded.py").write_text("SCALE = 3\n")
+    assert retained.loaded_numerics() == before
+    # A loaded module's change, or a kernel source's, does change it.
+    (root / "loaded.py").write_text("SCALE = 4\n")
+    changed = retained.loaded_numerics()
+    assert changed != before
+    (root / "kernel.cu").write_text("// another kernel\n")
+    retained._beside_modules.cache_clear()
+    assert retained.loaded_numerics() != changed
+
+
+def test_weights_bind_only_while_the_modules_that_loaded_them_are_unchanged(
+    tmp_path, monkeypatch
+):
+    from uniserve.loading import retained
+
+    root = _numerical_package(tmp_path, monkeypatch)
+    manifest = json.dumps({"modules": retained.module_digests()})
+    assert set(json.loads(manifest)["modules"]) == {"numerics/loaded.py"}
+    assert retained.modules_current(manifest)
+    (root / "unloaded.py").write_text("SCALE = 3\n")
+    assert retained.modules_current(manifest)
+    (root / "loaded.py").write_text("SCALE = 4\n")
+    assert not retained.modules_current(manifest)
+    # A manifest that records no modules binds nothing.
+    assert not retained.modules_current(json.dumps({"tensors": []}))

@@ -870,6 +870,11 @@ pub struct GenerationRequest {
     /// penalties and bad words of its sampling, and in its usage.
     #[serde(default)]
     pub generated_token_ids: Vec<u32>,
+    /// The LoRA adapter the request computes with: the slot of the
+    /// worker's adapter pool the daemon loaded it into, or 0 for the base
+    /// model alone (`uniserve.adapters`).
+    #[serde(default)]
+    pub adapter: u32,
 }
 
 impl GenerationRequest {
@@ -1339,6 +1344,7 @@ mod tests {
             image_generation: policy,
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 4,
         }
     }
 

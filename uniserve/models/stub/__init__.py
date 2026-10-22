@@ -14,6 +14,7 @@ from .model import (
     STUB_IMG_START_TOKEN_ID,
     STUB_STALL_TOKEN_ID,
     Model,
+    TokenCount,
     entry_points,
 )
 from .processing import image_processor
@@ -27,5 +28,6 @@ __all__ = [
     "STUB_EOS_TOKEN_ID",
     "STUB_IMG_START_TOKEN_ID",
     "STUB_STALL_TOKEN_ID",
+    "TokenCount",
     "entry_points",
 ]

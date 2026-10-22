@@ -11,12 +11,20 @@
 //! daemon joins the leader at the leader's address; the leader then accepts
 //! engines on its process socket, answers their requests for its own node
 //! and forwards the others to the member that owns the node (`service`).
+//!
+//! A hot restart hands a running daemon's service to its successor
+//! ([`Daemon::hand_over`], [`Daemon::resume`]): the successor goes on with
+//! its sockets, connections, processes and claims.
 
 mod claims;
 mod service;
 mod supervisor;
 
+pub(crate) use service::HandedService;
+pub use supervisor::LIFELINE_ENV;
+
 use std::net::IpAddr;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,9 +76,14 @@ pub struct Daemon {
     /// The leader's socket file, removed once its service ends.
     socket: Option<PathBuf>,
     requested: Arc<AtomicBool>,
+    handoff: Arc<AtomicBool>,
     wake: UnixStream,
-    thread: Option<JoinHandle<anyhow::Result<()>>>,
+    thread: Option<JoinHandle<Served>>,
 }
+
+/// How the service thread ended: stopped (`None`), or stopped for a hot
+/// restart with what it served and its descriptors.
+type Served = anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>>;
 
 impl Daemon {
     /// Starts this node's daemon. The leader binds its process socket and
@@ -95,8 +108,10 @@ impl Daemon {
         let (wake, wake_reader) = UnixStream::pair().context("creating the daemon's wake")?;
         wake_reader.set_nonblocking(true)?;
         let requested = Arc::new(AtomicBool::new(false));
+        let handoff = Arc::new(AtomicBool::new(false));
         let stop = Stop {
             requested: Arc::clone(&requested),
+            handoff: Arc::clone(&handoff),
             wake: wake_reader,
         };
 
@@ -115,7 +130,7 @@ impl Daemon {
             let leader_address = members
                 .first()
                 .and_then(|member| member.connection.local_ip());
-            let local = local(&options, leader_address, false);
+            let local = local(&options, leader_address, false)?;
             let host = options.host.clone();
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
@@ -125,7 +140,7 @@ impl Daemon {
         } else {
             let leader = join_leader(&options)?;
             let address = leader.local_ip();
-            let local = local(&options, address, true);
+            let local = local(&options, address, true)?;
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
@@ -137,9 +152,72 @@ impl Daemon {
             address,
             socket,
             requested,
+            handoff,
             wake,
             thread: Some(thread),
         })
+    }
+
+    /// Goes on with the service a predecessor handed over in a hot restart
+    /// ([`Daemon::hand_over`]), on host `host`; `address` and `socket` are
+    /// the leader's process socket, `None` on a member.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the service thread cannot start.
+    pub(crate) fn resume(
+        host: String,
+        address: Option<(String, PathBuf)>,
+        handed: HandedService,
+        descriptors: Vec<OwnedFd>,
+    ) -> anyhow::Result<Self> {
+        let (wake, wake_reader) = UnixStream::pair().context("creating the daemon's wake")?;
+        wake_reader.set_nonblocking(true)?;
+        let requested = Arc::new(AtomicBool::new(false));
+        let handoff = Arc::new(AtomicBool::new(false));
+        let stop = Stop {
+            requested: Arc::clone(&requested),
+            handoff: Arc::clone(&handoff),
+            wake: wake_reader,
+        };
+        let thread = std::thread::Builder::new()
+            .name("daemon".into())
+            .spawn(move || service::resume(host, handed, descriptors, &stop))
+            .context("starting the daemon's service")?;
+        let (address, socket) = address.unzip();
+        Ok(Self {
+            address,
+            socket,
+            requested,
+            handoff,
+            wake,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stops the service between two rounds and returns everything it
+    /// serves, for a successor to go on with ([`Daemon::resume`]): its
+    /// processes and connections outlive this daemon, and the process
+    /// socket's file stays for the successor.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the service ended or failed before it handed over.
+    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(HandedService, Vec<OwnedFd>)> {
+        use std::io::Write as _;
+
+        self.handoff.store(true, Ordering::Release);
+        let _ = (&self.wake).write(&[1]);
+        let thread = self
+            .thread
+            .take()
+            .context("the daemon's service is not running")?;
+        // The successor serves the socket from here on.
+        self.socket = None;
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))??
+            .context("the daemon's service stopped before it handed over")
     }
 
     /// The leader's process socket, which engines connect to; `None` on a
@@ -185,7 +263,7 @@ impl Daemon {
         if let Some(socket) = self.socket.take() {
             let _ = std::fs::remove_file(socket);
         }
-        served?
+        served?.map(drop)
     }
 }
 
@@ -198,12 +276,17 @@ impl Drop for Daemon {
 /// This node's supervisor and claims. `remote_pages` says whether another
 /// node's processes send this node's Storage Server page requests: a member
 /// node's server serves the engine on the leader.
-fn local(options: &DaemonOptions, address: Option<IpAddr>, remote_pages: bool) -> Local {
-    Local {
-        supervisor: Supervisor::new(options.host.clone()),
+fn local(
+    options: &DaemonOptions,
+    address: Option<IpAddr>,
+    remote_pages: bool,
+) -> anyhow::Result<Local> {
+    Ok(Local {
+        supervisor: Supervisor::new(options.host.clone())
+            .context("creating the daemon's lifeline")?,
         claims: ClaimHolder::new(options.executable.clone(), remote_pages, address),
         address,
-    }
+    })
 }
 
 /// The leader's wait for every member: each connects to `dist_init_addr`
@@ -335,4 +418,120 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     );
     tracing::info!(leader = %address, node_rank = options.node_rank, "joined the leader");
     Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use proto::process::{
+        Downstream, Engine, Request, Spawn, Stop, Upstream, downstream, reply, request, upstream,
+    };
+
+    use super::*;
+
+    /// The next reply on `connection`.
+    fn reply(connection: &mut Connection) -> proto::process::Reply {
+        loop {
+            let message: Downstream = connection
+                .recv(Duration::from_secs(30))
+                .unwrap()
+                .expect("a reply in time");
+            if let Some(downstream::Kind::Reply(reply)) = message.kind {
+                return reply;
+            }
+        }
+    }
+
+    fn send(connection: &mut Connection, id: u64, kind: request::Kind) {
+        connection
+            .send(&Upstream {
+                kind: Some(upstream::Kind::Request(Request {
+                    id,
+                    kind: Some(kind),
+                })),
+            })
+            .unwrap();
+    }
+
+    /// A leader's service handed over goes on with what it served: a
+    /// request on an engine connection the first service accepted is
+    /// answered by the successor's, which ends the process the first one
+    /// started.
+    #[test]
+    fn a_resumed_service_answers_the_connections_it_was_handed() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("process.sock");
+        let mut daemon = Daemon::start(DaemonOptions {
+            nnodes: 1,
+            node_rank: 0,
+            host: "localhost".to_owned(),
+            dist_init_addr: None,
+            socket: socket.clone(),
+            executable: PathBuf::from("uniserve"),
+            join_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let address = daemon.address().unwrap().to_owned();
+        let mut engine = Connection::connect(&address).unwrap();
+        engine
+            .send(&Hello {
+                major: proto::PROTOCOL_MAJOR,
+                minor: proto::PROTOCOL_MINOR,
+                build: proto::BUILD.to_owned(),
+                peer: Some(hello::Peer::Engine(Engine {
+                    deployment: "model".to_owned(),
+                })),
+            })
+            .unwrap();
+        let welcome: Welcome = engine.recv(Duration::from_secs(30)).unwrap().unwrap();
+        assert!(welcome.refusal.is_empty(), "{}", welcome.refusal);
+        send(
+            &mut engine,
+            1,
+            request::Kind::Spawn(Spawn {
+                host: "localhost".to_owned(),
+                group: "model".to_owned(),
+                rank: 0,
+                generation: 1,
+                executable: "sleep".to_owned(),
+                arguments: vec!["600".to_owned()],
+                ..Spawn::default()
+            }),
+        );
+        let Some(reply::Kind::Spawned(spawned)) = reply(&mut engine).kind else {
+            panic!("the spawn was not answered");
+        };
+
+        let (handed, descriptors) = daemon.hand_over().unwrap();
+        // The handed-over daemon ends nothing and leaves its socket.
+        drop(daemon);
+        assert!(socket.exists());
+        assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
+        let mut successor = Daemon::resume(
+            "localhost".to_owned(),
+            Some((address, socket.clone())),
+            handed,
+            descriptors,
+        )
+        .unwrap();
+
+        send(
+            &mut engine,
+            2,
+            request::Kind::Stop(Stop {
+                group: "model".to_owned(),
+                generation: None,
+            }),
+        );
+        let stopped = reply(&mut engine);
+        assert_eq!(stopped.id, 2);
+        assert!(stopped.error.is_empty(), "{}", stopped.error);
+        // The stopped process is this test's child: reap its zombie.
+        let mut status = 0;
+        // SAFETY: waits for this test's own child.
+        unsafe { libc::waitpid(spawned.pid as libc::pid_t, &mut status, 0) };
+        assert!(libc::WIFSIGNALED(status));
+        successor.stop().unwrap();
+    }
 }

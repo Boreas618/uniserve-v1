@@ -34,7 +34,7 @@ from typing import Generic, Literal, TypeVar
 import torch
 from torch import nn
 
-from uniserve import loading
+from uniserve import loading, plugins
 from uniserve.distributed import Communicator, DeviceMesh
 from uniserve.loading import checkpoint
 from uniserve.loading import weights as weight_options
@@ -698,6 +698,21 @@ def _root_metadata(root: Path) -> dict:
     )
 
 
+def _with_plugins() -> Mapping[str, str]:
+    """The catalog with the architectures plugins add (``uniserve.plugins``).
+
+    Raises:
+        ValueError: A plugin adds an architecture the catalog has.
+    """
+    added = plugins.registry().models
+    shadowed = sorted(added.keys() & _catalog.keys())
+    if shadowed:
+        raise ValueError(
+            f"plugins add the built-in architectures {', '.join(shadowed)}"
+        )
+    return {**_catalog, **added}
+
+
 def _architectures(metadata: Mapping) -> tuple[str, ...]:
     """Return the architectures a root metadata file declares.
 
@@ -758,12 +773,13 @@ def read_config(
     root, repository, revision = _root(path, io)
     metadata = _root_metadata(root)
     architectures = _architectures(metadata)
-    if len(architectures) != 1 or architectures[0] not in _catalog:
+    catalog = _with_plugins()
+    if len(architectures) != 1 or architectures[0] not in catalog:
         raise ValueError(
             f"checkpoint must declare one supported architecture; "
             f"found {architectures!r}"
         )
-    package = import_module(_catalog[architectures[0]])
+    package = import_module(catalog[architectures[0]])
 
     inventory = _inventory(root, repository, revision, io)
     # All architecture/index/tokenizer sidecars are small and required to

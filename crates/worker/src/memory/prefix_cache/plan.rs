@@ -18,6 +18,28 @@ use tvm_ffi::Any;
 
 use crate::ffi::{DType, Handle, Interpreter, integers, texts};
 use crate::memory::GroupShape;
+use crate::memory::request_slots::SlotField;
+
+/// One field of a cache layer kept per request slot: `name` is
+/// `layer/field`, `shape` one slot's extent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateField {
+    pub name: String,
+    pub dtype: DType,
+    pub shape: Vec<i64>,
+}
+
+impl StateField {
+    /// The field as a device bank of the request slots.
+    pub(crate) fn slot(&self) -> SlotField {
+        SlotField {
+            name: self.name.clone(),
+            dtype: self.dtype,
+            shape: self.shape.clone(),
+            host: false,
+        }
+    }
+}
 use crate::{Error, Result};
 
 /// The library module of the cache functions.
@@ -74,6 +96,8 @@ pub struct CachePlan {
     /// The published stored dtype (`PrefixCacheInfo::dtype`).
     pub dtype: PrefixCacheDtype,
     pub groups: Vec<CacheGroupPlan>,
+    /// The fields of the layers kept per request slot (`state_fields`).
+    pub states: Vec<StateField>,
     /// The library's `CachePlan`, passed back to its cache functions.
     pub handle: Handle,
 }
@@ -192,6 +216,9 @@ impl CachePlan {
                 compute_dtype: compute[group],
             })
             .collect();
+        let states: tvm_ffi::String = call("state_fields")?
+            .try_into()
+            .map_err(|error| Error::numerical("state_fields", &error))?;
 
         Ok(Self {
             columns: count("columns")? as u32,
@@ -200,6 +227,7 @@ impl CachePlan {
             unit_bytes: count("unit_bytes")?,
             dtype,
             groups,
+            states: state_fields(states.as_str())?,
             handle,
         })
     }
@@ -256,6 +284,9 @@ impl CachePlan {
             page_pools: Vec::new(),
             // The worker reports the units its warmup lent once it warmed up.
             scratch_units: 0,
+            segment_units: 0,
+            usable_units: num_units,
+            request_states: !self.states.is_empty(),
         }
     }
 
@@ -274,5 +305,62 @@ impl CachePlan {
                     scales.max(rows),
                 )
             })
+    }
+}
+
+/// The request state fields of a plan's `state_fields`: a JSON list of
+/// `{"name", "dtype", "shape"}`, `shape` one slot's extent.
+fn state_fields(text: &str) -> Result<Vec<StateField>> {
+    #[derive(serde::Deserialize)]
+    struct Field {
+        name: String,
+        dtype: String,
+        shape: Vec<i64>,
+    }
+    let fields: Vec<Field> = serde_json::from_str(text)
+        .map_err(|error| Error::Interface(format!("the cache plan's state fields: {error}")))?;
+    fields
+        .into_iter()
+        .map(|field| {
+            Ok(StateField {
+                dtype: DType::parse(&field.dtype)?,
+                name: field.name,
+                shape: field.shape,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan's request state fields read as the fields of device banks.
+    #[test]
+    fn state_fields_read_as_device_bank_fields() -> Result<()> {
+        let fields = state_fields(
+            r#"[{"name": "layers.0.mixer/conv.values", "dtype": "bfloat16", "shape": [4, 8]},
+                {"name": "layers.0.mixer/conv.initialized", "dtype": "bool", "shape": []}]"#,
+        )?;
+        assert_eq!(
+            fields.iter().map(StateField::slot).collect::<Vec<_>>(),
+            vec![
+                SlotField {
+                    name: "layers.0.mixer/conv.values".into(),
+                    dtype: DType::BF16,
+                    shape: vec![4, 8],
+                    host: false,
+                },
+                SlotField {
+                    name: "layers.0.mixer/conv.initialized".into(),
+                    dtype: DType::Bool,
+                    shape: vec![],
+                    host: false,
+                },
+            ]
+        );
+        assert!(state_fields("[]")?.is_empty());
+        assert!(state_fields(r#"[{"name": "x/y", "dtype": "complex", "shape": []}]"#).is_err());
+        Ok(())
     }
 }

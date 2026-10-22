@@ -1,0 +1,24 @@
+[package]
+name = "manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `uniserve-manager`: the optional external manager of deployments. It knows
+# the daemons only through their HTTP admin API and depends on no workspace
+# crate, so it attaches to and detaches from nodes of any build.
+[[bin]]
+name = "uniserve-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[lints]
+workspace = true

@@ -7,10 +7,15 @@
 //! its routers by `supported_tasks`, and wraps them in the middleware of
 //! `middleware`.
 
-mod listener;
+pub(crate) mod admin;
+pub(crate) mod listener;
 mod middleware;
+mod node;
+
+pub use node::node;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::metrics::METRICS;
@@ -33,7 +38,7 @@ use tracing::{info, warn};
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::input::readout::SystemOneError;
-use crate::leader::{Leader, Task, UpdateError};
+use crate::leader::{Leader, Task, UpdateError, UpdateRequest};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, images, videos};
 use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
@@ -90,57 +95,191 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
             .context("failed to start this node's daemon")?,
         () = shutdown.cancelled() => return Ok(()),
     };
-    let served = match daemon.address() {
-        Some(address) => lead(&config, &stated, address.to_owned(), &shutdown).await,
-        None => {
-            info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
-            while daemon.is_running() {
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
-                }
+    // Set by `POST /admin/shutdown`: the deployment's memory is released
+    // once its processes are down.
+    let retire = Arc::new(AtomicBool::new(false));
+    let address = daemon.address().map(str::to_owned);
+    let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
+    let Some(address) = address else {
+        info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
+        while daemon
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+            .as_ref()
+            .is_some_and(Daemon::is_running)
+        {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
             }
-            Ok(())
+        }
+        return stop_daemon(daemon).await;
+    };
+    let engine = tokio::select! {
+        engine = Leader::start(&config, &stated, address) => engine.map(Arc::new),
+        () = shutdown.cancelled() => return stop_daemon(daemon).await,
+    };
+    let engine = match engine {
+        Ok(engine) => engine,
+        Err(error) => {
+            if let Err(stopped) = stop_daemon(daemon).await {
+                warn!("the daemon did not stop after the engine failed to start: {stopped:#}");
+            }
+            return Err(error);
         }
     };
-    let stopped = tokio::task::spawn_blocking(move || {
-        let mut daemon = daemon;
-        daemon.stop()
+    let admin = admin::Admin::new(shutdown.clone(), Arc::clone(&retire));
+    admin.record(
+        "deployment",
+        format!("serving {}", engine.served_model_name()),
+    );
+    admin.watch(&engine);
+    let served = async {
+        let listener = Listener::bind(&config.server_config)
+            .await
+            .context("failed to bind listener for HTTP server")?;
+        let jobs = Arc::new(VideoJobs::new(
+            config.video_job_config.clone(),
+            shutdown.child_token(),
+        ));
+        serve_leader(
+            &config,
+            &stated,
+            Arc::clone(&engine),
+            admin,
+            listener,
+            jobs,
+            Arc::clone(&daemon),
+            &shutdown,
+        )
+        .await
+    }
+    .await;
+    let handed_over = served.as_ref().is_ok_and(|handed| *handed);
+    finish(
+        &config,
+        &engine,
+        daemon,
+        retire,
+        handed_over,
+        served.map(drop),
+    )
+    .await
+}
+
+/// Serves the leader `engine` on `listener` with `admin` and `jobs` until
+/// `shutdown` is cancelled, or until a hot restart's successor serves and
+/// this daemon finished the requests it took; returns whether the
+/// deployment was handed over. `daemon` is this node's daemon's service,
+/// which a hot restart hands over.
+///
+/// # Errors
+///
+/// As [`serve_on`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_leader(
+    config: &ServeConfig,
+    stated: &Stated,
+    engine: Arc<Leader>,
+    admin: Arc<admin::Admin>,
+    mut listener: Listener,
+    jobs: Arc<VideoJobs>,
+    daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
+    shutdown: &CancellationToken,
+) -> Result<bool> {
+    let accepting = shutdown.child_token();
+    let restarter = Arc::new(crate::restart::Restarter::new(
+        daemon,
+        &mut listener,
+        stated.clone(),
+        accepting.clone(),
+    )?);
+    let handed_over = Arc::clone(&restarter.handed_over);
+    serve_on(
+        &engine,
+        &admin,
+        listener,
+        config,
+        shutdown,
+        &accepting,
+        jobs,
+        Some(restarter),
+    )
+    .await?;
+    Ok(handed_over.load(Ordering::Acquire))
+}
+
+/// Ends a leader's serving: shuts its engine down, stops the daemon and,
+/// when `retire` was set, releases the deployment's memory; or, when the
+/// deployment was handed to a hot restart's successor, lets go of the
+/// engine and leaves the service and the memory to the successor.
+/// `served` is how serving ended.
+///
+/// # Errors
+///
+/// Returns `served`'s failure, or the first failure of the steps that
+/// follow.
+pub(crate) async fn finish(
+    config: &ServeConfig,
+    engine: &Arc<Leader>,
+    daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
+    retire: Arc<AtomicBool>,
+    handed_over: bool,
+    served: Result<()>,
+) -> Result<()> {
+    if handed_over {
+        info!("the successor daemon serves the deployment; this daemon exits");
+        return served.and(engine.detach().await);
+    }
+    let stopped = engine.shutdown().await;
+    let served = served.and(stopped).and(stop_daemon(daemon).await);
+    if retire.load(Ordering::Acquire) {
+        let deployment = config.served_model_name().to_owned();
+        let retired = tokio::task::spawn_blocking(move || retire_deployment(&deployment))
+            .await
+            .context("the deployment's release did not complete")?;
+        return served.and(retired);
+    }
+    served
+}
+
+/// Stops this node's daemon, ending every process it supervises.
+async fn stop_daemon(daemon: Arc<std::sync::Mutex<Option<Daemon>>>) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let daemon = daemon
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+            .take();
+        match daemon {
+            Some(mut daemon) => daemon.stop(),
+            None => Ok(()),
+        }
     })
     .await
-    .context("the daemon's stop did not complete")?;
-    served.and(stopped)
+    .context("the daemon's stop did not complete")?
+}
+
+/// Releases `deployment`'s weights and caches at this host's Storage
+/// Server, whose claim this daemon held until it stopped.
+fn retire_deployment(deployment: &str) -> Result<()> {
+    let socket = storage::socket::default_socket();
+    let mut operator = storage::Client::connect(&socket, storage::Role::Operator)
+        .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
+    let released = operator
+        .retire(deployment.to_owned())
+        .with_context(|| format!("retiring deployment {deployment}"))?;
+    info!(deployment, released, "released the deployment's memory");
+    Ok(())
 }
 
 /// How often a node other than the leader checks that its daemon still
 /// serves.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Serves the API on the leader, whose daemon's process socket is `daemon`,
-/// until `shutdown` is cancelled.
-async fn lead(
-    config: &ServeConfig,
-    stated: &Stated,
-    daemon: String,
-    shutdown: &CancellationToken,
-) -> Result<()> {
-    let engine = tokio::select! {
-        engine = Leader::start(config, stated, daemon) => Arc::new(engine?),
-        () = shutdown.cancelled() => return Ok(()),
-    };
-    let served = async {
-        let listener = Listener::bind(&config.server_config)
-            .await
-            .context("failed to bind listener for HTTP server")?;
-        serve_on(&engine, listener, config, shutdown).await
-    }
-    .await;
-    let stopped = engine.shutdown().await;
-    served.and(stopped)
-}
-
 /// Serves `engine` on `listener` until `shutdown` is cancelled and the
-/// server has drained, or its budget has run out.
+/// server has drained, or its budget has run out; or until `accepting` is
+/// cancelled, as a hot restart's successor serves, and the requests and
+/// video jobs this daemon took have ended, however long they take.
 ///
 /// Shutdown has one budget, `server_config.shutdown_timeout`, measured from
 /// the cancellation. The server stops accepting connections and waits for
@@ -152,28 +291,31 @@ async fn lead(
 /// # Errors
 ///
 /// Fails when the listener cannot report its address or the server fails.
+#[allow(clippy::too_many_arguments)]
 async fn serve_on(
     engine: &Arc<Leader>,
+    admin: &Arc<admin::Admin>,
     listener: Listener,
     config: &ServeConfig,
     shutdown: &CancellationToken,
+    accepting: &CancellationToken,
+    jobs: Arc<VideoJobs>,
+    restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Result<()> {
     let server = &config.server_config;
     let bind_address = listener.local_addr()?;
-    let jobs = Arc::new(VideoJobs::new(
-        config.video_job_config.clone(),
-        shutdown.child_token(),
-    ));
     let app = router(
         Arc::clone(engine),
         Arc::clone(&jobs),
         server,
         video_body_limit(&config.media_config),
+        Arc::clone(admin),
+        restarter,
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
     let serving =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+        axum::serve(listener, app).with_graceful_shutdown(accepting.clone().cancelled_owned());
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;
@@ -219,6 +361,8 @@ pub(crate) fn router(
     jobs: Arc<VideoJobs>,
     server: &ServerOptions,
     video_body_limit: usize,
+    admin: Arc<admin::Admin>,
+    restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Router {
     let timeout = |router: Router| match server.request_timeout {
         Some(timeout) => router.layer(from_fn(move |request: Request, next: Next| {
@@ -283,10 +427,16 @@ pub(crate) fn router(
         .layer(from_fn(middleware::track_http_metrics));
 
     // An update runs for as long as the standby engine takes to start, so
-    // it is held to no request timeout or concurrency limit.
+    // the admin routes are held to no request timeout or concurrency limit.
     let admin = Router::new()
         .route("/engine/update", post(update_engine))
-        .with_state(Arc::clone(&engine));
+        .with_state(Arc::clone(&engine))
+        .merge(admin::router(admin::AdminState {
+            leader: Arc::clone(&engine),
+            admin,
+            jobs: Arc::clone(&jobs),
+            restarter,
+        }));
     let mut authenticated = Router::new()
         .route("/version", get(version))
         .merge(api)
@@ -324,11 +474,12 @@ async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
     }
 }
 
-/// The body of `POST /engine/update`; an empty body updates to the build the
-/// running engine's executable holds now.
+/// The body of `POST /engine/update`, which `POST /admin/update` extends;
+/// an empty body updates to the build the running engine's executable
+/// holds now.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UpdateRequest {
+struct EngineUpdateBody {
     /// The `uniserve` executable of the build to update to.
     executable: Option<String>,
 }
@@ -339,15 +490,20 @@ struct UpdateRequest {
 /// took: `409` while another update runs.
 async fn update_engine(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
     let request = if body.is_empty() {
-        UpdateRequest::default()
+        EngineUpdateBody::default()
     } else {
-        match serde_json::from_slice::<UpdateRequest>(&body) {
+        match serde_json::from_slice::<EngineUpdateBody>(&body) {
             Ok(request) => request,
             Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
         }
     };
-    match engine.update(request.executable).await {
+    let request = UpdateRequest {
+        executable: request.executable,
+        set: Vec::new(),
+    };
+    match engine.update(request).await {
         Ok(update) => Json(json!({
+            "in_place": update.in_place,
             "pause_seconds": update.pause.as_secs_f64(),
             "drain_seconds": update.drain.as_secs_f64(),
             "close_seconds": update.close.as_secs_f64(),
@@ -432,6 +588,194 @@ mod tests {
             "allowed_token_ids": [u32::from(b'a')],
             "stream": stream,
         })
+    }
+
+    /// The admin API reports the deployment, holds new requests while
+    /// generation is paused, and logs what it did.
+    #[tokio::test]
+    async fn the_admin_api_pauses_generation_and_logs_it() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        let (status, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
+        assert_eq!(body["deployment"]["engine"], json!("ready"));
+        assert_eq!(body["deployment"]["paused"], json!(false));
+
+        let (status, _, body) = send(&app, post_json("/admin/pause_generation", &json!({}))).await;
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!("succeeded"))
+        );
+        let (_, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(body["deployment"]["paused"], json!(true));
+
+        // A chat completion waits while generation is paused, and is served
+        // once it continues.
+        let waiting = tokio::spawn({
+            let app = app.clone();
+            async move {
+                send(
+                    &app,
+                    post_json("/v1/chat/completions", &chat_body(2, false)),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "a paused deployment holds requests");
+        let (status, _, _) = send(&app, post_json("/admin/continue_generation", &json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+
+        // Each operation started and succeeded in the log.
+        let (_, _, body) = send(&app, get_request("/admin/events?after=0")).await;
+        let messages: Vec<&str> = body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "pause_generation 1 started",
+                "pause_generation 1 succeeded",
+                "continue_generation 2 started",
+                "continue_generation 2 succeeded",
+            ]
+        );
+        // An update this leader cannot run (it has no engine process of its
+        // own) fails and is logged as failed.
+        let (status, _, body) = send(&app, post_json("/admin/update", &json!({}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["state"], json!("failed"));
+    }
+
+    /// A sleeping deployment holds new requests and serves them once it
+    /// wakes, and its status says it sleeps. The engine's own worker hooks
+    /// run through their endpoints alone.
+    #[tokio::test]
+    async fn a_sleeping_deployment_serves_once_it_wakes() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!("succeeded"))
+        );
+        let (_, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(
+            (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
+            (&json!(true), &json!(true))
+        );
+
+        let waiting = tokio::spawn({
+            let app = app.clone();
+            async move {
+                send(
+                    &app,
+                    post_json("/v1/chat/completions", &chat_body(2, false)),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a sleeping deployment holds requests"
+        );
+        let (status, _, body) = send(&app, post_json("/admin/wake_up", &json!({}))).await;
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!("succeeded"))
+        );
+        let (status, _, _) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(
+            (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
+            (&json!(false), &json!(false))
+        );
+
+        let (status, _, _) = send(&app, post_json("/admin/hooks/uniserve.sleep", &json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A loaded LoRA adapter is listed and served under its name until it
+    /// is unloaded; a name is loaded once, and the served model's name is
+    /// no adapter's.
+    #[tokio::test]
+    async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        let adapter = json!({"lora_name": "tuned", "lora_path": "/adapters/tuned"});
+        let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["results"], json!([{"adapter": 1}]));
+        let (status, _, _) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/admin/load_lora_adapter",
+                &json!({"lora_name": SERVED_MODEL}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, _, body) = send(&app, get_request("/v1/models")).await;
+        let names: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec![SERVED_MODEL, "tuned"]);
+        let mut request = chat_body(2, false);
+        request["model"] = json!("tuned");
+        let (status, _, body) = send(&app, post_json("/v1/chat/completions", &request)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], json!("tuned"));
+
+        let (status, _, body) = send(
+            &app,
+            post_json("/admin/unload_lora_adapter", &json!({"lora_name": "tuned"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, _) = send(&app, post_json("/v1/chat/completions", &request)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = send(
+            &app,
+            post_json("/admin/unload_lora_adapter", &json!({"lora_name": "tuned"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A weight update names its checkpoint, and one whose files cannot be
+    /// resolved is refused before the engine is asked.
+    #[tokio::test]
+    async fn a_weight_update_from_an_unknown_checkpoint_is_refused() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        let (status, _, _) = send(
+            &app,
+            post_json("/admin/update_weights", &json!({"path": "/nowhere"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/admin/update_weights",
+                &json!({"model_path": "/nonexistent/checkpoint"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["state"], json!("failed"), "{body}");
+        let (_, _, body) = send(&app, get_request("/admin/status")).await;
+        assert_eq!(body["deployment"]["paused"], json!(false));
     }
 
     /// A token model serves chat completions and no video route; a video
@@ -612,7 +956,18 @@ mod tests {
         let server = tokio::spawn({
             let engine = Arc::clone(&engine);
             let shutdown = shutdown.clone();
-            async move { serve_on(&engine, listener, &ServeConfig::default(), &shutdown).await }
+            async move {
+                let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
+                let config = ServeConfig::default();
+                let jobs = Arc::new(VideoJobs::new(
+                    config.video_job_config.clone(),
+                    shutdown.child_token(),
+                ));
+                serve_on(
+                    &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
+                )
+                .await
+            }
         });
 
         let response = reqwest::Client::new()
@@ -649,7 +1004,17 @@ mod tests {
         let server = tokio::spawn({
             let engine = Arc::clone(&engine);
             let shutdown = shutdown.clone();
-            async move { serve_on(&engine, listener, &config, &shutdown).await }
+            async move {
+                let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
+                let jobs = Arc::new(VideoJobs::new(
+                    config.video_job_config.clone(),
+                    shutdown.child_token(),
+                ));
+                serve_on(
+                    &engine, &admin, listener, &config, &shutdown, &shutdown, jobs, None,
+                )
+                .await
+            }
         });
 
         // The server answers `100 Continue` once the handler waits for the

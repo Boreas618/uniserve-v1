@@ -71,6 +71,22 @@ pub(crate) struct Suspension {
     pub(crate) world: Option<crate::ffi::Handle>,
 }
 
+/// What the engine's built-in worker hooks (`uniserve.*`) reach: the
+/// Storage Server connection the cache planes' segments are retained
+/// through, and the graph pools a sleeping worker suspends.
+pub(crate) struct Maintenance {
+    /// `None` for a rank whose planes this process allocated for itself
+    /// (`LocalMemory`).
+    pub(crate) retained: Option<Arc<Retained>>,
+    /// What an in-place weight update rewrites; `None` for a rank that
+    /// loaded no model.
+    pub(crate) weights: Option<crate::worker::update::WeightUpdate>,
+    pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
+    /// Whether the worker sleeps: its graph memory suspended and its cache
+    /// given back.
+    pub(crate) asleep: bool,
+}
+
 /// A standby worker parked until its promotion: its retained storages,
 /// read-only, and what it released while parked.
 pub(crate) struct Parked {
@@ -156,6 +172,7 @@ pub(crate) struct Service<'a> {
     /// The Storage Server connection of a parked standby worker, which
     /// promotion takes write access through; `None` once the rank serves.
     standby: Option<Parked>,
+    maintenance: Maintenance,
 }
 
 impl<'a> Service<'a> {
@@ -166,6 +183,7 @@ impl<'a> Service<'a> {
         experts: bool,
         stall_bound: Duration,
         standby: Option<Parked>,
+        maintenance: Maintenance,
     ) -> Self {
         executor.set_completion_wake(Some(channel.wake()));
         Self {
@@ -181,6 +199,7 @@ impl<'a> Service<'a> {
             stalled: false,
             channel_failed: Cell::new(false),
             standby,
+            maintenance,
         }
     }
 
@@ -354,6 +373,21 @@ impl<'a> Service<'a> {
                     Err(error) => self.error_response(message_id, error)?,
                 }))
             }
+            WorkerRequest::Hook {
+                message_id,
+                name,
+                payload,
+            } => {
+                let ran = if name.starts_with(BUILT_IN) {
+                    self.built_in(&name, &payload)
+                } else {
+                    hook(&name, &payload)
+                };
+                PendingResponse::Ready(Box::new(match ran {
+                    Ok(result) => WorkerResponse::Hooked { message_id, result },
+                    Err(error) => self.error_response(message_id, WorkerError::from(error))?,
+                }))
+            }
             WorkerRequest::Submit { message_id, .. } if self.standby.is_some() => {
                 PendingResponse::Ready(Box::new(self.error_response(
                     message_id,
@@ -516,6 +550,186 @@ impl Drop for Service<'_> {
     }
 }
 
+/// The prefix of the hooks the worker runs itself, which no plugin may
+/// implement.
+const BUILT_IN: &str = "uniserve.";
+
+impl Service<'_> {
+    /// Runs the built-in hook `name` with the JSON `payload`, while the rank
+    /// runs no batch, and returns its JSON result:
+    ///
+    /// - `uniserve.cache_memory`: the cache planes' segments (count, units
+    ///   and bytes of each, the first given back) and the device's free
+    ///   memory and this process's, which a standby engine needs as much of;
+    /// - `uniserve.release_cache` (`{"from": segment}`): gives back the
+    ///   planes' segments from `segment` on, whose units the engine
+    ///   withdrew;
+    /// - `uniserve.restore_cache`: creates them again;
+    /// - `uniserve.sleep`: suspends the graph memory and gives back every
+    ///   segment; `uniserve.wake` restores both;
+    /// - `uniserve.update_weights` (`{"model_path": path}`): rewrites the
+    ///   weights in place from the checkpoint at `path`
+    ///   (`crate::worker::update`), and answers the rank's worker group and
+    ///   the new key seed of each host page pool.
+    fn built_in(&mut self, name: &str, payload: &str) -> crate::Result<String> {
+        let payload: serde_json::Value = if payload.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(payload)
+                .map_err(|error| Error::Invalid(format!("hook payload: {error}")))?
+        };
+        let planes = self
+            .executor
+            .backend()
+            .worker_storage()
+            .and_then(|storage| storage.prefix_cache.as_ref())
+            .map(|cache| Arc::clone(cache.planes()));
+        let retained = self.maintenance.retained.clone();
+        let mut shared = retained.as_deref();
+        let mut local = crate::memory::retained::LocalMemory;
+        let memory: &mut dyn crate::memory::retained::ExclusiveMemory = match &mut shared {
+            Some(retained) => retained,
+            None => &mut local,
+        };
+        let result = match name {
+            "uniserve.cache_memory" => {
+                let device = planes.as_ref().and_then(|planes| planes.device());
+                let (segments, units) = planes
+                    .as_ref()
+                    .and_then(|planes| planes.segments())
+                    .unwrap_or((0, 0));
+                // A parked standby keeps the graph share of the device free
+                // beside the workers it stands by for (`park_memory`).
+                let (free, process, reserve) = match device {
+                    Some(device) => {
+                        let memory = device.memory_info()?;
+                        (
+                            memory.free,
+                            cuda::Nvml::init()?.process_memory(device)?,
+                            crate::cuda_graph::graph_storage_budget_bytes(memory.total as i64),
+                        )
+                    }
+                    None => (0, 0, 0),
+                };
+                let plan = planes.as_ref().map(|planes| Arc::clone(planes.plan()));
+                let segment_bytes = plan.map_or(0, |plan| {
+                    2 * u64::from(plan.columns) * u64::from(units) * plan.plane_bytes
+                });
+                serde_json::json!({
+                    "segments": segments,
+                    "segment_units": units,
+                    "segment_bytes": segment_bytes,
+                    "released_from": planes.as_ref().map_or(0, |planes| {
+                        planes.usable_units() / units.max(1)
+                    }),
+                    "free_bytes": free,
+                    "process_bytes": process,
+                    "reserve_bytes": reserve,
+                })
+            }
+            "uniserve.release_cache" => {
+                let first = payload["from"]
+                    .as_u64()
+                    .and_then(|first| u32::try_from(first).ok())
+                    .ok_or_else(|| Error::Invalid("release_cache names no segment".into()))?;
+                planes
+                    .ok_or_else(|| Error::State("the rank holds no cache"))?
+                    .release_segments(first, memory)?;
+                serde_json::Value::Null
+            }
+            "uniserve.restore_cache" => {
+                restore(planes.as_ref(), memory)?;
+                serde_json::Value::Null
+            }
+            "uniserve.sleep" => {
+                // Asleep from the start: a wake restores whatever a sleep
+                // that failed part of the way gave back.
+                self.maintenance.asleep = true;
+                for pool in &self.maintenance.pools {
+                    pool.suspend()?;
+                }
+                if let Some(planes) = &planes
+                    && planes.segments().is_some()
+                {
+                    planes.release_segments(0, memory)?;
+                }
+                tracing::info!("the worker sleeps: its graph memory and cache are released");
+                serde_json::Value::Null
+            }
+            "uniserve.wake" => {
+                if self.maintenance.asleep {
+                    for pool in &self.maintenance.pools {
+                        pool.restore()?;
+                    }
+                    restore(planes.as_ref(), memory)?;
+                    self.maintenance.asleep = false;
+                    tracing::info!("the worker woke: its graph memory and cache are restored");
+                }
+                serde_json::Value::Null
+            }
+            "uniserve.update_weights" => {
+                let path = payload["model_path"]
+                    .as_str()
+                    .ok_or_else(|| Error::Invalid("update_weights names no model_path".into()))?;
+                let copies_pages = self
+                    .executor
+                    .backend()
+                    .worker_storage()
+                    .and_then(|storage| storage.prefix_cache.as_ref())
+                    .is_some_and(crate::memory::PrefixCache::copies_pages);
+                let plan = planes.as_ref().map(|planes| Arc::clone(planes.plan()));
+                match (self.maintenance.weights.as_mut(), retained.as_deref()) {
+                    (Some(weights), Some(retained)) => {
+                        weights.apply(path, retained, plan.as_deref(), copies_pages)?
+                    }
+                    _ => serde_json::json!({ "group": null, "page_contents": [] }),
+                }
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "no built-in worker hook {other}"
+                )));
+            }
+        };
+        Ok(result.to_string())
+    }
+}
+
+/// Creates the segments `planes` gave back again, through `memory`.
+fn restore(
+    planes: Option<&Arc<crate::memory::CachePlanes>>,
+    memory: &mut dyn crate::memory::retained::ExclusiveMemory,
+) -> crate::Result<()> {
+    let Some(planes) = planes else {
+        return Ok(());
+    };
+    let Some(device) = planes.device() else {
+        return Ok(());
+    };
+    if planes.segments().is_none() {
+        return Ok(());
+    }
+    let stream = cuda::Stream::new(device)?;
+    planes.restore_segments(memory, &stream)
+}
+
+/// Runs the worker hook `name` with `payload` (`uniserve.hooks.call`) and
+/// returns its JSON result. The engine sends a hook while the rank runs no
+/// forward; the hook's device work completes before it returns.
+fn hook(name: &str, payload: &str) -> crate::Result<String> {
+    use crate::ffi::Interpreter;
+    use tvm_ffi::Any;
+
+    let result: tvm_ffi::String = Interpreter::import("uniserve.hooks.call")?
+        .call_values(&[
+            Any::from(tvm_ffi::String::from(name)),
+            Any::from(tvm_ffi::String::from(payload)),
+        ])?
+        .try_into()
+        .map_err(|error| Error::numerical("hook", &error))?;
+    Ok(result.as_str().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -607,6 +821,7 @@ mod tests {
             finish_token_ids: Vec::new(),
             initial_position: 0,
             generated_token_ids: Vec::new(),
+            adapter: 0,
         };
         let request = NewRequest::new(
             RequestKey::new(1, RequestId(id), 1),
@@ -640,6 +855,12 @@ mod tests {
             false,
             Duration::from_secs(150),
             None,
+            super::Maintenance {
+                retained: None,
+                weights: None,
+                pools: Vec::new(),
+                asleep: false,
+            },
         )
         .run()
     }

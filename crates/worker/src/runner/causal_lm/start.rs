@@ -474,6 +474,7 @@ impl CausalLMRunners {
                     state.penalty_counts(),
                     state.prompt_logits(),
                     state.logit_bias(),
+                    state.adapters(),
                 ],
             })?;
 

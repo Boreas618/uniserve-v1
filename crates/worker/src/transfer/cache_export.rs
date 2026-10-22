@@ -12,6 +12,9 @@
 //! writes until the export retires. FP8 exports are frozen into staging
 //! first, because a later append can grow a page's scale and re-encode it;
 //! the export keeps that staging until its issuer's work was performed.
+//! Planes split into segments (`CachePlanes`) are one allocation per column
+//! and segment, which other ranks cannot map as one: an export other ranks
+//! read is frozen too, and one this rank reads alone aliases the pages.
 
 use std::sync::Arc;
 
@@ -331,7 +334,7 @@ fn export_group(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut source = Spans::new(views)?;
-            if plan.quantized {
+            if plan.quantized || (planes.segments().is_some() && !consumers.is_empty()) {
                 source = freeze(planes, &source, stream, frozen)?;
             }
             // The offset places this run inside the group's transfer at the
@@ -515,6 +518,7 @@ mod tests {
                 dtype: DType::F8E4M3,
                 compute_dtype: DType::BF16,
             }],
+            states: Vec::new(),
             handle: crate::ffi::Handle::none(),
         });
         let planes = CachePlanes::allocate(

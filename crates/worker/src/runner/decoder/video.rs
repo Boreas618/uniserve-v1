@@ -282,10 +282,12 @@ impl VideoDecoder {
 
     /// Record in `job` the forward of a unit of `shape` whose clip input reads
     /// `rows` latent rows, on the decoder's stream: the launch of the
-    /// shape's captured graph, or the eager call of `DecoderRunner.decode`,
-    /// which serves a shape startup did not capture. With `capture`, a
-    /// shape not captured yet is captured instead of called (startup's
-    /// capture of a warmed shape): the job's completion carries the graph
+    /// shape's captured graph, or, without graphs and while startup warms a
+    /// shape, the eager call of `DecoderRunner.decode`. Under graphs startup
+    /// captured every unit shape serving forms (`DecoderRunners::prepare_startup`), and
+    /// the sealed table refuses another. With `capture`, a shape not
+    /// captured yet is captured instead of called (startup's capture of a
+    /// warmed shape): the job's completion carries the graph
     /// ([`Self::complete_capture`]). A capture is counted when its graph is
     /// stored.
     fn forward(
@@ -322,7 +324,7 @@ impl VideoDecoder {
                 });
                 GraphMode::Capture
             }
-            // A shape startup did not capture runs on the builder thread.
+            Err(error) if self.pool.is_some() => return Err(error),
             _ => {
                 job.call(method(self)?);
                 GraphMode::Eager

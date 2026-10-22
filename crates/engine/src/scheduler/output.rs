@@ -643,9 +643,18 @@ impl Scheduler {
                     return;
                 }
 
+                // A request prefilled on a prefill group hands its cache to
+                // a decode group first; the decode there continues from the
+                // committed token, which leaves no device token to relay.
+                let hand_off = self.decodes_elsewhere(id);
                 if let Some(st) = self.running.get_mut(&id) {
                     st.next_token = tok;
-                    st.phase = Phase::DecodeUnd;
+                    if hand_off {
+                        st.phase = Phase::HandOff;
+                        st.latest_token = None;
+                    } else {
+                        st.phase = Phase::DecodeUnd;
+                    }
                 }
 
                 if can_open_gen_branch

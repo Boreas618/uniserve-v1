@@ -107,6 +107,7 @@ fn generation() -> GenerationRequest {
             }],
         }],
         generated_token_ids: Vec::new(),
+        adapter: 0,
     }
 }
 

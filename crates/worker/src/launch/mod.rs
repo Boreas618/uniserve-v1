@@ -133,7 +133,7 @@ pub(crate) fn end(status: i32) -> ! {
 /// worker's group as soon as it has read it, before the worker logs the
 /// error itself.
 /// A failure to send leaves the engine to notice the closed connection.
-fn report_startup_failure(channel: &mut ipc::Channel, error: &WorkerError) {
+pub(crate) fn report_startup_failure(channel: &mut ipc::Channel, error: &WorkerError) {
     let response = ipc::WorkerResponse::Error {
         message_id: None,
         error: error.response(),

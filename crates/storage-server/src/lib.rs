@@ -28,6 +28,7 @@
 mod kv_storage;
 pub mod mooncake;
 mod pages;
+mod restart;
 mod serve;
 mod shoot;
 
@@ -45,6 +46,7 @@ use crate::mooncake::BATCH_PAGES;
 pub use kv_storage::Launch as ConnectorLaunch;
 use kv_storage::{KvStorage, Task};
 pub use pages::DEFAULT_POOL_BYTES;
+pub use restart::{Pending as RestartPending, TAKEOVER_DESCRIPTOR, relaunch_arguments};
 pub use serve::{ServeOptions, list, retire, run_connector, serve};
 use shoot::ShootDowns;
 use storage::protocol::{
@@ -149,18 +151,29 @@ pub struct Server {
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
     pages: pages::Pools,
+    /// Host memory a new page pool leaves available to the host's other
+    /// processes.
+    host_reserve: u64,
     kv_storage: KvStorage,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
+    /// The arguments a hot restart's successor starts with.
+    relaunch: Vec<String>,
+    /// A hot restart under way, which hands the server over once nothing is
+    /// in flight.
+    restart: Option<restart::Pending>,
 }
 
 impl Server {
     /// Serve on `listener`, which the caller bound with mode 0600, with
-    /// page pools of `page_pool_bytes` each, and run the Mooncake connector
-    /// `connector` when given.
+    /// page pools of `page_pool_bytes` each unless a worker asks for another
+    /// size, leaving `host_reserve` bytes of the host's available memory to
+    /// other processes, and run the Mooncake connector `connector` when
+    /// given.
     pub fn new(
         listener: UnixListener,
         page_pool_bytes: u64,
+        host_reserve: u64,
         connector: Option<ConnectorLaunch>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
@@ -175,8 +188,11 @@ impl Server {
             deployments: HashMap::new(),
             shootdowns: ShootDowns::default(),
             pages: pages::Pools::new(page_pool_bytes),
+            host_reserve,
             kv_storage: KvStorage::new(connector),
             events: Vec::new(),
+            relaunch: Vec::new(),
+            restart: None,
         })
     }
 
@@ -191,12 +207,21 @@ impl Server {
 
     /// Serve until `stop` reads true. `stop` is checked after every wake;
     /// `wake` is a descriptor whose readability wakes the loop (a signal
-    /// pipe), drained when it fires.
-    pub fn run(&mut self, wake: BorrowedFd<'_>, stop: &dyn Fn() -> bool) -> io::Result<()> {
+    /// pipe), drained when it fires. Returns once `stop` holds, or with the
+    /// restart under way once nothing is in flight, which the caller then
+    /// completes ([`Server::hand_over`]).
+    pub fn run(
+        &mut self,
+        wake: BorrowedFd<'_>,
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<Option<restart::Pending>> {
         while !stop() {
             self.turn(wake)?;
+            if self.restart.is_some() && self.quiescent() {
+                return Ok(self.restart.take());
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// One wait and the work it makes ready.
@@ -575,6 +600,10 @@ impl Server {
                 Ok(Outcome::Reply(Reply::Finished, Vec::new()))
             }
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
+            (Request::Restart { executable }, Role::Operator) => self
+                .begin_restart(executable.as_deref())
+                .map(|pid| Outcome::Reply(Reply::Restarting { pid }, Vec::new()))
+                .map_err(resource),
             (Request::Claim { scopes }, Role::Head { deployment }) => {
                 self.claim(id, &deployment, scopes)
             }
@@ -606,6 +635,7 @@ impl Server {
                     }
                     Request::Promote { keys } => self.promote(&holder, keys),
                     Request::Release { keys } => self.release(&holder, keys),
+                    Request::Rekey { moves } => self.rekey(&holder, moves),
                     _ => Err(invalid(&format!(
                         "{} is not a worker request",
                         request_name(request)
@@ -706,7 +736,97 @@ impl Server {
             self.remove_tensor(&key);
         }
         tracing::info!(deployment, "a head claimed the deployment");
+        // The host serves the deployments whose heads run on it: every
+        // other one is retired, so its weights and caches do not outlive it.
+        for other in self.idle_deployments(deployment) {
+            self.release_deployment(&other);
+        }
         Ok(Outcome::Reply(Reply::Claimed { claim }, Vec::new()))
+    }
+
+    /// The deployments other than `except` that hold a claim, a tensor or a
+    /// page pool and whose head is not connected.
+    fn idle_deployments(&self, except: &str) -> Vec<String> {
+        let mut named: BTreeSet<String> = self.deployments.keys().cloned().collect();
+        named.extend(
+            self.tensors
+                .values()
+                .flat_map(|tensor| tensor.scopes.iter().map(|scope| scope.deployment.clone())),
+        );
+        named.extend(self.pages.deployments());
+        named
+            .into_iter()
+            .filter(|deployment| deployment != except)
+            .filter(|deployment| {
+                !self.deployments.get(deployment).is_some_and(|entry| {
+                    entry
+                        .head
+                        .is_some_and(|head| self.clients.contains_key(&head))
+                })
+            })
+            .collect()
+    }
+
+    /// Release every tensor and page pool of `deployment` and forget its
+    /// claim. Returns the tensors released.
+    fn release_deployment(&mut self, deployment: &str) -> u64 {
+        self.deployments.remove(deployment);
+        let released: Vec<Key> = self
+            .tensors
+            .iter_mut()
+            .filter_map(|(key, tensor)| {
+                tensor.scopes.retain(|scope| scope.deployment != deployment);
+                tensor.scopes.is_empty().then_some(*key)
+            })
+            .collect();
+        let count = released.len() as u64;
+        for key in released {
+            self.remove_tensor(&key);
+        }
+        let pools = self.pages.release(deployment);
+        self.pools_released(&pools);
+        tracing::info!(
+            deployment,
+            released = count,
+            pools = pools.len(),
+            "retired a deployment"
+        );
+        count
+    }
+
+    /// Tell the connector that it no longer maps `pools`.
+    fn pools_released(&mut self, pools: &[u64]) {
+        for &pool in pools {
+            if self.kv_storage.offered.remove(&pool)
+                && let Some(connector) = self.kv_storage.client
+            {
+                self.events
+                    .push((connector, Event::PoolReleased { pool }, Vec::new()));
+            }
+        }
+    }
+
+    /// Refuse `bytes` of new host memory that the host cannot hold: its
+    /// available memory less the server's reserve and what the page pools
+    /// have yet to allocate.
+    fn admit_host(&self, bytes: u64) -> Result<(), (ErrorKind, String)> {
+        let available = available_memory().map_err(resource)?;
+        let pending = self.pages.unallocated();
+        let room = available
+            .saturating_sub(self.host_reserve)
+            .saturating_sub(pending);
+        if bytes > room {
+            return Err((
+                ErrorKind::Resource,
+                format!(
+                    "{bytes} bytes of host memory exceed the {room} bytes the host can hold: \
+                     {available} bytes available, less {pending} bytes the page pools have yet \
+                     to allocate and the server's reserve of {} bytes",
+                    self.host_reserve
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// `retire`: see [`Request::Retire`]. Processes that still map the
@@ -723,20 +843,7 @@ impl Server {
                 format!("deployment {deployment} has a connected head"),
             ));
         }
-        self.deployments.remove(deployment);
-        let released: Vec<Key> = self
-            .tensors
-            .iter_mut()
-            .filter_map(|(key, tensor)| {
-                tensor.scopes.retain(|scope| scope.deployment != deployment);
-                tensor.scopes.is_empty().then_some(*key)
-            })
-            .collect();
-        let count = released.len() as u64;
-        for key in released {
-            self.remove_tensor(&key);
-        }
-        tracing::info!(deployment, released = count, "retired a deployment");
+        let count = self.release_deployment(deployment);
         Ok(Outcome::Reply(
             Reply::Retired { released: count },
             Vec::new(),
@@ -1042,6 +1149,49 @@ impl Server {
         Ok(Outcome::Reply(Reply::Released, Vec::new()))
     }
 
+    /// `rekey`: see [`Request::Rekey`].
+    fn rekey(
+        &mut self,
+        holder: &Holder,
+        moves: &[(Key, Key)],
+    ) -> Result<Outcome, (ErrorKind, String)> {
+        if !self.current(holder) {
+            return Err(stale(holder));
+        }
+        let mut moved = BTreeSet::new();
+        for (old, new) in moves {
+            let tensor = self
+                .tensors
+                .get(old)
+                .ok_or_else(|| invalid(&format!("{old:?} is not retained")))?;
+            if tensor.access != Access::ReadOnly {
+                return Err(invalid(&format!("{} is not read-only", tensor.name)));
+            }
+            if let Some(other) = tensor
+                .scopes
+                .iter()
+                .find(|scope| scope.deployment != holder.scope.deployment)
+            {
+                return Err((
+                    ErrorKind::Held,
+                    format!("{} is held by {other} as well", tensor.name),
+                ));
+            }
+            if self.tensors.contains_key(new) || !moved.insert(*new) {
+                return Err(invalid(&format!(
+                    "{} cannot move to {new:?}, which is retained",
+                    tensor.name
+                )));
+            }
+        }
+        for (old, new) in moves {
+            if let Some(tensor) = self.tensors.remove(old) {
+                self.tensors.insert(*new, tensor);
+            }
+        }
+        Ok(Outcome::Reply(Reply::Rekeyed, Vec::new()))
+    }
+
     /// Remove a tensor and release its storage with its last tensor.
     fn remove_tensor(&mut self, key: &Key) {
         let Some(tensor) = self.tensors.remove(key) else {
@@ -1248,7 +1398,7 @@ impl Server {
             return;
         };
         for listed in self.pages.listing() {
-            if self.kv_storage.offered.insert(listed.pool) {
+            if !self.pages.released(listed.pool) && self.kv_storage.offered.insert(listed.pool) {
                 self.events.push((
                     connector,
                     Event::Pool {
@@ -1353,12 +1503,16 @@ impl Server {
             return;
         };
         self.complete(task, results);
+        let reaped = self.pages.reap();
+        self.pools_released(&reaped);
     }
 
     /// End `task` as if the connector reported every page failed.
     fn fail(&mut self, task: Task) {
         self.complete(task, &[]);
         self.pages.settle();
+        let reaped = self.pages.reap();
+        self.pools_released(&reaped);
     }
 
     /// End `task` with the connector's `results`, one per page of the task;
@@ -1445,6 +1599,8 @@ impl Server {
             self.fail(task);
         }
         self.pages.connector_gone();
+        // The connector maps no pool any more: released pools leave.
+        self.pages.reap();
     }
 
     /// A page pool request: `page_pool` from a worker, the others from a
@@ -1456,8 +1612,28 @@ impl Server {
         role: &Role,
     ) -> Result<Outcome, (ErrorKind, String)> {
         let reply = |reply| Ok(Outcome::Reply(reply, Vec::new()));
-        if let (Request::PagePool { shape, numa_node }, Role::Worker { .. }) = (request, role) {
-            let pool = self.pages.pool(*shape, *numa_node).map_err(resource)?;
+        if let (
+            Request::PagePool {
+                shape,
+                numa_node,
+                bytes,
+            },
+            Role::Worker { scope, .. },
+        ) = (request, role)
+        {
+            let pool = match self.pages.find(&scope.deployment, *shape, *numa_node) {
+                Some(pool) => pool,
+                None => {
+                    let slots = self
+                        .pages
+                        .slots_of(shape.page_bytes, *bytes)
+                        .map_err(resource)?;
+                    self.admit_host(slots * shape.page_bytes)?;
+                    self.pages
+                        .create(&scope.deployment, *shape, *numa_node, slots)
+                        .map_err(resource)?
+                }
+            };
             let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
             self.offer_pools();
             return Ok(Outcome::Reply(
@@ -1482,6 +1658,14 @@ impl Server {
                 Err(invalid(&format!("{scope} is not a scope of {deployment}")))
             }
         };
+        if let Some(pool) = request_pool(request)
+            && let Some(entry) = self.pages.get(pool)
+            && (&entry.deployment != deployment || self.pages.released(pool))
+        {
+            return Err(invalid(&format!(
+                "page pool {pool} is not a live pool of {deployment}"
+            )));
+        }
         match request {
             Request::Lookup { pool, keys } => {
                 let held = pool_of(&mut self.pages, *pool)?.lookup(keys);
@@ -1593,6 +1777,33 @@ fn dedup(holders: &mut Vec<Holder>) {
     });
 }
 
+/// The page pool a head's page request names.
+fn request_pool(request: &Request) -> Option<u64> {
+    match request {
+        Request::Lookup { pool, .. }
+        | Request::Reserve { pool, .. }
+        | Request::Commit { pool, .. }
+        | Request::Abort { pool, .. }
+        | Request::Pin { pool, .. }
+        | Request::Unpin { pool, .. }
+        | Request::Prefetch { pool, .. } => Some(*pool),
+        _ => None,
+    }
+}
+
+/// The host's available memory (`MemAvailable` of `/proc/meminfo`), in
+/// bytes.
+fn available_memory() -> io::Result<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|kib| kib.trim().parse::<u64>().ok())
+        .map(|kib| kib * 1024)
+        .ok_or_else(|| io::Error::other("/proc/meminfo states no MemAvailable"))
+}
+
 fn invalid(message: &str) -> (ErrorKind, String) {
     (ErrorKind::Invalid, message.to_owned())
 }
@@ -1626,8 +1837,10 @@ fn request_name(request: &Request) -> &'static str {
         Request::Put { .. } => "put",
         Request::Promote { .. } => "promote",
         Request::Release { .. } => "release",
+        Request::Rekey { .. } => "rekey",
         Request::List => "list",
         Request::Retire { .. } => "retire",
+        Request::Restart { .. } => "restart",
         Request::PagePool { .. } => "page_pool",
         Request::Lookup { .. } => "lookup",
         Request::Reserve { .. } => "reserve",

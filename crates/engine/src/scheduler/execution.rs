@@ -187,6 +187,7 @@ impl Scheduler {
         progressed |= self.poll_kv_offload();
 
         progressed |= self.refill_executor();
+        self.poll_resize();
 
         self.stats
             .general
@@ -225,12 +226,19 @@ impl Scheduler {
         // A retiring request keeps its entries because
         // `Placement::batch_workers` finds the destinations of its `Finish`
         // and `Free` commands through them.
-        self.placement.affinity.retain(|(request, _), _| {
-            let id = request.request_id;
-            self.running.contains_key(&id)
-                || self.running_media.contains_key(&id)
-                || self.retiring_requests.contains_key(&id)
-        });
+        let live: HashSet<RequestId> = self
+            .running
+            .keys()
+            .chain(self.running_media.keys())
+            .chain(self.retiring_requests.keys())
+            .copied()
+            .collect();
+        self.placement
+            .affinity
+            .retain(|(request, _), _| live.contains(&request.request_id));
+        self.placement
+            .decode_affinity
+            .retain(|(request, _), _| live.contains(&request.request_id));
 
         let mut blocked_workers = HashSet::new();
         progressed |= self.dispatch_submissions(&mut blocked_workers);
@@ -300,8 +308,8 @@ impl Scheduler {
     /// nothing to schedule.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
-        // workers close.
-        if self.closing {
+        // workers close; a sleeping one runs nothing.
+        if self.closing || self.asleep {
             return Vec::new();
         }
         if self.prefer_media {

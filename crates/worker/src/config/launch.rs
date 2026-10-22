@@ -68,6 +68,9 @@ pub struct ModelSource {
     /// Precision selectors as a JSON object text, interpreted by the
     /// numerical library's rank loading (`uniserve.loading.rank`).
     pub quantization: String,
+    /// A plugin's weight source (`scheme://...`) that streams the
+    /// checkpoint's tensors in place of its files; `None` reads the files.
+    pub weights: Option<String>,
 }
 
 /// Checkpoint reading options, interpreted by the numerical library.
@@ -214,6 +217,7 @@ pub fn resolve(
         model: model.map(|path| ModelSource {
             path,
             quantization: descriptor.quantization_config.to_string(),
+            weights: text(descriptor.weights.as_deref()),
         }),
         data_plane: DataPlane { backends, exports },
         execution,

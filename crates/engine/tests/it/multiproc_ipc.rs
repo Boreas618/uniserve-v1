@@ -1956,6 +1956,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
             image_generation: Default::default(),
             readout: Vec::new(),
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }))?;
         std::fs::write(directory.path().join("release"), "")?;
         runtime.block_on(async {
@@ -2035,6 +2036,7 @@ fn greedy_text(id: u64, generated: Vec<u32>, max_und_tokens: usize) -> Request {
         image_generation: Default::default(),
         readout: Vec::new(),
         generated_token_ids: generated,
+        adapter: 0,
     })
 }
 
@@ -2054,6 +2056,149 @@ fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u3
             Err(_) => thread::sleep(Duration::from_millis(5)),
         }
     }
+}
+
+/// A stub model that also counts each request's tokens in a cache layer
+/// kept per request slot (`uniserve.models.stub.TokenCount`, the test
+/// implementation of such a cache layer type), whose forward fails when a
+/// row continues from another count than its prefix. A prompt of three
+/// chunks and its decode steps carry the count in the request's slot; a
+/// second request of the same prompt reuses no prefix, which its slot never
+/// counted, and generates the same tokens.
+#[test]
+fn a_cache_layer_kept_per_request_carries_its_state_across_forwards() -> anyhow::Result<()> {
+    let model = tempfile::tempdir()?;
+    std::fs::write(model.path().join("stub.json"), r#"{"request_state": true}"#)?;
+    let mut config = stub_engine_config("request-states");
+    config.worker_process.model = model.path().to_string_lossy().into_owned();
+    let engine = SchedulerHandle::start_all(config)?.remove(0);
+    let stats = std::sync::Arc::clone(engine.stats());
+    // 600 tokens: three chunks of the ranks' 256-token batches.
+    let prompt: Vec<u32> = (0..600u32).map(|index| index % 47 + 5).collect();
+    let result = (|| -> anyhow::Result<Vec<Vec<u32>>> {
+        let mut generated = Vec::new();
+        for id in [91, 92] {
+            let mut events = engine.submit(Request::from(engine::GenerationRequest {
+                request_id: RequestId(id),
+                prompt_token_ids: prompt.clone(),
+                negative_prompt_token_ids: Vec::new(),
+                multimodal_inputs: Default::default(),
+                constraint: engine::GenerationConstraint::UndOnly,
+                sampling: SamplingParams {
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+                image: Default::default(),
+                max_images: 1,
+                max_und_tokens: 8,
+                stop_strings: Vec::new(),
+                stop_token_ids: Vec::new(),
+                priority: 0,
+                cache: Default::default(),
+                include_stop_token: false,
+                image_generation: Default::default(),
+                readout: Vec::new(),
+                generated_token_ids: Vec::new(),
+                adapter: 0,
+            }))?;
+            let (tokens, terminal) = tokens_until_terminal(&mut events)?;
+            anyhow::ensure!(
+                matches!(terminal, Event::Finished { .. }),
+                "request {id} ended with {terminal:?}"
+            );
+            generated.push(tokens);
+        }
+        Ok(generated)
+    })();
+    engine.shutdown();
+    let generated = result?;
+    anyhow::ensure!(
+        generated[0].len() == 8 && generated[0] == generated[1],
+        "{generated:?}"
+    );
+    anyhow::ensure!(
+        stats.prefix.hit_tokens.load(Ordering::Relaxed) == 0,
+        "a prefix was reused"
+    );
+    Ok(())
+}
+
+/// A deployment of a prefill group and a decode group (`WorkerGroupRole`)
+/// prefills each request on the first, which exports the request's KV
+/// cache once its prompt is complete, and decodes it on the second, which
+/// installs that cache: requests generate what one model group generates,
+/// though the prefill group serves no decode and the decode group no
+/// prefill.
+#[test]
+fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> {
+    let generate = |config: EngineConfig| -> anyhow::Result<Vec<Vec<u32>>> {
+        let engine = SchedulerHandle::start_all(config)?.remove(0);
+        let result = (|| -> anyhow::Result<Vec<Vec<u32>>> {
+            // Two requests at once, one of a prompt of three chunks.
+            let mut streams = Vec::new();
+            for (id, prompt) in [
+                (101_u64, vec![7, 8, 9]),
+                (102, (0..600u32).map(|index| index % 47 + 5).collect()),
+            ] {
+                streams.push(engine.submit(Request::from(engine::GenerationRequest {
+                    request_id: RequestId(id),
+                    prompt_token_ids: prompt,
+                    negative_prompt_token_ids: Vec::new(),
+                    multimodal_inputs: Default::default(),
+                    constraint: engine::GenerationConstraint::UndOnly,
+                    sampling: SamplingParams {
+                        ignore_eos: true,
+                        ..Default::default()
+                    },
+                    image: Default::default(),
+                    max_images: 1,
+                    max_und_tokens: 6,
+                    stop_strings: Vec::new(),
+                    stop_token_ids: Vec::new(),
+                    priority: 0,
+                    cache: Default::default(),
+                    include_stop_token: false,
+                    image_generation: Default::default(),
+                    readout: Vec::new(),
+                    generated_token_ids: Vec::new(),
+                    adapter: 0,
+                }))?);
+            }
+            let mut generated = Vec::new();
+            for mut events in streams {
+                let (tokens, terminal) = tokens_until_terminal(&mut events)?;
+                anyhow::ensure!(
+                    matches!(terminal, Event::Finished { .. }),
+                    "a request ended with {terminal:?}"
+                );
+                generated.push(tokens);
+            }
+            Ok(generated)
+        })();
+        engine.shutdown();
+        result
+    };
+
+    let expected = generate(stub_engine_config("one-group"))?;
+    let mut config = stub_engine_config("prefill-decode");
+    let group = config.worker_groups.remove(0);
+    config.worker_groups = [
+        ("prefill", engine::WorkerGroupRole::Prefill),
+        ("decode", engine::WorkerGroupRole::Decode),
+    ]
+    .into_iter()
+    .map(|(id, role)| WorkerGroupConfig {
+        id: engine::WorkerGroupId(id.into()),
+        role,
+        ..group.clone()
+    })
+    .collect();
+    let handed = generate(config)?;
+    anyhow::ensure!(
+        expected.iter().all(|tokens| tokens.len() == 6) && handed == expected,
+        "one group generated {expected:?}, the prefill and decode groups {handed:?}"
+    );
+    Ok(())
 }
 
 /// An engine standing by for a running one starts beside it on the same
@@ -2549,9 +2694,13 @@ fn stub_storage() -> ipc::StorageLaunch {
             std::thread::spawn(move || {
                 let _lock = lock;
                 let (_keep, wake) = std::os::unix::net::UnixStream::pair().unwrap();
-                let mut server =
-                    storage_server::Server::new(listener, storage_server::DEFAULT_POOL_BYTES, None)
-                        .unwrap();
+                let mut server = storage_server::Server::new(
+                    listener,
+                    storage_server::DEFAULT_POOL_BYTES,
+                    0,
+                    None,
+                )
+                .unwrap();
                 server
                     .run(std::os::fd::AsFd::as_fd(&wake), &|| false)
                     .unwrap();
@@ -2569,6 +2718,7 @@ fn stub_storage() -> ipc::StorageLaunch {
                 deployment: STUB_WORKER.into(),
                 claim: claim.0,
                 host_kv_cache: false,
+                host_kv_cache_bytes: None,
                 tcp: None,
                 standby: false,
                 standby_memory: proto::request::StandbyMemory::Auto,
@@ -2592,6 +2742,7 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         // The engine's default watchdog timeout.
         watchdog_timeout_ms: 300_000,
         model: String::new(),
+        weights: None,
         host: "localhost".into(),
         device: "cpu".into(),
         rank: 0,
@@ -2709,6 +2860,7 @@ fn text_admission(
             finish_token_ids: Vec::new(),
             initial_position: 0,
             generated_token_ids: Vec::new(),
+            adapter: 0,
         }),
         None,
         0,
@@ -3880,6 +4032,7 @@ mod trajectory {
             finish_token_ids: vec![1000, 1007],
             initial_position: 0,
             generated_token_ids: Vec::new(),
+            adapter: 0,
         };
         let image = ipc::ImageParams {
             steps: IMAGE_STEPS as u16,
@@ -5084,6 +5237,17 @@ fn media_worker() -> anyhow::Result<()> {
                 return Ok(());
             }
             WorkerRequest::Promote { message_id } => WorkerResponse::Ok { message_id },
+            WorkerRequest::Hook { message_id, .. } => WorkerResponse::Error {
+                message_id,
+                error: ipc::WorkerResponseError {
+                    message: "this worker runs no hooks".into(),
+                    code: None,
+                    fatal: false,
+                    phase: None,
+                    route: None,
+                    calls: Vec::new(),
+                },
+            },
             WorkerRequest::Submit { message_id, batch } => {
                 let mut completions: Vec<CallOutput> = batch
                     .calls

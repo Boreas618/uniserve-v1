@@ -21,6 +21,7 @@ from typing import TypeAlias
 # name on this package, so the library keeps a distinct name here.
 import torch as torch_lib
 
+from uniserve import plugins
 from uniserve.models.inputs import TextSize
 from uniserve.nn.functional import Routes
 from uniserve.quantization import QuantizedTensor, RowOrder, ScaleLayout
@@ -42,7 +43,7 @@ from uniserve.tensors import BufferConfig
 # tuned CUTLASS layer on SM100 at 1-8 and 128-8192 tokens and ties it at
 # 16-64 tokens (artifacts/diffusion_gemma/stage5/moe/bf16/).
 _NATIVE = ("cutedsl", "cutlass")
-_PROVIDERS = frozenset((*_NATIVE, "trtllm", "torch"))
+PROVIDERS = frozenset((*_NATIVE, "trtllm", "torch"))
 
 # The physical arrangement a provider reads each named expert projection's
 # encoded weight in, by projection name (``up_gate``, ``down``).
@@ -395,9 +396,12 @@ def resolve(
                 "no native expert kernel covers this FusedMoE representation "
                 f"on {device} ({'; '.join(reasons)})"
             )
-    if backend not in _PROVIDERS:
+    if backend in PROVIDERS:
+        provider = import_module(f"{__name__}.{backend}").Backend()
+    elif (factory := plugins.provider("moe", backend)) is not None:
+        provider = factory()
+    else:
         raise ValueError(f"unknown expert backend {backend!r}")
-    provider = import_module(f"{__name__}.{backend}").Backend()
     reason = provider.unsupported(module)
     if reason is not None:
         raise ValueError(

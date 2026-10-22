@@ -42,6 +42,10 @@ pub struct EngineInfo {
     /// The prefix cache units of each worker group, which an engine
     /// standing by for this one maps.
     pub cache_units: Vec<wire::GroupCacheUnits>,
+    /// The batch the workers were started for, within which the schedulers
+    /// take scheduling limits in place; `None` from an engine that does not
+    /// state it.
+    pub capacity: Option<wire::BatchCapacity>,
 }
 
 impl From<wire::EngineInfo> for EngineInfo {
@@ -52,6 +56,7 @@ impl From<wire::EngineInfo> for EngineInfo {
             latent_encoding_units: info.latent_encoding_units,
             schedulers: info.schedulers,
             cache_units: info.cache_units,
+            capacity: info.capacity,
         }
     }
 }
@@ -118,7 +123,15 @@ struct Shared {
     requests: Mutex<HashMap<RequestId, Pending>>,
     state: watch::Sender<EngineState>,
     next_id: AtomicU64,
+    /// The hooks and configure commands awaiting their answer, by
+    /// identity: a hook's answer is each worker's result, a configure's
+    /// none.
+    answers: Mutex<HashMap<u64, Answer>>,
 }
+
+/// Where an engine command's answer goes: each worker's result, or why the
+/// command failed.
+type Answer = oneshot::Sender<Result<Vec<String>, String>>;
 
 impl Shared {
     /// Sends one frame to the engine; a closed connection is the reader's to
@@ -147,8 +160,14 @@ pub struct EngineClient {
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The daemon connection the engine's process lives under, which reports
     /// its exit; `None` for an engine whose process this client did not
-    /// start.
-    control: Option<Mutex<Connection>>,
+    /// start, or once handed to a successor daemon ([`Self::take_control`]).
+    control: Mutex<Option<Connection>>,
+    /// Set once the client let go of the engine without shutting it down
+    /// ([`Self::detach`]).
+    detached: std::sync::atomic::AtomicBool,
+    /// The identity this daemon's engine control gave the engine; `None`
+    /// for an engine it did not start.
+    engine: Option<u64>,
 }
 
 impl EngineClient {
@@ -190,6 +209,7 @@ impl EngineClient {
             requests: Mutex::default(),
             state,
             next_id: AtomicU64::new(1),
+            answers: Mutex::default(),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -201,8 +221,24 @@ impl EngineClient {
             shared,
             info,
             reader: Mutex::new(Some(thread)),
-            control: control.map(Mutex::new),
+            control: Mutex::new(control),
+            detached: std::sync::atomic::AtomicBool::new(false),
+            engine: None,
         })
+    }
+
+    /// The client of engine `engine`, as this daemon's engine control
+    /// numbers its engines.
+    #[must_use]
+    pub fn numbered(mut self, engine: u64) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
+    /// The engine's identity, when this daemon's engine control started or
+    /// adopted it.
+    pub fn engine(&self) -> Option<u64> {
+        self.engine
     }
 
     /// What the engine reported it serves.
@@ -327,10 +363,10 @@ impl EngineClient {
     pub fn await_exit(&self, timeout: Duration) -> anyhow::Result<Option<String>> {
         use proto::process::{Downstream, Event as ProcessEvent, downstream, event};
 
-        let Some(control) = &self.control else {
+        let mut control = lock(&self.control);
+        let Some(control) = control.as_mut() else {
             return Ok(None);
         };
-        let mut control = lock(control);
         let deadline = std::time::Instant::now() + timeout;
         loop {
             while let Some(message) = control.try_recv::<Downstream>()? {
@@ -390,9 +426,160 @@ impl EngineClient {
         }
     }
 
+    /// Runs the worker hook `name` with the JSON `payload` on every worker
+    /// once the engine's batches in flight complete, and returns each
+    /// worker's JSON result.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a worker gave, or when the engine ends first.
+    pub async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Hook(wire::Hook {
+                    id,
+                    name: name.to_owned(),
+                    payload: payload.to_owned(),
+                })),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+    }
+
+    /// Gives every scheduler of the engine the scheduling limits and policy
+    /// `scheduling` states, from its next step on.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a scheduler refused them (a limit beyond the
+    /// batch the workers were started for), or when the engine ends first.
+    pub async fn configure(&self, scheduling: wire::Scheduling) -> Result<(), String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Configure(wire::Configure {
+                    id,
+                    scheduling: Some(scheduling),
+                })),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+            .map(drop)
+    }
+
+    /// Gives back or restores the device memory of the engine's KV cache
+    /// (`wire::CacheChange`), and returns what each worker reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a scheduler could not make the change, or when
+    /// the engine ends first.
+    pub async fn resize_cache(&self, change: wire::CacheChange) -> Result<Vec<String>, String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
+                    id,
+                    change: change as i32,
+                })),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+    }
+
+    /// Has every worker rewrite its weights in place from the checkpoint at
+    /// `model_path` once no request runs, and returns what each reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the reason a worker could not update, or when the engine
+    /// ends first.
+    pub async fn update_weights(&self, model_path: &str) -> Result<Vec<String>, String> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        lock(&self.shared.answers).insert(id, answer);
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::UpdateWeights(
+                    wire::UpdateWeights {
+                        id,
+                        model_path: model_path.to_owned(),
+                    },
+                )),
+            }));
+        answered
+            .await
+            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
+    }
+
+    /// Commands the engine to revoke every cached prefix page; requests in
+    /// flight keep their pages.
+    pub fn flush_cache(&self) {
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::FlushCache(wire::FlushCache {})),
+            }));
+    }
+
+    /// Commands the engine to connect to the daemon whose request socket is
+    /// `requests` beside this one (a hot restart's successor), which it then
+    /// serves as well.
+    pub fn attach(&self, requests: &str) {
+        self.shared
+            .send(to_engine::Kind::Engine(wire::EngineCommand {
+                kind: Some(wire::engine_command::Kind::Attach(wire::Attach {
+                    requests: requests.to_owned(),
+                })),
+            }));
+    }
+
+    /// The daemon connection the engine's process lives under, for a
+    /// successor daemon to keep; this client reports no exit afterwards.
+    pub fn take_control(&self) -> Option<Connection> {
+        lock(&self.control).take()
+    }
+
+    /// The identity the next request submitted takes.
+    pub fn next_request_id(&self) -> u64 {
+        self.shared.next_id.load(Ordering::Relaxed)
+    }
+
+    /// Numbers this client's requests from `first` on, so that they never
+    /// take the identity of another daemon's request to the same engine.
+    pub fn number_requests_from(&self, first: u64) {
+        self.shared.next_id.fetch_max(first, Ordering::Relaxed);
+    }
+
+    /// Closes the connection without shutting the engine down, as the daemon
+    /// a hot restart replaced does once its requests ended: the engine goes
+    /// on serving its other daemons. Waits until the reader ended.
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::Release);
+        lock(&self.shared.writer).close();
+        let reader = lock(&self.reader).take();
+        if let Some(reader) = reader
+            && reader.join().is_err()
+        {
+            tracing::warn!("the engine's reader panicked");
+        }
+    }
+
     /// Commands the engine to shut down, finishing every request in flight
     /// as aborted, and waits until its connection closes.
     pub fn shutdown(&self) {
+        if self.detached.load(Ordering::Acquire) {
+            return;
+        }
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
@@ -496,9 +683,29 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     ready
                 });
             }
+            Some(from_engine::Kind::Hooked(hooked)) => {
+                if let Some(answer) = lock(&shared.answers).remove(&hooked.id) {
+                    let _ = answer.send(if hooked.error.is_empty() {
+                        Ok(hooked.results)
+                    } else {
+                        Err(hooked.error)
+                    });
+                }
+            }
+            Some(from_engine::Kind::Configured(configured)) => {
+                if let Some(answer) = lock(&shared.answers).remove(&configured.id) {
+                    let _ = answer.send(if configured.error.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        Err(configured.error)
+                    });
+                }
+            }
             Some(from_engine::Kind::State(_)) | None => {}
         }
     }
+    // A hook or configure the lost engine did not answer fails.
+    lock(&shared.answers).clear();
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
         shared.state.send_replace(EngineState::Closed);
     }

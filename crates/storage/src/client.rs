@@ -94,6 +94,38 @@ impl Client {
         }
     }
 
+    /// The connection's socket and the next request identity, for another
+    /// process to go on with ([`Client::resume`]), as a daemon's hot
+    /// restart hands its claim to its successor: the server knows the
+    /// connection under the role it said hello as.
+    ///
+    /// # Errors
+    ///
+    /// Fails when answers, events or frames are buffered.
+    pub fn hand_over(self) -> Result<(OwnedFd, u64)> {
+        if !self.answers.is_empty() || !self.events.is_empty() {
+            return Err(Error::Protocol(
+                "a connection with answers or events not taken cannot be handed over".into(),
+            ));
+        }
+        let socket = match self.connection.into_socket()? {
+            crate::transport::Socket::Unix(stream) => OwnedFd::from(stream),
+            crate::transport::Socket::Tcp(stream) => OwnedFd::from(stream),
+        };
+        Ok((socket, self.next))
+    }
+
+    /// Goes on with a Unix connection another process handed over
+    /// ([`Client::hand_over`]).
+    pub fn resume(descriptor: OwnedFd, next: u64) -> Self {
+        Self {
+            connection: Connection::new(UnixStream::from(descriptor)),
+            next,
+            answers: HashMap::new(),
+            events: VecDeque::new(),
+        }
+    }
+
     /// The connection's descriptor, readable when answers or events arrive.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.connection.stream().as_fd()
@@ -263,6 +295,22 @@ impl Client {
         match Self::expect(self.call(&Request::Release { keys }, &[])?)?.reply {
             Reply::Released => Ok(()),
             other => Err(unexpected("release", &other)),
+        }
+    }
+
+    /// See [`Request::Rekey`].
+    pub fn rekey(&mut self, moves: Vec<(Key, Key)>) -> Result<()> {
+        match Self::expect(self.call(&Request::Rekey { moves }, &[])?)?.reply {
+            Reply::Rekeyed => Ok(()),
+            other => Err(unexpected("rekey", &other)),
+        }
+    }
+
+    /// See [`Request::Restart`]. Returns the successor's process id.
+    pub fn restart(&mut self, executable: Option<String>) -> Result<u32> {
+        match Self::expect(self.call(&Request::Restart { executable }, &[])?)?.reply {
+            Reply::Restarting { pid } => Ok(pid),
+            other => Err(unexpected("restart", &other)),
         }
     }
 

@@ -58,22 +58,28 @@ pub(crate) fn unix_time() -> u64 {
         .as_secs()
 }
 
-/// Returns the served model in OpenAI `list models` format.
+/// Returns the served model, and every LoRA adapter its workers hold, in
+/// OpenAI `list models` format.
 ///
-/// A server serves exactly one model, so the list always has one entry, named
-/// by `Leader::served_model_name`.
+/// A server serves exactly one model, named by `Leader::served_model_name`,
+/// which a request names for the base model alone and an adapter's name
+/// for the model with that adapter, as vLLM lists them.
 async fn list_models(State(engine): State<Arc<Leader>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; the listing
     // reports the time it was produced.
     let created = unix_time() as i64;
+    let model = |id: String| ModelObject {
+        id,
+        object: "model".to_string(),
+        created,
+        owned_by: "uniserve".to_string(),
+    };
     Json(ListModelsResponse {
         object: "list".to_string(),
-        data: vec![ModelObject {
-            id: engine.served_model_name().to_string(),
-            object: "model".to_string(),
-            created,
-            owned_by: "uniserve".to_string(),
-        }],
+        data: std::iter::once(engine.served_model_name().to_string())
+            .chain(engine.adapter_names())
+            .map(model)
+            .collect(),
     })
 }
 

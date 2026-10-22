@@ -260,9 +260,33 @@ class State:
 
 @dataclass(frozen=True)
 class StateConfig(ABC):
-    """A numerical state layout.
+    """A cache layer type: the layout of one cache layer's state.
 
-    Allocation and prefix policy belong to callers.
+    A module owns a cache layer when it has a ``cache_name`` and a
+    ``cache_state(dtype)`` method returning its layer's ``StateConfig``
+    (``uniserve.nn.attention.Attention`` returns an ``mha.Config``); the
+    decoder collects them into the model's ``Config``. The type states:
+
+    - its shape: the fields ``buffers`` declares and ``bind`` borrows;
+    - its allocation unit, ``indexing``. ``"tokens"``: pages of the unit
+      pool, ``block_size`` tokens each, a subclass of ``mha.Config`` whose
+      rows are ``[heads, head_dim]`` in the stored element type.
+      ``"states"``: one block per request slot (``block_size`` 1, block 0
+      the padding slot), kept from a request's first forward to its end;
+      a forward's layer reads its rows' slots from
+      ``uniserve.prefix_cache.slots.rows()``;
+    - its reuse and host KV cache rules: pages follow their ``window``
+      (``None`` keeps the whole history, a token count only the window
+      before each reader); a deployment with ``"states"`` layers reuses no
+      prefix and copies no page through the host KV cache, since a page
+      does not hold the state a request reached;
+    - its transfer: ``State.transfer_views`` and ``State.copy_blocks``
+      borrow and copy whole blocks; a page transfer splits the ``heads``
+      axis between tensor-parallel ranks.
+
+    The owning module reads its state in a forward through
+    ``uniserve.prefix_cache.bound(module)`` (attention layers through their
+    attention binding).
     """
 
     indexing: ClassVar[Literal["tokens", "states"]]

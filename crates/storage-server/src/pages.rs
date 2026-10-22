@@ -29,10 +29,11 @@
 //! connector's fetches and uploads end when it reports them, or when its
 //! connection closes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 
+use serde::{Deserialize, Serialize};
 use storage::protocol::{Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, Scope};
 
 type ClientId = u64;
@@ -44,7 +45,7 @@ type ClientId = u64;
 pub const DEFAULT_POOL_BYTES: u64 = 64 << 30;
 
 /// One slot's state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Slot {
     Free,
     Reserved {
@@ -89,6 +90,7 @@ pub(super) enum Fetch {
 }
 
 /// The pages of one sliding window, and what it follows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Window {
     slots: Vec<u32>,
     anchor: Option<PageAnchor>,
@@ -96,6 +98,8 @@ struct Window {
 
 /// One page pool.
 pub(super) struct Pool {
+    /// The deployment whose workers share the pool.
+    pub(super) deployment: String,
     pub(super) shape: PageShape,
     pub(super) numa_node: Option<u32>,
     /// The memfd of `slots × page_bytes` bytes.
@@ -123,16 +127,151 @@ pub(super) struct Pool {
 /// Every page pool of the server.
 pub(super) struct Pools {
     pools: HashMap<u64, Pool>,
-    by_shape: HashMap<(PageShape, Option<u32>), u64>,
+    /// The live pool of each deployment, page shape and NUMA node.
+    by_shape: HashMap<(String, PageShape, Option<u32>), u64>,
     next: u64,
-    /// The bytes of each new pool, rounded down to whole pages.
+    /// The bytes of a new pool whose worker states none, rounded down to
+    /// whole pages.
     pool_bytes: u64,
     /// The windows that follow each anchor page, by the anchor's pool and
     /// key: each window's pool and id.
     anchors: HashMap<(u64, Key), Vec<(u64, u64)>>,
+    /// Released pools the connector still reads or writes: they leave once
+    /// it finishes ([`Self::reap`]).
+    releasing: BTreeSet<u64>,
+}
+
+/// A pool's state as a hot restart hands it to the successor server; its
+/// memfd travels apart.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct HandedPool {
+    id: u64,
+    deployment: String,
+    shape: PageShape,
+    numa_node: Option<u32>,
+    slots: Vec<Slot>,
+    index: Vec<(Key, u32)>,
+    evictable: Vec<(u64, u32)>,
+    free: Vec<u32>,
+    fetching: u64,
+    tick: u64,
+    windows: Vec<(u64, Window)>,
+    member_of: Vec<(u32, Vec<u64>)>,
+    next_window: u64,
+    removed: Vec<Key>,
+    ended: Vec<(u64, Option<PageAnchor>)>,
+}
+
+/// A pool's identity: its deployment, page shape and NUMA node.
+type PoolIdentity = (String, PageShape, Option<u32>);
+
+/// The windows that follow an anchor page (`Pools::anchors`).
+type AnchorWindows = ((u64, Key), Vec<(u64, u64)>);
+
+/// Every pool's state as a hot restart hands it over; each pool's memfd
+/// travels apart, in `pools` order.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct HandedPools {
+    pools: Vec<HandedPool>,
+    by_shape: Vec<(PoolIdentity, u64)>,
+    next: u64,
+    pool_bytes: u64,
+    anchors: Vec<AnchorWindows>,
+    releasing: Vec<u64>,
 }
 
 impl Pools {
+    /// Every pool's state and memfd, for a successor server to go on with
+    /// ([`Pools::resume`]); this server holds no pool afterwards.
+    pub(super) fn hand_over(&mut self) -> (HandedPools, Vec<OwnedFd>) {
+        let mut descriptors = Vec::with_capacity(self.pools.len());
+        let pools = self
+            .pools
+            .drain()
+            .map(|(id, pool)| {
+                descriptors.push(pool.descriptor);
+                HandedPool {
+                    id,
+                    deployment: pool.deployment,
+                    shape: pool.shape,
+                    numa_node: pool.numa_node,
+                    slots: pool.slots,
+                    index: pool.index.into_iter().collect(),
+                    evictable: pool.evictable.into_iter().collect(),
+                    free: pool.free,
+                    fetching: pool.fetching,
+                    tick: pool.tick,
+                    windows: pool.windows.into_iter().collect(),
+                    member_of: pool.member_of.into_iter().collect(),
+                    next_window: pool.next_window,
+                    removed: pool.removed,
+                    ended: pool.ended,
+                }
+            })
+            .collect();
+        (
+            HandedPools {
+                pools,
+                by_shape: self.by_shape.drain().collect(),
+                next: self.next,
+                pool_bytes: self.pool_bytes,
+                anchors: self.anchors.drain().collect(),
+                releasing: std::mem::take(&mut self.releasing).into_iter().collect(),
+            },
+            descriptors,
+        )
+    }
+
+    /// Goes on with the pools a predecessor handed over, with their memfds
+    /// in its order.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a memfd is missing.
+    pub(super) fn resume(handed: HandedPools, descriptors: Vec<OwnedFd>) -> io::Result<Self> {
+        if handed.pools.len() != descriptors.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a handed-over page pool lacks its memory",
+            ));
+        }
+        let pools = handed
+            .pools
+            .into_iter()
+            .zip(descriptors)
+            .map(|(pool, descriptor)| {
+                (
+                    pool.id,
+                    Pool {
+                        deployment: pool.deployment,
+                        shape: pool.shape,
+                        numa_node: pool.numa_node,
+                        descriptor,
+                        slots: pool.slots,
+                        index: pool.index.into_iter().collect(),
+                        evictable: pool.evictable.into_iter().collect(),
+                        free: pool.free,
+                        fetching: pool.fetching,
+                        tick: pool.tick,
+                        windows: pool.windows.into_iter().collect(),
+                        member_of: pool.member_of.into_iter().collect(),
+                        next_window: pool.next_window,
+                        removed: pool.removed,
+                        ended: pool.ended,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            pools,
+            by_shape: handed.by_shape.into_iter().collect(),
+            next: handed.next,
+            pool_bytes: handed.pool_bytes,
+            anchors: handed.anchors.into_iter().collect(),
+            releasing: handed.releasing.into_iter().collect(),
+        })
+    }
+
     pub(super) fn new(pool_bytes: u64) -> Self {
         Self {
             pools: HashMap::new(),
@@ -140,36 +279,58 @@ impl Pools {
             next: 1,
             pool_bytes,
             anchors: HashMap::new(),
+            releasing: BTreeSet::new(),
         }
     }
 
-    /// The pool of `shape` on `numa_node`, created when absent.
-    pub(super) fn pool(&mut self, shape: PageShape, numa_node: Option<u32>) -> io::Result<u64> {
-        if let Some(&pool) = self.by_shape.get(&(shape, numa_node)) {
-            return Ok(pool);
-        }
-        if shape.page_bytes == 0 {
+    /// The live pool of `deployment` for pages of `shape` on `numa_node`.
+    pub(super) fn find(
+        &self,
+        deployment: &str,
+        shape: PageShape,
+        numa_node: Option<u32>,
+    ) -> Option<u64> {
+        self.by_shape
+            .get(&(deployment.to_owned(), shape, numa_node))
+            .copied()
+    }
+
+    /// The slots of a new pool of `bytes` (the server's default when
+    /// `None`) for pages of `page_bytes`: its whole pages.
+    pub(super) fn slots_of(&self, page_bytes: u64, bytes: Option<u64>) -> io::Result<u64> {
+        let bytes = bytes.unwrap_or(self.pool_bytes);
+        if page_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "a page pool needs pages of at least one byte",
             ));
         }
-        let slots = self.pool_bytes / shape.page_bytes;
+        let slots = bytes / page_bytes;
         if slots == 0 || slots > u64::from(u32::MAX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "a page pool of {} bytes cannot hold pages of {} bytes",
-                    self.pool_bytes, shape.page_bytes
-                ),
+                format!("a page pool of {bytes} bytes cannot hold pages of {page_bytes} bytes"),
             ));
         }
+        Ok(slots)
+    }
+
+    /// Create the pool of `deployment` for pages of `shape` on `numa_node`,
+    /// of `slots` slots ([`Self::slots_of`]).
+    pub(super) fn create(
+        &mut self,
+        deployment: &str,
+        shape: PageShape,
+        numa_node: Option<u32>,
+        slots: u64,
+    ) -> io::Result<u64> {
         let descriptor = pool_memory(slots * shape.page_bytes, numa_node)?;
         let pool = self.next;
         self.next += 1;
         self.pools.insert(
             pool,
             Pool {
+                deployment: deployment.to_owned(),
                 shape,
                 numa_node,
                 descriptor,
@@ -186,15 +347,89 @@ impl Pools {
                 ended: Vec::new(),
             },
         );
-        self.by_shape.insert((shape, numa_node), pool);
+        self.by_shape
+            .insert((deployment.to_owned(), shape, numa_node), pool);
         tracing::info!(
             pool,
+            deployment,
             slots,
             page_bytes = shape.page_bytes,
             numa_node,
             "created a page pool"
         );
         Ok(pool)
+    }
+
+    /// The bytes the pools have yet to allocate: their sizes less what
+    /// their memfds hold. A pool's pages are allocated when a worker first
+    /// registers it, so a new pool's whole size is yet to come.
+    pub(super) fn unallocated(&self) -> u64 {
+        self.pools
+            .values()
+            .map(|pool| {
+                let size = pool.slots() * pool.shape.page_bytes;
+                let held = rustix::fs::fstat(&pool.descriptor)
+                    .map_or(0, |stat| (stat.st_blocks as u64).saturating_mul(512));
+                size.saturating_sub(held)
+            })
+            .sum()
+    }
+
+    /// Whether `pool` is released and waits for the connector to finish.
+    pub(super) fn released(&self, pool: u64) -> bool {
+        self.releasing.contains(&pool)
+    }
+
+    /// The deployments that own pools.
+    pub(super) fn deployments(&self) -> BTreeSet<String> {
+        self.pools
+            .values()
+            .map(|pool| pool.deployment.clone())
+            .collect()
+    }
+
+    /// Release the pools of `deployment`: no worker maps them again. Those
+    /// the connector has no page of in flight leave at once and are
+    /// returned; the others leave when it finishes ([`Self::reap`]).
+    pub(super) fn release(&mut self, deployment: &str) -> Vec<u64> {
+        self.by_shape.retain(|(owner, _, _), _| owner != deployment);
+        let mine: Vec<u64> = self
+            .pools
+            .iter()
+            .filter(|(_, pool)| pool.deployment == deployment)
+            .map(|(&id, _)| id)
+            .collect();
+        self.releasing.extend(mine);
+        self.reap()
+    }
+
+    /// Remove the released pools the connector no longer reads or writes.
+    /// Returns the pools removed.
+    pub(super) fn reap(&mut self) -> Vec<u64> {
+        let idle: Vec<u64> = self
+            .releasing
+            .iter()
+            .copied()
+            .filter(|id| self.pools.get(id).is_none_or(|pool| !pool.connector_busy()))
+            .collect();
+        for id in &idle {
+            self.releasing.remove(id);
+            if let Some(pool) = self.pools.remove(id) {
+                tracing::info!(
+                    pool = id,
+                    deployment = pool.deployment,
+                    bytes = pool.slots() * pool.shape.page_bytes,
+                    "released a page pool"
+                );
+            }
+        }
+        if !idle.is_empty() {
+            self.anchors.retain(|(pool, _), followers| {
+                followers.retain(|(follower, _)| !idle.contains(follower));
+                !idle.contains(pool) && !followers.is_empty()
+            });
+        }
+        idle
     }
 
     pub(super) fn get(&self, pool: u64) -> Option<&Pool> {
@@ -591,6 +826,16 @@ impl Pool {
         }
     }
 
+    /// Whether the connector reads pages into the pool or writes pages of
+    /// it to the KV storage.
+    fn connector_busy(&self) -> bool {
+        self.fetching > 0
+            || self
+                .slots
+                .iter()
+                .any(|slot| matches!(slot, Slot::Ready { uploads, .. } if *uploads > 0))
+    }
+
     /// Reserved pages were not written: their slots become free.
     pub(super) fn abort(&mut self, keys: &[Key]) {
         for key in keys {
@@ -756,6 +1001,7 @@ impl Pool {
         }
         ListedPool {
             pool,
+            deployment: self.deployment.clone(),
             shape: self.shape,
             numa_node: self.numa_node,
             slots: self.slots(),
@@ -896,17 +1142,16 @@ mod tests {
         Key([byte; 32])
     }
 
-    /// A pool of `slots` pages of 16 bytes and content `content`, in
-    /// `pools`.
-    fn add_pool(pools: &mut Pools, content: u8, slots: u64) -> u64 {
+    /// A pool of `slots` pages of 16 bytes and layout `layout`, in `pools`.
+    fn add_pool(pools: &mut Pools, layout: u8, slots: u64) -> u64 {
         let shape = PageShape {
-            content: key(content),
+            layout: key(layout),
             kv_head_offset: 0,
             kv_head_count: 1,
             page_bytes: 16,
         };
-        pools.pool_bytes = 16 * slots;
-        pools.pool(shape, None).unwrap()
+        let slots = pools.slots_of(16, Some(16 * slots)).unwrap();
+        pools.create("deployment", shape, None, slots).unwrap()
     }
 
     /// The servers' pools with one pool of `slots` pages, and its id.

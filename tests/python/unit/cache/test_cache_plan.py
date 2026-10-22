@@ -1,5 +1,6 @@
 """The library describes, resets and converts the worker's unit pools."""
 
+import json
 import subprocess
 import sys
 
@@ -9,7 +10,9 @@ from torch import nn
 
 from uniserve import errors
 from uniserve.models import CausalLM, TransformerDecoder
+from uniserve.models.stub import TokenCount
 from uniserve.nn.attention import Attention
+from uniserve.prefix_cache import mha
 from uniserve.prefix_cache import plan as cache
 from uniserve.prefix_cache.conversion import PageConversion
 from uniserve.prefix_cache.units import UnitResets
@@ -282,6 +285,109 @@ def test_conversion_binding_encodes_scratch_spans_like_writes():
             actual.planes_of(0, field).view(torch.uint8),
             expected.planes_of(0, field).view(torch.uint8),
         )
+
+
+class _Counted(nn.Module):
+    """A decoder layer with attention and a cache layer kept per request
+    slot (the stub model's ``TokenCount``).
+    """  # noqa: D205
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.attention = Attention(
+            2, 1, 8, cache_name="backbone.layers.0.attention"
+        )
+        self.count = _Count("backbone.layers.0.count")
+
+
+class _Count(nn.Module):
+    def __init__(self, cache_name):
+        super().__init__()
+        self.cache_name = cache_name
+
+    def cache_state(self, dtype):
+        return TokenCount()
+
+
+def _counted():
+    backbone = TransformerDecoder(
+        nn.Embedding(8, 4), nn.ModuleDict({"0": _Counted()}), nn.Identity()
+    )
+    return CausalLM(backbone, nn.Identity())
+
+
+def test_layers_kept_per_request_stay_out_of_the_pool_and_bind_beside_it():
+    model = _counted()
+    plan = cache.cache_plan(model, 16, "")
+    # The pool holds the attention layer's pages alone.
+    assert plan.layers() == ["backbone.layers.0.attention"]
+    assert model.backbone.cache_names == ("backbone.layers.0.attention",)
+    assert json.loads(plan.state_fields()) == [
+        {
+            "name": "backbone.layers.0.count/count.values",
+            "dtype": "int64",
+            "shape": [],
+        },
+        {
+            "name": "backbone.layers.0.count/count.initialized",
+            "dtype": "bool",
+            "shape": [],
+        },
+    ]
+
+    # Three request slots and the padding slot.
+    fields = _fields(plan, 4)
+    fields["backbone.layers.0.count/count.values"] = torch.arange(4)
+    fields["backbone.layers.0.count/count.initialized"] = torch.zeros(
+        4, dtype=torch.bool
+    )
+    pool = cache.pool(plan, 4, list(fields), *fields.values())
+    state = pool.state("backbone.layers.0.count")
+    assert state.tensors["count"].data_ptr() == (
+        fields["backbone.layers.0.count/count.values"].data_ptr()
+    )
+    assert pool.paged("backbone.layers.0.attention")
+    assert not pool.paged("backbone.layers.0.count")
+
+    # A bank of another shape is refused.
+    fields["backbone.layers.0.count/count.values"] = torch.zeros(4, 2)
+    with pytest.raises(ValueError, match="disagrees"):
+        cache.pool(plan, 4, list(fields), *fields.values())
+
+
+class _Pages(nn.Module):
+    """A paged cache layer another module than attention owns and reads."""
+
+    def __init__(self, reads):
+        super().__init__()
+        self.cache_name = "backbone.layers.0.pages"
+        self.reads = reads
+
+    def cache_state(self, dtype):
+        return mha.Config(1, 8, (0,), dtype)
+
+    def reads_pages(self, pages, dtype):
+        return self.reads
+
+
+@pytest.mark.parametrize("reads", (True, False))
+def test_a_paged_layer_of_another_module_is_read_through_its_reads_pages(
+    reads,
+):
+    layers = {
+        str(index): _Layer(index, 8, torch.float32, ((4, 4, 4), (2, 1, 8)))
+        for index in range(6)
+    }
+    # Its rows are those of the full-attention layer, whose group it joins.
+    layers["0"].pages = _Pages(reads)
+    backbone = TransformerDecoder(
+        nn.Embedding(8, 4), nn.ModuleDict(layers), nn.Identity()
+    )
+    model = CausalLM(backbone, nn.Identity())
+    plan = cache.cache_plan(model, 16, "")
+    assert "backbone.layers.0.pages" in plan.layers()
+    assert cache.reads_pages(model, "torch", plan) == reads
 
 
 def test_importing_the_cache_modules_does_not_initialize_cuda():

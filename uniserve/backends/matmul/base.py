@@ -11,6 +11,7 @@ from importlib import import_module
 
 import torch as torch_lib
 
+from uniserve import plugins
 from uniserve.quantization import QuantizedTensor, Quantizer, ScaleLayout
 from uniserve.tensors import BufferConfig, _join_channels
 
@@ -438,6 +439,10 @@ class Backend:
         )
 
 
+# The built-in providers.
+PROVIDERS = frozenset(("torch", "cublas", "flashinfer"))
+
+
 def resolve(backend: str | Backend, weight: torch_lib.Tensor) -> Backend:
     """Select a provider by name.
 
@@ -456,6 +461,9 @@ def resolve(backend: str | Backend, weight: torch_lib.Tensor) -> Backend:
         else:
             backend = "cublas" if weight.is_cuda else "torch"
 
-    if backend not in {"torch", "cublas", "flashinfer"}:
+    if backend in PROVIDERS:
+        return import_module(f"{__package__}.{backend}").Backend()
+    factory = plugins.provider("matmul", backend)
+    if factory is None:
         raise ValueError(f"unknown matmul backend {backend!r}")
-    return import_module(f"{__package__}.{backend}").Backend()
+    return factory()

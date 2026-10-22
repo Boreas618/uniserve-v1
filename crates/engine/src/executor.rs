@@ -421,6 +421,7 @@ impl ExecutorInfo {
         // and the widest diffusion LM step of any worker is warmed down to
         // one row.
         merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
+        merged.captured_images = flow.and_then(|info| info.captured_images.clone());
         merged.image_unconditional_token_ids =
             flow.and_then(|info| info.image_unconditional_token_ids.clone());
         merged.diffusion_lm_step_rows = self
@@ -1405,6 +1406,13 @@ pub trait Executor: Send {
     /// start.
     fn promote(&mut self) -> Result<(), ExecutorError> {
         Ok(())
+    }
+    /// Runs the worker hook `name` with `payload` on every worker while
+    /// none runs a batch, and returns each worker's result. The default
+    /// refuses: the executor has no workers to run hooks on.
+    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
+        let _ = payload;
+        anyhow::bail!("this executor runs no worker hook ({name})")
     }
 }
 

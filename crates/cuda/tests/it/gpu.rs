@@ -13,8 +13,8 @@ use cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
-    PitchedBatch, PrimaryContext, Protection, SourceOrder, Stream, Strided, StridedCopy,
-    VirtualPool, memcpy_async, memset_d8, memset_d32, reclaim,
+    PitchedBatch, PrimaryContext, Protection, SegmentedMapping, SourceOrder, Stream, Strided,
+    StridedCopy, VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -898,6 +898,154 @@ fn nvml_attributes_device_memory_to_this_process() {
     }
 }
 
+/// Rows of a pitched fill may each lie in a mapped segment while the range
+/// they span holds a segment given back: the driver refuses such a fill,
+/// and fills of one row each succeed. Cache planes given back in part
+/// reset their units column by column for this reason.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_pitched_fill_across_a_released_segment_is_refused() {
+    let _driver = exclusive_driver();
+    let stream = Stream::new(DEVICE).unwrap();
+    let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
+    // Two columns of two segments each, column-major.
+    let mut segmented = SegmentedMapping::reserve(DEVICE, &[granularity; 4], &[]).unwrap();
+    let _descriptors: Vec<_> = (0..4)
+        .map(|index| segmented.create(index).unwrap())
+        .collect();
+    segmented.release(1).unwrap();
+    segmented.release(3).unwrap();
+    let pitch = 2 * granularity;
+    // SAFETY: each row lies inside a mapped segment.
+    let spanning =
+        unsafe { memset_2d_d8(segmented.address(), pitch, 7, granularity / 2, 2, &stream) };
+    let per_row: Vec<_> = (0..2)
+        .map(|column| {
+            // SAFETY: the row lies inside column `column`'s mapped segment.
+            unsafe {
+                memset_2d_d8(
+                    segmented.address() + (column * pitch) as u64,
+                    pitch,
+                    7,
+                    granularity / 2,
+                    1,
+                    &stream,
+                )
+            }
+        })
+        .collect();
+    stream.synchronize().unwrap();
+    println!("a pitched fill across a released segment: {spanning:?}");
+    assert!(per_row.iter().all(Result::is_ok), "{per_row:?}");
+    assert!(
+        spanning.is_err(),
+        "the driver filled rows across a released segment"
+    );
+}
+
+/// A pitched copy whose rows lie in mapped segments while the range they
+/// span holds a segment given back, as a strided copy of one cache unit
+/// across the columns of planes given back in part: the driver refuses
+/// it, and a plan bounded by the segment length (`plan_within`) copies
+/// each column on its own, which the driver serves.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_pitched_copy_across_a_released_segment_is_refused() {
+    let _driver = exclusive_driver();
+    let stream = Stream::new(DEVICE).unwrap();
+    let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
+    // Two columns of two segments each, column-major.
+    let mut segmented = SegmentedMapping::reserve(DEVICE, &[granularity; 4], &[]).unwrap();
+    let _descriptors: Vec<_> = (0..4)
+        .map(|index| segmented.create(index).unwrap())
+        .collect();
+    segmented.release(1).unwrap();
+    segmented.release(3).unwrap();
+    let pitch = 2 * granularity;
+    let width = granularity / 2;
+    let target = DeviceAllocation::linear(DEVICE, 2 * width).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 2 * width).unwrap();
+    let shape = [2_u64, width as u64];
+    let destination = Strided {
+        address: target.address(),
+        element_bytes: 1,
+        shape: &shape,
+        strides: &[width as i64, 1],
+    };
+    let source = Strided {
+        address: segmented.address(),
+        element_bytes: 1,
+        shape: &shape,
+        strides: &[pitch as i64, 1],
+    };
+    let mut spanning = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
+    spanning.plan(&destination, &source).unwrap();
+    assert_eq!(spanning.pitched().len(), 1, "one pitched copy of two rows");
+    let mut bounded = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
+    bounded
+        .plan_within(&destination, &source, [u64::MAX, granularity as u64])
+        .unwrap();
+    assert!(
+        bounded.pitched().is_empty(),
+        "one contiguous copy per column"
+    );
+    // SAFETY: each row lies inside a mapped segment, the target and the
+    // host buffer outlive the synchronization below.
+    let (refused, copied) = unsafe {
+        for column in 0..2_u8 {
+            memset_d8(
+                segmented.address() + (usize::from(column) * pitch) as u64,
+                column + 1,
+                width,
+                &stream,
+            )
+            .unwrap();
+        }
+        let refused = spanning.submit(&stream);
+        let copied = bounded
+            .submit(&stream)
+            .and_then(|()| memcpy_async(host.address(), target.address(), 2 * width, &stream));
+        (refused, copied)
+    };
+    stream.synchronize().unwrap();
+    println!("a pitched copy across a released segment: {refused:?}");
+    assert!(
+        refused.is_err(),
+        "the driver copied rows across a released segment"
+    );
+    copied.unwrap();
+    let bytes = read(&host);
+    assert!(bytes[..width].iter().all(|&byte| byte == 1));
+    assert!(bytes[width..].iter().all(|&byte| byte == 2));
+}
+
+/// A segment a mapping creates is mapped from its descriptor, as another
+/// process maps it: NVML attributes its memory to no process, as it does
+/// the memory a Storage Server retains, which capacity planning counts
+/// apart from the process's own.
+#[test]
+#[ignore = "requires a CUDA device and NVML"]
+fn a_created_segment_is_attributed_to_no_process() {
+    let _driver = exclusive_driver();
+    let nvml = Nvml::init().unwrap();
+    let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
+    let bytes = (1_usize << 30).div_ceil(granularity) * granularity;
+    let mut segmented = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
+    let before = match nvml.process_memory(DEVICE) {
+        Ok(before) => before,
+        // NVML lists host PIDs; a container without the host PID namespace
+        // cannot find itself.
+        Err(Error::ProcessNotFound { .. }) => return,
+        Err(error) => panic!("{error}"),
+    };
+    let _descriptor = segmented.create(0).unwrap();
+    let after = nvml.process_memory(DEVICE).unwrap();
+    assert!(
+        after < before + bytes as u64 / 2,
+        "NVML attributes the created segment to this process: {before} -> {after} bytes"
+    );
+}
+
 #[test]
 #[ignore = "requires a CUDA device and NCCL"]
 fn single_rank_communicators_run_collectives() {
@@ -944,4 +1092,72 @@ fn single_rank_communicators_run_collectives() {
     assert_eq!(words, [41; 4]);
 
     communicator.destroy().unwrap();
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_released_segment_is_mapped_again_at_its_address() {
+    let _driver = exclusive_driver();
+    let stream = Stream::new(DEVICE).unwrap();
+    let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
+    let mut segmented = SegmentedMapping::reserve(DEVICE, &[granularity; 3], &[]).unwrap();
+    let address = segmented.address();
+    let descriptors: Vec<_> = (0..3)
+        .map(|index| segmented.create(index).unwrap())
+        .collect();
+    let host = PinnedBuffer::new(DEVICE, 3 * granularity).unwrap();
+    // SAFETY: every range lies inside a mapped segment, which outlives the
+    // synchronization.
+    unsafe {
+        for index in 0..3 {
+            memset_d8(
+                address + (index * granularity) as u64,
+                index as u8 + 1,
+                granularity,
+                &stream,
+            )
+            .unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+
+    // Another mapping maps the same memory from the segments' descriptors.
+    let mut other = SegmentedMapping::reserve(DEVICE, &[granularity; 3], &[]).unwrap();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        other.import(index, descriptor).unwrap();
+    }
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), other.address(), 3 * granularity, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    let bytes = read(&host);
+    for index in 0..3 {
+        assert!(
+            bytes[index * granularity..(index + 1) * granularity]
+                .iter()
+                .all(|byte| *byte == index as u8 + 1)
+        );
+    }
+
+    // The last segment leaves both mappings; a new one takes its place at
+    // the same addresses, and the others keep their bytes.
+    segmented.release(2).unwrap();
+    other.release(2).unwrap();
+    assert!(!segmented.is_mapped(2) && segmented.is_mapped(1));
+    drop(descriptors);
+    let _fresh = segmented.create(2).unwrap();
+    assert_eq!(segmented.address(), address);
+    // SAFETY: as above.
+    unsafe {
+        memset_d8(address + (2 * granularity) as u64, 9, granularity, &stream).unwrap();
+        memcpy_async(host.address(), address, 3 * granularity, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let bytes = read(&host);
+    assert!(bytes[..granularity].iter().all(|byte| *byte == 1));
+    assert!(
+        bytes[granularity..2 * granularity]
+            .iter()
+            .all(|byte| *byte == 2)
+    );
+    assert!(bytes[2 * granularity..].iter().all(|byte| *byte == 9));
 }

@@ -148,6 +148,12 @@ struct PoolInner {
     /// group, source worker or, after a hash collision, by tokens.
     hash_to_pages: HashMap<u64, Vec<u32>>,
     stats: BlockPoolStats,
+    /// Units `1..=scratch`, which the pool never allocates.
+    scratch: u32,
+    /// The first unit withdrawn from allocation, as the memory holding the
+    /// units from it on is given back (`BlockPool::withdraw`); the unit
+    /// count while none is.
+    withdrawn: u32,
 }
 
 impl PoolInner {
@@ -233,6 +239,16 @@ impl PoolInner {
             if meta.ref_cnt != 0 || meta.in_fq {
                 continue;
             }
+            // A withdrawn unit leaves the pool once its last holder lets it
+            // go, its page with it.
+            if unit.0 >= self.withdrawn {
+                if let Some(head) = meta.published {
+                    self.remove_page(head);
+                }
+                self.meta[unit.0 as usize].state = UnitState::Free;
+                continue;
+            }
+            let meta = &mut self.meta[unit.0 as usize];
             meta.state = if meta.published.is_some() {
                 UnitState::Cached
             } else {
@@ -241,6 +257,14 @@ impl PoolInner {
             self.fq_push_back(unit.0);
         }
         self.stats.free = self.free_count;
+    }
+
+    /// The withdrawn units requests still hold.
+    fn withdrawn_held(&self) -> usize {
+        self.meta[self.withdrawn as usize..]
+            .iter()
+            .filter(|meta| meta.ref_cnt > 0)
+            .count()
     }
 
     /// Returns the first unit of a published copy with this exact identity.
@@ -329,6 +353,8 @@ impl BlockPool {
                 total: (num_units - 1 - scratch) as usize,
                 ..BlockPoolStats::default()
             },
+            scratch,
+            withdrawn: num_units,
         };
 
         // Unit zero is the worker's padding sentinel and is never queued,
@@ -342,9 +368,77 @@ impl BlockPool {
         }
     }
 
+    /// Withdraws the units from `first` on from allocation, as the memory
+    /// holding them is to be given back: the queued ones leave the queue,
+    /// their published pages the prefix index, and the ones requests hold
+    /// leave as their holders let them go. Returns how many are held.
+    pub(crate) fn withdraw(&self, first: u32) -> usize {
+        let mut inner = lock(&self.inner);
+        let end = inner.meta.len() as u32;
+        let first = first.max(inner.scratch + 1).min(end);
+        if first >= inner.withdrawn {
+            return inner.withdrawn_held();
+        }
+        let from = inner.withdrawn;
+        inner.withdrawn = first;
+        for unit in first..from {
+            if let Some(head) = inner.meta[unit as usize].published {
+                inner.remove_page(head);
+            }
+            inner.fq_unlink(unit);
+        }
+        inner.stats.total = (first.saturating_sub(1 + inner.scratch)) as usize;
+        inner.stats.free = inner.free_count;
+        inner.withdrawn_held()
+    }
+
+    /// The withdrawn units requests still hold.
+    pub(crate) fn withdrawn_held(&self) -> usize {
+        lock(&self.inner).withdrawn_held()
+    }
+
+    /// The first unit withdrawn (`withdraw`); the unit count while none is.
+    pub(crate) fn withdrawn(&self) -> u32 {
+        lock(&self.inner).withdrawn
+    }
+
+    /// Whether some units are withdrawn.
+    pub(crate) fn has_withdrawn(&self) -> bool {
+        let inner = lock(&self.inner);
+        (inner.withdrawn as usize) < inner.meta.len()
+    }
+
+    /// Returns every withdrawn unit to allocation: their memory was created
+    /// again and reset. A unit a request still holds, as when a restore
+    /// cancels a shrink, is queued once its holder lets it go.
+    pub(crate) fn restore(&self) {
+        let mut inner = lock(&self.inner);
+        let end = inner.meta.len() as u32;
+        let from = inner.withdrawn;
+        inner.withdrawn = end;
+        for unit in from..end {
+            let meta = &mut inner.meta[unit as usize];
+            if meta.ref_cnt > 0 {
+                continue;
+            }
+            meta.state = UnitState::Free;
+            meta.published = None;
+            inner.fq_push_back(unit);
+        }
+        inner.stats.total = (end - 1 - inner.scratch) as usize;
+        inner.stats.free = inner.free_count;
+    }
+
     /// Returns the allocatable units, excluding the unit-zero sentinel.
     pub(crate) fn usable_units(&self) -> usize {
         lock(&self.inner).stats.total
+    }
+
+    /// Returns the units allocatable once no unit is withdrawn: the most a
+    /// request can ever take.
+    pub(crate) fn capacity_units(&self) -> usize {
+        let inner = lock(&self.inner);
+        inner.meta.len() - 1 - inner.scratch as usize
     }
 
     /// Returns the queued units, including `Cached` ones, which allocation
@@ -541,6 +635,18 @@ impl BlockPool {
     /// Returns the number of published prefix pages, referenced or not.
     pub(crate) fn cached_pages(&self) -> usize {
         lock(&self.inner).pages.len()
+    }
+
+    /// Revokes every published page's prefix identity, as
+    /// [`Self::invalidate_source`] does for one incarnation: later prompts
+    /// compute their prefixes anew. Returns how many pages it revoked.
+    pub(crate) fn flush(&self) -> usize {
+        let mut inner = lock(&self.inner);
+        let heads = inner.pages.keys().copied().collect::<Vec<_>>();
+        for &head in &heads {
+            inner.remove_page(head);
+        }
+        heads.len()
     }
 
     /// Revokes cache lookup for one lost incarnation without freeing live
@@ -1469,6 +1575,73 @@ mod tests {
                 .ensure_capacity(&pool, &mut allocation, 6, 7)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn withdrawn_units_leave_allocation_until_restored() {
+        // Fifteen allocatable units; a request holds units 1..=12.
+        let pool = BlockPool::new(16, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let mut allocation = coordinator.empty();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 12)
+            .unwrap();
+        let held: Vec<u32> = allocation.tables[0]
+            .unit_ids()
+            .iter()
+            .map(|unit| unit.0)
+            .collect();
+        assert_eq!(held, (1..=12).collect::<Vec<_>>());
+
+        // Withdrawing from unit 8 takes the free units 13..=15 out of the
+        // queue; the request still holds 8..=12.
+        assert_eq!(pool.withdraw(8), 5);
+        assert_eq!(pool.withdrawn_held(), 5);
+        assert_eq!((pool.usable_units(), pool.capacity_units()), (7, 15));
+        assert_eq!(pool.free_units(), 0);
+
+        // Released, the withdrawn units stay out of allocation and the
+        // others return to it.
+        drop(allocation);
+        assert_eq!(pool.withdrawn_held(), 0);
+        assert_eq!(pool.free_units(), 7);
+        let mut allocation = coordinator.empty();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 7)
+            .unwrap();
+        assert!(
+            allocation.tables[0]
+                .unit_ids()
+                .iter()
+                .all(|unit| unit.0 < 8)
+        );
+        assert!(
+            coordinator
+                .ensure_capacity(&pool, &mut allocation, 7, 8)
+                .is_none()
+        );
+
+        // A restore returns every withdrawn unit to allocation.
+        pool.restore();
+        assert!(!pool.has_withdrawn());
+        assert_eq!((pool.usable_units(), pool.free_units()), (15, 8));
+        drop(allocation);
+        assert_eq!(pool.free_units(), 15);
+    }
+
+    #[test]
+    fn a_restore_queues_the_withdrawn_units_requests_hold_once_released() {
+        let pool = BlockPool::new(8, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let mut allocation = coordinator.empty();
+        coordinator
+            .ensure_capacity(&pool, &mut allocation, 0, 7)
+            .unwrap();
+        assert_eq!(pool.withdraw(4), 4);
+        pool.restore();
+        assert_eq!((pool.usable_units(), pool.free_units()), (7, 0));
+        drop(allocation);
+        assert_eq!(pool.free_units(), 7);
     }
 
     #[test]

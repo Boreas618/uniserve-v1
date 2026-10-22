@@ -1,12 +1,22 @@
 //! The processes a daemon starts on its node and supervises.
 //!
 //! An engine asks the daemon of each node to start its workers there
-//! (`Spawn`); each becomes a child of the daemon's service thread, dies with
-//! it (`PR_SET_PDEATHSIG`), and leads a process group of its own, so the
-//! Storage Server's shoot-down of a previous writer ends the processes it
-//! started and never the daemon. The daemon reaps each child, removes the
-//! driver and NCCL shared memory a child that did not end in order left
-//! (`Child`), and reports its exit to the engine that started it.
+//! (`Spawn`); each becomes a child of the daemon's service thread and leads
+//! a process group of its own, so the Storage Server's shoot-down of a
+//! previous writer ends the processes it started and never the daemon. The
+//! daemon reaps each child, removes the driver and NCCL shared memory a
+//! child that did not end in order left (`Child`), and reports its exit to
+//! the engine that started it.
+//!
+//! A process ends with its daemon through its lifeline: a pipe whose write
+//! end the daemon holds and whose read end every process inherits, at the
+//! descriptor [`LIFELINE_ENV`] names. The engine and the workers exit once
+//! they read the pipe's end, which the kernel delivers when the last write
+//! end closed, however the daemon ended. A hot restart hands the processes,
+//! and the write end with them, to the successor daemon
+//! (`Supervisor::hand_over`), which supervises them from then on through
+//! their pidfds (`Supervisor::adopt`): the pipe stays open across it, so no
+//! process ends.
 //!
 //! A worker group's first rank serves the group's collective store. The
 //! daemon of that rank's node binds the store's socket when the engine
@@ -23,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
@@ -35,6 +45,11 @@ use proto::process::{Exit, Reserve, Reserved, Spawn};
 /// engine, not to its daemon, so the daemon notes them while the worker
 /// lives; its communicators exist from its startup on.
 const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The environment variable that names a supervised process's lifeline:
+/// the descriptor number of the read end of a pipe whose write end its
+/// daemon holds.
+pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
 
 /// A supervised process: the engine connection that started it, its worker
 /// group, its rank and the generation of the group's launch.
@@ -58,19 +73,51 @@ struct Reservation {
 pub(crate) struct Supervisor {
     /// This node's host identity, which every exit names.
     host: String,
+    /// The pipe every process inherits the read end of.
+    lifeline: Lifeline,
     children: HashMap<Key, Supervised>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
 }
 
+/// A daemon's lifeline: both ends of the pipe, close-on-exec in the
+/// daemon; a spawn makes the read end its process's.
+struct Lifeline {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl Lifeline {
+    fn new() -> std::io::Result<Self> {
+        let mut ends = [0; 2];
+        // SAFETY: pipe2 fills the two descriptors it creates.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 returned two new descriptors this daemon owns.
+        Ok(unsafe {
+            Self {
+                read: OwnedFd::from_raw_fd(ends[0]),
+                write: OwnedFd::from_raw_fd(ends[1]),
+            }
+        })
+    }
+}
+
 impl Supervisor {
-    pub(crate) fn new(host: String) -> Self {
-        Self {
+    /// The supervisor of host `host`'s processes.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the lifeline's pipe cannot be created.
+    pub(crate) fn new(host: String) -> std::io::Result<Self> {
+        Ok(Self {
             host,
+            lifeline: Lifeline::new()?,
             children: HashMap::new(),
             reservations: HashMap::new(),
             next_reservation: 1,
-        }
+        })
     }
 
     /// Starts the process `spawn` describes for `engine`, as a child of this
@@ -93,7 +140,7 @@ impl Supervisor {
         // group, which ends the children that may have inherited its device
         // descriptors, and never the daemon.
         command.process_group(0);
-        die_with_daemon(&mut command);
+        inherit_lifeline(&mut command, &self.lifeline.read);
         // Every reservation is checked before any is taken, so a refused
         // spawn leaves the group's reservations held.
         if let Some(reservation) = spawn.inherit.iter().find(|reservation| {
@@ -230,7 +277,15 @@ impl Supervisor {
                 let _ = supervised.child.note_nccl_segments();
             }
             let (status, success) = match supervised.child.try_wait() {
-                Ok(Some(status)) => (status.to_string(), status.success()),
+                Ok(Some(Exited::Status(status))) => (status.to_string(), status.success()),
+                // An adopted process's parent was the daemon this one
+                // replaced: it exited while it should have run.
+                Ok(Some(Exited::Unread)) => (
+                    "exited (adopted from the previous daemon, whose child it was; its \
+                     status is not readable here)"
+                        .to_owned(),
+                    false,
+                ),
                 Ok(None) => continue,
                 Err(error) => (format!("exit status unreadable: {error}"), false),
             };
@@ -277,10 +332,159 @@ impl Supervisor {
     }
 }
 
+impl Supervisor {
+    /// Hands every process and reservation to this daemon's successor in a
+    /// hot restart, which goes on with them ([`Supervisor::adopt`]): their
+    /// keys, and a pidfd for each process followed by each reservation's
+    /// socket, then the lifeline's read and write ends, in `descriptors`.
+    /// This daemon supervises nothing afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a process's pidfd cannot be opened; the supervisor keeps
+    /// every process then.
+    pub(crate) fn hand_over(&mut self) -> std::io::Result<(HandedProcesses, Vec<OwnedFd>)> {
+        let mut processes = Vec::with_capacity(self.children.len());
+        let mut descriptors = Vec::with_capacity(self.children.len() + self.reservations.len());
+        for ((engine, group, rank, generation), supervised) in &self.children {
+            descriptors.push(supervised.child.pidfd()?);
+            processes.push(HandedProcess {
+                engine: *engine,
+                group: group.clone(),
+                rank: *rank,
+                generation: *generation,
+                pid: supervised.child.id(),
+            });
+        }
+        let mut reservations = Vec::with_capacity(self.reservations.len());
+        for (id, reservation) in self.reservations.drain() {
+            reservations.push(HandedReservation {
+                id,
+                engine: reservation.engine,
+                group: reservation.group,
+            });
+            descriptors.push(OwnedFd::from(reservation.listener));
+        }
+        descriptors.push(self.lifeline.read.try_clone()?);
+        descriptors.push(self.lifeline.write.try_clone()?);
+        // The successor supervises them now; dropping a spawned child's
+        // handle neither kills nor waits for it.
+        self.children.clear();
+        Ok((
+            HandedProcesses {
+                processes,
+                reservations,
+                next_reservation: self.next_reservation,
+            },
+            descriptors,
+        ))
+    }
+
+    /// Goes on with the processes and reservations a predecessor handed over
+    /// ([`Supervisor::hand_over`]), with their descriptors in its order.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a descriptor is missing.
+    pub(crate) fn adopt(
+        host: String,
+        handed: HandedProcesses,
+        descriptors: Vec<OwnedFd>,
+    ) -> std::io::Result<Self> {
+        let mut descriptors = descriptors.into_iter();
+        let mut next = || {
+            descriptors.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a handed-over process or reservation lacks its descriptor",
+                )
+            })
+        };
+        let mut supervisor = Self::new(host)?;
+        for process in handed.processes {
+            let mut child = Child::adopt(process.pid, next()?);
+            let _ = child.note_nccl_segments();
+            tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
+            supervisor.children.insert(
+                (
+                    process.engine,
+                    process.group,
+                    process.rank,
+                    process.generation,
+                ),
+                Supervised {
+                    child,
+                    noted: Instant::now(),
+                },
+            );
+        }
+        for reservation in handed.reservations {
+            supervisor.reservations.insert(
+                reservation.id,
+                Reservation {
+                    engine: reservation.engine,
+                    group: reservation.group,
+                    listener: TcpListener::from(next()?),
+                },
+            );
+        }
+        supervisor.lifeline = Lifeline {
+            read: next()?,
+            write: next()?,
+        };
+        supervisor.next_reservation = handed.next_reservation;
+        Ok(supervisor)
+    }
+}
+
 impl Drop for Supervisor {
-    /// A daemon's processes never outlive it.
+    /// A daemon's processes never outlive it, unless it handed them over.
     fn drop(&mut self) {
         self.terminate_all();
+    }
+}
+
+/// The processes a daemon hands its successor (`Supervisor::hand_over`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedProcesses {
+    pub(crate) processes: Vec<HandedProcess>,
+    pub(crate) reservations: Vec<HandedReservation>,
+    pub(crate) next_reservation: u64,
+}
+
+/// One handed-over process: its key and process id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedProcess {
+    pub(crate) engine: u64,
+    pub(crate) group: String,
+    pub(crate) rank: u32,
+    pub(crate) generation: u64,
+    pub(crate) pid: u32,
+}
+
+/// One handed-over reservation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedReservation {
+    pub(crate) id: u64,
+    pub(crate) engine: u64,
+    pub(crate) group: String,
+}
+
+/// Makes the process `command` starts inherit the lifeline's read end at
+/// its descriptor number, which [`LIFELINE_ENV`] names to it.
+fn inherit_lifeline(command: &mut Command, read: &OwnedFd) {
+    let descriptor = read.as_raw_fd();
+    command.env(LIFELINE_ENV, descriptor.to_string());
+    // SAFETY: the closure runs in the forked child between fork and exec and
+    // only calls `fcntl`, which is async-signal-safe; the daemon holds the
+    // descriptor open for as long as it supervises.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -309,66 +513,97 @@ fn inherit_listener(command: &mut Command, listener: TcpListener) {
     }
 }
 
-/// Makes the process `command` starts die with this daemon.
-///
-/// The kernel sends the process SIGKILL when the thread that spawned it
-/// exits, which covers a daemon killed by a signal or aborted before its
-/// supervisor ends its processes. Every process is spawned from the
-/// daemon's service thread, which lives as long as the daemon. A process
-/// whose daemon exited between fork and the request is already orphaned, so
-/// it fails to start instead.
-fn die_with_daemon(command: &mut Command) {
-    let daemon = std::process::id() as libc::pid_t;
-    // SAFETY: the closure runs in the forked child between fork and exec and
-    // calls only `prctl` and `getppid`, which are async-signal-safe, and
-    // builds its errors without allocating.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != daemon {
-                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
-    }
-}
-
-/// A process this daemon spawned, and is the parent that reaps.
+/// A process this daemon supervises: one it spawned and reaps as its
+/// parent, or one a daemon it replaced spawned (adopted).
 ///
 /// A rank that ends in order destroys its CUDA contexts, which removes the
 /// shared memory the driver keeps for each context's interprocess events. A
 /// rank that is killed or crashes leaves that memory in `/dev/shm`, named
 /// for the rank's process id (`cuda::shm::remove_event_memory`), and the names of
 /// its NCCL communicators' proxy memory (`cuda::shm::NcclSegments`), which the
-/// parent notes while the rank lives. Every wait here therefore observes
+/// daemon notes while the rank lives. Every wait here therefore observes
 /// the exit first without reaping it, removes the memory named for the rank
 /// while its zombie still holds the process id, so that no live process can
 /// own those names, and the noted NCCL names, and then reaps it.
+///
+/// An adopted process's parent is the host's init, which reaps it: this
+/// daemon observes its exit through its pidfd and removes what it left at
+/// once. Its id may be taken again only after the kernel handed out every
+/// other id up to `pid_max`, so a process that took it would have to do so,
+/// and create interprocess events, between the exit and the removal.
 pub(crate) struct Child {
-    child: std::process::Child,
-    /// The exit status once the process was reaped; its id may name another
-    /// process from then on, so it is never waited on again.
-    status: Option<ExitStatus>,
+    process: Process,
+    /// How the process ended, once it did; a reaped child's id may name
+    /// another process from then on, so it is never waited on again.
+    exited: Option<Exited>,
     /// The NCCL shared memory the rank was last seen to map under names
     /// still linked ([`Self::note_nccl_segments`]).
     segments: cuda::shm::NcclSegments,
+}
+
+enum Process {
+    /// Spawned by this daemon, which reaps it.
+    Spawned(std::process::Child),
+    /// Spawned by a daemon this one replaced, observed through its pidfd.
+    Adopted { pid: u32, pidfd: OwnedFd },
+}
+
+/// How a supervised process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exited {
+    /// Its status, which this daemon read when it reaped it.
+    Status(ExitStatus),
+    /// An adopted process, whose status only its parent reads.
+    Unread,
+}
+
+impl Exited {
+    /// The exit status, when this daemon read it.
+    #[cfg(test)]
+    pub(crate) fn status(self) -> Option<ExitStatus> {
+        match self {
+            Self::Status(status) => Some(status),
+            Self::Unread => None,
+        }
+    }
 }
 
 impl Child {
     /// Spawns the process `command` describes.
     pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
         Ok(Self {
-            child: command.spawn()?,
-            status: None,
+            process: Process::Spawned(command.spawn()?),
+            exited: None,
             segments: cuda::shm::NcclSegments::default(),
         })
     }
 
+    /// Supervises process `pid`, which a daemon this one replaced spawned,
+    /// through its pidfd.
+    fn adopt(pid: u32, pidfd: OwnedFd) -> Self {
+        Self {
+            process: Process::Adopted { pid, pidfd },
+            exited: None,
+            segments: cuda::shm::NcclSegments::default(),
+        }
+    }
+
     /// The rank's process id.
     pub(crate) fn id(&self) -> u32 {
-        self.child.id()
+        match &self.process {
+            Process::Spawned(child) => child.id(),
+            Process::Adopted { pid, .. } => *pid,
+        }
+    }
+
+    /// A pidfd of the process, which names it whatever process later takes
+    /// its id, for a successor daemon to adopt it with.
+    fn pidfd(&self) -> std::io::Result<OwnedFd> {
+        match &self.process {
+            // An unreaped child's id names it alone.
+            Process::Spawned(child) => pidfd_open(child.id()),
+            Process::Adopted { pidfd, .. } => pidfd.try_clone(),
+        }
     }
 
     /// Notes the NCCL shared memory the running rank maps under names still
@@ -376,84 +611,150 @@ impl Child {
     /// communicators removes. A rank's communicators exist once it reported
     /// that it is ready: warmup and graph capture have connected them all.
     pub(crate) fn note_nccl_segments(&mut self) -> std::io::Result<()> {
-        if self.status.is_none() {
+        if self.exited.is_none() {
             self.segments
-                .extend(cuda::shm::NcclSegments::mapped_by(Some(self.child.id()))?);
+                .extend(cuda::shm::NcclSegments::mapped_by(Some(self.id()))?);
         }
         Ok(())
     }
 
-    /// Sends the rank SIGKILL, unless it was already reaped.
+    /// Sends the rank SIGKILL, unless it already ended.
     pub(crate) fn kill(&mut self) -> std::io::Result<()> {
-        if self.status.is_some() {
+        if self.exited.is_some() {
             return Ok(());
         }
-        self.child.kill()
-    }
-
-    /// Returns the rank's exit status if it has exited, after releasing what
-    /// it left and reaping it, and `None` while it runs.
-    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        if self.status.is_none() && self.exited(libc::WNOHANG)? {
-            self.reap()?;
-        }
-        Ok(self.status)
-    }
-
-    /// Waits for the rank to exit, releases what it left, reaps it and
-    /// returns its exit status.
-    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        if let Some(status) = self.status {
-            return Ok(status);
-        }
-        self.exited(0)?;
-        self.reap()
-    }
-
-    /// Whether the rank has exited, observed with `waitid(WNOWAIT)`, which
-    /// leaves it unreaped. Blocks until it exits unless `flags` holds
-    /// `WNOHANG`.
-    fn exited(&self, flags: libc::c_int) -> std::io::Result<bool> {
-        let pid = self.child.id();
-        loop {
-            // SAFETY: an all-zero `siginfo_t` is a valid value for the call
-            // to fill.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `info` is a valid out-pointer and `pid` is this
-            // process's unreaped child.
-            let waited = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT | flags,
-                )
-            };
-            if waited == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+        match &mut self.process {
+            Process::Spawned(child) => child.kill(),
+            Process::Adopted { pidfd, .. } => {
+                // SAFETY: the call takes a live pidfd and no pointers but a
+                // null `siginfo`.
+                let sent = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                if sent == -1 {
+                    let error = std::io::Error::last_os_error();
+                    // A process that already exited cannot be signaled.
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
                 }
-                return Err(error);
+                Ok(())
             }
-            // With WNOHANG, a child that has not exited leaves `si_pid` zero.
-            // SAFETY: the call succeeded, so `info` describes the child.
-            return Ok(unsafe { info.si_pid() } != 0);
         }
     }
 
-    /// Releases what the exited, unreaped rank left and reaps it.
-    fn reap(&mut self) -> std::io::Result<ExitStatus> {
+    /// Returns how the rank ended if it has, after releasing what it left
+    /// (and reaping it, when this daemon is its parent), and `None` while it
+    /// runs.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<Exited>> {
+        if self.exited.is_none() && self.ended(false)? {
+            self.release()?;
+        }
+        Ok(self.exited)
+    }
+
+    /// Waits for the rank to exit, releases what it left, reaps it when
+    /// this daemon is its parent, and returns how it ended.
+    pub(crate) fn wait(&mut self) -> std::io::Result<Exited> {
+        if let Some(exited) = self.exited {
+            return Ok(exited);
+        }
+        self.ended(true)?;
+        self.release()
+    }
+
+    /// Whether the rank has exited, leaving a child unreaped
+    /// (`waitid(WNOWAIT)`) and an adopted process observed through its
+    /// pidfd. Blocks until it exits when `block`.
+    fn ended(&self, block: bool) -> std::io::Result<bool> {
+        match &self.process {
+            Process::Spawned(child) => exited(child.id(), if block { 0 } else { libc::WNOHANG }),
+            Process::Adopted { pidfd, .. } => {
+                let mut polled = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    // SAFETY: one valid pollfd for the call.
+                    let ready = unsafe { libc::poll(&mut polled, 1, if block { -1 } else { 0 }) };
+                    if ready == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    // A pidfd turns readable once its process exited.
+                    return Ok(ready > 0);
+                }
+            }
+        }
+    }
+
+    /// Releases what the exited rank left and, as its parent, reaps it.
+    fn release(&mut self) -> std::io::Result<Exited> {
         // The rank inherited this process's user. The removal is best
         // effort: the rank is reaped whatever it finds.
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        let _ = cuda::shm::remove_event_memory(uid, self.child.id());
+        let _ = cuda::shm::remove_event_memory(uid, self.id());
         let _ = self.segments.remove();
-        let status = self.child.wait()?;
-        self.status = Some(status);
-        Ok(status)
+        let exited = match &mut self.process {
+            Process::Spawned(child) => Exited::Status(child.wait()?),
+            Process::Adopted { .. } => Exited::Unread,
+        };
+        self.exited = Some(exited);
+        Ok(exited)
     }
+}
+
+/// Whether child `pid` has exited, observed with `waitid(WNOWAIT)`, which
+/// leaves it unreaped. Blocks until it exits unless `flags` holds
+/// `WNOHANG`.
+fn exited(pid: u32, flags: libc::c_int) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value for the call to
+        // fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid out-pointer and `pid` is this process's
+        // unreaped child.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | flags,
+            )
+        };
+        if waited == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // With WNOHANG, a child that has not exited leaves `si_pid` zero.
+        // SAFETY: the call succeeded, so `info` describes the child.
+        return Ok(unsafe { info.si_pid() } != 0);
+    }
+}
+
+/// A pidfd of process `pid`.
+fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+    // SAFETY: the call takes integers only.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if descriptor == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call returned a new descriptor this daemon owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
 }
 
 #[cfg(test)]
@@ -563,8 +864,8 @@ time.sleep(600)
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if let Some(status) = holder.0.try_wait().unwrap() {
-                return status;
+            if let Some(exited) = holder.0.try_wait().unwrap() {
+                return exited.status().unwrap();
             }
             assert!(Instant::now() < deadline, "the killed rank was not reaped");
             std::thread::sleep(Duration::from_millis(10));
@@ -592,7 +893,10 @@ time.sleep(600)
         );
 
         live.0.kill().unwrap();
-        assert_eq!(live.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(
+            live.0.wait().unwrap().status().unwrap().signal(),
+            Some(libc::SIGKILL)
+        );
         assert!(
             live_memory.iter().all(|path| !path.exists()),
             "{live_memory:?} outlived its rank"
@@ -617,5 +921,51 @@ time.sleep(600)
         live.0.kill().unwrap();
         live.0.wait().unwrap();
         assert!(!live_path.exists(), "{live_path:?} outlived its rank");
+    }
+
+    /// A successor's supervisor adopts the processes and reservations a
+    /// supervisor hands over: it reports none of them exited while they
+    /// run, ends them as its own, and observes their exits.
+    #[test]
+    fn a_handed_over_process_is_supervised_by_the_successor() {
+        let mut first = Supervisor::new("host".to_owned()).unwrap();
+        let spawn = Spawn {
+            host: "host".to_owned(),
+            group: "model".to_owned(),
+            rank: 0,
+            generation: 1,
+            executable: "sleep".to_owned(),
+            arguments: vec!["600".to_owned()],
+            ..Spawn::default()
+        };
+        let pid = first.spawn(7, &spawn).unwrap();
+        let reserved = first
+            .reserve(
+                7,
+                &Reserve {
+                    host: "host".to_owned(),
+                    group: "model".to_owned(),
+                    routable: false,
+                },
+                None,
+            )
+            .unwrap();
+        let (handed, descriptors) = first.hand_over().unwrap();
+        // The first supervisor holds nothing more: dropping it ends nothing.
+        drop(first);
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+        let mut successor = Supervisor::adopt("host".to_owned(), handed, descriptors).unwrap();
+        assert!(successor.exits().is_empty());
+        assert!(successor.reservations.contains_key(&reserved.reservation));
+        successor.stop(7, "model", None);
+        assert!(successor.children.is_empty());
+        // The killed process is gone once the host's init reaps it, which
+        // in a test is this process: its zombie is reaped here.
+        let mut status = 0;
+        // SAFETY: waits for this test's own child, which the first
+        // supervisor spawned.
+        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert!(libc::WIFSIGNALED(status));
     }
 }

@@ -21,10 +21,12 @@ runner.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+import traceback
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -33,6 +35,7 @@ import torch
 from torch import nn
 
 from uniserve import loading as library
+from uniserve import plugins
 from uniserve.distributed import Communicator, communication_axes
 from uniserve.errors import SetupError
 from uniserve.loading import retained as retention
@@ -180,6 +183,11 @@ class Loaded:
     image_processor: Any = None
     flow_prompt: Any = None
     tokenizer: Path | None = None
+    # Loads the rank's modules of the checkpoint at a path, its tensors
+    # streamed from a weight source when one is named, into new memory, as
+    # the rank loaded this model (:func:`update_weights`); ``None`` for a
+    # rank without checkpoint weights.
+    reload: Callable[[str, str | None], nn.Module] | None = None
 
     @property
     def model(self) -> nn.Module:
@@ -212,7 +220,9 @@ def read_config(
         components: The launch's component placement as JSON object text:
             each component's ranks and parallel configuration.
         rank: This rank.
-        role: ``"model"`` or ``"experts"``.
+        role: ``"experts"`` for a rank holding only routed experts; a
+            rank of any other role (``"model"``, ``"prefill"``,
+            ``"decode"``) holds its request components.
         expert_split: Routed experts run on dedicated ranks.
 
     Raises:
@@ -232,10 +242,10 @@ def read_config(
     rank, role = int(rank), str(role)
     placed = placements(json.loads(str(components)))
     if stub:
-        from uniserve.models.stub import Model, entry_points
+        from uniserve.models.stub import Config, Model, entry_points
 
         with torch.device("meta"):
-            model = Model()
+            model = Model(Config.read(path))
         metadata = None
         entries = entry_points(model.config)
     else:
@@ -314,10 +324,14 @@ def _resolve(
     exclude_modules: Sequence[str],
     quantization: str,
     model_dtype: str,
+    weights: str | None = None,
 ) -> Description | Resolved:
     """Narrow the checkpoint to this rank's modules and weight choices.
 
-    The stub model needs no checkpoint and is returned unchanged.
+    With ``weights``, a plugin's weight source (``scheme://...``,
+    ``uniserve.plugins.weight_source``) streams the checkpoint's tensors in
+    place of its files. The stub model needs no checkpoint and is returned
+    unchanged.
     """
     if description.stub:
         return description
@@ -329,9 +343,19 @@ def _resolve(
         modules=frozenset(str(path) for path in modules),
         exclude_modules=frozenset(str(path) for path in exclude_modules),
     )
+    if weights:
+        stream = plugins.weight_source(str(weights))
+        identity = str(stream.identity())
+        source = replace(
+            source,
+            checkpoint=tuple(
+                replace(checkpoint, files=(), stream=stream, identity=identity)
+                for checkpoint in source.checkpoint
+            ),
+        )
     options = json.loads(str(quantization))
-    weights = weight_config(source, options, str(model_dtype))
-    return Resolved(replace(source, weights=weights), description)
+    chosen = weight_config(source, options, str(model_dtype))
+    return Resolved(replace(source, weights=chosen), description)
 
 
 def _expert_kernels(
@@ -356,22 +380,35 @@ def fingerprint(
     model_dtype: str,
     expert_exchange: str | None,
     attention_ranks: int,
+    weights: str | None = None,
+    numerics: str | None = None,
 ) -> str:
     """The digests of what determines this rank's loaded weights.
 
     Placement and GPUs aside (``uniserve.loading.retained.fingerprints``),
-    as JSON text; the arguments are those of :func:`load_model`. Empty for
-    the stub model, whose weights are not retained.
+    as JSON text; the arguments are those of :func:`load_model`, and
+    ``numerics`` the digest of the code the weights were loaded with (empty
+    for the code loaded so far). Empty for the stub model, whose weights
+    are not retained.
     """
     resolved = _resolve(
-        description, modules, exclude_modules, quantization, model_dtype
+        description,
+        modules,
+        exclude_modules,
+        quantization,
+        model_dtype,
+        _text(weights),
     )
     if isinstance(resolved, Description):
         return ""
     kernels = _expert_kernels(_text(expert_exchange), int(attention_ranks))
     return json.dumps(
         retention.fingerprints(
-            resolved.source, description.io, str(model_dtype), kernels
+            resolved.source,
+            description.io,
+            str(model_dtype),
+            kernels,
+            _text(numerics) or None,
         ),
         sort_keys=True,
     )
@@ -409,6 +446,7 @@ def load_model(
     decode_split_tile_size: int | None,
     prefill_split_tile_size: int | None,
     use_tensor_core: bool | None,
+    weights: str | None = None,
 ) -> Loaded:
     """Materialize this rank's modules of a described model on its meshes.
 
@@ -453,9 +491,18 @@ def load_model(
         decode_split_tile_size, prefill_split_tile_size, use_tensor_core:
             FlashInfer options (``flashinfer.Config``); ``None`` keeps an
             option's default.
+        weights: A plugin's weight source (``scheme://...``) that streams
+            the checkpoint's tensors in place of its files; ``None`` reads
+            the files.
     """
+    weights = _text(weights)
     resolved = _resolve(
-        description, modules, exclude_modules, quantization, model_dtype
+        description,
+        modules,
+        exclude_modules,
+        quantization,
+        model_dtype,
+        weights,
     )
     device = str(device)
     generation = _text(generation_device)
@@ -501,7 +548,9 @@ def load_model(
     if description.stub:
         from uniserve.models.stub import Model, image_processor
 
-        module = Model().to(device)
+        described = description.model
+        assert isinstance(described, Model)
+        module = Model(described.config).to(device)
         for path, target in (_devices(module, generation) or {}).items():
             module.get_submodule(path).to(target)
         loaded = Loaded(
@@ -534,6 +583,7 @@ def load_model(
         partition = _expert_partition(
             expert_world, int(attention_ranks), bool(expert_dedicated)
         )
+        kernels = _expert_kernels(_text(expert_exchange), int(attention_ranks))
         started = time.perf_counter()
         result = registry.load_model(
             source,
@@ -542,12 +592,32 @@ def load_model(
             attention=attention,
             devices=_devices(description.model, generation),
             experts=partition,
-            expert_kernels=_expert_kernels(
-                _text(expert_exchange), int(attention_ranks)
-            ),
+            expert_kernels=kernels,
             retained=retained,
             load=frozenset(str(name) for name in load),
         )
+        checkpoint = description
+
+        def reload(path: str, weights: str | None) -> nn.Module:
+            fresh = _resolve(
+                replace(checkpoint, path=path),
+                modules,
+                exclude_modules,
+                quantization,
+                model_dtype,
+                weights,
+            )
+            assert isinstance(fresh, Resolved)
+            return registry.load_model(
+                fresh.source,
+                device=device,
+                meshes=placed,
+                attention=attention,
+                devices=_devices(checkpoint.model, generation),
+                experts=partition,
+                expert_kernels=kernels,
+            ).model
+
         module = result.model
         if dedicated:
             # The worker owns invocation of the loaded expert modules, in
@@ -578,6 +648,7 @@ def load_model(
             flow_prompt=source.flow_prompt,
             tokenizer=None if dedicated else source.tokenizer,
             origins=result.origins,
+            reload=reload,
         )
 
     if not dedicated and not host_only:
@@ -590,7 +661,125 @@ def load_model(
         device=torch.device(device),
         flashinfer=flashinfer.Backend(flashinfer.Config(**options)),
     )
+    # Worker hooks reach the modules a rank loaded (``uniserve.hooks``).
+    from uniserve import hooks
+
+    hooks.register_model(loaded.module)
     return loaded
+
+
+def update_weights(loaded: Loaded, path: str) -> bool:
+    """Rewrite the rank's loaded tensors in place from the checkpoint at
+    ``path``; whether the rank holds checkpoint weights to rewrite.
+
+    The checkpoint loads into new memory as the rank loaded its model (the
+    same modules, meshes and weight choices: ``Loaded.reload``); every
+    tensor of the loaded model then takes its new value where it lies, so
+    the CUDA graphs and the retained storages that address it read the new
+    weights. Every tensor is checked before any is written: the checkpoint
+    must load the same tensors in the same representations, shapes and
+    element types, else the loaded model stays as it was.
+
+    ``path`` is a checkpoint directory, or a plugin's weight source
+    (``scheme://...``) that streams the tensors of the rank's checkpoint,
+    whose configuration stays its own. A rank without checkpoint weights
+    (the stub model, a host-only rank) has nothing to rewrite.
+
+    Raises:
+        ValueError: The checkpoint loads other tensors, or a tensor in
+            another representation, shape or element type.
+    """  # noqa: D205
+    if loaded.reload is None:
+        return False
+    path = str(path)
+    started = time.perf_counter()
+    try:
+        replaced = _update_weights(loaded, path)
+    except BaseException as error:
+        # The frames of a failed load hold what it allocated; drop them so
+        # the memory returns before the workers wake.
+        traceback.clear_frames(error.__traceback__)
+        _release_device_memory()
+        raise
+    _release_device_memory()
+    logger.info(
+        "updated %d tensors in place from %s in %.1f s; %.2f GiB of device "
+        "memory stay allocated",
+        replaced,
+        path,
+        time.perf_counter() - started,
+        torch.cuda.memory_allocated() / 2**30
+        if torch.cuda.is_available()
+        else 0.0,
+    )
+    return True
+
+
+def _release_device_memory() -> None:
+    """Free what an update's discarded model held: its modules may hold
+    each other in cycles, which only the cycle collector frees.
+    """  # noqa: D205
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _update_weights(loaded: Loaded, path: str) -> int:
+    """Load the checkpoint at ``path`` and copy every tensor into place
+    (``update_weights``); the tensors copied.
+    """  # noqa: D205
+    streamed = "://" in path
+    checkpoint = loaded.description.path
+    assert checkpoint is not None
+    assert loaded.reload is not None
+    fresh = (
+        loaded.reload(checkpoint, path)
+        if streamed
+        else loaded.reload(path, None)
+    )
+
+    def entries(model: nn.Module) -> dict[str, Any]:
+        return {
+            name: retention.tensor_entry(name, tensor)
+            for name, tensor in retention.tensors(model)
+            if not tensor.is_meta
+        }
+
+    current, incoming = entries(loaded.root), entries(fresh)
+    if current.keys() != incoming.keys():
+        missing = sorted(current.keys() - incoming.keys())[:4]
+        extra = sorted(incoming.keys() - current.keys())[:4]
+        raise ValueError(
+            f"the checkpoint at {path} loads other tensors: it lacks "
+            f"{missing} and adds {extra}"
+        )
+    pairs = []
+    for name, entry in current.items():
+        other = incoming[name]
+        if (
+            entry.representation != other.representation
+            or entry.fields.keys() != other.fields.keys()
+        ):
+            raise ValueError(
+                f"the checkpoint at {path} loads {name} in another "
+                "representation"
+            )
+        for key, target in entry.fields.items():
+            value = other.fields[key]
+            if (target.shape, target.dtype) != (value.shape, value.dtype):
+                raise ValueError(
+                    f"the checkpoint at {path} loads {name} ({key}) as "
+                    f"{tuple(value.shape)} {value.dtype}, not "
+                    f"{tuple(target.shape)} {target.dtype}"
+                )
+            pairs.append((target, value))
+    with torch.no_grad():
+        for target, value in pairs:
+            target.copy_(value)
+    if not streamed:
+        loaded.description = replace(loaded.description, path=path)
+    return len(current)
 
 
 def _expert_partition(
