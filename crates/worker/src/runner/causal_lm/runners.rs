@@ -117,6 +117,10 @@ pub(crate) struct CausalLMRunners {
     pub(super) outputs: OutputPool,
     /// Global vocabulary of sampling.
     pub(super) vocab: usize,
+    /// Prefills keep hidden states and last-position logits, which a
+    /// sampled prefill selects from; without them a prefill only writes the
+    /// prefix cache.
+    pub(super) prefill_outputs: bool,
     /// Orders slot state across runner streams: recorded after each text
     /// batch's last write, waited on by the next batch on another stream.
     pub(super) order: StreamOrder,

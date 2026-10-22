@@ -257,14 +257,16 @@ impl CausalLMRunners {
                     |runtime, prefix_cache, after| {
                         // One real token per row, prefilled in batches no larger than
                         // the scheduler admits (the largest prefill bucket's live
-                        // rows) and committed as each slot's cache; then the decode
-                        // the graph captures with every row's continuation flag set.
+                        // rows), as the runner's prefills select, and committed as
+                        // each slot's cache; then the decode the graph captures with
+                        // every row's continuation flag set.
+                        let selection = runtime.prefill_selection();
                         for first in (0..size).step_by(prime) {
                             let count = prime.min(size - first);
                             run(
                                 runtime,
                                 prefix_cache,
-                                &rows(first + 1, &lengths[..count], 0, TokenSelection::LastLogits),
+                                &rows(first + 1, &lengths[..count], 0, selection),
                                 ForwardMode::Prefill,
                                 None,
                                 None,
@@ -347,6 +349,17 @@ impl CausalLMRunners {
         stepped.and(released).and(performed)
     }
 
+    /// What the last row of a warmup prefill selects: the last logits
+    /// when the runners' prefills keep outputs, else the prefix cache
+    /// alone, as the runners' serving prefills do.
+    fn prefill_selection(&self) -> TokenSelection {
+        if self.prefill_outputs {
+            TokenSelection::LastLogits
+        } else {
+            TokenSelection::Cache
+        }
+    }
+
     /// Run the eager context prefills of every runner whose rows place
     /// vision features, over scratch tables of slot 1, on a model whose
     /// image facts are `image`.
@@ -376,17 +389,14 @@ impl CausalLMRunners {
         // second block starts where the first one's positions end.
         let first = injection.block(FEATURES, 1, false, Some([2, 2]))?;
         let width = first.len();
+        // A block ends its prompt, so its row selects as the runner's
+        // prefills do.
+        let selection = self.prefill_selection();
         let text = text_row(1, &[0], 0, 0, TokenSelection::Cache, spatial)?;
-        let mixed = block_row(first.clone(), 1, 1, spatial, TokenSelection::LastLogits)?;
+        let mixed = block_row(first.clone(), 1, 1, spatial, selection)?;
         let next = next_position(&mixed)?;
         let second = injection.block(FEATURES, next, false, Some([2, 2]))?;
-        let alone = block_row(
-            second.clone(),
-            1,
-            1 + width as u64,
-            spatial,
-            TokenSelection::LastLogits,
-        )?;
+        let alone = block_row(second.clone(), 1, 1 + width as u64, spatial, selection)?;
         let lengths = [1 + width + second.len()];
 
         for index in 0..self.runners.len() {
