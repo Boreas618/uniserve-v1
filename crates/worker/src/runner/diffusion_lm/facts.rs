@@ -30,8 +30,8 @@ pub(crate) struct Facts {
     /// This rank denoises resident blocks (one pipeline stage holding the
     /// unsharded embedding table); otherwise it serves readouts only.
     pub(crate) generates: bool,
-    /// `readout` exchanges no tokens across ranks, so it runs once per slot
-    /// chunk and is captured per slot bucket.
+    /// `finish` exchanges no tokens across ranks, so it follows its
+    /// readout's expert step and has no expert capacity.
     pub(crate) local_tail: bool,
     pub(crate) pipeline_rank: usize,
     pub(crate) pipeline_size: usize,
@@ -83,7 +83,7 @@ impl Facts {
 
         let stage = counts("stage")?;
         let exchanges = flag(
-            "exchanges_readout",
+            "exchanges_finish",
             &[Any::from(exchange), Any::from(attention_ranks as i64)],
         )?;
         Ok(Self {

@@ -219,16 +219,25 @@ class _Session:
             *self.attend_state(),
         ]
 
+    def finish_arguments(self, slots: int) -> list:
+        """The arguments of ``finish`` over the session's tensors."""
+        return [
+            slots,
+            NO_EXPERT_STEP,
+            self.buffers["slot_rows"],
+            self.buffers["finished"],
+            *self.attend_state(),
+        ]
+
     def readout_arguments(self, slots: int, candidates: int) -> list:
         """The arguments of ``readout`` over the session's tensors."""
         return [
             slots,
             candidates,
-            NO_EXPERT_STEP,
-            self.buffers["slot_rows"],
+            self.buffers["finished_rows"],
+            self.buffers["finished"],
             self.buffers["candidate_index"],
             self.buffers["candidate_logprobs"],
-            *self.attend_state(),
         ]
 
     def denoise_arguments(
@@ -314,6 +323,10 @@ class _Session:
             ),
             "attention.start_pages": torch.zeros((tables, rows), **ints),
             "slot_rows": torch.zeros(tokens, **long),
+            "finished": torch.zeros(
+                (tokens, hidden), dtype=dtype, device=device
+            ),
+            "finished_rows": torch.zeros(256, **long),
             "candidate_index": torch.zeros(256, **long),
             "candidate_logprobs": torch.zeros(
                 256, dtype=torch.float32, device=device
@@ -441,7 +454,7 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
     assert diffusion_lm.sequence_length(loaded, "denoiser") == CANVAS
     assert diffusion_lm.vocab_size(loaded, "denoiser") == VOCAB
     assert diffusion_lm.generates(loaded, "denoiser")
-    assert not diffusion_lm.exchanges_readout(loaded, "denoiser", False, 0)
+    assert not diffusion_lm.exchanges_finish(loaded, "denoiser", False, 0)
 
     generator = torch.Generator().manual_seed(9)
     canvases = [
@@ -487,6 +500,8 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
             starts,
         )
     )
+    session.runner.finish(*session.finish_arguments(len(packed)))
+    session.buffers["finished_rows"][: len(packed)] = torch.arange(len(packed))
     session.runner.readout(*session.readout_arguments(len(packed), len(index)))
 
     torch.testing.assert_close(
@@ -677,11 +692,11 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
 
     The ``attend`` graph holds two blocks of 32 and 20 tokens padded to a
     bucket of two 32-token blocks (a 12-token and an empty padding sequence
-    that read no prefix); the ``readout`` graph holds 64 slot rows and 256
-    candidates. Its candidates agree with the eager forward within the
-    rounding the different shapes allow. A captured ``denoise`` replays the
-    eager step bit for bit, the committed bank rows included, for a first
-    step and the step after it.
+    that read no prefix); the ``finish`` and ``readout`` graphs hold 64 slot
+    rows, the ``readout`` 256 candidates. Its candidates agree with the
+    eager forward within the rounding the different shapes allow. A
+    captured ``denoise`` replays the eager step bit for bit, the committed
+    bank rows included, for a first step and the step after it.
     """
     session = _Session(tmp_path, sampling=True, setup=GPU)
     runner, buffers = session.runner, session.buffers
@@ -714,6 +729,8 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
             2, tokens.numel(), 32, queries, prefixes, widths, starts
         ),
     )
+    _synchronized(runner.finish, *session.finish_arguments(len(slots)))
+    buffers["finished_rows"][: len(slots)] = torch.arange(len(slots)).cuda()
     _synchronized(runner.readout, *session.readout_arguments(len(slots), count))
     eager = buffers["candidate_logprobs"][:count].clone()
 
@@ -729,13 +746,19 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
     attend = _capture(session, pool, runner.attend, *arguments)
     buffers["candidate_logprobs"].zero_()
     buffers["slot_rows"][len(slots) : 64] = 0
+    arguments = session.finish_arguments(64)
+    _synchronized(runner.finish, *arguments)
+    finish = _capture(session, pool, runner.finish, *arguments)
+    buffers["finished_rows"][len(slots) : 64] = 0
     arguments = session.readout_arguments(64, 256)
     _synchronized(runner.readout, *arguments)
     readout = _capture(session, pool, runner.readout, *arguments)
     buffers["candidate_logprobs"].zero_()
+    buffers["finished"].zero_()
     buffers["attend_state.0"].zero_()
     buffers["attend_state.1"].zero_()
     _synchronized(attend.replay)
+    _synchronized(finish.replay)
     _synchronized(readout.replay)
     torch.testing.assert_close(
         buffers["candidate_logprobs"][:count], eager, rtol=2e-2, atol=2e-2
@@ -778,4 +801,5 @@ def test_captured_readouts_and_steps_replay_their_eager_results(tmp_path):
             assert torch.equal(buffers[f"bank.{name}"], expected[name]), name
         graph.release()
     attend.release()
+    finish.release()
     readout.release()

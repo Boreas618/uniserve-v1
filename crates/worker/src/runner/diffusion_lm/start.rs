@@ -39,8 +39,10 @@ pub(crate) const KIND: CallKind = CallKind::Forward(ForwardMode::TokenDenoising)
 /// Every bound of the runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Bounds {
-    /// Blocks a forward may carry: the graph buckets' limit.
+    /// Blocks a denoising step may carry: the `denoise` buckets' limit.
     capacity: usize,
+    /// Blocks a readout may carry: the rows of a pass.
+    readout_rows: usize,
     /// Packed sequences of one forward: an `attend` bucket's padding
     /// doubles its blocks.
     rows: usize,
@@ -81,8 +83,10 @@ impl Bounds {
             .iter()
             .map(|group| group.units_per_page as usize)
             .sum();
-        // Startup reads a one-page prefix per synthetic block, so the pool
-        // bounds the blocks a captured bucket may hold.
+        // A generating block holds a page of every group, so the pool bounds
+        // the blocks a denoising step may hold. Readout blocks only read
+        // their requests' prefixes, which they may share, so a pass carries
+        // as many blocks as the engine's rows allow.
         let pool_rows = units.map_or(usize::MAX, |units| {
             (units.saturating_sub(1) as usize) / row_units.max(1)
         });
@@ -93,11 +97,8 @@ impl Bounds {
                 "no block of {length} tokens fits a batch of {tokens} tokens and a pool of {pool_rows} blocks"
             )));
         }
-        let rows = if graphs {
-            (2 * capacity).max(max_rows)
-        } else {
-            max_rows
-        };
+        let readout_rows = max_rows.min(tokens);
+        let rows = if graphs { 2 * readout_rows } else { max_rows };
 
         let mut block_size = Vec::new();
         let mut windowed = Vec::new();
@@ -128,6 +129,7 @@ impl Bounds {
         });
         Ok(Self {
             capacity,
+            readout_rows,
             rows,
             tokens,
             block_size,
@@ -165,6 +167,8 @@ impl Bounds {
             candidates: CANDIDATES,
             attend_widths: facts.attend_widths.clone(),
             attend_dtype: facts.attend_dtype,
+            // The final stage holds the attend state `finish` completes.
+            finished: (!facts.attend_widths.is_empty()).then_some(facts.hidden_size),
             denoise: self
                 .denoise
                 .zip(banks)
@@ -443,6 +447,8 @@ impl DiffusionLMRunner {
             let shapes = Shapes::new(
                 facts.sequence_length,
                 bounds.capacity,
+                bounds.readout_rows,
+                bounds.tokens,
                 sampling.map(|_| startup.request_slots),
             )?;
 
