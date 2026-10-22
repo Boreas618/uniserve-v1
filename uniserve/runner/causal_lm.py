@@ -22,19 +22,18 @@ everywhere. The tensors of one forward are parameters of its method.
   attention metadata, runs the model and, unless the forward only writes
   the prefix cache, keeps the hidden states and projects each row's last
   position. It is captured per row and token bucket.
-- :meth:`CausalLMRunner.sample`, :meth:`CausalLMRunner.sample_top_k` and
-  :meth:`CausalLMRunner.sample_greedy` select tokens from the logits a
-  forward projected, for tasks whose selection ``decode`` does not make:
-  one call per group of tasks sharing a sampler. ``sample_top_k`` is the
-  sampler ``decode`` captures; ``sample`` and ``sample_greedy`` apply what
-  the caller knows on the host (token sets, logit biases, draft tokens,
-  reported logprobs).
+- :meth:`CausalLMRunner.select` selects the tokens of a forward's tasks
+  whose selection ``decode`` does not make, each with its own sampler, from
+  the logits the forward projected, and :meth:`CausalLMRunner.score` reports
+  the logprobs of the tasks that request them. Every input is a tensor
+  column (draws, parameters, token sets as bitmasks, the slot-indexed logit
+  biases; :mod:`uniserve.sampling.select`), so both are captured per task
+  bucket and launched without Python.
+  :meth:`CausalLMRunner.score_prompt` scores the prompt tokens of a prefill
+  forward, a block of rows per call, from hidden states it projects; it is
+  captured per top width and launched once per block.
   :meth:`CausalLMRunner.verify` projects every position of a verification
-  forward and selects with speculative acceptance, and
-  :meth:`CausalLMRunner.prompt_logprobs` scores prompt tokens. These run
-  eagerly. Per-row values (draws, temperatures, cutoffs, penalty
-  strengths) are tensor columns; what the caller knows on the host
-  arrives as flat integer lists (:mod:`uniserve.sampling.select`).
+  forward and selects with speculative acceptance; it runs eagerly.
 
 Attention operators that plan a launch on the host read the host mirrors of
 the lengths; :meth:`CausalLMRunner.plan_decode` and
@@ -68,19 +67,16 @@ from uniserve.nn.attention.gather import (
 from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import execution_context, kernel_records
 from uniserve.sampling.greedy import greedy
-from uniserve.sampling.logprobs import (
-    prompt_logprobs,
-)
+from uniserve.sampling.logprobs import scatter_logprobs
 from uniserve.sampling.select import (
+    CATEGORICAL,
     TOKEN_CONTINUATION_BIT,
+    Controls,
     Selection,
-    select_categorical,
-    select_greedy,
-    select_top_k,
+    select,
 )
 from uniserve.sampling.state import commit as commit_state
 from uniserve.sampling.top_k import sample_top_k
-from uniserve.sampling.upload import upload
 
 __all__ = ["CausalLMRunner"]
 
@@ -188,6 +184,8 @@ class CausalLMRunner:
         sampling_positions: ``[S]`` int64, the semantic draw position.
         penalty_counts: ``[S, vocab]`` int32 committed token counts.
         prompt_logits: ``[S, vocab]`` last logits of a scored prompt chunk.
+        logit_bias: ``[S, vocab]`` float32 logit biases of each slot's
+            request, which the caller installs.
 
     Construction shares the vocabulary descriptor over the pipeline group,
     so the ranks of a group construct their runners in the same order.
@@ -222,6 +220,7 @@ class CausalLMRunner:
         sampling_positions: torch.Tensor,
         penalty_counts: torch.Tensor,
         prompt_logits: torch.Tensor,
+        logit_bias: torch.Tensor,
     ) -> None:
         path = str(path)
         self._model = (
@@ -248,6 +247,7 @@ class CausalLMRunner:
         self._sampling_positions = sampling_positions
         self._penalty_counts = penalty_counts
         self._prompt_logits = prompt_logits
+        self._logit_bias = logit_bias
 
         # The state tensors live on the device the forwards compute on.
         placed = unit_tables.device
@@ -470,7 +470,7 @@ class CausalLMRunner:
                 ``TOKEN_CONTINUATION_BIT`` where the row continues.
             points: ``[R]`` int64 output, emitted tokens (one).
             transition: ``[R]`` uint8 output, zero: a row with a transition
-                output is selected by :meth:`sample`.
+                output is selected by :meth:`select`.
 
         The host mirrors serve an eager forward and the capture; a launched
         graph reads the device columns.
@@ -618,8 +618,8 @@ class CausalLMRunner:
         a padding row has no token or holds the padding tokens, and writes
         no cache entry. The forward writes the rows' keys and values to the
         prefix cache. With ``outputs`` it also writes every token's hidden
-        state and each row's last-position logits; :meth:`sample` selects
-        from those logits, and :meth:`verify` and :meth:`prompt_logprobs`
+        state and each row's last-position logits; :meth:`select` selects
+        from those logits, and :meth:`verify` and :meth:`score_prompt`
         project other positions from the hidden states.
 
         Args:
@@ -710,412 +710,278 @@ class CausalLMRunner:
         tensor = self._tensor
         return None if tensor.size == 1 else tensor.broadcast(value, src=0)
 
-    def _group(
-        self, logits: torch.Tensor, rows: Sequence[int], counts: Sequence[int]
-    ) -> torch.Tensor:
-        """The global logits of a group's candidate rows, task by task.
+    def _controls(
+        self,
+        tasks: int,
+        width: int,
+        rows: torch.Tensor,
+        paths: torch.Tensor,
+        draws: torch.Tensor,
+        params: torch.Tensor,
+        columns: torch.Tensor,
+        masks: torch.Tensor,
+        mask_rows: torch.Tensor,
+        biased: torch.Tensor,
+        force: torch.Tensor,
+        finish: torch.Tensor,
+        transitions: torch.Tensor,
+        drafts: torch.Tensor | None,
+        terminal: torch.Tensor | None,
+    ) -> Controls:
+        """The selection controls of ``tasks`` tasks of ``width`` rows.
 
-        ``rows`` holds each task's first candidate row in ``logits`` and
-        ``counts`` its candidate rows.
+        ``columns`` holds each task's slot and gate (nonzero when the task
+        follows its slot's continuation flag); the other tensors are the
+        selection columns :meth:`select` documents, read from their first
+        entries.
         """
-        first, total = int(rows[0]), sum(int(count) for count in counts)
-        expected, contiguous = first, True
-        for row, count in zip(rows, counts, strict=True):
-            contiguous &= int(row) == expected
-            expected += int(count)
-        if contiguous:
-            return self._gathered(logits[first : first + total])
-        # Tasks of one sampler may own rows anywhere in the forward.
-        (selected,) = upload(
-            logits.device,
-            [
-                int(row) + index
-                for row, count in zip(rows, counts, strict=True)
-                for index in range(int(count))
-            ],
+        count = tasks * width
+        slots = columns[0, :tasks]
+        predicates = self._predicates.index_select(0, slots)
+        active = torch.where(columns[1, :tasks] != 0, predicates, True)
+        if drafts is None or terminal is None:
+            drafts = rows.new_empty((tasks, 0))
+            terminal = torch.zeros(tasks, dtype=torch.int64, device=rows.device)
+        else:
+            drafts = drafts[: tasks * (width - 1)].view(tasks, width - 1)
+            terminal = terminal[:tasks]
+        return Controls(
+            rows=rows[:count].view(tasks, width),
+            paths=paths[:tasks],
+            params=params[:count],
+            draws=draws[:count],
+            slots=slots,
+            active=active,
+            masks=masks,
+            mask_rows=mask_rows[:count],
+            biased=biased[:tasks].view(torch.bool),
+            force=force[:tasks].view(torch.bool),
+            finish=finish[:tasks],
+            transitions=transitions[:tasks],
+            drafts=drafts,
+            terminal=terminal,
         )
-        return self._gathered(logits.index_select(0, selected))
-
-    def _active(self, tasks: torch.Tensor, first: int, count: int):
-        """Each task's predicate: its slot's continuation flag when gated."""
-        columns = tasks[:, first : first + count]
-        flags = self._predicates.index_select(0, columns[0])
-        return torch.where(columns[1] != 0, flags, True)
 
     @staticmethod
     def _write_selection(
-        first: int,
         selection: Selection,
         completion,
         continuation,
         tagged,
         points,
         transition,
+        scored,
     ) -> None:
-        end = first + int(selection.tokens.numel())
-        completion[0, first:end].copy_(selection.valid)
-        completion[1, first:end].copy_(selection.active)
-        completion[2, first:end].copy_(selection.tokens)
-        completion[3, first:end].copy_(selection.accepted)
-        continuation[first:end].copy_(selection.continuation)
-        tagged[first:end].copy_(selection.tagged)
-        points[first:end].copy_(selection.points)
-        transition[first:end].copy_(selection.transition)
+        end = int(selection.tokens.numel())
+        completion[0, :end].copy_(selection.valid)
+        completion[1, :end].copy_(selection.active)
+        completion[2, :end].copy_(selection.tokens)
+        completion[3, :end].copy_(selection.accepted)
+        continuation[:end].copy_(selection.continuation)
+        tagged[:end].copy_(selection.tagged)
+        points[:end].copy_(selection.points)
+        transition[:end].copy_(selection.transition)
+        scored[:end].copy_(selection.scored)
 
-    def sample_greedy(
+    def select(
         self,
-        first: int,
-        rows: Sequence[int],
-        suppressed: Sequence[int],
-        force_finish: Sequence[int],
-        finish_ids: Sequence[int],
-        transition_ids: Sequence[int],
+        tasks: int,
+        candidates: int,
+        top_k: int,
+        categorical: int,
+        sorts: int,
         logits: torch.Tensor,
-        tasks: torch.Tensor,
+        rows: torch.Tensor,
+        paths: torch.Tensor,
+        draws: torch.Tensor,
+        params: torch.Tensor,
+        columns: torch.Tensor,
+        masks: torch.Tensor,
+        mask_rows: torch.Tensor,
+        biased: torch.Tensor,
+        force: torch.Tensor,
+        finish: torch.Tensor,
+        transitions: torch.Tensor,
         completion: torch.Tensor,
         continuation: torch.Tensor,
         tagged: torch.Tensor,
         points: torch.Tensor,
         transition: torch.Tensor,
+        scored: torch.Tensor,
     ) -> None:
-        """Select the argmax token of each task of a group.
+        """Select a token for each of ``tasks`` tasks of a forward.
+
+        Each task samples from one row of the logits the forward projected,
+        with its own sampler (:func:`~uniserve.sampling.select.select`).
+        Every value that changes between forwards is the contents of a
+        tensor, so the method is captured per task bucket and set of
+        samplers. Padding tasks select over row 0 in slot 0 and their
+        results are not read.
 
         Args:
-            first: The group's first task: its tasks' selections are
-                written from this entry of the outputs on.
-            rows: Each task's row of ``logits``.
-            suppressed: Scatter indices ``task * vocab + token`` of tokens
-                masked from selection.
-            force_finish: Per task, whether it finishes whatever it
-                selects.
-            finish_ids: Row-major ``[tasks, width]`` finish tokens, padded
-                with -1.
-            transition_ids: Row-major ``[tasks, width]`` tokens that select
-                a transition, padded with -1; an empty row for a task
-                without a transition output.
-            logits: ``[R, local vocab]`` logits a forward projected.
-            tasks: ``[2, R]`` int64, each task's slot and gate (nonzero
-                when the task follows its slot's continuation flag).
-            completion, continuation, tagged, points, transition: The
-                selection outputs of :meth:`decode`, one entry per task.
+            tasks: Tasks selected, padding included.
+            candidates: The top-k sampler's candidate width.
+            top_k, categorical: Some task takes the top-k sampler or the
+                general one; ``sorts`` when the general one sorts a whole
+                vocabulary row for some task.
+            logits: ``[R, local vocab]`` logits the forward projected.
+            rows: ``[T]`` int64, each task's row of ``logits``.
+            paths: ``[T]`` int64, each task's sampler
+                (:mod:`uniserve.sampling.select`).
+            draws: ``[T]`` float32 uniform draws.
+            params: ``[T, PARAMETER_COLUMNS]`` float32 parameters.
+            columns: ``[2, R]`` int64, each task's slot and gate.
+            masks: ``[M, words]`` int32 token sets masked rows may select.
+            mask_rows: ``[T]`` int64, each task's set of ``masks``, or -1.
+            biased: ``[R]`` uint8, tasks that add their slot's logit biases.
+            force: ``[R]`` uint8, tasks that finish whatever they select.
+            finish, transitions: ``[R, words]`` int32 token sets.
+            completion: ``[4, R]`` int64 output: valid, active, token,
+                accepted drafts.
+            continuation: ``[R]`` uint8 output, the task continues.
+            tagged: ``[R]`` int64 output, the token with
+                ``TOKEN_CONTINUATION_BIT`` where the task continues.
+            points: ``[R]`` int64 output, emitted tokens.
+            transition: ``[R]`` uint8 output, the task transitions.
+            scored: ``[R]`` int64 output, the row of ``logits`` reported
+                logprobs score.
         """
+        tasks = int(tasks)
         with torch.inference_mode(), self._context.activate():
-            selection = select_greedy(
-                self._group(logits, rows, (1,) * len(rows)),
-                self._active(tasks, int(first), len(rows)),
-                suppressed=suppressed,
-                force_finish=force_finish,
-                finish_ids=finish_ids,
-                transition_ids=transition_ids,
-                broadcast=self._broadcast,
-            )
-            self._write_selection(
-                int(first),
-                selection,
-                completion,
-                continuation,
-                tagged,
-                points,
-                transition,
-            )
-
-    def sample_top_k(
-        self,
-        first: int,
-        rows: Sequence[int],
-        candidates: int,
-        parameters: int,
-        force_finish: Sequence[int],
-        finish_ids: Sequence[int],
-        transition_ids: Sequence[int],
-        logits: torch.Tensor,
-        draws: torch.Tensor,
-        params: torch.Tensor,
-        tasks: torch.Tensor,
-        completion: torch.Tensor,
-        continuation: torch.Tensor,
-        tagged: torch.Tensor,
-        points: torch.Tensor,
-        transition: torch.Tensor,
-    ) -> None:
-        """Sample each task of a group from its top-k candidates.
-
-        The selection :meth:`decode` captures, run eagerly over the logits
-        of any forward. Each task's shaping is decided by its row of
-        ``params`` (``[T, PARAMETER_COLUMNS]`` float32) alone, its penalties
-        reading its slot's committed token counts; ``parameters`` is the
-        group's first row of ``params`` and ``draws`` (``[T]`` float32), one
-        row per task. ``candidates`` bounds every sampled task's top-k
-        width. The other arguments are those of :meth:`sample_greedy`.
-        """
-        first, count, parameters = int(first), len(rows), int(parameters)
-        with torch.inference_mode(), self._context.activate():
-            selection = select_top_k(
-                self._group(logits, rows, (1,) * count),
-                draws[parameters : parameters + count],
-                params[parameters : parameters + count],
-                self._active(tasks, first, count),
-                int(candidates),
-                counts=self._penalty_counts,
-                slots=tasks[0, first : first + count],
-                force_finish=force_finish,
-                finish_ids=finish_ids,
-                transition_ids=transition_ids,
-                broadcast=self._broadcast,
-            )
-            self._write_selection(
-                first,
-                selection,
-                completion,
-                continuation,
-                tagged,
-                points,
-                transition,
-            )
-
-    def _select(
-        self,
-        logits: torch.Tensor,
-        first: int,
-        row_counts: Sequence[int],
-        drafts: Sequence[int],
-        terminal_prefixes: Sequence[int],
-        parameters: int,
-        width: int,
-        top_ks: Sequence[int],
-        top_p_rows: Sequence[int],
-        min_p_rows: Sequence[int],
-        typical_p_rows: Sequence[int],
-        allowed_rows: Sequence[int],
-        allowed: Sequence[int],
-        suppressed: Sequence[int],
-        penalty_rows: Sequence[int],
-        penalty_slots: Sequence[int],
-        penalty_drafts: Sequence[int],
-        bias: Sequence[int],
-        bias_values: Sequence[float],
-        logprob_tasks: Sequence[int],
-        logprob_counts: Sequence[int],
-        logprob_offset: int,
-        force_finish: Sequence[int],
-        finish_ids: Sequence[int],
-        transition_ids: Sequence[int],
-        draws: torch.Tensor,
-        params: torch.Tensor,
-        tasks: torch.Tensor,
-        completion: torch.Tensor,
-        continuation: torch.Tensor,
-        tagged: torch.Tensor,
-        points: torch.Tensor,
-        transition: torch.Tensor,
-        logprobs: torch.Tensor,
-    ) -> None:
-        """Shape, sample and write one group's global candidate rows.
-
-        ``width`` is the top-k sampler's candidate width, which rows with a
-        top-k width at most it share (``shape_logits``'s ``candidates``).
-        """
-        first, parameters = int(first), int(parameters)
-        rows = int(logits.shape[0])
-
-        # Each penalized row counts its slot's committed tokens and the
-        # draft tokens before it; the committed counts change only at
-        # commit.
-        counts = None
-        if len(penalty_rows):
-            slots, tokens = upload(self._device, penalty_slots, penalty_drafts)
-            counts = self._penalty_counts.index_select(0, slots)
-            if len(penalty_drafts):
-                counts.reshape(-1).index_put_(
-                    (tokens,),
-                    torch.ones_like(tokens, dtype=counts.dtype),
-                    accumulate=True,
-                )
-
-        selection = select_categorical(
-            logits,
-            draws[parameters : parameters + rows],
-            params[parameters : parameters + rows],
-            self._active(tasks, first, len(row_counts)),
-            row_counts=row_counts,
-            drafts=drafts,
-            terminal_prefixes=terminal_prefixes,
-            candidates=int(width),
-            top_ks=top_ks,
-            top_p_rows=top_p_rows,
-            min_p_rows=min_p_rows,
-            typical_p_rows=typical_p_rows,
-            allowed_rows=allowed_rows,
-            allowed=allowed,
-            suppressed=suppressed,
-            penalty_rows=penalty_rows,
-            penalty_counts=counts,
-            bias=bias,
-            bias_values=bias_values,
-            logprob_tasks=logprob_tasks,
-            logprob_counts=[int(count) for count in logprob_counts],
-            force_finish=force_finish,
-            finish_ids=finish_ids,
-            transition_ids=transition_ids,
-            broadcast=self._broadcast,
-        )
-        self._write_selection(
-            first,
-            selection,
-            completion,
-            continuation,
-            tagged,
-            points,
-            transition,
-        )
-        if selection.logprobs is not None:
-            packed = selection.logprobs
-            offset = int(logprob_offset)
-            logprobs[offset : offset + int(packed.numel())].copy_(packed)
-
-    def sample(
-        self,
-        first: int,
-        rows: Sequence[int],
-        parameters: int,
-        candidates: int,
-        top_ks: Sequence[int],
-        top_p_rows: Sequence[int],
-        min_p_rows: Sequence[int],
-        typical_p_rows: Sequence[int],
-        allowed_rows: Sequence[int],
-        allowed: Sequence[int],
-        suppressed: Sequence[int],
-        penalty_rows: Sequence[int],
-        penalty_slots: Sequence[int],
-        bias: Sequence[int],
-        bias_values: Sequence[float],
-        logprob_tasks: Sequence[int],
-        logprob_counts: Sequence[int],
-        logprob_offset: int,
-        force_finish: Sequence[int],
-        finish_ids: Sequence[int],
-        transition_ids: Sequence[int],
-        logits: torch.Tensor,
-        draws: torch.Tensor,
-        params: torch.Tensor,
-        tasks: torch.Tensor,
-        completion: torch.Tensor,
-        continuation: torch.Tensor,
-        tagged: torch.Tensor,
-        points: torch.Tensor,
-        transition: torch.Tensor,
-        logprobs: torch.Tensor,
-    ) -> None:
-        """Sample each task of a group through the general shaping path.
-
-        Each task's logits row is shaped in the canonical order
-        (:func:`~uniserve.sampling.select.shape_logits`) and sampled
-        by inverting the categorical CDF with its draw, or by argmax at
-        zero temperature.
-
-        Args:
-            candidates: The top-k sampler's candidate width; a task whose
-                top-k width is at most it keeps the candidates that sampler
-                (:meth:`sample_top_k`) keeps.
-            top_ks: Per task, its top-k width, or zero without one.
-            top_p_rows: Tasks with a nucleus cutoff below one and no top-k
-                width.
-            min_p_rows: Tasks with a minimum-probability cutoff.
-            typical_p_rows: Tasks with a typical-probability cutoff below one.
-            allowed_rows: Tasks restricted to the tokens ``allowed``
-                (scatter indices ``task * vocab + token``) names for them.
-            suppressed: Scatter indices of tokens masked from selection.
-            penalty_rows: Tasks with repetition, frequency or presence
-                penalties, and ``penalty_slots`` the request slot of each,
-                whose committed token counts the penalties read.
-            bias: Scatter indices of the additive offsets ``bias_values``.
-            draws: ``[T]`` float32 uniform draws and ``params`` ``[T,
-                PARAMETER_COLUMNS]`` float32 parameters, one row per task
-                from row ``parameters`` on.
-            logprob_tasks: The tasks that report logprobs, each its top
-                ``logprob_counts`` entries, packed into ``logprobs`` from
-                ``logprob_offset`` on.
-
-        The other arguments are those of :meth:`sample_greedy`.
-        """
-        with torch.inference_mode(), self._context.activate():
-            counts = (1,) * len(rows)
-            self._select(
-                self._group(logits, rows, counts),
-                first,
-                counts,
-                (),
-                (0,) * len(rows),
-                parameters,
-                candidates,
-                top_ks,
-                top_p_rows,
-                min_p_rows,
-                typical_p_rows,
-                allowed_rows,
-                allowed,
-                suppressed,
-                penalty_rows,
-                penalty_slots,
-                (),
-                bias,
-                bias_values,
-                logprob_tasks,
-                logprob_counts,
-                logprob_offset,
-                force_finish,
-                finish_ids,
-                transition_ids,
+            controls = self._controls(
+                tasks,
+                1,
+                rows,
+                paths,
                 draws,
                 params,
-                tasks,
+                columns,
+                masks,
+                mask_rows,
+                biased,
+                force,
+                finish,
+                transitions,
+                None,
+                None,
+            )
+            selection = select(
+                self._gathered(logits),
+                controls,
+                candidates=int(candidates),
+                top_k=bool(top_k),
+                categorical=bool(categorical),
+                sorts=bool(sorts),
+                counts=self._penalty_counts,
+                bias=self._logit_bias,
+                broadcast=self._broadcast,
+            )
+            self._write_selection(
+                selection,
                 completion,
                 continuation,
                 tagged,
                 points,
-                transition,
+                transition.view(torch.bool),
+                scored,
+            )
+
+    @staticmethod
+    def _task_layout(counts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The compact layout of reporting tasks: one block from word zero.
+
+        ``counts`` holds a row's top count per task, then -1 for each
+        padding row (:func:`~uniserve.sampling.logprobs.compact_offsets`).
+        """
+        kept = counts.clamp_min(0)
+        index = torch.arange(int(counts.numel()), device=counts.device)
+        return (
+            torch.zeros_like(counts),
+            index,
+            (counts >= 0).sum().expand_as(counts),
+            torch.cumsum(kept, 0) - kept,
+            kept.sum().expand_as(counts),
+            counts,
+        )
+
+    def score(
+        self,
+        rows: int,
+        top: int,
+        dump: int,
+        logits: torch.Tensor,
+        tasks: torch.Tensor,
+        counts: torch.Tensor,
+        scored: torch.Tensor,
+        completion: torch.Tensor,
+        logprobs: torch.Tensor,
+    ) -> None:
+        """Report the logprobs of the tasks a :meth:`select` selected.
+
+        Each reporting task's selected token and its top tokens are scored
+        under the model's distribution (the unshaped logits) of the row of
+        ``logits`` the task's selection read (``scored``), and packed
+        compactly into the first words of ``logprobs``, each task with its
+        own count of top tokens
+        (:func:`~uniserve.sampling.logprobs.scatter_logprobs`). The method
+        is captured per bucket of reporting tasks and top width.
+
+        Args:
+            rows: Reporting tasks, padding included.
+            top: Top tokens scored per task, at least each task's count.
+            dump: The word of ``logprobs`` padding scores into.
+            logits: ``[R, local vocab]`` logits the forward projected.
+            tasks: ``[R]`` int64, the task each row scores.
+            counts: ``[R]`` int64, each row's top count, -1 for padding.
+            scored: ``[R]`` int64, each task's scored row of ``logits``.
+            completion: ``[4, R]`` int64, the selection's outputs.
+            logprobs: ``[L]`` int64 output.
+        """
+        rows = int(rows)
+        with torch.inference_mode(), self._context.activate():
+            chosen = tasks[:rows]
+            scatter_logprobs(
+                self._gathered(logits).float(),
+                scored.index_select(0, chosen),
+                completion[2].index_select(0, chosen),
+                self._task_layout(counts[:rows]),
+                int(top),
                 logprobs,
+                int(dump),
             )
 
     def verify(
         self,
         count: int,
-        first: int,
-        rows: Sequence[int],
-        row_counts: Sequence[int],
-        drafts: Sequence[int],
-        terminal_prefixes: Sequence[int],
-        parameters: int,
+        tasks: int,
+        width: int,
         candidates: int,
-        top_ks: Sequence[int],
-        top_p_rows: Sequence[int],
-        min_p_rows: Sequence[int],
-        typical_p_rows: Sequence[int],
-        allowed_rows: Sequence[int],
-        allowed: Sequence[int],
-        suppressed: Sequence[int],
-        penalty_rows: Sequence[int],
-        penalty_slots: Sequence[int],
-        penalty_drafts: Sequence[int],
-        bias: Sequence[int],
-        bias_values: Sequence[float],
-        logprob_tasks: Sequence[int],
-        logprob_counts: Sequence[int],
-        logprob_offset: int,
-        force_finish: Sequence[int],
-        finish_ids: Sequence[int],
-        transition_ids: Sequence[int],
+        sorts: int,
+        top: int,
+        reported: int,
+        dump: int,
         hidden: torch.Tensor,
         logit_rows: torch.Tensor,
+        rows: torch.Tensor,
         draws: torch.Tensor,
         params: torch.Tensor,
-        tasks: torch.Tensor,
+        columns: torch.Tensor,
+        masks: torch.Tensor,
+        mask_rows: torch.Tensor,
+        biased: torch.Tensor,
+        force: torch.Tensor,
+        finish: torch.Tensor,
+        transitions: torch.Tensor,
+        drafts: torch.Tensor,
+        terminal: torch.Tensor,
+        logprob_tasks: torch.Tensor,
+        logprob_counts: torch.Tensor,
         completion: torch.Tensor,
         continuation: torch.Tensor,
         tagged: torch.Tensor,
         points: torch.Tensor,
         transition: torch.Tensor,
+        scored: torch.Tensor,
         logprobs: torch.Tensor,
     ) -> None:
         """Verify the draft tokens of a verification forward.
@@ -1123,133 +989,162 @@ class CausalLMRunner:
         A verification row evaluates its request's next token followed by
         draft tokens. This projects the ``count`` token positions
         ``logit_rows`` of the forward's ``hidden`` states, one candidate row
-        per position, and selects each task's tokens with speculative
-        acceptance: the accepted draft prefix and the token after it.
+        per position, and selects each of ``tasks`` tasks' tokens with the
+        general sampler and speculative acceptance: the accepted draft
+        prefix and the token after it. Every task has ``width`` candidate
+        rows (its drafts plus one, padded by repeating its first row).
 
         Args:
-            rows: Each task's first candidate row.
-            row_counts: Each task's candidate rows: its drafts plus one.
-            drafts: The tasks' draft tokens, concatenated.
-            terminal_prefixes: Per task, the one-based length of its draft
-                prefix ending at the first finish token, or zero.
-            penalty_drafts: Scatter indices ``row * vocab + token`` into
-                the penalized rows' token counts, one per draft token
-                before each row.
+            rows: ``[T * W]`` int64, each candidate row's projected row.
+            drafts: ``[T * (W - 1)]`` int64 draft tokens, -1 past a task's
+                own.
+            terminal: ``[T]`` int64, the one-based length of a task's draft
+                prefix ending at its first finish token, or zero.
+            top, reported, dump: Top tokens and tasks reporting logprobs,
+                which ``logprob_tasks`` and ``logprob_counts`` name as
+                :meth:`score` does; their words are packed into
+                ``logprobs``.
 
-        The shaping lists index candidate rows where :meth:`sample`'s index
-        tasks; the other arguments are those of :meth:`sample`.
+        The other arguments are those of :meth:`select`, with draws,
+        parameters and mask rows per candidate row.
         """
+        tasks, width = int(tasks), int(width)
         with torch.inference_mode(), self._context.activate():
-            projected = self._project(
-                hidden, logit_rows[: int(count)], int(count), None
+            projected = self._gathered(
+                self._project(
+                    hidden, logit_rows[: int(count)], int(count), None
+                )
             )
-            self._select(
-                self._group(projected, rows, row_counts),
-                first,
-                row_counts,
-                drafts,
-                terminal_prefixes,
-                parameters,
-                candidates,
-                top_ks,
-                top_p_rows,
-                min_p_rows,
-                typical_p_rows,
-                allowed_rows,
-                allowed,
-                suppressed,
-                penalty_rows,
-                penalty_slots,
-                penalty_drafts,
-                bias,
-                bias_values,
-                logprob_tasks,
-                logprob_counts,
-                logprob_offset,
-                force_finish,
-                finish_ids,
-                transition_ids,
+            controls = self._controls(
+                tasks,
+                width,
+                rows,
+                torch.full_like(rows, CATEGORICAL),
                 draws,
                 params,
-                tasks,
+                columns,
+                masks,
+                mask_rows,
+                biased,
+                force,
+                finish,
+                transitions,
+                drafts,
+                terminal,
+            )
+            selection = select(
+                projected,
+                controls,
+                candidates=int(candidates),
+                top_k=False,
+                categorical=True,
+                sorts=bool(sorts),
+                counts=self._penalty_counts,
+                bias=self._logit_bias,
+                broadcast=self._broadcast,
+            )
+            self._write_selection(
+                selection,
                 completion,
                 continuation,
                 tagged,
                 points,
-                transition,
-                logprobs,
+                transition.view(torch.bool),
+                scored,
             )
+            reported = int(reported)
+            if reported:
+                chosen = logprob_tasks[:reported]
+                scatter_logprobs(
+                    projected.float(),
+                    selection.scored.index_select(0, chosen),
+                    selection.tokens.index_select(0, chosen),
+                    self._task_layout(logprob_counts[:reported]),
+                    int(top),
+                    logprobs,
+                    int(dump),
+                )
 
-    def prompt_logprobs(
+    def score_prompt(
         self,
-        count: int,
-        rows: Sequence[int],
-        row_counts: Sequence[int],
-        tokens: Sequence[int],
-        continued: Sequence[int],
-        slots: Sequence[int],
-        offsets: Sequence[int],
-        tails: Sequence[int],
-        tops: Sequence[int],
+        rows: int,
+        top: int,
+        dump: int,
         hidden: torch.Tensor,
-        logit_rows: torch.Tensor,
+        prompt_rows: torch.Tensor,
+        block: torch.Tensor,
         input_ids: torch.Tensor,
         logprobs: torch.Tensor,
         prompt_tail: torch.Tensor,
     ) -> None:
-        """Score the prompt chunks of a prefill forward.
+        """Score ``rows`` prompt rows of a prefill forward from ``block`` on.
 
-        This projects the ``count`` token positions ``logit_rows`` of the
-        forward's ``hidden`` states into candidate rows and scores each
-        chunk into ``logprobs``, retaining the chunk's last logits in
-        ``prompt_tail`` for the chunk after it. The lists hold one entry
-        per chunk.
+        A prompt row is one position of a scored prompt chunk: it holds the
+        logits that predict one prompt token, or the chunk's last logits,
+        which the chunk after it continues from. Its logits are the
+        projection of its position of ``hidden``, or the retained logits of
+        its request slot (the last logits of the chunk before). Each row
+        scores its target token of ``input_ids`` and its chunk's count of top
+        tokens into the chunk's compact words of ``logprobs``
+        (:func:`~uniserve.sampling.logprobs.scatter_logprobs`) and copies
+        its logits to its row of ``prompt_tail``. A row with no target
+        scores into the ``dump`` word, and a row that is no chunk's last
+        copies into the last row of ``prompt_tail``, which no one reads, so
+        every row runs the same operations. The method is captured per top
+        width and block size, and a forward launches it once per block.
 
         Args:
-            rows: The chunk's first candidate row.
-            row_counts: Its candidate rows; a chunk of none only retains
-                candidate row ``rows`` (a prompt ending with a vision
-                block).
-            tokens: Its first token in ``input_ids``.
-            continued: What predicts its first token: nothing for 0, the
-                slot's retained logits for 1, candidate row
-                ``continued - 2`` otherwise (the vision block before it).
-            slots: Its request slot.
-            offsets: Where its logprob words start in ``logprobs``.
-            tails: The row of ``prompt_tail`` its last logits go to.
-            tops: Its top count.
+            rows: Rows of one call.
+            top: Top tokens scored per row, at least every chunk's count.
+            dump: The word of ``logprobs`` the rows without a target score
+                into.
+            hidden: ``[T, hidden]`` hidden states of the forward.
+            prompt_rows: ``[8, Q]`` int64; per row its position in
+                ``hidden``, its retained slot (or -1 for its projection), its
+                target token's index in ``input_ids``, its chunk's first
+                word, its index in the chunk, the chunk's rows and their top
+                count (or -1 for a row without a target), and its row of
+                ``prompt_tail``.
+            block: ``[1]`` int32, the call's first row.
+            input_ids: ``[T]`` int64 tokens of the forward.
+            logprobs: ``[L]`` int64 output words.
+            prompt_tail: ``[R + 1, vocab]`` logits retained per chunk.
         """
+        rows = int(rows)
         with torch.inference_mode(), self._context.activate():
-            candidates = self._project(
-                hidden, logit_rows[: int(count)], int(count), None
+            index = block.to(torch.long) + torch.arange(
+                rows, dtype=torch.long, device=prompt_rows.device
             )
-            for index, top in enumerate(tops):
-                row, scored = int(rows[index]), int(row_counts[index])
-                tail = int(tails[index])
-                if not scored:
-                    prompt_tail[tail].copy_(
-                        self._gathered(candidates[row : row + 1])[0]
-                    )
-                    continue
-                chunk = self._gathered(candidates[row : row + scored])
-                previous = None
-                before = int(continued[index])
-                if before == 1:
-                    previous = self._prompt_logits[int(slots[index])]
-                elif before > 1:
-                    previous = self._gathered(
-                        candidates[before - 2 : before - 1]
-                    )[0]
-                token = int(tokens[index])
-                retained, packed = prompt_logprobs(
-                    input_ids[token : token + scored], chunk, previous, int(top)
-                )
-                prompt_tail[tail].copy_(retained)
-                if packed is not None:
-                    offset = int(offsets[index])
-                    logprobs[offset : offset + int(packed.numel())].copy_(
-                        packed
-                    )
+            positions, slots, targets, bases, offsets, chunk, counts, tails = (
+                prompt_rows.index_select(1, index)
+            )
+            logits = self._gathered(
+                self._project(hidden, positions, rows, None)
+            )
+            logits = torch.where(
+                (slots >= 0).unsqueeze(1),
+                self._prompt_logits.index_select(0, slots.clamp_min(0)),
+                logits,
+            )
+            prompt_tail.index_copy_(0, tails, logits.to(prompt_tail.dtype))
+            # A chunk's rows report one count, so a row's top tokens follow
+            # those of the rows before it at that count.
+            scatter_logprobs(
+                logits.float(),
+                torch.arange(rows, device=logits.device),
+                input_ids.index_select(0, targets),
+                (
+                    bases,
+                    offsets,
+                    chunk,
+                    offsets * counts,
+                    chunk * counts,
+                    counts,
+                ),
+                int(top),
+                logprobs,
+                int(dump),
+            )
 
     # Slot state.
 

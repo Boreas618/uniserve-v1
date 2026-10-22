@@ -48,7 +48,7 @@ use crate::{Error, Result, lock};
 pub use pool::GraphPool;
 pub(crate) use pool::{GraphStorage, graph_storage_budget_bytes, reserve_pools};
 pub(crate) use shape_key::{
-    PrefillShape, PrefillVariant, ShapeKey, TextForward, TextShapes, prefill_shapes,
+    PrefillShape, PrefillVariant, ShapeKey, TextForward, TextShapes, prefill_shapes, task_buckets,
 };
 pub(crate) use table::{GraphTable, Lookup};
 

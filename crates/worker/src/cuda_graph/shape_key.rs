@@ -1,5 +1,6 @@
 //! Shape keys of text graphs: what identifies a captured graph, the sizes
-//! startup captures and the bucket serving selects for a forward.
+//! startup captures and the bucket serving selects for a forward, its
+//! selection and its reported logprobs.
 
 use std::collections::BTreeSet;
 
@@ -22,6 +23,30 @@ pub(crate) enum ShapeKey {
     },
     /// `commit` of a row bucket.
     Commit { rows: usize },
+    /// `select` of a task bucket with the samplers its tasks take: the
+    /// top-k one, and the general one with whether it sorts whole
+    /// vocabulary rows.
+    Select {
+        tasks: usize,
+        top_k: bool,
+        categorical: Option<bool>,
+    },
+    /// `score` of a row bucket of reporting tasks and a top width.
+    Score { rows: usize, top: usize },
+    /// `score_prompt` of a block of `rows` prompt rows reporting a top
+    /// width each.
+    Prompt { rows: usize, top: usize },
+}
+
+/// The task buckets of selections over a binding of `rows` rows: powers of
+/// two below it, then `rows` itself. A bucket at most doubles its tasks.
+pub(crate) fn task_buckets(rows: usize) -> Vec<usize> {
+    let mut buckets: Vec<usize> = (0..)
+        .map(|power| 1_usize << power)
+        .take_while(|&bucket| bucket < rows)
+        .collect();
+    buckets.push(rows);
+    buckets
 }
 
 /// The numerical semantics a prefill graph is captured for besides its

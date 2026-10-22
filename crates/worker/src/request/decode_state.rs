@@ -11,11 +11,13 @@
 //! | `sampling_positions` | `i64` | `[S]` | semantic draw position |
 //! | `penalty_counts` | `i32` | `[S, V]` | committed generated-token counts |
 //! | `prompt_logits` | model dtype | `[S, V]` | last logits of a scored prompt chunk |
+//! | `logit_bias` | `f32` | `[S, V]` | the logit biases of the slot's request |
 //!
 //! The slot's verified cache length is the block tables' `verified_lengths`,
 //! shared with attention gathers. `S` is the request slot count plus one:
 //! slot 0 is padding. Rust allocates, resets and copies; the runner's
-//! `commit` installs selections.
+//! `commit` installs selections. A slot's logit biases are installed when a
+//! request that has any takes the slot, and read only by its tasks.
 
 use std::sync::Arc;
 
@@ -40,12 +42,13 @@ pub(crate) struct DecodeState {
     sampling_positions: StorageView,
     penalty_counts: StorageView,
     prompt_logits: StorageView,
+    logit_bias: StorageView,
     /// Borrowed from the block tables.
     verified_lengths: StorageView,
 }
 
 /// Byte offsets of the carved fields and the total length.
-fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 6], usize) {
+fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 7], usize) {
     let sizes = [
         rows * 8,
         rows,
@@ -53,8 +56,9 @@ fn layout(rows: usize, vocab: usize, logits: DType) -> ([usize; 6], usize) {
         rows * 8,
         rows * vocab * 4,
         rows * vocab * logits.bytes(),
+        rows * vocab * 4,
     ];
-    let mut offsets = [0; 6];
+    let mut offsets = [0; 7];
     let mut cursor = 0;
     for (offset, size) in offsets.iter_mut().zip(sizes) {
         *offset = cursor;
@@ -116,6 +120,7 @@ impl DecodeState {
             sampling_positions: view(3, DType::I64, &[slots])?,
             penalty_counts: view(4, DType::I32, &[slots, width])?,
             prompt_logits: view(5, logits, &[slots, width])?,
+            logit_bias: view(6, DType::F32, &[slots, width])?,
             verified_lengths,
             memory,
             rows,
@@ -156,6 +161,10 @@ impl DecodeState {
 
     pub(crate) fn prompt_logits(&self) -> &StorageView {
         &self.prompt_logits
+    }
+
+    pub(crate) fn logit_bias(&self) -> &StorageView {
+        &self.logit_bias
     }
 
     pub(crate) fn verified_lengths(&self) -> &StorageView {
@@ -281,6 +290,31 @@ impl DecodeState {
         Ok(())
     }
 
+    /// Install `biases` as slot `slot`'s logit biases on `stream`: the
+    /// row's tokens outside the list are zero. A bias of a token outside the
+    /// vocabulary has no logit to shift.
+    pub(crate) fn install_bias(
+        &self,
+        slot: usize,
+        biases: &[(u32, f32)],
+        stream: impl Issue,
+    ) -> Result<()> {
+        self.require_slot(slot)?;
+        let mut row = vec![0.0_f32; self.vocab];
+        for &(token, bias) in biases {
+            if let Some(entry) = row.get_mut(token as usize) {
+                *entry = bias;
+            }
+        }
+        let address = self.logit_bias.address() + (4 * self.vocab * slot) as u64;
+        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
+        batch.push(address, row.as_ptr() as u64, 4 * self.vocab);
+        // SAFETY: the destination is one row of this state; the source is
+        // read during the call.
+        unsafe { stream.copy(&batch) }?;
+        Ok(())
+    }
+
     /// Set `slots`' continuation flags to `value` on `stream` (warmup graph
     /// capture runs its decode rows as active continuations).
     pub(crate) fn set_predicates(
@@ -346,6 +380,35 @@ mod tests {
         assert_eq!(counts[5], 3);
         assert_eq!(counts[10], 0);
         assert!(state.reset(&[4], None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_installs_its_logit_biases_in_its_slot() -> Result<()> {
+        let lengths = StorageView::contiguous(
+            Storage::host(4 * 4) as Arc<dyn Backing>,
+            0,
+            DType::I32,
+            &[4],
+        )?;
+        let state = DecodeState::allocate(3, 5, DType::BF16, lengths, None, None)?;
+        state.install_bias(2, &[(1, 0.5), (4, -2.0)], None)?;
+        let biases = read::<f32>(&state.logit_bias);
+        assert_eq!(&biases[10..15], &[0.0, 0.5, 0.0, 0.0, -2.0]);
+        assert!(
+            biases[..10]
+                .iter()
+                .chain(&biases[15..])
+                .all(|&bias| bias == 0.0)
+        );
+        // Token 5 is outside the vocabulary of five tokens.
+        state.install_bias(1, &[(5, 1.0)], None)?;
+        assert!(
+            read::<f32>(&state.logit_bias)[5..10]
+                .iter()
+                .all(|&bias| bias == 0.0)
+        );
+        assert!(state.install_bias(4, &[(0, 1.0)], None).is_err());
         Ok(())
     }
 
