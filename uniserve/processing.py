@@ -343,10 +343,18 @@ class StrideResize:
 
 @dataclass(frozen=True, slots=True)
 class TowerTransform:
-    """Combines resize and normalization policy for one image tower."""
+    """Combines resize and normalization policy for one image tower.
+
+    Without ``patch_layout`` the tower takes ``[channels, height, width]``
+    pixels. With it the tower takes patch rows: one row per
+    ``resize.stride`` pixels square, in raster order over the patch grid,
+    each row's values in that layout (see ``PatchTransform``). The rows
+    hold the same values as the pixels; only their order differs.
+    """
 
     resize: StrideResize
     normalization: Literal["imagenet", "signed_unit"] = "signed_unit"
+    patch_layout: Literal["channels_first", "channels_last"] | None = None
 
 
 @dataclass(frozen=True, slots=True)

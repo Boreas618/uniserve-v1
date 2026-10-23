@@ -62,13 +62,14 @@ _UNIT_SCALE = 1 / 255
 class PreparedImage:
     """Normalized tower input pixels and the model canvas dimensions.
 
-    For a ``PatchTransform`` tower, ``pixels`` is ``[patches, channels *
-    patch * patch]`` with patches in raster order and each row in the
-    transform's ``patch_layout``, and ``grid_shape`` holds the (rows,
-    columns) patch grid. For a ``TowerTransform`` tower, ``pixels`` is
-    ``[channels, height, width]`` and ``grid_shape`` is None. The pixels
-    are in the processor's output dtype. ``height`` and ``width`` are the
-    canvas dimensions, not the tower's input size.
+    For a tower that takes patch rows (a ``PatchTransform``, or a
+    ``TowerTransform`` with a ``patch_layout``), ``pixels`` is ``[patches,
+    channels * patch * patch]`` with patches in raster order and each row
+    in the transform's ``patch_layout``, and ``grid_shape`` holds the
+    (rows, columns) patch grid. For another ``TowerTransform`` tower,
+    ``pixels`` is ``[channels, height, width]`` and ``grid_shape`` is None.
+    The pixels are in the processor's output dtype. ``height`` and
+    ``width`` are the canvas dimensions, not the tower's input size.
 
     A host-prepared image keeps its pixels in page-locked memory when it is
     prepared for a CUDA device, so the consumer's copy to the device is
@@ -126,24 +127,42 @@ def _image_plan(
     return transform, canvas, _stride_image_shape(*canvas, transform.resize)
 
 
+def _patches(
+    transform: PatchTransform | TowerTransform,
+) -> tuple[int, str] | None:
+    """The patch side and row layout of a tower that takes patch rows.
+
+    A ``PatchTransform`` cuts ``patch_size`` squares; a ``TowerTransform``
+    with a ``patch_layout`` cuts squares of its resize stride. None for a
+    tower that takes ``[C, H, W]`` pixels.
+    """
+    if isinstance(transform, PatchTransform):
+        return transform.patch_size, transform.patch_layout
+    if transform.patch_layout is not None:
+        return transform.resize.stride, transform.patch_layout
+    return None
+
+
 def _packed_pixels(
     transform: PatchTransform | TowerTransform, pixels: torch.Tensor
 ) -> tuple[torch.Tensor, tuple[int, int] | None]:
     """Pack a patch tower's [C, H, W] input into patch rows.
 
-    Returns the rows and the (rows, columns) patch grid for a
-    ``PatchTransform``, and the unchanged pixels with no grid otherwise.
-    The packing is a pure layout change on the pixels' own device.
+    Returns the rows and the (rows, columns) patch grid for a tower that
+    takes patch rows (:func:`_patches`), and the unchanged pixels with no
+    grid otherwise. The packing is a pure layout change on the pixels' own
+    device.
     """
-    if not isinstance(transform, PatchTransform):
+    packing = _patches(transform)
+    if packing is None:
         return pixels, None
 
     # [C, H, W] -> one flattened row per patch, in raster order over the
     # patch grid; the declared layout orders the values within a row.
-    patch = transform.patch_size
+    patch, layout = packing
     channels, height, width = pixels.shape
     grid_shape = (height // patch, width // patch)
-    if transform.patch_layout == "channels_last":
+    if layout == "channels_last":
         return patchify(pixels, patch_size=patch), grid_shape
 
     # [C, H, W] -> [gh, gw, C, patch, patch] -> rows.
@@ -320,8 +339,8 @@ def prepared_shape(
 ) -> tuple[tuple[int, int], tuple[int, int] | None, tuple[int, ...]]:
     """Return what preparing an image of ``height`` x ``width`` produces.
 
-    The canvas (height, width), the (rows, columns) patch grid of a
-    ``PatchTransform`` tower (None otherwise) and the shape of
+    The canvas (height, width), the (rows, columns) patch grid of a tower
+    that takes patch rows (None otherwise) and the shape of
     ``PreparedImage.pixels``, as :func:`prepare_host_image` (with
     ``input_images``) and :func:`prepare_tensor_image` (with None) prepare
     the image.
@@ -333,8 +352,9 @@ def prepared_shape(
     transform, canvas, size = _image_plan(
         processor, tower, height, width, input_images
     )
-    if isinstance(transform, PatchTransform):
-        patch = transform.patch_size
+    packing = _patches(transform)
+    if packing is not None:
+        patch = packing[0]
         grid = (size[0] // patch, size[1] // patch)
         return canvas, grid, (grid[0] * grid[1], 3 * patch * patch)
     return canvas, None, (3, *size)

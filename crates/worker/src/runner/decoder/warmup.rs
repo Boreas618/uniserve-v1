@@ -30,13 +30,17 @@ impl WarmupHooks for DecoderWarmup {
     }
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
+        let lanes = backend.job_queues().clone();
         if backend.serves_video() {
-            let lanes = backend.job_queues().clone();
             let parts = backend.media_parts()?;
             parts
                 .decoders
                 .capture_startup(&lanes)
                 .map_err(|error| WorkerError::classify(error, Some("capture")))?;
+        } else if let Some(image) = backend.parts().image {
+            image.decoders.capture_image(&lanes).map_err(|error| {
+                WorkerError::classify(error, Some("image decoder capture")).with_phase("warmup")
+            })?;
         }
         Ok(())
     }

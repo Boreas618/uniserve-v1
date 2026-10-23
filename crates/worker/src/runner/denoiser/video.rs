@@ -24,7 +24,7 @@ use crate::lane::{Capture, Completion, Job};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::{LatentPlan, RequestSlots, TrajectoryVersion};
 use crate::parallel::joins::GraphFunctions;
-use crate::request::video::{VideoLayout, VideoSize};
+use crate::request::video::{ConditionShape, VideoLayout, VideoSize};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::stream::{Fill, Issue};
 use crate::{Error, LatentPool, LatentStorage, LatentUpdate, Result};
@@ -59,6 +59,29 @@ impl Conditioner {
             Argument::Tensor(self.output.prefix(i64::from(capacity))?),
         ])
     }
+}
+
+/// A captured condition encoding: a request of these conditions written
+/// into the conditioning of layout `layout`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConditionKey {
+    pub(crate) layout: usize,
+    pub(crate) conditions: Arc<[ConditionShape]>,
+}
+
+/// The condition encodings startup captured under CUDA graphs, and the
+/// buffers they read and write: a request's condition latents are copied
+/// into `latents` back to back and its draws into `noise`, the graph of its
+/// layout and conditions replays into `out`, and its condition rows are
+/// copied into its slot's conditioning.
+struct ConditionGraphs {
+    graphs: GraphTable<ConditionKey>,
+    /// `[rows, width]` condition latent rows.
+    latents: StorageView,
+    /// Flat FP32 condition draws.
+    noise: StorageView,
+    /// A flat retained conditioning of the largest layout.
+    out: StorageView,
 }
 
 /// How a prepared layout serves steps.
@@ -123,6 +146,9 @@ pub(crate) struct VideoDenoiser {
     pub(super) graphs: GraphTable<usize>,
     /// The graph pool captures allocate in; `None` serves steps eagerly.
     pool_handle: Option<Arc<GraphPool>>,
+    /// Under CUDA graphs, the captured condition encodings, which alone
+    /// encode requests' conditions.
+    conditions: Option<ConditionGraphs>,
 }
 
 /// The text conditioner a denoising rank holds.
@@ -304,12 +330,161 @@ impl DenoiserRunner {
                 transient_capacity: setup.transient_layouts.max(1),
                 graphs,
                 pool_handle: setup.graph_pool,
+                conditions: None,
             })),
         })
     }
 }
 
+impl VideoDenoiser {
+    /// Refuse further condition captures.
+    pub(super) fn seal_conditions(&mut self) {
+        if let Some(conditions) = &mut self.conditions {
+            conditions.graphs.seal();
+        }
+    }
+
+    /// Release the captured condition encodings.
+    pub(super) fn close_conditions(&mut self, aborted: bool) -> Result<()> {
+        self.conditions
+            .as_mut()
+            .map_or(Ok(()), |conditions| conditions.graphs.close(aborted))
+    }
+}
+
 impl DenoiserRunner {
+    /// Serve conditions under CUDA graphs, through the encodings startup
+    /// captures ([`Self::capture_conditions`]): allocate their buffers, for
+    /// `rows` condition latent rows of `width` values of `dtype`. A runner
+    /// without a graph pool encodes conditions eagerly.
+    pub(crate) fn serve_conditions(&mut self, rows: u32, width: i64, dtype: DType) -> Result<()> {
+        let (ordinal, _) = self.cuda()?;
+        let release = self.capture.release.clone();
+        let owner = format!("{}.conditions", self.owner);
+        let video = self.family.video_mut()?;
+        if video.pool_handle.is_none() {
+            return Ok(());
+        }
+        let field = |fields: &[crate::memory::SlotField], name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| (field.shape[0], field.dtype))
+                .ok_or_else(|| Error::Invariant(format!("the slot state has no {name}")))
+        };
+        let (draws, _) = field(&video.envelope.host, "condition_noise")?;
+        let (retained, retained_dtype) = field(&video.envelope.device, "text_condition")?;
+        let allocate = |dtype: DType, shape: &[i64]| -> Result<StorageView> {
+            let bytes = shape.iter().product::<i64>().max(1) as usize * dtype.bytes();
+            StorageView::contiguous(
+                Storage::device(ordinal, bytes)? as Arc<dyn Backing>,
+                0,
+                dtype,
+                shape,
+            )
+        };
+        video.conditions = Some(ConditionGraphs {
+            graphs: GraphTable::new(owner, release),
+            latents: allocate(dtype, &[i64::from(rows).max(1), width])?,
+            noise: allocate(DType::F32, &[draws])?,
+            out: allocate(retained_dtype, &[retained])?,
+        });
+        Ok(())
+    }
+
+    /// Record into `job` the capture of the encoding of `conditions` (each
+    /// a keyframe of the layout's canvas) into the conditioning of startup
+    /// layout `id`, behind its eager encoding, which warms it; the key whose
+    /// graph [`Self::complete_conditions`] stores from the job's
+    /// completion, or `None` for a runner that encodes eagerly or a key
+    /// captured already.
+    pub(crate) fn capture_conditions(
+        &mut self,
+        id: usize,
+        conditions: Arc<[ConditionShape]>,
+        job: &Job,
+    ) -> Result<Option<ConditionKey>> {
+        let (ordinal, stream) = self.cuda()?;
+        let issue = job.on(Some(&stream));
+        let video = self.family.video_mut()?;
+        let (Some(pool), Some(captured)) = (&video.pool_handle, &video.conditions) else {
+            return Ok(None);
+        };
+        let key = ConditionKey {
+            layout: id,
+            conditions: Arc::clone(&conditions),
+        };
+        if captured.graphs.contains(&key, None) {
+            return Ok(None);
+        }
+        let layout = video.layout(id)?;
+        // A keyframe's latent is one latent frame of the canvas.
+        let mut parts = Vec::with_capacity(conditions.len());
+        let mut row = 0;
+        for condition in conditions.iter() {
+            let Some((1, canvas)) = condition.pixels.filter(|_| condition.audio_samples == 0)
+            else {
+                return Err(Error::Unsupported(
+                    "only keyframe conditions are captured".into(),
+                ));
+            };
+            let rows = i64::from(models::video::plan::rows_per_frame(canvas));
+            parts.push(Argument::Tensor(captured.latents.narrow(0, row, rows)?));
+            row += rows;
+        }
+        // The capture encodes zero latents with zero draws.
+        for buffer in [&captured.latents, &captured.noise] {
+            // SAFETY: the encodings' own inputs, kept until the runner closes
+            // after its stream drained; only the captured encodings read
+            // them, recorded behind the fill on the same stream.
+            unsafe { buffer.zero(issue) }?;
+        }
+        let size = VideoSize {
+            frames: layout.key.frames,
+            canvas: layout.key.canvas,
+            tokens: 1,
+            conditions,
+            spans: Arc::from([]),
+        };
+        let mut arguments = vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Handle(layout.handle.clone()),
+        ];
+        arguments.extend(size_values(&size));
+        arguments.push(Argument::Tensor(captured.noise.clone()));
+        arguments.push(Argument::Tensor(captured.out.clone()));
+        arguments.push(Argument::Integers(vec![1; parts.len()]));
+        arguments.extend(parts);
+        job.call(MethodCall::new(
+            &self.methods.encode_conditions,
+            arguments.clone(),
+        ));
+        job.capture(Capture {
+            functions: self.capture.clone(),
+            pool: pool.value.clone(),
+            peers: Vec::new(),
+            stream: stream.raw(),
+            device: ordinal,
+            method: MethodCall::new(&self.methods.encode_conditions, arguments),
+            breaks: None,
+        });
+        Ok(Some(key))
+    }
+
+    /// Store the graph the job of [`Self::capture_conditions`] captured
+    /// for `key`.
+    pub(crate) fn complete_conditions(
+        &mut self,
+        key: ConditionKey,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        let video = self.family.video_mut()?;
+        let captured = video.conditions.as_mut().ok_or_else(|| {
+            Error::Invariant("a condition capture completed without its buffers".into())
+        })?;
+        captured.graphs.insert(key, None, completion.captured()?)
+    }
+
     /// Prepare startup layout `key` under a new id: read its fields and
     /// prepare its constants, on the calling thread. Startup layouts are
     /// never released.
@@ -647,6 +822,66 @@ impl DenoiserRunner {
     ) -> Result<()> {
         let video = self.family.video()?;
         let layout = video.layout(id)?;
+        if let Some(captured) = &video.conditions {
+            let key = ConditionKey {
+                layout: id,
+                conditions: Arc::clone(&size.conditions),
+            };
+            let graph = match captured.graphs.lookup(&key, None)? {
+                Lookup::Replay(graph) => graph,
+                Lookup::Capture => {
+                    return Err(Error::Invalid(format!(
+                        "{}: no captured graph encodes conditions {:?} in layout {:?}",
+                        self.owner, size.conditions, layout.key
+                    )));
+                }
+            };
+            let (_, stream) = self.cuda()?;
+            let issue = job.on(Some(&stream));
+            let mut input = CopyBatch::new(SourceOrder::Stream);
+            let mut offset = 0_u64;
+            for part in latents.iter().flatten() {
+                let bytes = bytes_of(part);
+                if offset + bytes > bytes_of(&captured.latents) {
+                    return Err(Error::Invalid(
+                        "condition latents exceed the captured encodings' rows".into(),
+                    ));
+                }
+                input.push(
+                    captured.latents.address() + offset,
+                    part.address(),
+                    bytes as usize,
+                );
+                offset += bytes;
+            }
+            let noise = video.host.slot("condition_noise", slot as u32)?;
+            let draws = layout.fields.condition_noise * 4;
+            input.push(captured.noise.address(), noise.address(), draws as usize);
+            // SAFETY: the latents lie in the products the batch read and the
+            // draws in the slot's pinned sources, both alive until the batch
+            // commits; the encodings' buffers hold them and only the
+            // captured encodings read those, in stream order.
+            unsafe { issue.copy(&input) }?;
+            issue.launch(graph)?;
+            // The conditions' rows follow the prompt's in the retained
+            // conditioning; only they are copied, so the prompt's rows the
+            // conditioner wrote stay.
+            let target = video.banks.slot("text_condition", slot as u32)?;
+            let row = layout.fields.text_condition.1 * target.dtype().bytes() as u64;
+            let first = u64::from(layout.key.text_rows) * row;
+            let bytes = u64::from(layout.key.condition_rows) * row;
+            let mut output = CopyBatch::new(SourceOrder::Stream);
+            output.push(
+                target.address() + first,
+                captured.out.address() + first,
+                bytes as usize,
+            );
+            // SAFETY: both ranges lie in the layout's retained conditioning,
+            // the graph wrote the source before this copy on the same stream,
+            // and the slot's rows belong to the request.
+            unsafe { issue.copy(&output) }?;
+            return Ok(());
+        }
         let mut arguments = vec![
             Argument::Handle(self.methods.runner.clone()),
             Argument::Handle(layout.handle.clone()),
@@ -1224,7 +1459,9 @@ impl VideoDenoiser {
     /// (startup's capture: the capture functions and the CUDA ordinal), a
     /// layout not captured yet is captured into the graph pool instead of
     /// called; the job's completion carries the graph. A capture is
-    /// counted when its graph is stored.
+    /// counted when its graph is stored. Under graphs a layout runs eagerly
+    /// only in startup's warmup before its capture; once the graphs are
+    /// sealed, a layout without one is refused.
     fn run_step(
         &mut self,
         methods: &Methods,
@@ -1250,7 +1487,9 @@ impl VideoDenoiser {
                 });
                 GraphMode::Capture
             }
-            // Transient layouts and uncaptured startup layouts run eagerly.
+            (Err(error), _, Some(_)) => return Err(error),
+            // Without graphs every step runs eagerly; under them, only a
+            // layout's warmup before startup captures it.
             _ => {
                 job.call(MethodCall::new(
                     &methods.denoise,

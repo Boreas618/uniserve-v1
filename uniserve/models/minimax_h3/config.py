@@ -377,13 +377,17 @@ class Config:
 
     ``denoisers`` maps each DiT partition the checkpoint holds
     (``transformer`` or ``transformer_ref``) to its configuration; a
-    deployment places one.
+    deployment places one. ``vision_processor`` holds the JSON texts of the
+    checkpoint's image and video processor configs, by which the server
+    plans the vision blocks of condition media; None when they were not
+    read.
     """
 
     text_encoder: TextEncoderConfig
     denoisers: Mapping[str, DenoiserConfig]
     video_vae: video_vae.Config
     audio_vae: audio_vae.Config
+    vision_processor: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.denoisers, Mapping) or not self.denoisers:
@@ -706,7 +710,9 @@ def normalize(
     ``metadata`` holds the parsed JSON of ``text_encoder``, ``processor``
     (the image processor's ``preprocessor_config.json``), ``video_vae``,
     ``audio_vae``, ``scheduler``, ``audio_scheduler`` and one entry per DiT
-    partition the layout holds (its ``config.json``).
+    partition the layout holds (its ``config.json``), and optionally
+    ``video_processor`` (the video processor's
+    ``video_preprocessor_config.json``).
     """
     for name in (
         "text_encoder",
@@ -758,6 +764,7 @@ def normalize(
             tasks=tasks,
             canvases=DMD_CANVASES if isinstance(schedule, DmdLadder) else None,
         )
+    video_processor = metadata.get("video_processor")
     return Config(
         text_encoder=_text_encoder(
             metadata["text_encoder"], metadata["processor"]
@@ -765,6 +772,12 @@ def normalize(
         denoisers=denoisers,
         video_vae=_video_vae(metadata["video_vae"]),
         audio_vae=_audio_vae(metadata["audio_vae"]),
+        vision_processor=None
+        if video_processor is None
+        else (
+            json.dumps(metadata["processor"]),
+            json.dumps(video_processor),
+        ),
     )
 
 
@@ -772,6 +785,7 @@ def normalize(
 _SIDECARS = {
     "text_encoder": "text_encoder/config.json",
     "processor": "processor/preprocessor_config.json",
+    "video_processor": "processor/video_preprocessor_config.json",
     "video_vae": "vae/config.json",
     "audio_vae": "audio_vae/config.json",
     "scheduler": "scheduler/scheduler_config.json",

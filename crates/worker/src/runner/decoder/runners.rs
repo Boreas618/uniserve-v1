@@ -60,6 +60,9 @@ pub(crate) struct DecoderRunners {
     track_units: Vec<(TrackUnits, u64)>,
     /// An image model's decoder, with its component.
     pub(crate) image: Option<(String, DecoderRunner)>,
+    /// The image sizes the image decoder captures under graphs, each with
+    /// its latent rows: `(units, height, width)`.
+    image_sizes: Vec<(u32, u32, u32)>,
     /// Output words of an image decoding batch's pixels at most.
     pub(crate) max_pixel_words: usize,
 }
@@ -67,12 +70,49 @@ pub(crate) struct DecoderRunners {
 impl DecoderRunners {
     /// The decoder of an image model and the most output words a decoding
     /// batch's pixels take.
-    pub(crate) fn image(decoder: Option<(String, DecoderRunner)>, max_pixel_words: usize) -> Self {
+    /// Under graphs the decoder decodes the images of `sizes` alone,
+    /// `(units, height, width)` each.
+    pub(crate) fn image(
+        decoder: Option<(String, DecoderRunner)>,
+        sizes: Vec<(u32, u32, u32)>,
+        max_pixel_words: usize,
+    ) -> Self {
         Self {
             image: decoder,
+            image_sizes: sizes,
             max_pixel_words,
             ..Self::default()
         }
+    }
+
+    /// Capture the image decoder's decode and quantization at every size
+    /// it serves, each warmed first, as jobs of the lane serving image
+    /// decoding on `lanes`; then seal it. Without graphs it captures
+    /// nothing.
+    pub(crate) fn capture_image(&mut self, lanes: &JobQueues) -> Result<()> {
+        let Some((_, decoder)) = &mut self.image else {
+            return Ok(());
+        };
+        if !decoder.image_graphs()? {
+            return Ok(());
+        }
+        for &(units, height, width) in &self.image_sizes {
+            let job = Job::new();
+            let mut returns = Vec::new();
+            let keys = decoder.capture_image(units, height, width, &job, &mut returns)?;
+            job.on(decoder.stream()).synchronize()?;
+            let mut completion = perform(lanes, IMAGE, job)?;
+            decoder.check_staged(returns, &mut completion)?;
+            for key in keys {
+                decoder.complete_image(key, &mut completion)?;
+            }
+        }
+        decoder.seal();
+        tracing::info!(
+            sizes = self.image_sizes.len(),
+            "captured the image decoder's decode and quantization"
+        );
+        Ok(())
     }
 
     /// Warm the image decoder on one black `side` x `side` image whose
@@ -91,6 +131,10 @@ impl DecoderRunners {
         else {
             return Ok(());
         };
+        // Under graphs every capture warms its size first.
+        if decoder.image_graphs()? {
+            return Ok(());
+        }
         let units = layout.latent_rows(side, side)?;
         let workspace = latents.workspace()?;
         let job = Job::new();

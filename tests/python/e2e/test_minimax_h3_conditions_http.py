@@ -9,8 +9,10 @@ and official video-plus-audio (W5) reference requests on the
 with a FastH3 OmniRef export.
 An OmniRef deployment that states a smaller condition capacity than the
 image-plus-audio request takes refuses it, naming its rows, and then serves
-the image-only request that fits. Condition media are read from ``file://``
-URIs under ``--media-directory``. Every served response is a complete MP4 at
+the image-only request that fits. Reference deployments serve without CUDA
+graphs, since references bring media of any size; keyframe deployments
+serve under graphs. Condition media are read from ``file://`` URIs under
+``--media-directory``. Every served response is a complete MP4 at
 the canvas and frame count the request resolves to.
 """
 
@@ -220,6 +222,10 @@ def _reference_requests(command, base, tmp_path, *, inputs):
 # The official video-plus-audio presentation holds 6913 text rows and its
 # references about 38k condition rows.
 REFERENCE_OPTIONS = [
+    # References bring media of any size, which no captured CUDA graph
+    # holds, so a reference deployment serves eagerly.
+    "--set",
+    "cuda_graph_config.policy=off",
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -250,6 +256,10 @@ def test_base_reference_requests(tmp_path: Path) -> None:
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
 OMNIREF_OPTIONS = [
+    # References bring media of any size, which no captured CUDA graph
+    # holds, so a reference deployment serves eagerly.
+    "--set",
+    "cuda_graph_config.policy=off",
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -301,6 +311,10 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
 # states a 7,680-row condition capacity: each of W4's condition products fits
 # it and their packed rows do not. W4's image without its voice fits.
 SMALL_CAPACITY_OPTIONS = [
+    # References bring media of any size, which no captured CUDA graph
+    # holds, so a reference deployment serves eagerly.
+    "--set",
+    "cuda_graph_config.policy=off",
     "--set",
     "mm_processor_kwargs.enlarge_references=true",
     "--set",

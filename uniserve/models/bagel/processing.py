@@ -31,6 +31,8 @@ def image_processor(config: Config) -> ImageProcessor:
     start/end-of-image tokens and take temporal positions only.
     """
     return ImageProcessor(
+        # The ViT tower takes SigLIP's patch rows, which pack into fixed
+        # slots (``Model.vision_encoder``).
         vit=TowerTransform(
             resize=StrideResize(
                 max_size=int(config.vision.image_size),
@@ -38,6 +40,7 @@ def image_processor(config: Config) -> ImageProcessor:
                 stride=int(config.vision.patch_size),
                 max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
             ),
+            patch_layout="channels_last",
         ),
         vae=TowerTransform(
             resize=StrideResize(

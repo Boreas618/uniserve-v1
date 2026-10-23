@@ -405,6 +405,16 @@ class EncoderRunner:
             encoder.draw_noise(size, noise.view(shape))
 
     @staticmethod
+    def vision_processor(loaded) -> list[str]:
+        """The JSON texts of the image and video processor configs by which
+        the server plans condition media's vision blocks; empty for a model
+        that keeps none.
+        """  # noqa: D205
+        config = getattr(loaded.root, "config", None)
+        texts = getattr(config, "vision_processor", None)
+        return [] if texts is None else [str(text) for text in texts]
+
+    @staticmethod
     def sample_rate(loaded) -> int:
         """The sample rate condition audio is resampled to for the encoder."""
         encoder = capability(loaded.module, AudioEncoder)
@@ -488,12 +498,15 @@ class EncoderRunner:
         (:meth:`position_ids`) and ``visual`` the vision rows spliced in at
         its placeholders.
 
-        A patch encoder takes ``(rows, out, grids)``: ``rows`` holds every
-        vision block's packed patch rows back to back, ``grids`` each
-        block's ``[time, height, width]`` patch grid, flattened; the
+        A patch encoder takes ``(rows, out, grids, *device_grids)``:
+        ``rows`` holds every vision block's packed patch rows back to back,
+        ``grids`` each block's ``[time, height, width]`` patch grid,
+        flattened, and ``device_grids``, when given, each block's grid as
+        the ``[1, 3]`` int64 device tensor the caller wrote it into; the
         blocks' features fill ``out``'s rows in block order. Each block is
         one sample of the call, so its features do not depend on the other
-        blocks.
+        blocks, and one block's encode at one grid is captured into one CUDA
+        graph.
 
         A text conditioner takes ``(features, lengths, out)``: the
         ``[capacity, width]`` prompt features, zero past the prompt, the
@@ -559,16 +572,25 @@ class EncoderRunner:
             out.copy_(values[0])
 
     def _encode_patches(
-        self, rows: torch.Tensor, out: torch.Tensor, grids: Sequence[int]
+        self,
+        rows: torch.Tensor,
+        out: torch.Tensor,
+        grids: Sequence[int],
+        *device_grids: torch.Tensor,
     ) -> None:
         shapes = _chunks(grids, 3)
         # Each block is one packed sample: its patch rows and its grid,
-        # which the encoder also takes as a [1, 3] device tensor.
+        # which the encoder also takes as a [1, 3] device tensor: the
+        # caller's, written before the call (a captured block encode reads
+        # the same tensor on every replay), or a copy made here.
+        if device_grids and len(device_grids) != len(shapes):
+            raise ValueError("device grids must align with the blocks")
         samples = rows.split([prod(shape) for shape in shapes])
         features = self._module.encode(
             VisionInput(
                 tuple(samples),
-                tuple(_device_grid(shape, self._device) for shape in shapes),
+                device_grids
+                or tuple(_device_grid(shape, self._device) for shape in shapes),
                 tuple(shapes),
             )
         )
@@ -778,7 +800,11 @@ class EncoderRunner:
     @staticmethod
     def packs_patches(loaded) -> bool:
         """Whether the understanding transform packs patch rows."""
-        return isinstance(loaded.image_processor.vit, PatchTransform)
+        transform = loaded.image_processor.vit
+        return isinstance(transform, PatchTransform) or (
+            isinstance(transform, TowerTransform)
+            and transform.patch_layout is not None
+        )
 
     @staticmethod
     def feature_injection(loaded) -> list[str]:

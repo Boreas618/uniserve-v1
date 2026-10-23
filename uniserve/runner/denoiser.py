@@ -54,7 +54,10 @@ row ``i`` reads ``timesteps[i]``. Rows cross flattened.
   :meth:`DenoiserRunner.plan_denoise` builds the plans of attention
   operators that plan a launch on the host.
 - ``encode_conditions`` writes the keys and values of latent images
-  inserted as conditioning.
+  inserted as conditioning. Under CUDA graphs it writes one image at a
+  time, captured into one graph per image size;
+  :meth:`DenoiserRunner.plan_conditions` builds its attention plans as
+  ``plan_denoise`` does a step's.
 - :meth:`DenoiserRunner.step` combines each image's branch predictions
   with its trajectory's guidance and advances its samples by one solver
   step. A trajectory's schedules and guidance are made from the image's
@@ -1599,6 +1602,37 @@ class DenoiserRunner:
         gathered metadata and its host mirrors here; the graph then reads
         the plans. The arguments are those of :meth:`denoise`.
         """
+        self._plan(rows, row_columns, queries, prefixes, starts, widths, False)
+
+    def plan_conditions(
+        self,
+        row_columns: torch.Tensor,
+        positions: torch.Tensor,
+        timesteps: torch.Tensor,
+        rows: Sequence[int],
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        starts: Sequence[int],
+        widths: Sequence[int],
+        *features: torch.Tensor,
+    ) -> None:
+        """Plan the attention launches of the next captured image
+        :meth:`encode_conditions`, whose rows write their keys and values;
+        the arguments are its own.
+        """  # noqa: D205
+        self._plan(rows, row_columns, queries, prefixes, starts, widths, True)
+
+    def _plan(
+        self,
+        rows: Sequence[int],
+        row_columns: torch.Tensor,
+        queries: Sequence[int],
+        prefixes: Sequence[int],
+        starts: Sequence[int],
+        widths: Sequence[int],
+        writes: bool,
+    ) -> None:
+        """Bind the attention plans of rows that read, or write, the cache."""
         described = _image_rows(rows)
         tokens = sum(row[5] for row in described)
         with torch.inference_mode(), self._context.activate():
@@ -1610,7 +1644,7 @@ class DenoiserRunner:
                 prefixes,
                 starts,
                 widths,
-                False,
+                writes,
             )
             self._context.bind_attention(attention)
 
@@ -1669,7 +1703,8 @@ class DenoiserRunner:
                 widths,
                 True,
             )
-            self._context.bind_attention(attention)
+            if not capturing(self._device):
+                self._context.bind_attention(attention)
             # Conditioning runs at timestep zero.
             timesteps[: len(described)].zero_()
             self._evaluate(described, positions, timesteps, attention, features)

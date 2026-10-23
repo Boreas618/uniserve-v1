@@ -344,6 +344,10 @@ message ImageEncoderInput {
   ImageEncoder encoder = 1;
   optional uint32 num_cache_tokens = 2;
   optional uint32 max_cache_tokens = 3;
+  // The pixels the encoder's transform resizes the image to, when known
+  // before execution: a latent encoder encodes the image at that size.
+  optional uint32 height = 4;
+  optional uint32 width = 5;
 }
 
 message SamplingParams {

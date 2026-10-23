@@ -151,6 +151,46 @@ def test_prepared_shapes_describe_the_prepared_pixels(patches, size):
         )
 
 
+@pytest.mark.parametrize("layout", ("channels_first", "channels_last"))
+def test_a_tower_transform_with_a_patch_layout_prepares_patch_rows(layout):
+    # The rows hold the pixels the transform prepares without the layout,
+    # one row per stride square in raster order, for a request input image
+    # and for a generated one alike.
+    raw = (np.arange(40 * 56 * 3).reshape(40, 56, 3) % 251).astype(np.uint8)
+    resize = StrideResize(64, 32, 8, 4096)
+    pixels = ImageProcessor(vit=TowerTransform(resize))
+    rows = ImageProcessor(vit=TowerTransform(resize, patch_layout=layout))
+    payload = _png(Image.fromarray(raw))
+    generated = torch.from_numpy(raw).permute(2, 0, 1).float() / 255
+
+    for prepare in (
+        lambda processor: _prepare(processor, "vit", payload),
+        lambda processor: prepare_tensor_image(
+            processor,
+            "vit",
+            generated,
+            device=torch.device("cpu"),
+            signed_unit=False,
+        ),
+    ):
+        image, packed = prepare(pixels), prepare(rows)
+        channels, height, width = image.pixels.shape
+        grid = (height // 8, width // 8)
+        squares = image.pixels.reshape(channels, grid[0], 8, grid[1], 8)
+        expected = (
+            squares.permute(1, 3, 2, 4, 0)
+            if layout == "channels_last"
+            else squares.permute(1, 3, 0, 2, 4)
+        ).reshape(grid[0] * grid[1], channels * 64)
+        assert packed.grid_shape == grid
+        assert (packed.height, packed.width) == (image.height, image.width)
+        torch.testing.assert_close(packed.pixels, expected, rtol=0, atol=0)
+        assert prepared_shape(rows, "vit", 40, 56, 1)[1:] == (
+            grid,
+            (grid[0] * grid[1], channels * 64),
+        )
+
+
 @pytest.mark.parametrize("tower", ("vae", "vit"))
 def test_image_sources_preserve_the_same_model_canvas(tower):
     raw = np.full((16, 16, 3), 128, dtype=np.uint8)
@@ -213,18 +253,23 @@ def test_bagel_resize_matches_the_shared_fixture(case):
     payload = base64.b64encode(encoded.getvalue()).decode()
     processor = _bagel_processor()
 
-    # Both encoders stage the VAE canvas; the ViT tower resizes it again.
+    # Both encoders stage the VAE canvas; the ViT tower resizes it again
+    # and takes SigLIP's 14-pixel patch rows.
     for tower in ("vae", "vit"):
         result = _prepare(processor, tower, payload)
         assert (result.height, result.width) == (
             case["vae_height"],
             case["vae_width"],
         )
-        assert tuple(result.pixels.shape) == (
-            3,
-            case[f"{tower}_height"],
-            case[f"{tower}_width"],
-        )
+        height, width = case[f"{tower}_height"], case[f"{tower}_width"]
+        if tower == "vae":
+            assert tuple(result.pixels.shape) == (3, height, width)
+        else:
+            assert result.grid_shape == (height // 14, width // 14)
+            assert tuple(result.pixels.shape) == (
+                height // 14 * (width // 14),
+                3 * 14 * 14,
+            )
 
 
 def _sensenova_processor() -> ImageProcessor:

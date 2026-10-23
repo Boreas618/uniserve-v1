@@ -141,6 +141,8 @@ fn policy(feedback: bool) -> ImageGenerationConfig {
                 encoder: engine::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             }]
         } else {
             Vec::new()
@@ -334,6 +336,8 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
                     encoder: engine::ImageEncoder::Vision,
                     num_cache_tokens: Some(4),
                     max_cache_tokens: None,
+                    height: None,
+                    width: None,
                 }],
             }],
         };

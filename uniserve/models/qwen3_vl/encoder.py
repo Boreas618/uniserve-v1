@@ -212,34 +212,39 @@ class TextEncoder(BaseTextEncoder):
                 text coordinates ``0..length-1``.
             visual: Per prompt, the ``vision.encode`` rows of its vision
                 blocks concatenated in the order of its placeholder tokens,
-                ``[placeholders, vision.feature_size]``, or None for a prompt
-                without placeholders.
+                ``[rows, vision.feature_size]`` with at least one row per
+                placeholder (rows past the placeholders' are not read), or
+                None for a prompt without placeholders.
 
         Returns:
             Per prompt ``[length, hidden]`` features on the final pipeline
             stage; None on earlier stages.
 
         Raises:
-            ValueError: A prompt's vision rows do not match its placeholder
-                count, or the inputs do not align with the prompts.
+            ValueError: A prompt has fewer vision rows than placeholders,
+                or the inputs do not align with the prompts.
         """
         if visual is None:
             return super().encode(tokens, positions=positions)
         if len(visual) != len(tokens):
             raise ValueError("vision rows must align with the prompts")
 
-        # [length] placeholder masks; one host read checks every prompt's
-        # placeholder count against its vision rows.
+        # [length] placeholder masks. One host read checks every prompt's
+        # placeholder count against its vision rows, except while a CUDA
+        # graph captures the encode: its caller pads the rows past the
+        # placeholders and has counted them.
         masks = tuple(
             (value == self.image_token_id) | (value == self.video_token_id)
             for value in tokens
         )
+        capturing = torch.cuda.is_current_stream_capturing()
         counts = (
             torch.stack(tuple(mask.sum() for mask in masks)).tolist()
-            if masks
-            else []
+            if masks and not capturing
+            else [None] * len(masks)
         )
         hidden = self.network.hidden_size
+        width = (1 + self.deepstack_layers) * hidden
         embeddings: list[EmbeddingReplacement | None] = []
         deepstack: list[tuple[torch.Tensor, ...] | None] = []
         for mask, count, rows in zip(masks, counts, visual, strict=True):
@@ -251,19 +256,31 @@ class TextEncoder(BaseTextEncoder):
                 embeddings.append(None)
                 deepstack.append(None)
                 continue
-            if rows.shape != (count, (1 + self.deepstack_layers) * hidden):
+            if (
+                rows.ndim != 2
+                or rows.shape[1] != width
+                or (count is not None and rows.shape[0] < count)
+            ):
                 raise ValueError(
                     "vision rows must cover the prompt's placeholders"
                 )
 
-            # [placeholders, 1 + deepstack, hidden]: the embedding, then one
-            # feature per DeepStack layer. Each is scattered onto the
-            # prompt's rows; rows without a placeholder hold zeros.
-            features = rows.unflatten(-1, (1 + self.deepstack_layers, hidden))
-            dense = rows.new_zeros(
-                (1 + self.deepstack_layers, mask.numel(), hidden)
-            )
-            dense[:, mask] = features.transpose(0, 1)
+            # The k-th placeholder takes row k: each position gathers the
+            # row of its placeholder ordinal, and positions without one hold
+            # zeros. [1 + deepstack, length, hidden]: the embedding, then one
+            # feature per DeepStack layer.
+            if rows.shape[0]:
+                ordinal = (mask.cumsum(0) - 1).clamp(min=0)
+                features = (
+                    rows[ordinal]
+                    .unflatten(-1, (1 + self.deepstack_layers, hidden))
+                    .transpose(0, 1)
+                )
+                dense = torch.where(mask[None, :, None], features, 0)
+            else:
+                dense = rows.new_zeros(
+                    (1 + self.deepstack_layers, mask.numel(), hidden)
+                )
             embeddings.append(EmbeddingReplacement(dense[0], mask))
             deepstack.append(tuple(dense[1:]))
         return super().encode(

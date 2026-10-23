@@ -52,6 +52,8 @@ fn main() -> anyhow::Result<()> {
                 encoder: engine::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             }],
             sample_feedback_continuation: true,
         };

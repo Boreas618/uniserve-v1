@@ -29,7 +29,7 @@ use crate::runner::denoiser::image::{DiffusionCapacity, DiffusionStorage};
 use crate::runner::denoiser::image_model::{ImageDenoiserLayout, ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
 use crate::runner::encoder::runners::EncoderRunners;
-use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner};
+use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner, Tower, VisionEncoder};
 use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
 use crate::stream::Streams;
@@ -441,6 +441,8 @@ impl ImageOwners {
         let mut encoder_routes = HashMap::new();
         let mut diffusion = None;
         let mut decoder = None;
+        // The image sizes the decoder captures under graphs.
+        let mut decoder_sizes = Vec::new();
         let mut units = None;
         // Every runner's Python half constructs its execution context over
         // the shared work areas of its stream, in this order.
@@ -461,7 +463,41 @@ impl ImageOwners {
             match target.kind {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
                     let info = EncoderInfo::describe(loaded, &target.path, dtype)?;
-                    let runner = EncoderRunner::image(&setup, info, &encoder_config)?;
+                    // Under graphs every encode replays a captured graph: a
+                    // vision encoder packs its images into fixed slots, and a
+                    // latent encoder encodes images of the configured sizes
+                    // alone.
+                    let graphs = config.graph_policy != "off" && target.device.is_cuda();
+                    if graphs
+                        && let EncoderInfo::Vision(VisionEncoder {
+                            max_patches: None, ..
+                        }) = info
+                    {
+                        return Err(Error::Unsupported(format!(
+                            "{}: under CUDA graphs a vision encoder packs its images into fixed \
+                             slots (PatchEncoder max_patches), which this one does not; serve \
+                             it with cuda_graph_config.policy = \"off\"",
+                            setup.owner()
+                        )));
+                    }
+                    let mut runner = EncoderRunner::image(&setup, info, &encoder_config)?;
+                    if graphs && let EncoderInfo::Latent(_) = info {
+                        let mut sizes = Vec::new();
+                        for &(height, width) in &config.flow_graph_shapes {
+                            let facts = policy.preparation().generated_facts(
+                                Tower::Vae,
+                                height as u32,
+                                width as u32,
+                            )?;
+                            let [_, height, width] = facts.shape[..] else {
+                                return Err(Error::Invariant(
+                                    "latent pixels are [channels, height, width]".into(),
+                                ));
+                            };
+                            sizes.push([height as u32, width as u32]);
+                        }
+                        runner.capture_latents(sizes)?;
+                    }
                     order.push((ImageRunner::Encoder(encoders.len()), setup.owner()));
                     encoder_routes.insert((target.component.clone(), target.kind), encoders.len());
                     encoders.push(runner);
@@ -529,7 +565,50 @@ impl ImageOwners {
                         Error::Unsupported("image decoding requires an image denoiser".into())
                     })?;
                     let staging = max_image_pixels(layout.as_ref()) * 3 * max_calls;
-                    let runner = DecoderRunner::image(&setup, range, latents, staging)?;
+                    // Under graphs the decoder decodes one image at a time at
+                    // every configured image size, which it captures.
+                    if config.graph_policy != "off"
+                        && target.device.is_cuda()
+                        && let Some(layout) = layout.as_ref()
+                    {
+                        for &(height, width) in &config.flow_graph_shapes {
+                            let (height, width) = (height as u32, width as u32);
+                            let units = layout.latent_rows(height, width)?;
+                            decoder_sizes.push((units, height, width));
+                        }
+                        decoder_sizes.sort_unstable();
+                        decoder_sizes.dedup();
+                    }
+                    let input_units = decoder_sizes
+                        .iter()
+                        .map(|&(units, ..)| units)
+                        .max()
+                        .unwrap_or(0);
+                    let values = decoder_sizes
+                        .iter()
+                        .map(|&(_, height, width)| 3 * height as usize * width as usize)
+                        .max()
+                        .unwrap_or(0);
+                    let mut runner =
+                        DecoderRunner::image(&setup, range, latents, staging, input_units, values)?;
+                    if let (false, Some(ordinal)) = (decoder_sizes.is_empty(), target.device.cuda())
+                    {
+                        let mut devices = vec![ordinal];
+                        devices.extend(
+                            config
+                                .devices()
+                                .filter_map(Device::cuda)
+                                .filter(|&device| device != ordinal),
+                        );
+                        let pools = reserve_pools(
+                            startup.graphs,
+                            &Interpreter::import("uniserve.cuda_graph.pool")?,
+                            runner.image_graph_key()?,
+                            &devices,
+                            None,
+                        )?;
+                        runner.serve_image_graphs(pools)?;
+                    }
                     order.push((ImageRunner::Decoder, setup.owner()));
                     decoder = Some((target.component.clone(), runner));
                 }
@@ -577,7 +656,16 @@ impl ImageOwners {
             }
         }
 
-        // Packed vision encoders capture their slot counts at warmup.
+        // The denoiser writes the latents of the images the latent encoder
+        // captured as conditioning, which it captures beside its steps.
+        let conditions = encoders
+            .iter()
+            .find_map(|runner| runner.latent_sizes().map(<[_]>::to_vec))
+            .filter(|_| graphs)
+            .unwrap_or_default();
+
+        // Packed vision encoders capture their slot counts at warmup, and
+        // latent encoders their image sizes.
         let mut pools = HashMap::new();
         if config.graph_policy != "off" {
             let create_pool = Interpreter::import("uniserve.cuda_graph.pool")?;
@@ -613,8 +701,10 @@ impl ImageOwners {
             model: facts,
             policy,
             encoders: EncoderRunners::image(encoders, encoder_routes, pools),
-            denoisers: DenoiserRunners::image(diffusion, flow, flow_pools, graphs, units),
-            decoders: DecoderRunners::image(decoder, max_pixel_words),
+            denoisers: DenoiserRunners::image(
+                diffusion, flow, flow_pools, conditions, graphs, units,
+            ),
+            decoders: DecoderRunners::image(decoder, decoder_sizes, max_pixel_words),
             latents,
             order,
             outputs,

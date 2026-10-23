@@ -612,7 +612,7 @@ pub(super) fn condition_latents(
         .as_mut()
         .ok_or_else(|| Error::Unsupported("text calls require a prefix cache".into()))?;
     runtime.order().wait(job.on(denoiser_stream.as_ref()))?;
-    denoiser.condition_latents(rows, prefix_cache, job)?;
+    denoiser.condition_latents(rows, prefix_cache, None, job)?;
     runtime
         .order_mut()
         .record(job.on(denoiser_stream.as_ref()))?;

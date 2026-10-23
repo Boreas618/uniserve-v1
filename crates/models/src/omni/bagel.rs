@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
     GenerationControls, ImageGenerationDefaults, OmniProfile, OutputFilterPolicy, encode,
-    model_dtype_bytes, required_token, required_token_id, stride_resize_tokens,
+    model_dtype_bytes, required_token, required_token_id, stride_resize_tokens, stride_resized,
 };
 use crate::{FactsError, Vocabulary, VocabularyError};
 
@@ -135,11 +135,15 @@ impl BagelProfile {
                 encoder: proto::request::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             },
             ImageEncoderInput {
                 encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             },
         ];
         let image_num_positions = 1;
@@ -157,6 +161,8 @@ impl BagelProfile {
                 encoder: proto::request::ImageEncoder::Latent,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             }],
             sample_feedback_continuation: false,
         };
@@ -281,9 +287,10 @@ impl OmniProfile for BagelProfile {
         self.wrap_context_text(vocabulary, prompt)
     }
 
-    /// The VAE grid comes from the VAE resize; the ViT grid comes from the
-    /// ViT resize applied to that VAE canvas. Each adds two marker tokens.
-    /// The image count does not affect the result.
+    /// The VAE grid comes from the VAE resize, whose size the latent block
+    /// carries; the ViT grid comes from the ViT resize applied to that VAE
+    /// canvas. Each adds two marker tokens. The image count does not affect
+    /// the result.
     fn image_encoders_for_dimensions(
         &self,
         width: u32,
@@ -297,6 +304,7 @@ impl OmniProfile for BagelProfile {
             Self::VAE_RESIZE.2,
             Self::MARKER_TOKENS,
         )?;
+        let (vae_width, vae_height) = stride_resized(width, height, &[Self::VAE_RESIZE])?;
         let vit_tokens = stride_resize_tokens(
             width,
             height,
@@ -309,11 +317,15 @@ impl OmniProfile for BagelProfile {
                 encoder: proto::request::ImageEncoder::Latent,
                 num_cache_tokens: Some(vae_tokens),
                 max_cache_tokens: None,
+                height: Some(vae_height),
+                width: Some(vae_width),
             },
             ImageEncoderInput {
                 encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: Some(vit_tokens),
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             },
         ])
     }

@@ -239,6 +239,7 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         transfer_tickets: 1,
         image_warmups: Vec::new(),
         captured_images: None,
+        captured_latents: None,
         diffusion_lm_step_rows: 0,
         image_unconditional_token_ids: None,
     })

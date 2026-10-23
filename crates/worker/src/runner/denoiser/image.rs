@@ -27,17 +27,20 @@
 //! Graphs: each captured `denoise` evaluates a fixed set of rows of one
 //! image size at the configured attention widths ([`DiffusionShape`]): the
 //! rows' sample offsets fix where it reads latents, and rows pack their
-//! tokens and predictions in order. Startup captures the configured shapes
-//! largest first; serving launches an exact shape natively (after
-//! `plan_denoise` when an attention operator plans its launch on the host)
-//! and runs any other on the builder thread. Solver updates run on the
-//! builder thread.
+//! tokens and predictions in order. Each captured `encode_conditions`
+//! writes one latent image of one size ([`ConditionShape`]) from the
+//! denoiser's conditioning rows. Startup captures the configured shapes
+//! largest first; serving under CUDA graphs launches an exact shape
+//! natively (after `plan_denoise` or `plan_conditions` when an attention
+//! operator plans its launch on the host) and refuses any other, which
+//! only a denoiser without graphs evaluates, on the builder thread.
+//! Solver updates run on the builder thread.
 
 mod denoising;
 
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use ipc::ImageParams;
 use tvm_ffi::Any;
 
@@ -104,6 +107,14 @@ impl DiffusionShape {
             stride,
         })
     }
+}
+
+/// The geometry of a captured conditioning: one latent image of this size
+/// written after a slot's visible tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConditionShape {
+    pub height: u32,
+    pub width: u32,
 }
 
 /// One denoising row: a guidance branch of one image.
@@ -197,10 +208,11 @@ pub(crate) struct DiffusionStorage {
 /// An image denoiser's state: the columns its forwards stage, their
 /// attention metadata and the graphs of its denoising steps.
 pub(crate) struct ImageDenoiser {
-    /// `DenoiserRunner.plan`, `plan_denoise` and `step`, which only an
-    /// image denoiser has.
+    /// `DenoiserRunner.plan`, `plan_denoise`, `plan_conditions` and
+    /// `step`, which only an image denoiser has.
     plan: Function,
     plan_denoise: Function,
+    plan_conditions: Function,
     step: Function,
     /// Whether an attention operator plans each launch on the host.
     plans_attention: bool,
@@ -212,7 +224,12 @@ pub(crate) struct ImageDenoiser {
     /// One image's initial noise, `[P, width]` in the samples' dtype: the
     /// library's seeded draw fills it and `prepare_latents` reads it.
     noise: StorageView,
+    /// One conditioning image's latent rows, `[P, width]` in the samples'
+    /// dtype: under CUDA graphs a conditioning reads its features here.
+    conditions: StorageView,
     pub(super) graphs: GraphTable<DiffusionShape>,
+    /// The captured conditionings, by image size.
+    pub(super) condition_graphs: GraphTable<ConditionShape>,
     capturing: bool,
     /// Whether the denoiser serves under CUDA graphs: a step no captured
     /// graph holds is refused, never evaluated eagerly.
@@ -280,6 +297,12 @@ impl DenoiserRunner {
             &[capacity.units as i64, width],
             stream.as_ref(),
         )?;
+        let conditions = allocate(
+            device,
+            storage.samples.dtype(),
+            &[capacity.units as i64, width],
+            stream.as_ref(),
+        )?;
         let attention = AttentionMetadata::allocate(
             AttentionCapacity {
                 rows: capacity.rows,
@@ -322,6 +345,7 @@ impl DenoiserRunner {
             family: Family::Image(Box::new(ImageDenoiser {
                 plan: method("plan")?,
                 plan_denoise: method("plan_denoise")?,
+                plan_conditions: method("plan_conditions")?,
                 step: method("step")?,
                 plans_attention,
                 layout,
@@ -330,7 +354,12 @@ impl DenoiserRunner {
                 positions,
                 timesteps,
                 noise,
+                conditions,
                 graphs: GraphTable::new(owner.clone(), capture.release.clone()),
+                condition_graphs: GraphTable::new(
+                    format!("{owner}.conditions"),
+                    capture.release.clone(),
+                ),
                 capturing: false,
                 graphs_only: false,
             })),
@@ -477,29 +506,7 @@ impl DenoiserRunner {
     ) -> Result<Predicted> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
-        // The pools a capture records into: the device's, and each peer's.
-        let capture = match capture {
-            None => None,
-            Some(pools) => {
-                let (Some(ordinal), Some(stream)) = (self.device.cuda(), &stream) else {
-                    return Err(Error::Invariant(
-                        "a denoiser captures on its CUDA stream".into(),
-                    ));
-                };
-                let pool = pools
-                    .iter()
-                    .find(|pool| pool.device == ordinal)
-                    .ok_or_else(|| {
-                        Error::Invariant("a denoiser graph has no pool on its device".into())
-                    })?;
-                let peers: Vec<(DeviceId, Handle)> = pools
-                    .iter()
-                    .filter(|pool| pool.device != ordinal)
-                    .map(|pool| (pool.device, pool.value.clone()))
-                    .collect();
-                Some((pool.value.clone(), peers, stream.raw(), ordinal))
-            }
-        };
+        let capture = self.capture_pools(capture)?;
         let image = self.family.image_mut()?;
         let positions = rows
             .iter()
@@ -583,16 +590,56 @@ impl DenoiserRunner {
         Ok(Predicted { mode, offsets })
     }
 
+    /// The pools a capture records into, with the runner's raw stream and
+    /// CUDA ordinal: the one on the runner's device, and one on each other
+    /// device the network's modules run on (a generation tower).
+    #[expect(clippy::type_complexity, reason = "the capture's coordinates")]
+    fn capture_pools(
+        &self,
+        pools: Option<&[Arc<GraphPool>]>,
+    ) -> Result<Option<(Handle, Vec<(DeviceId, Handle)>, usize, DeviceId)>> {
+        let Some(pools) = pools else {
+            return Ok(None);
+        };
+        let (Some(ordinal), Some(stream)) = (self.device.cuda(), &self.stream) else {
+            return Err(Error::Invariant(
+                "a denoiser captures on its CUDA stream".into(),
+            ));
+        };
+        let pool = pools
+            .iter()
+            .find(|pool| pool.device == ordinal)
+            .ok_or_else(|| Error::Invariant("a denoiser graph has no pool on its device".into()))?;
+        let peers = pools
+            .iter()
+            .filter(|pool| pool.device != ordinal)
+            .map(|pool| (pool.device, pool.value.clone()))
+            .collect();
+        Ok(Some((pool.value.clone(), peers, stream.raw(), ordinal)))
+    }
+
     /// Write the K/V of latent images inserted as conditioning into
     /// `prefix_cache`, every write checked against its live accesses.
+    ///
+    /// Without CUDA graphs one eager call writes every row. Under them each
+    /// row writes on its own: its features are copied into the denoiser's
+    /// conditioning rows, and the graph captured at its image size replays,
+    /// after `plan_conditions` when an attention operator plans its launch
+    /// on the host (a later row's plan waits for the stream, since plans
+    /// reuse their host buffers). Startup's capture passes the pools of
+    /// the conditioning's graph for one row: its eager evaluation warms the
+    /// capture recorded behind it, whose graph the job's completion
+    /// carries ([`Self::complete_condition`]).
     pub(crate) fn condition_latents(
         &mut self,
         rows: &[ConditionRow],
         prefix_cache: &mut PrefixCache,
+        capture: Option<&[Arc<GraphPool>]>,
         job: &Job,
     ) -> Result<()> {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
+        let capture = self.capture_pools(capture)?;
         let image = self.family.image_mut()?;
         let positions = rows
             .iter()
@@ -610,35 +657,135 @@ impl DenoiserRunner {
                 ));
             }
         }
-        let (_, _, described) = image.stage_rows(
-            &self.owner,
-            rows.iter()
-                .zip(positions)
-                .map(|(row, positions)| (0, row.height, row.width, positions, 0.0)),
-            issue,
-        )?;
-        let attention: Vec<AttentionRow> = rows
-            .iter()
-            .zip(&described)
-            .map(|(row, described)| AttentionRow {
+        let graphs = image.graphs_only || capture.is_some();
+        if !graphs {
+            let (_, _, described) = image.stage_rows(
+                &self.owner,
+                rows.iter()
+                    .zip(positions)
+                    .map(|(row, positions)| (0, row.height, row.width, positions, 0.0)),
+                issue,
+            )?;
+            let attention: Vec<AttentionRow> = rows
+                .iter()
+                .zip(&described)
+                .map(|(row, described)| AttentionRow {
+                    slot: row.slot,
+                    prefix: row.prefix,
+                    query: described[5] as u32,
+                    write: true,
+                })
+                .collect();
+            image
+                .attention
+                .stage(&attention, prefix_cache, None, issue)?;
+            let mut arguments = image.arguments(&self.methods.runner, &described);
+            // Each row's features follow the forward's tensors as a tensor of
+            // their own.
+            arguments.extend(
+                rows.iter()
+                    .map(|row| Argument::Tensor(row.features.clone())),
+            );
+            job.call(MethodCall::new(&self.methods.encode_conditions, arguments));
+            return Ok(());
+        }
+
+        let widths = image.capacity.graph_widths.clone();
+        for (index, (row, positions)) in rows.iter().zip(positions).enumerate() {
+            let units = image.layout.latent_rows(row.height, row.width)?;
+            let features = image.conditions.prefix(i64::from(units))?;
+            if row.features.dtype() != features.dtype() {
+                return Err(Error::Invalid(format!(
+                    "{}: conditioning latents are {:?}, the denoiser's samples {:?}",
+                    self.owner,
+                    row.features.dtype(),
+                    features.dtype()
+                )));
+            }
+            let mut copy = CopyBatch::new(SourceOrder::Stream);
+            copy.push(
+                features.address(),
+                row.features.address(),
+                features.nbytes() as usize,
+            );
+            // SAFETY: the row's features are the latent product the batch
+            // read, alive until it commits, and the denoiser's conditioning
+            // rows hold them; only this denoiser's forwards read those rows,
+            // in stream order.
+            unsafe { issue.copy(&copy) }?;
+            let (_, _, described) = image.stage_rows(
+                &self.owner,
+                std::iter::once((0, row.height, row.width, positions, 0.0)),
+                issue,
+            )?;
+            let attention = [AttentionRow {
                 slot: row.slot,
                 prefix: row.prefix,
-                query: described[5] as u32,
+                query: described[0][5] as u32,
                 write: true,
-            })
-            .collect();
-        image
-            .attention
-            .stage(&attention, prefix_cache, None, issue)?;
-        let mut arguments = image.arguments(&self.methods.runner, &described);
-        // Each row's features follow the forward's tensors as a tensor of
-        // their own.
-        arguments.extend(
-            rows.iter()
-                .map(|row| Argument::Tensor(row.features.clone())),
-        );
-        job.call(MethodCall::new(&self.methods.encode_conditions, arguments));
+            }];
+            image
+                .attention
+                .stage(&attention, prefix_cache, Some(&widths), issue)?;
+            let mut arguments = image.arguments(&self.methods.runner, &described);
+            arguments.push(Argument::Tensor(features));
+            let shape = ConditionShape {
+                height: row.height,
+                width: row.width,
+            };
+            match &capture {
+                Some((pool, peers, raw, device)) => {
+                    // The eager evaluation warms the capture, which records
+                    // the same call without executing it.
+                    job.call(MethodCall::new(
+                        &self.methods.encode_conditions,
+                        arguments.clone(),
+                    ));
+                    job.capture(Capture {
+                        functions: self.capture.clone(),
+                        pool: pool.clone(),
+                        peers: peers.clone(),
+                        stream: *raw,
+                        device: *device,
+                        method: MethodCall::new(&self.methods.encode_conditions, arguments),
+                        breaks: None,
+                    });
+                }
+                None => {
+                    let graph = match image.condition_graphs.lookup(&shape, None)? {
+                        Lookup::Replay(graph) => graph,
+                        Lookup::Capture => {
+                            return Err(Error::Invalid(format!(
+                                "{}: no captured graph holds the conditioning of a {}x{} image",
+                                self.owner, row.width, row.height
+                            )));
+                        }
+                    };
+                    if image.plans_attention {
+                        if index > 0 {
+                            issue.synchronize()?;
+                        }
+                        job.call(MethodCall::new(&image.plan_conditions, arguments));
+                    }
+                    issue.launch(graph)?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Store the graph a capturing [`Self::condition_latents`] took for a
+    /// conditioning of `shape`'s size.
+    pub(crate) fn complete_condition(
+        &mut self,
+        shape: ConditionShape,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        let graph = completion.captured()?;
+        self.family
+            .image_mut()?
+            .condition_graphs
+            .insert(shape, None, graph)
     }
 
     /// Combine each image's branch predictions and advance its samples by

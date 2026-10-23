@@ -174,8 +174,12 @@ impl DenoiserRunner {
                 if let Some(conditioner) = &mut video.conditioner {
                     conditioner.graphs.seal();
                 }
+                video.seal_conditions();
             }
-            Family::Image(image) => image.graphs.seal(),
+            Family::Image(image) => {
+                image.graphs.seal();
+                image.condition_graphs.seal();
+            }
         }
     }
 
@@ -214,6 +218,7 @@ impl DenoiserRunner {
         match &mut self.family {
             Family::Video(video) => {
                 keep(video.graphs.close(aborted));
+                keep(video.close_conditions(aborted));
                 if let Some(conditioner) = &mut video.conditioner {
                     keep(conditioner.graphs.close(aborted));
                     for runner in conditioner.runners.values() {
@@ -221,7 +226,10 @@ impl DenoiserRunner {
                     }
                 }
             }
-            Family::Image(image) => keep(image.graphs.close(aborted)),
+            Family::Image(image) => {
+                keep(image.graphs.close(aborted));
+                keep(image.condition_graphs.close(aborted));
+            }
         }
         keep(
             self.methods

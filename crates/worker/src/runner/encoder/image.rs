@@ -223,6 +223,25 @@ impl ImagePreparation {
     pub(crate) fn returned_facts(&self, values: &[i64]) -> Result<ImageFacts> {
         ImageFacts::parse(&self.facts, values)
     }
+
+    /// The facts of a generated `height` x `width` image for `tower`,
+    /// asked at once (startup).
+    pub(crate) fn generated_facts(
+        &self,
+        tower: Tower,
+        height: u32,
+        width: u32,
+    ) -> Result<ImageFacts> {
+        let values = crate::ffi::integers(self.facts.call_values(&[
+            self.loaded.to_any(),
+            Any::from(tvm_ffi::String::from(tower.name())),
+            Any::from(i64::from(height)),
+            Any::from(i64::from(width)),
+            Any::from(0_i64),
+        ])?)
+        .map_err(|error| Error::numerical(self.facts.name(), &error))?;
+        ImageFacts::parse(&self.facts, &values)
+    }
 }
 
 /// The tower an encoding kind runs.

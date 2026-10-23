@@ -195,7 +195,7 @@ impl EncoderRunner {
 }
 
 /// Native-endian int64 words of a grid layout, as the device reads them.
-pub(super) fn grid_bytes(layout: &[[i64; 2]]) -> Vec<u8> {
+pub(super) fn grid_bytes<const N: usize>(layout: &[[i64; N]]) -> Vec<u8> {
     layout
         .iter()
         .flatten()

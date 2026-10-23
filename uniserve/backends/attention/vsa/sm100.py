@@ -3,6 +3,9 @@
 64-row complete calls use the native CUDA kernel for the large key domains it
 was measured to serve and the CuTe kernel below that boundary; 128-row calls
 use the native kernel's 128-row build, the only SM100 kernel of that tile.
+Either kernel writes zeros for a query tile that selects no key block, as an
+empty query tile does (a layout's tiles past a request's conditions): the
+CuTe kernel runs its specialization that tests each tile for a zero count.
 """
 
 from uniserve_kernels.attention import vsa_cute, vsa_native
@@ -28,7 +31,15 @@ class _Operator(BaseOperator):
             rows=k.shape[0], prefix_tiles=self.pattern.dense_prefix_tiles
         ):
             vsa_cute.block_sparse_attention(
-                q, k, v, out, indices, counts, variable_block_sizes, scale=scale
+                q,
+                k,
+                v,
+                out,
+                indices,
+                counts,
+                variable_block_sizes,
+                allow_empty_blocks=True,
+                scale=scale,
             )
             return
         vsa_native.block_sparse_attention(

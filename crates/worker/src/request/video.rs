@@ -236,15 +236,20 @@ pub(crate) struct MediaPlan {
     /// capacity, or without one the rows of the largest condition set the
     /// denoiser admits; zero for a denoiser that admits none.
     pub(crate) condition_rows: u32,
-    /// The leading canvas's longest layout at the prompt capacity, widened
-    /// to the condition capacity. The denoiser prepares it first, so it
+    /// The layout among `largest` that takes the most storage on this rank
+    /// ([`storage_leading`]). The denoiser is constructed with it, so it
     /// sizes the storage every layout shares.
     pub(crate) maximum: VideoLayout,
     /// Startup layouts: canvases (in preparation order) by frame counts
     /// (longest first) by prompt capacities (largest first). None for a
     /// denoiser that is not text-only: every request it admits brings
-    /// conditions and evaluates in a layout of its own.
+    /// conditions.
     pub(crate) layouts: Vec<VideoLayout>,
+    /// Under CUDA graphs, the startup layouts of requests with conditions,
+    /// in the order of `layouts`: each widened to the condition capacity,
+    /// which holds every condition set the plan admits. Empty without
+    /// graphs, where such a request evaluates in a layout of its own.
+    pub(crate) conditioned: Vec<VideoLayout>,
     /// Each canvas's longest layout at the prompt capacity, widened to the
     /// condition capacity; their envelope bounds every request's state.
     pub(crate) largest: Vec<VideoLayout>,
@@ -407,32 +412,33 @@ fn prompt_capacities(listed: &[u32], max_text_tokens: u32) -> Result<Vec<u32>> {
     Ok(capacities)
 }
 
-/// The order a deployment prepares its canvases in.
-///
-/// The leading canvas is the one whose largest layout takes the most state
-/// and workspace, the first such canvas on ties: its layout is prepared
-/// first and sizes the storage every later layout shares. Generated rows
-/// alone do not select it: 768p 21:9 generates as many rows as 16:9 but
-/// pads to more sparse-attention tiles. The other canvases follow in
-/// decreasing generated elements, in their given order on ties.
+/// The order a deployment prepares its canvases in: decreasing generated
+/// elements, in their given order on ties. Generated elements count the
+/// complete sample, the same on every rank, so every rank prepares, warms
+/// and captures its layouts in one order, the order in which their
+/// forwards exchange tensors with the other ranks.
 fn preparation_order(extents: &[CanvasExtent]) -> Vec<Canvas> {
-    let mut leading = None;
-    for extent in extents {
-        if leading.is_none_or(|first: &CanvasExtent| extent.storage > first.storage) {
-            leading = Some(extent);
+    let mut ordered: Vec<&CanvasExtent> = extents.iter().collect();
+    // A stable sort keeps the given order among equal extents.
+    ordered.sort_by_key(|extent| std::cmp::Reverse(extent.generated));
+    ordered.into_iter().map(|extent| extent.canvas).collect()
+}
+
+/// The index of the canvas whose largest layout takes the most state and
+/// workspace on this rank, the first such canvas on ties: that layout sizes
+/// the storage every layout of the rank shares ([`MediaPlan::maximum`]).
+/// Generated rows alone do not select it: 768p 21:9 generates as many rows
+/// as 16:9 but pads to more sparse-attention tiles. Under sequence
+/// parallelism a rank's share of a layout differs between ranks, so ranks
+/// may select different canvases.
+fn storage_leading(extents: &[CanvasExtent]) -> usize {
+    let mut leading = 0;
+    for (index, extent) in extents.iter().enumerate() {
+        if extent.storage > extents[leading].storage {
+            leading = index;
         }
     }
-    let mut rest: Vec<&CanvasExtent> = extents
-        .iter()
-        .filter(|extent| leading.is_some_and(|first| first.canvas != extent.canvas))
-        .collect();
-    // A stable sort keeps the given order among equal extents.
-    rest.sort_by_key(|extent| std::cmp::Reverse(extent.generated));
     leading
-        .into_iter()
-        .chain(rest)
-        .map(|extent| extent.canvas)
-        .collect()
 }
 
 impl MediaPlan {
@@ -448,7 +454,10 @@ impl MediaPlan {
     /// count, on the admitted canvas where it packs the most, so no request
     /// is refused for its conditions. A denoiser that admits no condition
     /// gets none either way. `admitted` are the canvases the deployment
-    /// prepares ([`admitted_canvases`]), in the order it names them.
+    /// prepares ([`admitted_canvases`]), in the order it names them. Under
+    /// CUDA `graphs` requests with conditions also evaluate in startup
+    /// layouts (`conditioned`).
+    #[expect(clippy::too_many_arguments, reason = "the deployment's settings")]
     pub(crate) fn new(
         model: &VideoModel,
         max_seconds: f64,
@@ -457,6 +466,7 @@ impl MediaPlan {
         requested: &[u32],
         stated_rows: Option<u32>,
         admitted: Vec<ServedCanvas>,
+        graphs: bool,
     ) -> Result<Self> {
         let facts = &model.facts;
         let longest = model.legal_frame_count(requested_frames(max_seconds, facts.frame_rate))?;
@@ -510,8 +520,9 @@ impl MediaPlan {
         }
         let ordered = preparation_order(&extents);
         let reference = ordered[0];
-        let leading = model.layout_size(&VideoSize::plain(longest, reference, max_text_tokens))?;
-        let largest_text = leading.text_rows;
+        let largest_text = model
+            .layout_size(&VideoSize::plain(longest, reference, max_text_tokens))?
+            .text_rows;
 
         let mut text_capacities = prompt_capacities(requested, max_text_tokens)?
             .iter()
@@ -523,19 +534,26 @@ impl MediaPlan {
         text_capacities.sort_unstable();
         text_capacities.dedup();
 
-        // Only a request without conditions evaluates in a startup layout,
-        // so a denoiser that is not text-only prepares none.
+        // A request without conditions evaluates in a startup layout, so a
+        // denoiser that is not text-only prepares none of them; under graphs
+        // a request with conditions evaluates in the same layout widened to
+        // the condition capacity.
         let mut layouts = Vec::new();
-        if facts.text_only {
-            for &canvas in &ordered {
-                for &frames in frame_counts.iter().rev() {
-                    for &tokens in text_capacities.iter().rev() {
-                        layouts.push(model.layout_size(&VideoSize::plain(frames, canvas, tokens))?);
+        let mut conditioned = Vec::new();
+        for &canvas in &ordered {
+            for &frames in frame_counts.iter().rev() {
+                for &tokens in text_capacities.iter().rev() {
+                    let plain = model.layout_size(&VideoSize::plain(frames, canvas, tokens))?;
+                    if graphs && condition_rows > 0 {
+                        conditioned.push(widen(plain)?);
+                    }
+                    if facts.text_only {
+                        layouts.push(plain);
                     }
                 }
             }
         }
-        let maximum = widen(leading)?;
+        let maximum = largest[storage_leading(&extents)];
         Ok(Self {
             frame_counts,
             admitted,
@@ -545,6 +563,7 @@ impl MediaPlan {
             condition_rows,
             maximum,
             layouts,
+            conditioned,
             largest,
         })
     }
@@ -563,16 +582,27 @@ impl MediaPlan {
             .then(|| OUTSIDE_PLAN.to_owned())
     }
 
-    /// The layout of a size without conditions at prompt capacity
-    /// `capacity`: one of the startup layouts, in the order
-    /// [`Self::new`] lists them.
-    fn startup_layout(&self, frames: u32, canvas: Canvas, capacity: u32) -> Option<VideoLayout> {
+    /// The startup layout of a size at prompt capacity `capacity`: one of
+    /// `layouts` for a size without conditions and one of `conditioned` for
+    /// a size with them, in the order [`Self::new`] lists them.
+    fn startup_layout(
+        &self,
+        frames: u32,
+        canvas: Canvas,
+        capacity: u32,
+        conditions: bool,
+    ) -> Option<VideoLayout> {
         let position = |values: &[u32], value: u32| values.iter().position(|&each| each == value);
         let canvas = self.canvases.iter().position(|&each| each == canvas)?;
         let frames = self.frame_counts.len() - 1 - position(&self.frame_counts, frames)?;
         let capacities = self.text_capacities.len();
         let capacity = capacities - 1 - position(&self.text_capacities, capacity)?;
-        self.layouts
+        let layouts = if conditions {
+            &self.conditioned
+        } else {
+            &self.layouts
+        };
+        layouts
             .get((canvas * self.frame_counts.len() + frames) * capacities + capacity)
             .copied()
     }
@@ -838,10 +868,8 @@ impl VideoRequests {
                     .text_capacities
                     .iter()
                     .map(|&capacity| {
-                        size.conditions
-                            .is_empty()
-                            .then(|| self.plan.startup_layout(size.frames, size.canvas, capacity))
-                            .flatten()
+                        self.plan
+                            .startup_layout(size.frames, size.canvas, capacity, conditioned)
                     })
                     .collect(),
                 size,
@@ -917,7 +945,7 @@ impl VideoRequests {
         let layouts = sizing
             .requests
             .iter()
-            .any(|request| request.layouts.contains(&None));
+            .any(|request| request.layouts.contains(&None) || request.condition_rows.is_none());
         for request in &sizing.requests {
             if layouts {
                 // The layout of the request's size at each prompt capacity,
@@ -1276,33 +1304,38 @@ mod tests {
     }
 
     #[test]
-    fn the_canvas_taking_the_most_storage_is_prepared_first() {
+    fn canvases_are_prepared_by_generated_elements_and_storage_sizes_the_maximum() {
         let extent = |canvas, storage, generated| CanvasExtent {
             canvas,
             storage,
             generated,
         };
-        // 21:9 generates as many elements as 16:9 and takes more storage;
-        // the 480p canvas and the portrait canvas follow by generated
-        // elements, the equal ones in the order they were named.
+        // The canvases follow by generated elements, the equal ones in the
+        // order they were named, whatever storage this rank's share takes;
+        // 21:9 generates as many elements as 16:9 and takes more storage,
+        // so its layout sizes the rank's storage.
         let wide = canvas(1536, 672);
         let landscape = canvas(1344, 768);
         let portrait = canvas(768, 1344);
         let small = canvas(832, 480);
+        let extents = [
+            extent(small, 40, 30),
+            extent(landscape, 90, 100),
+            extent(wide, 96, 100),
+            extent(portrait, 90, 100),
+        ];
         assert_eq!(
-            preparation_order(&[
-                extent(small, 40, 30),
-                extent(landscape, 90, 100),
-                extent(wide, 96, 100),
-                extent(portrait, 90, 100),
-            ]),
-            vec![wide, landscape, portrait, small]
+            preparation_order(&extents),
+            vec![landscape, wide, portrait, small]
         );
-        // The first canvas leads among equal storage.
-        assert_eq!(
-            preparation_order(&[extent(portrait, 90, 100), extent(landscape, 90, 100)]),
-            vec![portrait, landscape]
-        );
+        assert_eq!(storage_leading(&extents), 2);
+        // Two ranks whose shares of the same canvases differ prepare them in
+        // one order; the first canvas sizes the storage among equal ones.
+        let first = [extent(portrait, 90, 100), extent(landscape, 90, 100)];
+        let second = [extent(portrait, 80, 100), extent(landscape, 95, 100)];
+        assert_eq!(preparation_order(&first), preparation_order(&second));
+        assert_eq!(preparation_order(&first), vec![portrait, landscape]);
+        assert_eq!((storage_leading(&first), storage_leading(&second)), (0, 1));
     }
 
     /// A plan of two canvases, two frame counts and two prompt capacities,
@@ -1335,6 +1368,7 @@ mod tests {
             condition_rows: 512,
             maximum: layout(canvases[0], 121, 2048),
             layouts,
+            conditioned: Vec::new(),
             largest: Vec::new(),
         }
     }
@@ -1371,7 +1405,9 @@ mod tests {
         for &canvas in &plan.canvases {
             for &frames in &plan.frame_counts {
                 for &capacity in &plan.text_capacities {
-                    let layout = plan.startup_layout(frames, canvas, capacity).unwrap();
+                    let layout = plan
+                        .startup_layout(frames, canvas, capacity, false)
+                        .unwrap();
                     assert_eq!(
                         (layout.canvas, layout.frames, layout.text_rows),
                         (canvas, frames, capacity)
@@ -1380,9 +1416,54 @@ mod tests {
             }
         }
         // Nothing outside the plan has a startup layout.
-        assert!(plan.startup_layout(73, plan.canvases[0], 1024).is_none());
-        assert!(plan.startup_layout(49, canvas(832, 480), 1024).is_none());
-        assert!(plan.startup_layout(49, plan.canvases[0], 4096).is_none());
+        assert!(
+            plan.startup_layout(73, plan.canvases[0], 1024, false)
+                .is_none()
+        );
+        assert!(
+            plan.startup_layout(49, canvas(832, 480), 1024, false)
+                .is_none()
+        );
+        assert!(
+            plan.startup_layout(49, plan.canvases[0], 4096, false)
+                .is_none()
+        );
+    }
+
+    /// Under graphs a size with conditions takes its startup layout widened
+    /// to the condition capacity; without them it has none and is asked
+    /// for a layout of its own.
+    #[test]
+    fn a_size_with_conditions_takes_its_widened_startup_layout_under_graphs() {
+        let mut plan = plan();
+        assert!(
+            plan.startup_layout(49, plan.canvases[0], 1024, true)
+                .is_none()
+        );
+        plan.conditioned = plan
+            .layouts
+            .iter()
+            .map(|&layout| VideoLayout {
+                condition_rows: plan.condition_rows,
+                ..layout
+            })
+            .collect();
+        for &canvas in &plan.canvases {
+            for &frames in &plan.frame_counts {
+                for &capacity in &plan.text_capacities {
+                    let layout = plan.startup_layout(frames, canvas, capacity, true).unwrap();
+                    assert_eq!(
+                        (
+                            layout.canvas,
+                            layout.frames,
+                            layout.text_rows,
+                            layout.condition_rows
+                        ),
+                        (canvas, frames, capacity, 512)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1392,7 +1473,10 @@ mod tests {
         let layouts: Vec<VideoLayout> = plan
             .text_capacities
             .iter()
-            .map(|&capacity| plan.startup_layout(49, size.canvas, capacity).unwrap())
+            .map(|&capacity| {
+                plan.startup_layout(49, size.canvas, capacity, false)
+                    .unwrap()
+            })
             .collect();
 
         let admitted = plan

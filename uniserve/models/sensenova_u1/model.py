@@ -21,7 +21,14 @@ from uniserve.nn.vae.patch import RGBDecoder
 from . import vision
 from .config import Config
 from .denoiser import Denoiser
+from .processing import MAX_IMAGE_PIXELS
 from .transformer import Transformer
+
+# Images one packed vision call holds, each in a slot of the largest image's
+# patch rows. The largest packed graph's activations (this many slots)
+# bound the graph pool every slot count shares; a larger batch replays that
+# graph once per group.
+VISION_SLOTS = 4
 
 
 class Model(nn.Module):
@@ -56,6 +63,7 @@ class Model(nn.Module):
             head.weight = embedding.weight
         self.denoiser = Denoiser(config, backbone)
 
+        # A slot holds the largest image the ViT transform prepares.
         self.vision_encoder = PatchEncoder(
             vision.Encoder(config.vision),
             nn.Identity(),
@@ -63,6 +71,8 @@ class Model(nn.Module):
             downsample=round(1 / config.vision.downsample_ratio),
             output_size=config.text.hidden_size,
             output_dtype=torch.bfloat16,
+            max_patches=MAX_IMAGE_PIXELS // config.vision.patch_size**2,
+            max_slots=VISION_SLOTS,
         )
         self.image_decoder = ImageDecoder(RGBDecoder(self.denoiser.patch_size))
 

@@ -56,6 +56,8 @@ pub(crate) fn engine_images(
                 encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: Some(placement.soft_tokens),
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             }],
         });
     }

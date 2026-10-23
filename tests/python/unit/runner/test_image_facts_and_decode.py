@@ -107,8 +107,18 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
     latents = latents.to(torch.bfloat16)
     staging = torch.zeros(4 * 32 * 32 * 3, dtype=torch.uint8)
     product = torch.zeros(3, 32, 32, dtype=torch.bfloat16)
+    inputs = torch.zeros(4, 768, dtype=torch.bfloat16)
+    values = torch.zeros(3 * 32 * 32, dtype=torch.bfloat16)
     runner = DecoderRunner.image(
-        model, "image_decoder", 0, -1, Scratch(), latents, staging
+        model,
+        "image_decoder",
+        0,
+        -1,
+        Scratch(),
+        latents,
+        staging,
+        inputs,
+        values,
     )
 
     # Two 32x32 images of four 16-pixel patches each; the second publishes
@@ -130,3 +140,16 @@ def test_decoded_images_fill_their_products_and_staging(loaded):
     # A resident product quantizes like a decoded image.
     assert runner.quantize(product, -1.0, 1.0, 6144) == 3072
     assert torch.equal(staging[6144:9216], staging[3072:6144])
+
+    # One image at a time, as a captured decode replays it: the rows copied
+    # into the inputs decode into the values and the head of the staging
+    # bytes, and values copied in quantize there.
+    staged = staging[3072:6144].clone()
+    staging.zero_()
+    inputs.copy_(latents[4:8])
+    assert runner.decode_one(4, 32, 32) == 3072
+    assert torch.equal(values.view(3, 32, 32), decoded)
+    assert torch.equal(staging[:3072], staged)
+    staging.zero_()
+    assert runner.quantize_one(32, 32, -1.0, 1.0) == 3072
+    assert torch.equal(staging[:3072], staged)

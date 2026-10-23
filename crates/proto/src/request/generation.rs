@@ -156,6 +156,12 @@ pub struct ImageEncoderInput {
     /// `num_cache_tokens` are present, `GenerationRequest::validate` requires
     /// `num_cache_tokens <= max_cache_tokens`.
     pub max_cache_tokens: Option<u32>,
+    /// The height and width in pixels the encoder's transform resizes the
+    /// image to, when known before execution: a latent encoder encodes the
+    /// image at that size, which a deployment under CUDA graphs must have
+    /// captured.
+    pub height: Option<u32>,
+    pub width: Option<u32>,
 }
 
 /// Derives the cache identity of one ordered image encoder.
@@ -1292,11 +1298,15 @@ mod tests {
                     encoder: ImageEncoder::Latent,
                     num_cache_tokens: None,
                     max_cache_tokens: Some(64),
+                    height: None,
+                    width: None,
                 },
                 ImageEncoderInput {
                     encoder: ImageEncoder::Vision,
                     num_cache_tokens: None,
                     max_cache_tokens: Some(64),
+                    height: None,
+                    width: None,
                 },
             ],
             sample_feedback_continuation: false,
@@ -1318,11 +1328,15 @@ mod tests {
                             encoder: ImageEncoder::Latent,
                             num_cache_tokens: None,
                             max_cache_tokens: Some(64),
+                            height: None,
+                            width: None,
                         },
                         ImageEncoderInput {
                             encoder: ImageEncoder::Vision,
                             num_cache_tokens: Some(32),
                             max_cache_tokens: None,
+                            height: None,
+                            width: None,
                         },
                     ],
                 }],
@@ -1439,11 +1453,15 @@ mod tests {
                     encoder: ImageEncoder::Latent,
                     num_cache_tokens: Some(1_026),
                     max_cache_tokens: None,
+                    height: None,
+                    width: None,
                 },
                 ImageEncoderInput {
                     encoder: ImageEncoder::Vision,
                     num_cache_tokens: Some(1_371),
                     max_cache_tokens: None,
+                    height: None,
+                    width: None,
                 },
             ],
         }];
@@ -1583,6 +1601,8 @@ mod tests {
             encoder: ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: Some(64),
+            height: None,
+            width: None,
         };
         assert_eq!(
             injected.validate(),
