@@ -225,6 +225,20 @@ pub(super) fn stride_resize_tokens(
     token_stride: u32,
     marker_tokens: u32,
 ) -> crate::Result<u32> {
+    dimensions_to_tokens(
+        stride_resized(width, height, transforms)?,
+        token_stride,
+        marker_tokens,
+    )
+}
+
+/// The `(width, height)` after the stride-aligned resizes `transforms`
+/// (see [`stride_resize_tokens`]), applied in order.
+pub(super) fn stride_resized(
+    width: u32,
+    height: u32,
+    transforms: &[(u32, u32, u32, u64)],
+) -> crate::Result<(u32, u32)> {
     let mut dimensions = (width, height);
     for &(max_side, min_side, stride, max_pixels) in transforms {
         dimensions = stride_resize(
@@ -236,7 +250,7 @@ pub(super) fn stride_resize_tokens(
             max_pixels,
         )?;
     }
-    dimensions_to_tokens(dimensions, token_stride, marker_tokens)
+    Ok(dimensions)
 }
 
 /// Computes visual token count under pixel-area and aspect-ratio bounds.

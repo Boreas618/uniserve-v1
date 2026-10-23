@@ -168,6 +168,17 @@ pub(crate) fn plan(
         &config.video_resolutions,
         &config.video_aspect_ratios,
     )?;
+    // Under graphs every forward replays one captured at startup; a
+    // reference brings media of any shape, which no startup capture holds.
+    let graphs = config.graph_policy != "off" && config.device.is_cuda();
+    if graphs && model.facts.tasks.iter().any(|task| task == "ref2va") {
+        return Err(Error::Unsupported(
+            "the video denoiser serves ref2va, whose references bring media of any size, \
+             which no captured CUDA graph holds; serve it with cuda_graph_config.policy = \
+             \"off\""
+                .into(),
+        ));
+    }
     let media = MediaPlan::new(
         model,
         config.max_video_seconds,
@@ -176,6 +187,7 @@ pub(crate) fn plan(
         &requested,
         config.max_condition_rows,
         admitted,
+        graphs,
     )?;
     let pages = SamplePages::plan(model, &media.largest)?;
     let envelope = if denoising {
@@ -184,6 +196,7 @@ pub(crate) fn plan(
         // ranks), so the envelope covers every layout startup prepares.
         let fields = std::iter::once(&media.maximum)
             .chain(&media.layouts)
+            .chain(&media.conditioned)
             .chain(&media.largest)
             .map(|layout| model.layout_fields(layout))
             .collect::<Result<Vec<_>>>()?;

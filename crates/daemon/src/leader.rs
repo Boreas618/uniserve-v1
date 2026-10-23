@@ -213,6 +213,29 @@ impl Leader {
             // conditions canvases: its prefill writes the prefix cache alone.
             prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
         });
+        // Under CUDA graphs an image model's workers generate only the image
+        // sizes they capture; unless the options name them, those are the
+        // size a request gets without naming one, in both orientations.
+        let default_size = match &model_config.parameters {
+            ModelParameters::Bagel(profile) => Some(&profile.resolution_policy.default),
+            ModelParameters::SenseNova(profile) => Some(&profile.resolution_policy.default),
+            _ => None,
+        };
+        if let (Some(size), Some(graphs)) = (default_size, spec.cuda_graphs.as_mut())
+            && graphs.flow_shapes.is_none()
+        {
+            let mut shapes = vec![wire::Shape {
+                height: size.height,
+                width: size.width,
+            }];
+            if size.height != size.width {
+                shapes.push(wire::Shape {
+                    height: size.width,
+                    width: size.height,
+                });
+            }
+            graphs.flow_shapes = Some(wire::Shapes { shapes });
+        }
         // Video workers prepare exactly the canvases their denoiser names for
         // the configured resolutions and aspect ratios, refusing a pair it
         // does not generate, and report them back as the only canvases

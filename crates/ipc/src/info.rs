@@ -469,6 +469,12 @@ pub struct WorkerInfo {
     /// CPU rank) or holds no image denoiser.
     #[serde(default)]
     pub captured_images: Option<Vec<CapturedImage>>,
+    /// The `[height, width]` image sizes this rank's latent encoder
+    /// captured, which alone it encodes under CUDA graphs: the engine admits
+    /// an input image's latent block only at one of them. `None` for a rank
+    /// that encodes eagerly or holds no latent encoder.
+    #[serde(default)]
+    pub captured_latents: Option<Vec<[u32; 2]>>,
     /// Blocks one sampler chunk of this rank's diffusion LM denoising step
     /// covers, every row count of which the engine warms; zero when the rank
     /// generates no blocks.
@@ -597,6 +603,13 @@ impl WorkerInfo {
             }),
             "a captured image step is empty or has no valid guidance branches"
         );
+        ensure_valid!(
+            self.captured_latents
+                .iter()
+                .flatten()
+                .all(|&[height, width]| height > 0 && width > 0),
+            "a captured latent image size is empty"
+        );
         if let Some(video) = &self.video_denoiser {
             video.validate()?;
         }
@@ -643,6 +656,7 @@ impl Default for WorkerInfo {
             video_denoiser: None,
             image_warmups: Vec::new(),
             captured_images: None,
+            captured_latents: None,
             diffusion_lm_step_rows: 0,
             image_unconditional_token_ids: None,
             fabric_handles: false,

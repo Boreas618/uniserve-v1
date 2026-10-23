@@ -247,14 +247,27 @@ class VisionTower(nn.Module):
         )
         cos, sin = cos.flatten(1), sin.flatten(1)
 
-        # One bidirectional sequence per time step of every grid.
-        lengths = SequenceLengths.from_lengths(
+        # One bidirectional sequence per time step of every grid. The
+        # device lengths are filled on the device, so the forward copies
+        # nothing from the host and stays capturable in a CUDA graph.
+        values = torch.cat(
             tuple(
+                torch.full(
+                    (time,), height * width, dtype=torch.int32, device=device
+                )
+                for time, height, width in grid_shapes
+            )
+        )
+        lengths = SequenceLengths(
+            values=values,
+            offsets=torch.cat(
+                (values.new_zeros(1), values.cumsum(0, dtype=torch.int32))
+            ),
+            host=tuple(
                 height * width
                 for time, height, width in grid_shapes
                 for _ in range(time)
             ),
-            device=device,
         )
         attention = AttentionBatch.single(
             VarlenInput(lengths, lengths, (False,) * lengths.batch_size)

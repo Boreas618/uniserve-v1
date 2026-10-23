@@ -14,6 +14,7 @@ from uniserve.nn.vision import (
     TubeletEmbed,
     merged_grid_coordinates,
 )
+from uniserve.nn.vision.position import merged_squares
 
 pytestmark = pytest.mark.unit
 
@@ -88,3 +89,28 @@ def test_interpolated_positions_blend_the_corner_aligned_table(grid):
 def test_merged_grids_require_whole_merge_blocks():
     with pytest.raises(ValueError, match="whole merge blocks"):
         merged_grid_coordinates(4, 5, 2)
+
+
+def test_merged_squares_gather_each_tokens_square_in_raster_order():
+    # Segments cover the packed rows in order: two images, an empty
+    # segment, and a padding segment two rows high.
+    grids = [(4, 6), (2, 4), (0, 0), (2, 10)]
+    merge = 2
+    expected = []
+    first = 0
+    for height, width in grids:
+        for row in range(height // merge):
+            for column in range(width // merge):
+                expected.append(
+                    [
+                        first + (merge * row + i) * width + merge * column + j
+                        for i in range(merge)
+                        for j in range(merge)
+                    ]
+                )
+        first += height * width
+    tokens = sum(height * width for height, width in grids) // merge**2
+
+    squares = merged_squares(torch.tensor(grids), tokens, merge)
+
+    assert squares.tolist() == expected

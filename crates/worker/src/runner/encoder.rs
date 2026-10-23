@@ -77,7 +77,7 @@ pub(crate) mod warmup;
 
 use std::sync::Arc;
 
-use cuda::Stream;
+use cuda::{CopyBatch, SourceOrder, Stream};
 use tvm_ffi::Any;
 
 use crate::config::Device;
@@ -91,6 +91,7 @@ use crate::parallel::joins::GraphFunctions;
 use crate::profiling::kernels::KernelRecord;
 use crate::runner::ImageSetup;
 use crate::runner::methods::{Argument, MethodCall, kernels_call, list_kernels};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 pub(crate) use image::{EncodeResume, ImageFacts, ImagePixels, image_placement};
@@ -324,6 +325,17 @@ impl EncoderInfo {
     }
 }
 
+/// Latent rows of a prepared `height` x `width` image.
+fn latent_units(latent: &LatentEncoder, height: u32, width: u32) -> Result<u64> {
+    let side = latent.downsample;
+    if side == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side) {
+        return Err(Error::Invalid(format!(
+            "a {width}x{height} image does not hold whole latent patches"
+        )));
+    }
+    Ok(u64::from(height / side) * u64::from(width / side))
+}
+
 /// Patch rows one unpacked vision call passes: the largest admitted image,
 /// or the configured row budget when larger.
 fn unpacked_rows(vision: &VisionEncoder, config: &EncoderConfig) -> usize {
@@ -366,6 +378,24 @@ pub(crate) enum EncoderGraph {
     Packed { slots: usize },
     /// A text-only encode at this capacity.
     Text { capacity: usize },
+    /// A latent encode of one prepared image of this many pixels.
+    Latent { height: u32, width: u32 },
+    /// A vision tower's encode of one block of this `[time, height, width]`
+    /// patch grid.
+    Patches { grid: [u32; 3] },
+    /// A text encode at this capacity of a prompt holding vision tokens.
+    TextVision { capacity: usize },
+}
+
+/// A vision tower's buffers under CUDA graphs: each block's patch rows are
+/// copied into `rows`, its grid uploaded into `grid` (`[1, 3]` int64), and
+/// the graph captured at its grid writes its features into `features`.
+struct Blocks {
+    /// The grids captured, largest first.
+    grids: Vec<[u32; 3]>,
+    rows: StorageView,
+    features: StorageView,
+    grid: StorageView,
 }
 
 /// The results of one encoder invocation set.
@@ -494,6 +524,17 @@ pub struct EncoderRunner {
     /// A sampling latent encoder's posterior noise: the largest draw, flat,
     /// FP32.
     noise: Option<StorageView>,
+    /// A latent encoder's latent rows of one image, `[units, width]` for
+    /// the largest image, which every captured encode writes.
+    encoded: Option<StorageView>,
+    /// Under CUDA graphs, a vision tower's block buffers: it encodes only
+    /// blocks of the grids it captured, one at a time.
+    blocks: Option<Blocks>,
+    /// Under CUDA graphs, the prepared `[height, width]` sizes a latent
+    /// encoder captures, largest first: those of the images the denoiser
+    /// generates, which it encodes again as conditioning. `None` encodes
+    /// every image eagerly.
+    latent_sizes: Option<Vec<[u32; 2]>>,
     text: Option<TextBuffers>,
     text_capacities: Vec<usize>,
     config: EncoderConfig,
@@ -537,7 +578,7 @@ impl EncoderRunner {
             ));
         }
 
-        let (mut packed, mut resident, mut noise) = (None, None, None);
+        let (mut packed, mut resident, mut noise, mut encoded) = (None, None, None, None);
         match info {
             EncoderInfo::Vision(vision) => {
                 if vision.max_patches.is_none() {
@@ -586,6 +627,13 @@ impl EncoderRunner {
                     latent.pixel_dtype,
                     &[latent.image_elements as i64],
                 )?);
+                // The largest image's pixels over the latent patch area.
+                let units = latent.image_elements / 3 / u64::from(latent.downsample).pow(2);
+                encoded = Some(allocate(
+                    device,
+                    latent.output_dtype,
+                    &[units.max(1) as i64, i64::from(latent.width)],
+                )?);
                 if latent.noise_elements > 0 {
                     noise = Some(allocate(
                         device,
@@ -619,9 +667,8 @@ impl EncoderRunner {
         };
         let methods = EncoderMethods::new(runner)?;
         Ok(Self {
-            graphs: packed
-                .as_ref()
-                .map(|_| GraphTable::new(owner.clone(), methods.capture.release.clone())),
+            graphs: (packed.is_some() || encoded.is_some())
+                .then(|| GraphTable::new(owner.clone(), methods.capture.release.clone())),
             owner,
             info,
             device,
@@ -631,6 +678,9 @@ impl EncoderRunner {
             pinned: PinnedPool::new(device.cuda()),
             resident,
             noise,
+            encoded,
+            latent_sizes: None,
+            blocks: None,
             text: None,
             text_capacities: Vec::new(),
             config: config.clone(),
@@ -684,6 +734,7 @@ impl EncoderRunner {
                         .positions
                         .then(|| allocate(device, DType::I64, &[3, capacity]))
                         .transpose()?,
+                    visual: None,
                     final_stage,
                 };
                 (
@@ -712,6 +763,9 @@ impl EncoderRunner {
             pinned: PinnedPool::new(device.cuda()),
             resident: None,
             noise: None,
+            encoded: None,
+            latent_sizes: None,
+            blocks: None,
             text,
             text_capacities,
             config: config.clone(),
@@ -746,11 +800,68 @@ impl EncoderRunner {
     }
 
     /// The identity of the runner's graph pool owner: the address of its
-    /// packed grids, which no other runner shares. `None` when unpacked.
+    /// packed grids or of a latent encoder's latent rows, which no other
+    /// runner shares. `None` for a runner that captures nothing: an
+    /// unpacked vision encoder, and a latent encoder without sizes to
+    /// capture ([`Self::capture_latents`]).
     pub(crate) fn graph_key(&self) -> Option<usize> {
-        self.packed
-            .as_ref()
-            .map(|packed| packed.grids.address() as usize)
+        match (&self.packed, &self.encoded) {
+            (Some(packed), _) => Some(packed.grids.address() as usize),
+            (None, Some(encoded))
+                if self
+                    .latent_sizes
+                    .as_ref()
+                    .is_some_and(|sizes| !sizes.is_empty()) =>
+            {
+                Some(encoded.address() as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// The image sizes a latent encoder captures under CUDA graphs, largest
+    /// first; `None` when it encodes eagerly.
+    pub(crate) fn latent_sizes(&self) -> Option<&[[u32; 2]]> {
+        self.latent_sizes.as_deref()
+    }
+
+    /// Serve a latent encoder under CUDA graphs: capture the encode of one
+    /// prepared image of each of `sizes` (`[height, width]`), the sizes the
+    /// denoiser generates, and encode only images of those sizes: generated
+    /// images fed back as conditioning and input images that resize to
+    /// them.
+    pub(crate) fn capture_latents(&mut self, mut sizes: Vec<[u32; 2]>) -> Result<()> {
+        let Some(encoded) = &self.encoded else {
+            return Err(Error::Invariant(format!(
+                "{} is not a latent encoder",
+                self.owner
+            )));
+        };
+        let EncoderInfo::Latent(latent) = self.info else {
+            return Err(Error::Invariant(format!(
+                "{} is not a latent encoder",
+                self.owner
+            )));
+        };
+        for &[height, width] in &sizes {
+            let units = latent_units(&latent, height, width)?;
+            if units > encoded.shape()[0] as u64 {
+                return Err(Error::Invalid(format!(
+                    "{}: a {width}x{height} image exceeds the latent encoder's largest image",
+                    self.owner
+                )));
+            }
+        }
+        sizes.sort_unstable_by_key(|&[height, width]| {
+            (
+                std::cmp::Reverse(u64::from(height) * u64::from(width)),
+                height,
+                width,
+            )
+        });
+        sizes.dedup();
+        self.latent_sizes = Some(sizes);
+        Ok(())
     }
 
     /// Record into `job` the encoding of one black `side` x `side` image
@@ -874,30 +985,38 @@ impl EncoderRunner {
                     result.encoded.record(GraphMode::Eager);
                 }
             }
-            (EncoderInfo::Latent(_), _) => {
+            (EncoderInfo::Latent(latent), _) => {
                 if draws.len() != images.len() {
                     return Err(Error::Invariant(
                         "latent images and their posterior draws must align".into(),
                     ));
                 }
+                let latent = *latent;
+                // A forward borrows the runner mutably, so the arguments
+                // hold their own reference to the Python half.
+                let handle = self.methods.runner.clone();
                 for (index, image) in images.iter().enumerate() {
+                    // Under graphs only images of the captured sizes are
+                    // encoded; the engine refuses input images of others.
+                    let graphs = self.latent_sizes.is_some();
+                    if graphs && !self.capturing {
+                        return Err(Error::Invariant(format!(
+                            "{}: the latent encoder serves under CUDA graphs it did not capture",
+                            self.owner
+                        )));
+                    }
                     let pixels = self.pixels(image, Tower::Vae, job)?;
-                    let mut arguments = vec![
-                        runner(),
-                        Argument::Tensor(pixels),
-                        Argument::Tensor(out[index].clone()),
-                    ];
+                    let [_, height, width] = image.facts.shape[..] else {
+                        return Err(Error::Invariant(
+                            "latent pixels are [channels, height, width]".into(),
+                        ));
+                    };
                     if let Some(noise) = &self.noise {
-                        let [_, height, width] = image.facts.shape[..] else {
-                            return Err(Error::Invariant(
-                                "latent pixels are [channels, height, width]".into(),
-                            ));
-                        };
                         let (seed, draw) = draws[index];
                         job.call(MethodCall::new(
                             &self.methods.draw_noise,
                             vec![
-                                runner(),
+                                Argument::Handle(handle.clone()),
                                 // The seed's bits; the Python half reads them
                                 // as unsigned.
                                 Argument::Integer(seed as i64),
@@ -907,6 +1026,77 @@ impl EncoderRunner {
                                 Argument::Tensor(noise.clone()),
                             ],
                         ));
+                    }
+                    if graphs {
+                        // The captured encodes read the resident pixels: a
+                        // generated image was prepared there, and an input
+                        // image's host-prepared pixels are copied there.
+                        if let ImagePixels::Host(source) = &image.pixels {
+                            let resident = self.resident.as_ref().ok_or_else(|| {
+                                Error::Invariant("a latent encoder holds resident pixels".into())
+                            })?;
+                            if source.dtype() != resident.dtype()
+                                || source.nbytes() > resident.nbytes()
+                            {
+                                return Err(Error::Invalid(format!(
+                                    "{}: input pixels {:?} of {:?} do not fit the resident \
+                                     pixels the captured encodes read",
+                                    self.owner,
+                                    source.shape(),
+                                    source.dtype()
+                                )));
+                            }
+                            let mut input = CopyBatch::new(SourceOrder::Stream);
+                            input.push(
+                                resident.address(),
+                                source.address(),
+                                source.nbytes() as usize,
+                            );
+                            // SAFETY: the source is the image's host-prepared
+                            // pixels, which the caller keeps until the copy
+                            // completed, and the target lies in the runner's
+                            // resident pixels, which only its forwards read,
+                            // in stream order.
+                            unsafe { job.on(self.stream.as_ref()).copy(&input) }?;
+                        }
+                        let (height, width) = (height as u32, width as u32);
+                        let (arguments, units) = self.latent_arguments(height, width)?;
+                        let mode = self.forward(
+                            EncoderGraph::Latent { height, width },
+                            arguments,
+                            None,
+                            job,
+                        )?;
+                        // The graph wrote the image's latent rows into the
+                        // runner's; they are copied into the product as they
+                        // are, both of the encoder's output dtype.
+                        let encoded = self.encoded.as_ref().ok_or_else(|| {
+                            Error::Invariant("a latent encoder holds its latent rows".into())
+                        })?;
+                        let bytes =
+                            units * u64::from(latent.width) * latent.output_dtype.bytes() as u64;
+                        if out[index].nbytes() < bytes {
+                            return Err(Error::Invalid(
+                                "a latent product holds fewer rows than its image".into(),
+                            ));
+                        }
+                        let mut rows_out = CopyBatch::new(SourceOrder::Stream);
+                        rows_out.push(out[index].address(), encoded.address(), bytes as usize);
+                        // SAFETY: the runner's latent rows hold the image's,
+                        // written by the graph before this copy on the same
+                        // stream, and the target is the product the caller
+                        // reserved, alive until the batch commits.
+                        unsafe { job.on(self.stream.as_ref()).copy(&rows_out) }?;
+                        result.encoded.shapes[index] = vec![units as i64, i64::from(latent.width)];
+                        result.encoded.record(mode);
+                        continue;
+                    }
+                    let mut arguments = vec![
+                        Argument::Handle(handle.clone()),
+                        Argument::Tensor(pixels),
+                        Argument::Tensor(out[index].clone()),
+                    ];
+                    if let Some(noise) = &self.noise {
                         arguments.push(Argument::Tensor(noise.clone()));
                     }
                     job.call_returning(MethodCall::new(&self.methods.encode, arguments));
@@ -919,6 +1109,35 @@ impl EncoderRunner {
             }
         }
         Ok(result)
+    }
+
+    /// The arguments of the Python half's `encode` of one prepared `height`
+    /// x `width` image in the runner's resident pixels into its latent
+    /// rows (and of its posterior noise), with the image's latent rows: the
+    /// call a latent encode's graph captures.
+    fn latent_arguments(&self, height: u32, width: u32) -> Result<(Vec<Argument>, u64)> {
+        let (EncoderInfo::Latent(latent), Some(resident), Some(encoded)) =
+            (&self.info, &self.resident, &self.encoded)
+        else {
+            return Err(Error::Invariant(format!(
+                "{} is not a latent encoder",
+                self.owner
+            )));
+        };
+        let units = latent_units(latent, height, width)?;
+        let (height, width) = (i64::from(height), i64::from(width));
+        let pixels = resident
+            .prefix(3 * height * width)?
+            .reshape(resident.dtype(), &[3, height, width])?;
+        let mut arguments = vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Tensor(pixels),
+            Argument::Tensor(encoded.prefix(units as i64)?),
+        ];
+        if let Some(noise) = &self.noise {
+            arguments.push(Argument::Tensor(noise.clone()));
+        }
+        Ok((arguments, units))
     }
 
     /// The pixels an unpacked call reads for `image`: its host-prepared
@@ -992,11 +1211,77 @@ impl EncoderRunner {
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
-        if !matches!(self.info, EncoderInfo::Vision(_)) {
+        let EncoderInfo::Vision(vision) = self.info else {
             return Err(Error::Invalid(format!(
                 "{} encodes no vision blocks",
                 self.owner
             )));
+        };
+        if let Some(blocks) = &self.blocks {
+            // Each block replays the graph captured at its grid, its rows
+            // copied into the tower's and its features copied out.
+            let (block_rows, features, grid_input) = (
+                blocks.rows.clone(),
+                blocks.features.clone(),
+                blocks.grid.clone(),
+            );
+            if rows.dtype() != block_rows.dtype()
+                || rows.shape().get(1) != block_rows.shape().get(1)
+            {
+                return Err(Error::Invalid(format!(
+                    "{}: vision rows disagree with the captured blocks' rows",
+                    self.owner
+                )));
+            }
+            let row_bytes = block_rows.shape()[1] as u64 * block_rows.dtype().bytes() as u64;
+            let feature_bytes = u64::from(vision.output_size) * vision.output_dtype.bytes() as u64;
+            // A forward borrows the runner mutably, so the copies issue on
+            // their own handle of its stream.
+            let stream = self.stream.clone();
+            let issue = job.on(stream.as_ref());
+            let (mut row, mut token) = (0_u64, 0_u64);
+            for &grid in grids {
+                let count = grid
+                    .iter()
+                    .map(|&extent| u64::from(extent))
+                    .product::<u64>();
+                let tokens = count / u64::from(vision.downsample).pow(2);
+                if count > block_rows.shape()[0] as u64 {
+                    return Err(Error::Invalid(format!(
+                        "{}: no captured graph holds a {grid:?} vision block",
+                        self.owner
+                    )));
+                }
+                let mut input = CopyBatch::new(SourceOrder::Stream);
+                input.push(
+                    block_rows.address(),
+                    rows.address() + row * row_bytes,
+                    (count * row_bytes) as usize,
+                );
+                // SAFETY: the block's rows lie in the product the batch read,
+                // alive until it commits, and the tower's rows hold them;
+                // only this tower's forwards read its rows, in stream order.
+                unsafe { issue.copy(&input) }?;
+                let bytes = grid_bytes(&[grid.map(i64::from)]);
+                // SAFETY: the tower's grid input, kept until it closes after
+                // its stream drained; its forwards read it in stream order.
+                unsafe { grid_input.upload(&bytes, issue) }?;
+                let arguments = self.block_arguments(grid)?;
+                self.forward(EncoderGraph::Patches { grid }, arguments, None, job)?;
+                let mut output = CopyBatch::new(SourceOrder::Stream);
+                output.push(
+                    out.address() + token * feature_bytes,
+                    features.address(),
+                    (tokens * feature_bytes) as usize,
+                );
+                // SAFETY: the tower's features hold the block's, written by
+                // the graph before this copy on the same stream, and the
+                // target rows lie in the product the caller bound.
+                unsafe { issue.copy(&output) }?;
+                row += count;
+                token += tokens;
+            }
+            return Ok(());
         }
         job.call(MethodCall::new(
             &self.methods.encode,
@@ -1014,6 +1299,80 @@ impl EncoderRunner {
             ],
         ));
         Ok(())
+    }
+}
+
+impl EncoderRunner {
+    /// Serve a vision tower under CUDA graphs: capture the encode of one
+    /// block of each of `grids` (`[time, height, width]`) and encode only
+    /// blocks of those grids, one at a time. Its block rows are
+    /// `row_width` values of `row_dtype`, as the media reader packs them.
+    pub(crate) fn capture_blocks(
+        &mut self,
+        mut grids: Vec<[u32; 3]>,
+        row_width: i64,
+        row_dtype: DType,
+    ) -> Result<()> {
+        let EncoderInfo::Vision(vision) = self.info else {
+            return Err(Error::Invariant(format!(
+                "{} is not a vision tower",
+                self.owner
+            )));
+        };
+        let patches = |grid: &[u32; 3]| grid.iter().map(|&extent| u64::from(extent)).product();
+        grids.sort_unstable_by_key(|grid| (std::cmp::Reverse(patches(grid)), *grid));
+        grids.dedup();
+        let rows = grids.first().map_or(0, patches);
+        let tokens = rows / u64::from(vision.downsample).pow(2);
+        let block_rows = allocate(self.device, row_dtype, &[rows.max(1) as i64, row_width])?;
+        // Rows past a block keep earlier values, which no graph reads; they
+        // start finite.
+        // SAFETY: a new allocation the tower keeps until it closes after its
+        // stream drained; its forwards run behind the fill on that stream.
+        unsafe { block_rows.zero(self.stream.as_ref()) }?;
+        if let Some(stream) = &self.stream {
+            stream.synchronize()?;
+        }
+        self.blocks = Some(Blocks {
+            grids,
+            rows: block_rows,
+            features: allocate(
+                self.device,
+                vision.output_dtype,
+                &[tokens.max(1) as i64, i64::from(vision.output_size)],
+            )?,
+            grid: allocate(self.device, DType::I64, &[1, 3])?,
+        });
+        if self.graphs.is_none() {
+            self.graphs = Some(GraphTable::new(
+                self.owner.clone(),
+                self.methods.capture.release.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The arguments of the Python half's `encode` of one block of `grid`
+    /// in the tower's block buffers: the call a block's graph captures.
+    fn block_arguments(&self, grid: [u32; 3]) -> Result<Vec<Argument>> {
+        let (EncoderInfo::Vision(vision), Some(blocks)) = (&self.info, &self.blocks) else {
+            return Err(Error::Invariant(format!(
+                "{} captures no vision blocks",
+                self.owner
+            )));
+        };
+        let count = grid
+            .iter()
+            .map(|&extent| i64::from(extent))
+            .product::<i64>();
+        let tokens = count / i64::from(vision.downsample).pow(2);
+        Ok(vec![
+            Argument::Handle(self.methods.runner.clone()),
+            Argument::Tensor(blocks.rows.prefix(count)?),
+            Argument::Tensor(blocks.features.prefix(tokens)?),
+            Argument::Integers(grid.iter().map(|&extent| i64::from(extent)).collect()),
+            Argument::Tensor(blocks.grid.clone()),
+        ])
     }
 }
 
@@ -1083,8 +1442,8 @@ impl EncoderRunner {
     }
 
     /// Warm and, with `pool`, capture every graph this encoder launches:
-    /// packed slot counts `capacity..=1` and text capacities, largest
-    /// first. Each forward is one job, as serving records it: its input
+    /// packed slot counts `capacity..=1`, a vision tower's block grids,
+    /// latent image sizes and text capacities, largest first. Each forward is one job, as serving records it: its input
     /// writes, its eager call and, with a pool, its capture. `perform`
     /// performs a job and returns its completion: at a rank's startup the
     /// encoder's lane performs it, outside a rank the calling thread
@@ -1124,36 +1483,75 @@ impl EncoderRunner {
                     ));
                 }
             }
+            (EncoderInfo::Vision(_), None, _) if self.blocks.is_some() => {
+                for &grid in self.blocks.iter().flat_map(|blocks| &blocks.grids) {
+                    forwards.push((
+                        EncoderGraph::Patches { grid },
+                        Some(grid_bytes(&[grid.map(i64::from)])),
+                        self.block_arguments(grid)?,
+                    ));
+                }
+            }
+            (EncoderInfo::Latent(_), _, _) => {
+                // Every size encodes zero pixels with zero noise.
+                for buffer in self.resident.iter().chain(&self.noise) {
+                    // SAFETY: the encoder's own input, kept until it closes
+                    // after its stream drained; only its forwards read it,
+                    // recorded behind the fill on the same stream.
+                    unsafe { buffer.zero(job.on(self.stream.as_ref())) }?;
+                }
+                for &[height, width] in self.latent_sizes.iter().flatten() {
+                    let (arguments, _) = self.latent_arguments(height, width)?;
+                    forwards.push((EncoderGraph::Latent { height, width }, None, arguments));
+                }
+            }
             (EncoderInfo::Text(_), _, Some(text)) => {
-                // Every capacity encodes the zero prompt.
-                // SAFETY: the text encoder's token input, kept until it closes
-                // after its stream drained; only the warm forwards read it,
-                // recorded behind the fill on the same stream.
-                unsafe { text.tokens.zero(job.on(self.stream.as_ref())) }?;
+                // Every capacity encodes the zero prompt, and under graphs
+                // with zero vision rows at zero coordinates.
+                for buffer in std::iter::once(&text.tokens)
+                    .chain(text.visual.iter().flat_map(|_| &text.positions))
+                    .chain(&text.visual)
+                {
+                    // SAFETY: the text encoder's own input, kept until it
+                    // closes after its stream drained; only the warm forwards
+                    // read it, recorded behind the fill on the same stream.
+                    unsafe { buffer.zero(job.on(self.stream.as_ref())) }?;
+                }
                 for &capacity in self.text_capacities.iter().rev() {
                     forwards.push((
                         EncoderGraph::Text { capacity },
                         None,
                         self.text_arguments(capacity)?,
                     ));
+                    if text.visual.is_some() {
+                        forwards.push((
+                            EncoderGraph::TextVision { capacity },
+                            None,
+                            self.text_vision_arguments(capacity)?,
+                        ));
+                    }
                 }
             }
             _ => {}
         }
         for (key, grids, arguments) in forwards {
             let recorded = std::mem::take(&mut job);
-            if let (EncoderGraph::Packed { slots }, Some(grids), Some(packed)) =
-                (key, &grids, &self.packed)
-            {
+            if let Some(grids) = &grids {
+                let input = match (key, &self.packed, &self.blocks) {
+                    (EncoderGraph::Packed { slots }, Some(packed), _) => {
+                        packed.grids.prefix(2 * slots as i64)?
+                    }
+                    (EncoderGraph::Patches { .. }, _, Some(blocks)) => blocks.grid.clone(),
+                    _ => {
+                        return Err(Error::Invariant(
+                            "an encoder graph without a grid input reads grids".into(),
+                        ));
+                    }
+                };
                 // SAFETY: the encoder's grid input, kept until it closes after
                 // its stream drained; the warm forwards reading it run on its
                 // stream, each job performed before the next writes.
-                unsafe {
-                    packed
-                        .grids
-                        .prefix(2 * slots as i64)?
-                        .upload(grids, recorded.on(self.stream.as_ref()))
-                }?;
+                unsafe { input.upload(grids, recorded.on(self.stream.as_ref())) }?;
             }
             let mode = self.forward(key, arguments, pool.map(Arc::as_ref), &recorded)?;
             let mut completion = perform(recorded)?;

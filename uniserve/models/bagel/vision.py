@@ -43,8 +43,10 @@ class Encoder(nn.Module):
         Args:
             pixels: Patch rows or NCHW pixels, as ``siglip.Encoder`` accepts.
             grids: ``[images, 2]`` integer tensor of per-image patch grid
-                ``(height, width)``.
-            grid_shapes: The same grid dimensions as host integers.
+                ``(height, width)``, as ``siglip.Encoder`` accepts, padding
+                segments of a packed batch included.
+            grid_shapes: The same grid dimensions as host integers, or None
+                when the caller has checked the packing.
 
         Returns:
             ``[total_patches, text_hidden]`` features, images concatenated in
@@ -53,15 +55,17 @@ class Encoder(nn.Module):
         # [total_patches, text_hidden] after connector projection.
         features = self.connector(self.encoder(pixels, grids, grid_shapes))
 
-        # The patch total comes from the host grid shapes, so position
-        # construction reads no device value and stays capturable in a CUDA
-        # graph. Every grid fits the ``side x side`` table because
-        # ``siglip.Encoder.forward`` rejects larger ones.
+        # The patch total is a static shape, so position construction reads
+        # no device value and stays capturable in a CUDA graph. Every image
+        # grid fits the ``side x side`` table because
+        # ``siglip.Encoder.forward`` rejects larger ones; a padding
+        # segment's rows may run past it and read the last entry.
         columns, rows = build_abs_positions_from_grid_hw(
-            grids, total=sum(height * width for height, width in grid_shapes)
+            grids, total=features.shape[0]
         )
+        height, width = self.position.grid_size
 
         # Row-major index into the flattened position table.
         return features + self.position(
-            rows * self.position.grid_size[1] + columns
+            (rows * width + columns).clamp(max=height * width - 1)
         )

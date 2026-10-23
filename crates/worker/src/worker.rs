@@ -584,6 +584,7 @@ impl Worker {
                     .warmups(info.request_slots, info.latent_capacity_units())
                     .map_err(phase("bind"))?;
                 info.captured_images = image.captured_images();
+                info.captured_latents = image.encoders.captured_latents();
                 info.image_unconditional_token_ids =
                     image.image_unconditional_prefix().map_err(phase("bind"))?;
             }

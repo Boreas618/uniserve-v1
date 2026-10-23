@@ -563,8 +563,10 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
             for condition in size.conditions
         ]
         draws = iter(noise)
-        level = torch.tensor(
-            VISUAL_CONDITION_TIME, dtype=torch.float32, device=out.device
+        # Filled on the device, so the encoding copies nothing from the host
+        # and a CUDA graph captures it.
+        level = torch.full(
+            (), VISUAL_CONDITION_TIME, dtype=torch.float32, device=out.device
         )
         row = layout.num_text_tokens
         for segment in segments:
@@ -776,13 +778,14 @@ class Denoiser(VideoDenoiser[DenoiserInput, DenoiserSize]):
         return result
 
     def _rotary_width(self) -> int:
-        """Width of one packed row's flattened rotary coordinates."""
-        cosine, _ = self.rotary(
-            torch.zeros((1, 3), dtype=torch.float64),
-            dtype=torch.float32,
-            sequence_length=1,
-        )
-        return int(cosine.flatten(1).shape[1])
+        """Width of one packed row's flattened rotary coordinates: the
+        rotary's factors of each of its three position coordinates.
+
+        The frequency table's shape fixes it, so a rank that does not hold
+        the transformer, whose table loading leaves on meta, sizes the
+        state as the ranks that hold it do.
+        """  # noqa: D205
+        return 3 * cast(torch.Tensor, self.rotary.inv_freq).numel()
 
     def state_buffers(self, size: DenoiserSize) -> Mapping[str, BufferConfig]:
         """Describe one request's state on the caller's device.

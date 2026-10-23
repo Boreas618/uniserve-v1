@@ -1,16 +1,18 @@
 //! Startup of a video model's encoder runners on a rank.
 
 use ipc::MediaCall;
+use models::video::plan::ProcessorConfig;
 
 use super::runners::EncoderRunners;
-use super::{EncoderConfig, EncoderRunner, TextSetup};
-use crate::Result;
+use super::{ENCODER, EncoderConfig, EncoderRunner, TextSetup};
 use crate::config::placement::Placed;
 use crate::executor::video::extent;
+use crate::ffi::{DType, Interpreter, texts};
 use crate::runner::RunnerSetup;
 use crate::runner::component::{
     Component, LATENT_GRAPHS, TEXT_GRAPHS, VideoSetup, call_path, cuda_device,
 };
+use crate::{Error, Result};
 
 impl EncoderRunners {
     /// Build the text encoder of a placed component and, when the component
@@ -23,11 +25,12 @@ impl EncoderRunners {
         // The media reader packs a request's vision blocks into the
         // rows of `vision_pixels`; a deployment without conditioned
         // tasks declares none.
-        let vision_rows = setup
+        let vision_pixels = setup
             .capacity
             .outputs
             .get("media_reader")
-            .and_then(|outputs| outputs.iter().find(|output| output.name == "vision_pixels"))
+            .and_then(|outputs| outputs.iter().find(|output| output.name == "vision_pixels"));
+        let vision_rows = vision_pixels
             .and_then(|output| output.shape_bound.dims.first())
             .map_or(0, |dim| extent(dim) as usize);
         let path = placed
@@ -38,7 +41,7 @@ impl EncoderRunners {
             .unwrap_or_default();
         let (stream, scratch) = setup.stream(MediaCall::TextEncoding, device)?;
         self.text_pool = setup.graph_pool(TEXT_GRAPHS, device)?;
-        let (runner, tower) = EncoderRunner::text(TextSetup {
+        let (mut runner, mut tower) = EncoderRunner::text(TextSetup {
             loaded,
             component: &placed.name,
             path: &path,
@@ -61,6 +64,47 @@ impl EncoderRunners {
             },
             vision: placed.has(crate::config::placement::Capability::PatchEncoder),
         })?;
+        // Under graphs the vision tower encodes only blocks of the grids it
+        // captured: an fl2va keyframe's at each admitted canvas, which the
+        // server plans with the checkpoint's processor configs.
+        if let (Some(tower), Some(_), Some(pixels)) = (&mut tower, &self.text_pool, vision_pixels) {
+            let processor = texts(
+                Interpreter::import(&format!("{ENCODER}.vision_processor"))?
+                    .call_values(&[loaded.to_any()])?,
+            )
+            .map_err(|error| Error::numerical("vision_processor", &error))?;
+            let [image, video] = &processor[..] else {
+                return Err(Error::Unsupported(
+                    "under CUDA graphs the vision tower captures the keyframe grids its \
+                     processor configs plan, which the model does not keep"
+                        .into(),
+                ));
+            };
+            let processor = ProcessorConfig::parse(image, video)
+                .map_err(|error| Error::Interface(format!("the vision processor: {error}")))?;
+            let grids = plan
+                .admitted
+                .iter()
+                .map(|served| {
+                    processor
+                        .image_grid(served.canvas.height, served.canvas.width)
+                        .map(|grid| [grid.t, grid.h, grid.w])
+                        .map_err(|error| Error::Invalid(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let width = pixels
+                .shape_bound
+                .dims
+                .get(1)
+                .map(extent)
+                .ok_or_else(|| Error::Interface("vision pixels are rows".into()))?;
+            tower.capture_blocks(grids, width as i64, DType::from(pixels.dtype))?;
+            // A prompt holding the blocks' features encodes through its
+            // capacity's graph of prompts with vision.
+            if let super::EncoderInfo::Vision(vision) = tower.info {
+                runner.capture_vision(i64::from(vision.output_size), vision.output_dtype)?;
+            }
+        }
         self.text = Some(Component {
             name: placed.name.clone(),
             config: placed.config.clone(),
@@ -80,6 +124,27 @@ impl EncoderRunners {
         let loaded = setup.loaded;
         let attention = setup.attention.clone();
         let device = placed.device;
+        let canvases: Vec<models::video::Canvas> = setup
+            .capacity
+            .media
+            .admitted
+            .iter()
+            .map(|served| served.canvas)
+            .collect();
+        // The rows a call of the video encoder writes.
+        let rows = setup
+            .capacity
+            .outputs
+            .get(placed.name.as_str())
+            .and_then(|outputs| {
+                outputs
+                    .iter()
+                    .find(|output| output.name == "condition_video_latents")
+            })
+            .and_then(|output| {
+                let width = output.shape_bound.dims.get(1).map(extent)?;
+                Some((width as i64, DType::from(output.dtype)))
+            });
         let (stream, scratch) = setup.stream(MediaCall::LatentEncoding, device)?;
         // The pool the still-frame tile encoding is captured into.
         self.latent_pool = setup.graph_pool(LATENT_GRAPHS, device)?;
@@ -97,6 +162,17 @@ impl EncoderRunners {
             setup(crate::config::placement::Capability::VideoEncoder)?,
             setup(crate::config::placement::Capability::AudioEncoder)?,
         )?;
+        // Under graphs the encoders serve only the keyframe encodings they
+        // capture: an fl2va request's keyframes, at most two, fitted to an
+        // admitted canvas, as many in one call as a rank takes units.
+        if let (Some(_), Some(rows)) = (&self.latent_pool, rows) {
+            let per_call = if placed.config.distribution.is_some() {
+                placed.config.units_per_rank.min(2) as u32
+            } else {
+                2
+            };
+            self.keyframes = Some((canvases, per_call, rows));
+        }
         self.latent = Some(Component {
             name: placed.name.clone(),
             config: placed.config.clone(),

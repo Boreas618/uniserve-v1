@@ -29,7 +29,10 @@ from uniserve.nn.linear import (
 from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve.nn.vision.position import (
+    build_abs_positions_from_grid_hw,
+    merged_squares,
+)
 
 from .config import VisionConfig
 
@@ -227,34 +230,9 @@ class Pooler(nn.Module):
         patch rows in order; a ``(0, 0)`` grid is an empty segment.
         """
         kernel = self.kernel_size
-        device = features.device
-        tokens = features.shape[0] // kernel**2
-
-        # Soft token t of the packing belongs to image image[t] and is its
-        # local[t]-th token in row-major order of that image's pooled grid.
-        heights, widths = grids[:, 0], grids[:, 1]
-        patch_counts = heights * widths
-        token_counts = patch_counts // kernel**2
-        image = torch.repeat_interleave(
-            torch.arange(grids.shape[0], device=device),
-            token_counts,
-            output_size=tokens,
-        )
-        first_token = torch.cumsum(token_counts, 0) - token_counts
-        first_patch = torch.cumsum(patch_counts, 0) - patch_counts
-        local = torch.arange(tokens, device=device) - first_token[image]
-        width = widths[image]
-        row, column = local // (width // kernel), local % (width // kernel)
-
-        # The patch rows of each token's k x k square in row-major order:
-        # [tokens, k * k] indices into the packed rows.
-        corner = first_patch[image] + (row * width + column) * kernel
-        offsets = torch.arange(kernel, device=device)
-        square = (
-            corner[:, None, None]
-            + offsets[None, :, None] * width[:, None, None]
-            + offsets[None, None, :]
-        ).flatten(1)
+        # The patch rows of each soft token's k x k square in row-major
+        # order: [tokens, k * k] indices into the packed rows.
+        square = merged_squares(grids, features.shape[0] // kernel**2, kernel)
         pooled = features.float()[square].mean(dim=1).to(features.dtype)
 
         values = pooled.float() * self.root_size

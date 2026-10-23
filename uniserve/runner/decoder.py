@@ -110,6 +110,8 @@ class DecoderRunner:
     _image: ImageDecoder
     _latents: torch.Tensor
     _staging: torch.Tensor
+    _inputs: torch.Tensor
+    _values: torch.Tensor
 
     def __init__(
         self,
@@ -195,6 +197,8 @@ class DecoderRunner:
         scratch,
         latents: torch.Tensor,
         staging: torch.Tensor,
+        inputs: torch.Tensor,
+        values: torch.Tensor,
     ) -> DecoderRunner:
         """A runner of an image model's decoder.
 
@@ -212,6 +216,12 @@ class DecoderRunner:
                 pages before decoding.
             staging: uint8 bytes receiving each image's quantized HWC
                 pixels, which the caller copies to the host and encodes.
+            inputs: ``[units, width]`` latent rows of the largest image the
+                denoiser captured, into which the caller copies one
+                image's rows for :meth:`decode_one`.
+            values: flat BF16 elements of that image's decoded values,
+                which :meth:`decode_one` writes and :meth:`quantize_one`
+                reads, as an image product holds them.
         """
         path = str(path)
         decoder = loaded.module.get_submodule(path) if path else loaded.module
@@ -234,6 +244,8 @@ class DecoderRunner:
         runner._device = context.device
         runner._latents = latents
         runner._staging = staging
+        runner._inputs = inputs
+        runner._values = values
         runner._decode = runner._decode_image
         return runner
 
@@ -373,6 +385,46 @@ class DecoderRunner:
         each image's byte count, ``height * width * 3``.
         """
         return self._decode(*arguments)
+
+    def decode_one(self, units: int, height: int, width: int) -> int:
+        """Decode one ``height`` x ``width`` image from the ``units`` latent
+        rows at the head of the runner's inputs into its values and the head
+        of the staging bytes; the staged byte count.
+
+        Every tensor it reads and writes keeps its address, so a CUDA graph
+        captured at one size replays the decode of every image of that
+        size, the caller copying each image's rows in and its values out.
+        """  # noqa: D205
+        decoder, context = self._image, self._context
+        low, high = (float(value) for value in decoder.decoder.value_range)
+        with scope(context):
+            value = decoder.decode(
+                (
+                    self._inputs[: int(units)].to(
+                        context.device, non_blocking=True
+                    ),
+                ),
+                sizes=(image.Config(int(height), int(width)),),
+            )[0]
+            write(self._values, value)
+            return self._stage(value, low, high, 0)
+
+    def quantize_one(
+        self, height: int, width: int, low: float, high: float
+    ) -> int:
+        """Quantize the ``[3, height, width]`` image the caller copied to
+        the head of the runner's values, holding values in ``[low,
+        high]``, into the head of the staging bytes; the staged byte count.
+        A CUDA graph captured at one size replays it.
+        """  # noqa: D205
+        count = 3 * int(height) * int(width)
+        with scope(self._context):
+            return self._stage(
+                self._values[:count].view(3, int(height), int(width)),
+                float(low),
+                float(high),
+                0,
+            )
 
     def quantize(
         self, image: torch.Tensor, low: float, high: float, offset: int

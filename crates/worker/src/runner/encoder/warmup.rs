@@ -35,7 +35,7 @@ impl WarmupHooks for EncoderWarmup {
                 .capture_tiles(&lanes)
                 .map_err(|error| WorkerError::classify(error, Some("capture")))?;
         } else if let Some(image) = backend.parts().image {
-            image.encoders.capture_packed(&lanes).map_err(|error| {
+            image.encoders.capture_image(&lanes).map_err(|error| {
                 WorkerError::classify(error, Some("image graph capture")).with_phase("warmup")
             })?;
         }

@@ -391,6 +391,8 @@ fn image_input(
                     encoder: engine::ImageEncoder::Vision,
                     num_cache_tokens: Some(physical_tokens),
                     max_cache_tokens: None,
+                    height: None,
+                    width: None,
                 }],
             }],
         },
@@ -428,6 +430,8 @@ fn generation_request(
             encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: None,
+            height: None,
+            width: None,
         }],
         sample_feedback_continuation: true,
     };
@@ -1752,6 +1756,84 @@ fn image_requests_are_admitted_only_at_captured_steps() {
     }
 }
 
+/// Workers that encode latents under CUDA graphs report the image sizes
+/// they captured; the engine admits an input image's latent block only at
+/// one of them, and refuses a block of another size, or of no stated size,
+/// with the sizes it serves.
+#[test]
+fn latent_blocks_are_admitted_only_at_captured_sizes() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    sim.mut_info_for_test().captured_latents = Some(vec![[512, 512]]);
+    let scheduler =
+        support::scheduler(Box::new(SimExecutor::new(sim)), special_tokens(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let terminal = |id: u64, size: Option<(u32, u32)>| {
+        let mut request = generation_request(
+            RequestId(id),
+            image_input(vec![1, 2], vec![3, 4], id, 4, 5),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            4,
+        );
+        request.multimodal_inputs.images[0].encoders = vec![
+            ImageEncoderInput {
+                encoder: engine::ImageEncoder::Latent,
+                num_cache_tokens: Some(6),
+                max_cache_tokens: None,
+                height: size.map(|(height, _)| height),
+                width: size.map(|(_, width)| width),
+            },
+            ImageEncoderInput {
+                encoder: engine::ImageEncoder::Vision,
+                num_cache_tokens: Some(5),
+                max_cache_tokens: None,
+                height: None,
+                width: None,
+            },
+        ];
+        let mut events = handle.submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
+                    return Some(event);
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        None
+    };
+    let captured = terminal(1, Some((512, 512)));
+    let uncaptured = terminal(2, Some((512, 768)));
+    let unstated = terminal(3, None);
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+
+    assert!(
+        matches!(&captured, Some(Event::Finished { reason, .. }) if *reason != FinishReason::Error),
+        "{captured:?}"
+    );
+    for refused in [&uncaptured, &unstated] {
+        let Some(Event::Rejected {
+            kind: RejectionKind::Invalid,
+            message,
+        }) = refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            message.contains("only at the sizes they captured: 512x512"),
+            "{message}"
+        );
+    }
+}
+
 /// Workers that keep cache layers per request slot (a recurrent state) reuse
 /// no prefix and retain no reusable page, although the deployment enables
 /// prefix caching: a page does not hold the state its request reached.
@@ -2319,11 +2401,15 @@ fn a_latent_image_block_is_written_by_its_own_call() {
             encoder: engine::ImageEncoder::Latent,
             num_cache_tokens: Some(6),
             max_cache_tokens: None,
+            height: None,
+            width: None,
         },
         ImageEncoderInput {
             encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: Some(5),
             max_cache_tokens: None,
+            height: None,
+            width: None,
         },
     ];
     let mut events = handle.submit(request).expect("submit request");
@@ -2704,6 +2790,8 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
         encoder: engine::ImageEncoder::Vision,
         num_cache_tokens: Some(1),
         max_cache_tokens: None,
+        height: None,
+        width: None,
     }];
     request.image_generation.sample_feedback_continuation = false;
 

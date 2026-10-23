@@ -207,6 +207,9 @@ impl Scheduler {
         if let Some(refusal) = self.uncaptured_image(req) {
             return Err(refusal);
         }
+        if let Some(refusal) = self.uncaptured_latent(req) {
+            return Err(refusal);
+        }
         // A prefill group hands a request's cache to a decode group once,
         // after its prompt: such a deployment generates text.
         if self.splits_prefill()
@@ -875,7 +878,44 @@ impl Scheduler {
         sizes.dedup();
         Some(format!(
             "the workers serve {width}x{height} images with {branches} guidance branches \
-             under CUDA graphs only at the sizes they captured: {}",
+             under CUDA graphs only at the sizes they captured: {}; \
+             cuda_graph_config.flow_shapes names the sizes to capture",
+            if sizes.is_empty() {
+                "none".to_owned()
+            } else {
+                sizes.join(", ")
+            }
+        ))
+    }
+
+    /// Why the latent encoder cannot encode one of `req`'s input images, if
+    /// so: under CUDA graphs it encodes only the image sizes it captured
+    /// (`WorkerInfo::captured_latents`), and a latent block states the size
+    /// its image resizes to.
+    fn uncaptured_latent(&self, req: &GenerationRequest) -> Option<String> {
+        let captured = self.info.captured_latents.as_ref()?;
+        let block = req
+            .multimodal_inputs
+            .images
+            .iter()
+            .flat_map(|image| &image.encoders)
+            .filter(|input| input.encoder == crate::ImageEncoder::Latent)
+            .find(|input| match (input.height, input.width) {
+                (Some(height), Some(width)) => !captured.contains(&[height, width]),
+                _ => true,
+            })?;
+        let sizes: Vec<String> = captured
+            .iter()
+            .map(|[height, width]| format!("{width}x{height}"))
+            .collect();
+        let size = match (block.height, block.width) {
+            (Some(height), Some(width)) => format!("{width}x{height}"),
+            _ => "an unstated size".to_owned(),
+        };
+        Some(format!(
+            "an input image resizes to {size} for latent encoding, which the workers encode \
+             under CUDA graphs only at the sizes they captured: {}; serve with \
+             cuda_graph_config.policy = \"off\" to encode every size",
             if sizes.is_empty() {
                 "none".to_owned()
             } else {

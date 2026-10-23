@@ -288,6 +288,11 @@ def test_component_bindings_release_cancelled_requests(
     }
     devices = worker_config.pop("devices")
     visible_devices = max(devices) + 1
+    if torch.cuda.device_count() < visible_devices:
+        pytest.skip(
+            f"{parallel_kind} needs {visible_devices} devices; "
+            f"this host has {torch.cuda.device_count()}"
+        )
     # Mapping a product into a consumer's device needs peer access between the
     # two. A host that grants it only within its own device pairs cannot carry
     # device products between ranks that fall in different pairs, and there the
@@ -297,11 +302,6 @@ def test_component_bindings_release_cancelled_requests(
         for first in devices
         for second in devices
     )
-    if torch.cuda.device_count() < visible_devices:
-        pytest.skip(
-            f"{parallel_kind} needs {visible_devices} devices; "
-            f"this host has {torch.cuda.device_count()}"
-        )
     groups = {
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],

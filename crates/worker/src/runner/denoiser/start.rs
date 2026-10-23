@@ -76,7 +76,21 @@ impl DenoiserRunners {
                 })
             })
             .transpose()?;
-        let runner = DenoiserRunner::video(crate::runner::denoiser::DenoiserSetup {
+        // Under graphs a request's conditions are encoded through the
+        // encodings startup captures, which read the condition latents the
+        // video encoder writes.
+        let condition_latents = setup
+            .capacity
+            .outputs
+            .values()
+            .flatten()
+            .find(|output| output.name == "condition_video_latents")
+            .and_then(|output| {
+                let width = output.shape_bound.dims.get(1).map(extent)?;
+                Some((width as i64, DType::from(output.dtype)))
+            });
+        let condition_rows = plan.condition_rows;
+        let mut runner = DenoiserRunner::video(crate::runner::denoiser::DenoiserSetup {
             loaded,
             component: &placed.name,
             stream,
@@ -94,6 +108,9 @@ impl DenoiserRunners {
             transient_layouts: config.max_request_pool_size,
             memory: &mut *setup.memory,
         })?;
+        if let Some((width, dtype)) = condition_latents.filter(|_| condition_rows > 0) {
+            runner.serve_conditions(condition_rows, width, dtype)?;
+        }
         self.video = Some(Component {
             name: placed.name.clone(),
             config: placed.config.clone(),

@@ -422,6 +422,8 @@ impl ExecutorInfo {
         // one row.
         merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
         merged.captured_images = flow.and_then(|info| info.captured_images.clone());
+        merged.captured_latents = routed(CallKind::Media(MediaCall::LatentEncoding))
+            .and_then(|info| info.captured_latents.clone());
         merged.image_unconditional_token_ids =
             flow.and_then(|info| info.image_unconditional_token_ids.clone());
         merged.diffusion_lm_step_rows = self

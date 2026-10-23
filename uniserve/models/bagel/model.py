@@ -24,6 +24,12 @@ from .denoiser import Denoiser
 from .transformer import Transformer
 from .vision import Encoder
 
+# Images one packed vision call holds, each in a slot of the largest image's
+# patch rows. The largest packed graph's activations (this many slots)
+# bound the graph pool every slot count shares; a larger batch replays that
+# graph once per group.
+VISION_SLOTS = 8
+
 
 class Model(nn.Module):
     """Compose text, denoising, vision, and VAE over one backbone.
@@ -49,7 +55,9 @@ class Model(nn.Module):
 
         # BAGEL's ``Encoder`` applies its own connector and language-width
         # positions, so the wrapper's connector is the identity; downsample=1
-        # keeps one feature per SigLIP patch.
+        # keeps one feature per SigLIP patch. A slot holds the largest image
+        # the ViT transform prepares: its position table's whole grid.
+        side = config.vision.image_size // config.vision.patch_size
         self.vision_encoder = PatchEncoder(
             Encoder(config),
             nn.Identity(),
@@ -57,6 +65,8 @@ class Model(nn.Module):
             downsample=1,
             output_size=config.text.hidden_size,
             output_dtype=torch.bfloat16,
+            max_patches=side * side,
+            max_slots=VISION_SLOTS,
         )
 
         autoencoder = vae.Model(config.vae)

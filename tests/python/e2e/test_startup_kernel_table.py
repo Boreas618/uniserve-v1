@@ -5,9 +5,12 @@ completes. Startup runs
 every call kind, image encoders and decoders included, so for an
 image-understanding model the table already names the kernels that serve
 image inputs: here BAGEL's SigLIP vision tower, its autoencoder's encoder
-and decoder, the non-causal image-feature rows its prefill appends, and the
-image latents its denoiser writes into the prompt. A call kind without a
-native kernel would fail startup instead of its first request.
+and decoder, the image-feature rows its prefill appends, and the image
+latents its denoiser writes into the prompt. The server serves under CUDA
+graphs (the default policy on a CUDA device), where a prefill's image rows
+run in the captured bucket of prompts with vision blocks, whose rows state
+their causality on the device. A call kind without a native kernel would
+fail startup instead of its first request.
 
 The checkpoint directory comes from ``UNISERVE_BAGEL_MODEL``; the worker
 executable is ``UNISERVE_WORKER_EXECUTABLE``, else the test environment's
@@ -108,11 +111,13 @@ def test_bagel_startup_table_names_every_image_kernel(attention):
 
 
 def test_bagel_startup_serves_image_rows_before_the_first_request(attention):
-    # Prefill has served causal text and non-causal image rows, and the
-    # denoiser has written an input image's latent into the prompt.
+    # Prefill has served causal text rows and, in the captured bucket of
+    # prompts with vision blocks, image rows whose causality the device
+    # holds; the denoiser has written an input image's latent into the
+    # prompt.
     assert {
         "paged attention: causal rows",
-        "paged attention: non-causal rows",
+        "paged attention: device row causality",
     } <= inputs(attention["model.text"])
     assert "paged attention: non-causal rows" in inputs(
         attention["model.denoiser"]

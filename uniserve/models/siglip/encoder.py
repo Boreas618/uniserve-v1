@@ -123,9 +123,13 @@ class Encoder(nn.Module):
         self,
         pixels: torch.Tensor,
         grids: torch.Tensor,
-        grid_shapes: tuple[tuple[int, int], ...],
+        grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
         """Encode the packed patches of one or more images.
+
+        The computation reads the grids only as device values, so its shapes
+        depend only on the number of patch rows and grids, and a padded
+        packing (``PatchEncoder.encode_packed``) replays one captured call.
 
         Args:
             pixels: ``[total_patches, num_channels * patch_size**2]`` patch
@@ -133,22 +137,24 @@ class Encoder(nn.Module):
                 ``[images, channels, height, width]`` pixels of same-sized
                 images, which are patchified here.
             grids: ``[images, 2]`` int32 or int64 tensor of each image's
-                ``(height, width)`` in patches, on the encoder's device.
-            grid_shapes: The same ``(height, width)`` pairs as host integers,
-                so patch counts and kernel shapes are known without reading
-                device values.
+                ``(height, width)`` in patches, on the encoder's device. An
+                image's sides lie within ``1..image_size // patch_size``; a
+                padding segment of a packed batch may run past them, and a
+                ``(0, 0)`` grid is an empty segment.
+            grid_shapes: The same ``(height, width)`` pairs as host
+                integers, checked against the patch rows, or None when the
+                caller has checked the packing.
 
         Returns:
             ``[total_patches, hidden_size]`` features after the final
             layernorm, in input patch order.
 
         Raises:
-            ValueError: If the patch rows are not ``[sum of grid areas,
-                num_channels * patch_size**2]``, ``grids`` is not an
-                ``[images, 2]`` int32 or int64 tensor, or a grid side lies
-                outside ``1..image_size // patch_size``. ``patchify`` also
-                raises for NCHW pixels whose sides the patch size does not
-                divide.
+            ValueError: If the patch rows do not cover the declared grids,
+                ``grids`` is not an ``[images, 2]`` int32 or int64 tensor,
+                or a declared grid side lies outside ``1..image_size //
+                patch_size``. ``patchify`` also raises for NCHW pixels whose
+                sides the patch size does not divide.
         """
         if pixels.ndim == 4:
             pixels = patchify(
@@ -159,25 +165,41 @@ class Encoder(nn.Module):
         # every image grid must fit the fixed learned position table. The
         # checks compare shapes and host values only; ``grids`` values are
         # trusted to agree with ``grid_shapes``.
-        counts = tuple(height * width for height, width in grid_shapes)
+        counts = (
+            None
+            if grid_shapes is None
+            else tuple(height * width for height, width in grid_shapes)
+        )
         side = self.config.image_size // self.config.patch_size
         if (
             pixels.ndim != 2
-            or pixels.shape != (sum(counts), self.patch_embedding.in_features)
-            or grids.shape != (len(counts), 2)
+            or pixels.shape[1] != self.patch_embedding.in_features
+            or grids.ndim != 2
+            or grids.shape[1] != 2
             or grids.dtype not in (torch.int32, torch.int64)
-            or any(min(shape) < 1 or max(shape) > side for shape in grid_shapes)
+        ) or (
+            grid_shapes is not None
+            and counts is not None
+            and (
+                pixels.shape[0] != sum(counts)
+                or grids.shape[0] != len(counts)
+                or any(
+                    min(shape) < 1 or max(shape) > side for shape in grid_shapes
+                )
+            )
         ):
             raise ValueError(
                 "SigLIP patches and grid coordinates must cover "
                 "the declared image grids"
             )
 
-        # Row-major absolute position index within the side x side patch grid.
+        # Row-major absolute position index within the side x side patch
+        # grid. An image's rows lie within it; a padding segment's rows may
+        # run past it and read the last entry instead.
         columns, rows = build_abs_positions_from_grid_hw(
-            grids, total=sum(counts)
+            grids, total=pixels.shape[0]
         )
-        positions = rows * side + columns
+        positions = (rows * side + columns).clamp(max=side * side - 1)
 
         # Callers may stage pixels in another dtype; embed in the weight dtype.
         features = self.patch_embedding(
@@ -186,8 +208,9 @@ class Encoder(nn.Module):
         features = features + self.position_embedding(positions)
 
         # Varlen attention needs each image's patch count on device and their
-        # prefix-sum offsets, while the host copy drives kernel launch shapes.
-        # Queries and keys share the same lengths, and no image is causal.
+        # prefix-sum offsets; the host copy, when known, drives kernel launch
+        # shapes. Queries and keys share the same lengths, and no image is
+        # causal.
         values = grids.prod(dim=1).to(torch.int32)
         offsets = torch.cat(
             (values.new_zeros(1), values.cumsum(0, dtype=torch.int32))
@@ -196,6 +219,6 @@ class Encoder(nn.Module):
         return self.encoder(
             features,
             AttentionBatch.single(
-                VarlenInput(lengths, lengths, (False,) * len(counts))
+                VarlenInput(lengths, lengths, (False,) * grids.shape[0])
             ),
         )

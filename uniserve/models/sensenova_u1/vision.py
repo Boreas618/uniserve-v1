@@ -16,7 +16,10 @@ from torch import nn
 
 from uniserve.nn.functional import apply_rotary
 from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.vision.position import build_abs_positions_from_grid_hw
+from uniserve.nn.vision.position import (
+    build_abs_positions_from_grid_hw,
+    merged_squares,
+)
 
 
 def _finite(value: object) -> bool:
@@ -118,18 +121,35 @@ class Encoder(nn.Module):
         self,
         pixels: torch.Tensor,
         grids: torch.Tensor,
-        grid_shapes: tuple[tuple[int, int], ...],
+        grid_shapes: tuple[tuple[int, int], ...] | None,
     ) -> torch.Tensor:
-        counts = tuple(height * width for height, width in grid_shapes)
-        if grids.shape != (len(counts), 2) or grids.dtype not in (
-            torch.int32,
-            torch.int64,
+        """Encode images, or patch rows packed in fixed slots.
+
+        With ``grid_shapes`` None the computation reads the grids only as
+        device values: ``pixels`` are packed patch rows, ``grids`` cover
+        them in order (images and the padding segments of a packed batch,
+        a ``(0, 0)`` grid an empty segment, every side a multiple of the
+        reduction factor), and the shapes depend only on the number of rows
+        and grids, so a padded packing (``PatchEncoder.encode_packed``)
+        replays one captured call. Each image's tokens are those it has
+        alone.
+        """
+        counts = (
+            None
+            if grid_shapes is None
+            else tuple(height * width for height, width in grid_shapes)
+        )
+        if (
+            grids.ndim != 2
+            or grids.shape[1] != 2
+            or grids.dtype not in (torch.int32, torch.int64)
+            or (counts is not None and grids.shape[0] != len(counts))
         ):
             raise ValueError(
                 "NEO grids require one integer height/width pair per image"
             )
         factor = round(1 / self.config.downsample_ratio)
-        if any(
+        if grid_shapes is not None and any(
             min(shape) < 1 or any(axis % factor for axis in shape)
             for shape in grid_shapes
         ):
@@ -139,10 +159,9 @@ class Encoder(nn.Module):
 
         if pixels.ndim == 2:
             # Packed patches arrive as [total_patches, channels*patch*patch].
-            if pixels.shape != (
-                sum(counts),
-                self.config.num_channels * self.config.patch_size**2,
-            ):
+            if pixels.shape[1] != (
+                self.config.num_channels * self.config.patch_size**2
+            ) or (counts is not None and pixels.shape[0] != sum(counts)):
                 raise ValueError(
                     "NEO packed CHW pixels must cover the declared image grids"
                 )
@@ -152,7 +171,11 @@ class Encoder(nn.Module):
                 self.config.patch_size,
                 self.config.patch_size,
             )
-        if pixels.ndim != 4:
+        # Without host grids only packed patch rows are accepted.
+        packed = grid_shapes is None
+        if pixels.ndim != 4 or (
+            packed and pixels.shape[2:] != (self.config.patch_size,) * 2
+        ):
             raise ValueError(
                 "NEO pixels must be NCHW images or flattened CHW patches"
             )
@@ -164,11 +187,15 @@ class Encoder(nn.Module):
         features = features.permute(0, 2, 3, 1).reshape(
             -1, self.config.hidden_size
         )
-        if features.shape[0] != sum(counts):
+        if counts is not None and features.shape[0] != sum(counts):
             raise ValueError("NEO image grids must cover all projected patches")
+        if packed and features.shape[0] % factor**2:
+            raise ValueError(
+                "NEO packed patch rows must hold whole reduction squares"
+            )
 
         columns, rows = build_abs_positions_from_grid_hw(
-            grids, total=sum(counts)
+            grids, total=features.shape[0]
         )
         parts = []
         for hidden, coordinates, axis in zip(
@@ -177,12 +204,13 @@ class Encoder(nn.Module):
             (1, 0),
             strict=True,
         ):
+            # Without host grids, every coordinate lies below the row count.
             cosine, sine = self.rotary(
                 coordinates,
                 dtype=torch.float32,
-                sequence_length=max(
-                    (shape[axis] for shape in grid_shapes), default=0
-                ),
+                sequence_length=features.shape[0]
+                if grid_shapes is None
+                else max((shape[axis] for shape in grid_shapes), default=0),
             )
             parts.append(
                 apply_rotary(
@@ -191,6 +219,20 @@ class Encoder(nn.Module):
             )
         features = torch.cat(parts, dim=-1).to(features.dtype)
 
+        if grid_shapes is None:
+            # Each token's factor x factor square of patch rows, gathered from
+            # the device grids, reduced by the same convolution.
+            squares = merged_squares(
+                grids, features.shape[0] // factor**2, factor
+            )
+            blocks = (
+                features[squares]
+                .reshape(-1, factor, factor, self.config.hidden_size)
+                .permute(0, 3, 1, 2)
+            )
+            return self.dense_embedding(blocks).reshape(
+                -1, self.config.output_size
+            )
         if not grid_shapes:
             return features.new_empty((0, self.config.output_size))
 
@@ -207,7 +249,9 @@ class Encoder(nn.Module):
             )
         outputs = []
         for values, (height, width) in zip(
-            features.split(counts), grid_shapes, strict=True
+            features.split([height * width for height, width in grid_shapes]),
+            grid_shapes,
+            strict=True,
         ):
             spatial = values.reshape(1, height, width, -1).permute(0, 3, 1, 2)
             outputs.append(

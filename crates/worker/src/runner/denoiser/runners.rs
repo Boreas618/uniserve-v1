@@ -4,15 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ipc::{BufferId, CallKind, MediaCall, RequestKey};
+use models::video::ConditionRole;
 
-use super::image::{ConditionRow, DenoiseRow};
+use super::image::{ConditionRow, ConditionShape, DenoiseRow};
 use super::{DenoiserRunner, Evicted, VideoModel};
 use crate::cuda_graph::GraphPool;
 use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::memory::{LatentCache, PrefixCache, UnitColumn};
 use crate::profiling::kernels::KernelRecord;
-use crate::request::video::{MediaPlan, VideoLayout, VideoSize};
+use crate::request::video::{self, MediaPlan, VideoLayout, VideoSize};
 use crate::runner::component::Component;
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -58,6 +59,9 @@ pub(crate) struct DenoiserRunners {
     /// graphs are off.
     flow: Vec<FlowShape>,
     flow_pools: Vec<Arc<GraphPool>>,
+    /// The `[height, width]` latent image sizes whose conditioning startup
+    /// captures into the same pools: those the latent encoder captured.
+    conditions: Vec<[u32; 2]>,
     /// Whether the image denoiser serves under CUDA graphs (graph policy
     /// not `off`, on a CUDA device): it then denoises only the captured
     /// steps.
@@ -67,14 +71,15 @@ pub(crate) struct DenoiserRunners {
 }
 
 impl DenoiserRunners {
-    /// The denoiser of an image model with the steps startup captures,
-    /// their graph pools and the unit reset column of its stream.
-    /// Under `graphs` the denoiser denoises only the steps startup
-    /// captured once it is sealed ([`Self::seal_image`]).
+    /// The denoiser of an image model with the steps and the conditioning
+    /// sizes startup captures, their graph pools and the unit reset column
+    /// of its stream. Under `graphs` the denoiser evaluates only what
+    /// startup captured once it is sealed ([`Self::seal_image`]).
     pub(crate) fn image(
         denoiser: Option<(String, DenoiserRunner)>,
         flow: Vec<FlowShape>,
         flow_pools: Vec<Arc<GraphPool>>,
+        conditions: Vec<[u32; 2]>,
         graphs: bool,
         units: Option<UnitColumn>,
     ) -> Self {
@@ -83,6 +88,7 @@ impl DenoiserRunners {
             image: denoiser,
             flow,
             flow_pools,
+            conditions,
             image_graphs,
             units,
             ..Self::default()
@@ -105,10 +111,10 @@ impl DenoiserRunners {
         }
     }
 
-    /// Capture the image denoiser's configured steps over scratch prefix
-    /// cache of `prefix_cache`, with their samples in the step workspace of
-    /// `latents`, as jobs of the lane on `lanes` serving denoising; a last
-    /// job waits for the stream.
+    /// Capture the image denoiser's configured steps and conditionings over
+    /// scratch prefix cache of `prefix_cache`, with their samples and
+    /// features in the step workspace of `latents`, as jobs of the lane on
+    /// `lanes` serving denoising; a last job waits for the stream.
     pub(crate) fn capture_flow(
         &mut self,
         latents: Option<&LatentCache>,
@@ -126,13 +132,76 @@ impl DenoiserRunners {
         for shape in &shapes {
             self.capture_step(shape, &pools, latents, prefix_cache, lanes)?;
         }
+        for size in self.conditions.clone() {
+            self.capture_condition(size, &pools, latents, prefix_cache, lanes)?;
+        }
         if let Some((_, denoiser)) = &self.image {
             let job = Job::new();
             job.on(denoiser.stream()).synchronize()?;
             perform(lanes, job)?;
-            tracing::info!("captured {} image denoising graphs", denoiser.captured());
+            tracing::info!(
+                conditionings = self.conditions.len(),
+                "captured {} image denoising graphs",
+                denoiser.captured()
+            );
         }
         Ok(())
+    }
+
+    /// Capture the conditioning of one latent image of `height` x `width`
+    /// after a scratch slot's prefix, its features zero rows of the step
+    /// workspace of `latents`. Three jobs of the lane serving denoising, as
+    /// [`Self::capture_step`] runs them: one zeroes the features and
+    /// installs the scratch table, one warms and captures the conditioning,
+    /// whose completion carries the graph, and one clears the table and
+    /// resets the scratch units, whether or not the capture succeeded.
+    fn capture_condition(
+        &mut self,
+        [height, width]: [u32; 2],
+        pools: &[Arc<GraphPool>],
+        latents: &LatentCache,
+        prefix_cache: &mut PrefixCache,
+        lanes: &JobQueues,
+    ) -> Result<()> {
+        let Some((_, denoiser)) = &mut self.image else {
+            return Ok(());
+        };
+        let layout = *denoiser.layout()?;
+        let units = layout.latent_rows(height, width)?;
+        let prefix = CAPTURE_PREFIX as u32;
+        let length = prefix + layout.sequence_length(height, width)?;
+        let features = latents.workspace()?.narrow(0, 0, i64::from(units))?;
+        let stream = denoiser.stream().cloned();
+
+        let before = Job::new();
+        // SAFETY: the latent cache keeps its workspace past the capture,
+        // whose jobs are performed in order before it returns; nothing else
+        // uses the workspace before serving starts.
+        unsafe { features.zero(before.on(stream.as_ref())) }?;
+        let scratch =
+            prefix_cache.install_scratch(&[length as usize], before.on(stream.as_ref()))?;
+        perform(lanes, before)?;
+
+        let job = Job::new();
+        let row = ConditionRow {
+            features,
+            height,
+            width,
+            slot: 1,
+            prefix,
+            position: u64::from(prefix),
+        };
+        let captured = denoiser
+            .condition_latents(&[row], prefix_cache, Some(pools), &job)
+            .and_then(|()| perform(lanes, job))
+            .and_then(|mut completion| {
+                denoiser.complete_condition(ConditionShape { height, width }, &mut completion)
+            });
+
+        let after = Job::new();
+        let released = prefix_cache.release_scratch(scratch, 1, after.on(stream.as_ref()));
+        let performed = perform(lanes, after).map(drop);
+        captured.and(released).and(performed)
     }
 
     /// Run the image denoiser's eager calls once over scratch prefix cache
@@ -142,8 +211,8 @@ impl DenoiserRunners {
     /// and, when the model `conditions` on latent images, the write of a
     /// zero latent image's K/V after that prefix.
     ///
-    /// Serving evaluates every step no graph holds, and every latent
-    /// conditioning, eagerly. Running each call here selects and compiles
+    /// Without CUDA graphs serving evaluates every step and every latent
+    /// conditioning eagerly. Running each call here selects and compiles
     /// the kernels of its attention inputs (a segmented read of the prefix,
     /// and non-causal paged rows) before the first image request; kernel
     /// choice depends on the input class, not on lengths. Four jobs: one
@@ -211,7 +280,7 @@ impl DenoiserRunners {
                 position: u64::from(prefix),
             };
             warmed = denoiser
-                .condition_latents(&[condition], prefix_cache, &job)
+                .condition_latents(&[condition], prefix_cache, None, &job)
                 .and_then(|()| perform(lanes, job).map(drop));
         }
 
@@ -358,10 +427,13 @@ impl DenoiserRunners {
         Ok(Some(id))
     }
 
-    /// Prepare and warm every startup layout (the largest first, so it
-    /// sizes the shared workspace) and the conditioner capacities. Each
-    /// warmup is a job of the denoiser's lane on `lanes`, which startup
-    /// waits for.
+    /// Prepare and warm every startup layout, those of requests with
+    /// conditions under graphs and each canvas's largest, in the plan's
+    /// order, which every rank shares since a layout's warm step exchanges
+    /// tensors with the other ranks, then the conditioner capacities. The
+    /// layout the denoiser was constructed with ([`MediaPlan::maximum`]) is
+    /// among the largest. Each warmup is a job of the denoiser's lane on
+    /// `lanes`, which startup waits for.
     pub(crate) fn prepare_startup(
         &mut self,
         model: &VideoModel,
@@ -371,8 +443,10 @@ impl DenoiserRunners {
         if let Some(denoiser) = &mut self.video {
             let runner = &mut denoiser.runner;
             let mut ids = Vec::new();
-            for layout in std::iter::once(&plan.maximum)
-                .chain(&plan.layouts)
+            for layout in plan
+                .layouts
+                .iter()
+                .chain(&plan.conditioned)
                 .chain(&plan.largest)
             {
                 let id = runner.prepare_startup(model, *layout)?;
@@ -404,7 +478,8 @@ impl DenoiserRunners {
         Ok(())
     }
 
-    /// Capture the startup layouts and conditioner capacities, then refuse
+    /// Capture the startup layouts (those of requests with conditions
+    /// among them under graphs) and conditioner capacities, then refuse
     /// further captures. Each layout's capture is a job of the denoiser's
     /// lane on `lanes`, whose completion carries the graph; a last job
     /// warms and captures the conditioner capacities and waits for the
@@ -417,12 +492,36 @@ impl DenoiserRunners {
     ) -> Result<()> {
         if let Some(denoiser) = &mut self.video {
             let runner = &mut denoiser.runner;
-            for layout in &plan.layouts {
+            for layout in plan.layouts.iter().chain(&plan.conditioned) {
                 let id = runner.prepare_startup(model, *layout)?;
                 let job = Job::new();
                 if runner.capture(id, &job)? {
                     let mut completion = perform(lanes, job)?;
                     runner.complete_capture(id, &mut completion)?;
+                }
+            }
+            // Every keyframe set a request may bring, encoded into each
+            // layout of requests with conditions.
+            for layout in &plan.conditioned {
+                let id = runner.prepare_startup(model, *layout)?;
+                let keyframe = |role| video::ConditionShape {
+                    role,
+                    pixels: Some((1, layout.canvas)),
+                    audio_samples: 0,
+                };
+                for conditions in [
+                    vec![keyframe(ConditionRole::FirstFrame)],
+                    vec![keyframe(ConditionRole::LastFrame)],
+                    vec![
+                        keyframe(ConditionRole::FirstFrame),
+                        keyframe(ConditionRole::LastFrame),
+                    ],
+                ] {
+                    let job = Job::new();
+                    if let Some(key) = runner.capture_conditions(id, conditions.into(), &job)? {
+                        let mut completion = perform(lanes, job)?;
+                        runner.complete_conditions(key, &mut completion)?;
+                    }
                 }
             }
             let job = Job::new();

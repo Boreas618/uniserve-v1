@@ -30,6 +30,7 @@ use crate::memory::PinnedPool;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::runner::RunnerSetup;
 use crate::runner::methods::{Argument, MethodCall, Methods, RunnerClass};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// A condition encoding was recorded before the job that constructs its
@@ -103,6 +104,25 @@ pub(super) struct Conditions {
     encode_tile: Function,
     /// The captured still-frame tile encoding, once startup captured it.
     tile: Option<StillTile>,
+    /// Under CUDA graphs, the keyframe encodings startup captured, which
+    /// alone the encoders serve.
+    keyframes: Option<Keyframes>,
+}
+
+/// The keyframe encodings startup captured under CUDA graphs, by input
+/// shapes (`[1, height, width, 3]` per keyframe): a call copies its
+/// keyframes' pixels into `pixels`, back to back, replays the graph of its
+/// shapes and copies its rows out of `rows`. Their runners encode tiles
+/// inline, so each graph holds the whole encoding.
+struct Keyframes {
+    /// The encoders' stream, which the graphs replay on.
+    stream: Stream,
+    /// `[pixels, 3]` uint8 condition pixels of one call's keyframes.
+    pixels: StorageView,
+    /// `[rows, width]` encoded rows of one call's keyframes.
+    rows: StorageView,
+    graphs: GraphTable<Vec<i64>>,
+    runners: HashMap<Vec<i64>, Methods>,
 }
 
 /// A captured still-frame tile encoding: the Python tile runner, whose
@@ -185,6 +205,7 @@ impl Conditions {
             tile_runner: MethodCall::new(&method("tile")?, video.arguments()),
             encode_tile: method("encode_tile")?,
             tile: None,
+            keyframes: None,
         })
     }
 
@@ -214,10 +235,21 @@ impl Conditions {
             self.posterior_order.push_back(size);
         }
         while self.posterior_order.len() > POSTERIORS {
+            // A captured keyframe encoding reads its size's draw on every
+            // replay, so that draw stays.
+            let captured = |size: &[i64; 3]| {
+                let [frames, width, height] = *size;
+                self.keyframes.as_ref().is_some_and(|keyframes| {
+                    keyframes
+                        .runners
+                        .keys()
+                        .any(|shapes| shapes[..4] == [frames, height, width, 3])
+                })
+            };
             let Some(index) = self
                 .posterior_order
                 .iter()
-                .position(|held| !current.contains(held))
+                .position(|held| !current.contains(held) && !captured(held))
             else {
                 break;
             };
@@ -275,6 +307,137 @@ impl Conditions {
             graphs,
             stream: stream.clone(),
         });
+        Ok(())
+    }
+
+    /// Capture the encoding of `1..=per_call` keyframes of each of
+    /// `canvases` into `pool` on `stream`, rows of `row_width` values of
+    /// `row_dtype`, and from then on encode only keyframes of those shapes.
+    /// Each capture is a job `perform` performs on the encoder's lane: the
+    /// construction of the shapes' runner, then its eager encoding, which
+    /// compiles its kernels outside the capture, and the capture. A size's
+    /// posterior draw is filled here and held for the graphs' life.
+    #[expect(clippy::too_many_arguments, reason = "the capture's coordinates")]
+    fn capture_keyframes(
+        &mut self,
+        canvases: &[Canvas],
+        per_call: u32,
+        row_width: i64,
+        row_dtype: DType,
+        pool: &GraphPool,
+        stream: &Stream,
+        device: DeviceId,
+        perform: &mut dyn FnMut(Job) -> Result<Completion>,
+    ) -> Result<()> {
+        let area = |canvas: &Canvas| i64::from(canvas.width) * i64::from(canvas.height);
+        let mut canvases = canvases.to_vec();
+        canvases.sort_by_key(|canvas| std::cmp::Reverse(area(canvas)));
+        let largest = canvases.first().map_or(0, area);
+        let rows_per_frame = |canvas: &Canvas| {
+            i64::from(canvas.width / CANVAS_MULTIPLE) * i64::from(canvas.height / CANVAS_MULTIPLE)
+        };
+        let most_rows = canvases.iter().map(rows_per_frame).max().unwrap_or(0);
+        let per_call = i64::from(per_call.max(1));
+        let allocate = |dtype: DType, shape: &[i64]| -> Result<StorageView> {
+            let bytes = shape.iter().product::<i64>().max(1) as usize * dtype.bytes();
+            StorageView::contiguous(Storage::device(device, bytes)?, 0, dtype, shape)
+        };
+        let mut keyframes = Keyframes {
+            stream: stream.clone(),
+            pixels: allocate(DType::U8, &[largest * per_call, 3])?,
+            rows: allocate(row_dtype, &[most_rows * per_call, row_width])?,
+            graphs: GraphTable::new(
+                format!("{ENCODER}.keyframes"),
+                crate::parallel::joins::GraphFunctions::import()?.release,
+            ),
+            runners: HashMap::new(),
+        };
+        // SAFETY: new allocations the encoders keep until they close after
+        // their stream drained; the captured encodings read them behind the
+        // fill on that stream.
+        unsafe { keyframes.pixels.zero(Some(stream)) }?;
+        stream.synchronize()?;
+        for canvas in &canvases {
+            let (width, height) = (i64::from(canvas.width), i64::from(canvas.height));
+            let size = [1, width, height];
+            if !self.posteriors.contains_key(&size) {
+                let arguments = [
+                    self.loaded.to_any(),
+                    Any::from(1_i64),
+                    Any::from(width),
+                    Any::from(height),
+                ];
+                let elements: i64 = self
+                    .posterior_elements
+                    .call_as(&arguments.iter().map(Into::into).collect::<Vec<_>>())?;
+                let posterior = if elements == 0 {
+                    Posterior::None
+                } else {
+                    let memory = Storage::pinned(self.device, elements as usize * 4)?;
+                    let noise = StorageView::contiguous(
+                        memory as Arc<dyn Backing>,
+                        0,
+                        DType::F32,
+                        &[elements],
+                    )?;
+                    let mut draw = arguments.to_vec();
+                    draw.push(noise.handle()?.to_any());
+                    self.draw_posterior.call_values(&draw)?;
+                    Posterior::Drawn(noise)
+                };
+                self.posteriors.insert(size, posterior);
+                self.posterior_order.push_back(size);
+            }
+            for count in (1..=per_call).rev() {
+                let shapes: Vec<i64> = (0..count).flat_map(|_| [1, height, width, 3]).collect();
+                let job = Job::new();
+                job.call_handle(self.video.construction(vec![
+                    Argument::Integers(shapes.clone()),
+                    Argument::None,
+                    Argument::None,
+                ]));
+                let runner = self.video.constructed(perform(job)?.handle()?);
+                let units: Vec<i64> = (0..count)
+                    .flat_map(|index| {
+                        [
+                            index * width * height,
+                            1,
+                            width,
+                            height,
+                            0,
+                            0,
+                            height / i64::from(CANVAS_MULTIPLE),
+                        ]
+                    })
+                    .collect();
+                let mut arguments = vec![
+                    Argument::Handle(runner.runner().clone()),
+                    Argument::Tensor(keyframes.pixels.prefix(count * width * height)?),
+                    Argument::Tensor(keyframes.rows.prefix(count * rows_per_frame(canvas))?),
+                    Argument::Integers(units),
+                ];
+                if let Some(Posterior::Drawn(noise)) = self.posteriors.get(&size) {
+                    arguments.extend((0..count).map(|_| Argument::Tensor(noise.clone())));
+                }
+                let encode = MethodCall::new(&self.video.forward, arguments);
+                let job = Job::new();
+                job.call(encode.clone());
+                job.capture(Capture {
+                    functions: runner.graphs.clone(),
+                    pool: pool.value.clone(),
+                    peers: Vec::new(),
+                    stream: stream.raw(),
+                    device,
+                    method: encode,
+                    breaks: None,
+                });
+                let graph = perform(job)?.captured()?;
+                keyframes.graphs.insert(shapes.clone(), None, graph)?;
+                keyframes.runners.insert(shapes, runner);
+            }
+        }
+        keyframes.graphs.seal();
+        self.keyframes = Some(keyframes);
         Ok(())
     }
 
@@ -378,6 +541,15 @@ impl Conditions {
                     (ConditionMedium::Audio, Self::track_shapes(lengths))
                 }
             };
+            // Under graphs only the captured keyframe encodings serve.
+            if let Some(keyframes) = &self.keyframes {
+                if medium == ConditionMedium::Video && keyframes.runners.contains_key(&shapes) {
+                    continue;
+                }
+                return Err(Error::Invalid(format!(
+                    "no captured CUDA graph encodes condition media of shapes {shapes:?}"
+                )));
+            }
             let (class, constructed) = match medium {
                 ConditionMedium::Video => (&self.video, &self.video_runners),
                 ConditionMedium::Audio => (&self.audio, &self.audio_runners),
@@ -507,6 +679,45 @@ impl Conditions {
         out: &StorageView,
         job: &Job,
     ) -> Result<()> {
+        if let Some(keyframes) = &self.keyframes {
+            // Each keyframe's pixels are copied into the encoders', back to
+            // back, the graph of the call's shapes replays, and the rows are
+            // copied out.
+            let shapes = self.unit_shapes(units)?.ok_or(MISSING_ENCODER)?;
+            let graph = match keyframes.graphs.lookup(&shapes, None)? {
+                Lookup::Replay(graph) => graph,
+                Lookup::Capture => return Err(MISSING_ENCODER),
+            };
+            let issue = job.on(Some(&keyframes.stream));
+            let mut input = cuda::CopyBatch::new(cuda::SourceOrder::Stream);
+            let mut offset = 0_u64;
+            for &[first, frames, width, height, ..] in units {
+                let bytes = (frames * width * height * 3) as u64;
+                input.push(
+                    keyframes.pixels.address() + offset,
+                    pixels.address() + first as u64 * 3,
+                    bytes as usize,
+                );
+                offset += bytes;
+            }
+            // SAFETY: each keyframe's pixels lie in the condition pixels the
+            // batch read, alive until it commits, and the encoders' pixels
+            // hold them; only the captured encodings read those, in stream
+            // order.
+            unsafe { issue.copy(&input) }?;
+            issue.launch(graph)?;
+            let mut output = cuda::CopyBatch::new(cuda::SourceOrder::Stream);
+            output.push(
+                out.address(),
+                keyframes.rows.address(),
+                out.nbytes() as usize,
+            );
+            // SAFETY: the encoders' rows hold the call's, written by the graph
+            // before this copy on the same stream, and `out` is the region
+            // the caller bound for them.
+            unsafe { issue.copy(&output) }?;
+            return Ok(());
+        }
         let runner = self
             .unit_shapes(units)?
             .and_then(|shapes| self.video_runners.get(&shapes))
@@ -556,7 +767,13 @@ impl Conditions {
     }
 
     pub(crate) fn kernel_calls(&self) -> Vec<MethodCall> {
-        let mut calls = self.video.kernel_calls(self.video_runners.values());
+        let mut calls = self.video.kernel_calls(
+            self.video_runners.values().chain(
+                self.keyframes
+                    .iter()
+                    .flat_map(|keyframes| keyframes.runners.values()),
+            ),
+        );
         calls.extend(self.audio.kernel_calls(self.audio_runners.values()));
         calls
     }
@@ -569,6 +786,10 @@ impl Conditions {
         if let Some(tile) = &mut self.tile {
             result = result.and(self.video.close(aborted, [&tile.runner]));
             result = result.and(tile.graphs.close(aborted));
+        }
+        if let Some(keyframes) = &mut self.keyframes {
+            result = result.and(keyframes.graphs.close(aborted));
+            result = result.and(self.video.close(aborted, keyframes.runners.values()));
         }
         result
     }
@@ -696,6 +917,9 @@ impl EncoderRunner {
             pinned: PinnedPool::new(Some(video.device)),
             resident: None,
             noise: None,
+            encoded: None,
+            latent_sizes: None,
+            blocks: None,
             text: None,
             text_capacities: Vec::new(),
             config: EncoderConfig::default(),
@@ -724,6 +948,31 @@ impl EncoderRunner {
         }
         self.condition_encoders()?
             .capture_tile(pool, &stream, device, perform)
+    }
+
+    /// Capture the condition encoders' keyframe encodings into `pool` and
+    /// serve only those ([`Conditions::capture_keyframes`]): `1..=per_call`
+    /// keyframes of each of `canvases`, rows of `row_width` values of
+    /// `row_dtype`.
+    pub(crate) fn capture_keyframes(
+        &mut self,
+        canvases: &[Canvas],
+        per_call: u32,
+        (row_width, row_dtype): (i64, DType),
+        pool: &GraphPool,
+        perform: &mut dyn FnMut(Job) -> Result<Completion>,
+    ) -> Result<()> {
+        let (Some(stream), Device::Cuda(device)) = (self.stream.clone(), self.device) else {
+            return Ok(());
+        };
+        if pool.device != device {
+            return Err(Error::Invariant(
+                "an encoder captures into a pool of its device".into(),
+            ));
+        }
+        self.condition_encoders()?.capture_keyframes(
+            canvases, per_call, row_width, row_dtype, pool, &stream, device, perform,
+        )
     }
 
     fn condition_encoders(&mut self) -> Result<&mut Conditions> {

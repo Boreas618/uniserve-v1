@@ -251,6 +251,8 @@ impl From<&ImageEncoderInput> for wire::ImageEncoderInput {
             encoder: encoder as i32,
             num_cache_tokens: input.num_cache_tokens,
             max_cache_tokens: input.max_cache_tokens,
+            height: input.height,
+            width: input.width,
         }
     }
 }
@@ -267,6 +269,8 @@ impl TryFrom<wire::ImageEncoderInput> for ImageEncoderInput {
             encoder,
             num_cache_tokens: input.num_cache_tokens,
             max_cache_tokens: input.max_cache_tokens,
+            height: input.height,
+            width: input.width,
         })
     }
 }

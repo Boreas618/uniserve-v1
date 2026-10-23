@@ -134,6 +134,8 @@ impl SenseNovaProfile {
             encoder: proto::request::ImageEncoder::Vision,
             num_cache_tokens: None,
             max_cache_tokens: None,
+            height: None,
+            width: None,
         }];
         let image_num_positions = 1;
         let image_generation = ImageGenerationConfig {
@@ -150,6 +152,8 @@ impl SenseNovaProfile {
                 encoder: proto::request::ImageEncoder::Vision,
                 num_cache_tokens: None,
                 max_cache_tokens: None,
+                height: None,
+                width: None,
             }],
             sample_feedback_continuation: true,
         };
@@ -302,6 +306,8 @@ impl OmniProfile for SenseNovaProfile {
             encoder: proto::request::ImageEncoder::Vision,
             num_cache_tokens: Some(tokens),
             max_cache_tokens: None,
+            height: None,
+            width: None,
         }])
     }
 

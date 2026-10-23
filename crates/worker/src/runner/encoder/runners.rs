@@ -45,17 +45,21 @@ pub(crate) struct EncoderRunners {
     pub(crate) latent: Option<Component<EncoderRunner>>,
     /// The condition latent encoders' graph pool, when graphs are captured.
     pub(crate) latent_pool: Option<Arc<GraphPool>>,
+    /// Under CUDA graphs, the keyframes the condition latent encoders
+    /// capture: the admitted canvases, the most keyframes one call encodes,
+    /// and the width and dtype of the rows they write.
+    pub(crate) keyframes: Option<(Vec<models::video::Canvas>, u32, (i64, crate::ffi::DType))>,
     /// An image model's encoders, in construction order.
     pub(crate) image: Vec<EncoderRunner>,
     /// The image encoder serving each component's call kind.
     routes: HashMap<(String, CallKind), usize>,
-    /// Graph pools of packed vision encoders, by encoder.
+    /// Graph pools of the image encoders that capture, by encoder.
     pools: HashMap<usize, Arc<GraphPool>>,
 }
 
 impl EncoderRunners {
     /// The encoders of an image model, routed by component and call kind,
-    /// with the graph pools of the packed ones.
+    /// with the graph pools of those that capture.
     pub(crate) fn image(
         encoders: Vec<EncoderRunner>,
         routes: HashMap<(String, CallKind), usize>,
@@ -97,10 +101,10 @@ impl EncoderRunners {
         Ok(())
     }
 
-    /// Capture every packed vision encoder's graphs into its pool, each
-    /// forward a job of the lane on `lanes` serving the call kind the
-    /// encoder is routed for.
-    pub(crate) fn capture_packed(&mut self, lanes: &JobQueues) -> Result<()> {
+    /// Capture every image encoder's graphs into its pool (packed vision
+    /// slot counts, latent image sizes), each forward a job of the lane on
+    /// `lanes` serving the call kind the encoder is routed for.
+    pub(crate) fn capture_image(&mut self, lanes: &JobQueues) -> Result<()> {
         for (index, runner) in self.image.iter_mut().enumerate() {
             let Some(pool) = self.pools.get(&index) else {
                 continue;
@@ -113,6 +117,15 @@ impl EncoderRunners {
         Ok(())
     }
 
+    /// The image sizes the latent encoder captured
+    /// (`WorkerInfo::captured_latents`), which alone it encodes; `None` when
+    /// it encodes eagerly or the rank holds none.
+    pub(crate) fn captured_latents(&self) -> Option<Vec<[u32; 2]>> {
+        self.image
+            .iter()
+            .find_map(|runner| runner.latent_sizes().map(<[_]>::to_vec))
+    }
+
     /// Seal every image encoder's graphs.
     pub(crate) fn seal_image(&mut self) {
         for runner in &mut self.image {
@@ -120,9 +133,10 @@ impl EncoderRunners {
         }
     }
 
-    /// Capture the text encoder's prompt capacities, each forward a job of
-    /// the text encoder's lane on `lanes`, then refuse further captures
-    /// once a last job waited for the stream.
+    /// Capture the text encoder's prompt capacities and its vision tower's
+    /// block grids, each forward a job of the lane serving its call kind
+    /// on `lanes`, then refuse further captures once a last job waited for
+    /// the stream.
     pub(crate) fn capture_text(&mut self, lanes: &JobQueues) -> Result<()> {
         if let Some(text) = &mut self.text {
             let kind = CallKind::Media(MediaCall::TextEncoding);
@@ -132,6 +146,14 @@ impl EncoderRunners {
                 .capture_with(self.text_pool.as_ref(), &mut || Ok(()), &mut |job| {
                     perform(lanes, kind, job)
                 })?;
+            // The vision tower computes on the text encoder's stream, so its
+            // block graphs share the text encoder's pool.
+            if let Some(vision) = &mut self.vision {
+                let kind = CallKind::Media(MediaCall::VisionEncoding);
+                vision.capture_with(self.text_pool.as_ref(), &mut || Ok(()), &mut |job| {
+                    perform(lanes, kind, job)
+                })?;
+            }
             let job = Job::new();
             job.on(text.runner.stream()).synchronize()?;
             perform(lanes, kind, job)?;
@@ -143,9 +165,10 @@ impl EncoderRunners {
         Ok(())
     }
 
-    /// Capture the condition latent encoders' still-frame tile encoding,
-    /// each step a job of the latent encoder's lane on `lanes`, then wait
-    /// for the encoders' stream. Without a graph pool nothing is captured.
+    /// Capture the condition latent encoders' still-frame tile encoding and
+    /// their keyframe encodings, each step a job of the latent encoder's
+    /// lane on `lanes`, then wait for the encoders' stream. Without a graph
+    /// pool nothing is captured.
     pub(crate) fn capture_tiles(&mut self, lanes: &JobQueues) -> Result<()> {
         let (Some(latent), Some(pool)) = (&mut self.latent, &self.latent_pool) else {
             return Ok(());
@@ -154,6 +177,13 @@ impl EncoderRunners {
         latent
             .runner
             .capture_tile(pool, &mut |job| perform(lanes, kind, job))?;
+        if let Some((canvases, per_call, rows)) = &self.keyframes {
+            latent
+                .runner
+                .capture_keyframes(canvases, *per_call, *rows, pool, &mut |job| {
+                    perform(lanes, kind, job)
+                })?;
+        }
         let job = Job::new();
         job.on(latent.runner.stream()).synchronize()?;
         perform(lanes, kind, job)?;

@@ -1,31 +1,39 @@
 //! Image decoding: the image decoder of a bound component and the image batches
-//! it serves. A batch decodes in consecutive sub-batches ([`Chunk`]) of the
+//! it serves. Under CUDA graphs each image replays the graph captured at its
+//! size: its latent rows are copied into the decoder's fixed inputs, the
+//! graph decodes them into the decoder's fixed values and the head of the
+//! staging bytes, and the values are copied into the image product. Without
+//! graphs a batch decodes in consecutive sub-batches ([`Chunk`]) of the
 //! images whose pixels fit the decoder's staging bytes, images of one size
-//! together; each decoded image is optionally published as an image product and
-//! quantized into staging, from which a host lane encodes it.
+//! together, each one eager call. Either way each decoded image is
+//! optionally published as an image product and quantized into staging,
+//! from which a host lane encodes it.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
 use ipc::{Batch as BatchPlan, BufferId, ForwardStats};
 
 use super::{DECODER, DecodeImage};
 use crate::config::Device;
+use crate::cuda_graph::{GraphMode, GraphPool, GraphTable, Lookup};
 use crate::executor::image::ImageParts;
 use crate::executor::image::{Encoding, ImageBatch, allocations};
 use crate::ffi::{DType, Function, Handle, Interpreter};
 use crate::host::HostTask;
 use crate::host::image::{ImageTask, ImageWork};
-use crate::lane::Job;
+use crate::lane::{Capture, Completion, Job};
 use crate::lock;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::{
     LatentUpdate, Metadata, OutputPlacement, ProductBuffer, TrajectoryVersion, ValueRange,
 };
+use crate::parallel::joins::GraphFunctions;
 use crate::runner::ImageSetup;
 use crate::runner::methods::{Argument, MethodCall};
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// An image decoder of a bound component.
@@ -37,19 +45,49 @@ pub(super) struct ImageDecoder {
     pub(super) runner: Handle,
     pub(super) decode: Function,
     quantize: Function,
+    decode_one: Function,
+    quantize_one: Function,
     pub(super) kernels: Function,
     pub(super) close: Function,
     /// The decoder's pixel range, `(low, high)`.
     pub(super) range: (f32, f32),
     staging: StorageView,
+    /// The latent pool's step workspace, which a batch gathers each
+    /// trajectory into.
+    latents: StorageView,
+    /// `[units, width]` latent rows of one image, read by every captured
+    /// decode.
+    inputs: StorageView,
+    /// Flat BF16 values of one image, as an image product holds them:
+    /// written by every captured decode, read by every captured quantize.
+    values: StorageView,
+    pub(super) graphs: GraphTable<OneImage>,
+    capture: GraphFunctions,
+    /// The graph pools captures allocate in, the decoder's device's first
+    /// and a generation tower's after it; empty without graphs, which
+    /// decodes every image eagerly.
+    pools: Vec<Arc<GraphPool>>,
+}
+
+/// The graph key of one image's decode or quantization at its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct OneImage {
+    /// A resident image product quantized; otherwise latent rows decoded.
+    quantize: bool,
+    height: u32,
+    width: u32,
 }
 
 impl ImageDecoder {
+    /// Under graphs ([`Self::set_pools`]) the decoder decodes images of at
+    /// most `input_units` latent rows and `values` elements.
     pub(super) fn new(
         setup: &ImageSetup<'_>,
         range: (f32, f32),
         latents: StorageView,
         staging_bytes: usize,
+        input_units: u32,
+        values: usize,
     ) -> Result<Self> {
         let owner = setup.owner();
         let (device, stream) = (setup.device, setup.stream.clone());
@@ -63,39 +101,192 @@ impl ImageDecoder {
             Device::Cpu => Storage::host(staging_bytes.max(1)),
         };
         let staging = StorageView::contiguous(memory, 0, DType::U8, &[staging_bytes as i64])?;
+        let buffer = |dtype: DType, shape: &[i64]| -> Result<StorageView> {
+            let bytes = shape.iter().product::<i64>().max(1) as usize * dtype.bytes();
+            let memory: std::sync::Arc<dyn crate::ffi::Backing> = match device {
+                Device::Cuda(index) => Storage::device(index, bytes)?,
+                Device::Cpu => Storage::host(bytes),
+            };
+            StorageView::contiguous(memory, 0, dtype, shape)
+        };
+        let width = latents.shape().get(1).copied().unwrap_or(1);
+        let inputs = buffer(latents.dtype(), &[i64::from(input_units.max(1)), width])?;
+        let values = buffer(DType::BF16, &[values.max(1) as i64])?;
         let method = |name: &str| Interpreter::import(&format!("{DECODER}.{name}"));
         let mut arguments = setup.arguments();
         arguments.push(latents.handle()?.to_any());
         arguments.push(staging.handle()?.to_any());
+        arguments.push(inputs.handle()?.to_any());
+        arguments.push(values.handle()?.to_any());
         let runner = Handle::new(method("image")?.call_values(&arguments)?)?;
+        let capture = GraphFunctions::import()?;
         Ok(Self {
+            graphs: GraphTable::new(format!("{owner}.decoder"), capture.release.clone()),
+            capture,
+            pools: Vec::new(),
             owner,
             device,
             stream,
             runner,
             decode: method("decode")?,
             quantize: method("quantize")?,
+            decode_one: method("decode_one")?,
+            quantize_one: method("quantize_one")?,
             kernels: method("kernels")?,
             close: method("close")?,
             range,
             staging,
+            latents,
+            inputs,
+            values,
         })
     }
 
-    /// The numerical calls that decode `images`: each decodes the longest
-    /// prefix of the remaining images that fits the staging bytes.
-    ///
-    /// Every sub-batch is one eager Python call, because a graph would
-    /// remove too little to pay for itself. Profiled on a GB200 with the
-    /// image milestone's requests, BAGEL's 512x512 decode keeps the device
-    /// busy for 21.7 ms of a 23.8 ms span, and the host issues it in about
-    /// 10 ms, ahead of the device: a replay could remove only the 2.0 to
-    /// 2.6 ms of idle time inside the span, 1% of a two-step request
-    /// (241 ms) and 0.05% of a 50-step one (4.9 s). SenseNova's decode is a
-    /// call of under 1.1 ms issuing eleven small operations. A graph per
-    /// (size, count) would also need fixed latent rows, a runner-owned
-    /// buffer of decoded values with native copies to the product regions,
-    /// and a bound on the activations each captured size retains.
+    /// Whether the decoder serves under CUDA graphs: every image at a
+    /// captured size, none eagerly.
+    pub(super) fn graphs(&self) -> bool {
+        !self.pools.is_empty()
+    }
+
+    /// Serve under CUDA graphs, capturing into `pools`: the decoder's
+    /// device's, and a generation tower's.
+    pub(super) fn set_pools(&mut self, pools: Vec<Arc<GraphPool>>) {
+        self.pools = pools;
+    }
+
+    /// The graph pool's identity: the address of the decoder's staging
+    /// bytes, which no other runner shares.
+    pub(super) fn graph_key(&self) -> usize {
+        self.staging.address() as usize
+    }
+
+    /// Record in `job` the call of `key`'s method on the decoder's fixed
+    /// buffers: the launch of its captured graph; with `capture`, the
+    /// capture of one not captured yet (startup), the job's completion
+    /// carrying the graph ([`Self::complete_capture`]); without graphs and
+    /// while startup warms a size, the eager call.
+    fn one(&self, key: OneImage, units: u32, capture: bool, job: &Job) -> Result<GraphMode> {
+        let runner = Argument::Handle(self.runner.clone());
+        let method = if key.quantize {
+            MethodCall::new(
+                &self.quantize_one,
+                vec![
+                    runner,
+                    Argument::Integer(i64::from(key.height)),
+                    Argument::Integer(i64::from(key.width)),
+                    Argument::Float(f64::from(self.range.0)),
+                    Argument::Float(f64::from(self.range.1)),
+                ],
+            )
+        } else {
+            MethodCall::new(
+                &self.decode_one,
+                vec![
+                    runner,
+                    Argument::Integer(i64::from(units)),
+                    Argument::Integer(i64::from(key.height)),
+                    Argument::Integer(i64::from(key.width)),
+                ],
+            )
+        };
+        Ok(match self.graphs.lookup(&key, None) {
+            Ok(Lookup::Replay(graph)) => {
+                job.on(self.stream.as_ref()).launch(graph)?;
+                GraphMode::Replay
+            }
+            Ok(Lookup::Capture) if capture => {
+                let (Some(stream), Some(ordinal)) = (&self.stream, self.device.cuda()) else {
+                    return Err(Error::Invariant(
+                        "an image decoder captures on its CUDA stream".into(),
+                    ));
+                };
+                let pool = self
+                    .pools
+                    .iter()
+                    .find(|pool| pool.device == ordinal)
+                    .ok_or_else(|| {
+                        Error::Invariant("an image decoder has no graph pool on its device".into())
+                    })?;
+                job.capture(Capture {
+                    functions: self.capture.clone(),
+                    pool: pool.value.clone(),
+                    peers: self
+                        .pools
+                        .iter()
+                        .filter(|pool| pool.device != ordinal)
+                        .map(|pool| (pool.device, pool.value.clone()))
+                        .collect(),
+                    stream: stream.raw(),
+                    device: ordinal,
+                    method,
+                    breaks: None,
+                });
+                GraphMode::Capture
+            }
+            Err(error) if self.graphs() => return Err(error),
+            _ => {
+                job.call_returning(method);
+                GraphMode::Eager
+            }
+        })
+    }
+
+    /// Record in `job` the warmup and then the capture of the decode of a
+    /// `height` x `width` image of `units` latent rows and of the
+    /// quantization of a resident image of that size; whether it records a
+    /// capture. The warmup's staged byte counts join `returns`.
+    pub(super) fn capture_size(
+        &self,
+        units: u32,
+        height: u32,
+        width: u32,
+        job: &Job,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<Vec<OneImage>> {
+        let issue = job.on(self.stream.as_ref());
+        // SAFETY: the decoder's own buffers, which only its calls read,
+        // recorded behind the fills on its stream.
+        unsafe {
+            self.inputs.zero(issue)?;
+            self.values.zero(issue)?;
+        }
+        let mut captured = Vec::new();
+        for quantize in [false, true] {
+            let key = OneImage {
+                quantize,
+                height,
+                width,
+            };
+            if self.graphs.contains(&key, None) {
+                continue;
+            }
+            // The eager call warms the kernels the capture records.
+            self.one(key, units, false, job)?;
+            returns.push(vec![i64::from(height) * i64::from(width) * 3]);
+            if self.one(key, units, true, job)? == GraphMode::Capture {
+                captured.push(key);
+            }
+        }
+        Ok(captured)
+    }
+
+    /// Store the graph a capture of [`Self::capture_size`] took for `key`.
+    pub(super) fn complete_capture(
+        &mut self,
+        key: OneImage,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        self.graphs.insert(key, None, completion.captured()?)
+    }
+
+    /// Seal the captured graphs: a size startup did not capture is refused.
+    pub(super) fn seal(&mut self) {
+        self.graphs.seal();
+    }
+
+    /// The eager calls that decode `images` without graphs: each decodes
+    /// the longest prefix of the remaining images that fits the staging
+    /// bytes.
     fn chunks(&self, images: &[DecodeImage]) -> Result<Vec<Chunk>> {
         let capacity = self.staging.numel() as usize;
         let mut chunks = Vec::new();
@@ -162,6 +353,9 @@ impl ImageDecoder {
         job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
+        if self.graphs() {
+            return self.record_captured(images, stage, job);
+        }
         for chunk in self.chunks(images)? {
             job.call_returning(MethodCall::new(&self.decode, chunk.arguments));
             let decoded = &images[chunk.images.clone()];
@@ -177,6 +371,73 @@ impl ImageDecoder {
         Ok(())
     }
 
+    /// Record the decoding of `images` one at a time under graphs: each
+    /// image's latent rows copied into the inputs, the replay of the graph
+    /// of its size, its values copied into its product, and what `stage`
+    /// issues for its staged pixels, which the next image overwrites.
+    fn record_captured(
+        &self,
+        images: &[DecodeImage],
+        mut stage: impl FnMut(usize, StorageView) -> Result<()>,
+        job: &Job,
+    ) -> Result<()> {
+        let issue = job.on(self.stream.as_ref());
+        let workspace = self.inputs.shape()[1] as usize * self.inputs.dtype().bytes();
+        for (index, image) in images.iter().enumerate() {
+            if i64::from(image.units) > self.inputs.shape()[0] {
+                return Err(Error::Invalid(format!(
+                    "{}: a {}x{} image of {} latent rows exceeds the captured sizes",
+                    self.owner, image.height, image.width, image.units
+                )));
+            }
+            let rows = self.latents_of(image)?;
+            let mut input = CopyBatch::new(SourceOrder::Stream);
+            input.push(
+                self.inputs.address(),
+                rows,
+                image.units as usize * workspace,
+            );
+            // SAFETY: the rows lie in the latent pool's step workspace, which
+            // the batch gathered them into on this stream, and the inputs
+            // hold them; only this decoder's calls read the inputs, in
+            // stream order.
+            unsafe { issue.copy(&input) }?;
+            let key = OneImage {
+                quantize: false,
+                height: image.height,
+                width: image.width,
+            };
+            self.one(key, image.units, false, job)?;
+            let elements = image.pixel_bytes();
+            if let Some(product) = &image.product {
+                if product.dtype() != DType::BF16 || product.numel() < elements as u64 {
+                    return Err(Error::Invalid(
+                        "an image product holds fewer BF16 values than its image".into(),
+                    ));
+                }
+                let mut output = CopyBatch::new(SourceOrder::Stream);
+                output.push(product.address(), self.values.address(), elements * 2);
+                // SAFETY: the product region holds the image's values, which
+                // the graph wrote into the decoder's values before this copy
+                // on the same stream.
+                unsafe { issue.copy(&output) }?;
+            }
+            stage(index, self.staging.narrow(0, 0, elements as i64)?)?;
+        }
+        Ok(())
+    }
+
+    /// The address of `image`'s latent rows in the step workspace.
+    fn latents_of(&self, image: &DecodeImage) -> Result<u64> {
+        if i64::from(image.sample) + i64::from(image.units) > self.latents.shape()[0] {
+            return Err(Error::Invalid(
+                "an image's latent rows exceed the step workspace".into(),
+            ));
+        }
+        let row = self.latents.shape()[1] as u64 * self.latents.dtype().bytes() as u64;
+        Ok(self.latents.address() + u64::from(image.sample) * row)
+    }
+
     /// Record the quantization of a resident image product holding values
     /// in `range` into `job`, then what `stage` issues for its staged
     /// pixels (see [`Self::record_decode`]).
@@ -188,6 +449,44 @@ impl ImageDecoder {
         job: &Job,
         returns: &mut Vec<Vec<i64>>,
     ) -> Result<()> {
+        if self.graphs() {
+            // A resident image of this decoder's range replays the
+            // quantization captured at its size from the values.
+            let shape = image.shape();
+            if shape.len() != 3
+                || range != self.range
+                || image.dtype() != DType::BF16
+                || !image.is_contiguous()
+            {
+                return Err(Error::Invalid(format!(
+                    "{}: under CUDA graphs a resident image is a [3, height, width] BF16 \
+                     product of the decoder's value range",
+                    self.owner
+                )));
+            }
+            let (height, width) = (shape[1] as u32, shape[2] as u32);
+            let elements = image.numel() as usize;
+            if elements > self.values.numel() as usize {
+                return Err(Error::Invalid(format!(
+                    "{}: a {height}x{width} resident image exceeds the captured sizes",
+                    self.owner
+                )));
+            }
+            let issue = job.on(self.stream.as_ref());
+            let mut input = CopyBatch::new(SourceOrder::Stream);
+            input.push(self.values.address(), image.address(), elements * 2);
+            // SAFETY: the product holds the image's values and the decoder's
+            // values hold them; only this decoder's calls read the values,
+            // in stream order.
+            unsafe { issue.copy(&input) }?;
+            let key = OneImage {
+                quantize: true,
+                height,
+                width,
+            };
+            self.one(key, 0, false, job)?;
+            return stage(self.staging.narrow(0, 0, elements as i64)?);
+        }
         // The quantized pixels are one byte per element of the image.
         let count = image.numel();
         if count == 0 || count > self.staging.numel() {
@@ -513,6 +812,7 @@ impl ImageBatch<'_> {
             .as_ref()
             .map(|(_, runner)| runner)
             .ok_or_else(|| Error::Unsupported("image decoding requires a decoder".into()))?;
+        let graphs = runner.image_graphs()?;
         for (&index, source) in active.iter().zip(&sources) {
             match source {
                 Some(Source::Resident(region, range, height, width)) => {
@@ -573,7 +873,8 @@ impl ImageBatch<'_> {
             }))?;
         }
         let mut stats = ForwardStats::default();
-        *stats.mode_counts.entry("eager".into()).or_default() += 1;
+        let mode = if graphs { "replay" } else { "eager" };
+        *stats.mode_counts.entry(mode.into()).or_default() += 1;
         Ok(stats)
     }
 

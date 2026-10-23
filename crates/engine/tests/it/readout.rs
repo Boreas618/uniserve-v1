@@ -441,6 +441,8 @@ fn an_image_readout_reads_the_encoded_image_with_its_prompt() {
             encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: Some(9),
             max_cache_tokens: None,
+            height: None,
+            width: None,
         }],
     });
     let answer = events(running.submit(request.clone()));
@@ -474,6 +476,8 @@ fn vision_image(hash: u64, position: u32, tokens: u32) -> ImageInput {
             encoder: engine::ImageEncoder::Vision,
             num_cache_tokens: Some(tokens),
             max_cache_tokens: None,
+            height: None,
+            width: None,
         }],
     }
 }
@@ -717,6 +721,8 @@ fn an_image_encode_waits_for_a_free_host_lane_task() {
                     encoder: engine::ImageEncoder::Vision,
                     num_cache_tokens: Some(9),
                     max_cache_tokens: None,
+                    height: None,
+                    width: None,
                 }],
             });
             request

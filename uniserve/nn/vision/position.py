@@ -9,6 +9,7 @@ __all__ = [
     "build_abs_positions_from_grid_hw",
     "get_flattened_position_ids_extrapolate",
     "merged_grid_coordinates",
+    "merged_squares",
     "PositionEmbedding",
 ]
 
@@ -47,6 +48,49 @@ def build_abs_positions_from_grid_hw(
     abs_x = patch_id % width_per_patch
     abs_y = patch_id // width_per_patch
     return abs_x, abs_y
+
+
+def merged_squares(
+    grids: torch.Tensor, tokens: int, merge: int
+) -> torch.Tensor:
+    """The packed rows of each merged token's ``merge x merge`` square.
+
+    ``grids`` holds the ``[segments, 2]`` ``(height, width)`` patch grids
+    that cover packed patch rows in order, each grid's rows in raster
+    order; every side is a multiple of ``merge``, and a ``(0, 0)`` grid is
+    an empty segment. A segment merges into ``height * width / merge**2``
+    tokens in raster order over its merged grid, segments in order, so the
+    packing holds ``tokens`` of them. Returns ``[tokens, merge * merge]``
+    int64 row indices, each token's square in raster order. ``tokens`` is
+    a static shape and the grids are read only as device values, so the
+    computation stays capturable in a CUDA graph.
+    """
+    device = grids.device
+    heights, widths = grids[:, 0], grids[:, 1]
+    patch_counts = heights * widths
+    token_counts = patch_counts // merge**2
+
+    # Token t of the packing belongs to segment[t] and is its local[t]-th
+    # token in raster order of that segment's merged grid.
+    segment = torch.repeat_interleave(
+        torch.arange(grids.shape[0], device=device),
+        token_counts,
+        output_size=tokens,
+    )
+    first_token = torch.cumsum(token_counts, 0) - token_counts
+    first_patch = torch.cumsum(patch_counts, 0) - patch_counts
+    local = torch.arange(tokens, device=device) - first_token[segment]
+    width = widths[segment]
+    row, column = local // (width // merge), local % (width // merge)
+
+    # A square's top-left row, then its merge x merge rows in raster order.
+    corner = first_patch[segment] + (row * width + column) * merge
+    offsets = torch.arange(merge, device=device)
+    return (
+        corner[:, None, None]
+        + offsets[None, :, None] * width[:, None, None]
+        + offsets[None, None, :]
+    ).flatten(1)
 
 
 def get_flattened_position_ids_extrapolate(

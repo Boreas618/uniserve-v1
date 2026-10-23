@@ -240,7 +240,8 @@ fn decode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             );
         }
         let workspace = StorageView::contiguous(memory as Arc<_>, 0, DType::BF16, &[units, width])?;
-        let runner = DecoderRunner::image(&setup, (-1.0, 1.0), workspace, staging_bytes)?;
+        // The harness decodes eagerly, at any size.
+        let runner = DecoderRunner::image(&setup, (-1.0, 1.0), workspace, staging_bytes, 0, 0)?;
         let mut images = Vec::new();
         let mut sample = 0;
         for (index, size) in sizes.iter().enumerate() {

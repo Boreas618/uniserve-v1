@@ -16,6 +16,9 @@ from uniserve.processing import (
 
 from .config import Config
 
+# The most pixels one image resizes to; the reference preprocessing's bound.
+MAX_IMAGE_PIXELS = 2048 * 2048
+
 
 def image_processor(config: Config) -> ImageProcessor:
     """Build the checkpoint architecture's caller-owned image transforms.
@@ -33,7 +36,7 @@ def image_processor(config: Config) -> ImageProcessor:
             downsample=round(1 / config.vision.downsample_ratio),
             resize=PixelBounds(
                 min_pixels=512 * 512,
-                max_pixels=2048 * 2048,
+                max_pixels=MAX_IMAGE_PIXELS,
                 max_total_pixels=4096 * 4096,
             ),
         ),

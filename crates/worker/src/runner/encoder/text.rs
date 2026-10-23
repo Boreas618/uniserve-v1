@@ -1,12 +1,15 @@
 //! Text encoding: a prompt zero-padded to the smallest configured text capacity
 //! that holds it ([`text_capacity`]), the buffers of a text encoder's forward,
-//! and the encode of a prompt, natively through its capacity's graph or, with
-//! vision tokens ([`PromptVision`]), on the builder thread.
+//! and the encode of a prompt, natively through its capacity's graph. With
+//! vision tokens ([`PromptVision`]) the builder thread computes the prompt's
+//! rotary coordinates, and the prompt encodes through its capacity's graph
+//! of prompts with vision under CUDA graphs, on the builder thread without.
 
 use cuda::{CopyBatch, SourceOrder};
 
 use super::{EncoderGraph, EncoderRunner};
 use crate::cuda_graph::GraphMode;
+use crate::ffi::DType;
 use crate::lane::Job;
 use crate::memory::allocation::StorageView;
 use crate::runner::methods::{Argument, MethodCall};
@@ -51,11 +54,63 @@ pub(super) struct TextBuffers {
     /// The `[3, max capacity]` int64 rotary coordinates of a prompt with
     /// vision tokens, for an encoder that places them.
     pub(super) positions: Option<StorageView>,
+    /// Under CUDA graphs, the `[max capacity, width]` vision rows of a
+    /// prompt with vision tokens, one per placeholder from the first:
+    /// every capacity's graph of such a prompt reads them.
+    pub(super) visual: Option<StorageView>,
     /// Whether this rank's pipeline stage emits the features.
     pub(super) final_stage: bool,
 }
 
 impl EncoderRunner {
+    /// Serve prompts with vision tokens under CUDA graphs: capture each
+    /// prompt capacity's encode of a prompt whose vision rows are copied
+    /// into the encoder's, rows of `width` values of `dtype` (the vision
+    /// tower's features).
+    pub(crate) fn capture_vision(&mut self, width: i64, dtype: DType) -> Result<()> {
+        let device = self.device;
+        let Some(text) = self.text.as_mut().filter(|text| text.positions.is_some()) else {
+            return Err(Error::Invariant(format!(
+                "{} places no vision tokens",
+                self.owner
+            )));
+        };
+        let capacity = text.tokens.shape()[0];
+        let bytes = (capacity * width) as usize * dtype.bytes();
+        let memory: std::sync::Arc<dyn crate::ffi::Backing> = match device {
+            crate::config::Device::Cuda(index) => {
+                crate::memory::allocation::Storage::device(index, bytes)?
+            }
+            crate::config::Device::Cpu => crate::memory::allocation::Storage::host(bytes),
+        };
+        text.visual = Some(StorageView::contiguous(
+            memory,
+            0,
+            dtype,
+            &[capacity, width],
+        )?);
+        Ok(())
+    }
+
+    /// The arguments of the Python half's `encode` of a prompt padded to
+    /// `capacity` whose vision rows lie in the encoder's: the call a
+    /// capacity's graph of a prompt with vision tokens captures.
+    pub(super) fn text_vision_arguments(&self, capacity: usize) -> Result<Vec<Argument>> {
+        let (Some(positions), Some(visual)) = (
+            self.text.as_ref().and_then(|text| text.positions.as_ref()),
+            self.text.as_ref().and_then(|text| text.visual.as_ref()),
+        ) else {
+            return Err(Error::Invariant(format!(
+                "{} captures no prompts with vision tokens",
+                self.owner
+            )));
+        };
+        let mut arguments = self.text_arguments(capacity)?;
+        arguments.push(Argument::Tensor(positions.clone()));
+        arguments.push(Argument::Tensor(visual.prefix(capacity as i64)?));
+        Ok(arguments)
+    }
+
     /// The arguments of the Python half's `encode` of a prompt padded to
     /// `capacity`, without vision tokens.
     pub(super) fn text_arguments(&self, capacity: usize) -> Result<Vec<Argument>> {
@@ -143,10 +198,36 @@ impl EncoderRunner {
                         Argument::Tensor(positions.clone()),
                     ],
                 ));
-                arguments.push(Argument::Tensor(positions.clone()));
-                arguments.push(Argument::Tensor(rows.clone()));
-                job.call(MethodCall::new(&encode, arguments));
-                GraphMode::Eager
+                let visual = self.text.as_ref().and_then(|text| text.visual.clone());
+                match visual {
+                    // Under graphs the rows are copied into the encoder's and
+                    // the capacity's graph of a prompt with vision replays.
+                    Some(visual) => {
+                        if rows.dtype() != visual.dtype()
+                            || rows.shape().get(1) != visual.shape().get(1)
+                            || rows.shape()[0] > capacity as i64
+                        {
+                            return Err(Error::Invalid(format!(
+                                "{}: vision rows disagree with the captured prompt encodes",
+                                self.owner
+                            )));
+                        }
+                        let mut input = CopyBatch::new(SourceOrder::Stream);
+                        input.push(visual.address(), rows.address(), rows.nbytes() as usize);
+                        // SAFETY: the rows lie in the product the batch read,
+                        // alive until it commits, and the encoder's rows hold
+                        // them; only its forwards read them, in stream order.
+                        unsafe { issue.copy(&input) }?;
+                        let arguments = self.text_vision_arguments(capacity)?;
+                        self.forward(EncoderGraph::TextVision { capacity }, arguments, None, job)?
+                    }
+                    None => {
+                        arguments.push(Argument::Tensor(positions.clone()));
+                        arguments.push(Argument::Tensor(rows.clone()));
+                        job.call(MethodCall::new(&encode, arguments));
+                        GraphMode::Eager
+                    }
+                }
             }
             // Without configured capacities a prompt is encoded at its
             // exact length, which no graph serves.

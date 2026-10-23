@@ -97,17 +97,71 @@ pub struct DecoderRunner {
 
 impl DecoderRunner {
     /// The runner of an image model's decoder over the latent pool's step
-    /// workspace `latents` and `staging_bytes` of staging.
+    /// workspace `latents` and `staging_bytes` of staging. Under CUDA graphs
+    /// ([`Self::serve_image_graphs`]) it decodes images of at most
+    /// `input_units` latent rows and `values` elements, each at a size it
+    /// captures at startup (`DecoderRunners::capture_image`).
     pub fn image(
         setup: &ImageSetup<'_>,
         range: (f32, f32),
         latents: StorageView,
         staging_bytes: usize,
+        input_units: u32,
+        values: usize,
     ) -> Result<Self> {
-        let image = ImageDecoder::new(setup, range, latents, staging_bytes)?;
+        let image = ImageDecoder::new(setup, range, latents, staging_bytes, input_units, values)?;
         Ok(Self {
             family: Family::Image(Box::new(image)),
         })
+    }
+
+    /// Serve the image decoder under CUDA graphs, capturing into `pools`.
+    pub(crate) fn serve_image_graphs(&mut self, pools: Vec<Arc<GraphPool>>) -> Result<()> {
+        match &mut self.family {
+            Family::Image(image) => {
+                image.set_pools(pools);
+                Ok(())
+            }
+            _ => Err(Error::Invariant("the decoder decodes no images".into())),
+        }
+    }
+
+    /// The image decoder's graph pool identity.
+    pub(crate) fn image_graph_key(&self) -> Result<usize> {
+        Ok(self.image_decoder()?.graph_key())
+    }
+
+    /// Whether the image decoder serves under CUDA graphs.
+    pub(crate) fn image_graphs(&self) -> Result<bool> {
+        Ok(self.image_decoder()?.graphs())
+    }
+
+    /// Record in `job` the warmup and the capture of an image decoder's
+    /// decode of a `height` x `width` image of `units` latent rows and its
+    /// quantization of a resident image of that size; the keys it captures,
+    /// in order, for [`Self::complete_image`].
+    pub(crate) fn capture_image(
+        &self,
+        units: u32,
+        height: u32,
+        width: u32,
+        job: &Job,
+        returns: &mut Vec<Vec<i64>>,
+    ) -> Result<Vec<image::OneImage>> {
+        self.image_decoder()?
+            .capture_size(units, height, width, job, returns)
+    }
+
+    /// Store the graph a capture of [`Self::capture_image`] took for `key`.
+    pub(crate) fn complete_image(
+        &mut self,
+        key: image::OneImage,
+        completion: &mut Completion,
+    ) -> Result<()> {
+        match &mut self.family {
+            Family::Image(image) => image.complete_capture(key, completion),
+            _ => Err(Error::Invariant("the decoder decodes no images".into())),
+        }
     }
 
     /// The runner of a video decoder and its RGB post-processor.
@@ -396,7 +450,7 @@ impl DecoderRunner {
     /// Refuse further captures.
     pub(crate) fn seal(&mut self) {
         match &mut self.family {
-            Family::Image(_) => {}
+            Family::Image(image) => image.seal(),
             Family::Video(video) => video.graphs.seal(),
             Family::Audio(audio) => audio.graphs.seal(),
         }
@@ -418,13 +472,14 @@ impl DecoderRunner {
     }
 
     /// Release the graphs and Python runners of a video or audio decoder;
-    /// an image decoder releases the execution context its Python half
-    /// constructed.
+    /// an image decoder releases its graphs, then the execution context its
+    /// Python half constructed.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         match &mut self.family {
             Family::Image(image) => {
+                let graphs = image.graphs.close(aborted);
                 let flag = Any::from(aborted);
-                image.close.invoke(&[image.runner.view(), (&flag).into()])
+                graphs.and(image.close.invoke(&[image.runner.view(), (&flag).into()]))
             }
             Family::Video(video) => video.close(aborted),
             Family::Audio(audio) => audio.close(aborted),

@@ -427,6 +427,7 @@ impl WorkerGroup {
         // those its stating ranks agree on.
         let mut image_warmups = Vec::new();
         let mut captured_images = None;
+        let mut captured_latents = None;
         let mut diffusion_lm_step_rows = 0;
         let mut image_unconditional = None;
         for (rank, worker) in workers.iter().enumerate() {
@@ -454,6 +455,14 @@ impl WorkerGroup {
                 );
                 captured_images = Some(shapes.clone());
             }
+            if let Some(sizes) = &stated.captured_latents {
+                anyhow::ensure!(
+                    captured_latents.as_ref().is_none_or(|known| known == sizes),
+                    "physical rank {rank} states other captured latent image sizes than another \
+                     latent encoder rank"
+                );
+                captured_latents = Some(sizes.clone());
+            }
             if stated.diffusion_lm_step_rows > 0 {
                 anyhow::ensure!(
                     diffusion_lm_step_rows == 0
@@ -465,6 +474,7 @@ impl WorkerGroup {
         }
         info.image_warmups = image_warmups;
         info.captured_images = captured_images;
+        info.captured_latents = captured_latents;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
 
