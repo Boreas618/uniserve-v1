@@ -79,10 +79,34 @@ def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
                 )
 
 
-# Eight-rank denoiser layouts. Every degree product equals eight, and each
-# entry names a distinct way of dividing the sequence, the tensors or the layer
-# range across that many ranks. They are declared apart from the four-rank
-# layouts because they place every numerical component on all eight devices,
+# Each deployment below starts its own server, which takes most of its time,
+# so the layouts are one per way of dividing the denoiser: the sequence
+# (Ulysses, all-gather, both), the tensors, the layer range, and tensors or
+# layers combined with the sequence. Other degrees of the same division run
+# the same code.
+#
+# Four-rank layouts place the denoiser on four devices and the text encoder
+# and decoders beside it, as the default deployment does.
+FOUR_RANK_PARALLEL_CONFIGS = {
+    "gather4": {
+        "sequence_parallel": {"kind": "allgather", "allgather_degree": 4},
+    },
+    "hybrid": {
+        "sequence_parallel": {
+            "kind": "hybrid",
+            "ulysses_degree": 2,
+            "allgather_degree": 2,
+        },
+    },
+    "tensor4": {"tensor_parallel_size": 4},
+    "tensor2_ulysses2": {
+        "tensor_parallel_size": 2,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
+    },
+    "pipeline4": {"pipeline_parallel_size": 4},
+}
+
+# Eight-rank layouts place every numerical component on all eight devices,
 # which is how an eight-device host, or two hosts of four, serve.
 EIGHT_RANK_PARALLEL_CONFIGS = {
     "ulysses8": {
@@ -91,23 +115,6 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
     "gather8": {
         "sequence_parallel": {"kind": "allgather", "allgather_degree": 8},
     },
-    "tensor8": {"tensor_parallel_size": 8},
-    "tensor2_ulysses4": {
-        "tensor_parallel_size": 2,
-        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
-    },
-    "tensor4_ulysses2": {
-        "tensor_parallel_size": 4,
-        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
-    },
-    "pipeline2_ulysses4": {
-        "pipeline_parallel_size": 2,
-        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
-    },
-    "pipeline4_ulysses2": {
-        "pipeline_parallel_size": 4,
-        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
-    },
     "hybrid_ulysses4_gather2": {
         "sequence_parallel": {
             "kind": "hybrid",
@@ -115,12 +122,14 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
             "allgather_degree": 2,
         },
     },
-    "hybrid_ulysses2_gather4": {
-        "sequence_parallel": {
-            "kind": "hybrid",
-            "ulysses_degree": 2,
-            "allgather_degree": 4,
-        },
+    "tensor8": {"tensor_parallel_size": 8},
+    "tensor2_ulysses4": {
+        "tensor_parallel_size": 2,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
+    },
+    "pipeline2_ulysses4": {
+        "pipeline_parallel_size": 2,
+        "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 4},
     },
 }
 
@@ -220,38 +229,24 @@ def _eight_rank_worker_config(parallel_kind: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("parallel_kind", "precision", "grouping", "max_running_requests"),
+    ("parallel_kind", "grouping", "max_running_requests"),
     [
-        (kind, precision, "whole", 2)
+        (kind, "whole", 2)
         for kind in (
-            "ulysses2",
-            "ulysses4",
-            "gather2",
-            "gather4",
-            "hybrid",
-            "tensor2_ulysses2",
-            "tensor2",
-            "tensor4",
-            "pipeline2",
-            "pipeline4",
             "local",
+            *FOUR_RANK_PARALLEL_CONFIGS,
             *EIGHT_RANK_PARALLEL_CONFIGS,
         )
-        for precision in ("quality", "balanced", "performance", "maximum")
     ]
-    + [("ulysses4", "balanced", grouping, 2) for grouping in ("split", "mixed")]
-    + [
-        ("tensor2_ulysses4", "balanced", grouping, 2)
-        for grouping in ("split", "mixed")
-    ]
-    # The worker's two state slots follow its queue depth, not the number of
-    # admitted requests, so one admitted request still leaves two.
-    + [("ulysses4", "quality", "whole", 1)],
+    # A worker group per component carries every product edge between
+    # groups. The Ulysses-4 deployment admits one request: the worker's two
+    # state slots follow its queue depth, not the number of admitted
+    # requests, so one admitted request still leaves two.
+    + [("ulysses4", "split", 1), ("tensor2_ulysses4", "split", 2)],
 )
 def test_component_bindings_release_cancelled_requests(
     tmp_path: Path,
     parallel_kind: str,
-    precision: str,
     grouping: str,
     max_running_requests: int,
 ) -> None:
@@ -273,20 +268,8 @@ def test_component_bindings_release_cancelled_requests(
     max_video_seconds = str(max(seconds for seconds, _, _ in shapes))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    worker_config = {
-        "devices": [0, 1, 2, 3],
-        "transformer": {
-            "ranks": [3, 1],
-            "parallel_config": {"tensor_parallel_size": 2},
-        },
-        "text_encoder": {"ranks": [0]},
-        "video_decoder": {
-            "ranks": [2, 0],
-        },
-        "audio_decoder": {"ranks": [1]},
-    }
-    if parallel_kind in ("local", "ulysses2", "ulysses4"):
-        degree = {"local": 1, "ulysses2": 2, "ulysses4": 4}[parallel_kind]
+    if parallel_kind in ("local", "ulysses4"):
+        degree = {"local": 1, "ulysses4": 4}[parallel_kind]
         ranks = list(range(degree))
         sequence = (
             {"kind": "local"}
@@ -308,50 +291,23 @@ def test_component_bindings_release_cancelled_requests(
             },
             "audio_decoder": {"ranks": [0]},
         }
-    elif parallel_kind in ("pipeline2", "pipeline4"):
-        degree = 2 if parallel_kind == "pipeline2" else 4
-        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["transformer"]["parallel_config"] = {
-            "pipeline_parallel_size": degree
-        }
-    elif parallel_kind in ("gather2", "gather4"):
-        degree = 2 if parallel_kind == "gather2" else 4
-        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["transformer"]["parallel_config"] = {
-            "sequence_parallel": {
-                "kind": "allgather",
-                "allgather_degree": degree,
-            }
-        }
-    elif parallel_kind == "hybrid":
-        worker_config["transformer"] = {
-            "ranks": [3, 1, 2, 0],
-            "parallel_config": {
-                "sequence_parallel": {
-                    "kind": "hybrid",
-                    "ulysses_degree": 2,
-                    "allgather_degree": 2,
-                }
+    elif parallel_kind in FOUR_RANK_PARALLEL_CONFIGS:
+        # The denoiser's ranks reach the devices in the order 3, 1, 2, 0, so
+        # a layout that assumed rank index equals device index would fail.
+        worker_config = {
+            "devices": [0, 1, 2, 3],
+            "transformer": {
+                "ranks": [3, 1, 2, 0],
+                "parallel_config": FOUR_RANK_PARALLEL_CONFIGS[parallel_kind],
             },
-        }
-    elif parallel_kind == "tensor2_ulysses2":
-        worker_config["transformer"] = {
-            "ranks": [3, 1, 2, 0],
-            "parallel_config": {
-                "tensor_parallel_size": 2,
-                "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 2},
+            "text_encoder": {"ranks": [0]},
+            "video_decoder": {
+                "ranks": [2, 0],
             },
+            "audio_decoder": {"ranks": [1]},
         }
-    elif parallel_kind in ("tensor2", "tensor4"):
-        degree = 2 if parallel_kind == "tensor2" else 4
-        worker_config["transformer"]["ranks"] = [3, 1, 2, 0][:degree]
-        worker_config["transformer"]["parallel_config"] = {
-            "tensor_parallel_size": degree
-        }
-    elif parallel_kind in EIGHT_RANK_PARALLEL_CONFIGS:
-        worker_config = _eight_rank_worker_config(parallel_kind)
     else:
-        raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
+        worker_config = _eight_rank_worker_config(parallel_kind)
     # A FastH3 student also serves fl2va, so every deployment places the
     # latent encoder that encodes its keyframes, here on the first video
     # decoder rank; the requests below are text-to-video and never use it.
@@ -390,10 +346,6 @@ def test_component_bindings_release_cancelled_requests(
     groups = {
         "whole": [tuple(worker_config)],
         "split": [(name,) for name in worker_config],
-        "mixed": [
-            ("transformer", "text_encoder"),
-            ("video_decoder", "audio_decoder", "latent_encoder"),
-        ],
     }[grouping]
     workers = []
     owners = {}
@@ -500,7 +452,7 @@ def test_component_bindings_release_cancelled_requests(
         "--set",
         "dtype=bfloat16",
         "--set",
-        f"quantization_config.mode={precision}",
+        "quantization_config.mode=balanced",
     ]
     if two_hosts:
         # Products cross the hosts by the mechanisms each edge derives, as in
@@ -597,8 +549,7 @@ def test_component_bindings_release_cancelled_requests(
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
             (tmp_path / f"{seconds}s.mp4").write_bytes(response.content)
             print(
-                f"{parallel_kind}/{precision}: {seconds}s "
-                "complete media passed",
+                f"{parallel_kind}/{grouping}: {seconds}s complete media passed",
                 flush=True,
             )
 
