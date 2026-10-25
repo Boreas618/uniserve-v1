@@ -31,6 +31,14 @@ TASK_PARTITIONS: Mapping[str, str] = MappingProxyType(
     {"t2va": "transformer", "fl2va": "transformer", "ref2va": "transformer_ref"}
 )
 
+# The packed ModelOpt FastH3 exports name their DiT partition's modules in
+# ``modelopt_manifest.json`` under the root ``denoiser`` (``transformer``)
+# or ``reference_denoiser`` (``transformer_ref``); the registry reads the
+# manifest's module paths through this map.
+manifest_roots: Mapping[str, str] = MappingProxyType(
+    {"denoiser": "transformer", "reference_denoiser": "transformer_ref"}
+)
+
 # FastVideo states a student's task as ``task`` (``t2av`` for
 # text-to-video-and-audio) or as ``model_type``.
 _FASTVIDEO_TASKS: Mapping[str, str] = MappingProxyType(

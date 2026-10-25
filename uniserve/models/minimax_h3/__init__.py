@@ -7,12 +7,13 @@ encoder, one denoiser per DiT partition the checkpoint holds (each with its
 token refiner), the video decoder with its RGB post-processor, and the audio
 decoder. ``read_config`` recognizes the base release or a FastH3 export and
 normalizes its JSON sidecars, ``base_checkpoint`` names the base revision
-an export reads the directories it omits from, and ``checkpoint_mappings``
-maps its tensors onto the modules.
+an export reads the directories it omits from, ``manifest_roots`` names the
+modules a packed ModelOpt export's manifest lists, and
+``checkpoint_mappings`` maps its tensors onto the modules.
 """
 
 from .attention import Dense, Sparse
-from .checkpoint import base_checkpoint
+from .checkpoint import base_checkpoint, manifest_roots
 from .conditioning import Conditioner, RefinerBlock, TokenRefiner
 from .config import (
     Config,
@@ -52,6 +53,7 @@ flow_prompt = None
 
 __all__ = [
     "base_checkpoint",
+    "manifest_roots",
     "config_sources",
     "image_processor",
     "flow_prompt",
