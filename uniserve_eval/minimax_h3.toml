@@ -1684,7 +1684,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "1024", "--set", "video_config.text_capacities=1024", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "cuda_graph_config.policy=off", "--set", "quantization_config.mode=quality"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "1024", "--set", "video_config.text_capacities=1024", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "quantization_config.mode=quality"]
 
 [servers.gb200-8.environment]
 NCCL_NVLS_ENABLE = "0"
@@ -2233,7 +2233,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "2048", "--set", "video_config.text_capacities=2048", "--set", "video_config.max_seconds=8", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "cuda_graph_config.policy=off", "--set", "quantization_config.mode=quality"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses8-two-host.toml", "--max-running-requests", "2", "--max-model-len", "2048", "--set", "video_config.text_capacities=2048", "--set", "video_config.max_seconds=8", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "dtype=bfloat16", "--host-identity", "rank-0", "--nnodes", "2", "--dist-init-addr", "${UNISERVE_DIST_INIT_ADDR}", "--set", "quantization_config.mode=quality"]
 
 
 [servers.gb200-8-keyframe.environment]
