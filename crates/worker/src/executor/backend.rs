@@ -33,12 +33,10 @@ use crate::profiling::kernels::{KernelCalls, KernelRecord, KernelWatch};
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
 use crate::request::diffusion::Trajectories;
-use crate::request::video::VideoRequests;
 use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
 use crate::runner::denoiser::runners::DenoiserRunners;
 use crate::runner::encoder::runners::EncoderRunners;
-use crate::runner::media::MediaRunner;
 use crate::runner::methods::list_kernels;
 use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::worker::WorkerMemory;
@@ -109,14 +107,13 @@ pub(crate) struct Runtimes {
     /// The transfer runtime: tensor transfers, cache exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<super::transfer::TransferRuntime>,
-    /// The admitted video requests, on ranks of a video model.
-    video: Option<VideoRequests>,
-    /// The rank's encoder, denoiser and decoder runners.
+    /// What serves a video model on its ranks: the executor and the
+    /// trajectory ledger.
+    video: Option<super::video::VideoRuntime>,
+    /// An image model's encoder, denoiser and decoder runners.
     encoders: EncoderRunners,
     denoisers: DenoiserRunners,
     decoders: DecoderRunners,
-    /// The host media of a rank holding host components.
-    media: Option<MediaRunner>,
     /// The output leases of media batches.
     media_outputs: Option<OutputPool>,
     /// Other capability runtimes' request storage.
@@ -127,8 +124,7 @@ impl Runtimes {
     /// Every request storage owner, in lifecycle order: rank storage, the
     /// text runners, an image model's trajectories, output leases and
     /// latent pool, the diffusion LM runners, the transfer runtime, a video
-    /// model's requests, denoiser runners and output leases, then the other
-    /// runtimes' owners.
+    /// model's runtime and output leases, then the other runtimes' owners.
     pub(crate) fn owners(&mut self) -> impl Iterator<Item = &mut dyn RequestStorage> {
         fn owner<T: RequestStorage>(owner: &mut T) -> &mut dyn RequestStorage {
             owner
@@ -148,7 +144,6 @@ impl Runtimes {
         } else {
             (None, None)
         };
-        let denoisers = video.then_some(&mut self.denoisers);
 
         self.worker_storage
             .as_mut()
@@ -161,7 +156,6 @@ impl Runtimes {
             .chain(self.diffusion_lm.iter_mut().map(owner))
             .chain(self.transfer.as_mut().map(owner))
             .chain(self.video.as_mut().map(owner))
-            .chain(denoisers.map(owner))
             .chain(video_outputs.map(owner))
             .chain(
                 self.storage
@@ -437,7 +431,6 @@ impl WorkerBackend {
         self.runtimes.decoders = DecoderRunners::default();
         self.runtimes.latents = None;
         self.runtimes.trajectories = Trajectories::default();
-        self.runtimes.media = None;
     }
 
     /// Install the diffusion LM runners.
@@ -626,40 +619,21 @@ impl WorkerBackend {
     }
 
     /// Whether the rank serves a video model: its calls run as media
-    /// batches on the rank's video runners.
+    /// batches on the executor.
     pub(crate) fn serves_video(&self) -> bool {
         self.runtimes.video.is_some()
     }
 
-    /// Install what serves a video model on this rank: its request
-    /// records, its runners, its host media and its output leases.
-    pub(crate) fn set_video(
-        &mut self,
-        video: VideoRequests,
-        encoders: EncoderRunners,
-        denoisers: DenoiserRunners,
-        decoders: DecoderRunners,
-        media: Option<MediaRunner>,
-        outputs: OutputPool,
-    ) {
+    /// Install what serves a video model on this rank: the executor with
+    /// the trajectory ledger, and the output leases of its batches.
+    pub(crate) fn set_video(&mut self, video: super::video::VideoRuntime, outputs: OutputPool) {
         self.runtimes.video = Some(video);
-        self.runtimes.encoders = encoders;
-        self.runtimes.denoisers = denoisers;
-        self.runtimes.decoders = decoders;
-        self.runtimes.media = media;
         self.runtimes.media_outputs = Some(outputs);
     }
 
-    pub(crate) fn encoders(&self) -> &EncoderRunners {
-        &self.runtimes.encoders
-    }
-
-    pub(crate) fn denoisers(&self) -> &DenoiserRunners {
-        &self.runtimes.denoisers
-    }
-
-    pub(crate) fn decoders(&self) -> &DecoderRunners {
-        &self.runtimes.decoders
+    /// What serves a video model on this rank.
+    pub(crate) fn video(&self) -> Option<&super::video::VideoRuntime> {
+        self.runtimes.video.as_ref()
     }
 
     /// The parts a video batch executes with.
@@ -677,10 +651,6 @@ impl WorkerBackend {
             placement: &self.placement,
             rank: self.rank,
             video: self.runtimes.video.as_mut().ok_or_else(unserved)?,
-            encoders: &mut self.runtimes.encoders,
-            denoisers: &mut self.runtimes.denoisers,
-            decoders: &mut self.runtimes.decoders,
-            media: self.runtimes.media.as_ref(),
             outputs: self.runtimes.media_outputs.as_mut().ok_or_else(unserved)?,
         })
     }
@@ -716,15 +686,12 @@ impl WorkerBackend {
             self.perform_lifecycle()?;
         }
         started?;
+        // The executor admits a video model's started requests in a job
+        // before the batch opens (`admit_inputs`); one whose size it does not
+        // serve is refused alone, and its calls report the refusal.
         if let Some(video) = &mut self.runtimes.video {
             for request in installed {
-                // A request whose size the rank does not serve is refused
-                // alone: its calls report the refusal.
-                if let Some(reason) =
-                    video.admit(request, self.runtimes.denoisers.video.is_some())?
-                {
-                    self.requests.refuse(request.request_key, &reason)?;
-                }
+                video.start(request)?;
             }
         }
 
@@ -795,8 +762,8 @@ impl WorkerBackend {
         if let Some(host) = &self.runtimes.image_host {
             host.set_wake(wake.clone());
         }
-        if let Some(media) = &self.runtimes.media {
-            media.lane.set_wake(wake.clone());
+        if let Some(video) = &self.runtimes.video {
+            video.set_wake(wake.clone());
         }
         for owner in &self.runtimes.storage {
             owner.set_wake(wake.clone());
@@ -813,17 +780,9 @@ impl WorkerBackend {
             result = result.and(owner.close(aborted));
         }
         // A video model's owners close before the rank storage their
-        // products live in: the host lane, the request records, then the
-        // runners and the output leases.
+        // products live in: the executor, then the output leases.
         if let Some(mut video) = self.runtimes.video.take() {
-            if let Some(media) = &self.runtimes.media {
-                result = result.and(media.close(aborted));
-            }
             result = result.and(video.close(aborted));
-            result = result.and(self.runtimes.encoders.close_text(aborted));
-            result = result.and(self.runtimes.denoisers.close(aborted));
-            result = result.and(self.runtimes.decoders.close(aborted));
-            result = result.and(self.runtimes.encoders.close_latent(aborted));
             if let Some(mut outputs) = self.runtimes.media_outputs.take() {
                 result = result.and(outputs.close(aborted));
             }

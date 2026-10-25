@@ -57,7 +57,7 @@ use crate::request::diffusion::{BranchSet, GuidancePlan};
 use crate::runner::ImageSetup;
 use crate::runner::attention::{AttentionCapacity, AttentionMetadata};
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
-use crate::runner::denoiser::{DENOISER, DenoiserRunner, Family, Methods};
+use crate::runner::denoiser::{DENOISER, DenoiserRunner, Methods};
 use crate::runner::methods::{Argument, MethodCall};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -342,7 +342,7 @@ impl DenoiserRunner {
         let plans_attention = method("plans_attention")?.call_as::<bool>(&[runner.view()])?;
         let capture = GraphFunctions::import()?;
         Ok(Self {
-            family: Family::Image(Box::new(ImageDenoiser {
+            image: Box::new(ImageDenoiser {
                 plan: method("plan")?,
                 plan_denoise: method("plan_denoise")?,
                 plan_conditions: method("plan_conditions")?,
@@ -362,7 +362,7 @@ impl DenoiserRunner {
                 ),
                 capturing: false,
                 graphs_only: false,
-            })),
+            }),
             methods: Methods::import(runner)?,
             capture,
             owner,
@@ -373,12 +373,12 @@ impl DenoiserRunner {
 
     /// An image denoiser's layout.
     pub(crate) fn layout(&self) -> Result<&ImageDenoiserLayout> {
-        Ok(&self.family.image()?.layout)
+        Ok(&self.image.as_ref().layout)
     }
 
     /// An image denoiser's column capacity.
     pub(crate) fn capacity(&self) -> Result<&DiffusionCapacity> {
-        Ok(&self.family.image()?.capacity)
+        Ok(&self.image.as_ref().capacity)
     }
 
     /// Record the call that makes the guidance plan of an admitted image's
@@ -387,7 +387,7 @@ impl DenoiserRunner {
     /// job's completion carries what it returned ([`Self::planned`]).
     pub(crate) fn plan(&self, image: &ImageParams, job: &Job) -> Result<()> {
         job.call_values(MethodCall::new(
-            &self.family.image()?.plan,
+            &self.image.as_ref().plan,
             vec![
                 Argument::Handle(self.methods.runner.clone()),
                 Argument::Integer(i64::from(image.steps)),
@@ -411,7 +411,7 @@ impl DenoiserRunner {
         params: Arc<ImageParams>,
         values: Vec<Value>,
     ) -> Result<GuidancePlan> {
-        let name = self.family.image()?.plan.name();
+        let name = self.image.as_ref().plan.name();
         let steps = usize::from(params.steps);
         let Ok([timesteps, Value::Integers(masks)]) = <[Value; 2]>::try_from(values) else {
             return Err(Error::Interface(format!(
@@ -459,7 +459,7 @@ impl DenoiserRunner {
         job: &Job,
     ) -> Result<()> {
         let runner = Argument::Handle(self.methods.runner.clone());
-        let noise = Argument::Tensor(self.family.image()?.noise.clone());
+        let noise = Argument::Tensor(self.image.as_ref().noise.clone());
         job.call(MethodCall::new(
             &self.methods.draw_noise,
             vec![
@@ -507,7 +507,7 @@ impl DenoiserRunner {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
         let capture = self.capture_pools(capture)?;
-        let image = self.family.image_mut()?;
+        let image = self.image.as_mut();
         let positions = rows
             .iter()
             .map(|row| image.layout.positions(row.height, row.width, row.temporal))
@@ -640,7 +640,7 @@ impl DenoiserRunner {
         let stream = self.stream.clone();
         let issue = job.on(stream.as_ref());
         let capture = self.capture_pools(capture)?;
-        let image = self.family.image_mut()?;
+        let image = self.image.as_mut();
         let positions = rows
             .iter()
             .map(|row| {
@@ -782,10 +782,7 @@ impl DenoiserRunner {
         completion: &mut Completion,
     ) -> Result<()> {
         let graph = completion.captured()?;
-        self.family
-            .image_mut()?
-            .condition_graphs
-            .insert(shape, None, graph)
+        self.image.condition_graphs.insert(shape, None, graph)
     }
 
     /// Combine each image's branch predictions and advance its samples by
@@ -834,7 +831,7 @@ impl DenoiserRunner {
                 .map(|row| row.params.cfg_renorm_type.as_str().to_owned())
                 .collect(),
         ));
-        job.call(MethodCall::new(&self.family.image()?.step, arguments));
+        job.call(MethodCall::new(&self.image.as_ref().step, arguments));
         Ok(())
     }
 
@@ -859,7 +856,7 @@ impl DenoiserRunner {
                     .into(),
             )
         })?;
-        if self.family.image()?.graphs.contains(&shape, None) {
+        if self.image.as_ref().graphs.contains(&shape, None) {
             return Ok(None);
         }
         self.predict(rows, prefix_cache, Some(pools), job)?;
@@ -885,7 +882,7 @@ impl DenoiserRunner {
             }
             return Err(error);
         }
-        let image = self.family.image_mut()?;
+        let image = self.image.as_mut();
         image.graphs.insert(shape, None, graph)?;
         image.capturing = true;
         Ok(())
@@ -893,14 +890,14 @@ impl DenoiserRunner {
 
     /// Serve under CUDA graphs: a step no captured graph holds is refused.
     pub(crate) fn require_graphs(&mut self) -> Result<()> {
-        self.family.image_mut()?.graphs_only = true;
+        self.image.as_mut().graphs_only = true;
         Ok(())
     }
 
     /// The graph pool's identity: the address of an image denoiser's
     /// positions column, which no other runner shares.
     pub(crate) fn graph_key(&self) -> Result<usize> {
-        Ok(self.family.image()?.positions.address() as usize)
+        Ok(self.image.as_ref().positions.address() as usize)
     }
 }
 

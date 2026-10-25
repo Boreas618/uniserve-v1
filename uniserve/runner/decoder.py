@@ -262,94 +262,6 @@ class DecoderRunner:
             return []
         return [float(value) for value in decoder.decoder.value_range]
 
-    @staticmethod
-    def frame_rate(loaded) -> int:
-        """Output video frames per second."""
-        return int(_require(loaded, VideoPostprocessor).frame_rate)
-
-    @staticmethod
-    def sample_rate(loaded) -> int:
-        """Output audio samples per second."""
-        return int(_require(loaded, AudioDecoder).sample_rate)
-
-    @staticmethod
-    def unit_frames(loaded, frames: int) -> list[int]:
-        """Frames of each media unit of a video of ``frames`` frames."""
-        decoder = _require(loaded, VideoDecoder)
-        return [clip.stop - clip.start for clip in decoder.clips(int(frames))]
-
-    @staticmethod
-    def clip_output(
-        loaded, frames: int, width: int, height: int, unit: int
-    ) -> list[int]:
-        """The ``[frames, width, height]`` clip output one unit decodes to.
-
-        Media unit ``unit`` decodes the video's clip of that index.
-        """
-        decoder = _require(loaded, VideoDecoder)
-        size = _video(frames, width, height)
-        clip = decoder.clips(size.num_frames)[int(unit)]
-        output = decoder.clip_output(size, clip)
-        return [
-            int(output.num_frames),
-            int(output.frame.width),
-            int(output.frame.height),
-        ]
-
-    @staticmethod
-    def clip_rows(
-        loaded, frames: int, width: int, height: int, unit: int
-    ) -> list[int]:
-        """The rows of a video's packed latent that one unit decodes.
-
-        The video has ``frames`` frames at the raster; the result lists, in
-        the order the decoder reads them, the rows of its complete packed
-        latent that the decoder input of the clip of media unit ``unit``
-        holds.
-        """
-        decoder = _require(loaded, VideoDecoder)
-        size = _video(frames, width, height)
-        clip = decoder.clips(size.num_frames)[int(unit)]
-        return [int(row) for row in decoder.clip_rows(clip, size)]
-
-    @staticmethod
-    def overlap_elements(loaded, width: int, height: int) -> int:
-        """Elements of the overlap a canvas's unit carries to the next."""
-        decoder = _require(loaded, VideoDecoder)
-        size = _video(_first_frames(decoder), width, height)
-        state = _require(loaded, VideoPostprocessor).state_buffers(size)
-        return _elements(state["video_overlap"].shape)
-
-    @staticmethod
-    def overlap_dtype(loaded, width: int, height: int) -> str:
-        """The dtype of that overlap."""
-        decoder = _require(loaded, VideoDecoder)
-        size = _video(_first_frames(decoder), width, height)
-        state = _require(loaded, VideoPostprocessor).state_buffers(size)
-        return str(state["video_overlap"].dtype).removeprefix("torch.")
-
-    @staticmethod
-    def track_samples(loaded, frames: int) -> int:
-        """Samples of the audio track generated with ``frames`` frames."""
-        clock = _require(loaded, VideoPostprocessor)
-        audio = _require(loaded, AudioDecoder)
-        return int(audio.track_samples(int(frames), clock.frame_rate))
-
-    @staticmethod
-    def audio_units(loaded, samples: int, units: int) -> list[int]:
-        """``[start, stop]`` samples of each of a track's ``units`` units."""
-        spans = _require(loaded, AudioDecoder).unit_samples(
-            int(samples), int(units)
-        )
-        return [
-            int(value) for span in spans for value in (span.start, span.stop)
-        ]
-
-    @staticmethod
-    def audio_latent_frames(loaded, samples: int) -> int:
-        """Latent frames of a track of ``samples`` samples."""
-        return int(_require(loaded, AudioDecoder).latent_frames(int(samples)))
-
     # Forward.
 
     def decode(self, *arguments: Any) -> Any:
@@ -359,7 +271,8 @@ class DecoderRunner:
         unit_count)`` and decodes and reconstructs one media unit at the
         runner's raster. ``latent`` holds the request's complete packed
         video latent in its leading rows; ``rows`` (int64) names the rows
-        of it that the unit's clip input reads (:meth:`clip_rows`);
+        of it that the unit's clip input reads
+        (``uniserve.executor.video.decoder.clip``);
         ``overlap`` is the request's retained overlap (flat, the decoded
         tail its previous round left), which the round's first unit blends
         with and replaces; ``out`` the unit's ``[longest, height, width,

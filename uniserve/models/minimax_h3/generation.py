@@ -4,10 +4,11 @@
 uses (``uniserve.runner``): the text encoder's and the denoiser's
 conditioner's ``EncoderRunner``, the denoiser's ``DenoiserRunner`` for every
 solver step, and the video and audio decoders' ``DecoderRunner``. It holds
-the request state a worker would hold, sized by the runners' facts, and
-calls their methods in the worker's order and with the worker's arguments,
-eagerly, on one stream of its own. Every rank that holds the components
-calls it with the same arguments (SPMD); a denoiser sharded by sequence
+the request state the executor holds, sized by the model's facts
+(``uniserve.executor.video.plan.VideoModel``), and calls the runners in the
+executor's order and with its arguments, eagerly, on one stream of its own.
+Every rank that holds the components calls it with the same arguments
+(SPMD); a denoiser sharded by sequence
 parallelism gathers its final samples before decoding.
 """
 
@@ -20,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from uniserve.bindings.workspace import Scratch
+from uniserve.executor.video.decoder import clip, overlap
+from uniserve.executor.video.plan import Canvas, Layout, VideoModel, VideoSize
 from uniserve.media import image
 from uniserve.runner.decoder import DecoderRunner
 from uniserve.runner.denoiser import DenoiserRunner
@@ -62,6 +65,7 @@ class _Runners:
     """
 
     loaded: Any
+    model: VideoModel
     stream: torch.cuda.Stream
     scratch: Scratch = field(default_factory=Scratch)
     opened: list[Any] = field(default_factory=list)
@@ -145,8 +149,7 @@ def _condition(
             "eager H3 generation needs the text encoder's final pipeline stage"
         )
 
-    rows = DenoiserRunner.text_condition_rows(loaded, component, layout)
-    columns = DenoiserRunner.text_condition_width(loaded, component)
+    rows, columns = runners.model.fields(Layout(*layout)).text_condition
     conditioning = torch.zeros(
         rows * columns, dtype=torch.bfloat16, device=device
     )
@@ -178,31 +181,27 @@ def _denoise(
     """Run a request's trajectory and return each modality's final sample.
 
     The request's state is what the worker keeps for its slot: one flat
-    tensor per state field of ``layout`` (``DenoiserRunner.state_names``),
+    tensor per state field of ``layout`` (``VideoModel.fields``),
     prepared on the host from the seed's draws and copied to the device,
     which every solver step advances in place. A sequence-parallel rank
     holds its own rows of each sample; they are gathered over the
     denoiser's sequence group into the complete ``[rows, width]`` sample.
     """
     loaded = runners.loaded
+    model = runners.model
     denoiser = runners.open(DenoiserRunner, component, layout)
     prepared = denoiser.prepare_layout(layout)
 
-    names = DenoiserRunner.state_names(loaded, component, layout)
-    dtypes = DenoiserRunner.state_dtypes(loaded, component, layout)
-    elements = DenoiserRunner.state_elements(loaded, component, layout)
+    fields = model.fields(Layout(*layout))
+    names = [field.name for field in fields.state]
     noise = [
-        torch.empty(count, dtype=torch.float32)
-        for count in DenoiserRunner.noise_elements(loaded, component, layout)
+        torch.empty(count, dtype=torch.float32) for _, count in fields.noise
     ]
-    condition_noise = torch.empty(
-        DenoiserRunner.condition_noise_elements(loaded, component, layout),
-        dtype=torch.float32,
-    )
+    condition_noise = torch.empty(fields.condition_noise, dtype=torch.float32)
     # Page-locked host sources copy to the device without blocking.
     sources = [
-        torch.empty(count, dtype=getattr(torch, name), pin_memory=True)
-        for name, count in zip(dtypes, elements, strict=True)
+        torch.empty(field.elements, dtype=field.dtype, pin_memory=True)
+        for field in fields.state
     ]
     # A text-conditioned request has no conditions and no vision spans.
     denoiser.draw_noise(seed, prepared, size, [], [], condition_noise, *noise)
@@ -210,18 +209,15 @@ def _denoise(
     state = [source.to(device, non_blocking=True) for source in sources]
 
     step = torch.zeros(1, dtype=torch.int64, device=device)
-    for index in range(DenoiserRunner.num_steps(loaded, component)):
+    for index in range(model.num_steps):
         step.fill_(index)
         denoiser.denoise(prepared, step, conditioning, *state)
 
-    # Each modality's ``[rows, width, first, stop]``: its complete sample and
-    # this rank's rows of it, which the state field holds.
-    modalities = DenoiserRunner.modalities(loaded, component)
-    extents = DenoiserRunner.sample_rows(loaded, component, layout)
+    # Each modality's complete sample and this rank's rows of it, which the
+    # state field holds.
     group = loaded.module.get_submodule(component).sequence_group()
     latents = {}
-    for index, name in enumerate(modalities):
-        rows, width, first, stop = extents[4 * index : 4 * index + 4]
+    for name, (rows, width, first, stop) in fields.samples:
         local = state[names.index(name)][: (stop - first) * width]
         latents[name] = _gather(local.view(stop - first, width), rows, group)
     return latents
@@ -241,14 +237,15 @@ def _decode_video(
     packed latent and the overlap the previous unit retained; this rank
     reconstructs every unit alone, so each round holds one unit.
     """
-    loaded = runners.loaded
+    model = runners.model
     width, height = canvas.width, canvas.height
-    units = DecoderRunner.unit_frames(loaded, num_frames)
+    raster = Canvas(width, height)
+    units = model.unit_frames(num_frames)
+    clips = [
+        clip(model, num_frames, raster, unit) for unit in range(len(units))
+    ]
     outputs = [
-        tuple(
-            DecoderRunner.clip_output(loaded, num_frames, width, height, unit)
-        )
-        for unit in range(len(units))
+        (frames, output.width, output.height) for (frames, output), _ in clips
     ]
     decoders = {
         output: runners.open(DecoderRunner, _VIDEO_DECODER, output)
@@ -258,25 +255,16 @@ def _decode_video(
             reverse=True,
         )
     }
-    overlap = torch.zeros(
-        DecoderRunner.overlap_elements(loaded, width, height),
-        dtype=getattr(
-            torch, DecoderRunner.overlap_dtype(loaded, width, height)
-        ),
-        device=device,
-    )
+    elements, overlap_dtype = overlap(model, raster)
+    retained = torch.zeros(elements, dtype=overlap_dtype, device=device)
     rgb = torch.empty(
         (max(units), height, width, 3), dtype=torch.uint8, device=device
     )
     frames = []
     for unit, (count, output) in enumerate(zip(units, outputs, strict=True)):
-        rows = torch.tensor(
-            DecoderRunner.clip_rows(loaded, num_frames, width, height, unit),
-            dtype=torch.long,
-            device=device,
-        )
+        rows = torch.tensor(clips[unit][1], dtype=torch.long, device=device)
         decoders[output].decode(
-            latent, rows, overlap, rgb, unit == 0, unit + 1 == len(units), 1
+            latent, rows, retained, rgb, unit == 0, unit + 1 == len(units), 1
         )
         frames.append(rgb[:count].clone())
     return torch.cat(frames)
@@ -289,9 +277,9 @@ def _decode_audio(
     device: torch.device,
 ) -> torch.Tensor:
     """Decode a video's stereo track as one audio unit."""
-    loaded = runners.loaded
-    samples = DecoderRunner.track_samples(loaded, num_frames)
-    frames = DecoderRunner.audio_latent_frames(loaded, samples)
+    model = runners.model
+    samples = model.track_samples(num_frames)
+    frames = int(model.audio.latent_frames(samples))
     decoder = runners.open(DecoderRunner, _AUDIO_DECODER, [frames])
     audio = torch.empty((samples, 2), dtype=torch.int16, device=device)
     decoder.decode(latent, audio, samples, 0, 1, 1)
@@ -340,9 +328,18 @@ def generate(
     # The denoiser's placement fixes the device the request computes on.
     device = next(loaded.module.get_submodule(component).parameters()).device
     size = [int(num_frames), canvas.width, canvas.height, len(prompt_token_ids)]
+    model = VideoModel(loaded, component)
+    request = VideoSize(
+        int(num_frames),
+        Canvas(canvas.width, canvas.height),
+        len(prompt_token_ids),
+    )
     if layout is None:
-        layout = DenoiserRunner.layout_size(loaded, component, size, [], [])
-    elif not DenoiserRunner.holds(loaded, component, layout, size, [], []):
+        layout = model.layout_size(request)
+    elif not model.denoiser.holds(
+        model.resolve(Layout(*(int(extent) for extent in layout))),
+        model.size(request),
+    ):
         raise ValueError("the capacity layout does not hold the request")
     layout = [int(extent) for extent in layout]
 
@@ -350,7 +347,7 @@ def generate(
     # for the caller's work; the runners are released once it drained.
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
-    runners = _Runners(loaded, stream)
+    runners = _Runners(loaded, model, stream)
     try:
         with torch.cuda.stream(stream):
             conditioning = _condition(

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import shlex
+import subprocess
+import threading
+import time
+from collections.abc import Iterator
 from itertools import zip_longest
 from pathlib import Path
 
@@ -77,7 +83,7 @@ def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
 # entry names a distinct way of dividing the sequence, the tensors or the layer
 # range across that many ranks. They are declared apart from the four-rank
 # layouts because they place every numerical component on all eight devices,
-# which is how an eight-device host serves.
+# which is how an eight-device host, or two hosts of four, serve.
 EIGHT_RANK_PARALLEL_CONFIGS = {
     "ulysses8": {
         "sequence_parallel": {"kind": "ulysses", "ulysses_degree": 8},
@@ -125,6 +131,72 @@ EIGHT_RANK_PARALLEL_CONFIGS = {
 # consecutive rank pair, and splitting those across a host's pairs would test
 # nothing about the layout while making every such layout unrunnable there.
 EIGHT_RANK_DENOISER_RANKS = [2, 3, 0, 1, 6, 7, 4, 5]
+
+# A layout needing more devices than this host has runs on two hosts when
+# UNISERVE_H3_FOLLOWER names the second (an ssh destination whose checkout
+# path holds the same build) and UNISERVE_H3_LEADER_ADDRESS the address of
+# this host that the second reaches. The second host's daemon joins this
+# host's leader as node `rank-1`, as docs/minimax_h3/minimax_h3.md's two-host
+# deployments do, and runs the ranks placed on its devices.
+FOLLOWER = os.environ.get("UNISERVE_H3_FOLLOWER")
+LEADER_ADDRESS = os.environ.get("UNISERVE_H3_LEADER_ADDRESS")
+AWAITING = "awaiting the deployment's other nodes"
+
+
+@contextlib.contextmanager
+def _follower(leader_log: Path, log: Path, address: str) -> Iterator[None]:
+    """Start the second host's daemon once the leader logged that it awaits
+    it, joining at ``address``; on exit wait until it ended, which it does
+    when the leader's connection closes.
+    """  # noqa: D205
+    assert FOLLOWER is not None
+    environment = " ".join(
+        f"{name}={shlex.quote(os.environ.get(name, ''))}"
+        for name in ("PATH", "LD_LIBRARY_PATH")
+    )
+    remote = (
+        f"cd {shlex.quote(str(Path.cwd()))} && echo follower pid $$ && "
+        f"exec env {environment} NCCL_NVLS_ENABLE=0 "
+        f"{shlex.quote(str(require_uniserve_binary()))} serve --nnodes 2 "
+        f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1"
+    )
+    started: list[subprocess.Popen[str]] = []
+    leaving = threading.Event()
+
+    def start() -> None:
+        while not leaving.is_set():
+            if leader_log.exists() and AWAITING in leader_log.read_text(
+                errors="replace"
+            ):
+                started.append(
+                    subprocess.Popen(
+                        ["ssh", "-o", "BatchMode=yes", FOLLOWER, remote],
+                        stdout=log.open("w", encoding="utf-8"),
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                )
+                return
+            time.sleep(1)
+
+    starter = threading.Thread(target=start, daemon=True)
+    starter.start()
+    try:
+        yield
+    finally:
+        leaving.set()
+        starter.join()
+        for process in started:
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                pid = log.read_text().split("follower pid ")[1].split()[0]
+                subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", FOLLOWER, f"kill {pid}"],
+                    check=False,
+                )
+                process.wait(timeout=120)
+                pytest.fail("the follower daemon outlived its leader")
 
 
 def _eight_rank_worker_config(parallel_kind: str) -> dict:
@@ -288,16 +360,29 @@ def test_component_bindings_release_cancelled_requests(
     }
     devices = worker_config.pop("devices")
     visible_devices = max(devices) + 1
-    if torch.cuda.device_count() < visible_devices:
+    local_devices = torch.cuda.device_count()
+    two_hosts = (
+        local_devices < visible_devices <= 2 * local_devices
+        and FOLLOWER is not None
+        and LEADER_ADDRESS is not None
+    )
+    if local_devices < visible_devices and not two_hosts:
         pytest.skip(
             f"{parallel_kind} needs {visible_devices} devices; "
-            f"this host has {torch.cuda.device_count()}"
+            f"this host has {local_devices} and no second host is named"
         )
+
+    def place(device: int) -> str:
+        # The ranks past this host's devices run on the second host's.
+        if device < local_devices:
+            return f"cuda:{device}"
+        return f"rank-1/cuda:{device - local_devices}"
+
     # Mapping a product into a consumer's device needs peer access between the
     # two. A host that grants it only within its own device pairs cannot carry
     # device products between ranks that fall in different pairs, and there the
     # host mechanism is the one those edges admit.
-    device_products = all(
+    device_products = not two_hosts and all(
         first == second or torch.cuda.can_device_access_peer(first, second)
         for first in devices
         for second in devices
@@ -329,7 +414,7 @@ def test_component_bindings_release_cancelled_requests(
         workers.append(
             {
                 "id": worker_id,
-                "ranks": [f"cuda:{devices[rank]}" for rank in members],
+                "ranks": [place(devices[rank]) for rank in members],
                 "queue_depth": 6,
                 "components": components,
             }
@@ -338,12 +423,23 @@ def test_component_bindings_release_cancelled_requests(
     # Media units are encoded and the artifact assembled on the CPU workers
     # of the media group, as in the shipped deployments: each CPU worker is
     # one codec slot encoding one unit of a round, a further worker muxes and
-    # the last reads condition media.
-    decoder_units = len(worker_config["video_decoder"]["ranks"])
+    # the last reads condition media. On two hosts each unit's codec slot is
+    # on its decoder's host.
+    decoder_ranks = worker_config["video_decoder"]["ranks"]
+    decoder_units = len(decoder_ranks)
+    media_ranks = (
+        [
+            place(devices[rank]).split("cuda:")[0] + "cpu"
+            for rank in decoder_ranks
+        ]
+        + ["cpu", "cpu"]
+        if two_hosts
+        else [f"cpu*{decoder_units + 2}"]
+    )
     workers.append(
         {
             "id": "media",
-            "ranks": [f"cpu*{decoder_units + 2}"],
+            "ranks": media_ranks,
             "queue_depth": 6,
             "components": {
                 "video_codec": {
@@ -385,21 +481,6 @@ def test_component_bindings_release_cancelled_requests(
         str(worker_executable()),
         "--worker-groups",
         str(written_deployment(tmp_path, workers)),
-        "--set",
-        "placement_config.transfer="
-        + ",".join(
-            # Device products cross workers over VMM handles where the
-            # devices can map one another; the media group's CPU workers have
-            # no device, so their edges carry host products over shared
-            # storage only.
-            f"{source}->{destination}="
-            + (
-                "posix_shm"
-                if "media" in (source, destination) or not device_products
-                else "cuda_vmm+posix_shm"
-            )
-            for source, destination in sorted(edges)
-        ),
         "--max-running-requests",
         str(max_running_requests),
         "--max-model-len",
@@ -421,6 +502,36 @@ def test_component_bindings_release_cancelled_requests(
         "--set",
         f"quantization_config.mode={precision}",
     ]
+    if two_hosts:
+        # Products cross the hosts by the mechanisms each edge derives, as in
+        # the shipped two-host deployments.
+        address = f"{LEADER_ADDRESS}:{find_free_port()}"
+        command += [
+            "--host-identity",
+            "rank-0",
+            "--nnodes",
+            "2",
+            "--dist-init-addr",
+            address,
+        ]
+    else:
+        command += [
+            "--set",
+            "placement_config.transfer="
+            + ",".join(
+                # Device products cross workers over VMM handles where the
+                # devices can map one another; the media group's CPU workers
+                # have no device, so their edges carry host products over
+                # shared storage only.
+                f"{source}->{destination}="
+                + (
+                    "posix_shm"
+                    if "media" in (source, destination) or not device_products
+                    else "cuda_vmm+posix_shm"
+                )
+                for source, destination in sorted(edges)
+            ),
+        ]
     tokenizer = AutoTokenizer.from_pretrained(Path(model_value) / "tokenizer")
     payloads = []
     for seconds, tokens, _frames in shapes:
@@ -439,19 +550,32 @@ def test_component_bindings_release_cancelled_requests(
         )
         prompt = MiniMaxH3Dataset(case).load(tokenizer)[0].prompt
         payloads.append(t2va_request("MiniMax-H3", prompt, seconds, 1000))
-    with server_process(
-        command,
-        base_url,
-        # Startup prepares and captures every admitted duration at both
-        # text capacities; two-way tensor or pipeline layouts took 9 to 11
-        # minutes to become ready on 4 x GB200.
-        tmp_path / "h3-components.log",
-        timeout_s=1800,
-        env={
-            "CUDA_VISIBLE_DEVICES": ",".join(
-                str(index) for index in range(visible_devices)
-            )
-        },
+    log = tmp_path / "h3-components.log"
+    environment = {
+        "CUDA_VISIBLE_DEVICES": ",".join(
+            str(index) for index in range(min(visible_devices, local_devices))
+        )
+    }
+    if two_hosts:
+        # NVLink SHARP is off across hosts, as in the two-host measurements.
+        environment["NCCL_NVLS_ENABLE"] = "0"
+    follower = (
+        _follower(log, tmp_path / "h3-follower.log", address)
+        if two_hosts
+        else contextlib.nullcontext()
+    )
+    with (
+        follower,
+        server_process(
+            command,
+            base_url,
+            # Startup prepares and captures every admitted duration at both
+            # text capacities; two-way tensor or pipeline layouts took 9 to
+            # 11 minutes to become ready on 4 x GB200.
+            log,
+            timeout_s=1800,
+            env=environment,
+        ),
     ):
         # Warm both decode geometries before exercising cancellation. Three
         # disconnects exceed the two provisioned slots and require their reuse.
@@ -715,7 +839,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
 
     # The eager policy covers decoding as well as the learned denoising steps.
     # Keep the exact checkpoint, capacity, prompt and seed from the full run.
-    command[-1] = "off"
+    command[-1] = "cuda_graph_config.policy=off"
     with (
         server_process(
             command, base, tmp_path / "video-eager.log", timeout_s=900

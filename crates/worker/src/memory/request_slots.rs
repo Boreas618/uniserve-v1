@@ -32,20 +32,16 @@ impl SlotField {
 
 /// Banks of per-slot state: one allocation per field shaped
 /// `[capacity + 1, ...shape]`, where row 0 is the padding slot and request
-/// slots are 1-based. Banks are bound once; a slot's state is a row view,
-/// made once with its bank, so each row crosses to Python as one torch
-/// tensor for the bank's life. Contents are uninitialized until their owner
-/// writes them.
+/// slots are 1-based. Banks are bound once. Contents are uninitialized until
+/// their owner writes them.
 pub(crate) struct RequestSlots {
-    capacity: u32,
     banks: Vec<Bank>,
 }
 
-/// One field's bank and its row views, the padding row first.
+/// One field's bank.
 struct Bank {
     field: SlotField,
     view: StorageView,
-    rows: Vec<StorageView>,
 }
 
 impl RequestSlots {
@@ -88,17 +84,13 @@ impl RequestSlots {
                 shape.extend(&field.shape);
                 let view =
                     StorageView::contiguous(memory as Arc<dyn Backing>, 0, field.dtype, &shape)?;
-                let slots = (0..rows)
-                    .map(|row| view.select(0, row))
-                    .collect::<Result<Vec<_>>>()?;
                 Ok(Bank {
                     field: field.clone(),
                     view,
-                    rows: slots,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { capacity, banks })
+        Ok(Self { banks })
     }
 
     /// Every bank keyed by field name, as bindings receive them.
@@ -114,17 +106,6 @@ impl RequestSlots {
         self.find(name).map(|bank| &bank.view)
     }
 
-    /// One request slot's row of a field; slots are 1-based.
-    pub(crate) fn slot(&self, name: &str, slot: u32) -> Result<StorageView> {
-        if slot == 0 || slot > self.capacity {
-            return Err(Error::Invalid(format!(
-                "request slot {slot} is outside capacity {}",
-                self.capacity
-            )));
-        }
-        Ok(self.find(name)?.rows[slot as usize].clone())
-    }
-
     fn find(&self, name: &str) -> Result<&Bank> {
         self.banks
             .iter()
@@ -138,7 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn banks_add_a_padding_row_and_index_slots_from_one() -> Result<()> {
+    fn banks_add_a_padding_row() -> Result<()> {
         let fields = [
             SlotField {
                 name: "tokens".into(),
@@ -156,14 +137,9 @@ mod tests {
         assert_eq!(RequestSlots::bytes(&fields, 2)?, (3 * 16, 3 * 8));
 
         let slots = RequestSlots::allocate(&fields, 2, None)?;
-        let bank = slots.bank("tokens")?;
-        assert_eq!(bank.shape(), &[3, 4]);
-        let second = slots.slot("tokens", 2)?;
-        assert_eq!(second.shape(), &[4]);
-        assert_eq!(second.address(), bank.address() + 2 * 16);
-        assert!(slots.slot("tokens", 0).is_err());
-        assert!(slots.slot("tokens", 3).is_err());
-        assert!(slots.slot("missing", 1).is_err());
+        assert_eq!(slots.bank("tokens")?.shape(), &[3, 4]);
+        assert_eq!(slots.bank("seed")?.shape(), &[3]);
+        assert!(slots.bank("missing").is_err());
         Ok(())
     }
 }

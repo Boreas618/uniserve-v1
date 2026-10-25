@@ -113,7 +113,7 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         };
         let root = config.string("root")?;
         let module = module_path(&root, &path);
-        let info = EncoderInfo::describe(&loaded, &module, DType::BF16)?;
+        let info = EncoderInfo::describe(&loaded, &module)?;
         let settings = EncoderConfig {
             max_images: orders.iter().map(Vec::len).max().unwrap_or(1),
             ..EncoderConfig::default()
@@ -128,6 +128,9 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
             scratch: scratch()?,
         };
         let products = arena(device)?;
+        // The captured graphs address the pool's memory, which it releases
+        // when dropped: declared before the runner, it outlives it.
+        let mut capture_pool = None;
         let mut runner = EncoderRunner::image(&setup, info, &settings)?;
         if config.optional::<bool>("capture")?.unwrap_or(false) {
             let Device::Cuda(cuda) = device else {
@@ -135,8 +138,8 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
                     "capture requires a CUDA device".into(),
                 ));
             };
-            let pool = pool(cuda)?;
-            runner.capture(Some(&pool), &mut || Ok(()))?;
+            let pool = capture_pool.insert(pool(cuda)?);
+            runner.capture(Some(pool), &mut || Ok(()))?;
         }
         runner.seal();
         let tower = if tower.as_str() == "vit" {
@@ -163,10 +166,6 @@ fn encode(config: Map<FfiString, Any>) -> std::result::Result<Array<Any>, tvm_ff
         let dtype = match info {
             EncoderInfo::Vision(vision) => vision.output_dtype,
             EncoderInfo::Latent(latent) => latent.output_dtype,
-            EncoderInfo::Text(text) => text.output_dtype,
-            EncoderInfo::Condition => {
-                return Err(worker::Error::Invalid("the harness encodes images".into()));
-            }
         };
         let mut results = Vec::new();
         let mut next = 0;

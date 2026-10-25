@@ -2,7 +2,6 @@
 
 pub(crate) mod decode_state;
 pub(crate) mod diffusion;
-pub(crate) mod video;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};

@@ -72,8 +72,9 @@ pub(crate) struct WorkerBatch {
     image_inputs: Option<Inputs>,
     /// An image batch between two of its jobs.
     image: Option<crate::executor::image::Pending>,
-    /// The video requests the batch started, while the library sizes them.
-    sizing: Option<crate::request::video::Sizing>,
+    /// The executor admits the video requests the batch started: the job
+    /// that asks it is on its lane.
+    starting: bool,
     /// Products and cache transfers imported from other calls.
     inputs: crate::executor::inputs::Inputs,
     /// The batch's host KV cache copies.
@@ -109,7 +110,7 @@ impl WorkerBatch {
             running: None,
             image_inputs: None,
             image: None,
-            sizing: None,
+            starting: false,
             inputs: crate::executor::inputs::Inputs::default(),
             pages: Pages::default(),
             media: None,
@@ -291,37 +292,26 @@ impl WorkerBackend {
             return Ok(Some(job));
         }
 
-        // A video request this batch started evaluates in a layout the
-        // library selects for its size. Asking is a job of the Python
-        // thread (it issues nothing on a stream); the batch goes on from
-        // its completion, and so do the request's later calls, which start
-        // behind this batch.
-        if let Some(video) = &mut self.runtimes.video {
-            if batch.sizing.is_none() {
-                batch.sizing = video.begin_sizing();
-            }
-            if let Some(sizing) = &mut batch.sizing {
-                let job = Job::new();
-                let on_lane = match video.ask(sizing, &mut self.runtimes.denoisers, &job) {
-                    Ok(on_lane) => on_lane,
-                    Err(error) => {
-                        if let Some(sizing) = batch.sizing.take() {
-                            video.abandon(sizing);
-                        }
-                        return Err(error.into());
-                    }
-                };
-                // A layout's preparation works on the denoiser's stream,
-                // so it is a job of that lane; the model's arithmetic is a
-                // job of the builder thread alone.
-                let submitted = if on_lane {
-                    let kind = CallKind::Media(ipc::MediaCall::LatentPreparation);
-                    self.jobs.start(kind, job, true).map_err(lane_lost)?
-                } else {
-                    self.jobs.call(job, true)
-                };
-                return Ok(Some(submitted));
-            }
+        // The executor admits the video requests this batch started: it
+        // sizes each and selects the layout it evaluates in. The batch goes
+        // on from the job's completion, and so do the requests' later
+        // calls, which start behind this batch. Preparing a layout the
+        // denoiser lacks works on its stream, so on a denoising rank the job
+        // belongs on the denoiser's lane; elsewhere it is a job of the
+        // builder thread alone.
+        if let Some(video) = &mut self.runtimes.video
+            && let Some(call) = video.take_started()
+        {
+            let job = Job::new();
+            job.call_texts(call);
+            let submitted = if video.denoising() {
+                let kind = CallKind::Media(ipc::MediaCall::LatentPreparation);
+                self.jobs.start(kind, job, true).map_err(lane_lost)?
+            } else {
+                self.jobs.call(job, true)
+            };
+            batch.starting = true;
+            return Ok(Some(submitted));
         }
 
         // Products other calls published are imported for every runtime
@@ -381,37 +371,27 @@ impl WorkerBackend {
             return Ok(());
         }
 
-        let Some(mut sizing) = batch.sizing.take() else {
+        if !std::mem::take(&mut batch.starting) {
             return crate::executor::inputs::admitted(self, batch, completion);
-        };
+        }
 
-        // The job asked the library to size the requests the batch started.
-        let Some(video) = &mut self.runtimes.video else {
-            return Err(Error::State("a batch sized requests on a rank without video").into());
-        };
-        let answered = completion
+        // The job asked the executor to admit the requests the batch
+        // started; those whose size the denoiser or the plan does not serve
+        // are refused alone.
+        let refused = completion
             .check()
-            .map_err(|failure| crate::runner::denoiser::invalid_size(failure.error))
-            .and_then(|mut completion| {
-                video.answer(&mut sizing, &mut completion, &mut self.runtimes.denoisers)
-            });
-        // The requests the denoiser or the plan does not serve are refused
-        // alone; the others go on being sized.
-        for (key, reason) in sizing.take_refused() {
+            .map_err(|failure| failure.error)
+            .and_then(|mut completion| completion.texts())
+            .and_then(|texts| {
+                serde_json::from_str::<Vec<(ipc::RequestKey, String)>>(&texts.concat())
+                    .map_err(|error| Error::Interface(format!("the executor's refusals: {error}")))
+            })
+            .map_err(|error| WorkerError::classify(error, Some("video request admission")))?;
+        for (key, reason) in refused {
             tracing::info!(request = ?key, "refused video request: {reason}");
             self.requests.refuse(key, &reason)?;
         }
-        match answered {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                batch.sizing = Some(sizing);
-                Ok(())
-            }
-            Err(error) => {
-                video.abandon(sizing);
-                Err(error.into())
-            }
-        }
+        Ok(())
     }
 
     pub(crate) fn prepare_inputs(

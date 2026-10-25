@@ -42,6 +42,7 @@ pub(crate) mod inputs;
 pub(crate) mod lifecycle;
 mod pending;
 pub(crate) mod products;
+pub(crate) mod python;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod transfer;

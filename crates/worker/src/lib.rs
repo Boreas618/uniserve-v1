@@ -51,7 +51,7 @@ pub use runner::ImageSetup;
 pub use runner::decoder::{DecodeImage, DecoderRunner};
 pub use runner::encoder::{
     Encoded, EncoderConfig, EncoderInfo, EncoderRunner, ImagePreparation, LatentEncoder,
-    PreparedImage, TextEncoder, Tower, VisionEncoder,
+    PreparedImage, Tower, VisionEncoder,
 };
 pub use stream::{CUDAStream, EventPool, Fill, Issue, RowFill};
 
