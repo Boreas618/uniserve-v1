@@ -139,7 +139,7 @@ One replica across every GPU gives the lowest latency; replicas serve more reque
 | Hardware | Goal | Deployment | Options |
 | --- | --- | --- | --- |
 | 4 x GB200 | Latency and throughput | `ulysses4.toml` | `--max-running-requests 2` |
-| 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off` |
+| 8 x GB200, two hosts | Latency | `ulysses8-two-host.toml` | `--max-running-requests 2` |
 | 8 x GB200, two hosts | Throughput | `fasth3-ulysses4x2-two-host.toml` | `--max-running-requests 4` |
 | 8 x RTX PRO 6000 | Latency | `ulysses8.toml` | `--max-running-requests 2 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
 | 8 x RTX PRO 6000 | Throughput | `fasth3-ulysses4x2.toml` | `--max-running-requests 4 --set cuda_graph_config.policy=off --mem-fraction-static 0.92 --set video_config.text_capacities=1024,10240` |
