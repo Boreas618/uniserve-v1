@@ -247,23 +247,14 @@ impl LatentStorage {
         self.step.as_ref()
     }
 
-    /// A bank's consecutive pages as `[pages * page_units, width]` units.
-    pub(crate) fn bank_view(&self, bank: u8, first: u32, count: u32) -> Result<StorageView> {
-        if bank > 1 || first == 0 || count == 0 || first + count > self.num_pages {
-            return Err(Error::Invalid(
-                "latent bank view requires consecutive pool pages".into(),
-            ));
+    /// Every page of `bank`, `[pages, page_units, width]`: the executor's
+    /// view of a video denoiser's bank, which it gathers a request's pages
+    /// from and scatters them to.
+    pub(crate) fn bank(&self, bank: u8) -> Result<StorageView> {
+        if bank > 1 {
+            return Err(Error::Invalid("a latent pool has two banks".into()));
         }
-        self.pages
-            .select(0, i64::from(bank))?
-            .narrow(0, i64::from(first), i64::from(count))?
-            .reshape(
-                self.pages.dtype(),
-                &[
-                    i64::from(count) * i64::from(self.page_units),
-                    i64::from(self.width),
-                ],
-            )
+        self.pages.select(0, i64::from(bank))
     }
 
     /// The first `units` units stored in `pages` of `bank`, page by page.
@@ -367,8 +358,8 @@ mod tests {
         assert_eq!(spans.shape(), vec![3, 3]);
         assert_eq!(spans.views()[1].shape(), &[1, 3]);
         assert!(storage.spans(0, &[0], 1).is_err());
-        assert_eq!(storage.bank_view(0, 1, 2)?.shape(), &[4, 3]);
-        assert!(storage.bank_view(0, 3, 2).is_err());
+        assert_eq!(storage.bank(1)?.shape(), &[4, 2, 3]);
+        assert!(storage.bank(2).is_err());
 
         let row = storage.fill_timestep(2, 0.5, None)?;
         // SAFETY: host column of the test.

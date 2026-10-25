@@ -9,9 +9,11 @@ and official video-plus-audio (W5) reference requests on the
 with a FastH3 OmniRef export.
 An OmniRef deployment that states a smaller condition capacity than the
 image-plus-audio request takes refuses it, naming its rows, and then serves
-the image-only request that fits. Reference deployments serve without CUDA
-graphs, since references bring media of any size; keyframe deployments
-serve under graphs. Condition media are read from ``file://`` URIs under
+the image-only request that fits. Every deployment serves under CUDA
+graphs: a request with conditions denoises in a captured layout widened to
+the deployment's condition capacity, and the encoding of reference media
+whose shape no graph holds runs eagerly. Condition media are read from
+``file://`` URIs under
 ``--media-directory``. Every served response is a complete MP4 at
 the canvas and frame count the request resolves to.
 """
@@ -20,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 import httpx
@@ -200,16 +204,53 @@ def test_fasth3_first_frame_request(tmp_path: Path) -> None:
         _check_media(response, width=1344, height=768, frames=192)
 
 
+def _graph_replays(client: httpx.Client) -> float:
+    """The workers' graph replays once their counters stop moving.
+
+    Worker statistics reach the registry with the engine's periodic
+    snapshot, so the counter is read until three reads agree.
+    """
+
+    def read() -> float:
+        response = client.get("/metrics")
+        response.raise_for_status()
+        total = 0.0
+        for line in response.text.splitlines():
+            match = re.match(
+                r"uniserve:worker_cuda_graph_runtime_mode_counts_total"
+                r"\{([^}]*)\} (\S+)",
+                line,
+            )
+            if match and 'mode="graph_replay"' in match.group(1):
+                total += float(match.group(2))
+        return total
+
+    current, stable = read(), 0
+    deadline = time.monotonic() + 120
+    while stable < 3:
+        if time.monotonic() > deadline:
+            pytest.fail("worker graph counters did not settle")
+        time.sleep(1)
+        value = read()
+        stable = stable + 1 if value == current else 0
+        current = value
+    return current
+
+
 def _reference_requests(command, base, tmp_path, *, inputs):
-    """Serve ``command`` and check W4 and W5 against it."""
+    """Serve ``command`` and check W4 and W5 against it; each request's
+    denoising steps replay captured graphs.
+    """  # noqa: D205
     with (
         server_process(command, base, tmp_path / "server.log", timeout_s=3600),
         httpx.Client(base_url=base, timeout=3600) as client,
     ):
         video = client.get("/v1/capabilities").json()["video"]
         assert video["tasks"] == ["ref2va"]
+        steps = video["schedule"]["num_inference_steps"]
 
         for name in ("w4", "w5"):
+            before = _graph_replays(client)
             response = client.post(
                 "/v1/videos/sync", json=_request(name, inputs)
             )
@@ -217,15 +258,12 @@ def _reference_requests(command, base, tmp_path, *, inputs):
             # References leave the auto canvas at 16:9; five seconds align
             # up to 124 frames.
             _check_media(response, width=1344, height=768, frames=124)
+            assert _graph_replays(client) - before >= steps, name
 
 
 # The official video-plus-audio presentation holds 6913 text rows and its
 # references about 38k condition rows.
 REFERENCE_OPTIONS = [
-    # References bring media of any size, which no captured CUDA graph
-    # holds, so a reference deployment serves eagerly.
-    "--set",
-    "cuda_graph_config.policy=off",
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -256,10 +294,6 @@ def test_base_reference_requests(tmp_path: Path) -> None:
 # reference video fills 10 x 6 x 6 tiles and its soundtrack and audio
 # reference 4 tiles each, against 38,124 rows packed densely.
 OMNIREF_OPTIONS = [
-    # References bring media of any size, which no captured CUDA graph
-    # holds, so a reference deployment serves eagerly.
-    "--set",
-    "cuda_graph_config.policy=off",
     "--set",
     "video_config.max_seconds=5",
     "--max-model-len",
@@ -311,10 +345,6 @@ def test_omniref_reference_requests(tmp_path: Path) -> None:
 # states a 7,680-row condition capacity: each of W4's condition products fits
 # it and their packed rows do not. W4's image without its voice fits.
 SMALL_CAPACITY_OPTIONS = [
-    # References bring media of any size, which no captured CUDA graph
-    # holds, so a reference deployment serves eagerly.
-    "--set",
-    "cuda_graph_config.policy=off",
     "--set",
     "mm_processor_kwargs.enlarge_references=true",
     "--set",

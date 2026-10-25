@@ -24,17 +24,7 @@ impl WarmupHooks for EncoderWarmup {
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let lanes = backend.job_queues().clone();
-        if backend.serves_video() {
-            let parts = backend.media_parts()?;
-            parts
-                .encoders
-                .capture_text(&lanes)
-                .map_err(|error| WorkerError::classify(error, Some("capture")))?;
-            parts
-                .encoders
-                .capture_tiles(&lanes)
-                .map_err(|error| WorkerError::classify(error, Some("capture")))?;
-        } else if let Some(image) = backend.parts().image {
+        if let Some(image) = backend.parts().image {
             image.encoders.capture_image(&lanes).map_err(|error| {
                 WorkerError::classify(error, Some("image graph capture")).with_phase("warmup")
             })?;

@@ -208,7 +208,26 @@ fn video_named_canvas(
     )
 }
 
+/// `video_image_grid(image_config, video_config, height, width) -> [t, h,
+/// w]`: the patch grid the conditioner reads a `height` x `width` still
+/// image on, under the checkpoint's image and video processor configs (JSON
+/// texts; `plan::ProcessorConfig::image_grid`).
+fn video_image_grid(
+    image_config: tvm_ffi::String,
+    video_config: tvm_ffi::String,
+    height: i64,
+    width: i64,
+) -> Result<Array<Any>> {
+    let processor = plan::ProcessorConfig::parse(image_config.as_str(), video_config.as_str())
+        .map_err(|error| value_error(&error.to_string()))?;
+    let grid = processor
+        .image_grid(positive(height, "height")?, positive(width, "width")?)
+        .map_err(|error| value_error(&error.to_string()))?;
+    Ok(integer_list([grid.t, grid.h, grid.w].map(i64::from)))
+}
+
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_tasks, video_tasks);
+tvm_ffi::tvm_ffi_dll_export_typed_func!(video_image_grid, video_image_grid);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_canvas, video_canvas);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_frame_count, video_frame_count);
 tvm_ffi::tvm_ffi_dll_export_typed_func!(video_reference_bounds, video_reference_bounds);

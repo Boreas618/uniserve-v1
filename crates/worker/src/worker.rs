@@ -29,6 +29,7 @@ mod loading;
 mod memory;
 mod planning;
 pub(crate) mod update;
+mod video;
 
 pub(crate) use loading::LoadedModel;
 pub(crate) use memory::WorkerMemory;
@@ -67,19 +68,16 @@ use crate::parallel::{
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
-use crate::request::video::VideoRequests;
 use crate::runner::causal_lm::CausalLMRunners;
 use crate::runner::causal_lm::start::{Startup, expert_tokens};
 use crate::runner::causal_lm::warmup::CausalLMWarmup;
-use crate::runner::component::VideoSetup;
 use crate::runner::decoder::warmup::DecoderWarmup;
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::denoiser::warmup::DenoiserWarmup;
-use crate::runner::denoiser::{VideoModel, placed_denoiser};
 use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
 use crate::runner::encoder::warmup::EncoderWarmup;
 use crate::runner::scratch::Scratches;
-use crate::runner::start::{ImageOwners, Startup as ImageStartup, start_video};
+use crate::runner::start::{ImageOwners, Startup as ImageStartup};
 use crate::service::{Ending, Parked, Service, Suspension};
 use crate::stream::{CUDAStream, Streams};
 use crate::transfer::TransportKind;
@@ -316,10 +314,21 @@ impl Worker {
                 .map_err(phase("load"))?;
         }
         let image = ImageModel::describe(model.handle()).map_err(phase("load"))?;
+        // A video model's executor states what capacity planning sizes the
+        // rank by.
         let video = if model.video_decoder {
-            let denoiser = placed_denoiser(&model.declarations, &config.deployment_components)
-                .map_err(phase("load"))?;
-            Some(VideoModel::new(model.handle(), denoiser).map_err(phase("load"))?)
+            let denoiser =
+                video::placed_denoiser(&model.declarations, &config.deployment_components)
+                    .map_err(phase("load"))?;
+            let (executor, manifest) = video::executor(
+                model.handle(),
+                &config,
+                &components,
+                &denoiser,
+                &model.attention_backend,
+            )
+            .map_err(phase("load"))?;
+            Some((denoiser, executor, manifest))
         } else {
             None
         };
@@ -387,7 +396,9 @@ impl Worker {
             budget.as_ref(),
             &components,
             streams.lanes().len().max(1),
-            video.as_ref(),
+            video
+                .as_ref()
+                .map(|(denoiser, _, manifest)| (denoiser.as_str(), manifest.clone())),
         )
         .map_err(phase("capacity"))?;
         if let Some(budget) = &budget {
@@ -540,38 +551,21 @@ impl Worker {
         }
         let mut streams = streams;
         let video_owners = match (video, video_capacity) {
-            (Some(video), Some(capacity)) => {
-                let (encoders, denoisers, decoders, media) = start_video(
-                    VideoSetup {
-                        loaded: model.handle(),
-                        model: &video,
-                        capacity: &capacity,
-                        info: &info,
-                        queue_depth: launch.ipc.queue_depth,
-                        config: &config,
-                        streams: &mut streams,
-                        graphs: &mut graphs,
-                        attention: model.attention_backend.clone(),
-                        memory: &mut &*retained,
-                    },
-                    &components,
-                )
-                .map_err(phase("storage"))?;
-                let device = match config.device {
-                    crate::config::Device::Cuda(index) => Some(index),
-                    crate::config::Device::Cpu => None,
-                };
-                let leases = 2 * launch.ipc.queue_depth + 2;
-                let words = info.max_batch_calls.max(1) as usize;
-                Some((
-                    VideoRequests::new(video, capacity.media).map_err(phase("storage"))?,
-                    encoders,
-                    denoisers,
-                    decoders,
-                    media,
-                    crate::OutputPool::new(device, leases, words).map_err(phase("storage"))?,
-                ))
-            }
+            (Some((_, executor, _)), Some(capacity)) => Some(
+                video::start(video::VideoStart {
+                    executor,
+                    capacity: &capacity,
+                    info: &info,
+                    config: &config,
+                    components: &components,
+                    streams: &mut streams,
+                    graphs: &mut graphs,
+                    scratches: &mut scratches,
+                    queue_depth: launch.ipc.queue_depth,
+                    memory: &mut &*retained,
+                })
+                .map_err(phase("storage"))?,
+            ),
             _ => None,
         };
         // The shapes the engine warms the serving path with, through its
@@ -605,8 +599,8 @@ impl Worker {
         backend.set_job_queues(streams.job_queues());
         let text_warmup = text.is_some();
         let video_warmup = video_owners.is_some();
-        if let Some((requests, encoders, denoisers, decoders, media, outputs)) = video_owners {
-            backend.set_video(requests, encoders, denoisers, decoders, media, outputs);
+        if let Some((runtime, outputs)) = video_owners {
+            backend.set_video(runtime, outputs);
         }
         if let Some(text) = text {
             backend.set_text(text);
@@ -666,7 +660,10 @@ impl Worker {
         )
         .map_err(|error| error.with_phase("executor"))?;
         let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
-        if video_warmup || image_warmup {
+        if video_warmup {
+            hooks.push(Box::new(video::VideoWarmup));
+        }
+        if image_warmup {
             // Prepared and captured in this order on every rank.
             hooks.push(Box::new(EncoderWarmup));
             hooks.push(Box::new(DenoiserWarmup));
@@ -1157,18 +1154,8 @@ impl Worker {
         for (label, device, kernels) in executor.backend().kernels().map_err(phase("warmup"))? {
             records.add(&label, &device, &kernels);
         }
-        if executor.backend().serves_video() {
-            let backend = executor.backend();
-            let mut video = backend.encoders().text_kernels().map_err(phase("warmup"))?;
-            video.extend(backend.denoisers().kernels().map_err(phase("warmup"))?);
-            video.extend(backend.decoders().kernels().map_err(phase("warmup"))?);
-            video.extend(
-                backend
-                    .encoders()
-                    .latent_kernels()
-                    .map_err(phase("warmup"))?,
-            );
-            for (label, kernels) in video {
+        if let Some(video) = executor.backend().video() {
+            for (label, kernels) in video.executor.kernels().map_err(phase("warmup"))? {
                 records.add(&label, &self.config.device.to_string(), &kernels);
             }
         }

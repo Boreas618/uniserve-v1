@@ -1,6 +1,5 @@
-//! Startup of a rank's media runners: the runners of a video model's
-//! placed components, and the runners of an image model's
-//! encoders, denoiser and decoder.
+//! Startup of an image model's media runners: its encoders, denoiser and
+//! decoder.
 
 use std::collections::HashMap;
 
@@ -19,9 +18,7 @@ use crate::host::image::ImageTask;
 use crate::memory::{LatentCache, LatentPlan, LatentPool, LatentStorage, OutputPool};
 use crate::request::diffusion::BranchSource;
 use crate::runner::ImageSetup;
-use crate::runner::causal_lm::model_dtype;
 use crate::runner::causal_lm::start::TextBounds;
-use crate::runner::component::VideoSetup;
 use crate::runner::decoder::DecoderRunner;
 use crate::runner::decoder::runners::DecoderRunners;
 use crate::runner::denoiser::DenoiserRunner;
@@ -30,7 +27,6 @@ use crate::runner::denoiser::image_model::{ImageDenoiserLayout, ImageModel, Imag
 use crate::runner::denoiser::runners::{DenoiserRunners, FlowShape};
 use crate::runner::encoder::runners::EncoderRunners;
 use crate::runner::encoder::{EncoderConfig, EncoderInfo, EncoderRunner, Tower, VisionEncoder};
-use crate::runner::media::MediaRunner;
 use crate::runner::scratch::Scratches;
 use crate::stream::Streams;
 use crate::worker::LoadedModel;
@@ -350,7 +346,6 @@ impl ImageOwners {
         let loaded = startup.model.handle();
         let facts = ImageModel::describe(loaded)?;
         let policy = ImagePolicy::new(loaded.clone())?;
-        let dtype = model_dtype(&config.model_dtype)?;
         let max_calls = config
             .max_batch_calls
             .min(startup.request_slots.max(1))
@@ -358,8 +353,6 @@ impl ImageOwners {
         let encoder_config = EncoderConfig {
             max_images: max_calls,
             row_budget: config.max_batch_tokens,
-            text_capacities: Vec::new(),
-            max_text_tokens: config.max_model_len,
         };
 
         // The denoiser's attention geometry and the cache pool its context
@@ -462,7 +455,7 @@ impl ImageOwners {
             };
             match target.kind {
                 CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-                    let info = EncoderInfo::describe(loaded, &target.path, dtype)?;
+                    let info = EncoderInfo::describe(loaded, &target.path)?;
                     // Under graphs every encode replays a captured graph: a
                     // vision encoder packs its images into fixed slots, and a
                     // latent encoder encodes images of the configured sizes
@@ -730,58 +723,4 @@ pub(crate) fn reserved_bytes(
     let columns = tokens * (3 * 8 + 8 * 4) + rows * 64;
     let staging = (max_image_pixels(Some(layout)) * 3 * calls) as u64;
     predictions + columns + staging
-}
-
-/// Start the runners of a video model's components placed on this rank, in
-/// placement order, and the host media of its host components.
-pub(crate) fn start_video(
-    mut setup: VideoSetup<'_>,
-    components: &Components,
-) -> Result<(
-    EncoderRunners,
-    DenoiserRunners,
-    DecoderRunners,
-    Option<MediaRunner>,
-)> {
-    use crate::config::placement::Capability;
-
-    let mut encoders = EncoderRunners::default();
-    let mut denoisers = DenoiserRunners::default();
-    let mut decoders = DecoderRunners::default();
-    let mut host_components = std::collections::BTreeMap::new();
-    for placed in components.placed() {
-        if placed.host() {
-            host_components.insert(placed.name.clone(), placed.config.clone());
-            continue;
-        }
-        if placed.has(Capability::TextEncoder) {
-            encoders.start_text(&mut setup, placed)?;
-        }
-        if placed.name == setup.model.denoiser {
-            denoisers.start_video(&mut setup, placed)?;
-        }
-        if placed.has(Capability::VideoDecoder) {
-            decoders.start_video(&mut setup, placed)?;
-        }
-        if placed.has(Capability::AudioDecoder) {
-            decoders.start_audio(&mut setup, placed)?;
-        }
-        if placed.has(Capability::VideoEncoder) {
-            encoders.start_conditions(&mut setup, placed)?;
-        }
-    }
-    let media = if host_components.is_empty() {
-        None
-    } else {
-        let capacity = (setup.queue_depth * setup.info.max_batch_calls.max(1) as usize).max(1);
-        Some(MediaRunner::new(
-            setup.loaded,
-            host_components,
-            setup.config.ffmpeg.clone(),
-            setup.model.facts.frame_rate,
-            capacity,
-            setup.config.device.cuda(),
-        )?)
-    };
-    Ok((encoders, denoisers, decoders, media))
 }

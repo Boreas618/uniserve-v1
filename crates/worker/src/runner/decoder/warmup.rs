@@ -10,13 +10,7 @@ pub(crate) struct DecoderWarmup;
 impl WarmupHooks for DecoderWarmup {
     fn prepare(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let lanes = backend.job_queues().clone();
-        if backend.serves_video() {
-            let parts = backend.media_parts()?;
-            parts
-                .decoders
-                .prepare_startup(&parts.video.model, &parts.video.plan, parts.rank, &lanes)
-                .map_err(|error| WorkerError::classify(error, Some("warmup")))?;
-        } else if let Some(image) = backend.parts().image {
+        if let Some(image) = backend.parts().image {
             let layout = image.model.denoiser;
             let side = layout.map_or(64, |layout| 2 * layout.downsample);
             image
@@ -31,13 +25,7 @@ impl WarmupHooks for DecoderWarmup {
 
     fn capture(&mut self, backend: &mut WorkerBackend) -> std::result::Result<(), WorkerError> {
         let lanes = backend.job_queues().clone();
-        if backend.serves_video() {
-            let parts = backend.media_parts()?;
-            parts
-                .decoders
-                .capture_startup(&lanes)
-                .map_err(|error| WorkerError::classify(error, Some("capture")))?;
-        } else if let Some(image) = backend.parts().image {
+        if let Some(image) = backend.parts().image {
             image.decoders.capture_image(&lanes).map_err(|error| {
                 WorkerError::classify(error, Some("image decoder capture")).with_phase("warmup")
             })?;

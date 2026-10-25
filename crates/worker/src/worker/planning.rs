@@ -13,7 +13,7 @@ use super::loading::LoadedModel;
 use super::{endpoint, expert_exchange, exports_device_products};
 use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::{Plan, Report, TokenFacts, TokenLayout, resolve_block_size};
-use crate::capacity::video::VideoCapacity;
+use crate::capacity::video::{VideoCapacity, VideoManifest};
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
@@ -21,7 +21,6 @@ use crate::ffi::DType;
 use crate::memory::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::parallel::world::World;
 use crate::runner::causal_lm::start::reserved_bytes;
-use crate::runner::denoiser::VideoModel;
 use crate::runner::denoiser::image_model::ImageModel;
 use crate::runner::diffusion_lm::{self};
 use crate::runner::encoder::EncoderInfo;
@@ -74,7 +73,7 @@ pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
 /// Bytes of the largest vision feature product the image policy admits: the
 /// feature rows of its largest image at the vision encoder's output width.
 /// Zero for a model without a vision encoder or an understanding transform.
-fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
+fn vision_feature_bytes(model: &LoadedModel) -> Result<u64> {
     let declarations = &model.declarations;
     let Some(call) = declarations
         .names()
@@ -83,10 +82,7 @@ fn vision_feature_bytes(model: &LoadedModel, model_dtype: &str) -> Result<u64> {
     else {
         return Ok(0);
     };
-    let dtype = DType::from_name(model_dtype)
-        .ok_or_else(|| Error::Unsupported(format!("unsupported model dtype {model_dtype:?}")))?;
-    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path, dtype)?
-    else {
+    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path)? else {
         return Ok(0);
     };
 
@@ -109,7 +105,7 @@ pub(super) fn plan(
     budget: Option<&DeviceBudget>,
     components: &Components,
     unit_columns: usize,
-    video: Option<&VideoModel>,
+    video: Option<(&str, VideoManifest)>,
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
     if let (Device::Cuda(index), Some(budget)) = (device, budget) {
@@ -161,16 +157,9 @@ pub(super) fn plan(
             .collect()
     };
     let capacity = match video {
-        Some(video) => {
-            let sampling = launch.components.contains_key(&video.denoiser);
-            let denoising = components.get(&video.denoiser).is_some();
-            let decoding = components
-                .placed()
-                .iter()
-                .any(|placed| placed.has(Capability::VideoDecoder));
-            Some(crate::capacity::video::plan(
-                video, config, sampling, denoising, decoding,
-            )?)
+        Some((denoiser, manifest)) => {
+            let sampling = launch.components.contains_key(denoiser);
+            Some(VideoCapacity::new(manifest, sampling)?)
         }
         None => None,
     };
@@ -182,7 +171,7 @@ pub(super) fn plan(
             // Only a video model's components publish products.
             outputs: capacity
                 .as_ref()
-                .and_then(|capacity| capacity.outputs.get(name).cloned())
+                .and_then(|capacity| capacity.outputs().get(name).cloned())
                 .unwrap_or_default(),
         })
         .collect();
@@ -207,14 +196,13 @@ pub(super) fn plan(
         media_components,
         components: infos,
     };
-    if let (Some(video), Some(capacity)) = (video, capacity) {
+    if let Some(capacity) = capacity {
         let plan = video_layout(
             report,
             config,
             launch,
             declarations,
             components,
-            video,
             &capacity,
             budget,
             &world.host,
@@ -241,7 +229,7 @@ pub(super) fn plan(
     });
     let token_facts = TokenFacts {
         image_processor: image.processing.is_some(),
-        vision_feature_bytes: vision_feature_bytes(model, &config.model_dtype)?,
+        vision_feature_bytes: vision_feature_bytes(model)?,
         latent_feature_bytes: latent.map_or(0, |plan| {
             image_tokens as u64 * plan.latent_width as u64 * plan.dtype.bytes() as u64
         }),
@@ -351,7 +339,6 @@ fn video_layout(
     launch: &WorkerLaunch,
     declarations: &crate::config::placement::Declarations,
     components: &Components,
-    video: &VideoModel,
     capacity: &VideoCapacity,
     budget: Option<&DeviceBudget>,
     group: &crate::parallel::host::HostGroup,
@@ -372,7 +359,7 @@ fn video_layout(
         .iter()
         .map(|placed| placed.name.clone())
         .collect();
-    let local = crate::capacity::video::local_product_bytes(&capacity.outputs, &routes, &held);
+    let local = crate::capacity::video::local_product_bytes(capacity.outputs(), &routes, &held);
     let codec_ranks = launch
         .components
         .get("video_codec")
@@ -383,7 +370,7 @@ fn video_layout(
         // a single slot's three queue positions.
         let maximum = config.max_request_pool_size;
         let minimum = 1;
-        let facts = capacity.facts(video, maximum, local, codec_ranks)?;
+        let facts = capacity.facts(maximum, local, codec_ranks)?;
         let requirements = crate::capacity::plan::slot_requirements(
             config,
             queue_depth,
@@ -397,7 +384,7 @@ fn video_layout(
         config.max_batch_calls = config.max_batch_calls.min(slots);
         config.max_batch_tokens = config.max_batch_tokens.min(slots);
     }
-    let facts = capacity.facts(video, config.max_request_pool_size, local, codec_ranks)?;
+    let facts = capacity.facts(config.max_request_pool_size, local, codec_ranks)?;
     crate::capacity::plan::request_layout(
         report,
         config,

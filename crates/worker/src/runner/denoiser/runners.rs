@@ -1,22 +1,16 @@
 //! The denoiser runners of a rank.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ipc::{BufferId, CallKind, MediaCall, RequestKey};
-use models::video::ConditionRole;
+use ipc::{CallKind, MediaCall};
 
+use super::DenoiserRunner;
 use super::image::{ConditionRow, ConditionShape, DenoiseRow};
-use super::{DenoiserRunner, Evicted, VideoModel};
+use crate::Result;
 use crate::cuda_graph::GraphPool;
-use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::memory::{LatentCache, PrefixCache, UnitColumn};
-use crate::profiling::kernels::KernelRecord;
-use crate::request::video::{self, MediaPlan, VideoLayout, VideoSize};
-use crate::runner::component::Component;
 use crate::stream::Issue;
-use crate::{Error, Result};
 
 /// The lane kind of a denoiser's jobs.
 const DENOISING: CallKind = CallKind::Media(MediaCall::Denoising);
@@ -44,13 +38,9 @@ pub(crate) struct FlowShape {
     pub(crate) width: u32,
 }
 
-/// The denoiser runners of a rank.
+/// An image model's denoiser runner on a rank.
 #[derive(Default)]
 pub(crate) struct DenoiserRunners {
-    /// A video model's denoiser.
-    pub(crate) video: Option<Component<DenoiserRunner>>,
-    /// The layout each admitted slot holds on the video denoiser.
-    layouts: HashMap<usize, usize>,
     /// An image model's denoiser, with its component.
     pub(crate) image: Option<(String, DenoiserRunner)>,
     /// The denoising steps captured at startup, largest first, and their
@@ -91,7 +81,6 @@ impl DenoiserRunners {
             conditions,
             image_graphs,
             units,
-            ..Self::default()
         }
     }
 
@@ -370,234 +359,5 @@ impl DenoiserRunners {
             }
         }
         Ok(())
-    }
-
-    /// Whether `layout` needs preparing before a request is admitted with
-    /// it: the rank's video denoiser does not hold it yet.
-    pub(crate) fn lacks(&self, layout: &VideoLayout) -> bool {
-        self.video
-            .as_ref()
-            .is_some_and(|denoiser| !denoiser.runner.prepared(layout))
-    }
-
-    /// Record into `job`, a job of the video denoiser's lane, the
-    /// preparation of transient layout `layout`
-    /// ([`super::DenoiserRunner::ask_layout`]).
-    pub(crate) fn ask_layout(
-        &mut self,
-        model: &VideoModel,
-        layout: VideoLayout,
-        job: &Job,
-    ) -> Result<Evicted> {
-        self.video
-            .as_mut()
-            .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?
-            .runner
-            .ask_layout(model, layout, job)
-    }
-
-    /// Keep transient layout `layout` as the job of [`Self::ask_layout`]
-    /// prepared it.
-    pub(crate) fn accept_layout(
-        &mut self,
-        model: &VideoModel,
-        layout: VideoLayout,
-        completion: &mut Completion,
-    ) -> Result<()> {
-        self.video
-            .as_mut()
-            .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?
-            .runner
-            .accept_layout(model, layout, completion)
-    }
-
-    /// Hold prepared `layout` for the request admitted in `slot` and
-    /// return its id, releasing the layout of the request the slot held
-    /// before. `None` on a rank without a video denoiser.
-    pub(crate) fn admit(&mut self, slot: usize, layout: VideoLayout) -> Result<Option<usize>> {
-        let Some(denoiser) = &mut self.video else {
-            return Ok(None);
-        };
-        let id = denoiser.runner.acquire(layout)?.ok_or_else(|| {
-            Error::Invariant("a request was admitted with a layout that is not prepared".into())
-        })?;
-        if let Some(previous) = self.layouts.insert(slot, id) {
-            denoiser.runner.release(previous)?;
-        }
-        Ok(Some(id))
-    }
-
-    /// Prepare and warm every startup layout, those of requests with
-    /// conditions under graphs and each canvas's largest, in the plan's
-    /// order, which every rank shares since a layout's warm step exchanges
-    /// tensors with the other ranks, then the conditioner capacities. The
-    /// layout the denoiser was constructed with ([`MediaPlan::maximum`]) is
-    /// among the largest. Each warmup is a job of the denoiser's lane on
-    /// `lanes`, which startup waits for.
-    pub(crate) fn prepare_startup(
-        &mut self,
-        model: &VideoModel,
-        plan: &MediaPlan,
-        lanes: &JobQueues,
-    ) -> Result<()> {
-        if let Some(denoiser) = &mut self.video {
-            let runner = &mut denoiser.runner;
-            let mut ids = Vec::new();
-            for layout in plan
-                .layouts
-                .iter()
-                .chain(&plan.conditioned)
-                .chain(&plan.largest)
-            {
-                let id = runner.prepare_startup(model, *layout)?;
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-            // A placeholder request in slot one warms every layout before
-            // any capture: kernels, plans and scratch are created by a
-            // layout's first step.
-            for &id in &ids {
-                let key = runner.key(id)?;
-                let size = VideoSize::plain(
-                    key.frames,
-                    key.canvas,
-                    key.text_rows.min(plan.max_text_tokens),
-                );
-                // The placeholder's host sources are filled, then its
-                // layout's step warms from them, in one job.
-                let job = Job::new();
-                runner.prepare_latents(id, 1, &size, 0, &job)?;
-                runner.warm(id, 1, &job)?;
-                perform(lanes, job)?;
-            }
-            let job = Job::new();
-            runner.warm_conditioner(false, &job)?;
-            perform(lanes, job)?;
-        }
-        Ok(())
-    }
-
-    /// Capture the startup layouts (those of requests with conditions
-    /// among them under graphs) and conditioner capacities, then refuse
-    /// further captures. Each layout's capture is a job of the denoiser's
-    /// lane on `lanes`, whose completion carries the graph; a last job
-    /// warms and captures the conditioner capacities and waits for the
-    /// stream before the runner is sealed.
-    pub(crate) fn capture_startup(
-        &mut self,
-        model: &VideoModel,
-        plan: &MediaPlan,
-        lanes: &JobQueues,
-    ) -> Result<()> {
-        if let Some(denoiser) = &mut self.video {
-            let runner = &mut denoiser.runner;
-            for layout in plan.layouts.iter().chain(&plan.conditioned) {
-                let id = runner.prepare_startup(model, *layout)?;
-                let job = Job::new();
-                if runner.capture(id, &job)? {
-                    let mut completion = perform(lanes, job)?;
-                    runner.complete_capture(id, &mut completion)?;
-                }
-            }
-            // Every keyframe set a request may bring, encoded into each
-            // layout of requests with conditions.
-            for layout in &plan.conditioned {
-                let id = runner.prepare_startup(model, *layout)?;
-                let keyframe = |role| video::ConditionShape {
-                    role,
-                    pixels: Some((1, layout.canvas)),
-                    audio_samples: 0,
-                };
-                for conditions in [
-                    vec![keyframe(ConditionRole::FirstFrame)],
-                    vec![keyframe(ConditionRole::LastFrame)],
-                    vec![
-                        keyframe(ConditionRole::FirstFrame),
-                        keyframe(ConditionRole::LastFrame),
-                    ],
-                ] {
-                    let job = Job::new();
-                    if let Some(key) = runner.capture_conditions(id, conditions.into(), &job)? {
-                        let mut completion = perform(lanes, job)?;
-                        runner.complete_conditions(key, &mut completion)?;
-                    }
-                }
-            }
-            let job = Job::new();
-            let capacities = runner.warm_conditioner(true, &job)?;
-            job.on(runner.stream()).synchronize()?;
-            let mut completion = perform(lanes, job)?;
-            runner.complete_conditioner(capacities, &mut completion)?;
-            runner.seal();
-        }
-        Ok(())
-    }
-
-    /// The kernels the video denoiser's operators selected.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, Vec<KernelRecord>)>> {
-        let mut kernels = Vec::new();
-        if let Some(denoiser) = &self.video {
-            kernels.push((denoiser.name.clone(), denoiser.runner.kernels()?));
-        }
-        Ok(kernels)
-    }
-}
-
-impl RequestStorage for DenoiserRunners {
-    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
-        // A slot's layout is held when its request's admission is installed.
-        Ok(())
-    }
-
-    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
-        Ok(())
-    }
-
-    fn release_requests(
-        &mut self,
-        _requests: &HashSet<RequestKey>,
-        _retained: &HashSet<BufferId>,
-        _jobs: &LaneJobs,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn retirement_ready(
-        &mut self,
-        _buffers: &HashSet<BufferId>,
-        _requests: &HashSet<RequestKey>,
-        _retained: &HashSet<BufferId>,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-
-    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
-        let Some(denoiser) = &mut self.video else {
-            return Ok(());
-        };
-        let mut released = Vec::new();
-        for slot in slots {
-            if let Some(id) = self.layouts.remove(slot) {
-                released.push(*slot);
-                denoiser.runner.release(id)?;
-            }
-        }
-        if !released.is_empty() {
-            denoiser.runner.release_slots(&released)?;
-        }
-        Ok(())
-    }
-
-    fn reap(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn close(&mut self, aborted: bool) -> Result<()> {
-        self.layouts.clear();
-        match &mut self.video {
-            Some(denoiser) => denoiser.runner.close(aborted),
-            None => Ok(()),
-        }
     }
 }

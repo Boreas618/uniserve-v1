@@ -1,46 +1,51 @@
 //! A video model's media batch: what its calls contribute beside the shared
-//! batch skeleton ([`VideoCall`], [`MediaBatch`]), the parts of the backend
-//! it executes with ([`Parts`]), and the dispatch of its calls to the
-//! encoder, denoiser, decoder and host media runners ([`forward`],
-//! [`complete`]).
+//! batch skeleton ([`VideoCall`], [`MediaBatch`]), what a video model's rank
+//! keeps beside the executor ([`VideoRuntime`]: the trajectory ledger, the
+//! lanes' streams and the output leases), and the jobs of a batch
+//! ([`forward`], [`complete`]).
 //!
-//! A media batch goes through the steps of [`crate::executor::batch`] as
-//! jobs of its lane:
+//! The executor (`uniserve.executor`) computes every call; the worker leases
+//! what the calls read, binds what they write, keeps the trajectory ledger,
+//! publishes the products and delivers the results. A media batch goes
+//! through the steps of [`crate::executor::batch`] as jobs of its lane:
 //!
 //! 1. The opening job reads the batch's host-gated predicates, when it has
 //!    any. A call whose predicate is false is skipped: it runs nothing and
 //!    forwards a false decision to its successor through its completion
 //!    flag.
-//! 2. When the batch's condition encodings lack an encoder the library
-//!    constructs for new input shapes, a job asks for it; the forwards are
-//!    recorded from its completion.
-//! 3. The last job leases the batch's output storage on the stream of its
-//!    kind, binds the completion flags and holds every active call's
-//!    forward: device calls on the component's stream, host calls as tasks
-//!    of the rank's host lane, submitted while the job is recorded. Behind
-//!    the forwards, [`MediaBatch::issue_commit`] records the device half of
-//!    the commit (the end of the input leases, the executed calls' flags,
-//!    the seal of the lease) after every owner validated its update.
-//! 4. From that job's completion, [`MediaBatch::apply_commit`] publishes
-//!    the exports the forwards issued, applies the trajectory commits to
-//!    the video denoiser's latent pool, makes the writes visible and the
-//!    calls pending: the commit point. A failure before it retires everything the batch
-//!    reserved in a job behind what it recorded, and the batch's calls fail;
-//!    a failure at or past it is fatal.
+//! 2. The plan job asks the executor what each call reads and writes
+//!    (`plan`): which inputs, and every output's shape, region and memory,
+//!    whether a host task fills it after the batch commits and how it is
+//!    published.
+//! 3. From its completion the last job is recorded: the batch leases its
+//!    output storage on the stream of its kind, binds the completion flags,
+//!    leases the reads and binds the writes, takes each trajectory's banks
+//!    from the ledger, and records the executor's `execute` on those
+//!    tensors; behind it the producer fences and exports of what the calls
+//!    wrote, and [`MediaBatch::issue_commit`] (the end of the input leases,
+//!    the executed calls' flags, the seal of the lease) after every owner
+//!    validated its update.
+//! 4. From that job's completion, [`MediaBatch::apply_commit`] publishes the
+//!    exports, applies the trajectory commits to the ledger, makes the writes
+//!    visible and the calls pending: the commit point. A failure before it
+//!    retires everything the batch reserved in a job behind what it
+//!    recorded, and the batch's calls fail; a failure at or past it is fatal.
 //! 5. The launched batch materializes once its output fences completed and
-//!    its host tasks finished ([`HostTasks`]): what the tasks wrote is then
-//!    published as host products, after the commit point, and the output
-//!    rank delivers a finished MP4.
+//!    the executor reported its host tasks ([`HostTasks`]): what they wrote
+//!    is then published, after the commit point, and the output rank
+//!    delivers a finished MP4.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use cuda::Stream;
 use ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, CallStatus, ErrorCode,
-    ForwardStats, MediaCall, TensorRef, WorkerInfo,
+    ForwardStats, LatentParams, MediaCall, TensorRef, TransferTransport, WorkerInfo,
 };
 use ipc::{CallId, MediaSource};
+use serde::Deserialize;
 
 use crate::config::Device;
 use crate::config::placement::GroupPlacement;
@@ -50,25 +55,23 @@ use crate::executor::PendingOutput;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::batch::{Batch, Failure, HostStage, Launched, Opening, Stage, fail};
 use crate::executor::inputs::Inputs;
+use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
 use crate::executor::products::{
-    OutputShape, Placement, ProductOwners, Publications, bind_outputs, export,
+    OutputShape, Placement, ProductOwners, Publications, bind_outputs, export, supplied,
 };
-use crate::ffi::MemoryKind;
-use crate::host::HostTask;
-use crate::host::task::{MediaTask, TaskOutput};
+use crate::executor::python::{DONE, Inbox, PythonExecutor, Report};
+use crate::ffi::{Backing, DType, MemoryKind};
 use crate::lane::{Completion, Job};
 use crate::memory::ProductExport;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::request::RequestPool;
-use crate::request::video::VideoRequests;
-use crate::runner::decoder::runners::DecoderRunners;
-use crate::runner::denoiser::DenoiserRunner;
-use crate::runner::denoiser::runners::DenoiserRunners;
-use crate::runner::encoder::ConditionSetup;
-use crate::runner::encoder::runners::EncoderRunners;
-use crate::runner::media::MediaRunner;
 use crate::stream::{CUDAStream, Issue};
+use crate::transfer::{SharedMapping, SharedRead, TransportKind};
 use crate::worker::WorkerMemory;
-use crate::{Error, LatentUpdate, OutputPool, ProductBuffer, ProductRead, ProductStore, Result};
+use crate::{
+    Error, LatentPool, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductRead,
+    ProductStore, Result, lock,
+};
 
 /// The step a media batch's failure is reported in.
 const PHASE: &str = "media batch";
@@ -76,10 +79,275 @@ const PHASE: &str = "media batch";
 /// The component timer name of a media batch's materialization.
 const MATERIALIZE: &str = "video_materialize";
 
+/// The trajectory ledger of a denoising rank: the latent pool whose two
+/// banks of pages hold every request's samples, which bank holds a
+/// request's committed step, and the storage of the banks. A request slot
+/// owns `pages` consecutive pages after the padding page 0.
+pub(crate) struct LatentLedger {
+    pool: LatentPool,
+    storage: LatentStorage,
+    /// Elements of one page.
+    page_units: u64,
+    /// Pages a request slot owns.
+    pages: u64,
+}
+
+impl LatentLedger {
+    pub(crate) fn new(
+        pool: LatentPool,
+        storage: LatentStorage,
+        page_units: u64,
+        pages: u64,
+    ) -> Self {
+        Self {
+            pool,
+            storage,
+            page_units,
+            pages,
+        }
+    }
+
+    /// The two banks, `[pages, page_units, 1]` float32 each, which the
+    /// executor gathers from and scatters to.
+    pub(crate) fn banks(&self) -> Result<[StorageView; 2]> {
+        Ok([self.storage.bank(0)?, self.storage.bank(1)?])
+    }
+
+    /// The pages, latent units and raster of `slot`'s trajectory: every
+    /// slot owns the same run of consecutive pages after the padding page,
+    /// so the rank names them itself; the raster is the request's admitted
+    /// canvas.
+    fn params(&self, slot: usize, call: &Call, canvas: (u32, u32)) -> LatentParams {
+        let first = 1 + (slot as u64 - 1) * self.pages;
+        LatentParams {
+            request_key: call.request_key,
+            call_id: call.call_id,
+            page_table: (first..first + self.pages)
+                .map(|page| page as u32)
+                .collect(),
+            latent_units: (self.pages * self.page_units) as u32,
+            width: canvas.0,
+            height: canvas.1,
+        }
+    }
+
+    fn slot_pages(&self, params: &LatentParams) -> Result<Vec<usize>> {
+        let pages: Vec<i64> = params
+            .page_table
+            .iter()
+            .map(|&page| i64::from(page))
+            .collect();
+        self.pool
+            .validate_pages(&pages, i64::from(params.latent_units))
+    }
+
+    /// The bank a latent preparation initializes `slot`'s trajectory in, and
+    /// its commit.
+    fn initial(
+        &self,
+        slot: usize,
+        call: &Call,
+        canvas: (u32, u32),
+    ) -> Result<(Banks, LatentUpdate)> {
+        let params = self.params(slot, call, canvas);
+        let pages = self.slot_pages(&params)?;
+        self.pool.require_initial(slot, &pages)?;
+        let update = LatentUpdate::for_call(slot, call, &params, 0)?;
+        Ok((
+            Banks {
+                read: 1,
+                write: 1,
+                step: 0,
+            },
+            update,
+        ))
+    }
+
+    /// The banks a denoising call reads and writes `slot`'s trajectory in,
+    /// the step it evaluates, and its commit: it advances the step the pool
+    /// committed by one.
+    fn step(&self, slot: usize, call: &Call, canvas: (u32, u32)) -> Result<(Banks, LatentUpdate)> {
+        let params = self.params(slot, call, canvas);
+        let pages = self.slot_pages(&params)?;
+        let step = self.pool.step_index(slot);
+        let trajectory = crate::memory::TrajectoryVersion {
+            step_index: step,
+            generation: step + 1,
+            units: i64::from(params.latent_units),
+            height: i64::from(params.height),
+            width: i64::from(params.width),
+        };
+        let read = self.pool.current_bank(slot, &trajectory, &pages)?;
+        let write = 1 - read;
+        self.pool.require_writable(write, &pages)?;
+        let update = LatentUpdate::for_call(slot, call, &params, step)?;
+        Ok((Banks { read, write, step }, update))
+    }
+
+    /// Validate trajectory commits before any becomes visible.
+    fn validate(&self, updates: &[LatentUpdate]) -> Result<()> {
+        self.pool.validate_updates(updates)
+    }
+
+    /// Make validated commits visible.
+    fn apply(&mut self, updates: &[LatentUpdate]) {
+        drop(self.pool.apply_updates(updates));
+    }
+
+    /// Release retired requests' pages.
+    fn release_slots(&mut self, slots: &[usize]) -> Result<()> {
+        let slots: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
+        drop(self.pool.release_slots(&slots)?);
+        self.pool.reap();
+        Ok(())
+    }
+}
+
+/// The banks a trajectory call reads and writes, and the step it evaluates.
+#[derive(Clone, Copy, Debug)]
+struct Banks {
+    read: u8,
+    write: u8,
+    step: i64,
+}
+
+/// What serves a video model on this rank beside the executor's runners.
+pub(crate) struct VideoRuntime {
+    pub(crate) executor: PythonExecutor,
+    /// The trajectory ledger of a denoising rank.
+    pub(crate) ledger: Option<LatentLedger>,
+    /// The device and stream of each media call kind this rank serves.
+    lanes: HashMap<MediaCall, (Device, Option<Stream>)>,
+    /// On a CUDA rank holding host components, the stream device products
+    /// host tasks wrote are fenced on: the tasks waited for their copies,
+    /// so the fences complete at once.
+    host_stream: Option<Arc<CUDAStream>>,
+    /// Each admitted request's canvas, by slot, which its trajectory's
+    /// raster is.
+    canvases: HashMap<usize, (u32, u32)>,
+    /// Started requests the executor has not admitted yet, as JSON.
+    started: Vec<serde_json::Value>,
+}
+
+impl VideoRuntime {
+    pub(crate) fn new(
+        executor: PythonExecutor,
+        ledger: Option<LatentLedger>,
+        lanes: HashMap<MediaCall, (Device, Option<Stream>)>,
+        host_stream: Option<Arc<CUDAStream>>,
+    ) -> Self {
+        Self {
+            executor,
+            ledger,
+            lanes,
+            host_stream,
+            canvases: HashMap::new(),
+            started: Vec::new(),
+        }
+    }
+
+    /// Hold a started request for the executor's admission, which the batch
+    /// that started it asks for next ([`Self::take_started`]).
+    pub(crate) fn start(&mut self, request: &ipc::NewRequest) -> Result<()> {
+        if let Some(media) = &request.diffusion
+            && request.video.is_some()
+        {
+            self.canvases.insert(
+                request.request_pool_idx as usize,
+                (media.width, media.height),
+            );
+        }
+        self.started.push(
+            serde_json::to_value(request)
+                .map_err(|error| Error::Invalid(format!("encoding a started request: {error}")))?,
+        );
+        Ok(())
+    }
+
+    /// The started requests no batch asked the executor to admit yet, as the
+    /// call that admits them; `None` when there is none.
+    pub(crate) fn take_started(&mut self) -> Option<crate::runner::methods::MethodCall> {
+        if self.started.is_empty() {
+            return None;
+        }
+        let requests = serde_json::Value::Array(std::mem::take(&mut self.started));
+        Some(self.executor.start(requests.to_string()))
+    }
+
+    /// Whether the executor's admission works on the denoiser's stream (a
+    /// transient layout's preparation), so its job belongs on that lane.
+    pub(crate) fn denoising(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    /// The device and stream of `kind`'s lane: none on the host.
+    fn lane(&self, kind: MediaCall) -> (Device, Option<Stream>) {
+        self.lanes
+            .get(&kind)
+            .cloned()
+            .unwrap_or((Device::Cpu, None))
+    }
+
+    pub(crate) fn set_wake(&self, wake: Option<ipc::Wake>) {
+        self.executor.set_wake(wake);
+    }
+}
+
+impl RequestStorage for VideoRuntime {
+    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
+        // A request's state is created when the executor admits it.
+        Ok(())
+    }
+
+    fn release_buffers(&mut self, _buffers: &HashSet<BufferId>, _jobs: &LaneJobs) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_requests(
+        &mut self,
+        _requests: &HashSet<ipc::RequestKey>,
+        _retained: &HashSet<BufferId>,
+        _jobs: &LaneJobs,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn retirement_ready(
+        &mut self,
+        _buffers: &HashSet<BufferId>,
+        _requests: &HashSet<ipc::RequestKey>,
+        _retained: &HashSet<BufferId>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn retire_slots(&mut self, slots: &[usize], _jobs: &LaneJobs) -> Result<()> {
+        for slot in slots {
+            self.canvases.remove(slot);
+        }
+        if let Some(ledger) = &mut self.ledger {
+            ledger.release_slots(slots)?;
+        }
+        self.executor.release(slots);
+        Ok(())
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self, aborted: bool) -> Result<()> {
+        self.started.clear();
+        self.canvases.clear();
+        self.executor.close(aborted)
+    }
+}
+
 /// How a call publishes what its host tasks wrote.
 pub(crate) enum Publication {
     /// Products the task wrote whole: host products, or device products the
-    /// task copied there on `stream`, exported over the device transport.
+    /// task copied there (fenced on `stream`), exported over the device
+    /// transport.
     Products {
         written: Vec<(TensorRef, ProductBuffer)>,
         stream: Option<Arc<CUDAStream>>,
@@ -101,22 +369,24 @@ pub(crate) enum Publication {
 #[derive(Default)]
 pub(crate) struct VideoCall {
     /// The trajectory commit the call's forward recorded, applied to the
-    /// denoiser's latent pool at the commit point.
+    /// ledger at the commit point.
     pub(crate) latent: Option<LatentUpdate>,
     /// The exports the call's forward issued, located when the batch
     /// commits: their device work is performed by then.
     exports: Vec<(ProductBuffer, ProductExport)>,
-    /// The host tasks writing the call's results, submitted while the
-    /// batch's job is recorded.
-    pub(crate) tasks: Vec<Arc<HostTask<MediaTask>>>,
+    /// The reports the executor's host tasks of the call send.
+    reports: usize,
     /// How the call publishes what its tasks wrote once they finished.
-    pub(crate) publication: Option<Publication>,
+    publication: Option<Publication>,
+    /// Inputs read in place from their shared-memory exports, released once
+    /// the call's host tasks finished.
+    borrowed: Vec<Arc<Mutex<SharedRead>>>,
 }
 
 impl VideoCall {
     /// Issue the export of `write`, the call's output `product`, to
     /// `stream`, behind the work that produced it.
-    pub(crate) fn export(
+    fn export(
         &mut self,
         owners: ProductOwners<'_>,
         call: &Call,
@@ -154,9 +424,8 @@ pub(crate) struct MediaBatch {
 }
 
 impl MediaBatch {
-    /// Count one forward of the batch by the graph mode it ran in: a
-    /// captured graph's launch, a capture, or an eager call.
-    pub(crate) fn record(&mut self, mode: GraphMode) {
+    /// Count one forward of the batch by the graph mode it ran in.
+    fn record(&mut self, mode: GraphMode) {
         let name = mode.as_str();
         *self.stats.mode_counts.entry(name.into()).or_default() += 1;
         match mode {
@@ -174,26 +443,22 @@ impl MediaBatch {
     }
 
     /// The device the batch's products live on.
-    pub(crate) fn target(&self) -> MemoryKind {
+    fn target(&self) -> MemoryKind {
         self.batch.target()
-    }
-
-    /// Whether an input is read in place from its export.
-    pub(crate) fn borrowed(&self, product: &TensorRef) -> bool {
-        self.borrowed.contains(&product.buffer_id())
     }
 
     /// Lease one input for `consumer`, whole, on the batch's device; what
     /// `stream` issues next waits on its writer. The lease ends with the
     /// batch's other reads, when it commits or retires.
-    pub(crate) fn read(
+    fn read(
         &mut self,
         store: &ProductStore,
         product: &TensorRef,
         consumer: CallId,
+        memory: MemoryKind,
         stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
-        let read = store.consume(product, consumer, Some(self.target()), stream)?;
+        let read = store.consume(product, consumer, Some(memory), stream)?;
         // Kept before the check below, so a refused read still ends.
         self.batch.reads.push(Arc::clone(&read));
         if read.region().is_some() {
@@ -224,7 +489,7 @@ impl MediaBatch {
         plan: &BatchPlan,
         storage: &WorkerMemory,
         requests: &RequestPool,
-        trajectories: Option<&DenoiserRunner>,
+        ledger: Option<&LatentLedger>,
         job: &Job,
     ) -> std::result::Result<(), Failure> {
         let failed = Failure::new(PHASE);
@@ -233,8 +498,8 @@ impl MediaBatch {
         self.batch.set_flags(tensors, job).map_err(&failed)?;
         self.batch.validate(plan, tensors).map_err(&failed)?;
         let updates = self.updates();
-        match trajectories {
-            Some(pool) => pool.validate(&updates),
+        match ledger {
+            Some(ledger) => ledger.validate(&updates),
             None if updates.is_empty() => Ok(()),
             None => Err(Error::Invariant(
                 "a trajectory commit has no latent pool".into(),
@@ -249,15 +514,14 @@ impl MediaBatch {
 
     /// Apply the issued commit once its job was performed: publish the
     /// exports the forwards issued, then apply the trajectory commits to
-    /// `trajectories`, register the exports, make the writes visible and
-    /// record the calls as pending. A failure after the exports' check is
-    /// fatal.
+    /// the ledger, register the exports, make the writes visible and record
+    /// the calls as pending. A failure after the exports' check is fatal.
     fn apply_commit(
         &mut self,
         plan: &BatchPlan,
         tensors: &ProductStore,
         requests: &mut RequestPool,
-        trajectories: Option<&mut DenoiserRunner>,
+        ledger: Option<&mut LatentLedger>,
     ) -> std::result::Result<(), Failure> {
         let failed = Failure::new(PHASE);
         for state in &mut self.batch.calls {
@@ -271,8 +535,8 @@ impl MediaBatch {
 
         // Every owner accepted its update. Any failure from here is fatal.
         let fatal = Failure::fatal(PHASE);
-        if let Some(pool) = trajectories {
-            pool.apply(&self.updates());
+        if let Some(ledger) = ledger {
+            ledger.apply(&self.updates());
         }
         for state in &mut self.batch.calls {
             if let Some(update) = state.forward.latent.take() {
@@ -284,19 +548,16 @@ impl MediaBatch {
     }
 
     /// Retire every reservation after a failure before the commit point,
-    /// recording in `job` the fences that end them: withdraw the host tasks
-    /// not running yet, revoke the exports, end the reads, abandon the
-    /// writes and seal and abandon the lease. A running task keeps its
-    /// inputs and outputs to completion, so the products host tasks write
-    /// stay deferred rather than abandoned under it.
+    /// recording in `job` the fences that end them: revoke the exports, end
+    /// the reads, abandon the writes and seal and abandon the lease.
     fn discard(&mut self, storage: &WorkerMemory, job: &Job) -> Result<()> {
         for state in &mut self.batch.calls {
-            withdraw(&state.forward.tasks);
             state
                 .forward
                 .exports
                 .drain(..)
                 .for_each(|(_, export)| export.revoke());
+            release_borrowed(&state.forward.borrowed);
         }
         let revoked = self.publications.revoke();
         let discarded = self.batch.discard(&storage.tensors, &storage.events, job);
@@ -305,7 +566,7 @@ impl MediaBatch {
 
     /// Hand the committed batch to materialization, with the host tasks its
     /// calls' results wait for.
-    fn launch(self) -> Launched {
+    fn launch(self, inbox: Inbox, batch_id: u64) -> Launched {
         let Self {
             mut batch, stats, ..
         } = self;
@@ -313,24 +574,30 @@ impl MediaBatch {
             .calls
             .iter_mut()
             .enumerate()
-            .filter(|(_, state)| !state.forward.tasks.is_empty())
+            .filter(|(_, state)| state.forward.reports > 0)
             .map(|(index, state)| HostCall {
                 index,
-                tasks: std::mem::take(&mut state.forward.tasks),
+                reports: std::mem::take(&mut state.forward.reports),
                 publication: state.forward.publication.take(),
+                borrowed: std::mem::take(&mut state.forward.borrowed),
+                received: None,
             })
             .collect();
-        let host = (!calls.is_empty()).then(|| Box::new(HostTasks { calls }) as Box<dyn HostStage>);
+        let host = (!calls.is_empty()).then(|| {
+            Box::new(HostTasks {
+                calls,
+                inbox,
+                batch: batch_id,
+            }) as Box<dyn HostStage>
+        });
         batch.launch(stats, MATERIALIZE, host)
     }
 }
 
-/// Withdraw host tasks that are not running yet; a running task completes.
-fn withdraw(tasks: &[Arc<HostTask<MediaTask>>]) {
-    for task in tasks {
-        if let Err(error) = task.cancel(false) {
-            tracing::warn!("withdrawing a host media task failed: {error}");
-        }
+/// Release borrowed shared-memory reads: their producer may reuse the rows.
+fn release_borrowed(borrowed: &[Arc<Mutex<SharedRead>>]) {
+    for read in borrowed {
+        lock(read).release();
     }
 }
 
@@ -339,25 +606,36 @@ fn withdraw(tasks: &[Arc<HostTask<MediaTask>>]) {
 struct HostCall {
     /// The call's index in the batch.
     index: usize,
-    tasks: Vec<Arc<HostTask<MediaTask>>>,
+    /// The reports the executor sends for it.
+    reports: usize,
     publication: Option<Publication>,
+    borrowed: Vec<Arc<Mutex<SharedRead>>>,
+    /// The reports, once all arrived.
+    received: Option<Vec<Report>>,
 }
 
 /// The host tasks a launched media batch's results wait for. What they
-/// write is published once every task finished, after the commit point:
+/// write is published once every task reported, after the commit point:
 /// such a product is committed and its exports registered at once.
 struct HostTasks {
     calls: Vec<HostCall>,
+    inbox: Inbox,
+    batch: u64,
 }
 
 impl HostStage for HostTasks {
     fn poll(&mut self) -> Result<bool> {
-        // The tasks were submitted when the batch's job was recorded.
-        Ok(self
-            .calls
-            .iter()
-            .flat_map(|call| &call.tasks)
-            .all(|task| task.completion.done()))
+        let mut done = true;
+        for call in &mut self.calls {
+            if call.received.is_none() {
+                call.received = self.inbox.take(self.batch, call.index, call.reports);
+                if call.received.is_some() {
+                    release_borrowed(&call.borrowed);
+                }
+            }
+            done &= call.received.is_some();
+        }
+        Ok(done)
     }
 
     fn finish(
@@ -378,8 +656,12 @@ impl HostStage for HostTasks {
     }
 
     fn cancel(&mut self) {
+        // The executor's host thread finishes what it started; its reports
+        // are dropped, and borrowed rows are released when they arrive or
+        // the inbox closes.
+        self.inbox.discard(self.batch);
         for call in &self.calls {
-            withdraw(&call.tasks);
+            release_borrowed(&call.borrowed);
         }
     }
 }
@@ -393,21 +675,9 @@ impl HostCall {
         owners: ProductOwners<'_>,
         output: &mut PendingOutput,
     ) -> Result<()> {
-        let mut results = Vec::with_capacity(self.tasks.len());
-        let mut failure = None;
-        for task in &self.tasks {
-            match task.completion.outcome() {
-                Some(crate::Outcome::Success(result)) => results.push(result),
-                Some(crate::Outcome::Failed(error)) => {
-                    failure.get_or_insert(error.to_string());
-                }
-                Some(crate::Outcome::Cancelled) | None => {
-                    failure.get_or_insert("a host media task was cancelled".to_owned());
-                }
-            }
-        }
-        if let Some(message) = failure {
-            tracing::error!("host media call failed: {message}");
+        let reports = self.received.unwrap_or_default();
+        if reports.iter().any(|report| report.status != DONE) {
+            tracing::error!("a host media call failed; the executor logged why");
             output.output.status = CallStatus::Error;
             output.output.error_code = Some(ErrorCode::ComputeError);
             let writes: Vec<ProductBuffer> = match self.publication {
@@ -425,22 +695,20 @@ impl HostCall {
         let mut publications = Publications::default();
         match self.publication {
             Some(Publication::Products { written, stream }) => {
-                // A device product's write and export record their fences on
-                // the stream its copy drained on.
-                let stream = stream.as_deref().map(CUDAStream::stream).transpose()?;
                 for (product, write) in written {
                     let view = write.view();
-                    owners.store.write(&write, &view, stream, None)?;
+                    // A device product's write and export record their
+                    // fences on the host stream; its copies drained already.
+                    let device = matches!(view.device(), MemoryKind::Cuda(_));
+                    let fence = if device {
+                        stream.as_deref().map(CUDAStream::stream).transpose()?
+                    } else {
+                        None
+                    };
+                    owners.store.write(&write, &view, fence, None)?;
                     owners.store.commit_writes(std::slice::from_ref(&write))?;
-                    let (exported, locations) = export(
-                        owners,
-                        call,
-                        &product,
-                        &write,
-                        stream.is_none(),
-                        None,
-                        stream,
-                    )?;
+                    let (exported, locations) =
+                        export(owners, call, &product, &write, fence.is_none(), None, fence)?;
                     publications.accept(write.id(), locations, exported, output)?;
                     publications.register(owners.store)?;
                 }
@@ -455,16 +723,18 @@ impl HostCall {
                 owners.store.commit_writes(std::slice::from_ref(&write))?;
                 let width = view.shape().get(1).copied().unwrap_or(0) as u64;
                 let mut regions = Vec::with_capacity(rows.len());
-                for (result, row) in results.iter().zip(&rows) {
-                    let TaskOutput::Framed(length) = **result else {
-                        return Err(Error::Invariant(
-                            "a video encoding task framed no unit".into(),
-                        ));
-                    };
-                    if length as u64 > width {
+                for (local, &row) in rows.iter().enumerate() {
+                    let report = reports
+                        .iter()
+                        .find(|report| report.row == local as i64)
+                        .ok_or_else(|| {
+                            Error::Invariant("a video encoding task reported no unit".into())
+                        })?;
+                    let length = u64::try_from(report.value).unwrap_or(u64::MAX);
+                    if length > width {
                         return Err(Error::Invariant("a framed unit exceeds its row".into()));
                     }
-                    regions.push(vec![*row..*row + 1, 0..length as u64]);
+                    regions.push(vec![row..row + 1, 0..length]);
                 }
                 let (exported, locations) =
                     export(owners, call, &product, &write, true, Some(&regions), None)?;
@@ -472,9 +742,9 @@ impl HostCall {
                 publications.register(owners.store)?;
             }
             Some(Publication::Media) if output.reports_output => {
-                for result in &results {
-                    if let TaskOutput::Media(bytes) = &**result {
-                        let source = MediaSource::publish(bytes).map_err(|error| {
+                for report in &reports {
+                    if !report.payload.is_empty() {
+                        let source = MediaSource::publish(&report.payload).map_err(|error| {
                             Error::transport_source("publishing media failed", error)
                         })?;
                         output.set_media(source)?;
@@ -491,11 +761,12 @@ impl HostCall {
 pub(crate) enum Pending {
     /// The job on the lane reads the batch's host-gated predicates.
     Predicates(Opening<VideoCall>),
-    /// The predicates are known: the batch records its next job.
+    /// The predicates are known: the batch asks the executor for its plan
+    /// next.
     Opened(Opening<VideoCall>),
-    /// The job on the lane asks the library for what the batch's condition
-    /// encodings lack; the batch goes on from its completion.
-    Setup(Opening<VideoCall>, ConditionSetup),
+    /// The job on the lane asks the executor what the batch's calls read
+    /// and write; the batch goes on from its completion.
+    Planning(Opening<VideoCall>, serde_json::Value),
     /// The job on the lane is the batch's last: its forwards and the
     /// issued commit.
     Committing(Box<MediaBatch>),
@@ -523,13 +794,7 @@ pub(crate) struct Parts<'a> {
     pub(crate) info: &'a WorkerInfo,
     pub(crate) placement: &'a GroupPlacement,
     pub(crate) rank: usize,
-    /// The rank's video requests, with the model and plan that admit them.
-    pub(crate) video: &'a mut VideoRequests,
-    pub(crate) encoders: &'a mut EncoderRunners,
-    pub(crate) denoisers: &'a mut DenoiserRunners,
-    pub(crate) decoders: &'a mut DecoderRunners,
-    /// The host media of a rank holding host components.
-    pub(crate) media: Option<&'a MediaRunner>,
+    pub(crate) video: &'a mut VideoRuntime,
     /// The output leases of media batches.
     pub(crate) outputs: &'a mut OutputPool,
 }
@@ -537,73 +802,17 @@ pub(crate) struct Parts<'a> {
 impl<'a> Parts<'a> {
     /// The product owners, borrowed for the parts' lifetime rather than
     /// from the parts themselves.
-    pub(crate) fn owners(&self) -> ProductOwners<'a> {
+    fn owners(&self) -> ProductOwners<'a> {
         let storage: &'a WorkerMemory = self.storage;
         ProductOwners {
             store: &storage.tensors,
             transports: &storage.transports,
         }
     }
-
-    /// The stream and device a batch of `kind` on `component` runs on.
-    pub(crate) fn placement(
-        &self,
-        kind: MediaCall,
-        component: &str,
-    ) -> Result<(Device, Option<Stream>)> {
-        match kind {
-            MediaCall::TextEncoding | MediaCall::VisionEncoding => {
-                let text = self
-                    .encoders
-                    .text
-                    .as_ref()
-                    .ok_or_else(|| Error::Invalid("this rank holds no text encoder".into()))?;
-                Ok((text.device, text.runner.stream().cloned()))
-            }
-            MediaCall::LatentPreparation | MediaCall::Denoising => {
-                let denoiser = self
-                    .denoisers
-                    .video
-                    .as_ref()
-                    .filter(|denoiser| denoiser.name == component);
-                let denoiser = denoiser
-                    .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
-                Ok((denoiser.device, denoiser.runner.stream().cloned()))
-            }
-            MediaCall::VideoDecoding => {
-                let decoder = self
-                    .decoders
-                    .video
-                    .as_ref()
-                    .ok_or_else(|| Error::Invalid("this rank holds no video decoder".into()))?;
-                Ok((decoder.device, decoder.runner.stream().cloned()))
-            }
-            MediaCall::AudioDecoding => {
-                let audio = self
-                    .decoders
-                    .audio
-                    .as_ref()
-                    .ok_or_else(|| Error::Invalid("this rank holds no audio decoder".into()))?;
-                Ok((audio.device, audio.runner.stream().cloned()))
-            }
-            MediaCall::LatentEncoding => {
-                let latent =
-                    self.encoders.latent.as_ref().ok_or_else(|| {
-                        Error::Invalid("this rank holds no latent encoder".into())
-                    })?;
-                Ok((latent.device, latent.runner.stream().cloned()))
-            }
-            _ => Ok((Device::Cpu, None)),
-        }
-    }
 }
 
 /// The name of a call's output product.
-pub(crate) fn product_name<'a>(
-    info: &'a WorkerInfo,
-    call: &Call,
-    output: &TensorRef,
-) -> Result<&'a str> {
+fn product_name<'a>(info: &'a WorkerInfo, call: &Call, output: &TensorRef) -> Result<&'a str> {
     info.components
         .iter()
         .find(|component| component.name == call.component)
@@ -624,11 +833,85 @@ fn media_kind(call: &Call) -> MediaCall {
     }
 }
 
+/// One output a call writes, as the executor planned it.
+#[derive(Debug, Deserialize)]
+struct PlannedWrite {
+    output: usize,
+    shape: Vec<u64>,
+    region: Option<Vec<[u64; 2]>>,
+    /// `host` or `device`.
+    memory: String,
+    /// A host task fills it after the batch commits.
+    deferred: bool,
+    /// Host readers read its export.
+    host_export: bool,
+}
+
+/// What one call reads and writes, as the executor planned it.
+#[derive(Debug, Deserialize)]
+struct Planned {
+    /// Indices into the call's inputs.
+    reads: Vec<usize>,
+    writes: Vec<PlannedWrite>,
+    /// `products`, `encoded` or `media`.
+    publication: Option<String>,
+    /// For a call reading rows of a round's decoded frames: the round
+    /// position each read takes, read in place from its shared-memory
+    /// export or leased.
+    #[serde(default)]
+    read_rows: Option<Vec<u32>>,
+    /// Each input is a round's framed rows, read from the exports that
+    /// reach this rank.
+    #[serde(default)]
+    exported_rows: bool,
+    /// The product rows an encoding call's tasks frame into.
+    #[serde(default)]
+    rows: Vec<u64>,
+    /// The reports the call's host tasks send.
+    #[serde(default)]
+    reports: usize,
+}
+
+/// The JSON step the executor plans and executes: every call with what the
+/// worker knows of it.
+fn step_json(
+    plan: &BatchPlan,
+    info: &WorkerInfo,
+    calls: &[crate::executor::batch::CallState<VideoCall>],
+) -> Result<serde_json::Value> {
+    let encode = |error: serde_json::Error| Error::Invalid(format!("encoding a batch: {error}"));
+    let mut entries = Vec::with_capacity(plan.calls.len());
+    for (index, (call, state)) in plan.calls.iter().zip(calls).enumerate() {
+        let range = plan
+            .decode_ranges
+            .iter()
+            .find(|range| range.request_key == call.request_key && range.call_id == call.call_id);
+        let names = call
+            .outputs
+            .iter()
+            .map(|output| product_name(info, call, output).map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?;
+        entries.push(serde_json::json!({
+            "index": index,
+            "slot": state.slot,
+            "active": state.active,
+            "refused": state.refused(),
+            "call": serde_json::to_value(call).map_err(encode)?,
+            "range": serde_json::to_value(range).map_err(encode)?,
+            "output_names": names,
+            "latent": serde_json::Value::Null,
+        }));
+    }
+    Ok(serde_json::json!({
+        "batch_id": plan.batch_id,
+        "calls": entries,
+    }))
+}
+
 /// The next job of a media batch: the read of its host-gated predicates
-/// when it has any, the library's setup of new condition encodings when
-/// they need it, then its forwards with the issued commit, and after a
-/// failure the retirement of what it reserved. `None` when the batch
-/// failed without needing the lane again.
+/// when it has any, the executor's plan, then its forwards with the issued
+/// commit, and after a failure the retirement of what it reserved. `None`
+/// when the batch failed without needing the lane again.
 pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -654,44 +937,18 @@ fn record(
     inputs: &Inputs,
     state: Option<Pending>,
 ) -> std::result::Result<Step, WorkerError> {
-    let opened = match state {
-        None => None,
-        Some(Pending::Opened(opening)) => Some(opening),
-        // What the batch recorded was performed: retire what it reserved,
-        // behind that work.
-        Some(Pending::Failing(media, failure)) => {
-            return Ok(retire(parts.storage, *media, Job::new(), failure));
-        }
-        Some(
-            Pending::Predicates(_)
-            | Pending::Setup(..)
-            | Pending::Committing(_)
-            | Pending::Discarding(_),
-        ) => {
-            return Err(WorkerError::classify(
-                Error::Invariant(
-                    "a media batch's job was prepared before its last completed".into(),
-                ),
-                Some(PHASE),
-            ));
-        }
-    };
     let failed = Failure::new(PHASE);
     let Some(first) = plan.calls.first() else {
         return Ok(Step::Failed(failed(Error::Invariant(
             "a video batch has calls".into(),
         ))));
     };
-    let (device, stream) = match parts.placement(media_kind(first), &first.component) {
-        Ok((device, stream)) => (device.cuda(), stream),
-        Err(error) => return Ok(Step::Failed(failed(error))),
-    };
-
-    // The batch's first job binds its calls and reads its host-gated
-    // predicates: they decide which calls run.
-    let opening = match opened {
-        Some(opening) => opening,
+    let (device, stream) = parts.video.lane(media_kind(first));
+    let device = device.cuda();
+    let (opening, planned) = match state {
         None => {
+            // The batch's first job binds its calls and reads its
+            // host-gated predicates: they decide which calls run.
             let job = Job::new();
             let opened = Opening::open(
                 parts.requests,
@@ -707,22 +964,28 @@ fn record(
                 Ok(opening) if opening.reads_predicates() => {
                     return Ok(Step::Job(job, Pending::Predicates(opening)));
                 }
-                Ok(opening) => opening,
+                Ok(opening) => return Ok(ask_plan(parts, plan, opening, job)),
                 Err(error) => return Ok(ended(job, failed(error))),
             }
         }
+        Some(Pending::Opened(opening)) => return Ok(ask_plan(parts, plan, opening, Job::new())),
+        Some(Pending::Planning(opening, planned)) => (opening, planned),
+        // What the batch recorded was performed: retire what it reserved,
+        // behind that work.
+        Some(Pending::Failing(media, failure)) => {
+            return Ok(retire(parts.storage, *media, Job::new(), failure));
+        }
+        Some(Pending::Predicates(_) | Pending::Committing(_) | Pending::Discarding(_)) => {
+            return Err(WorkerError::classify(
+                Error::Invariant(
+                    "a media batch's job was prepared before its last completed".into(),
+                ),
+                Some(PHASE),
+            ));
+        }
     };
 
-    // A condition encoding of input shapes this rank has not encoded
-    // before takes an encoder the library constructs. The job makes that
-    // call, so the batch's forwards are recorded from its completion.
     let job = Job::new();
-    match crate::runner::encoder::setup_conditions(parts, plan, opening.calls(), &job) {
-        Ok(Some(setup)) => return Ok(Step::Job(job, Pending::Setup(opening, setup))),
-        Ok(None) => {}
-        Err(error) => return Ok(ended(job, failed(error))),
-    }
-
     let leased = Batch::lease(
         opening,
         parts.outputs,
@@ -744,15 +1007,16 @@ fn record(
     let recorded = media
         .batch
         .bind_flags(plan, &parts.storage.tensors, &job)
-        .and_then(|()| record_forwards(parts, plan, &mut media, &job))
+        .and_then(|()| record_forwards(parts, plan, &mut media, planned, &job))
         .map_err(&failed)
         .and_then(|()| {
-            let trajectories = parts
-                .denoisers
-                .video
-                .as_ref()
-                .map(|denoiser| &denoiser.runner);
-            media.issue_commit(plan, parts.storage, parts.requests, trajectories, &job)
+            media.issue_commit(
+                plan,
+                parts.storage,
+                parts.requests,
+                parts.video.ledger.as_ref(),
+                &job,
+            )
         });
     Ok(match recorded {
         Ok(()) => Step::Job(job, Pending::Committing(Box::new(media))),
@@ -760,22 +1024,45 @@ fn record(
         Err(failure) if job.is_empty() => retire(parts.storage, media, job, failure),
         // What the batch recorded before it failed is performed before its
         // reservations are retired: the events it queued are due, and its
-        // writes are abandoned only behind its work. An export that failed
-        // kept only its event operations ([`Issue::attempt`]).
+        // writes are abandoned only behind its work.
         Err(failure) => Step::Job(job, Pending::Failing(Box::new(media), failure)),
     })
 }
 
-/// Record every call's forward into `job`: a host call's tasks are
-/// submitted to the rank's host lane, and the job holds only what the
-/// batch writes for them; a device call's forward is recorded on the
-/// batch's stream, unless its predicate skipped it.
+/// Record into `job` the executor's plan of the opened batch: what each
+/// call reads and writes.
+fn ask_plan(parts: &Parts<'_>, plan: &BatchPlan, opening: Opening<VideoCall>, job: Job) -> Step {
+    match step_json(plan, parts.info, opening.calls()) {
+        Ok(step) => {
+            job.call_texts(parts.video.executor.plan(step.to_string()));
+            Step::Job(job, Pending::Planning(opening, step))
+        }
+        Err(error) => ended(job, Failure::new(PHASE)(error)),
+    }
+}
+
+/// Lease what every call reads, bind what it writes, take each trajectory's
+/// banks from the ledger and record into `job` the executor's execution of
+/// the batch on those tensors, then the producer fences and exports of
+/// what the calls wrote.
 fn record_forwards(
     parts: &mut Parts<'_>,
     plan: &BatchPlan,
     media: &mut MediaBatch,
+    mut step: serde_json::Value,
     job: &Job,
 ) -> Result<()> {
+    let planned_json = step
+        .get("planned")
+        .cloned()
+        .ok_or_else(|| Error::Invariant("a media batch has no plan".into()))?;
+    let planned: Vec<Planned> = serde_json::from_value(planned_json)
+        .map_err(|error| Error::Interface(format!("the executor's plan: {error}")))?;
+    if planned.len() != plan.calls.len() {
+        return Err(Error::Interface(
+            "the executor planned another number of calls".into(),
+        ));
+    }
     let slots = media.batch.slots(plan);
     let allocations: HashMap<BufferId, BufferAllocation> = plan
         .buffer_allocations
@@ -786,71 +1073,338 @@ fn record_forwards(
         allocations: &allocations,
         slots: &slots,
     };
-    for (index, call) in plan.calls.iter().enumerate() {
-        // A call of a request the rank refused records nothing; its output
-        // reports the refusal.
-        if media.batch.calls[index].refused() {
+    let owners = parts.owners();
+    let stream = media.batch.stream.clone();
+    let issue = job.on(stream.as_ref());
+    let mut tensors = Vec::new();
+    // Each non-deferred write, published behind the execution.
+    let mut published: Vec<(usize, TensorRef, ProductBuffer, bool)> = Vec::new();
+    for (index, (call, planned)) in plan.calls.iter().zip(&planned).enumerate() {
+        let state = &media.batch.calls[index];
+        if state.refused() {
             continue;
         }
-        let slot = media.batch.calls[index].slot;
-        match call.kind {
-            CallKind::Media(MediaCall::MediaReading) => {
-                crate::runner::media::read_media(parts, media, index, call, slot, &placement)?;
+        let slot = state.slot;
+
+        // Reads.
+        for (position, &input_index) in planned.reads.iter().enumerate() {
+            let input = call.inputs.get(input_index).ok_or_else(|| {
+                Error::Interface("the executor planned a read of an undeclared input".into())
+            })?;
+            if planned.exported_rows {
+                tensors.push(exported_rows(parts, plan, input)?);
                 continue;
             }
-            CallKind::Media(MediaCall::VideoEncoding) => {
-                crate::runner::media::encode_units(
-                    parts, plan, media, index, call, slot, &placement,
-                )?;
+            if let Some(rows) = &planned.read_rows {
+                let row = *rows
+                    .get(position)
+                    .ok_or_else(|| Error::Interface("a planned row read names no row".into()))?;
+                if media.borrowed(input) {
+                    let read = borrow_row(parts, plan, input, u64::from(row))?;
+                    tensors.push(row_view(&read)?);
+                    media.batch.calls[index]
+                        .forward
+                        .borrowed
+                        .push(Arc::new(Mutex::new(read)));
+                } else {
+                    let read =
+                        media.read(owners.store, input, call.call_id, MemoryKind::Host, None)?;
+                    tensors.push(read.value().select(0, i64::from(row))?);
+                }
                 continue;
             }
-            CallKind::Media(MediaCall::AudioEncoding) => {
-                crate::runner::media::encode_audio(parts, media, index, call, slot)?;
-                continue;
-            }
-            CallKind::Media(MediaCall::Muxing) => {
-                crate::runner::media::mux(parts, plan, media, index, call, slot)?;
-                continue;
-            }
-            _ => {}
+            let memory = if host_kind(media_kind(call)) {
+                MemoryKind::Host
+            } else {
+                media.target()
+            };
+            let read = media.read(owners.store, input, call.call_id, memory, issue)?;
+            tensors.push(read.value().clone());
         }
 
-        if !media.batch.calls[index].active {
-            continue;
+        // Writes.
+        let mut deferred = Vec::new();
+        for write in &planned.writes {
+            let product = call.outputs.get(write.output).ok_or_else(|| {
+                Error::Interface("the executor planned an undeclared output".into())
+            })?;
+            let memory = match write.memory.as_str() {
+                "host" => MemoryKind::Host,
+                "device" => media.target(),
+                other => {
+                    return Err(Error::Interface(format!(
+                        "the executor planned an output in {other:?} memory"
+                    )));
+                }
+            };
+            let bound = bind_outputs(
+                owners.store,
+                &[OutputShape {
+                    product: product.clone(),
+                    shape: write.shape.clone(),
+                    region: write
+                        .region
+                        .as_ref()
+                        .map(|region| region.iter().map(|&[a, b]| a..b).collect()),
+                }],
+                memory,
+                &placement,
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invariant("a planned output was not bound".into()))?;
+            tensors.push(bound.view());
+            if write.deferred {
+                owners.store.defer_write(&bound)?;
+                deferred.push((product.clone(), bound));
+            } else {
+                media.batch.writes.push(bound.clone());
+                published.push((index, product.clone(), bound, write.host_export));
+            }
         }
-        match call.kind {
-            CallKind::Media(MediaCall::TextEncoding) => crate::runner::encoder::encode_text(
-                parts, plan, media, index, slot, &placement, job,
-            )?,
-            CallKind::Media(MediaCall::VisionEncoding) => crate::runner::encoder::encode_vision(
-                parts, plan, media, index, slot, &placement, job,
-            )?,
-            CallKind::Media(MediaCall::LatentEncoding) => {
-                crate::runner::encoder::encode_conditions(
-                    parts, plan, media, index, slot, &placement, job,
-                )?
+        let forward = &mut media.batch.calls[index].forward;
+        forward.reports = planned.reports;
+        forward.publication = match planned.publication.as_deref() {
+            Some("products") => Some(Publication::Products {
+                written: deferred,
+                stream: parts.video.host_stream.clone(),
+            }),
+            Some("encoded") => {
+                let (product, write) = deferred.into_iter().next().ok_or_else(|| {
+                    Error::Interface("an encoding call planned no encoded rows".into())
+                })?;
+                Some(Publication::Encoded {
+                    product,
+                    write,
+                    rows: planned.rows.clone(),
+                })
             }
-            CallKind::Media(MediaCall::LatentPreparation) => {
-                crate::runner::denoiser::prepare(parts, plan, media, index, slot, job)?
-            }
-            CallKind::Media(MediaCall::Denoising) => {
-                crate::runner::denoiser::denoise(parts, plan, media, index, slot, &placement, job)?
-            }
-            CallKind::Media(MediaCall::VideoDecoding) => crate::runner::decoder::decode_video(
-                parts, plan, media, index, slot, &placement, job,
-            )?,
-            CallKind::Media(MediaCall::AudioDecoding) => crate::runner::decoder::decode_audio(
-                parts, plan, media, index, slot, &placement, job,
-            )?,
-            kind => {
-                return Err(Error::Unsupported(format!(
-                    "{} is not a video model's media call",
-                    kind.as_str()
+            Some("media") => Some(Publication::Media),
+            None => None,
+            Some(other) => {
+                return Err(Error::Interface(format!(
+                    "the executor planned the unknown publication {other:?}"
                 )));
             }
+        };
+
+        // The trajectory ledger.
+        let kind = media_kind(call);
+        if matches!(kind, MediaCall::LatentPreparation | MediaCall::Denoising)
+            && media.batch.calls[index].active
+        {
+            let ledger = parts
+                .video
+                .ledger
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("this rank holds no video denoiser".into()))?;
+            let canvas = *parts
+                .video
+                .canvases
+                .get(&slot)
+                .ok_or_else(|| Error::Invalid("a denoising request has no canvas".into()))?;
+            let (banks, update) = if kind == MediaCall::LatentPreparation {
+                ledger.initial(slot, call, canvas)?
+            } else {
+                ledger.step(slot, call, canvas)?
+            };
+            step["calls"][index]["latent"] = serde_json::json!({
+                "read": banks.read,
+                "write": banks.write,
+                "step": banks.step,
+            });
+            media.batch.calls[index].forward.latent = Some(update);
         }
     }
+
+    job.call_returning(parts.video.executor.execute(step.to_string(), tensors));
+
+    for (index, product, write, host) in published {
+        owners.store.write(&write, &write.view(), issue, None)?;
+        media.batch.calls[index].forward.export(
+            owners,
+            &plan.calls[index],
+            &product,
+            &write,
+            host,
+            issue,
+        )?;
+    }
     Ok(())
+}
+
+/// Whether the executor runs calls of `kind` on its host thread.
+fn host_kind(kind: MediaCall) -> bool {
+    matches!(
+        kind,
+        MediaCall::MediaReading
+            | MediaCall::VideoEncoding
+            | MediaCall::AudioEncoding
+            | MediaCall::Muxing
+    )
+}
+
+impl MediaBatch {
+    /// Whether an input is read in place from its export.
+    fn borrowed(&self, product: &TensorRef) -> bool {
+        self.borrowed.contains(&product.buffer_id())
+    }
+}
+
+/// A borrowed shared-memory row as host bytes, viewed as long as the read
+/// lives.
+struct MappedBytes {
+    mapping: Arc<SharedMapping>,
+    offset: usize,
+    bytes: usize,
+}
+
+impl Backing for MappedBytes {
+    fn device(&self) -> MemoryKind {
+        MemoryKind::Host
+    }
+
+    fn address(&self) -> u64 {
+        (self.mapping.address() + self.offset) as u64
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// A host uint8 view of a borrowed row's bytes.
+fn row_view(read: &SharedRead) -> Result<StorageView> {
+    let bytes = read.nbytes();
+    let backing = MappedBytes {
+        mapping: read.mapping()?,
+        offset: read.offset(),
+        bytes,
+    };
+    StorageView::contiguous(
+        Arc::new(backing) as Arc<dyn Backing>,
+        0,
+        DType::U8,
+        &[bytes as i64],
+    )
+}
+
+/// Row `row` of a round's decoded frames, read in place from its
+/// shared-memory export on this host.
+fn borrow_row(
+    parts: &Parts<'_>,
+    plan: &BatchPlan,
+    product: &TensorRef,
+    row: u64,
+) -> Result<SharedRead> {
+    let export = supplied(plan, product)
+        .ok_or_else(|| Error::Invalid("a borrowed media input has no export".into()))?;
+    let tensor = crate::executor::products::tensor(export)?;
+    let transport = parts
+        .storage
+        .transports
+        .get(TransportKind::PosixShm)
+        .ok_or_else(|| Error::Invalid("video encoding requires local shared storage".into()))?;
+    let location = tensor
+        .locations
+        .iter()
+        .find(|location| {
+            matches!(location.transport, TransferTransport::PosixShm { .. })
+                && location.source.host == parts.info.endpoint.host
+                && location.offset[0] <= row
+                && row < location.offset[0] + location.shape[0]
+        })
+        .ok_or_else(|| Error::Invalid("decoded media unit has no local shared storage".into()))?;
+    let region: Vec<Range<u64>> = std::iter::once(row..row + 1)
+        .chain(tensor.shape[1..].iter().map(|&extent| 0..extent))
+        .collect();
+    transport.borrow(location, Some(&region))
+}
+
+/// A round's framed unit rows, `[rows, width]` host uint8, read from the
+/// exports that reach this rank.
+fn exported_rows(parts: &Parts<'_>, plan: &BatchPlan, product: &TensorRef) -> Result<StorageView> {
+    let export = supplied(plan, product).ok_or_else(|| {
+        Error::Invalid("artifact assembly input has no transfer locations".into())
+    })?;
+    let tensor = crate::executor::products::tensor(export)?;
+    if tensor.shape.len() != 2
+        || tensor
+            .locations
+            .iter()
+            .any(|location| location.dtype != "uint8")
+    {
+        return Err(Error::Invalid("encoded units require byte rows".into()));
+    }
+    let (count, width) = (tensor.shape[0] as usize, tensor.shape[1] as usize);
+    let memory = Storage::host((count * width).max(1));
+    let mut filled = vec![false; count];
+    for location in &tensor.locations {
+        if location.offset.get(1).copied().unwrap_or(0) != 0 {
+            return Err(Error::Invalid(
+                "encoded unit location lacks its length prefix".into(),
+            ));
+        }
+        let first = location.offset[0] as usize;
+        let rows = location.shape[0] as usize;
+        let row_bytes = location.shape.get(1).copied().unwrap_or(0) as usize;
+        if first + rows > count || filled[first..first + rows].iter().all(|&done| done) {
+            continue;
+        }
+        let bytes: Vec<u8> = match &location.transport {
+            TransferTransport::Channel { payload, .. } => payload.clone(),
+            TransferTransport::PosixShm { .. }
+                if location.source.host == parts.info.endpoint.host =>
+            {
+                let Some(transport) = parts.storage.transports.get(TransportKind::PosixShm) else {
+                    continue;
+                };
+                let mut read = transport.borrow(location, None)?;
+                let mapping = read.mapping()?;
+                // SAFETY: the claimed range is mapped and ready until the
+                // read is released below.
+                let payload = unsafe {
+                    std::slice::from_raw_parts(
+                        (mapping.address() + read.offset()) as *const u8,
+                        read.nbytes(),
+                    )
+                }
+                .to_vec();
+                read.release();
+                payload
+            }
+            _ => continue,
+        };
+        if row_bytes == 0 || row_bytes > width || bytes.len() != rows * row_bytes {
+            return Err(Error::Invalid(
+                "encoded unit rows disagree with their location".into(),
+            ));
+        }
+        for (offset, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            let target = (first + offset) * width;
+            // SAFETY: the host allocation holds `count * width` bytes, this
+            // row's range lies inside it and nothing else references it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    (memory.address() as *mut u8).add(target),
+                    row.len(),
+                );
+            }
+            filled[first + offset] = true;
+        }
+    }
+    if filled.iter().any(|&done| !done) {
+        return Err(Error::Invalid(
+            "artifact assembly requires every encoded media unit".into(),
+        ));
+    }
+    StorageView::contiguous(
+        memory as Arc<dyn Backing>,
+        0,
+        DType::U8,
+        &[count as i64, width as i64],
+    )
 }
 
 /// The step of a batch that failed holding no reservation: `job`
@@ -890,13 +1444,13 @@ pub(crate) fn complete(
     }
 
     let done = {
-        let mut parts = backend.media_parts()?;
+        let parts = backend.media_parts()?;
         let (plan, _, pending) = batch.media_parts();
         let failed = Failure::new(PHASE);
         match (pending.take(), completion.check()) {
-            // A predicate that could not be read, or a setup the library
+            // A predicate that could not be read, or a plan the executor
             // refused, fails the batch, which has reserved nothing yet.
-            (Some(Pending::Predicates(_) | Pending::Setup(..)), Err(failure)) => {
+            (Some(Pending::Predicates(_) | Pending::Planning(..)), Err(failure)) => {
                 Done::Failed(failed(failure.error))
             }
             (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
@@ -905,10 +1459,16 @@ pub(crate) fn complete(
                     Err(error) => Done::Failed(failed(error)),
                 }
             }
-            (Some(Pending::Setup(opening, setup)), Ok(mut completion)) => {
-                match crate::runner::encoder::accept_conditions(&mut parts, setup, &mut completion)
-                {
-                    Ok(()) => Done::Next(Pending::Opened(opening)),
+            (Some(Pending::Planning(opening, mut step)), Ok(mut completion)) => {
+                let planned = completion.texts().and_then(|texts| {
+                    serde_json::from_str::<serde_json::Value>(&texts.concat())
+                        .map_err(|error| Error::Interface(format!("the executor's plan: {error}")))
+                });
+                match planned {
+                    Ok(planned) => {
+                        step["planned"] = planned;
+                        Done::Next(Pending::Planning(opening, step))
+                    }
                     Err(error) => Done::Failed(failed(error)),
                 }
             }
@@ -917,15 +1477,33 @@ pub(crate) fn complete(
             (Some(Pending::Committing(media)), Err(failure)) => {
                 Done::Next(Pending::Failing(media, failed(failure.error)))
             }
-            (Some(Pending::Committing(mut media)), Ok(_)) => {
-                let trajectories = parts
-                    .denoisers
-                    .video
-                    .as_mut()
-                    .map(|denoiser| &mut denoiser.runner);
-                match media.apply_commit(plan, &parts.storage.tensors, parts.requests, trajectories)
-                {
-                    Ok(()) => Done::Launched(Box::new(media.launch())),
+            (Some(Pending::Committing(mut media)), Ok(mut completion)) => {
+                let modes = completion.returned();
+                let committed = match modes {
+                    Ok(modes) => {
+                        for mode in modes {
+                            media.record(match mode {
+                                1 => GraphMode::Replay,
+                                2 => GraphMode::Capture,
+                                _ => GraphMode::Eager,
+                            });
+                        }
+                        media.apply_commit(
+                            plan,
+                            &parts.storage.tensors,
+                            parts.requests,
+                            parts.video.ledger.as_mut(),
+                        )
+                    }
+                    Err(error) => Err(failed(error)),
+                };
+                match committed {
+                    Ok(()) => match parts.video.executor.reports() {
+                        Ok(reports) => {
+                            Done::Launched(Box::new(media.launch(reports.inbox(), plan.batch_id)))
+                        }
+                        Err(error) => Done::Failed(Failure::fatal(PHASE)(error)),
+                    },
                     Err(failure) if failure.committed => Done::Failed(failure),
                     Err(failure) => Done::Next(Pending::Failing(media, failure)),
                 }
@@ -962,104 +1540,68 @@ pub(crate) fn complete(
     }
 }
 
-pub(crate) fn decode_range<'a>(plan: &'a BatchPlan, call: &Call) -> Result<&'a ipc::DecodeRange> {
-    plan.decode_ranges
-        .iter()
-        .find(|range| range.request_key == call.request_key && range.call_id == call.call_id)
-        .ok_or_else(|| Error::Invalid("a media round has no unit range".into()))
-}
+#[cfg(test)]
+mod tests {
+    use ipc::RequestId;
 
-/// The batch's stream.
-pub(crate) fn stream_of(batch: &MediaBatch) -> Result<Stream> {
-    batch
-        .batch
-        .stream
-        .clone()
-        .ok_or_else(|| Error::Invariant("a device media call has no stream".into()))
-}
+    use super::*;
+    use crate::memory::{LatentPlan, LocalMemory};
 
-/// The most elements a product holds along one dimension.
-pub(crate) fn extent(dim: &ipc::DimBound) -> u64 {
-    match dim {
-        ipc::DimBound::Static(extent) | ipc::DimBound::Device { max: extent } => u64::from(*extent),
+    /// The ledger of a rank whose two request slots own two pages of four
+    /// units each.
+    fn ledger() -> Result<LatentLedger> {
+        let plan = LatentPlan {
+            request_pool_size: 2,
+            num_pages: 5,
+            page_units: 4,
+            latent_width: 1,
+            dtype: DType::F32,
+            with_workspace: false,
+        };
+        let storage = LatentStorage::allocate(&plan, None, None, "latent_banks", &mut LocalMemory)?;
+        Ok(LatentLedger::new(LatentPool::new(2, 5, 4)?, storage, 4, 2))
     }
-}
 
-/// Rows' width of a two-dimensional product.
-pub(crate) fn row_width(output: &TensorRef) -> Result<u64> {
-    output
-        .shape_bound
-        .dims
-        .get(1)
-        .map(extent)
-        .ok_or_else(|| Error::Invalid("the product is not rows".into()))
-}
+    fn call(slot: u64, kind: MediaCall) -> Call {
+        Call::new(
+            ipc::RequestKey::new(1, RequestId(slot), 1),
+            CallId::new(1, 0),
+            CallKind::Media(kind),
+        )
+    }
 
-/// Bind a call's single output as rows of `shape` on every rank that
-/// computes it; the batch commits the write.
-pub(crate) fn bind_rows(
-    parts: &Parts<'_>,
-    batch: &mut MediaBatch,
-    output: &TensorRef,
-    shape: Vec<u64>,
-    placement: &Placement<'_>,
-) -> Result<crate::ProductBuffer> {
-    let owners = parts.owners();
-    let write = bind_outputs(
-        owners.store,
-        &[OutputShape {
-            product: output.clone(),
-            shape,
-            region: None,
-        }],
-        batch.target(),
-        placement,
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| Error::Invariant("an encoder product was not bound".into()))?;
-    batch.batch.writes.push(write.clone());
-    Ok(write)
-}
+    /// A latent preparation opens a trajectory in bank one at step zero;
+    /// each denoising step reads the bank holding the committed step and
+    /// writes the other, and a released slot starts a new trajectory.
+    #[test]
+    fn a_trajectory_alternates_banks_from_its_committed_step() -> Result<()> {
+        let mut ledger = ledger()?;
+        let canvas = (1344, 768);
+        let preparation = call(2, MediaCall::LatentPreparation);
+        let (banks, update) = ledger.initial(2, &preparation, canvas)?;
+        assert_eq!((banks.read, banks.write, banks.step), (1, 1, 0));
+        // Slot two owns the two pages after slot one's and the padding page.
+        assert_eq!(update.params.page_table, [3, 4]);
+        assert_eq!(update.params.latent_units, 8);
+        assert_eq!((update.params.width, update.params.height), canvas);
+        ledger.validate(std::slice::from_ref(&update))?;
+        ledger.apply(&[update]);
 
-/// Publish a call's output, written at `shape` from its leading elements,
-/// and export it to its readers, behind the work `stream` issued for it.
-pub(crate) fn publish(
-    parts: &Parts<'_>,
-    batch: &mut MediaBatch,
-    call: &Call,
-    index: usize,
-    write: &crate::ProductBuffer,
-    shape: &[u64],
-    stream: impl Issue,
-) -> Result<()> {
-    let owners = parts.owners();
-    owners.store.produced(write, shape, stream, None)?;
-    batch.batch.calls[index]
-        .forward
-        .export(owners, call, &call.outputs[0], write, false, stream)
-}
-
-/// Publish a call's first output, whose bound view the producer filled, and
-/// export it to its readers (`host` readers read it from host memory).
-///
-/// The bound view is this rank's share of the product: its region when
-/// other ranks hold the rest, the whole product when the round assigns
-/// this rank all of it. Publishing the view itself is right in both cases;
-/// the store tracks a share that covers the product as a whole product.
-/// The fence and the export follow the work `stream` issued for the value.
-pub(crate) fn publish_bound(
-    parts: &Parts<'_>,
-    batch: &mut MediaBatch,
-    call: &Call,
-    index: usize,
-    write: &crate::ProductBuffer,
-    host: bool,
-    stream: impl Issue,
-) -> Result<()> {
-    let owners = parts.owners();
-    owners.store.write(write, &write.view(), stream, None)?;
-    batch.batch.calls[index]
-        .forward
-        .export(owners, call, &call.outputs[0], write, host, stream)
+        let denoising = call(2, MediaCall::Denoising);
+        for (step, read) in [(0, 1), (1, 0), (2, 1)] {
+            let (banks, update) = ledger.step(2, &denoising, canvas)?;
+            assert_eq!(
+                (banks.read, banks.write, banks.step),
+                (read, 1 - read, step)
+            );
+            ledger.validate(std::slice::from_ref(&update))?;
+            ledger.apply(&[update]);
+        }
+        // A trajectory in use cannot be opened again until its slot retires.
+        assert!(ledger.initial(2, &preparation, canvas).is_err());
+        ledger.release_slots(&[2])?;
+        let (banks, _) = ledger.initial(2, &preparation, canvas)?;
+        assert_eq!((banks.read, banks.write, banks.step), (1, 1, 0));
+        Ok(())
+    }
 }
