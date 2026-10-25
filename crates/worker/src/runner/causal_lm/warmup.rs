@@ -187,9 +187,11 @@ impl CausalLMRunners {
     /// Capture every runner's graphs, each step a job of its lane.
     ///
     /// With experts, each microbatch runner captures every bucket at every
-    /// step capacity that holds it, largest first: each capture's eager
-    /// warmup is a collective expert step at that capacity (announced to
-    /// dedicated expert ranks), in which the other microbatches join.
+    /// step capacity its forward can run at
+    /// ([`crate::parallel::ExpertParallel::microbatch_capacities`]), largest
+    /// first: each capture's eager warmup is a collective expert step at that
+    /// capacity (announced to dedicated expert ranks), in which the other
+    /// microbatches join.
     fn warmup(
         &mut self,
         prefix_cache: &mut PrefixCache,
@@ -203,17 +205,16 @@ impl CausalLMRunners {
             .map(|shape| (shape.block_size as usize, shape.units_per_page as usize))
             .collect();
         let units = prefix_cache.planes().num_units() as usize - 1;
-        // Step capacities a graph of `tokens` tokens is captured at.
-        let variants = |tokens: usize| -> Vec<Option<usize>> {
+        // Step capacities a graph of `tokens` tokens is captured at: every
+        // capacity a forward of one of `microbatches` microbatches that sends
+        // them can run at, largest first.
+        let variants = |tokens: usize, microbatches: usize| -> Vec<Option<usize>> {
             match experts {
                 None => vec![None],
                 Some(experts) => {
                     let mut capacities: Vec<Option<usize>> = experts
                         .parallel()
-                        .capacities()
-                        .iter()
-                        .copied()
-                        .filter(|&capacity| capacity >= tokens)
+                        .microbatch_capacities(tokens, microbatches)
                         .map(Some)
                         .collect();
                     capacities.reverse();
@@ -223,6 +224,7 @@ impl CausalLMRunners {
         };
         for index in 0..self.runners.len() {
             let (group, peer) = self.locate(index)?;
+            let microbatches = self.groups[group].len();
             let prefill = capture_order(self.runners[index].shapes().prefill().to_vec(), |shape| {
                 (shape.token_bucket * shape.row_bucket, shape.token_bucket)
             });
@@ -263,7 +265,7 @@ impl CausalLMRunners {
                 } else {
                     TokenSelection::Cache
                 };
-                for capacity in variants(shape.token_bucket) {
+                for capacity in variants(shape.token_bucket, microbatches) {
                     // The media variant's graphs serve prompts placing vision
                     // blocks, whose rows carry explicit positions; their
                     // causality and features are device columns, so text rows
@@ -334,7 +336,7 @@ impl CausalLMRunners {
                             .state
                             .set_predicates(&slots, false, after.on(stream))?;
                         let neutral = RowSampling::neutral(size);
-                        for capacity in variants(size) {
+                        for capacity in variants(size, microbatches) {
                             for row_sampling in [None, Some(&neutral)] {
                                 run(
                                     runtime,

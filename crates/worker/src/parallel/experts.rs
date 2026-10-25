@@ -196,6 +196,12 @@ impl ExpertExchange {
         &self.capacities
     }
 
+    /// The rank groups that send tokens, each executing its forwards
+    /// together.
+    pub(crate) fn source_groups(&self) -> usize {
+        self.sources.len()
+    }
+
     /// The smallest capacity holding `tokens`.
     pub(crate) fn capacity_for(&self, tokens: usize) -> Result<usize> {
         self.capacities
@@ -247,6 +253,9 @@ pub struct ExpertParallel {
     attention_ranks: usize,
     max_tokens: usize,
     capacities: Vec<usize>,
+    /// One source group sends the tokens of every step, so each step runs at
+    /// the smallest capacity holding that group's tokens.
+    one_source: bool,
 }
 
 /// Step selection and the fixed agreement buffers, used under one lock.
@@ -323,6 +332,7 @@ impl ExpertParallel {
         Ok(Self {
             host,
             capacities: exchange.capacities().to_vec(),
+            one_source: exchange.source_groups() == 1,
             control: Mutex::new(Control {
                 exchange,
                 records: vec![0; RECORD_BYTES * size],
@@ -352,14 +362,38 @@ impl ExpertParallel {
         lock(&self.control).exchange.capacity_for(tokens)
     }
 
-    /// The step capacities a forward that sends `tokens` tokens can run at:
-    /// every capacity holding them. Fixed at startup, so the thread that
-    /// prepares a step reads them without the agreement's lock.
+    /// The step capacities a forward that sends `tokens` tokens can run at,
+    /// ascending: the capacities warmup captures its graphs at and a step
+    /// prepares variants for. An agreement selects the smallest capacity
+    /// holding the most tokens any ready source group sends, so with one
+    /// source group that is the smallest capacity holding `tokens`; with
+    /// several, any capacity holding them. Fixed at startup, so the thread
+    /// that prepares a step reads them without the agreement's lock.
     pub(crate) fn capacities_for(&self, tokens: usize) -> impl Iterator<Item = usize> + '_ {
+        self.microbatch_capacities(tokens, 1)
+    }
+
+    /// The step capacities one of `microbatches` forwards of a step can run
+    /// at when it sends `tokens` tokens, ascending: the capacities warmup
+    /// captures its graphs at. The step runs at a capacity
+    /// [`Self::capacities_for`] the most tokens of any of the rank's
+    /// microbatches; with several, another may send more than this one, so
+    /// every capacity holding `tokens` is reachable.
+    pub(crate) fn microbatch_capacities(
+        &self,
+        tokens: usize,
+        microbatches: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let reachable = if self.one_source && microbatches == 1 {
+            1
+        } else {
+            usize::MAX
+        };
         self.capacities
             .iter()
             .copied()
             .filter(move |&capacity| capacity >= tokens.max(1))
+            .take(reachable)
     }
 
     /// This rank's member index and the union size.
@@ -651,6 +685,84 @@ mod tests {
             assert_eq!((second.capacity, second.active), (16, rank == 2));
             assert_eq!(leaving.capacity, 0);
             assert!(leaving.released);
+        }
+    }
+
+    #[test]
+    fn steps_run_at_a_capacity_their_sources_prepared() {
+        // Ranks 0 and 1 source tokens and rank 2 holds the experts; the
+        // sources form one group (`together`) or one group each.
+        for together in [true, false] {
+            let results = union(3, |rank, group| {
+                let sources: Vec<usize> = match rank {
+                    2 => Vec::new(),
+                    _ if together => vec![0, 1],
+                    _ => vec![rank],
+                };
+                let parallel = ExpertParallel::configure(
+                    Arc::new(Mutex::new(group)),
+                    2,
+                    &sources,
+                    48,
+                    ExpertTransport::DeepEp,
+                )
+                .unwrap();
+                // A group's members send equal tokens; separate groups do not.
+                let tokens = match rank {
+                    2 => 0,
+                    _ if together => 5,
+                    _ => [5, 20][rank],
+                };
+                let prepared: Vec<usize> = parallel.capacities_for(tokens).collect();
+                let agreed = parallel.agree(tokens, 0, false).unwrap();
+                (prepared, agreed.capacity)
+            });
+            for (rank, (prepared, agreed)) in results.into_iter().take(2).enumerate() {
+                let expected: &[usize] = match (together, rank) {
+                    (true, _) => &[8],
+                    (false, 0) => &[8, 16, 32, 48],
+                    (false, _) => &[32, 48],
+                };
+                assert_eq!(prepared, expected);
+                assert!(prepared.contains(&agreed), "{agreed} not in {prepared:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_microbatch_prepares_the_capacity_of_its_largest_peer() {
+        // One source group of two ranks, each splitting its step into two
+        // microbatches of 5 and 20 tokens; rank 2 holds the experts.
+        let results = union(3, |rank, group| {
+            let sources: Vec<usize> = if rank < 2 { vec![0, 1] } else { Vec::new() };
+            let parallel = ExpertParallel::configure(
+                Arc::new(Mutex::new(group)),
+                2,
+                &sources,
+                48,
+                ExpertTransport::DeepEp,
+            )
+            .unwrap();
+            let microbatches = [5, 20];
+            // A rank sends the most tokens of its microbatches.
+            let tokens = if rank < 2 { 20 } else { 0 };
+            let agreed = parallel.agree(tokens, 0, false).unwrap().capacity;
+            let prepared: Vec<Vec<usize>> = microbatches
+                .iter()
+                .map(|&tokens| parallel.microbatch_capacities(tokens, 2).collect())
+                .collect();
+            let alone: Vec<usize> = parallel.microbatch_capacities(5, 1).collect();
+            (agreed, prepared, alone)
+        });
+        for (agreed, prepared, alone) in results.into_iter().take(2) {
+            assert_eq!(agreed, 32);
+            assert_eq!(prepared, [vec![8, 16, 32, 48], vec![32, 48]]);
+            assert!(
+                prepared
+                    .iter()
+                    .all(|capacities| capacities.contains(&agreed))
+            );
+            assert_eq!(alone, [8]);
         }
     }
 
