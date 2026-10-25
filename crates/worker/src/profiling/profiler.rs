@@ -24,7 +24,6 @@ use std::path::PathBuf;
 
 use crossbeam_channel::{Receiver, Sender};
 use cuda::DeviceId;
-use ipc::CallKind;
 
 use crate::ffi::{Function, Handle};
 use crate::lane::{Completion, Job, JobId, JobQueues};
@@ -186,16 +185,16 @@ impl Profiler {
     }
 
     /// Submit the next job of the window's opening or closing: a job of
-    /// the lane serving `kind`, or calls for the builder thread. `None` when
+    /// the lane, or calls for the builder thread. `None` when
     /// nothing is left to submit, or while the last one is in flight. The
     /// batch whose forward this is waits for the job as for its own and
     /// hands its completion to [`Self::complete`].
-    pub(crate) fn next(&mut self, jobs: &JobQueues, kind: CallKind) -> Option<JobId> {
+    pub(crate) fn next(&mut self, jobs: &JobQueues) -> Option<JobId> {
         if self.submitted.is_some() {
             return None;
         }
         while let Some(phase) = self.phases.pop_front() {
-            match self.submit(phase, jobs, kind) {
+            match self.submit(phase, jobs) {
                 Ok(Some(job)) => {
                     self.submitted = Some(phase);
                     return Some(job);
@@ -240,7 +239,7 @@ impl Profiler {
     }
 
     /// Submit `phase`'s job; `None` when the phase has nothing to do.
-    fn submit(&mut self, phase: Phase, jobs: &JobQueues, kind: CallKind) -> Result<Option<JobId>> {
+    fn submit(&mut self, phase: Phase, jobs: &JobQueues) -> Result<Option<JobId>> {
         let range = self.device.filter(|_| self.config.cuda_profiler);
         match phase {
             Phase::Start => {
@@ -255,11 +254,11 @@ impl Profiler {
                 Ok(Some(jobs.call(calls, true)))
             }
             Phase::StartRange => match range {
-                Some(device) => self.range(jobs, kind, move || cuda::profiler_start(device)),
+                Some(device) => self.range(jobs, move || cuda::profiler_start(device)),
                 None => Ok(None),
             },
             Phase::StopRange => match range.filter(|_| std::mem::take(&mut self.ranging)) {
-                Some(device) => self.range(jobs, kind, move || cuda::profiler_stop(device)),
+                Some(device) => self.range(jobs, move || cuda::profiler_stop(device)),
                 None => Ok(None),
             },
             Phase::Discard => Ok(self.torch.take().map(|profile| {
@@ -275,13 +274,12 @@ impl Profiler {
         }
     }
 
-    /// A job of the lane serving `kind` that makes `call`, a driver call of
+    /// A job of the lane that makes `call`, a driver call of
     /// the capture range, on the lane's execution thread, behind the jobs
     /// submitted before it. The driver call is not issued on a stream.
     fn range(
         &self,
         jobs: &JobQueues,
-        kind: CallKind,
         call: impl FnOnce() -> cuda::Result<()> + Send + 'static,
     ) -> Result<Option<JobId>> {
         let failures = self.failures.0.clone();
@@ -292,7 +290,7 @@ impl Profiler {
                 let _ = failures.send(error.into());
             }
         }))?;
-        jobs.start(kind, job, true).map(Some)
+        jobs.start(job, true).map(Some)
     }
 
     /// Note that `phase` failed. A window that did not open is given up,
@@ -415,12 +413,9 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    use ipc::ForwardMode;
     use tvm_ffi::{Any, AnyView};
 
     use super::*;
-
-    const KIND: CallKind = CallKind::Forward(ForwardMode::Decode);
 
     /// Take the completion of `job`, which a rank without lanes and
     /// without a started interpreter performed where it was submitted.
@@ -473,28 +468,28 @@ mod tests {
         // The first step lies before the window: its forward waits for
         // nothing.
         profiler.begin();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
         profiler.end();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
 
         // The second step opens it: the profiler's start is a job the
         // forward waits for, and nothing more once it completed.
         profiler.begin();
-        let job = profiler.next(&jobs, KIND).unwrap();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        let job = profiler.next(&jobs).unwrap();
+        assert!(profiler.next(&jobs).is_none());
         profiler.complete(completed(&jobs, job));
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
         assert_eq!(*started.lock().unwrap(), [vec!["CPU".to_owned()]]);
         assert!(directory.path().join("profiles").is_dir());
         profiler.end();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
 
         // The window's last step ends it: the export is a job behind that
         // step's forward, named after the steps the window covered.
         profiler.begin();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
         profiler.end();
-        let job = profiler.next(&jobs, KIND).unwrap();
+        let job = profiler.next(&jobs).unwrap();
         profiler.complete(completed(&jobs, job));
         let stopped = stopped.lock().unwrap();
         let [(profile, prefix)] = &stopped[..] else {
@@ -506,7 +501,7 @@ mod tests {
 
         // The window is not opened again.
         profiler.begin();
-        assert!(profiler.next(&jobs, KIND).is_none());
+        assert!(profiler.next(&jobs).is_none());
         assert_eq!(started.lock().unwrap().len(), 1);
     }
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use cuda::Stream;
 use ipc::CallId;
-use ipc::{BufferId, CallKind, ForwardMode, RequestKey, Wake};
+use ipc::{BufferId, RequestKey, Wake};
 
 use super::cache_width;
 use crate::Result;
@@ -22,10 +22,6 @@ use crate::memory::{BufferPool, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
 
-/// The call kind whose lane owns the stream slot releases are ordered on:
-/// token calls, which read the rows a release clears.
-const RELEASE: CallKind = CallKind::Forward(ForwardMode::Decode);
-
 /// The storage owners of a rank.
 pub(crate) struct WorkerMemory {
     pub events: Arc<EventPool>,
@@ -34,7 +30,7 @@ pub(crate) struct WorkerMemory {
     pub transports: Arc<Transports>,
     pub prefix_cache: Option<PrefixCache>,
     /// Stream that orders slot releases after the batches reading them: the
-    /// stream serving token calls, shared with its lane.
+    /// lane's.
     release_stream: Option<Stream>,
     /// Finished requests whose guidance prefix slots (image trajectories)
     /// clear with their own slots, once their readers retired.
@@ -82,7 +78,7 @@ impl RequestStorage for WorkerMemory {
     }
 
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
-        self.tensors.release_buffers(buffers, jobs.any().on(None))?;
+        self.tensors.release_buffers(buffers, jobs.job().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
             prefix_cache.release_buffers(buffers)?;
         }
@@ -96,7 +92,7 @@ impl RequestStorage for WorkerMemory {
         jobs: &LaneJobs,
     ) -> Result<()> {
         self.tensors
-            .release_requests(requests, retained, jobs.any().on(None))?;
+            .release_requests(requests, retained, jobs.job().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
             prefix_cache.release_requests(requests, retained)?;
             self.finished_prefixes.extend(requests.iter().copied());
@@ -127,17 +123,9 @@ impl RequestStorage for WorkerMemory {
 
     fn retire_slots(&mut self, slots: &[usize], jobs: &LaneJobs) -> Result<()> {
         if let Some(prefix_cache) = &mut self.prefix_cache {
-            // The rows are cleared by the lane that owns the release
-            // stream, behind the batches it already performed.
-            let release = match &self.release_stream {
-                // A rank that does not list the kind has one lane for
-                // every kind, which owns the stream.
-                Some(stream) => jobs
-                    .job(RELEASE)
-                    .unwrap_or_else(|_| jobs.any())
-                    .on(Some(stream)),
-                None => jobs.any().on(None),
-            };
+            // The rows are cleared on the lane's stream, behind the batches
+            // it already performed.
+            let release = jobs.job().on(self.release_stream.as_ref());
             let slots: Vec<u32> = slots.iter().map(|&slot| slot as u32).collect();
             prefix_cache.release_slots(&slots, release)?;
             for request in std::mem::take(&mut self.retired_prefixes) {
@@ -272,10 +260,11 @@ pub(super) fn allocate_storage(
     if let Some(stream) = preparation {
         stream.synchronize()?;
     }
-    // Slot releases order after the token batches that read them.
+    // Slot releases order after the token batches that read them, on the
+    // lane's stream.
     let release_stream = match device {
         Some(cuda) => streams
-            .stream_for(CallKind::Forward(ForwardMode::Decode), cuda)
+            .stream_for(cuda)
             .map(|stream| stream.stream().cloned())
             .transpose()?,
         None => None,

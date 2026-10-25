@@ -1,7 +1,5 @@
 //! The decoder runners of a rank.
 
-use ipc::{CallKind, MediaCall};
-
 use super::{DecodeImage, DecoderRunner};
 use crate::Result;
 use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
@@ -9,14 +7,10 @@ use crate::memory::LatentCache;
 use crate::runner::denoiser::image_model::ImageDenoiserLayout;
 use crate::stream::Issue;
 
-/// The lane kind of the image decoder's jobs.
-const IMAGE: CallKind = CallKind::Media(MediaCall::ImageDecoding);
-
-/// Perform a startup `job` on the lane serving `kind` and wait for its
-/// completion.
-fn perform(lanes: &JobQueues, kind: CallKind, job: Job) -> Result<Completion> {
+/// Perform a startup `job` on the lane and wait for its completion.
+fn perform(lanes: &JobQueues, job: Job) -> Result<Completion> {
     lanes
-        .block_on(kind, job, BLOCK_ON_TIMEOUT)?
+        .block_on(job, BLOCK_ON_TIMEOUT)?
         .check()
         .map_err(|failure| failure.error)
 }
@@ -51,8 +45,8 @@ impl DecoderRunners {
     }
 
     /// Capture the image decoder's decode and quantization at every size
-    /// it serves, each warmed first, as jobs of the lane serving image
-    /// decoding on `lanes`; then seal it. Without graphs it captures
+    /// it serves, each warmed first, as jobs of the lane on `lanes`; then
+    /// seal it. Without graphs it captures
     /// nothing.
     pub(crate) fn capture_image(&mut self, lanes: &JobQueues) -> Result<()> {
         let Some((_, decoder)) = &mut self.image else {
@@ -66,7 +60,7 @@ impl DecoderRunners {
             let mut returns = Vec::new();
             let keys = decoder.capture_image(units, height, width, &job, &mut returns)?;
             job.on(decoder.stream()).synchronize()?;
-            let mut completion = perform(lanes, IMAGE, job)?;
+            let mut completion = perform(lanes, job)?;
             decoder.check_staged(returns, &mut completion)?;
             for key in keys {
                 decoder.complete_image(key, &mut completion)?;
@@ -123,7 +117,7 @@ impl DecoderRunners {
             &mut returns,
         )?;
         issue.synchronize()?;
-        let mut completion = perform(lanes, IMAGE, job)?;
+        let mut completion = perform(lanes, job)?;
         decoder.check_staged(returns, &mut completion)
     }
 }

@@ -9,7 +9,7 @@
 //! | Resource | Owner | Release |
 //! | --- | --- | --- |
 //! | Primary context | [`PrimaryContext`], [`DeviceGuard`] | release / pop on drop; destroyed at the process's end by [`PrimaryContext::reset_all`] |
-//! | Stream | [`Stream`], [`GreenContext`] (SM partitions) | `cuStreamDestroy` on drop |
+//! | Stream | [`Stream`] | `cuStreamDestroy` on drop |
 //! | Event | [`Event`] | `cuEventDestroy` on drop |
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
 //! | Device memory | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
@@ -30,7 +30,6 @@ mod driver;
 mod error;
 mod event;
 mod graph;
-mod green;
 mod memory;
 pub mod nccl;
 mod nvml;
@@ -51,7 +50,6 @@ pub use device::{
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::GraphExec;
-pub use green::GreenContext;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
@@ -86,7 +84,6 @@ mod tests {
         shared::<Event>();
         shared::<GraphExec>();
         shared::<PrimaryContext>();
-        shared::<GreenContext>();
         shared::<DeviceAllocation>();
         shared::<PeerMapping>();
         shared::<PinnedBuffer>();

@@ -54,9 +54,8 @@ pub struct PrefixCacheStats {
 /// time fields (`launch_us`, `device_us`, `completion_us`) add, once per batch
 /// result report that contains calls of the domain, the maximum over those
 /// calls of each `TimingCounters` field they draw on. Batches of different
-/// domains can execute concurrently on separate worker execution lanes, so
-/// time fields must not be summed across domains to estimate aggregate GPU
-/// busy time.
+/// domains can overlap on a device, so time fields must not be summed
+/// across domains to estimate aggregate GPU busy time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainSchedulerStats {
     /// Stable execution-domain name.

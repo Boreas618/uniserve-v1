@@ -1,7 +1,7 @@
 """The numerical half of a worker rank: :class:`Executor`.
 
 The worker (Rust) owns the control plane and the data plane: requests,
-batches, lanes and their streams, product storage and transfers, the KV and
+batches, the lane and its streams, product storage and transfers, the KV and
 latent memory and the graph pools' device memory. The executor owns every
 numerical decision and computation of the rank: the components' runners,
 their buffers, layouts and buckets, graph capture and replay, sampling and
@@ -75,20 +75,20 @@ class Executor:
     def bind(self, memory: str, *values: Any) -> None:
         """Construct the runners on the storage the worker granted.
 
-        ``memory`` is JSON: ``slots``, the ``lanes`` (call kind to
+        ``memory`` is JSON: ``slots``, the ``streams`` (call kind to
         ``[stream handle, CUDA ordinal]``), the capabilities whose graph
         ``pools`` follow in ``values`` in that order, then one ``Scratch``
-        per lane in the order of ``lanes``, whether the two latent ``banks``
+        per stream in the order of ``streams``, whether the two latent ``banks``
         follow them, the ``reports`` pipe descriptor, the ``ffmpeg``
         executable and the ``transient_layouts`` a denoiser keeps.
         """
         settings = json.loads(str(memory))
-        lanes = list(settings["lanes"].items())
+        named = list(settings["streams"].items())
         streams = {
             str(kind): torch.cuda.ExternalStream(
                 int(handle), device=torch.device("cuda", int(ordinal))
             )
-            for kind, (handle, ordinal) in lanes
+            for kind, (handle, ordinal) in named
         }
         names = [str(name) for name in settings["pools"]]
         rest = list(values)
@@ -97,10 +97,10 @@ class Executor:
         scratches = {
             str(kind): scratch
             for (kind, _), scratch in zip(
-                lanes, rest[: len(lanes)], strict=True
+                named, rest[: len(named)], strict=True
             )
         }
-        del rest[: len(lanes)]
+        del rest[: len(named)]
         banks = None
         if settings["banks"]:
             first, second = rest

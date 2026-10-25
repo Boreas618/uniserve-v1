@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ipc::{CallKind, MediaCall, WorkerInfo};
+use ipc::{MediaCall, WorkerInfo};
 
 use crate::capacity::video::{VideoCapacity, VideoManifest};
 use crate::config::placement::{Capability, Components, Declarations};
@@ -36,8 +36,8 @@ const AUDIO_GRAPHS: usize = 1003;
 const LATENT_GRAPHS: usize = 1004;
 
 /// The capabilities whose components capture graphs, each with its graph
-/// storage key and the call kind whose lane its stream forks from; the
-/// kinds after it compute on the same stream.
+/// storage key and the call kind its stream is named by; the kinds after it
+/// compute on the same stream.
 const CAPTURING: [(Capability, usize, MediaCall, &[MediaCall]); 5] = [
     (
         Capability::TextEncoder,
@@ -197,10 +197,10 @@ pub(crate) fn start(start: VideoStart<'_>) -> Result<(VideoRuntime, OutputPool)>
     let capture = config.graph_policy != "off" && config.device.is_cuda();
     let create = Interpreter::import("uniserve.cuda_graph.pool")?;
 
-    // One stream per component the rank holds, forked from the lane of its
-    // first call kind; its other kinds compute on it. The contexts of a
+    // One stream per component the rank holds, forked from the lane's; its
+    // call kinds compute on it. The contexts of a
     // stream share its scratch.
-    let mut lanes: HashMap<MediaCall, (Device, Option<cuda::Stream>)> = HashMap::new();
+    let mut kinds: HashMap<MediaCall, (Device, Option<cuda::Stream>)> = HashMap::new();
     let mut streams_json = serde_json::Map::new();
     let mut lane_scratches = HashMap::new();
     let mut pool_names = Vec::new();
@@ -219,12 +219,9 @@ pub(crate) fn start(start: VideoStart<'_>) -> Result<(VideoRuntime, OutputPool)>
                     "video components compute on CUDA devices".into(),
                 ));
             };
-            let stream = streams
-                .fork_module(CallKind::Media(kind), cuda)?
-                .stream()?
-                .clone();
+            let stream = streams.fork_module(cuda)?.stream()?.clone();
             for &served in std::iter::once(&kind).chain(others) {
-                lanes.insert(served, (Device::Cuda(cuda), Some(stream.clone())));
+                kinds.insert(served, (Device::Cuda(cuda), Some(stream.clone())));
             }
             streams_json.insert(
                 kind.as_str().to_owned(),
@@ -270,7 +267,7 @@ pub(crate) fn start(start: VideoStart<'_>) -> Result<(VideoRuntime, OutputPool)>
         _ => None,
     };
     let banks = ledger.as_ref().map(LatentLedger::banks).transpose()?;
-    // The scratches follow the pools in the order the lanes serialize.
+    // The scratches follow the pools in the order the streams serialize.
     let lane_scratches = streams_json
         .keys()
         .map(|kind| lane_scratches.remove(kind))
@@ -278,7 +275,7 @@ pub(crate) fn start(start: VideoStart<'_>) -> Result<(VideoRuntime, OutputPool)>
         .ok_or_else(|| Error::Invariant("a lane has no scratch".into()))?;
     let memory_json = serde_json::json!({
         "slots": slots,
-        "lanes": streams_json,
+        "streams": streams_json,
         "pools": pool_names,
         "ffmpeg": config.ffmpeg,
         // A conditioned request whose layout startup did not prepare
@@ -290,7 +287,7 @@ pub(crate) fn start(start: VideoStart<'_>) -> Result<(VideoRuntime, OutputPool)>
     let words = info.max_batch_calls.max(1) as usize;
     let outputs = OutputPool::new(device, leases, words)?;
     Ok((
-        VideoRuntime::new(executor, ledger, lanes, host_stream),
+        VideoRuntime::new(executor, ledger, kinds, host_stream),
         outputs,
     ))
 }

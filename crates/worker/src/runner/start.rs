@@ -115,13 +115,13 @@ struct Target {
     stream: Option<Stream>,
 }
 
-/// The lane stream serving `kind` on `device`.
-fn stream(streams: &Streams, kind: CallKind, device: Device) -> Result<Option<Stream>> {
+/// The full-device stream of `device`, the lane's on the primary device.
+fn stream(streams: &Streams, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda() else {
         return Ok(None);
     };
     let stream = streams
-        .stream_for(kind, index)
+        .stream_for(index)
         .ok_or(Error::State("image calls have no execution stream"))?;
     Ok(Some(stream.stream()?.clone()))
 }
@@ -332,7 +332,7 @@ impl ImageOwners {
                             path: call.path.clone(),
                             kind,
                             device: placed.device,
-                            stream: stream(startup.streams, kind, placed.device)?,
+                            stream: stream(startup.streams, placed.device)?,
                         });
                     }
                 }

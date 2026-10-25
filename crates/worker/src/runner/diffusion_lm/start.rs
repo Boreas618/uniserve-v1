@@ -71,12 +71,8 @@ impl Bounds {
         facts: &Facts,
         cuda: bool,
     ) -> Result<Self> {
-        let mut max_rows = config.max_batch_calls.min(request_slots.max(1));
-        let mut tokens = config.max_batch_tokens;
-        for lane in &config.lanes {
-            max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
-            tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
-        }
+        let max_rows = config.max_batch_calls.min(request_slots.max(1));
+        let tokens = config.max_batch_tokens;
         let length = facts.sequence_length;
         let groups = cache.group_shapes()?;
         let row_units: usize = groups
@@ -177,27 +173,17 @@ impl Bounds {
     }
 }
 
-/// The stream serving the runner's calls on `device`: the configured lane
-/// serving token denoising, or the device stream.
+/// The stream serving the runner's calls on `device`: its full-device
+/// stream, the lane's on the primary device.
 fn stream(streams: &Streams, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda() else {
         return Ok(None);
     };
-    let mut serving = streams.lanes().iter().filter(|lane| lane.serves(KIND));
-    let stream = match (serving.next(), serving.next()) {
-        (Some(lane), None) => lane.stream.stream()?.clone(),
-        (None, _) if streams.lanes().is_empty() => streams
-            .stream_for(KIND, index)
-            .ok_or(Error::State("diffusion LM calls have no execution stream"))?
-            .stream()?
-            .clone(),
-        _ => {
-            return Err(Error::Invalid(format!(
-                "computation {} is served by one lane",
-                KIND.as_str()
-            )));
-        }
-    };
+    let stream = streams
+        .stream_for(index)
+        .ok_or(Error::State("diffusion LM calls have no execution stream"))?
+        .stream()?
+        .clone();
     Ok(Some(stream))
 }
 

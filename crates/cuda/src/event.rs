@@ -73,7 +73,8 @@ impl Drop for EventHandle {
 /// first recorded on.
 ///
 /// An event belongs to one CUDA context, and the worker records the same
-/// logical fence on streams of different contexts (primary or SM partition).
+/// logical fence on streams of different contexts (the primary contexts of
+/// different devices).
 /// Recording on a stream of another context replaces the driver event with a
 /// new one in that context; waits and queries always observe the most recent
 /// record. The event retains the context it was created in, so a fence may

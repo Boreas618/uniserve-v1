@@ -1,7 +1,6 @@
 //! Launch descriptor resolution.
 
 use cuda::DeviceId;
-use ipc::{CallKind, ForwardMode};
 use serde_json::{Value, json};
 use worker::config::{Device, WorkerLaunch, resolve};
 
@@ -40,7 +39,6 @@ fn defaults() -> Value {
         "expert_microbatches": 1,
         "distributed_backend": null,
         "mesh": null,
-        "lane": [],
         "no_model": false,
         "load_format": "auto",
         "download_dir": null,
@@ -165,46 +163,6 @@ fn engine_capacities_and_precision_reach_the_worker() {
 
 fn launch_error(overrides: Value) -> String {
     resolved(overrides).unwrap_err()
-}
-
-#[test]
-fn execution_lanes_bind_disjoint_calls() {
-    let launch = resolved(json!({"lane": [
-        {"lane_id": "decode", "sm_budget": 64, "call_kinds": ["decode", "verify", "token_denoising"],
-         "max_batch_calls": null, "max_batch_tokens": null, "max_inflight": null},
-        {"lane_id": "compute", "sm_budget": 88, "call_kinds": ["prefill", "denoising"],
-         "max_batch_calls": null, "max_batch_tokens": null, "max_inflight": null},
-    ]}))
-    .unwrap();
-    let lanes = &launch.execution.lanes;
-    assert_eq!(lanes[0].lane_id, "decode");
-    assert_eq!(lanes[1].sm_budget, 88);
-    assert_eq!(
-        lanes[0].call_kinds,
-        vec![
-            CallKind::Forward(ForwardMode::Decode),
-            CallKind::Forward(ForwardMode::Verify),
-            CallKind::Forward(ForwardMode::TokenDenoising),
-        ]
-    );
-
-    // A misspelled optional limit fails at parsing instead of leaving the
-    // lane without that limit.
-    for field in ["max_batch_token", "max_inflght"] {
-        let mut lane = json!({"lane_id": "decode", "sm_budget": 64, "call_kinds": ["decode"]});
-        lane[field] = json!(2);
-        assert!(
-            launch_error(json!({ "lane": [lane] })).contains("unknown field"),
-            "{field}"
-        );
-    }
-    let duplicate = json!({"lane": [
-        {"lane_id": "a", "sm_budget": 64, "call_kinds": ["decode"],
-         "max_batch_calls": null, "max_batch_tokens": null, "max_inflight": null},
-        {"lane_id": "b", "sm_budget": 64, "call_kinds": ["decode"],
-         "max_batch_calls": null, "max_batch_tokens": null, "max_inflight": null},
-    ]});
-    assert!(launch_error(duplicate).contains("one execution lane"));
 }
 
 /// A stated capture catalog or capacity list replaces the rank's own, and an

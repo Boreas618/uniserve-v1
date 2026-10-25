@@ -5,36 +5,12 @@
 //! ordinary host memory. Every submission is `unsafe` because the caller keeps
 //! each addressed range valid, and not concurrently written by other work,
 //! until the stream reaches the copy.
-//!
-//! # Mapped memory on SM-partition streams
-//!
-//! `cuMemcpyBatchAsync_v2` and `cuMemcpy3DBatchAsync_v2` fault inside the
-//! driver (a segmentation fault, observed on driver 580.82.07) when the
-//! stream belongs to a green context and an operand lies in memory mapped
-//! with `cuMemMap`: an exportable allocation, an import or an alias. On the
-//! same streams `cuMemcpyAsync` and `cuMemcpy3DAsync` serve those operands,
-//! and the batched calls serve every other operand. [`CopyBatch::submit`] and
-//! [`PitchedBatch::submit`] therefore send each entry with a mapped operand
-//! in a call of its own when the stream runs in an SM partition, and all
-//! other entries in one batched call.
-//!
-//! The unbatched calls read a page-locked host source or a device source in
-//! stream order, and consume only an ordinary (pageable) host source before
-//! they return. An entry of a [`SourceOrder::DuringCall`] batch that is sent
-//! unbatched with a source of the first kind makes `submit` wait for the
-//! stream before returning, so the caller may still reuse every source
-//! immediately.
 
 mod pitched;
 mod strided;
 
-use std::ffi::c_void;
-
-use crate::driver::{
-    CU_MEMORYTYPE_HOST, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CUDA_ERROR_INVALID_VALUE, MemLocation,
-    MemcpyAttributes, driver,
-};
-use crate::{Error, Result, Stream, vmm};
+use crate::driver::{MemLocation, MemcpyAttributes, driver};
+use crate::{Error, Result, Stream};
 
 pub use pitched::{Pitched, PitchedBatch};
 pub use strided::{Strided, StridedCopy};
@@ -69,59 +45,6 @@ fn require_batch_stream(stream: &Stream, call: &'static str) -> Result<()> {
         )));
     }
     stream.require_eager(call)
-}
-
-/// Whether the batched calls cannot take a copy between `destination` and
-/// `source` on a stream that runs in an SM partition (see the module
-/// documentation).
-fn mapped(destination: u64, source: u64) -> bool {
-    vmm::is_mapped(destination) || vmm::is_mapped(source)
-}
-
-/// Where the driver places an operand address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Residence {
-    Device,
-    /// Page-locked or registered host memory.
-    PageLocked,
-    /// Host memory the driver does not track.
-    Pageable,
-}
-
-impl Residence {
-    /// Classifies `address` with the stream's context current.
-    fn of(address: u64) -> Result<Self> {
-        if vmm::is_mapped(address) {
-            return Ok(Self::Device);
-        }
-        let driver = driver()?;
-        let mut kind = 0_u32;
-        // SAFETY: the driver writes one `CUmemorytype` for this attribute.
-        let status = unsafe {
-            (driver.pointer_get_attribute)(
-                (&raw mut kind).cast::<c_void>(),
-                CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
-                address,
-            )
-        };
-        // An address outside unified memory is ordinary host memory.
-        if status == CUDA_ERROR_INVALID_VALUE {
-            return Ok(Self::Pageable);
-        }
-        driver.check(status, "cuPointerGetAttribute")?;
-
-        Ok(if kind == CU_MEMORYTYPE_HOST {
-            Self::PageLocked
-        } else {
-            Self::Device
-        })
-    }
-
-    /// Whether an unbatched copy reads this source before its call returns.
-    /// Other sources are read in stream order.
-    fn read_during_call(self) -> bool {
-        self == Self::Pageable
-    }
 }
 
 /// Copies `bytes` from `source` to `destination` after preceding work on
@@ -232,9 +155,7 @@ pub unsafe fn memset_2d_d32(
     )
 }
 
-/// Contiguous copies submitted with one `cuMemcpyBatchAsync` call, except
-/// entries with a mapped operand on an SM-partition stream, which are
-/// submitted one `cuMemcpyAsync` call each (see the module documentation).
+/// Contiguous copies submitted with one `cuMemcpyBatchAsync` call.
 ///
 /// Copies in one batch are unordered with respect to each other: a batch must
 /// never contain overlapping destinations, or a destination that another
@@ -299,8 +220,7 @@ impl CopyBatch {
     /// Submits every entry on `stream`; an empty batch submits nothing.
     ///
     /// With [`SourceOrder::DuringCall`] every source has been read when this
-    /// returns. For an entry submitted unbatched whose source is page-locked
-    /// host memory or device memory, that requires waiting for the stream.
+    /// returns.
     ///
     /// Fails with [`Error::Capturing`] on a capturing stream and with
     /// [`Error::Symbol`] on a driver older than CUDA 12.8.
@@ -315,54 +235,16 @@ impl CopyBatch {
         require_batch_stream(stream, BATCH_CALL)?;
         let _scope = stream.enter()?;
 
-        let operands = || self.destinations.iter().zip(&self.sources);
-        if !stream.is_partitioned()? || !operands().any(|(&to, &from)| mapped(to, from)) {
-            // SAFETY: forwarded from the caller.
-            return unsafe {
-                submit_batch(
-                    &self.destinations,
-                    &self.sources,
-                    &self.sizes,
-                    self.order,
-                    stream,
-                )
-            };
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            submit_batch(
+                &self.destinations,
+                &self.sources,
+                &self.sizes,
+                self.order,
+                stream,
+            )
         }
-
-        let driver = driver()?;
-        let mut batched = Self::new(self.order);
-        let mut wait = false;
-        for (destination, source, bytes) in self.iter() {
-            if !mapped(destination, source) {
-                batched.push(destination, source, bytes);
-                continue;
-            }
-            driver.check(
-                // SAFETY: forwarded from the caller, who keeps both ranges valid until
-                // the stream reaches the copy.
-                unsafe { (driver.memcpy_async)(destination, source, bytes, stream.handle()) },
-                "cuMemcpyAsync",
-            )?;
-            if self.order == SourceOrder::DuringCall {
-                wait |= !Residence::of(source)?.read_during_call();
-            }
-        }
-        if !batched.is_empty() {
-            // SAFETY: forwarded from the caller.
-            unsafe {
-                submit_batch(
-                    &batched.destinations,
-                    &batched.sources,
-                    &batched.sizes,
-                    self.order,
-                    stream,
-                )
-            }?;
-        }
-        if wait {
-            stream.synchronize()?;
-        }
-        Ok(())
     }
 }
 
@@ -371,8 +253,7 @@ const BATCH_CALL: &str = "cuMemcpyBatchAsync_v2";
 /// Submits parallel arrays of contiguous copies with one batched call.
 ///
 /// # Safety
-/// As for [`CopyBatch::submit`]; the stream's context is current and no
-/// entry needs an unbatched call.
+/// As for [`CopyBatch::submit`]; the stream's context is current.
 unsafe fn submit_batch(
     destinations: &[u64],
     sources: &[u64],

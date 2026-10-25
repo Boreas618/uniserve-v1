@@ -12,9 +12,8 @@ pub use issue::{Fill, Issue, RowFill};
 
 use crossbeam_channel::{Receiver, Sender};
 use cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
-use ipc::CallKind;
 
-use crate::config::{Device, WorkerConfig};
+use crate::config::Device;
 use crate::lane::{Completion, JobId, JobQueues, Lane};
 use crate::{Error, Result};
 
@@ -38,10 +37,7 @@ pub(crate) unsafe fn external(device: DeviceId, handle: usize) -> Result<Stream>
     Ok(unsafe { Stream::borrowed(device, handle) }?)
 }
 
-/// An execution stream and its SM allocation.
-///
-/// Callers serialize context use across streams sharing an SM partition.
-/// Forks independently retain an owned SM partition.
+/// An execution stream of a rank.
 pub struct CUDAStream {
     device: DeviceId,
     stream: Option<Stream>,
@@ -64,14 +60,6 @@ impl CUDAStream {
     /// primary context.
     pub fn create(device: DeviceId) -> Result<Self> {
         Ok(Self::new(device, Stream::new(device)?))
-    }
-
-    /// Allocate the configured SM partitions from one disjoint split tree.
-    pub(crate) fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Self>> {
-        Ok(Stream::partition(device, counts)?
-            .into_iter()
-            .map(|stream| Self::new(device, stream))
-            .collect())
     }
 
     pub(crate) fn fork(&self) -> Result<Self> {
@@ -118,8 +106,8 @@ impl CUDAStream {
     }
 
     /// Drain submitted work, then release this owner's handle to the stream.
-    /// The driver stream and its SM partition are released once every
-    /// component sharing the handle has dropped its clone. Failed collective
+    /// The driver stream is released once every component sharing the
+    /// handle has dropped its clone. Failed collective
     /// execution retains resources until process exit.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         // A closed stream keeps an unrecorded fence, which holds no driver
@@ -149,15 +137,15 @@ impl Drop for CUDAStream {
     }
 }
 
-/// Every stream of a rank: its lanes', its copy lane's, each device's
-/// preparation stream for startup work outside any lane, the full-device
+/// Every stream of a rank: its lane's, its copy lane's, each device's
+/// preparation stream for startup work outside the lane, the full-device
 /// streams of its other devices, and the module and microbatch streams
-/// capability runtimes fork from a lane. They close in dependency order:
-/// preparation, modules, microbatches, the copy lane, lanes, devices, each
-/// newest first.
+/// capability runtimes fork from the lane's. They close in dependency
+/// order: preparation, modules, microbatches, the copy lane, the lane,
+/// devices, each newest first.
 pub(crate) struct Streams {
-    /// The configured lanes, or the one lane of a rank without them.
-    lanes: Vec<Lane>,
+    /// The lane of a rank with a CUDA device, on its primary device.
+    lane: Option<Lane>,
     /// The copy lane of a rank whose prefix cache copies pages through the
     /// host KV cache (`crate::lane`), on its primary device.
     copy: Option<Lane>,
@@ -166,8 +154,7 @@ pub(crate) struct Streams {
     /// work.
     posted: Sender<(JobId, Completion)>,
     completions: Receiver<(JobId, Completion)>,
-    /// The full-device streams of the other CUDA devices of a rank without
-    /// configured lanes.
+    /// The full-device streams of the rank's other CUDA devices.
     devices: Vec<CUDAStream>,
     preparation: Vec<CUDAStream>,
     modules: Vec<CUDAStream>,
@@ -176,11 +163,11 @@ pub(crate) struct Streams {
 
 impl Streams {
     /// Create the streams of `devices`.
-    pub(crate) fn create(config: &WorkerConfig, devices: &[Device]) -> Result<Self> {
+    pub(crate) fn create(devices: &[Device]) -> Result<Self> {
         let cuda: Vec<DeviceId> = devices.iter().filter_map(|device| device.cuda()).collect();
         let (posted, completions) = crossbeam_channel::unbounded();
         let mut streams = Self {
-            lanes: Vec::new(),
+            lane: None,
             copy: None,
             posted: posted.clone(),
             completions,
@@ -189,47 +176,17 @@ impl Streams {
             modules: Vec::new(),
             microbatches: Vec::new(),
         };
-        if cuda.is_empty() {
-            return Ok(streams);
-        }
-        if !config.lanes.is_empty() {
-            let [device] = cuda[..] else {
-                return Err(Error::Unsupported(
-                    "execution lanes require one physical device".into(),
-                ));
-            };
-            if config.expert_microbatches > 1 && config.lanes.len() > 1 {
-                return Err(Error::Unsupported(
-                    "expert parallelism runs on exactly one execution lane".into(),
-                ));
-            }
-            let counts: Vec<u32> = config
-                .lanes
-                .iter()
-                .map(|lane| u32::try_from(lane.sm_budget).unwrap_or(u32::MAX))
-                .collect();
-            let partitions = CUDAStream::partition(device, &counts)?;
-            for (index, (config, stream)) in
-                config.lanes.iter().cloned().zip(partitions).enumerate()
-            {
-                streams.lanes.push(Lane::start(
-                    format!("lane-{index}"),
-                    Some(config),
+        // The primary device leads `devices`.
+        for (index, &device) in cuda.iter().enumerate() {
+            let stream = CUDAStream::create(device)?;
+            if index == 0 {
+                streams.lane = Some(Lane::start(
+                    crate::lane::LANE.into(),
                     stream,
                     posted.clone(),
                 )?);
-            }
-        } else {
-            // The primary device leads `devices`.
-            for (index, &device) in cuda.iter().enumerate() {
-                let stream = CUDAStream::create(device)?;
-                if index == 0 {
-                    streams
-                        .lanes
-                        .push(Lane::start("lane-0".into(), None, stream, posted.clone())?);
-                } else {
-                    streams.devices.push(stream);
-                }
+            } else {
+                streams.devices.push(stream);
             }
         }
         for &device in &cuda {
@@ -247,55 +204,31 @@ impl Streams {
         }
         let lane = Lane::start(
             crate::lane::COPY_LANE.into(),
-            None,
             CUDAStream::create(device)?,
             self.posted.clone(),
         )?;
         Ok(&self.copy.insert(lane).stream)
     }
 
-    /// The configured lanes; empty for a rank without them.
-    pub(crate) fn lanes(&self) -> &[Lane] {
-        if self.configured() { &self.lanes } else { &[] }
-    }
-
-    /// Whether the lanes are configured SM partitions.
-    fn configured(&self) -> bool {
-        self.lanes.first().is_some_and(|lane| lane.config.is_some())
-    }
-
-    /// The job queue of every lane with the call kinds it serves, for the
-    /// executor, which submits each forward to its lane.
+    /// The job queues of the lane and the copy lane, for the executor,
+    /// which submits each forward to the lane.
     pub(crate) fn job_queues(&self) -> JobQueues {
         JobQueues::of(
-            &self.lanes,
+            self.lane.as_ref(),
             self.copy.as_ref(),
             self.posted.clone(),
             self.completions.clone(),
         )
     }
 
-    /// The stream of the lane serving `kind`, or `device`'s full-device
-    /// stream without configured lanes.
-    pub(crate) fn stream_for(&self, kind: CallKind, device: DeviceId) -> Option<&CUDAStream> {
-        if self.configured() {
-            return self
-                .lanes
-                .iter()
-                .find(|lane| lane.serves(kind))
-                .map(|lane| &lane.stream);
-        }
-        self.full_device_streams()
-            .find(|stream| stream.device() == device)
-    }
-
-    /// The full-device streams of a rank without configured lanes.
-    fn full_device_streams(&self) -> impl Iterator<Item = &CUDAStream> {
-        self.lanes
+    /// The full-device stream of `device`: the lane's for the primary
+    /// device.
+    pub(crate) fn stream_for(&self, device: DeviceId) -> Option<&CUDAStream> {
+        self.lane
             .iter()
-            .filter(|_| !self.configured())
             .map(|lane| &lane.stream)
             .chain(&self.devices)
+            .find(|stream| stream.device() == device)
     }
 
     /// The startup preparation stream of `device`.
@@ -305,27 +238,11 @@ impl Streams {
             .find(|stream| stream.device() == device)
     }
 
-    /// Fork the stream serving `kind` for a module that runs beside it.
-    /// With lanes, exactly one lane must serve the kind.
-    pub(crate) fn fork_module(&mut self, kind: CallKind, device: DeviceId) -> Result<&CUDAStream> {
-        let matching: Vec<&CUDAStream> = if self.configured() {
-            self.lanes
-                .iter()
-                .filter(|lane| lane.serves(kind))
-                .map(|lane| &lane.stream)
-                .collect()
-        } else {
-            self.full_device_streams()
-                .filter(|stream| stream.device() == device)
-                .collect()
-        };
-        let [origin] = matching[..] else {
-            return Err(Error::Invalid(format!(
-                "{} is served by {} execution lanes; a module stream needs exactly one",
-                kind.as_str(),
-                matching.len()
-            )));
-        };
+    /// Fork `device`'s full-device stream for a module that runs beside it.
+    pub(crate) fn fork_module(&mut self, device: DeviceId) -> Result<&CUDAStream> {
+        let origin = self.stream_for(device).ok_or_else(|| {
+            Error::Invalid(format!("the rank has no stream on cuda:{}", device.0))
+        })?;
         let stream = origin.fork()?;
         self.modules.push(stream);
         self.modules
@@ -333,11 +250,11 @@ impl Streams {
             .ok_or(Error::State("module stream was not registered"))
     }
 
-    /// Fork the first lane (or device stream) for one more microbatch.
+    /// Fork the lane's stream for one more microbatch.
     pub(crate) fn fork_microbatch(&mut self) -> Result<&CUDAStream> {
         let origin = self
-            .lanes
-            .first()
+            .lane
+            .as_ref()
             .map(|lane| &lane.stream)
             .ok_or(Error::State("a microbatch stream requires a CUDA lane"))?;
         let stream = origin.fork()?;
@@ -360,15 +277,15 @@ impl Streams {
             .chain(&self.modules)
             .chain(&self.microbatches)
             .chain(self.copy.iter().map(|lane| &lane.stream))
-            .chain(self.lanes.iter().map(|lane| &lane.stream))
+            .chain(self.lane.iter().map(|lane| &lane.stream))
             .chain(&self.devices)
     }
 
     /// Close the streams in dependency order: preparation, modules,
-    /// microbatches, the copy lane, then lanes, each newest first. Attempts every stream
-    /// before returning the first failure. No job is in flight unless the
-    /// close is aborted: the worker drained the lanes
-    /// ([`JobQueues::drain`]).
+    /// microbatches, the copy lane, the lane, then devices, each newest
+    /// first. Attempts every stream before returning the first failure. No
+    /// job is in flight unless the close is aborted: the worker drained the
+    /// lanes ([`JobQueues::drain`]).
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
         let mut failure = None;
         let mut close = |stream: &mut CUDAStream| {
@@ -382,10 +299,9 @@ impl Streams {
         if let Some(lane) = &mut self.copy {
             close(&mut lane.stream);
         }
-        self.lanes
-            .iter_mut()
-            .rev()
-            .for_each(|lane| close(&mut lane.stream));
+        if let Some(lane) = &mut self.lane {
+            close(&mut lane.stream);
+        }
         self.devices.iter_mut().rev().for_each(&mut close);
         failure.map_or(Ok(()), Err)
     }

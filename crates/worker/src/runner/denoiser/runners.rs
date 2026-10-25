@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use ipc::{CallKind, MediaCall};
-
 use super::DenoiserRunner;
 use super::image::{ConditionRow, ConditionShape, DenoiseRow};
 use crate::Result;
@@ -12,14 +10,10 @@ use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::memory::{LatentCache, PrefixCache, UnitColumn};
 use crate::stream::Issue;
 
-/// The lane kind of a denoiser's jobs.
-const DENOISING: CallKind = CallKind::Media(MediaCall::Denoising);
-
-/// Perform a startup `job` on the lane serving denoising and wait for its
-/// completion.
+/// Perform a startup `job` on the lane and wait for its completion.
 fn perform(lanes: &JobQueues, job: Job) -> Result<Completion> {
     lanes
-        .block_on(DENOISING, job, BLOCK_ON_TIMEOUT)?
+        .block_on(job, BLOCK_ON_TIMEOUT)?
         .check()
         .map_err(|failure| failure.error)
 }
@@ -139,7 +133,7 @@ impl DenoiserRunners {
 
     /// Capture the conditioning of one latent image of `height` x `width`
     /// after a scratch slot's prefix, its features zero rows of the step
-    /// workspace of `latents`. Three jobs of the lane serving denoising, as
+    /// workspace of `latents`. Three jobs of the lane, as
     /// [`Self::capture_step`] runs them: one zeroes the features and
     /// installs the scratch table, one warms and captures the conditioning,
     /// whose completion carries the graph, and one clears the table and
@@ -195,7 +189,7 @@ impl DenoiserRunners {
 
     /// Run the image denoiser's eager calls once over scratch prefix cache
     /// of `prefix_cache`, with samples in the step workspace of `latents`,
-    /// as jobs of the lane serving denoising: one denoising step of the
+    /// as jobs of the lane: one denoising step of the
     /// smallest image (two latent patches a side) over a slot's prefix,
     /// and, when the model `conditions` on latent images, the write of a
     /// zero latent image's K/V after that prefix.
@@ -282,7 +276,7 @@ impl DenoiserRunners {
     /// Capture one denoising step: `shape.images` images placed in the
     /// step workspace as serving places them (consecutive whole pages from
     /// its start), each evaluating `shape.branches` guidance branches over
-    /// one scratch slot's prefix. Three jobs of the lane serving denoising:
+    /// one scratch slot's prefix. Three jobs of the lane:
     /// one zeroes the samples and installs the scratch tables, one warms
     /// and captures the step, whose completion carries the graph, and one
     /// clears the tables and resets the scratch units, whether or not the

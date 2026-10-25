@@ -73,12 +73,8 @@ impl TextBounds {
         cuda: bool,
         media: Option<usize>,
     ) -> Result<Self> {
-        let mut max_rows = config.max_batch_calls.min(request_slots.max(1));
-        let mut tokens = config.max_batch_tokens;
-        for lane in &config.lanes {
-            max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
-            tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
-        }
+        let max_rows = config.max_batch_calls.min(request_slots.max(1));
+        let tokens = config.max_batch_tokens;
         let shapes = cache.group_shapes()?;
         let mut tables = Vec::new();
         let mut widths = Vec::new();
@@ -194,12 +190,8 @@ impl TextBounds {
 /// token bound or the largest decode graph bucket, whichever is larger.
 /// The runners' bounds never exceed it, before or after the cache pool fits.
 pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
-    let mut max_rows = config.max_batch_calls;
-    let mut tokens = config.max_batch_tokens;
-    for lane in &config.lanes {
-        max_rows = max_rows.min(lane.max_batch_calls.unwrap_or(max_rows));
-        tokens = tokens.min(lane.max_batch_tokens.unwrap_or(tokens));
-    }
+    let max_rows = config.max_batch_calls;
+    let tokens = config.max_batch_tokens;
     let graphs = config.device.is_cuda() && config.graph_policy != "off";
     if !graphs {
         return tokens;
@@ -212,36 +204,16 @@ pub(crate) fn expert_tokens(config: &WorkerConfig) -> usize {
         .fold(tokens, usize::max)
 }
 
-/// The streams serving text calls on `device`, with the text kinds each
-/// serves: every configured lane with a text kind, or the device stream.
-fn streams(
-    streams: &Streams,
-    device: Device,
-    kinds: &[CallKind],
-) -> Result<Vec<(Option<Stream>, Vec<CallKind>)>> {
+/// The stream serving text calls on `device`: its full-device stream, the
+/// lane's on the primary device; `None` on the host.
+fn text_stream(streams: &Streams, device: Device) -> Result<Option<Stream>> {
     let Some(index) = device.cuda() else {
-        return Ok(vec![(None, kinds.to_vec())]);
+        return Ok(None);
     };
-    let mut result: Vec<(Option<Stream>, Vec<CallKind>)> = Vec::new();
-    for lane in streams.lanes() {
-        let served: Vec<CallKind> = kinds
-            .iter()
-            .copied()
-            .filter(|kind| lane.serves(*kind))
-            .collect();
-        if !served.is_empty() {
-            let stream = lane.stream.stream()?.clone();
-            result.push((Some(stream), served));
-        }
-    }
-    if streams.lanes().is_empty() {
-        let stream = streams
-            .stream_for(kinds[0], index)
-            .ok_or(Error::State("text calls have no execution stream"))?;
-        let stream = stream.stream()?.clone();
-        result.push((Some(stream), kinds.to_vec()));
-    }
-    Ok(result)
+    let stream = streams
+        .stream_for(index)
+        .ok_or(Error::State("text calls have no execution stream"))?;
+    Ok(Some(stream.stream()?.clone()))
 }
 
 /// One runner to construct: a causal LM on one stream.
@@ -251,7 +223,7 @@ struct Target {
     path: String,
     device: Device,
     stream: Option<Stream>,
-    /// The text call kinds the runner's lane serves.
+    /// The text call kinds the runner serves.
     served: Vec<CallKind>,
     /// The expert exchange of the runner's microbatch.
     exchange: Option<Handle>,
@@ -350,14 +322,15 @@ impl CausalLMRunners {
             startup.preparation,
         )?;
 
-        // One runner per lane serving text kinds. With experts, each lane
-        // has one runner per microbatch: the first on the lane's stream, the
+        // One runner group per text component. With experts, a group has
+        // one runner per microbatch: the first on the lane's stream, the
         // others on the microbatch streams, each with its own exchange.
         let mut experts = startup.experts;
         let mut targets = Vec::new();
         let mut groups = Vec::new();
         for (component, path, device, kinds) in &texts {
-            for (stream, served) in streams(startup.streams, *device, kinds)? {
+            {
+                let (stream, served) = (text_stream(startup.streams, *device)?, kinds.clone());
                 let mut peers = Vec::new();
                 let microbatches = experts.as_ref().map_or(1, |experts| experts.microbatches());
                 for microbatch in 0..microbatches {
@@ -392,7 +365,7 @@ impl CausalLMRunners {
         }
         if experts.is_some() && groups.len() != 1 {
             return Err(Error::Unsupported(format!(
-                "expert parallelism serves one text lane; {} streams serve text",
+                "expert parallelism serves one text component; {} serve text",
                 groups.len()
             )));
         }
@@ -519,7 +492,7 @@ impl CausalLMRunners {
                     let kinds = routes.entry(component.clone()).or_default();
                     if kinds.insert(kind, group).is_some() {
                         return Err(Error::Invalid(format!(
-                            "computation {component}.{} has multiple lane bindings",
+                            "computation {component}.{} has multiple runner bindings",
                             kind.as_str()
                         )));
                     }
@@ -613,7 +586,6 @@ pub(crate) fn reserved_bytes(
     request_slots: usize,
     cache: &CachePlan,
     image_processor: bool,
-    streams: usize,
 ) -> Result<u64> {
     // A rank without a causal language model reports no vocabulary.
     let vocab = methods::vocab_size(model.handle())?;
@@ -627,6 +599,5 @@ pub(crate) fn reserved_bytes(
     let dtype = model_dtype(&config.model_dtype)?;
     let mut dimensions = bounds.dimensions(vocab, vocab, hidden, dtype);
     dimensions.embeddings = image_processor;
-    Ok(InputBuffers::bytes(&dimensions) * streams.max(1) as u64
-        + DecodeState::bytes(request_slots, vocab, dtype))
+    Ok(InputBuffers::bytes(&dimensions) + DecodeState::bytes(request_slots, vocab, dtype))
 }

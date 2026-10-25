@@ -384,20 +384,12 @@ pub(crate) struct ExpertStart<'a> {
     pub(crate) host: &'a str,
 }
 
-/// The stream the rank's forwards (and the first microbatch) run on: its
-/// only execution lane, or the device stream.
+/// The stream the rank's forwards (and the first microbatch) run on: the
+/// lane's.
 fn primary_stream(streams: &Streams, device: DeviceId) -> Result<Stream> {
-    let stream = match streams.lanes() {
-        [] => streams
-            .stream_for(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), device)
-            .ok_or(Error::State("expert parallelism requires a CUDA stream"))?,
-        [lane] => &lane.stream,
-        _ => {
-            return Err(Error::Unsupported(
-                "expert parallelism runs on exactly one execution lane".into(),
-            ));
-        }
-    };
+    let stream = streams
+        .stream_for(device)
+        .ok_or(Error::State("expert parallelism requires a CUDA stream"))?;
     Ok(stream.stream()?.clone())
 }
 
@@ -664,11 +656,7 @@ impl WarmupHooks for ExpertWarmup {
         job.expert_warmup(experts);
         let completion = backend
             .job_queues()
-            .block_on(
-                ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-                job,
-                crate::lane::BLOCK_ON_TIMEOUT,
-            )
+            .block_on(job, crate::lane::BLOCK_ON_TIMEOUT)
             .map_err(failed("expert warmup"))?;
         completion
             .check()

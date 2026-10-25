@@ -22,7 +22,6 @@ mod registry;
 pub use executor::WorkerExecutor;
 pub use group::{CallReaders, WorkerGroup};
 pub(crate) use incarnations::IncarnationRegistry;
-pub use process::LaneConfig;
 use process::{PendingWorker, WorkerProcess};
 use proto::request::{ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat};
 
@@ -159,8 +158,6 @@ pub struct WorkerProcessArgs {
     pub worker_mesh: Option<String>,
     /// Optional process-world communication backend.
     pub distributed_backend: Option<String>,
-    /// Configuration-static execution lane descriptors.
-    pub lanes: Vec<LaneConfig>,
     /// Module graph coverage policy.
     pub graph_policy: GraphPolicy,
     /// Strictly increasing decode batch sizes captured as CUDA graphs;

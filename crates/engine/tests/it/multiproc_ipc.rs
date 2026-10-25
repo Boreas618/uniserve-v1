@@ -2759,7 +2759,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         expert_microbatches: 1,
         distributed_backend: None,
         mesh: None,
-        lane: Vec::new(),
         no_model: true,
         load_format: "auto".into(),
         download_dir: None,

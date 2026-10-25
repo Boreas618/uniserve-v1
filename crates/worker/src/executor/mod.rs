@@ -71,8 +71,6 @@ pub(crate) struct Batch {
     producers: HashSet<u64>,
     data: WorkerBatch,
     submission: Option<Arc<Submission>>,
-    /// The lane its forward runs on.
-    lane: Option<usize>,
     /// It is to be started: it was admitted, or what its start waited for
     /// arrived, and the ordering rules have not let it start since.
     startable: bool,
@@ -142,7 +140,6 @@ impl Batch {
             producers,
             data,
             submission: None,
-            lane: None,
             startable: false,
             prepared: false,
             forwarding: false,
@@ -445,7 +442,6 @@ impl Executor {
         }
 
         batch.submission = Some(Arc::clone(&submission));
-        batch.lane = self.backend.lane(&batch.data);
         batch.startable = true;
         self.batches.insert(batch.id, batch);
         self.start(submission.batch_id);

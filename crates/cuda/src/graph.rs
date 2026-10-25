@@ -69,8 +69,7 @@ impl GraphExec {
     ///
     /// The launch is ordered after the work already queued on `stream` and
     /// after every earlier launch of this executable. The graph may have
-    /// been captured on another stream of the same device, including a
-    /// stream outside `stream`'s SM partition.
+    /// been captured on another stream of the same device.
     pub fn launch(&self, stream: &Stream) -> Result<()> {
         let driver = driver()?;
         // The launch resolves the executable in the stream's context; the

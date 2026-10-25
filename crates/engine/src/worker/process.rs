@@ -59,8 +59,6 @@ const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use ipc::LaneConfig;
-
 /// One adopted rank: its channel, the report of its process's exit, and the
 /// requests outstanding on it.
 ///

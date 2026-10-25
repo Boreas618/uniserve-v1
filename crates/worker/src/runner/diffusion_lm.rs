@@ -969,7 +969,7 @@ impl DiffusionLMRunner {
     /// Submit `job`, which recorded `recorded`, to the runner's lane and
     /// apply its completion.
     fn perform(&mut self, lanes: &JobQueues, job: Job, recorded: Recorded) -> Result<()> {
-        let completion = lanes.block_on(KIND, job, BLOCK_ON_TIMEOUT)?;
+        let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(recorded, &mut completion).map(drop)
     }
@@ -1201,7 +1201,7 @@ impl DiffusionLMRunner {
             plan: None,
         };
         let mode = self.method(&method, None, arguments, &job, &job)?;
-        let completion = lanes.block_on(KIND, job, BLOCK_ON_TIMEOUT)?;
+        let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         if mode == GraphMode::Capture {
             let graph = completion.captured()?;

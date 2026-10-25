@@ -41,8 +41,8 @@ alike. The buffer is therefore per invocation domain, never shared across
 streams: it is not the shared ``scratch`` grant, so an execution context
 allocates it privately for each call site (automatic selection namespaces it
 as ``prefix_block.schedule``), and a context runs its preparation, eager
-calls and graph replays on its one stream; separate execution lanes use
-separate contexts.
+calls and graph replays on its one stream; separate streams use separate
+contexts.
 """
 
 from __future__ import annotations

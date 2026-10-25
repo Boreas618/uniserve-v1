@@ -550,13 +550,6 @@ mod tests {
                 "cuda_graph_config.policy",
             ),
             (vec!["--set", "max_batch=4"], "max_batch"),
-            (
-                vec![
-                    "--set",
-                    "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"], max_inflght = 2 }]",
-                ],
-                "max_inflght",
-            ),
             (vec!["--set", "dtype.size=2"], "dtype"),
             (
                 vec![
@@ -631,8 +624,6 @@ mod tests {
             "rank-0:5000",
             "--worker-executable",
             "/opt/env/bin/uniserve",
-            "--set",
-            "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"] }]",
         ])
         .unwrap();
         for (_, path) in FLAG_PATHS {
@@ -819,15 +810,13 @@ mod tests {
         }
     }
 
-    /// Lanes, the precision policy, expert parallelism, prefix caching and
-    /// the scheduler budgets reach the engine configuration as stated, and
+    /// The precision policy, expert parallelism, prefix caching and the
+    /// scheduler budgets reach the engine configuration as stated, and
     /// unstated budgets take the engine defaults.
     #[test]
     fn grouped_options_reach_the_engine() {
         let (_, engine) = lowered(&[
             "m",
-            "--set",
-            "lanes=[{ lane_id = \"decode\", sm_budget = 64, domains = [\"decode\"] }]",
             "--set",
             "quantization_config.mode=performance",
             "--set",
@@ -839,7 +828,6 @@ mod tests {
         ])
         .unwrap();
         let worker = &engine.worker_process;
-        assert_eq!(worker.lanes.len(), 1);
         assert_eq!(worker.quantization_config["mode"], "performance");
         assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
@@ -852,9 +840,6 @@ mod tests {
             worker.max_batch_tokens as usize,
             engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
-
-        let lane = "lanes=[{ lane_id = \"decode\", sm_budget = 0, domains = [\"decode\"] }]";
-        assert!(lowered(&["m", "--set", lane]).is_err());
     }
 
     /// The server listens on a non-blank host or Unix socket path, port 0

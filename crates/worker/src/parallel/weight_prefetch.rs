@@ -696,16 +696,9 @@ impl DwdpManager {
         let Device::Cuda(device) = launch.device() else {
             return Err(Error::Unsupported("DWDP requires CUDA peer memory".into()));
         };
-        let stream = match streams.lanes() {
-            [] => streams.preparation(device),
-            [lane] => Some(&lane.stream),
-            _ => {
-                return Err(Error::Unsupported(
-                    "DWDP runs every forward on exactly one execution lane".into(),
-                ));
-            }
-        }
-        .ok_or(Error::State("DWDP requires a CUDA stream"))?;
+        let stream = streams
+            .preparation(device)
+            .ok_or(Error::State("DWDP requires a CUDA stream"))?;
         let stream = stream.stream()?.clone();
         let union_group = world
             .union

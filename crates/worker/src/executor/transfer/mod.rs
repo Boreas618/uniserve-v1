@@ -66,31 +66,28 @@ use crate::{Error, Result};
 use latents::PendingExport;
 use prefix_cache::{Exporting, Installation, Published};
 
-/// The transfer runtime of a rank: the lane streams its transfers and
-/// imports run on, and its output storage.
+/// The transfer runtime of a rank: the streams its transfers and imports
+/// run on, and its output storage.
 pub(crate) struct TransferRuntime {
-    /// The lane stream serving each call kind on each CUDA device.
-    streams: HashMap<(CallKind, DeviceId), Stream>,
+    /// The full-device stream of each CUDA device, the lane's on the
+    /// primary device.
+    streams: HashMap<DeviceId, Stream>,
     outputs: OutputPool,
 }
 
 impl TransferRuntime {
-    /// The runtime of a rank with `devices`, serving `kinds` on the streams
-    /// of `lanes`, with `queue_depth` batches of at most `max_calls` calls
-    /// in flight.
+    /// The runtime of a rank with `devices`, with `queue_depth` batches of
+    /// at most `max_calls` calls in flight.
     pub(crate) fn start(
         streams: &Streams,
         devices: &[DeviceId],
-        kinds: &[CallKind],
         queue_depth: usize,
         max_calls: usize,
     ) -> Result<Self> {
         let mut served = HashMap::new();
         for &device in devices {
-            for &kind in kinds {
-                if let Some(stream) = streams.stream_for(kind, device) {
-                    served.insert((kind, device), stream.stream()?.clone());
-                }
+            if let Some(stream) = streams.stream_for(device) {
+                served.insert(device, stream.stream()?.clone());
             }
         }
         Ok(Self {
@@ -104,16 +101,13 @@ impl TransferRuntime {
         })
     }
 
-    /// The stream serving `kind` calls on `device`; none for host devices.
-    pub(crate) fn stream(&self, kind: CallKind, device: MemoryKind) -> Result<Option<Stream>> {
+    /// The stream of `device`; none for host devices.
+    pub(crate) fn stream(&self, device: MemoryKind) -> Result<Option<Stream>> {
         let MemoryKind::Cuda(index) = device else {
             return Ok(None);
         };
-        let stream = self.streams.get(&(kind, index)).ok_or_else(|| {
-            Error::Unsupported(format!(
-                "no execution stream serves {} on cuda:{index}",
-                kind.as_str()
-            ))
+        let stream = self.streams.get(&index).ok_or_else(|| {
+            Error::Unsupported(format!("the rank has no execution stream on cuda:{index}"))
         })?;
         Ok(Some(stream.clone()))
     }
@@ -208,7 +202,7 @@ fn placement(
         Ok((device, stream))
     } else {
         let device = component_device(backend, &first.component)?;
-        Ok((device.cuda(), backend.transfer_stream(kind, device)?))
+        Ok((device.cuda(), backend.transfer_stream(device)?))
     }
 }
 

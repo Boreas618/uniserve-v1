@@ -56,7 +56,7 @@ use crate::lane::{Completion, Job};
 use crate::memory::{PendingImport, ProductRead, ProductStore};
 use crate::transfer::{Notify, Retirement, fetch};
 use crate::{Error, Result};
-use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, CallKind, DType, TensorRef};
+use ipc::{Batch as BatchPlan, BufferId, CacheTransfer, Call, DType, TensorRef};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -623,7 +623,7 @@ fn read_predicate(backend: &WorkerBackend, call: &Call, job: &Job) -> Result<()>
         .as_ref()
         .ok_or(Error::State("a host-gated call has a predicate"))?;
     let device = component_device(backend, &call.component)?;
-    let stream = backend.transfer_stream(call.kind, device)?;
+    let stream = backend.transfer_stream(device)?;
     let storage = backend
         .worker_storage()
         .ok_or_else(|| Error::Unsupported("predicates require rank storage".into()))?;
@@ -645,15 +645,15 @@ fn publish(
     product: &TensorRef,
     job: &Job,
 ) -> Result<()> {
-    let kind = consumer_kind(plan, product)?;
+    require_consumer(plan, product)?;
     match batch.inputs().state.inputs.get(&product.buffer_id()) {
         Some(Input::Tensor { read, device }) => {
-            let stream = backend.transfer_stream(kind, *device)?;
+            let stream = backend.transfer_stream(*device)?;
             tensors(backend)?.complete_import(read, job.on(stream.as_ref()))
         }
         // An imported trajectory version becomes its slot's committed one.
         Some(Input::Latent { input, device }) => {
-            let stream = backend.transfer_stream(kind, *device)?;
+            let stream = backend.transfer_stream(*device)?;
             let (pool, _) = latent_pool(backend)?;
             latents::adopt(pool, input, job.on(stream.as_ref()))
         }
@@ -680,7 +680,7 @@ fn latent_pool(
 }
 
 /// The call kind of a product's consumers, whose stream publishes it.
-fn consumer_kind(plan: &BatchPlan, product: &TensorRef) -> Result<CallKind> {
+fn require_consumer(plan: &BatchPlan, product: &TensorRef) -> Result<()> {
     plan.calls
         .iter()
         .find(|call| {
@@ -688,7 +688,7 @@ fn consumer_kind(plan: &BatchPlan, product: &TensorRef) -> Result<CallKind> {
                 .chain(call.predicate.as_ref())
                 .any(|input| input == product)
         })
-        .map(|call| call.kind)
+        .map(drop)
         .ok_or_else(|| Error::Invalid("a supplied input product has no consumer".into()))
 }
 
@@ -742,11 +742,11 @@ pub(crate) fn close(backend: &mut WorkerBackend, batch: &mut WorkerBatch) -> Res
             Input::Borrowed => {}
         }
     }
-    let kind = plan.calls.first().map(|call| call.kind);
+    let calls = !plan.calls.is_empty();
     for (device, reads) in reads {
         // The leases end on the stream that published them.
-        let completed = kind
-            .map(|kind| backend.transfer_stream(kind, device))
+        let completed = calls
+            .then(|| backend.transfer_stream(device))
             .transpose()
             .map(Option::flatten)
             .and_then(|stream| tensors(backend)?.complete_reads(&reads, stream.as_ref(), &[]));
