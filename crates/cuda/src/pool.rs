@@ -25,8 +25,6 @@ use crate::driver::{
 };
 use crate::{DeviceId, Error, PinnedBuffer, PrimaryContext, Result, Stream, reclaim};
 
-/// No shareable handle: the chunks are local to this process.
-const CU_MEM_HANDLE_TYPE_NONE: i32 = 0;
 const CU_MEM_ALLOC_GRANULARITY_RECOMMENDED: i32 = 1;
 
 /// One chunk of the pool: `bytes` at `offset` of the reservation.
@@ -50,6 +48,10 @@ pub struct VirtualPool {
     address: u64,
     reserved: usize,
     granularity: usize,
+    /// The shareable handle type of every chunk ([`crate::HandleType::probe`]):
+    /// NCCL registers a captured collective's buffers with its peers by
+    /// exporting them, a fabric handle to a peer on another host.
+    handle_type: i32,
     /// The bytes of the reservation given out so far.
     used: usize,
     chunks: Vec<Chunk>,
@@ -72,8 +74,9 @@ impl VirtualPool {
                 access.push(peer.handle()?);
             }
         }
+        let handle_type = crate::HandleType::probe(device)?.raw();
         let (address, reserved, granularity) = in_context(context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, CU_MEM_HANDLE_TYPE_NONE);
+            let properties = MemAllocationProp::device(ordinal, handle_type);
             let mut granularity = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
@@ -105,6 +108,7 @@ impl VirtualPool {
             address,
             reserved,
             granularity,
+            handle_type,
             used: 0,
             chunks: Vec::new(),
             suspended: false,
@@ -187,7 +191,7 @@ impl VirtualPool {
         let ordinal = self.device.handle()?;
         let address = self.address + offset;
         in_context(self.context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, CU_MEM_HANDLE_TYPE_NONE);
+            let properties = MemAllocationProp::device(ordinal, self.handle_type);
             let mut handle = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
