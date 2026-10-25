@@ -16,7 +16,10 @@ A model package provides ``config_sources``, ``read_config``, ``Model``,
 that a base revision supplies also provides ``base_checkpoint(root)``, which
 returns that revision's ``(repository, revision)`` or ``None``; a top-level
 directory the checkpoint omits is then read from the base revision. This
-module also recognizes calibrated ModelOpt NVFP4 exports.
+module also recognizes calibrated ModelOpt NVFP4 exports. A package whose
+packed exports name some components by other root modules than the
+package's own also provides ``manifest_roots``, mapping each such manifest
+root to the package's module.
 """
 
 from __future__ import annotations
@@ -494,12 +497,17 @@ def _require_static_nvfp4(source: str, declared: Mapping) -> None:
         )
 
 
-def _manifest_scales(root: Path, model: nn.Module) -> dict[str, float] | None:
+def _manifest_scales(
+    root: Path, model: nn.Module, roots: Mapping[str, str]
+) -> dict[str, float] | None:
     """Read native module calibration from a packed ModelOpt manifest.
 
     The manifest owns the W4A4 representation, including on ranks without a
     quantized component. Per-module amax is converted to ModelOpt's tensor
-    scale; K16 block encoding remains a numerical layer operation.
+    scale; K16 block encoding remains a numerical layer operation. A manifest
+    module path whose first segment is a key of ``roots`` (the package's
+    ``manifest_roots``) names the module under that key's value; the returned
+    scales are keyed by ``model``'s module paths.
     """
     path = root / "modelopt_manifest.json"
     if not path.is_file():
@@ -535,7 +543,9 @@ def _manifest_scales(root: Path, model: nn.Module) -> dict[str, float] | None:
             or bool(modules) != component["enabled"]
         ):
             raise ValueError(f"invalid ModelOpt calibration for {name!r}")
-        for path, calibration in modules.items():
+        for listed, calibration in modules.items():
+            root_name, dot, rest = listed.partition(".")
+            path = roots.get(root_name, root_name) + dot + rest
             amax = (
                 calibration.get("activation_amax")
                 if isinstance(calibration, dict)
@@ -550,7 +560,7 @@ def _manifest_scales(root: Path, model: nn.Module) -> dict[str, float] | None:
                 or amax <= 0
             ):
                 raise ValueError(
-                    f"invalid ModelOpt activation calibration for {path!r}"
+                    f"invalid ModelOpt activation calibration for {listed!r}"
                 )
             scales[path] = amax / (6 * 448)
     if not scales:
@@ -945,7 +955,9 @@ def read_config(
             modelopt[declaration.name] = declared
     # Packed exports instead publish native module calibration in a root
     # manifest. Its metadata is fetched with the architecture sidecars.
-    manifest_scales = _manifest_scales(root, model)
+    manifest_scales = _manifest_scales(
+        root, model, getattr(package, "manifest_roots", {})
+    )
     if modelopt and manifest_scales is not None:
         raise ValueError(
             "checkpoint declares both unified and manifest ModelOpt calibration"
