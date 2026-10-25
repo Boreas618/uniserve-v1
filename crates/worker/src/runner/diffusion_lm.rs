@@ -990,19 +990,20 @@ impl DiffusionLMRunner {
                 forced: capacity,
             })
         };
-        // The expert capacities a forward of `tokens` is captured at.
+        // The expert capacities a forward of `tokens` is captured at: every
+        // capacity a step that sends them can run at, largest first.
         let variants = |tokens: usize| -> Vec<Option<usize>> {
             match experts {
                 None => vec![None],
-                Some(experts) => experts
-                    .parallel()
-                    .capacities()
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(|&capacity| capacity >= tokens)
-                    .map(Some)
-                    .collect(),
+                Some(experts) => {
+                    let mut capacities: Vec<Option<usize>> = experts
+                        .parallel()
+                        .capacities_for(tokens)
+                        .map(Some)
+                        .collect();
+                    capacities.reverse();
+                    capacities
+                }
             }
         };
         let length = self.facts.sequence_length;

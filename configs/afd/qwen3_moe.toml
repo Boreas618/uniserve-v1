@@ -1,6 +1,6 @@
 # Qwen3 MoE with dedicated experts on two hosts: a TP2 attention replica on
-# rank-0 and two expert ranks on rank-1. Serve it with --expert-parallel
-# --expert-exchange deepep.
+# rank-0 and two expert ranks on rank-1. Serve it with
+# --set moe_config.expert_parallel=true --set moe_config.exchange=deepep.
 
 [[worker_groups]]
 id = "attention"
