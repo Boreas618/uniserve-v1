@@ -31,7 +31,7 @@
 //! The serving path of these graphs is warmed by the engine, with a real
 //! request through its scheduler once the rank reported.
 
-use ipc::{CallKind, ForwardMode};
+use ipc::ForwardMode;
 
 use std::sync::Arc;
 
@@ -239,7 +239,6 @@ impl CausalLMRunners {
                 .max(1);
             let stream = self.runners[index].stream().cloned();
             let stream = stream.as_ref();
-            let kind = self.kind(group)?;
             let run = |runtime: &mut CausalLMRunners,
                        prefix_cache: &mut PrefixCache,
                        rows: &[TokenRow],
@@ -276,7 +275,6 @@ impl CausalLMRunners {
                     };
                     self.warmup_bucket(
                         lanes,
-                        kind,
                         prefix_cache,
                         &lengths,
                         stream,
@@ -299,7 +297,6 @@ impl CausalLMRunners {
                 let tables = vec![2; size];
                 self.warmup_bucket(
                     lanes,
-                    kind,
                     prefix_cache,
                     &tables,
                     stream,
@@ -327,7 +324,7 @@ impl CausalLMRunners {
                             .iter()
                             .map(|&slot| [slot as i64, COMMIT_CACHE, -1, 1, 0, 0, 0, 0])
                             .collect();
-                        runtime.warmup_commit(lanes, index, group, &prefilled)?;
+                        runtime.warmup_commit(lanes, index, &prefilled)?;
 
                         // The flags are set by the job of the first decode step
                         // and cleared by the job that clears the tables.
@@ -378,12 +375,10 @@ impl CausalLMRunners {
             if self.runners[index].pool().is_none() {
                 continue;
             }
-            let (group, _) = self.locate(index)?;
-            let kind = self.kind(group)?;
             let padded = Job::new();
             self.runners[index].pad_selection(&padded)?;
             lanes
-                .block_on(kind, padded, BLOCK_ON_TIMEOUT)?
+                .block_on(padded, BLOCK_ON_TIMEOUT)?
                 .check()
                 .map_err(|failure| failure.error)?;
 
@@ -395,7 +390,7 @@ impl CausalLMRunners {
                         top_k,
                         categorical,
                     };
-                    self.capture_selection(index, kind, key, lanes)?;
+                    self.capture_selection(index, key, lanes)?;
                 }
             }
             let words = self.runners[index].dimensions().logprob_words();
@@ -405,7 +400,7 @@ impl CausalLMRunners {
                     if logprob_words(least(&buckets, place), least(&tops, position)) > words {
                         continue;
                     }
-                    self.capture_selection(index, kind, ShapeKey::Score { rows, top }, lanes)?;
+                    self.capture_selection(index, ShapeKey::Score { rows, top }, lanes)?;
                 }
             }
             let dimensions = self.runners[index].dimensions();
@@ -414,7 +409,7 @@ impl CausalLMRunners {
                     continue;
                 }
                 let rows = dimensions.prompt_block(top);
-                self.capture_selection(index, kind, ShapeKey::Prompt { rows, top }, lanes)?;
+                self.capture_selection(index, ShapeKey::Prompt { rows, top }, lanes)?;
             }
             tracing::info!(
                 "captured {} text graphs with selections",
@@ -425,14 +420,8 @@ impl CausalLMRunners {
     }
 
     /// Capture runner `index`'s graph of `key`, a selection or a scoring,
-    /// alone as a job of `kind`'s lane, and store it.
-    fn capture_selection(
-        &mut self,
-        index: usize,
-        kind: CallKind,
-        key: ShapeKey,
-        lanes: &JobQueues,
-    ) -> Result<()> {
+    /// alone as a job of the lane, and store it.
+    fn capture_selection(&mut self, index: usize, key: ShapeKey, lanes: &JobQueues) -> Result<()> {
         let runner = &self.runners[index];
         let call = |key: &ShapeKey| match key {
             ShapeKey::Select { .. } => runner.select_call(key),
@@ -441,27 +430,26 @@ impl CausalLMRunners {
         };
         let job = Job::new();
         runner.capture_alone(call(&key)?, call(&key)?, &job)?;
-        let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
+        let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.runners[index].store_alone(key, &mut completion)
     }
 
     /// Run a capture bucket's `steps` over scratch tables of `lengths`
-    /// tokens for slots `1..`. One job of `kind`'s lane installs the tables
+    /// tokens for slots `1..`. One job of the lane installs the tables
     /// before the steps; one clears them and resets the scratch units after
     /// the steps, whether or not they succeeded. `steps` records into that
     /// second job what the device undoes before the tables are cleared.
     fn warmup_bucket(
         &mut self,
         lanes: &JobQueues,
-        kind: CallKind,
         prefix_cache: &mut PrefixCache,
         lengths: &[usize],
         stream: Option<&cuda::Stream>,
         steps: impl FnOnce(&mut Self, &mut PrefixCache, &Job) -> Result<()>,
     ) -> Result<()> {
         let perform = |job: Job| -> Result<()> {
-            let completion = lanes.block_on(kind, job, BLOCK_ON_TIMEOUT)?;
+            let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
             completion
                 .check()
                 .map(drop)
@@ -535,7 +523,6 @@ impl CausalLMRunners {
                 continue;
             }
             let (group, peer) = self.locate(index)?;
-            let kind = self.kind(group)?;
             let stream = self.runners[index].stream().cloned();
             let stream = stream.as_ref();
 
@@ -563,7 +550,7 @@ impl CausalLMRunners {
             unsafe { features.zero(zeroed.on(stream)) }?;
             zeroed.on(stream).synchronize()?;
             lanes
-                .block_on(kind, zeroed, BLOCK_ON_TIMEOUT)?
+                .block_on(zeroed, BLOCK_ON_TIMEOUT)?
                 .check()
                 .map_err(|failure| failure.error)?;
 
@@ -584,7 +571,6 @@ impl CausalLMRunners {
             // synchronization the driver does not promise.
             self.warmup_bucket(
                 lanes,
-                kind,
                 prefix_cache,
                 &lengths,
                 stream,
@@ -665,7 +651,7 @@ impl CausalLMRunners {
         requests[peer] = Some(request);
 
         let step = self.forward(experts, group, &requests, prefix_cache, capacity, &job)?;
-        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
+        let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         self.complete(step, &mut completion).map(drop)
     }
@@ -680,25 +666,18 @@ impl CausalLMRunners {
             if runner.pool().is_none() || runner.shapes().decode().contains(&rows) {
                 continue;
             }
-            let (group, _) = self.locate(index)?;
             let padding = vec![[0, COMMIT_CACHE, -1, 0, 0, 0, 0, 0]; rows];
-            self.warmup_commit(lanes, index, group, &padding)?;
+            self.warmup_commit(lanes, index, &padding)?;
         }
         Ok(())
     }
 
-    /// Commit `rows` on runner `index` of `group` as a job of its lane,
+    /// Commit `rows` on runner `index` as a job of the lane,
     /// storing the commit graph a bucket's first commit captures.
-    fn warmup_commit(
-        &mut self,
-        lanes: &JobQueues,
-        index: usize,
-        group: usize,
-        rows: &[[i64; 8]],
-    ) -> Result<()> {
+    fn warmup_commit(&mut self, lanes: &JobQueues, index: usize, rows: &[[i64; 8]]) -> Result<()> {
         let job = Job::new();
         let captured = self.runners[index].commit(rows, &job)?;
-        let completion = lanes.block_on(self.kind(group)?, job, BLOCK_ON_TIMEOUT)?;
+        let completion = lanes.block_on(job, BLOCK_ON_TIMEOUT)?;
         let mut completion = completion.check().map_err(|failure| failure.error)?;
         match captured {
             Some(key) => self.runners[index].complete_commit(key, &mut completion),

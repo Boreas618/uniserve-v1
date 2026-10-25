@@ -11,23 +11,12 @@ use crate::lane::{BLOCK_ON_TIMEOUT, Completion, Job, JobQueues};
 use crate::stream::Issue;
 use crate::{Error, Result};
 
-/// Perform a startup `job` on the lane serving `kind` and wait for its
-/// completion.
-fn perform(lanes: &JobQueues, kind: CallKind, job: Job) -> Result<Completion> {
+/// Perform a startup `job` on the lane and wait for its completion.
+fn perform(lanes: &JobQueues, job: Job) -> Result<Completion> {
     lanes
-        .block_on(kind, job, BLOCK_ON_TIMEOUT)?
+        .block_on(job, BLOCK_ON_TIMEOUT)?
         .check()
         .map_err(|failure| failure.error)
-}
-
-/// The call kind image encoder `index` is routed for: the lane serving it
-/// performs the encoder's startup jobs.
-fn routed(routes: &HashMap<(String, CallKind), usize>, index: usize) -> Result<CallKind> {
-    routes
-        .iter()
-        .find(|(_, routed)| **routed == index)
-        .map(|((_, kind), _)| *kind)
-        .ok_or_else(|| Error::Invariant("an image encoder serves no call kind".into()))
 }
 
 /// An image model's encoder runners on a rank.
@@ -71,31 +60,27 @@ impl EncoderRunners {
 
     /// Warm every unpacked image encoder on one black `side` x `side`
     /// image, in construction order, as serving prepares its images: one
-    /// job of the lane on `lanes` serving the call kind the encoder is
-    /// routed for, which also waits for the encoder's stream.
+    /// job of the lane on `lanes`, which also waits for the encoder's
+    /// stream.
     pub(crate) fn warm_image(&self, side: u32, lanes: &JobQueues) -> Result<()> {
-        for (index, runner) in self.image.iter().enumerate() {
-            let kind = routed(&self.routes, index)?;
+        for runner in &self.image {
             let job = Job::new();
             runner.warm(side, &job);
             job.on(runner.stream()).synchronize()?;
-            perform(lanes, kind, job)?;
+            perform(lanes, job)?;
         }
         Ok(())
     }
 
     /// Capture every image encoder's graphs into its pool (packed vision
     /// slot counts, latent image sizes), each forward a job of the lane on
-    /// `lanes` serving the call kind the encoder is routed for.
+    /// `lanes`.
     pub(crate) fn capture_image(&mut self, lanes: &JobQueues) -> Result<()> {
         for (index, runner) in self.image.iter_mut().enumerate() {
             let Some(pool) = self.pools.get(&index) else {
                 continue;
             };
-            let kind = routed(&self.routes, index)?;
-            runner.capture_with(Some(pool), &mut || Ok(()), &mut |job| {
-                perform(lanes, kind, job)
-            })?;
+            runner.capture_with(Some(pool), &mut || Ok(()), &mut |job| perform(lanes, job))?;
         }
         Ok(())
     }

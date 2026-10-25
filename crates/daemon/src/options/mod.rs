@@ -199,8 +199,6 @@ pub struct ServeConfig {
     /// The leader's `host:port`, which the other nodes' daemons join at and
     /// the leader binds; required with several nodes.
     pub dist_init_addr: Option<String>,
-    /// Execution lanes, each a stream with its own SM partition.
-    pub lanes: Vec<LaneOptions>,
     pub server_config: ServerOptions,
     pub load_config: LoadOptions,
     pub kv_cache_config: KvCacheOptions,
@@ -241,7 +239,6 @@ impl Default for ServeConfig {
             nnodes: NonZeroU32::MIN,
             node_rank: 0,
             dist_init_addr: None,
-            lanes: Vec::new(),
             server_config: ServerOptions::default(),
             load_config: LoadOptions::default(),
             kv_cache_config: KvCacheOptions::default(),
@@ -665,24 +662,6 @@ fn default_executable() -> PathBuf {
     EXECUTABLE.into()
 }
 
-/// An execution lane (`lanes`): a stream with its own SM partition, which
-/// serves the call domains it names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaneOptions {
-    pub lane_id: String,
-    /// Streaming multiprocessors in the lane's partition.
-    pub sm_budget: usize,
-    /// `prefill`, `decode` or `flow`.
-    pub domains: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_calls: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_tokens: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_inflight: Option<usize>,
-}
-
 /// What the server logs about its serving (`logging_config`). A process's
 /// log levels are options of the binary that runs it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1057,18 +1036,6 @@ impl ServeConfig {
                 worker_hosts: self.placement_config.worker_hosts.clone(),
                 mem_fraction_static: self.mem_fraction_static,
             }),
-            lanes: self
-                .lanes
-                .iter()
-                .map(|lane| wire::Lane {
-                    lane_id: lane.lane_id.clone(),
-                    sm_budget: lane.sm_budget as u32,
-                    domains: lane.domains.clone(),
-                    max_batch_calls: lane.max_batch_calls.map(|value| value as u32),
-                    max_batch_tokens: lane.max_batch_tokens.map(|value| value as u32),
-                    max_inflight: lane.max_inflight.map(|value| value as u32),
-                })
-                .collect(),
             transfer: self.placement_config.transfer.clone().unwrap_or_default(),
             scheduling: Some(scheduling),
             kv_cache: Some(wire::KvCache {

@@ -16,8 +16,6 @@ use std::collections::BTreeMap;
 use crate::{CanvasSampling, ComponentConfig};
 use serde::{Deserialize, Serialize};
 
-use crate::LaneConfig;
-
 /// The Storage Server a worker retains its memory at, and its deployment's
 /// claim there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,8 +115,6 @@ pub struct LaunchDescriptor {
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's.
     pub mesh: Option<String>,
-    /// Execution lanes and their SM partitions.
-    pub lane: Vec<LaneConfig>,
     /// Load the deterministic stub model instead of a checkpoint.
     pub no_model: bool,
 

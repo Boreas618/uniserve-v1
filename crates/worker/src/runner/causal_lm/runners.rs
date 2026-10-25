@@ -363,16 +363,6 @@ impl CausalLMRunners {
         Ok(executed)
     }
 
-    /// A call kind `group` serves, which names the lane its jobs run on.
-    pub(crate) fn kind(&self, group: usize) -> Result<CallKind> {
-        self.routes
-            .values()
-            .flatten()
-            .find(|(_, routed)| **routed == group)
-            .map(|(kind, _)| *kind)
-            .ok_or_else(|| Error::Invariant("a text runner group serves no call kind".into()))
-    }
-
     /// The order of these runners' batches, for other runtimes that also
     /// write what text batches read (guidance prefixes, latent images'
     /// K/V).
@@ -535,15 +525,10 @@ impl CausalLMRunners {
 
 impl RequestStorage for CausalLMRunners {
     fn admit_slots(&mut self, admitted: &[AdmittedSlot<'_>], jobs: &LaneJobs) -> Result<()> {
-        // Reset on the first runner's stream, by the lane that owns it;
-        // other streams order after it before their next batch.
+        // Reset on the first runner's stream, by the lane; other streams
+        // order after it before their next batch.
         let stream = self.runners.first().and_then(CausalLMRunner::stream);
-        let group = self
-            .groups
-            .iter()
-            .position(|group| group.contains(&0))
-            .ok_or_else(|| Error::Invariant("the first text runner is in no group".into()))?;
-        let issue = jobs.job(self.kind(group)?)?.on(stream);
+        let issue = jobs.job().on(stream);
         self.order.wait(issue)?;
         let slots: Vec<usize> = admitted.iter().map(|admitted| admitted.slot).collect();
         self.state.reset(&slots, issue)?;

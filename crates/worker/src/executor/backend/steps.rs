@@ -305,8 +305,7 @@ impl WorkerBackend {
             let job = Job::new();
             job.call_texts(call);
             let submitted = if video.denoising() {
-                let kind = CallKind::Media(ipc::MediaCall::LatentPreparation);
-                self.jobs.start(kind, job, true).map_err(lane_lost)?
+                self.jobs.start(job, true).map_err(lane_lost)?
             } else {
                 self.jobs.call(job, true)
             };
@@ -319,9 +318,7 @@ impl WorkerBackend {
         // when an import failed after it: the fences are due either way.
         let (job, admitted) = crate::executor::inputs::admit(self, batch);
         let submitted = match batch.route() {
-            Some(kind) if !job.is_empty() => {
-                Some(self.start(Some(kind), job, true).map_err(lane_lost)?)
-            }
+            Some(_) if !job.is_empty() => Some(self.start(job, true).map_err(lane_lost)?),
             _ => None,
         };
         admitted.map(|()| submitted)
@@ -423,10 +420,6 @@ impl WorkerBackend {
         Ok(crate::executor::inputs::subscribe(self, batch, submission)?)
     }
 
-    pub(crate) fn lane(&self, batch: &WorkerBatch) -> Option<usize> {
-        batch.route().and_then(|kind| self.jobs.lane(kind))
-    }
-
     pub(crate) fn forward(
         &mut self,
         batch: &mut WorkerBatch,
@@ -471,7 +464,7 @@ impl WorkerBackend {
             // last step's: each of its jobs is one the batch waits for.
             if stage != batch::Stage::Inputs
                 && let Some(profiler) = &mut self.profiler
-                && let Some(job) = profiler.next(&lanes, kind)
+                && let Some(job) = profiler.next(&lanes)
             {
                 batch.profiling = Some(job);
                 return Ok(Some(job));
@@ -484,15 +477,7 @@ impl WorkerBackend {
             // A stage that needs nothing of the lane advances without a
             // job.
             let submitted = match batch::forward(self, batch, kind) {
-                Ok(Some(job)) => {
-                    // One forward is in flight at a time (the executor's
-                    // ordering): lifecycle work without a stream follows
-                    // it to its lane.
-                    if lanes.lane(kind).is_some() {
-                        self.lifecycle.follow(kind);
-                    }
-                    Some(self.start(Some(kind), job, true).map_err(lane_lost))
-                }
+                Ok(Some(job)) => Some(self.start(job, true).map_err(lane_lost)),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             };
@@ -563,7 +548,7 @@ impl WorkerBackend {
         let job = Job::new();
         job.after(device, fences);
         let submitted = match batch.route() {
-            Some(kind) => self.jobs.start(kind, job, true),
+            Some(_) => self.jobs.start(job, true),
             None => self.jobs.start_copy(job, true),
         };
         submitted.map(Some).map_err(lane_lost)
@@ -587,9 +572,6 @@ impl WorkerBackend {
         &mut self,
     ) -> std::result::Result<Option<(JobId, Completion)>, WorkerError> {
         while let Some((job, completion)) = self.jobs.take() {
-            if let Some(storage) = &self.runtimes.worker_storage {
-                storage.events.performed(job);
-            }
             // What belongs to no batch is applied here: the event pool's
             // deferred work, a lifecycle command's device work, the expert
             // union's step this rank joined, the kernel watch's calls.

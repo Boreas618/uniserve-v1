@@ -21,7 +21,7 @@ reads and writes and its evaluation index.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -179,16 +179,6 @@ class VideoRequest:
         return max(self.units)
 
 
-@dataclass
-class _Lanes:
-    """The streams of the rank's call kinds and the graph pools of its
-    components, as the worker binds them.
-    """  # noqa: D205
-
-    streams: dict[str, torch.cuda.Stream] = field(default_factory=dict)
-    pools: dict[str, Any] = field(default_factory=dict)
-
-
 class VideoExecutor:
     """The media calls of a video model's rank.
 
@@ -260,7 +250,6 @@ class VideoExecutor:
         self.staging: Staging | None = None
         self.lane: HostLane | None = None
         self.reports: Reports | None = None
-        self.lanes = _Lanes()
         # The layout each admitted slot holds on the denoiser.
         self.held: dict[int, Layout] = {}
 
@@ -370,7 +359,6 @@ class VideoExecutor:
         """
         slots = int(settings["slots"])
         ffmpeg = str(settings["ffmpeg"])
-        self.lanes = _Lanes(dict(streams), dict(pools))
         self.reports = Reports(int(settings["reports"]))
 
         plan, model = self.plan, self.model

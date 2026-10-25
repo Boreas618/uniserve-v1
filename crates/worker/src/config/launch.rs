@@ -147,11 +147,10 @@ impl WorkerLaunch {
 /// Resolve a launch descriptor.
 ///
 /// The command line and the engine validate the launch values they own
-/// before they write the descriptor (`lanes` validates each lane where
-/// the operator states it), so this checks only what the rank alone knows:
-/// its device, the transports it can bind, the precisions its device
-/// computes, the generation-tower placement it parses (`worker_config.mesh`) and
-/// the lanes taken together. Fails with the first violated
+/// before they write the descriptor, so this checks only what the rank
+/// alone knows: its device, the transports it can bind, the precisions its
+/// device computes and the generation-tower placement it parses
+/// (`worker_config.mesh`). Fails with the first violated
 /// rule; messages name the launch option the operator sets, because the
 /// engine reports them as the rank's exit cause.
 pub fn resolve(
@@ -368,7 +367,6 @@ fn execution(
         model_dtype: descriptor.model_dtype.clone(),
         prefix_cache_dtype: descriptor.prefix_cache_dtype.clone(),
         mem_fraction_static: descriptor.mem_fraction_static,
-        lanes: descriptor.lane.clone(),
         graph_policy: descriptor.graph_policy.clone(),
         decode_graph_batch_sizes: default_decode_sizes(),
         prefill_outputs: descriptor.prefill_outputs,

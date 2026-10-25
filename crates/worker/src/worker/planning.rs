@@ -91,6 +91,9 @@ fn vision_feature_bytes(model: &LoadedModel) -> Result<u64> {
     Ok(rows * u64::from(vision.output_size) * vision.output_dtype.bytes() as u64)
 }
 
+/// Unit columns the rank's lane binds beside the import workers'.
+const LANE_COLUMNS: usize = 1;
+
 /// Resolve the rank's capacity on the loaded model.
 #[expect(
     clippy::too_many_arguments,
@@ -104,7 +107,6 @@ pub(super) fn plan(
     world: &World,
     budget: Option<&DeviceBudget>,
     components: &Components,
-    unit_columns: usize,
     video: Option<(&str, VideoManifest)>,
 ) -> Result<(Plan, Option<VideoCapacity>)> {
     let device = config.device;
@@ -263,7 +265,7 @@ pub(super) fn plan(
             layout.info().request_slots,
             width,
             import_capacity,
-            unit_columns,
+            LANE_COLUMNS,
         )?;
         layout.reserve(config.device, fixed);
         // The text runners' columns and the slot continuation state.
@@ -275,7 +277,6 @@ pub(super) fn plan(
                 layout.info().request_slots as usize,
                 &cache,
                 image.processing.is_some(),
-                unit_columns,
             )?,
         );
         // The image denoiser's columns and the image decoder's staging.
@@ -302,10 +303,10 @@ pub(super) fn plan(
             )?,
         );
         // Every unit column holds one index per unit, charged with each unit:
-        // the import workers', the lanes' and the copy lane's of a rank that
+        // the import workers', the lane's and the copy lane's of a rank that
         // copies pages through the host KV cache.
         let columns = PrefixCache::import_workers(import_capacity)
-            + unit_columns
+            + LANE_COLUMNS
             + usize::from(launch.storage.host_kv_cache);
         let unit_overhead = columns as u64 * UnitColumn::bytes(1);
         let granularity = match config.device {
@@ -324,7 +325,7 @@ pub(super) fn plan(
     } else {
         None
     };
-    Ok((layout.finish(config, cache), None))
+    Ok((layout.finish(cache), None))
 }
 
 /// The layout of a video rank: request slots sized by every rank's storage

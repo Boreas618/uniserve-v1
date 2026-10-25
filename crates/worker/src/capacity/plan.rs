@@ -193,26 +193,6 @@ pub(crate) struct Plan {
     pub cache: Option<Arc<CachePlan>>,
 }
 
-impl Plan {
-    /// Every eligible lane must be able to execute an admitted batch, so
-    /// lane limits bound the advertised batch; storage still covers warmup
-    /// and graph capture at the configured dimensions.
-    fn clamp_lanes(&mut self, config: &WorkerConfig) {
-        for lane in &config.lanes {
-            if let Some(calls) = lane.max_batch_calls {
-                self.info.max_batch_calls = self.info.max_batch_calls.min(saturate(calls));
-            }
-            if let Some(tokens) = lane.max_batch_tokens {
-                self.info.max_batch_tokens = self.info.max_batch_tokens.min(saturate(tokens));
-            }
-        }
-    }
-}
-
-fn saturate(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
-}
-
 fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::Invalid(format!("{name} exceeds the protocol range")))
 }
@@ -411,16 +391,14 @@ impl TokenLayout {
         Ok(capacity)
     }
 
-    pub(crate) fn finish(self, config: &WorkerConfig, cache: Option<Arc<CachePlan>>) -> Plan {
-        let mut plan = Plan {
+    pub(crate) fn finish(self, cache: Option<Arc<CachePlan>>) -> Plan {
+        Plan {
             info: self.info,
             arena: self.arena,
             fixed_device_bytes: self.fixed,
             latent: self.latent,
             cache,
-        };
-        plan.clamp_lanes(config);
-        plan
+        }
     }
 }
 
@@ -464,15 +442,13 @@ pub(crate) fn request_layout(
         narrow(arena.host_lane_inflight, "host lane capacity")?
     };
     info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
-    let mut plan = Plan {
+    Ok(Plan {
         info,
         arena,
         fixed_device_bytes: BTreeMap::new(),
         latent: media.stored_latent(),
         cache: None,
-    };
-    plan.clamp_lanes(config);
-    Ok(plan)
+    })
 }
 
 /// This rank's storage for every candidate slot count from `minimum` to
@@ -567,7 +543,6 @@ pub(crate) mod tests {
             model_dtype: "bfloat16".into(),
             prefix_cache_dtype: None,
             mem_fraction_static: 0.7,
-            lanes: Vec::new(),
             graph_policy: "auto".into(),
             decode_graph_batch_sizes: crate::config::default_decode_sizes(),
             prefill_outputs: true,
@@ -705,7 +680,7 @@ pub(crate) mod tests {
         let granule = (2 << 20) / gcd(cache.plane_bytes, 2 << 20);
         assert_eq!(capacity.num_units, fitted / 8 / granule * granule * 8);
         assert!(fitted - capacity.num_units < 8 * granule);
-        let plan = layout.finish(&config, Some(Arc::new(cache)));
+        let plan = layout.finish(Some(Arc::new(cache)));
         let info = plan.info.prefix_cache.as_ref().unwrap();
         assert_eq!(u64::from(info.num_units), capacity.num_units);
         assert_eq!(info.groups[0].kv_head_offset, 4);
@@ -716,20 +691,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cpu_workers_take_the_default_pool_and_lane_limits_clamp_the_batch() {
+    fn cpu_workers_take_the_default_pool() {
         let config = WorkerConfig {
             device: Device::Cpu,
             max_batch_calls: 8,
             max_batch_tokens: 64,
             max_request_pool_size: 8,
-            lanes: vec![ipc::LaneConfig {
-                lane_id: "decode".into(),
-                sm_budget: 1,
-                call_kinds: vec![CallKind::Forward(ipc::ForwardMode::Decode)],
-                max_batch_calls: Some(4),
-                max_batch_tokens: None,
-                max_inflight: None,
-            }],
             ..cpu_config()
         };
         let facts = TokenFacts {
@@ -750,8 +717,7 @@ pub(crate) mod tests {
             .fit_cache(&cache(), 0, &config, 0, None, &group())
             .unwrap();
         assert_eq!(capacity.num_units, DEFAULT_NUM_UNITS);
-        let plan = layout.finish(&config, Some(Arc::new(cache())));
-        assert_eq!(plan.info.max_batch_calls, 4);
+        let plan = layout.finish(Some(Arc::new(cache())));
         assert_eq!(plan.info.encoder_entry_bytes, 1024);
         // One feature per encoder cache entry and one in flight.
         assert_eq!(plan.info.buffer_pool_bytes, 257 * 1024);

@@ -20,7 +20,6 @@ pub(crate) type HostFn = unsafe extern "C" fn(Handle);
 pub(crate) const LIBCUDA: &str = "libcuda.so.1";
 
 pub(crate) const CUDA_SUCCESS: CuResult = 0;
-pub(crate) const CUDA_ERROR_INVALID_VALUE: CuResult = 1;
 pub(crate) const CUDA_ERROR_NOT_READY: CuResult = 600;
 
 /// `CUipcEventHandle`: an opaque 64-byte token passed by value.
@@ -112,71 +111,6 @@ pub(crate) struct Memcpy3DBatchOp {
     pub(crate) flags: u32,
 }
 
-/// `CUDA_MEMCPY3D` (v2). The array handles and reserved pointers stay null:
-/// operands are host or device pointers.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Memcpy3D {
-    pub(crate) source_x: usize,
-    pub(crate) source_y: usize,
-    pub(crate) source_z: usize,
-    pub(crate) source_lod: usize,
-    pub(crate) source_kind: u32,
-    pub(crate) source_host: usize,
-    pub(crate) source_device: u64,
-    pub(crate) source_array: usize,
-    pub(crate) reserved0: usize,
-    pub(crate) source_pitch: usize,
-    pub(crate) source_height: usize,
-
-    pub(crate) destination_x: usize,
-    pub(crate) destination_y: usize,
-    pub(crate) destination_z: usize,
-    pub(crate) destination_lod: usize,
-    pub(crate) destination_kind: u32,
-    pub(crate) destination_host: usize,
-    pub(crate) destination_device: u64,
-    pub(crate) destination_array: usize,
-    pub(crate) reserved1: usize,
-    pub(crate) destination_pitch: usize,
-    pub(crate) destination_height: usize,
-
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) depth: usize,
-}
-
-/// `CUmemorytype` values of host and device pointers.
-pub(crate) const CU_MEMORYTYPE_HOST: u32 = 1;
-pub(crate) const CU_MEMORYTYPE_DEVICE: u32 = 2;
-
-/// `CU_POINTER_ATTRIBUTE_MEMORY_TYPE`: the `CUmemorytype` of an address.
-pub(crate) const CU_POINTER_ATTRIBUTE_MEMORY_TYPE: i32 = 2;
-
-/// `CUdevResource` (v1): a type tag, 92 opaque bytes and a 48-byte union.
-/// Only `smCount` of the SM arm is read; the driver owns the rest.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct DevResource {
-    pub(crate) kind: i32,
-    pub(crate) internal: [u8; 92],
-    pub(crate) sm_count: u32,
-    pub(crate) reserved: [u8; 44],
-}
-
-impl DevResource {
-    pub(crate) fn empty() -> Self {
-        Self {
-            kind: 0,
-            internal: [0; 92],
-            sm_count: 0,
-            reserved: [0; 44],
-        }
-    }
-}
-
-pub(crate) const CU_DEV_RESOURCE_TYPE_SM: i32 = 1;
-
 /// Declares the driver table: one typed field per entry point.
 macro_rules! driver_table {
     (
@@ -238,18 +172,6 @@ driver_table! {
         graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
         graph_exec_destroy = "cuGraphExecDestroy": fn(Handle);
 
-        device_get_dev_resource = "cuDeviceGetDevResource": fn(i32, *mut DevResource, i32);
-        dev_sm_resource_split_by_count = "cuDevSmResourceSplitByCount": fn(
-            *mut DevResource, *mut u32, *const DevResource, *mut DevResource, u32, u32,
-        );
-        dev_resource_generate_desc = "cuDevResourceGenerateDesc": fn(*mut Handle, *mut DevResource, u32);
-        green_ctx_create = "cuGreenCtxCreate": fn(*mut Handle, Handle, i32, u32);
-        green_ctx_destroy = "cuGreenCtxDestroy": fn(Handle);
-        green_ctx_stream_create = "cuGreenCtxStreamCreate": fn(*mut Handle, Handle, u32, i32);
-        green_ctx_get_dev_resource = "cuGreenCtxGetDevResource": fn(Handle, *mut DevResource, i32);
-        stream_get_green_ctx = "cuStreamGetGreenCtx": fn(Handle, *mut Handle);
-        ctx_get_dev_resource = "cuCtxGetDevResource": fn(Handle, *mut DevResource, i32);
-
         event_create = "cuEventCreate": fn(*mut Handle, u32);
         event_record_with_flags = "cuEventRecordWithFlags": fn(Handle, Handle, u32);
         event_query = "cuEventQuery": fn(Handle);
@@ -282,8 +204,6 @@ driver_table! {
         mem_retain_allocation_handle = "cuMemRetainAllocationHandle": fn(*mut u64, Handle);
 
         memcpy_async = "cuMemcpyAsync": fn(u64, u64, usize, Handle);
-        memcpy_3d_async = "cuMemcpy3DAsync_v2": fn(*const Memcpy3D, Handle);
-        pointer_get_attribute = "cuPointerGetAttribute": fn(*mut c_void, i32, u64);
         memset_d8_async = "cuMemsetD8Async": fn(u64, u8, usize, Handle);
         memset_d16_async = "cuMemsetD16Async": fn(u64, u16, usize, Handle);
         memset_d32_async = "cuMemsetD32Async": fn(u64, u32, usize, Handle);

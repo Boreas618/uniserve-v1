@@ -63,8 +63,8 @@ pub use crate::sim::{
     BatchEvent, SimEngine, SimExecutor, sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
 pub use crate::worker::{
-    BatchSubmitError, CallReaders, ExpertParallelPlacement, LaneConfig, WorkerExecutor,
-    WorkerGroup, WorkerProcessArgs,
+    BatchSubmitError, CallReaders, ExpertParallelPlacement, WorkerExecutor, WorkerGroup,
+    WorkerProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
 /// Serializable scheduler, cache, and worker performance snapshots.

@@ -216,22 +216,6 @@ impl ShareableHandle {
     }
 }
 
-/// Reserved virtual address ranges by base address, with their lengths. Every
-/// mapping this process creates (exportable allocations, imports and aliases)
-/// lies in one of them.
-static RESERVED: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
-
-/// Whether `address` lies in a virtual address range reserved here, that is,
-/// in memory addressed through `cuMemMap` rather than a linear allocation or
-/// host memory.
-pub(crate) fn is_mapped(address: u64) -> bool {
-    let reserved = lock(&RESERVED);
-    reserved
-        .range(..=address)
-        .next_back()
-        .is_some_and(|(&base, &bytes)| address - base < bytes as u64)
-}
-
 /// A reserved virtual address range, the segments mapped into it and the
 /// physical allocation references that back them.
 ///
@@ -291,7 +275,6 @@ impl VirtualRange {
         )?;
         self.address = address;
         self.reserved = bytes;
-        lock(&RESERVED).insert(address, bytes);
         Ok(())
     }
 
@@ -350,13 +333,6 @@ impl Drop for VirtualRange {
         if address == 0 && handles.is_empty() {
             return;
         }
-        if address != 0 {
-            // The owner retired every access before dropping the range, and
-            // the driver cannot hand the address out again until the queued
-            // teardown frees it.
-            lock(&RESERVED).remove(&address);
-        }
-
         reclaim::defer(move || {
             in_context(context.raw(), |driver| {
                 // Every step runs even after a failure so that as much as

@@ -4,7 +4,7 @@ It covers condition reading, unit and soundtrack encoding, and MP4
 assembly.
 
 Host media has no model. Its work runs on one host thread of the executor,
-in submission order, beside the device work of the rank's lanes; the
+in submission order, beside the device work of the rank's streams; the
 codecs release the GIL while they encode. Every finished task reports to
 the worker as one message on the pipe the worker passes in
 (:class:`Reports`): the batch and call it belongs to, a row, a status, a

@@ -1,7 +1,7 @@
 //! A video model's media batch: what its calls contribute beside the shared
 //! batch skeleton ([`VideoCall`], [`MediaBatch`]), what a video model's rank
 //! keeps beside the executor ([`VideoRuntime`]: the trajectory ledger, the
-//! lanes' streams and the output leases), and the jobs of a batch
+//! call kinds' streams and the output leases), and the jobs of a batch
 //! ([`forward`], [`complete`]).
 //!
 //! The executor (`uniserve.executor`) computes every call; the worker leases
@@ -217,7 +217,7 @@ pub(crate) struct VideoRuntime {
     /// The trajectory ledger of a denoising rank.
     pub(crate) ledger: Option<LatentLedger>,
     /// The device and stream of each media call kind this rank serves.
-    lanes: HashMap<MediaCall, (Device, Option<Stream>)>,
+    streams: HashMap<MediaCall, (Device, Option<Stream>)>,
     /// On a CUDA rank holding host components, the stream device products
     /// host tasks wrote are fenced on: the tasks waited for their copies,
     /// so the fences complete at once.
@@ -233,13 +233,13 @@ impl VideoRuntime {
     pub(crate) fn new(
         executor: PythonExecutor,
         ledger: Option<LatentLedger>,
-        lanes: HashMap<MediaCall, (Device, Option<Stream>)>,
+        streams: HashMap<MediaCall, (Device, Option<Stream>)>,
         host_stream: Option<Arc<CUDAStream>>,
     ) -> Self {
         Self {
             executor,
             ledger,
-            lanes,
+            streams,
             host_stream,
             canvases: HashMap::new(),
             started: Vec::new(),
@@ -280,9 +280,9 @@ impl VideoRuntime {
         self.ledger.is_some()
     }
 
-    /// The device and stream of `kind`'s lane: none on the host.
-    fn lane(&self, kind: MediaCall) -> (Device, Option<Stream>) {
-        self.lanes
+    /// The device and stream of `kind`: none on the host.
+    fn stream(&self, kind: MediaCall) -> (Device, Option<Stream>) {
+        self.streams
             .get(&kind)
             .cloned()
             .unwrap_or((Device::Cpu, None))
@@ -943,7 +943,7 @@ fn record(
             "a video batch has calls".into(),
         ))));
     };
-    let (device, stream) = parts.video.lane(media_kind(first));
+    let (device, stream) = parts.video.stream(media_kind(first));
     let device = device.cuda();
     let (opening, planned) = match state {
         None => {

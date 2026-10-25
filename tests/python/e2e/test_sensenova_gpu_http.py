@@ -64,7 +64,6 @@ def image_start_token_id(model: Path) -> int:
 def production_server(
     tmp_path: Path,
     model: Path,
-    binding: str,
     graph_policy: str,
     *,
     devices: str | None = None,
@@ -105,23 +104,6 @@ def production_server(
         "logging_config.log_stats=false",
         *extra,
     ]
-    if binding == "shared":
-        args.extend(
-            [
-                "--set",
-                'lanes=[{ lane_id = "compute", sm_budget = 152, '
-                'domains = ["decode", "prefill", "flow"] }]',
-            ]
-        )
-    elif binding == "split":
-        args.extend(
-            [
-                "--set",
-                'lanes=[{ lane_id = "decode", sm_budget = 64, '
-                'domains = ["decode"] }, { lane_id = "compute", '
-                'sm_budget = 88, domains = ["prefill", "flow"] }]',
-            ]
-        )
     environment = {"CUDA_VISIBLE_DEVICES": devices}
     with server_process(
         args,
@@ -175,21 +157,11 @@ def visible_stream_delta(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 @pytest.mark.timeout(600)
-@pytest.mark.parametrize(
-    ("binding", "graph_policy"),
-    [
-        ("default", "full"),
-        ("shared", "full"),
-        ("split", "full"),
-        ("split", "off"),
-    ],
-)
-def test_sensenova_public_production_lineage(
-    tmp_path: Path, binding: str, graph_policy: str
-):
+@pytest.mark.parametrize("graph_policy", ["full", "off"])
+def test_sensenova_public_production_lineage(tmp_path: Path, graph_policy: str):
     model = active_model()
     input_image_url = f"data:image/png;base64,{tiny_input_png_b64()}"
-    with production_server(tmp_path, model, binding, graph_policy) as base_url:
+    with production_server(tmp_path, model, graph_policy) as base_url:
         delivered = []
         snapshots = []
         for _round in range(2):
@@ -334,7 +306,7 @@ def test_sensenova_generation_tower_serves_one_device_outputs(tmp_path: Path):
 
     def serve(placement: str, **options) -> tuple:
         with production_server(
-            tmp_path / placement, model, "default", "full", **options
+            tmp_path / placement, model, "full", **options
         ) as base_url:
             understanding = post_chat(
                 base_url,
@@ -401,7 +373,7 @@ def test_image_guidance_with_a_negative_prompt_generates_its_image(
     together. Both generate the requested image.
     """
     model = active_model()
-    with production_server(tmp_path, model, "default", "full") as base_url:
+    with production_server(tmp_path, model, "full") as base_url:
         for guidance_scale, image_guidance_scale in [(1.0, 2.0), (4.0, 2.0)]:
             response = httpx.post(
                 f"{base_url}/v1/images/generations",

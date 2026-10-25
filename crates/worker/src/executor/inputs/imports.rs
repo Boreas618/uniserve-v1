@@ -156,7 +156,7 @@ pub(super) fn import_products(
                 ));
             }
         }
-        let stream = backend.transfer_stream(plan.calls[indices[0]].kind, device)?;
+        let stream = backend.transfer_stream(device)?;
         let tensor = export
             .value
             .tensors()
@@ -241,7 +241,7 @@ fn import_latent(
         .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
         .ok_or_else(|| Error::Invalid("latent transfer has no scheduler parameters".into()))?;
     let device = component_device(backend, &call.component)?;
-    let stream = backend.transfer_stream(call.kind, device)?;
+    let stream = backend.transfer_stream(device)?;
     let slot = backend
         .requests()
         .peek(export.product.request_key.request_id.0)

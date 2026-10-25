@@ -15,7 +15,7 @@ pub use launch::{
     RendezvousConfig, WorkerLaunch, resolve,
 };
 
-use ipc::{CanvasSampling, LaneConfig};
+use ipc::CanvasSampling;
 
 use crate::{Error, Result};
 
@@ -96,7 +96,6 @@ pub struct WorkerConfig {
     /// Fraction of the device's total memory this process may hold for
     /// static allocations, weights and KV cache (`--mem-fraction-static`).
     pub mem_fraction_static: f64,
-    pub lanes: Vec<LaneConfig>,
 
     pub graph_policy: String,
     pub decode_graph_batch_sizes: Vec<usize>,
@@ -183,9 +182,9 @@ impl WorkerConfig {
     }
 
     /// Check what the rank alone knows or derives: its rank within its
-    /// world, its request slot bounds, positive capacities, and the lanes
-    /// taken together. The command line and the engine check the launch
-    /// values they own, each lane among them, before a rank starts.
+    /// world, its request slot bounds and positive capacities. The command
+    /// line and the engine check the launch values they own before a rank
+    /// starts.
     pub(crate) fn validate(&self) -> Result<()> {
         let invalid = |message: &str| Error::Invalid(message.into());
         if self.world_size == 0 || self.rank >= self.world_size {
@@ -203,19 +202,6 @@ impl WorkerConfig {
             .contains(&0)
         {
             return Err(invalid("worker configuration capacities must be positive"));
-        }
-
-        // Each lane is valid on its own; the rank binds every call kind to at
-        // most one of them.
-        let mut lane_ids = std::collections::HashSet::new();
-        let mut operations = std::collections::HashSet::new();
-        for lane in &self.lanes {
-            if !lane_ids.insert(&lane.lane_id) {
-                return Err(invalid("lane ids must be unique"));
-            }
-            if lane.call_kinds.iter().any(|kind| !operations.insert(*kind)) {
-                return Err(invalid("call kinds must have one execution lane binding"));
-            }
         }
 
         Ok(())

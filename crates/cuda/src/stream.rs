@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
-use crate::green::{self, GreenContext};
 use crate::{DeviceId, Error, PrimaryContext, Result};
 
 const CU_STREAM_NON_BLOCKING: u32 = 1;
@@ -18,7 +17,6 @@ pub(crate) enum Retention {
     Primary {
         _context: PrimaryContext,
     },
-    Green(Arc<GreenContext>),
 }
 
 /// The capture state of a stream (`CUstreamCaptureStatus`).
@@ -40,8 +38,7 @@ pub enum CaptureStatus {
 /// context alive for as long as it is used.
 ///
 /// Created streams are non-blocking with respect to the legacy NULL stream
-/// and retain the context they belong to (a primary context or an SM
-/// partition). Dropping the last handle does not wait: `cuStreamDestroy`
+/// and retain the primary context they belong to. Dropping the last handle does not wait: `cuStreamDestroy`
 /// returns immediately and the driver releases the stream once its queued
 /// work completes.
 #[derive(Clone)]
@@ -159,81 +156,21 @@ impl Stream {
         })
     }
 
-    pub(crate) fn from_green(
-        device: DeviceId,
-        raw: Handle,
-        green: Arc<GreenContext>,
-    ) -> Result<Self> {
-        let driver = driver()?;
-        let mut context = std::ptr::null_mut();
-        // SAFETY: raw was just created in the retained green context.
-        let status = unsafe { (driver.stream_get_ctx)(raw, &mut context) };
-        if let Err(error) = driver.check(status, "cuStreamGetCtx") {
-            // SAFETY: the new stream is owned here and has no work.
-            let _ = unsafe { (driver.stream_destroy)(raw) };
-            return Err(error);
-        }
-
-        let retention = Retention::Green(green);
-        Ok(Self {
-            raw,
-            device,
-            context,
-            _created: Created::new(raw, &retention),
-            retention,
-        })
-    }
-
-    /// Divides `device` into disjoint SM partitions (green contexts) of exactly
-    /// `counts[i]` SMs and returns one owned stream per partition.
-    pub fn partition(device: DeviceId, counts: &[u32]) -> Result<Vec<Self>> {
-        green::partition(device, counts)
-    }
-
-    /// Creates an independent owned stream in this stream's context (or SM
-    /// partition) with the same priority. It retains whatever this stream
-    /// retains; forking a borrowed stream inherits the borrow's contract.
+    /// Creates an independent owned stream in this stream's context with the
+    /// same priority. It retains whatever this stream retains; forking a
+    /// borrowed stream inherits the borrow's contract.
     pub fn fork(&self) -> Result<Self> {
-        let driver = driver()?;
         let priority = self.priority()?;
-        let mut green = std::ptr::null_mut();
-        driver.check(
-            // SAFETY: self is a live stream; the driver writes one handle to the
-            // local `green`.
-            unsafe { (driver.stream_get_green_ctx)(self.raw, &mut green) },
-            "cuStreamGetGreenCtx",
-        )?;
-
         let mut raw = std::ptr::null_mut();
-        if green.is_null() {
-            in_context(self.context, |driver| {
-                // SAFETY: the driver writes a stream handle in self's context.
-                driver.check(
-                    unsafe {
-                        (driver.stream_create_with_priority)(
-                            &mut raw,
-                            CU_STREAM_NON_BLOCKING,
-                            priority,
-                        )
-                    },
-                    "cuStreamCreateWithPriority",
-                )
-            })?;
-        } else {
+        in_context(self.context, |driver| {
+            // SAFETY: the driver writes a stream handle in self's context.
             driver.check(
-                // SAFETY: the green context is live while self's retention is; the
-                // driver writes the new stream to the local `raw`.
                 unsafe {
-                    (driver.green_ctx_stream_create)(
-                        &mut raw,
-                        green,
-                        CU_STREAM_NON_BLOCKING,
-                        priority,
-                    )
+                    (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, priority)
                 },
-                "cuGreenCtxStreamCreate",
-            )?;
-        }
+                "cuStreamCreateWithPriority",
+            )
+        })?;
 
         Ok(Self {
             raw,
@@ -282,28 +219,6 @@ impl Stream {
             "cuStreamGetPriority",
         )?;
         Ok(priority)
-    }
-
-    /// Whether the stream runs in an SM partition (a green context).
-    pub fn is_partitioned(&self) -> Result<bool> {
-        let driver = driver()?;
-        let mut green = std::ptr::null_mut();
-        driver.check(
-            // SAFETY: self is a live stream; the driver writes one handle to the
-            // local `green`.
-            unsafe { (driver.stream_get_green_ctx)(self.raw, &mut green) },
-            "cuStreamGetGreenCtx",
-        )?;
-        Ok(!green.is_null())
-    }
-
-    /// The SMs available to kernels on this stream: the partition's count for
-    /// a green-context stream, otherwise the context's (whole device's).
-    pub fn sm_count(&self) -> Result<u32> {
-        if let Retention::Green(green) = &self.retention {
-            return Ok(green.sm_count());
-        }
-        green::context_sm_count(self.context)
     }
 
     pub fn capture_status(&self) -> Result<CaptureStatus> {

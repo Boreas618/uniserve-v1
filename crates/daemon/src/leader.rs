@@ -1007,8 +1007,8 @@ impl Leader {
 /// serve with differently. A standby maps the running engine's weights and
 /// cache planes and serves its placement, so the model, the placement, the
 /// KV cache, the experts and how weights load and are stored stay; the
-/// scheduling, CUDA graphs, FlashInfer, the lanes and the workers' other
-/// options may change.
+/// scheduling, CUDA graphs, FlashInfer and the workers' other options may
+/// change.
 ///
 /// # Errors
 ///
@@ -1068,7 +1068,6 @@ fn updated_spec(
     spec.scheduling = recomputed.scheduling.clone();
     spec.cuda_graphs = recomputed.cuda_graphs.clone();
     spec.flashinfer = recomputed.flashinfer.clone();
-    spec.lanes = recomputed.lanes.clone();
     if let (Some(workers), Some(new)) = (spec.workers.as_mut(), &recomputed.workers) {
         workers.executable = new.executable.clone();
         workers.watchdog_timeout_ms = new.watchdog_timeout_ms;

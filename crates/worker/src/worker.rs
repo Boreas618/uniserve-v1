@@ -335,7 +335,7 @@ impl Worker {
         drop(loading);
 
         let devices: Vec<Device> = config.devices().collect();
-        let mut streams = Streams::create(&config, &devices).map_err(phase("streams"))?;
+        let mut streams = Streams::create(&devices).map_err(phase("streams"))?;
         let host = launch.host.clone();
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
@@ -395,7 +395,6 @@ impl Worker {
             &world,
             budget.as_ref(),
             &components,
-            streams.lanes().len().max(1),
             video
                 .as_ref()
                 .map(|(denoiser, _, manifest)| (denoiser.as_str(), manifest.clone())),
@@ -626,7 +625,6 @@ impl Worker {
             TransferRuntime::start(
                 &streams,
                 &cuda,
-                &CallKind::ALL,
                 launch.ipc.queue_depth,
                 info.max_batch_calls as usize,
             )

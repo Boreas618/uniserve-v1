@@ -19,81 +19,35 @@
 //! Lifecycle commands run on the control thread, which issues no stream
 //! work itself: what an owner's command needs on a device (a slot's reset,
 //! the clearing of released rows, what follows a released buffer's
-//! fences) is recorded into the job of the lane whose stream it belongs to
-//! ([`LaneJobs`]), and the backend submits those jobs after the command.
+//! fences) is recorded into the command's job ([`LaneJobs`]), and the
+//! backend submits it to the lane after the command.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use ipc::{Batch, BatchCommand, BufferId, CallKind, NewRequest, RequestKey};
+use ipc::{Batch, BatchCommand, BufferId, NewRequest, RequestKey};
 
 use super::backend::Runtimes;
+use crate::Result;
 use crate::lane::Job;
 use crate::request::RequestPool;
-use crate::{Error, Result};
 
-/// The jobs a lifecycle command records: one per call kind the rank serves,
-/// performed by the lane serving that kind. An owner records work on a
-/// stream into the job of the kind whose lane owns the stream.
+/// The job a lifecycle command records, performed by the rank's lane (by
+/// the builder thread on a rank without one). An owner records the work
+/// its command needs on a stream into it.
+#[derive(Default)]
 pub(crate) struct LaneJobs {
-    jobs: HashMap<CallKind, Job>,
-    /// The kind whose job takes work that belongs to no lane's stream
-    /// (deferred work behind an event): the first the rank serves.
-    any: Option<CallKind>,
-    /// That job on a rank that serves no call kind and so has no lane.
-    unserved: Job,
+    job: Job,
 }
 
 impl LaneJobs {
-    /// Empty jobs for a rank serving `kinds`.
-    pub(crate) fn new(kinds: &[CallKind]) -> Self {
-        Self {
-            jobs: kinds.iter().map(|&kind| (kind, Job::new())).collect(),
-            any: kinds.first().copied(),
-            unserved: Job::new(),
-        }
+    /// The command's job.
+    pub(crate) fn job(&self) -> &Job {
+        &self.job
     }
 
-    /// The job of the lane serving `kind`.
-    pub(crate) fn job(&self, kind: CallKind) -> Result<&Job> {
-        self.jobs.get(&kind).ok_or_else(|| {
-            Error::Invariant(format!(
-                "lifecycle work names {}, which this rank does not serve",
-                kind.as_str()
-            ))
-        })
-    }
-
-    /// Record the work no lane's stream carries for the lane serving
-    /// `kind` from now on: the lane of the forward in flight. The job that
-    /// waits for an event one of its jobs records is then ordered behind
-    /// that record, since a lane performs its jobs in order.
-    pub(crate) fn follow(&mut self, kind: CallKind) {
-        if self.jobs.contains_key(&kind) {
-            self.any = Some(kind);
-        }
-    }
-
-    /// The job for work no lane's stream carries.
-    pub(crate) fn any(&self) -> &Job {
-        self.any
-            .and_then(|kind| self.jobs.get(&kind))
-            .unwrap_or(&self.unserved)
-    }
-
-    /// The jobs that hold work, leaving every job empty for the next
-    /// command: each with the kind whose lane performs it, or `None` for
-    /// the job of a rank without a lane, which its submitter performs.
-    pub(crate) fn take(&mut self) -> Vec<(Option<CallKind>, Job)> {
-        let mut taken: Vec<_> = self
-            .jobs
-            .iter_mut()
-            .filter(|(_, job)| !job.is_empty())
-            .map(|(&kind, job)| (Some(kind), std::mem::take(job)))
-            .collect();
-        if !self.unserved.is_empty() {
-            taken.push((None, std::mem::take(&mut self.unserved)));
-        }
-        taken
+    /// The job when it holds work, leaving it empty for the next command.
+    pub(crate) fn take(&mut self) -> Option<Job> {
+        (!self.job.is_empty()).then(|| std::mem::take(&mut self.job))
     }
 }
 

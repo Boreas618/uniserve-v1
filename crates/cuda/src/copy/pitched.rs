@@ -1,11 +1,9 @@
 //! Pitched copies: layers of rows at a byte pitch in each operand, submitted
-//! as one `cuMemcpy3DBatchAsync` call apart from the entries the module
-//! documentation of `copy` sends unbatched.
+//! as one `cuMemcpy3DBatchAsync` call.
 
-use super::{Residence, SourceOrder, mapped, require_batch_stream};
+use super::{SourceOrder, require_batch_stream};
 use crate::driver::{
-    CU_MEMCPY_OPERAND_TYPE_POINTER, CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, Handle, MemLocation,
-    Memcpy3D, Memcpy3DBatchOp, Memcpy3DOperand, driver,
+    CU_MEMCPY_OPERAND_TYPE_POINTER, Handle, MemLocation, Memcpy3DBatchOp, Memcpy3DOperand, driver,
 };
 use crate::{Error, Result, Stream};
 
@@ -63,62 +61,10 @@ impl Pitched {
             hint: MemLocation::default(),
         }
     }
-
-    /// This copy as one `cuMemcpy3DAsync` operation whose source lies in
-    /// `source` memory.
-    fn unbatched(&self, source: Residence) -> Result<Memcpy3D> {
-        let mut operation = Memcpy3D {
-            width: self.width,
-            height: self.height,
-            depth: self.depth,
-            ..Memcpy3D::default()
-        };
-
-        // Rows are measured in bytes and layers in rows, as for the batched
-        // operands.
-        operation.source_pitch = if self.height > 1 {
-            self.source_pitch
-        } else {
-            self.width
-        };
-        operation.source_height = if self.depth > 1 {
-            self.source_layer
-        } else {
-            self.height
-        };
-        if source == Residence::Device {
-            operation.source_kind = CU_MEMORYTYPE_DEVICE;
-            operation.source_device = self.source;
-        } else {
-            operation.source_kind = CU_MEMORYTYPE_HOST;
-            operation.source_host = self.source as usize;
-        }
-
-        operation.destination_pitch = if self.height > 1 {
-            self.destination_pitch
-        } else {
-            self.width
-        };
-        operation.destination_height = if self.depth > 1 {
-            self.destination_layer
-        } else {
-            self.height
-        };
-        if Residence::of(self.destination)? == Residence::Device {
-            operation.destination_kind = CU_MEMORYTYPE_DEVICE;
-            operation.destination_device = self.destination;
-        } else {
-            operation.destination_kind = CU_MEMORYTYPE_HOST;
-            operation.destination_host = self.destination as usize;
-        }
-        Ok(operation)
-    }
 }
 
-/// Pitched copies submitted with one `cuMemcpy3DBatchAsync` call, except
-/// copies with a mapped operand on an SM-partition stream, which are
-/// submitted one `cuMemcpy3DAsync` call each (see the module documentation).
-/// The same ordering rules as [`CopyBatch`](super::CopyBatch) apply.
+/// Pitched copies submitted with one `cuMemcpy3DBatchAsync` call. The same
+/// ordering rules as [`CopyBatch`](super::CopyBatch) apply.
 #[derive(Clone, Debug)]
 pub struct PitchedBatch {
     copies: Vec<Pitched>,
@@ -168,38 +114,8 @@ impl PitchedBatch {
         require_batch_stream(stream, PITCHED_BATCH_CALL)?;
         let _scope = stream.enter()?;
 
-        let unbatched = |copy: &Pitched| mapped(copy.destination, copy.source);
-        if !stream.is_partitioned()? || !self.copies.iter().any(unbatched) {
-            // SAFETY: forwarded from the caller.
-            return unsafe { submit_pitched_batch(&self.copies, self.order, stream) };
-        }
-
-        let driver = driver()?;
-        let mut batched = Vec::new();
-        let mut wait = false;
-        for copy in &self.copies {
-            if !unbatched(copy) {
-                batched.push(*copy);
-                continue;
-            }
-            let source = Residence::of(copy.source)?;
-            let operation = copy.unbatched(source)?;
-            driver.check(
-                // SAFETY: the driver reads the operation during the call only;
-                // the caller guarantees the addressed rows.
-                unsafe { (driver.memcpy_3d_async)(&raw const operation, stream.handle()) },
-                "cuMemcpy3DAsync_v2",
-            )?;
-            wait |= self.order == SourceOrder::DuringCall && !source.read_during_call();
-        }
-        if !batched.is_empty() {
-            // SAFETY: forwarded from the caller.
-            unsafe { submit_pitched_batch(&batched, self.order, stream) }?;
-        }
-        if wait {
-            stream.synchronize()?;
-        }
-        Ok(())
+        // SAFETY: forwarded from the caller.
+        unsafe { submit_pitched_batch(&self.copies, self.order, stream) }
     }
 }
 
@@ -208,8 +124,7 @@ const PITCHED_BATCH_CALL: &str = "cuMemcpy3DBatchAsync_v2";
 /// Submits pitched copies with one batched call.
 ///
 /// # Safety
-/// As for [`PitchedBatch::submit`]; the stream's context is current and no
-/// copy needs an unbatched call.
+/// As for [`PitchedBatch::submit`]; the stream's context is current.
 unsafe fn submit_pitched_batch(
     copies: &[Pitched],
     order: SourceOrder,

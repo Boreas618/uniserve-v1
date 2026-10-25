@@ -95,7 +95,6 @@ retention = "30m"
 | `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
 | `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and runs the engine, and requires `model`; every other node runs only its daemon, which joins the leader's |
 | `dist_init_addr` | Unset | The leader's `HOST:PORT`, which the other nodes' daemons join at and the leader binds on every interface; required with several nodes |
-| `lanes` | Unset, no SM partition | Execution lanes, each `{ lane_id, sm_budget, domains }` with optional `max_batch_calls`, `max_batch_tokens` and `max_inflight`; `domains` are `prefill`, `decode` and `flow` |
 
 ### `server_config`
 
@@ -195,7 +194,7 @@ A token request that generates text moves to the engine that serves next when it
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `executable` | The daemon's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the workers run as (`uniserve worker`), and that starts a host's Storage Server; it runs workers in the Python environment it is installed in |
-| `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled lane after half of it |
+| `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled job after half of it |
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
 | `standby` | `false` | Keep a standby beside every worker group. The standby maps the group's retained weights and cache, captures its graphs on warmup scratch units and parks; when the group fails, it is promoted in the group's place instead of a relaunch, and a new standby starts. A group whose ranks all run on the leader's host and that shares no expert world keeps a standby rank group of its own. The groups of an expert world, and a group on several nodes, keep a standby world: a second launch of every group of their failure domain, which forms communicators of its own and is promoted as a whole when any group of the domain fails. Each standby rank holds a CUDA context, graph pools and workspaces of its own, which the device memory `mem_fraction_static` leaves must hold |

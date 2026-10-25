@@ -352,18 +352,6 @@ impl Job {
         std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
-    /// The events whose records the job's operations queue.
-    pub(crate) fn records(&self) -> Vec<Arc<Event>> {
-        self.operations
-            .borrow()
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::Record { event, .. } => Some(Arc::clone(event)),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The import path of the first runner method the job calls or
     /// captures, which names the job when its lane is reported stalled;
     /// `None` for a job that calls none (a graph launch, copies, waits).

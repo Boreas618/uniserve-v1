@@ -684,7 +684,7 @@ message EngineSpec {
   // The host identity of the leader, where the engine process runs.
   string host = 3;
   Placement placement = 4;
-  repeated Lane lanes = 5;
+  reserved 5;
   // Product transport per worker edge (`placement_config.transfer`); empty
   // for the defaults.
   string transfer = 6;
@@ -721,15 +721,6 @@ message Placement {
   // Hosts after the leader the shorthand spreads ranks across.
   repeated string worker_hosts = 6;
   double mem_fraction_static = 7;
-}
-
-message Lane {
-  string lane_id = 1;
-  uint32 sm_budget = 2;
-  repeated string domains = 3;
-  optional uint32 max_batch_calls = 4;
-  optional uint32 max_batch_tokens = 5;
-  optional uint32 max_inflight = 6;
 }
 
 message Scheduling {

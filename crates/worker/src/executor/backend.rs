@@ -16,10 +16,7 @@ mod steps;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use ipc::{
-    Batch as BatchPlan, BatchCommand, CallKind, ForwardMode, RequestKind, Stall, WorkerInfo,
-    WorkerResponseError,
-};
+use ipc::{Batch as BatchPlan, BatchCommand, RequestKind, Stall, WorkerInfo, WorkerResponseError};
 
 use super::image::ImageParts;
 use super::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
@@ -185,7 +182,6 @@ impl WorkerBackend {
         placement: GroupPlacement,
         components: Components,
     ) -> Result<Self> {
-        let lifecycle = LaneJobs::new(&info.supported_calls);
         Ok(Self {
             requests: RequestPool::new(info.request_slots as usize)?,
             info,
@@ -196,50 +192,38 @@ impl WorkerBackend {
             profiler: None,
             kernels: None,
             jobs: JobQueues::default(),
-            lifecycle,
+            lifecycle: LaneJobs::default(),
             lifecycle_jobs: HashSet::new(),
             joining: None,
             joined: None,
         })
     }
 
-    /// Submit the jobs the last lifecycle command recorded, each to the
-    /// lane of its kind, without waiting for them: a lane performs them in
-    /// the order of its jobs, so a forward submitted later finds their work
-    /// done. Nothing goes on from their completions, which are taken with
-    /// the next one that arrives ([`WorkerBackend::completed`]); a failed one
-    /// stops the rank there.
+    /// Submit the job the last lifecycle command recorded to the lane
+    /// without waiting for it: the lane performs it in the order of its
+    /// jobs, so a forward submitted later finds its work done. Nothing goes
+    /// on from its completion, which is taken with the next one that
+    /// arrives ([`WorkerBackend::completed`]); a failed one stops the rank
+    /// there.
     fn perform_lifecycle(&mut self) -> Result<()> {
-        for (kind, job) in self.lifecycle.take() {
-            let submitted = self.start(kind, job, false)?;
+        if let Some(job) = self.lifecycle.take() {
+            let submitted = self.start(job, false)?;
             self.lifecycle_jobs.insert(submitted);
         }
         Ok(())
     }
 
-    /// Submit `job` to the lane serving `kind` (the builder thread for a
-    /// rank that serves no call kind and so has no lane). `wake` is as for
-    /// [`JobQueues::start`].
+    /// Submit `job` to the lane (the builder thread for a rank without
+    /// one). `wake` is as for [`JobQueues::start`].
     ///
     /// The deferred work the job carries waits for events the job records.
     /// The job whose completion says they completed is started right
-    /// behind it, on the same lane, and the event pool runs the work when
-    /// that completion arrives ([`WorkerBackend::completed`]). Started earlier,
+    /// behind it, on the lane, and the event pool runs the work when that
+    /// completion arrives ([`WorkerBackend::completed`]). Started earlier,
     /// that job would reach the lane before the records and pass at once.
-    fn start(&self, kind: Option<CallKind>, job: Job, wake: bool) -> Result<JobId> {
+    fn start(&self, job: Job, wake: bool) -> Result<JobId> {
         let deferrals = job.deferrals();
-        let records = job.records();
-        let lane = kind.and_then(|kind| self.jobs.lane(kind));
-        let submitted = match kind {
-            Some(kind) => self.jobs.start(kind, job, wake)?,
-            None => self.jobs.call(job, wake),
-        };
-        // Work deferred later behind these records waits on their lane.
-        if let (Some(lane), Some(storage)) = (lane, &self.runtimes.worker_storage)
-            && !records.is_empty()
-        {
-            storage.events.queued(submitted, lane, &records);
-        }
+        let submitted = self.jobs.start(job, wake)?;
         if !deferrals.is_empty() {
             let storage = self.runtimes.worker_storage.as_ref().ok_or(Error::State(
                 "a job defers work on a rank without an event pool",
@@ -247,43 +231,27 @@ impl WorkerBackend {
             let jobs = &self.jobs;
             storage
                 .events
-                .defer_submitted(deferrals, |device, events| {
-                    after(jobs, kind, device, events)
-                })?;
+                .defer_submitted(deferrals, |device, events| jobs.after(device, events))?;
         }
         Ok(submitted)
     }
 
     /// Have the rank's event pool start the jobs its deferred work waits
-    /// for on the rank's lanes, from this thread, the control thread.
+    /// for on the lane, from this thread, the control thread.
     fn serve_events(&self) {
         let Some(storage) = &self.runtimes.worker_storage else {
             return;
         };
         let jobs = self.jobs.clone();
-        // Work deferred outside a recording waits on the lane whose job
-        // queued its events' records; once they are made, any lane's
-        // notification stream waits for them: the first kind a lane serves.
-        let mut kinds = self.info.supported_calls.clone();
-        kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
-        let kind = kinds.first().copied();
         storage
             .events
-            .set_submitter(Some(Box::new(move |device, lane, events| match lane {
-                Some(lane) => jobs.after_on(lane, device, events),
-                None => after(&jobs, kind, device, events),
+            .set_submitter(Some(Box::new(move |device, events| {
+                jobs.after(device, events)
             })));
     }
 
-    /// Use the job queues of the rank's lanes for forward submission.
+    /// Use the job queues of the rank's lane for forward submission.
     pub(crate) fn set_job_queues(&mut self, jobs: JobQueues) {
-        // Lifecycle work that belongs to no lane's stream (deferred work
-        // behind an event) is recorded for the first kind: one a lane
-        // serves, where the rank has lanes, since only a lane waits for an
-        // event.
-        let mut kinds = self.info.supported_calls.clone();
-        kinds.sort_by_key(|&kind| jobs.lane(kind).is_none());
-        self.lifecycle = LaneJobs::new(&kinds);
         self.jobs = jobs;
         self.serve_events();
     }
@@ -558,11 +526,10 @@ impl WorkerBackend {
         self.runtimes.transfer = Some(transfer);
     }
 
-    /// The stream serving `kind` calls on `device` (none on host devices):
-    /// imports for such calls are read and published on it.
+    /// The lane's stream on `device` (none on host devices): imports are
+    /// read and published on it.
     pub(crate) fn transfer_stream(
         &self,
-        kind: CallKind,
         device: crate::ffi::MemoryKind,
     ) -> Result<Option<cuda::Stream>> {
         if !matches!(device, crate::ffi::MemoryKind::Cuda(_)) {
@@ -574,7 +541,7 @@ impl WorkerBackend {
             .ok_or_else(|| {
                 Error::Unsupported("device transfers require the transfer runtime".into())
             })?
-            .stream(kind, device)
+            .stream(device)
     }
 
     /// Disjoint borrows for executing one batch.
@@ -979,10 +946,7 @@ impl WorkerBackend {
         // execution thread takes part in the agreement.
         let job = Job::new();
         job.expert_join(Arc::clone(experts), leaving);
-        let submitted = self
-            .jobs
-            .start(CallKind::Forward(ForwardMode::Decode), job, true)
-            .map_err(lane_lost)?;
+        let submitted = self.jobs.start(job, true).map_err(lane_lost)?;
         self.joining = Some(submitted);
         Ok(None)
     }
@@ -1015,25 +979,6 @@ impl WorkerBackend {
                 .map(|(_, batch)| batch.identities())
                 .unwrap_or_default(),
             running_ms: u64::try_from(running.as_millis()).unwrap_or(u64::MAX),
-        }
-    }
-}
-
-/// Start the job that completes once `events` completed where `kind` is
-/// served (the builder thread for a rank without a lane, which has no device
-/// event to wait for), with the control thread's wake behind it.
-fn after(
-    jobs: &JobQueues,
-    kind: Option<CallKind>,
-    device: cuda::DeviceId,
-    events: Vec<Arc<cuda::Event>>,
-) -> Result<JobId> {
-    match kind {
-        Some(kind) => jobs.after(kind, device, events),
-        None => {
-            let job = Job::new();
-            job.after(device, events);
-            Ok(jobs.call(job, true))
         }
     }
 }

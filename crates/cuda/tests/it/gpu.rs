@@ -12,9 +12,9 @@ use std::time::Duration;
 use cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use cuda::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
-    Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, Pitched,
-    PitchedBatch, PrimaryContext, Protection, SegmentedMapping, SourceOrder, Stream, Strided,
-    StridedCopy, VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext,
+    Protection, SegmentedMapping, SourceOrder, Stream, Strided, StridedCopy, VirtualPool,
+    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -578,12 +578,10 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
 }
 
 /// A graph executable instantiated from a captured graph runs its captured
-/// work on whichever stream it is launched on, after the graph is
-/// destroyed: a stream of the primary context and a stream of an SM
-/// partition, neither of which captured it.
+/// work on a stream that did not capture it, after the graph is destroyed.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn graph_executables_launch_on_full_device_and_partition_streams() {
+fn graph_executables_launch_on_another_stream() {
     let _driver = exclusive_driver();
     let (begin, end, destroy_graph) = capture_functions();
 
@@ -607,19 +605,16 @@ fn graph_executables_launch_on_full_device_and_partition_streams() {
         launched
     };
 
-    let full = Stream::new(DEVICE).unwrap();
-    let partition = Stream::partition(DEVICE, &[8]).unwrap().remove(0);
-    for stream in [&full, &partition] {
-        // SAFETY: the ranges lie inside the allocation and the pinned buffer;
-        // the stream orders the clearing fill, the launch and the read back.
-        unsafe {
-            memset_d8(device.address(), 0, 256, stream).unwrap();
-            launched.launch(stream).unwrap();
-            memcpy_async(host.address(), device.address(), 256, stream).unwrap();
-        }
-        stream.synchronize().unwrap();
-        assert_eq!(read(&host), vec![7; 256]);
+    let stream = Stream::new(DEVICE).unwrap();
+    // SAFETY: the ranges lie inside the allocation and the pinned buffer; the
+    // stream orders the clearing fill, the launch and the read back.
+    unsafe {
+        memset_d8(device.address(), 0, 256, &stream).unwrap();
+        launched.launch(&stream).unwrap();
+        memcpy_async(host.address(), device.address(), 256, &stream).unwrap();
     }
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![7; 256]);
 }
 
 type RawHandle = *mut std::ffi::c_void;
@@ -706,178 +701,6 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
     drop(fill);
     pool.free(second);
     assert_eq!(pool.allocate(1 << 20).unwrap(), second);
-}
-
-#[test]
-#[ignore = "requires a CUDA device"]
-fn sm_partitions_create_streams_of_the_requested_size() {
-    let _driver = exclusive_driver();
-    let total = DEVICE
-        .attribute(DeviceAttribute::MultiprocessorCount)
-        .unwrap() as u32;
-    let streams = Stream::partition(DEVICE, &[8, 16]).unwrap();
-
-    assert_eq!(streams.len(), 2);
-    assert_eq!(streams[0].sm_count().unwrap(), 8);
-    assert_eq!(streams[1].sm_count().unwrap(), 16);
-    assert!(streams[0].is_partitioned().unwrap());
-    let fork = streams[1].fork().unwrap();
-    assert!(fork.is_partitioned().unwrap());
-    assert_eq!(fork.sm_count().unwrap(), 16);
-
-    let full = Stream::new(DEVICE).unwrap();
-    assert!(!full.is_partitioned().unwrap());
-    assert_eq!(full.sm_count().unwrap(), total);
-    assert!(matches!(
-        Stream::partition(DEVICE, &[total + 1]),
-        Err(Error::InvalidArgument(_))
-    ));
-}
-
-/// Batched copies on an SM-partition stream deliver their bytes whether an
-/// entry addresses mapped (exportable) or linear memory, in both source
-/// orders, and a source read during the call may change once `submit`
-/// returns.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn batched_copies_reach_mapped_memory_on_partition_streams() {
-    let _driver = exclusive_driver();
-    let stream = Stream::partition(DEVICE, &[8, 16]).unwrap().remove(0);
-    let pattern: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
-
-    for (order, page_locked) in [
-        (SourceOrder::Stream, true),
-        (SourceOrder::DuringCall, false),
-        (SourceOrder::DuringCall, true),
-    ] {
-        let mapped = DeviceAllocation::exportable(DEVICE, 4096, &[]).unwrap();
-        let linear = DeviceAllocation::linear(DEVICE, 4096).unwrap();
-        let readback = PinnedBuffer::new(DEVICE, 4096).unwrap();
-        let mut pinned = PinnedBuffer::new(DEVICE, 4096).unwrap();
-        // SAFETY: no copy is pending on the buffer.
-        unsafe { pinned.as_mut_slice() }.copy_from_slice(&pattern);
-        let mut pageable = pattern.clone();
-        // A source read in stream order is page-locked; one read during the
-        // call may also be ordinary host memory.
-        let source = if page_locked {
-            pinned.address()
-        } else {
-            pageable.as_ptr() as u64
-        };
-
-        // The first half goes to mapped memory and the second to linear.
-        let mut upload = CopyBatch::new(order);
-        upload.push(mapped.address(), source, 2048);
-        upload.push(linear.address(), source + 2048, 2048);
-        // SAFETY: every range outlives the synchronization below; a source
-        // read during the call is not needed after `submit` returns.
-        unsafe { upload.submit(&stream).unwrap() };
-        if order == SourceOrder::DuringCall {
-            pageable.fill(0xff);
-            // SAFETY: the batch has read its sources.
-            unsafe { pinned.as_mut_slice() }.fill(0xff);
-        }
-
-        // The mapped half moves on through device memory.
-        let transit = DeviceAllocation::linear(DEVICE, 2048).unwrap();
-        let mut forward = CopyBatch::new(SourceOrder::Stream);
-        forward.push(transit.address(), mapped.address(), 2048);
-        let mut download = CopyBatch::new(SourceOrder::Stream);
-        download.push(readback.address(), transit.address(), 2048);
-        download.push(readback.address() + 2048, linear.address(), 2048);
-        // SAFETY: as above.
-        unsafe {
-            forward.submit(&stream).unwrap();
-            download.submit(&stream).unwrap();
-        }
-        stream.synchronize().unwrap();
-
-        assert_eq!(
-            read(&readback),
-            pattern,
-            "{order:?} with a page-locked source: {page_locked}"
-        );
-    }
-}
-
-/// Pitched batches on an SM-partition stream deliver their rows into and
-/// out of mapped (exportable) memory.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn pitched_batches_reach_mapped_memory_on_partition_streams() {
-    let _driver = exclusive_driver();
-    let stream = Stream::partition(DEVICE, &[8, 16]).unwrap().remove(0);
-    let mapped = DeviceAllocation::exportable(DEVICE, 4096, &[]).unwrap();
-    let linear = DeviceAllocation::linear(DEVICE, 4096).unwrap();
-    let readback = PinnedBuffer::new(DEVICE, 1024).unwrap();
-    let mut pinned = PinnedBuffer::new(DEVICE, 1024).unwrap();
-    let pattern: Vec<u8> = (0..1024).map(|index| (index % 251) as u8).collect();
-    // SAFETY: no copy is pending on the buffer.
-    unsafe { pinned.as_mut_slice() }.copy_from_slice(&pattern);
-
-    // 16 rows of 64 bytes: packed on the host, 256 bytes apart on the device.
-    let rows = |destination, destination_pitch, source, source_pitch| Pitched {
-        destination,
-        destination_pitch,
-        destination_layer: 16,
-        source,
-        source_pitch,
-        source_layer: 16,
-        width: 64,
-        height: 16,
-        depth: 1,
-    };
-    for (destination, source) in [
-        ((mapped.address(), 256), (pinned.address(), 64)),
-        ((linear.address(), 256), (mapped.address(), 256)),
-        ((readback.address(), 64), (linear.address(), 256)),
-    ] {
-        let mut batch = PitchedBatch::new(SourceOrder::Stream);
-        batch
-            .push(rows(destination.0, destination.1, source.0, source.1))
-            .unwrap();
-        // SAFETY: every row outlives the synchronization below.
-        unsafe { batch.submit(&stream).unwrap() };
-    }
-    stream.synchronize().unwrap();
-
-    assert_eq!(read(&readback), pattern);
-}
-
-#[test]
-#[ignore = "requires a CUDA device"]
-fn forks_and_fences_outlive_their_partition_stream() {
-    let _driver = exclusive_driver();
-    let parent = Stream::partition(DEVICE, &[16]).unwrap().remove(0);
-    let fork = parent.fork().unwrap();
-    let device = DeviceAllocation::linear(DEVICE, 1024).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 1024).unwrap();
-    let written = Event::new(EventFlags::default());
-
-    // SAFETY: the ranges outlive the synchronizations below.
-    unsafe { memset_d8(device.address(), 7, 1024, &parent).unwrap() };
-    written.record(&parent).unwrap();
-    drop(parent);
-
-    // The fence recorded in the partition still orders a consumer of the
-    // primary context after the recording stream is gone.
-    let consumer = Stream::new(DEVICE).unwrap();
-    consumer.wait_event(&written).unwrap();
-    // SAFETY: as above.
-    unsafe { memcpy_async(host.address(), device.address(), 1024, &consumer).unwrap() };
-    consumer.synchronize().unwrap();
-    assert!(read(&host).iter().all(|byte| *byte == 7));
-
-    // The fork keeps the partition and still executes work in it.
-    assert!(fork.is_partitioned().unwrap());
-    assert_eq!(fork.sm_count().unwrap(), 16);
-    // SAFETY: as above.
-    unsafe {
-        memset_d8(device.address(), 9, 1024, &fork).unwrap();
-        memcpy_async(host.address(), device.address(), 1024, &fork).unwrap();
-    }
-    fork.synchronize().unwrap();
-    assert!(read(&host).iter().all(|byte| *byte == 9));
 }
 
 #[test]
