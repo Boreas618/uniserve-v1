@@ -340,6 +340,32 @@ def test_sensenova_generated_images_keep_the_single_image_bound():
     assert result.grid_shape == (72, 128)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+def test_a_generated_device_image_prepares_without_waiting_for_the_stream():
+    # Serving calls run under PyTorch's error sync debug mode
+    # (`uniserve.executor.Executor`): encoding a generated image back into
+    # the context must not make the host wait for the stream.
+    generated = torch.rand(3, 1152, 2048, device="cuda")
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        result = prepare_tensor_image(
+            _sensenova_processor(),
+            "vit",
+            generated,
+            device=generated.device,
+            signed_unit=False,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+    assert result.grid_shape == (72, 128)
+
+
 def _png(image: Image.Image) -> str:
     """Return an image as a base64 PNG payload, which decodes losslessly."""
     encoded = io.BytesIO()

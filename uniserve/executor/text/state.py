@@ -39,6 +39,7 @@ import numpy as np
 import torch
 
 from uniserve.executor.arena import ALLOCATION_ROUNDING
+from uniserve.tensors import staged
 
 from .philox import request_sampling_key
 from .sampling import FINISH_IDS, NEUTRAL, SamplingParams, logprob_count
@@ -408,7 +409,10 @@ class SlotState:
         index = np.asarray(list(slots), dtype=np.int64)
         if np.any((index < 0) | (index >= self.rows)):
             raise ValueError("request slot is outside the slot state")
-        return torch.from_numpy(index).to(self.penalty_counts.device)
+        device = self.penalty_counts.device
+        return staged(torch.from_numpy(index), device).to(
+            device, non_blocking=True
+        )
 
     def _slot(self, slot: int) -> int:
         if not 0 <= slot < self.rows:
@@ -459,7 +463,10 @@ class SlotState:
         if np.any((values < 0) | (values >= self.vocab)):
             raise ValueError("a generated token is outside the vocabulary")
         counts = np.bincount(values, minlength=self.vocab).astype(np.int32)
-        self.penalty_counts[slot].copy_(torch.from_numpy(counts))
+        self.penalty_counts[slot].copy_(
+            staged(torch.from_numpy(counts), self.penalty_counts.device),
+            non_blocking=True,
+        )
 
     def install_bias(
         self, slot: int, biases: Sequence[tuple[int, float]]
@@ -478,7 +485,10 @@ class SlotState:
         for token, bias in biases:
             if 0 <= token < self.vocab:
                 row[token] = bias
-        self.logit_bias[slot].copy_(torch.from_numpy(row))
+        self.logit_bias[slot].copy_(
+            staged(torch.from_numpy(row), self.logit_bias.device),
+            non_blocking=True,
+        )
 
     def set_predicates(
         self, slots: Sequence[int] | range | np.ndarray, value: bool

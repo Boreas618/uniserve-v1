@@ -47,6 +47,7 @@ from uniserve.processing import (
     StrideResize,
     TowerTransform,
 )
+from uniserve.tensors import staged
 
 Tower = Literal["vit", "vae"]
 
@@ -484,8 +485,14 @@ def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
     if name == "signed_unit":
         return (tensor - 0.5) / 0.5
     if name == "imagenet":
-        mean = tensor.new_tensor(_IMAGENET_MEAN).view(3, 1, 1)
-        std = tensor.new_tensor(_IMAGENET_STD).view(3, 1, 1)
+        # The constants round to the tensor's dtype on the host, as
+        # ``tensor.new_tensor`` would, and reach its device in stream order.
+        mean, std = (
+            staged(torch.tensor(values, dtype=tensor.dtype), tensor.device)
+            .to(tensor.device, non_blocking=True)
+            .view(3, 1, 1)
+            for values in (_IMAGENET_MEAN, _IMAGENET_STD)
+        )
         return (tensor - mean) / std
     raise ValueError(f"unknown image normalization {name!r}")
 

@@ -73,6 +73,31 @@ def test_a_resumed_request_counts_its_generated_tokens():
         state.count_generated(1, [5])
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+def test_slot_writes_are_queued_without_waiting_for_the_stream():
+    # Serving calls run under PyTorch's error sync debug mode
+    # (`uniserve.executor.Executor`): a slot write that made the host wait
+    # for the stream would raise here.
+    lengths = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state = SlotState.allocate(3, 5, torch.bfloat16, lengths)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        state.reset([2])
+        state.count_generated(2, [4, 1, 4])
+        state.install_bias(2, [(1, 0.5), (4, -2.0)])
+        state.set_predicates([1, 2], True)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    assert state.penalty_counts[2].tolist() == [0, 1, 0, 0, 2]
+    assert state.logit_bias[2].tolist() == [0.0, 0.5, 0.0, 0.0, -2.0]
+    assert state.predicates.tolist() == [0, 1, 1, 0]
+
+
 def test_a_slot_selects_its_requests_adapter():
     state, _ = _state()
     state.select_adapter(3, 7)

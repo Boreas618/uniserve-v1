@@ -7,6 +7,8 @@ from typing import ClassVar
 
 import torch
 
+from uniserve.tensors import staged
+
 from .schedule import Schedule
 
 
@@ -207,8 +209,14 @@ class Guidance:
                     conditioned,
                 )
             )
-            factors = values.new_tensor(coefficients).reshape(
-                3, *((1,) * conditioned.ndim)
+            # The coefficients round to the predictions' dtype on the host,
+            # as ``values.new_tensor`` would, and reach the device in stream
+            # order.
+            host = torch.tensor(coefficients, dtype=values.dtype)
+            factors = (
+                staged(host, values.device)
+                .to(values.device, non_blocking=True)
+                .reshape(3, *((1,) * conditioned.ndim))
             )
             guided = _normalize(
                 (values * factors).sum(0),
