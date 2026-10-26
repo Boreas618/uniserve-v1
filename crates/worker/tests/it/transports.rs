@@ -13,14 +13,10 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
-use ipc::PrefixCacheDtype;
 use ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use worker::ffi::{Backing, DType, MemoryKind};
 use worker::memory::LocalMemory;
-use worker::memory::{
-    CacheGroupPlan, CachePlan, CachePlanes, GroupAxis, LatentPlan, LatentStorage, Storage,
-    StorageView,
-};
+use worker::memory::{LatentPlan, LatentStorage, Storage, StorageView};
 use worker::transfer::exports::{self, Location};
 use worker::transfer::{
     Notify, Read, Retirement, Spans, TransferCapacity, Transport, TransportKind, TransportOptions,
@@ -769,40 +765,8 @@ fn exports_larger_than_the_vmm_pool_need_a_host_mechanism() -> Result<()> {
     with_shared.close()
 }
 
-/// A one-group bfloat16 plan: two layers in two columns, 8-token pages of
-/// two heads of `head_dim` elements, each plane with one initialized flag.
-fn cache_plan(head_dim: u32) -> CachePlan {
-    let plane_bytes = u64::from(8 * 2 * head_dim * 2);
-    CachePlan {
-        columns: 2,
-        plane_bytes,
-        quantized: false,
-        unit_bytes: 2 * 2 * (plane_bytes + 1),
-        dtype: PrefixCacheDtype::BFloat16,
-        groups: vec![CacheGroupPlan {
-            window: None,
-            block_size: 8,
-            units_per_page: 1,
-            layers: vec!["a".into(), "b".into()],
-            layer_ids: vec![0, 1],
-            axis: GroupAxis {
-                offset: 0,
-                total: 2,
-            },
-            num_kv_heads: 2,
-            total_kv_heads: 2,
-            kv_head_offset: 0,
-            head_dim,
-            dtype: DType::BF16,
-            compute_dtype: DType::BF16,
-        }],
-        states: Vec::new(),
-        handle: worker::ffi::Handle::none(),
-    }
-}
-
-/// Resident cache pages and latent pages reach a VMM consumer where they lie:
-/// an export larger than the VMM pool needs no host mechanism.
+/// Resident latent pages reach a VMM consumer where they lie: an export
+/// larger than the VMM pool needs no host mechanism.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
@@ -814,13 +778,8 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
         0,
     )?;
 
-    // Six tokens of both columns: 6 MiB of bfloat16, more than the 4 MiB
-    // pool the transports configure.
-    let plan = Arc::new(cache_plan(1 << 17));
-    let planes = CachePlanes::allocate(plan, Some(DEVICE), 2, Some(&stream), &mut LocalMemory)?;
-    let cache_page = Spans::single(planes.page(0, 0, 1, 0, 6)?)?;
-
-    // One page of 768 units of 2048 f32 elements, also 6 MiB.
+    // One page of 768 units of 2048 f32 elements: 6 MiB, more than the
+    // 4 MiB pool the transports configure.
     let latents = LatentStorage::allocate(
         &LatentPlan {
             request_pool_size: 1,
@@ -834,18 +793,16 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
         "latent_banks",
         &mut LocalMemory,
     )?;
-    let latent_page = latents.spans(0, &[1], 768)?;
+    let source = latents.spans(0, &[1], 768)?;
+    assert_eq!(source.nbytes(), 6 << 20);
 
-    for source in [cache_page, latent_page] {
-        assert_eq!(source.nbytes(), 6 << 20);
-        let locations = located(&transports, &source, None, &[1], Some(&stream), |_| Ok(()))?;
-        assert_eq!(
-            kinds(&locations),
-            [TransportKind::Local, TransportKind::CudaVmm]
-        );
-        exports::release(&locations)?;
-        settle(&transports, &capacity, &events)?;
-    }
+    let locations = located(&transports, &source, None, &[1], Some(&stream), |_| Ok(()))?;
+    assert_eq!(
+        kinds(&locations),
+        [TransportKind::Local, TransportKind::CudaVmm]
+    );
+    exports::release(&locations)?;
+    settle(&transports, &capacity, &events)?;
     transports.close()
 }
 

@@ -646,4 +646,151 @@ mod tests {
         assert_eq!(payloads(2), scales);
         Ok(())
     }
+
+    /// A device cache export larger than the rank's VMM pool reaches a
+    /// same-host VMM reader without a host mechanism. Planes that are one
+    /// allocation per field are exported where the pages lie, as resident
+    /// memory; planes split into segments, which other ranks cannot map as
+    /// one, through a frozen copy that is the export's own and not resident.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn device_exports_larger_than_the_vmm_pool_reach_vmm_readers() -> Result<()> {
+        use cuda::{DeviceId, Stream};
+
+        let device = DeviceId(0);
+        let stream = Stream::new(device)?;
+        // Two-unit pools of one group of two layers in two columns, with
+        // 8-token pages of two bfloat16 KV heads: an exported field of one
+        // page is 64 * head_dim bytes, 8 MiB and 5 MiB, both more than the
+        // 4 MiB VMM pool. Unit planes of 4 MiB split the pool into two
+        // segments of one unit; planes of 2.5 MiB fill whole 2 MiB
+        // allocation granules only four units at a time, so the two-unit
+        // pool is too small to split.
+        for (head_dim, segmented) in [(1_u32 << 17, true), (81_920, false)] {
+            let plane_bytes = u64::from(8 * 2 * head_dim * 2);
+            let plan = Arc::new(CachePlan {
+                columns: 2,
+                plane_bytes,
+                quantized: false,
+                unit_bytes: 2 * 2 * (plane_bytes + 1),
+                dtype: PrefixCacheDtype::BFloat16,
+                groups: vec![CacheGroupPlan {
+                    window: None,
+                    block_size: 8,
+                    units_per_page: 1,
+                    layers: vec!["a".into(), "b".into()],
+                    layer_ids: vec![0, 1],
+                    axis: GroupAxis {
+                        offset: 0,
+                        total: 2,
+                    },
+                    num_kv_heads: 2,
+                    total_kv_heads: 2,
+                    kv_head_offset: 0,
+                    head_dim,
+                    dtype: DType::BF16,
+                    compute_dtype: DType::BF16,
+                }],
+                states: Vec::new(),
+                handle: crate::ffi::Handle::none(),
+            });
+            let planes = CachePlanes::allocate(
+                Arc::clone(&plan),
+                Some(device),
+                2,
+                Some(&stream),
+                &mut crate::memory::LocalMemory,
+            )?;
+            assert_eq!(
+                planes.segments().is_some(),
+                segmented,
+                "whether a two-unit pool of {plane_bytes}-byte planes splits"
+            );
+            let mut tables = BlockTables::new(plan.group_shapes()?, 1, 1, 2)?;
+            let update = tables.prepare(&[BlockTable {
+                request_pool_idx: 1,
+                group_id: 0,
+                start_page: 0,
+                unit_ids: vec![UnitId(1)],
+                allocated_tokens: 8,
+            }])?;
+            tables.commit(update);
+
+            // Consumer 1 shares this host and reads over CUDA VMM.
+            let capacity = Arc::new(TransferCapacity::new(1 << 26, 8)?);
+            let events = EventPool::new();
+            let transports = Transports::new(
+                &[TransportKind::Local, TransportKind::CudaVmm],
+                Arc::clone(&capacity),
+                Arc::clone(&events),
+                &TransportOptions {
+                    source: WorkerEndpoint {
+                        host: "host".into(),
+                        address_space: "space".into(),
+                        incarnation: "incarnation".into(),
+                    },
+                    acknowledgment_slot: 0,
+                    host_slots: HashSet::from([0, 1]),
+                    cross_host_consumers: false,
+                    vmm_pool_bytes: 1 << 22,
+                },
+            )?;
+            let buffer = BufferId {
+                owner: RequestKey::new(1, RequestId(7), 1),
+                producer_call_id: CallId::new(2, 0),
+                output_index: 0,
+                generation: 2,
+            };
+            let mut accesses = UnitAccesses::default();
+            let exported = export(
+                &mut accesses,
+                &TransferBases::default(),
+                &tables,
+                &planes,
+                1,
+                8,
+                "target",
+                buffer,
+                &transports,
+                &[1],
+                Some(&stream),
+            )?;
+            let (transfer, locations) = exported.locate(&mut accesses)?;
+
+            for (field, tensor) in transfer.groups[0].tensors.iter().enumerate() {
+                let kinds: Vec<_> = tensor.locations.iter().map(TransportKind::of).collect();
+                assert_eq!(
+                    kinds,
+                    [TransportKind::Local, TransportKind::CudaVmm],
+                    "field {field} of {plane_bytes}-byte planes"
+                );
+                let resident: Vec<bool> = tensor
+                    .locations
+                    .iter()
+                    .filter_map(|locator| match &locator.transport {
+                        TransferTransport::CudaVmm { resident, .. } => Some(*resident),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    resident,
+                    [!segmented],
+                    "field {field} of {plane_bytes}-byte planes"
+                );
+            }
+
+            // Every export retires once released and its device work drained.
+            exports::release(&locations)?;
+            stream.synchronize()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while capacity.used() != 0 && std::time::Instant::now() < deadline {
+                events.drain()?;
+                transports.reap()?;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(capacity.used(), 0, "the exports retire after release");
+            transports.close()?;
+        }
+        Ok(())
+    }
 }
