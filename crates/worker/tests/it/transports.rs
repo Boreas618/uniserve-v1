@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::ops::Range;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
@@ -27,6 +27,8 @@ use worker::transfer::{
     Transports, fetch,
 };
 use worker::{Error, ErrorCode, EventPool, Result, WorkerError};
+
+use crate::device::exclusive_driver;
 
 /// Export `source` on `stream` and take its locations, completing at once.
 fn located(
@@ -538,25 +540,10 @@ const DEVICE: DeviceId = DeviceId(0);
 /// The child half of the two-process VMM test reads this variable.
 const CHILD_LOCATOR: &str = "UNISERVE_TEST_VMM_LOCATOR";
 
-/// Serializes the device tests of this binary.
-///
-/// One test holds a stream in a host function to observe the work queued
-/// behind it (see [`block`]). While a stream is held, a driver call that
-/// waits for all of the context's queued work (`cuMemFree`,
-/// `cuMemFreeHost`) cannot return, and it keeps driver locks that every
-/// other call needs, including the calls the holding test makes before it
-/// releases the stream. No other test may use the driver meanwhile, so every
-/// device test takes this lock first.
-static DRIVER: Mutex<()> = Mutex::new(());
-
-fn exclusive_driver() -> MutexGuard<'static, ()> {
-    DRIVER.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Blocks `stream` in a host function until the returned sender is used.
 ///
 /// Until then the caller must not release device or pinned memory: the
-/// release would wait on the held stream (see [`DRIVER`]). Releases queued
+/// release would wait on the held stream (see `crate::device`). Releases queued
 /// earlier are flushed first for the same reason.
 fn block(stream: &Stream) -> Result<mpsc::Sender<()>> {
     reclaim::flush()?;

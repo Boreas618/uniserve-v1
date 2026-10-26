@@ -17,6 +17,8 @@ use worker::memory::{
 };
 use worker::{EventPool, Result};
 
+use crate::device::exclusive_driver;
+
 const DEVICE: DeviceId = DeviceId(0);
 
 /// Copy a device view's bytes to the host (drains `stream`).
@@ -53,6 +55,7 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn block_table_installs_and_clears_write_device_tables() -> Result<()> {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE)?;
     let groups = vec![
         GroupShape::new(16, 1, None)?,
@@ -128,6 +131,7 @@ fn block_table_installs_and_clears_write_device_tables() -> Result<()> {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn output_readback_waits_for_device_copies_into_lent_words() -> Result<()> {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE)?;
     let events = EventPool::default();
     let tokens = Storage::device(DEVICE, 3 * size_of::<i64>())?;
@@ -199,6 +203,7 @@ fn fp8_plan() -> CachePlan {
 #[test]
 #[ignore = "requires a CUDA device"]
 fn cache_planes_start_reset_and_reset_their_leading_units() -> Result<()> {
+    let _driver = exclusive_driver();
     let stream = Stream::new(DEVICE)?;
     let plan = Arc::new(fp8_plan());
     assert_eq!(plan.unit_bytes, 276);
