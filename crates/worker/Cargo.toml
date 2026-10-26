@@ -47,12 +47,6 @@ uuid.workspace = true
 name = "storage_harness"
 crate-type = ["cdylib"]
 
-# A TVM-FFI library that Python tests load to drive the image runners with
-# the real numerical interface (tests/python/integration/runtime).
-[[example]]
-name = "image_harness"
-crate-type = ["cdylib"]
-
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
@@ -60,7 +54,8 @@ tempfile.workspace = true
 [lints]
 workspace = true
 
-# Expert-step agreement latency over the host group (separate processes).
+# Fixed-width host gather latency, an expert step's agreement round
+# (separate processes).
 [[bench]]
-name = "expert_agreement"
+name = "host_gather"
 harness = false

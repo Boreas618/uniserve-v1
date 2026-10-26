@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from uniserve.bindings.context import ExecutionContext
-from uniserve.nn.routing import RoutedTensor, RouteSpan
+from uniserve.nn.routing import IndexedRoutes, SparseRoute
 
 pytestmark = pytest.mark.unit
 
@@ -46,23 +46,37 @@ def test_expert_modules_preserve_route_values_and_packed_order(
         text.bias.fill_(1)
         flow.weight.copy_(torch.eye(2) * 3)
         flow.bias.fill_(-1)
-    spans = tuple(
-        RouteSpan(route, 2 * index, 2) for index, route in enumerate(routes)
-    )
+    # Each route takes two consecutive tokens; flow is the dense route
+    # whenever it appears, and text takes over its tokens.
     values = torch.arange(
         4 * len(routes), dtype=torch.float32, device=device
     ).reshape(-1, 2)
     expected = torch.cat(
         [
-            values[span.start : span.stop] * (2 if span.route == "text" else 3)
-            + (1 if span.route == "text" else -1)
-            for span in spans
+            values[2 * index : 2 * index + 2] * (2 if route == "text" else 3)
+            + (1 if route == "text" else -1)
+            for index, route in enumerate(routes)
         ]
     )
-    routed = RoutedTensor.from_packed(
-        values, spans, routes=frozenset({"text", "flow"})
-    )
+    text = [
+        token
+        for index, route in enumerate(routes)
+        if route == "text"
+        for token in (2 * index, 2 * index + 1)
+    ]
+    indexed = (
+        IndexedRoutes("text")
+        if "flow" not in routes
+        else IndexedRoutes(
+            "flow",
+            (
+                SparseRoute.of(
+                    "text", torch.tensor(text, dtype=torch.int64, device=device)
+                ),
+            ),
+        )
+    ).shard(0, values.shape[0])
     with ExecutionContext(modules) as context, torch.inference_mode():
         context.prepare(None)
-        actual = routed.apply(modules).packed(spans)
+        actual = indexed.apply(modules, values)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

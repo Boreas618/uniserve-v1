@@ -164,8 +164,9 @@ class CausalLMRunner:
             or ``None``.
         weights: The distributed expert weights' prefetch object, or
             ``None``.
-        collectives: The ``NativeCollectives`` of the model's communicators
-            on the stream, or ``None``.
+        collectives: The process group of each of the model's
+            multi-member communicators on the stream, by communicator name,
+            or ``None``.
         rows: The most rows one forward evaluates.
         tokens: The most tokens one forward evaluates.
         width: The most pages one row selects from a block table.

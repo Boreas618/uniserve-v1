@@ -20,7 +20,7 @@ use cuda::{DeviceId, Protection};
 use tvm_ffi::Any;
 
 use super::loading::{Description, LoadedModel};
-use crate::config::WorkerLaunch;
+use crate::config::{ExpertUnion, WorkerLaunch};
 use crate::ffi::{Backing, Handle, Interpreter, MemoryKind};
 use crate::memory::CachePlan;
 use crate::memory::allocation::Storage;
@@ -63,7 +63,7 @@ impl WeightUpdate {
             .launch
             .expert_parallel
             .as_ref()
-            .is_some_and(|union| union.exchange == "dwdp")
+            .is_some_and(ExpertUnion::prefetches_weights)
         {
             return Some("DWDP keeps the routed experts in memory of the expert union");
         }

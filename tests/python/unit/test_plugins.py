@@ -163,7 +163,6 @@ def test_a_plugins_graph_policy_changes_the_entries_it_returns(
         "mode": "auto",
         "decode": [1, 2, 4, 8],
         "prefill": [512],
-        "flow_batches": [1],
         "flow_shapes": [[1024, 1024]],
     }
     chosen = json.loads(plugins.graph_policy(json.dumps(configured)))

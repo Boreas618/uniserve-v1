@@ -1,7 +1,8 @@
-"""A video executor's host media: encoded unit rows, the MP4 under assembly,
-condition rows and the reports host tasks send the worker
-(``uniserve.executor.video.media``).
-"""  # noqa: D205
+"""A video executor's host media (``uniserve.executor.video.media``).
+
+Encoded unit rows, the MP4 under assembly, condition rows and the reports
+host tasks send the worker.
+"""
 
 from __future__ import annotations
 
@@ -71,9 +72,10 @@ def test_the_soundtrack_spans_the_video_duration_rounded_half_to_even():
 
 
 class _Recorder:
-    """A container recording what the session hands it: a unit ends at its
-    offset plus its length.
-    """  # noqa: D205
+    """A container recording what the session hands it.
+
+    A unit ends at its offset plus its length.
+    """
 
     log: list[str] = []
 

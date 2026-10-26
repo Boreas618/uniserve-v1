@@ -42,18 +42,25 @@ from uniserve.models import (
 )
 
 __all__ = [
+    "CANVAS_MULTIPLE",
+    "OUTSIDE_PLAN",
     "Admission",
     "Canvas",
+    "ConditionShape",
     "Layout",
     "LayoutFields",
     "MediaPlan",
     "SampleLayout",
     "SamplePages",
+    "SampleRows",
     "StateEnvelope",
     "VideoModel",
     "VideoSize",
     "admitted_canvases",
+    "decode_conditioning",
     "prompt_capacities",
+    "rows_per_frame",
+    "vision_spans",
 ]
 
 # The refusal of a request whose frame count, canvas or prompt lies outside
@@ -78,6 +85,11 @@ REQUEST_PAGES = 8
 # Each modality's sample starts on this element boundary.
 SAMPLE_ALIGNMENT = 256
 
+# Pixels per side of a latent patch: a canvas side is a multiple of it, and
+# one latent frame holds one denoiser row per patch
+# (``models::video::plan::CANVAS_MULTIPLE``).
+CANVAS_MULTIPLE = 32
+
 _ROLES = {
     "first_frame": ConditionRole.FIRST_FRAME,
     "last_frame": ConditionRole.LAST_FRAME,
@@ -97,9 +109,11 @@ def _elements(shape: Sequence[int]) -> int:
 
 
 def requested_frames(seconds: float, frame_rate: int) -> int:
-    """Frames of ``seconds`` of video at ``frame_rate``: rounded half to
-    even, as the reference implementations round with Python's ``round``.
-    """  # noqa: D205
+    """Frames of ``seconds`` of video at ``frame_rate``.
+
+    Rounded half to even, as the reference implementations round with
+    Python's ``round``.
+    """
     return round(seconds * frame_rate)
 
 
@@ -110,10 +124,18 @@ class Canvas(NamedTuple):
     height: int
 
 
+def rows_per_frame(canvas: Canvas) -> int:
+    """Denoiser rows of one latent frame of ``canvas``: one per patch."""
+    return (canvas.width // CANVAS_MULTIPLE) * (
+        canvas.height // CANVAS_MULTIPLE
+    )
+
+
 class Layout(NamedTuple):
-    """A layout's extents: ``[frames, width, height, text_rows,
-    condition_rows]``.
-    """  # noqa: D205
+    """A layout's extents.
+
+    ``[frames, width, height, text_rows, condition_rows]``.
+    """
 
     frames: int
     width: int
@@ -186,9 +208,11 @@ class VideoSize:
 
 
 def vision_spans(tags: Sequence[int]) -> tuple[tuple[int, int], ...]:
-    """The vision blocks of a presented prompt: maximal runs of tag 0 in its
-    token tags, as ``(start, stop)`` token ranges.
-    """  # noqa: D205
+    """The vision blocks of a presented prompt.
+
+    They are the maximal runs of tag 0 in its token tags, as ``(start,
+    stop)`` token ranges.
+    """
     spans = []
     start = None
     for index, tag in enumerate(tags):
@@ -246,10 +270,10 @@ class LayoutFields:
     workspace: int
 
     def storage(self) -> int:
-        """Elements of the state and workspace the denoiser holds for the
-        layout on this rank: what the layout takes of the storage every
-        layout shares.
-        """  # noqa: D205
+        """Elements of the layout's state and workspace on this rank.
+
+        They are what the layout takes of the storage every layout shares.
+        """
         return sum(field.elements for field in self.state) + self.workspace
 
 
@@ -289,9 +313,10 @@ class VideoModel:
         )
 
     def facts(self) -> dict[str, Any]:
-        """What the engine is told about the denoiser
-        (``models::video::DenoiserInfo`` without its canvases).
-        """  # noqa: D205
+        """What the engine is told about the denoiser.
+
+        ``models::video::DenoiserInfo`` without its canvases.
+        """
         denoiser = self.denoiser
         shifts = denoiser.schedule_shifts
         limits = denoiser.max_references
@@ -486,8 +511,7 @@ def admitted_canvases(
     resolutions: Sequence[str],
     aspect_ratios: Sequence[str],
 ) -> list[tuple[int, str, Canvas]]:
-    """The canvases a deployment prepares and admits, in the order it names
-    them.
+    """The canvases a deployment prepares and admits, in its order.
 
     ``offered`` are the canvases the denoiser generates, each named by the
     ``(short_edge, aspect_ratio)`` a request selects it with. Every
@@ -501,7 +525,7 @@ def admitted_canvases(
         ValueError: A resolution is not a class, or a name repeats.
         SetupError: The denoiser offers no canvas, or names none by a
             selected pair.
-    """  # noqa: D205
+    """
     if not offered:
         raise SetupError("the video denoiser prepares no canvas")
     if not resolutions and not aspect_ratios:
@@ -544,18 +568,18 @@ def admitted_canvases(
 
 
 def prompt_capacities(listed: Sequence[int], max_text_tokens: int) -> list[int]:
-    """The prompt capacities, in tokens, a deployment prepares layouts for,
-    in increasing order.
+    """The prompt capacities, in tokens, a deployment prepares layouts for.
 
-    The prompt capacity ``max_text_tokens`` (``--max-model-len``) is always
-    the largest. ``listed`` (``video_config.text_capacities``) names the
-    capacities below it; a listed capacity equal to it repeats the largest.
+    They ascend. The prompt capacity ``max_text_tokens``
+    (``--max-model-len``) is always the largest. ``listed``
+    (``video_config.text_capacities``) names the capacities below it; a
+    listed capacity equal to it repeats the largest.
     Without a list the capacities are :data:`TEXT_CAPACITY_FIRST`, then
     steps of :data:`TEXT_CAPACITY_STEP` below the prompt capacity.
 
     Raises:
         ValueError: A listed capacity is zero or above the prompt capacity.
-    """  # noqa: D205
+    """
     if any(tokens == 0 or tokens > max_text_tokens for tokens in listed):
         raise ValueError(
             "video text capacities must be positive and not exceed the "
@@ -582,28 +606,29 @@ class _CanvasExtent:
 
 
 def preparation_order(extents: Sequence[_CanvasExtent]) -> list[Canvas]:
-    """The order a deployment prepares its canvases in: decreasing
-    generated elements, in their given order on ties.
+    """The order a deployment prepares its canvases in.
 
-    Generated elements count the complete sample, the same on every rank,
-    so every rank prepares, warms and captures its layouts in one order,
-    the order in which their forwards exchange tensors with the other
-    ranks.
-    """  # noqa: D205
+    Decreasing generated elements, in their given order on ties. Generated
+    elements count the complete sample, the same on every rank, so every
+    rank prepares, warms and captures its layouts in one order, the order
+    in which their forwards exchange tensors with the other ranks.
+    """
     ordered = sorted(extents, key=lambda extent: -extent.generated)
     return [extent.canvas for extent in ordered]
 
 
 def storage_leading(extents: Sequence[_CanvasExtent]) -> int:
-    """The index of the canvas whose largest layout takes the most state
-    and workspace on this rank, the first such canvas on ties: that layout
-    sizes the storage every layout of the rank shares.
+    """The canvas whose largest layout takes the most storage on this rank.
+
+    Returns the canvas's index: the first such canvas on ties. The storage
+    is the layout's state and workspace, and that layout sizes the storage
+    every layout of the rank shares.
 
     Generated rows alone do not select it: 768p 21:9 generates as many rows
     as 16:9 but pads to more sparse-attention tiles. Under sequence
     parallelism a rank's share of a layout differs between ranks, so ranks
     may select different canvases.
-    """  # noqa: D205
+    """
     leading = 0
     for index, extent in enumerate(extents):
         if extent.storage > extents[leading].storage:
@@ -647,7 +672,7 @@ class MediaPlan:
     # (:func:`storage_leading`); it sizes the storage every layout shares.
     maximum: Layout
     # Startup layouts: canvases (in preparation order) by frame counts
-    # (longest first) by prompt capacities (largest first). None for a
+    # (longest first) by prompt capacities (largest first). Empty for a
     # denoiser that is not text-only: every request it admits brings
     # conditions.
     layouts: list[Layout]
@@ -789,13 +814,13 @@ class MediaPlan:
         return self.frame_counts[-1]
 
     def startup(self) -> list[Layout]:
-        """Every layout startup prepares, each once, in the order every
-        rank shares: ``layouts``, ``conditioned``, then ``largest``.
+        """Every layout startup prepares, each once, in a shared order.
 
-        A layout's warm step exchanges tensors with the other ranks, so the
-        order must not depend on this rank's share of a layout; the
-        ``maximum``, which does, is one of ``largest``.
-        """  # noqa: D205
+        The order every rank shares is ``layouts``, ``conditioned``, then
+        ``largest``. A layout's warm step exchanges tensors with the other
+        ranks, so the order must not depend on this rank's share of a
+        layout; the ``maximum``, which does, is one of ``largest``.
+        """
         prepared: list[Layout] = []
         for layout in (*self.layouts, *self.conditioned, *self.largest):
             if layout not in prepared:
@@ -803,9 +828,10 @@ class MediaPlan:
         return prepared
 
     def refusal(self, size: VideoSize) -> str | None:
-        """The refusal of a size outside the plan's frame counts, canvases
-        or prompt capacity; ``None`` for a size the plan admits.
-        """  # noqa: D205
+        """The refusal of a size outside the plan; ``None`` if it admits it.
+
+        The plan admits its frame counts, canvases and prompt capacity.
+        """
         if (
             size.frames not in self.frame_counts
             or size.canvas not in self.canvases
@@ -817,11 +843,12 @@ class MediaPlan:
     def startup_layout(
         self, frames: int, canvas: Canvas, capacity: int, conditions: bool
     ) -> Layout | None:
-        """The startup layout of a size at prompt capacity ``capacity``:
-        one of ``layouts`` for a size without conditions and one of
+        """The startup layout of a size at prompt capacity ``capacity``.
+
+        One of ``layouts`` for a size without conditions and one of
         ``conditioned`` for a size with them, in the order :meth:`new` lists
-        them.
-        """  # noqa: D205
+        them; ``None`` outside the plan.
+        """
         if (
             canvas not in self.canvases
             or frames not in self.frame_counts
@@ -893,13 +920,14 @@ class SamplePages:
 
     @classmethod
     def plan(cls, model: VideoModel, largest: Sequence[Layout]) -> SamplePages:
-        """Pages holding the complete samples of every ``largest`` layout:
-        the global extents bound every sequence-parallel shard, even when a
+        """Pages holding the complete samples of every ``largest`` layout.
+
+        The global extents bound every sequence-parallel shard, even when a
         shorter prompt moves more media rows onto one rank.
 
         Raises:
             SetupError: The denoiser describes empty samples.
-        """  # noqa: D205
+        """
         capacity = max(
             sum(
                 _aligned(model.latent_elements(name, layout))
@@ -915,10 +943,6 @@ class SamplePages:
     def for_slot(self, slot: int) -> range:
         """Page zero is padding; every slot owns a consecutive run after it."""
         return range(1 + (slot - 1) * self.pages, 1 + slot * self.pages)
-
-    def pool_pages(self, slots: int) -> int:
-        """Pages of a pool of ``slots`` slots, the padding page included."""
-        return slots * self.pages + 1
 
 
 @dataclass(frozen=True)
@@ -1051,6 +1075,6 @@ class StateEnvelope:
         )
 
 
-def conditioning(payload: bytes | str) -> dict[str, Any]:
+def decode_conditioning(payload: bytes | str) -> dict[str, Any]:
     """A request's decoded ``models::video::Conditioning``."""
     return json.loads(payload)

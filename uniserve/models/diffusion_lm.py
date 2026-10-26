@@ -179,13 +179,12 @@ class DiffusionLM(nn.Module):
         """The width of the hidden states and token embeddings."""
         return int(self.backbone.hidden_size)
 
-    def compute_dtype(self) -> str:
-        """The name of the element type the layers compute in."""
-        dtype = next(self.backbone.layers.parameters()).dtype
-        return str(dtype).removeprefix("torch.")
+    def compute_dtype(self) -> torch.dtype:
+        """The element type the layers compute in."""
+        return next(self.backbone.layers.parameters()).dtype
 
-    def embedding_dtype(self) -> str:
-        """The name of the token embedding's element type.
+    def embedding_dtype(self) -> torch.dtype:
+        """The token embedding's element type.
 
         Self-conditioning embeddings have it. A stage without the embedding
         table reports its compute type.
@@ -193,7 +192,8 @@ class DiffusionLM(nn.Module):
         embedding = self.backbone.embedding
         if embedding is None:
             return self.compute_dtype()
-        return str(embedding.weight.dtype).removeprefix("torch.")
+        # ``nn.Module`` types an attribute read as ``Tensor | Module``.
+        return cast(torch.Tensor, embedding.weight).dtype
 
     def attend_widths(self) -> list[int]:
         """Per-token widths of the state ``attend`` returns.
@@ -205,10 +205,10 @@ class DiffusionLM(nn.Module):
             return []
         return [int(width) for width in self.backbone.attend_widths]
 
-    def stage(self) -> list[int]:
-        """``[rank, size]`` of this rank in the model's pipeline."""
+    def stage(self) -> tuple[int, int]:
+        """``(rank, size)`` of this rank in the model's pipeline."""
         pipeline = self.backbone._pipeline
-        return [int(pipeline.rank), int(pipeline.size)]
+        return int(pipeline.rank), int(pipeline.size)
 
     def generates(self) -> bool:
         """Whether this rank can denoise blocks.

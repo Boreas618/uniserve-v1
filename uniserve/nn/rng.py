@@ -1,10 +1,11 @@
-"""Schedule-stable seeds of a request's noise draws.
+"""Schedule-stable seeds of a request's random draws.
 
-The rank's token sampler draws its uniforms in Rust
-(``ipc::philox``); the Python library draws only normal noise,
-from ``torch`` generators seeded here. A seed is a SplitMix64 fold of the
-request's seed and a semantic coordinate, so a draw depends on which image
-or encoding it belongs to, never on batch order, execution depth or replay.
+A seed is a SplitMix64 fold of the request's seed and a semantic
+coordinate, so a draw depends on which token, image or encoding it belongs
+to, never on batch order, execution depth or replay. Normal noise is drawn
+from ``torch`` generators seeded here; the text executor's sampler derives
+its Philox keys with :func:`splitmix_coordinate`
+(``uniserve.executor.text.philox``).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ def flow_noise_seed(request_seed: int, semantic_image_index: int) -> int:
     """Return the schedule-stable seed for one semantic image's initial
     noise.
     """  # noqa: D205
-    return _splitmix_coordinate(request_seed, semantic_image_index)
+    return splitmix_coordinate(request_seed, semantic_image_index)
 
 
 def posterior_noise_seed(request_seed: int, encode_index: int) -> int:
@@ -27,10 +28,10 @@ def posterior_noise_seed(request_seed: int, encode_index: int) -> int:
     A second mixing step keeps these seeds apart from the flow-noise seeds
     of the same request and index.
     """
-    return _splitmix_coordinate(flow_noise_seed(request_seed, encode_index), 0)
+    return splitmix_coordinate(flow_noise_seed(request_seed, encode_index), 0)
 
 
-def _splitmix_coordinate(seed: int, coordinate: int) -> int:
+def splitmix_coordinate(seed: int, coordinate: int) -> int:
     """Mix a seed and logical coordinate into one deterministic unsigned
     64-bit value.
     """  # noqa: D205
@@ -42,4 +43,4 @@ def _splitmix_coordinate(seed: int, coordinate: int) -> int:
     return (value ^ (value >> 31)) & _U64
 
 
-__all__ = ["flow_noise_seed", "posterior_noise_seed"]
+__all__ = ["flow_noise_seed", "posterior_noise_seed", "splitmix_coordinate"]

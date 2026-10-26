@@ -1,6 +1,7 @@
-"""What a video rank admits, the layouts it prepares and where a request's
-state lives (``uniserve.executor.video.plan``).
-"""  # noqa: D205
+"""What a video rank admits (``uniserve.executor.video.plan``).
+
+The layouts it prepares and where a request's state lives.
+"""
 
 from __future__ import annotations
 
@@ -127,9 +128,10 @@ def test_the_prompt_capacity_is_the_largest_text_capacity():
 
 
 def _plan() -> MediaPlan:
-    """A plan of two canvases, two frame counts and two prompt capacities,
-    whose startup layouts name what they were sized for.
-    """  # noqa: D205
+    """A plan of two canvases, two frame counts and two prompt capacities.
+
+    Its startup layouts name what they were sized for.
+    """
     canvases = [Canvas(1344, 768), Canvas(768, 1344)]
     layouts = [
         Layout(frames, canvas.width, canvas.height, capacity, 0)
@@ -212,9 +214,10 @@ def test_a_size_with_conditions_takes_its_widened_startup_layout_under_graphs():
 
 
 def _model(condition_rows: int, holds: dict[int, bool]) -> SimpleNamespace:
-    """A denoiser that sizes every request at ``condition_rows`` and holds
-    it in the layouts of the text rows ``holds`` names.
-    """  # noqa: D205
+    """A denoiser that sizes every request at ``condition_rows``.
+
+    It holds a request in the layouts of the text rows ``holds`` names.
+    """
     return SimpleNamespace(
         size=lambda size: SimpleNamespace(condition_rows=condition_rows),
         resolve=lambda layout: layout,
@@ -270,7 +273,7 @@ def test_condition_latents_follow_their_rows_across_encoding_rounds():
         [(3, 0, 3)],
         [(3, 3, 2)],
     ]
-    # Reads that hold other rows than the request planned are refused.
+    # Reads that hold other rows than the conditions take are refused.
     for rounds, tracks in (([6, 5], 5), ([6, 5, 3], 4), ([6, 5, 3], None)):
         with pytest.raises(ValueError):
             condition_spans(conditions, rounds, tracks)
@@ -287,10 +290,12 @@ def _field(
 def _layout(
     video: int, audio: int, table: int, rows: int, shared: int = 0
 ) -> LayoutFields:
-    """One layout's fields on a rank that holds every sample row but the
-    video's last ``shared`` rows: a video and an audio sample of width 8, a
-    timestep table and ``rows`` prompt rows of width 4.
-    """  # noqa: D205
+    """One layout's fields on a rank short of the video's last rows.
+
+    The rank holds every sample row but the video's last ``shared`` rows: a
+    video and an audio sample of width 8, a timestep table and ``rows``
+    prompt rows of width 4.
+    """
     return LayoutFields(
         state=(
             _field("video", torch.float32, (video - shared) * 8, True),
@@ -375,4 +380,3 @@ def test_slots_own_consecutive_pages_after_the_padding_page():
     pages = SamplePages(256, 3)
     assert pages.for_slot(1) == range(1, 4)
     assert pages.for_slot(2) == range(4, 7)
-    assert pages.pool_pages(2) == 7

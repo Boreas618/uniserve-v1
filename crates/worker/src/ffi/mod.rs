@@ -17,15 +17,17 @@
 //! Callers must not hold a lock while calling into Python: a callback may
 //! block on work that needs it.
 
+mod call;
 mod dlpack;
 mod function;
 mod handle;
 mod interpreter;
 
+pub(crate) use call::{Argument, MethodCall};
 pub use dlpack::{Backing, DType, MemoryKind};
 pub(crate) use dlpack::{contiguous_strides, export};
 pub use function::{DeferredCall, Function, integer_list, integers, is_none};
 pub(crate) use function::{list, strings, texts};
 pub use handle::Handle;
-pub use interpreter::{Interpreter, cooperative};
+pub use interpreter::Interpreter;
 pub(crate) use tvm_ffi::{Shape, Tensor};

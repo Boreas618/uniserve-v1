@@ -1,26 +1,25 @@
 //! Bounded host output storage and per-batch readback lifetimes.
 //!
-//! A batch's results are copied device-to-host into the batch's range of
-//! its runtime's word arena (`OutputPool`): one arena per runtime on each
-//! lane, allocated when that runtime starts, page-locked for device copies
-//! and pageable on a CPU lane. Integer token columns fill the range
-//! from its front, raw byte captures from its back. The copies are ordered
-//! on the producing streams and fenced by events; the host reads the words
-//! only after those fences complete, widening narrower token columns to 64
-//! bits on the host.
+//! A batch's results reach the host in the batch's range of a word arena
+//! (`OutputPool`): one arena per executor lane and one for the transfer
+//! runtime, allocated at startup, page-locked for device copies and
+//! pageable on a CPU lane. The producer writes the range itself, on the
+//! batch's stream in its own order: `int64` words from the range's front
+//! ([`OutputBuffer::lend_words`]) and raw bytes, such as decoded pixels,
+//! from its back ([`OutputBuffer::lend_bytes`]). The lease's seal fences
+//! those copies; the host reads the words only after the fences complete.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use cuda::{DeviceId, Event, SourceOrder};
+use cuda::{DeviceId, Event};
 use ipc::TokenLogprob;
 
-use crate::ffi::{Backing, DType, MemoryKind};
+use crate::ffi::{Backing, DType};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Issue;
-use crate::transfer::{Spans, copy_planner};
 use crate::{Error, EventPool, Result, lock};
 
 mod logprobs;
@@ -46,10 +45,6 @@ impl OutputStorage {
             offset: 0,
             words,
         })
-    }
-
-    pub fn words(&self) -> usize {
-        self.words
     }
 
     /// Byte offset of the first word in `memory`.
@@ -85,10 +80,10 @@ pub struct OutputBuffer {
     rows: Vec<bool>,
     remaining: usize,
     tokens: usize,
-    /// Token captures narrower than 64 bits: `(word offset, count, dtype)`.
-    /// Their raw elements are packed at the start of their reserved words and
-    /// widened on readback.
-    narrow: Vec<(usize, usize, DType)>,
+    /// The token words lent to a producer that writes them itself
+    /// ([`Self::lend_words`]), until it states what it wrote
+    /// ([`Self::register_lent`]).
+    lent: Option<Range<usize>>,
     readback: Option<Vec<i64>>,
     logprob_layouts: HashMap<(usize, usize), LogprobLayout>,
     logprobs: HashMap<(usize, usize), HashMap<usize, Vec<TokenLogprob>>>,
@@ -114,7 +109,7 @@ impl OutputBuffer {
             rows: vec![false; rows],
             remaining: rows,
             tokens: 0,
-            narrow: Vec::new(),
+            lent: None,
             readback: None,
             logprob_layouts: HashMap::new(),
             logprobs: HashMap::new(),
@@ -152,133 +147,37 @@ impl OutputBuffer {
             .ok_or_else(|| Error::Invariant("output storage has retired".into()))
     }
 
-    /// Copy an integer token column into the next token words, on `stream`
-    /// for a device column. Returns the capture's `(word offset, count)`.
-    ///
-    /// The source holds `int64`, `int32` or `uint32` tokens in any layout;
-    /// narrower values are widened when read back. The producing stream must
-    /// remain alive until the buffer is sealed.
-    pub fn capture(
+    /// Lend `count` bytes at the back of the buffer to a producer that
+    /// copies them in itself, on `stream` of `device` in its own order (the
+    /// executor staging decoded pixels). Returns a host `uint8 [count]`
+    /// view of the lent bytes, pinned for a device lease and readable once
+    /// the buffer's fences completed; a CPU reader retains the buffer
+    /// ([`Self::retain_reader`]). The lend marks where the buffer's copy
+    /// timing begins.
+    pub(crate) fn lend_bytes(
         &mut self,
-        source: &StorageView,
-        stream: impl Issue,
-        events: &EventPool,
-    ) -> Result<(usize, usize)> {
-        let dtype = source.dtype();
-        if !matches!(dtype, DType::I64 | DType::I32 | DType::U32) {
-            return Err(Error::Invalid(format!(
-                "token captures require 32- or 64-bit integers, not {dtype:?}"
-            )));
-        }
-        let count = source.numel() as usize;
-        let offset = self.reserve_tokens(count)?;
-        let address = self.storage()?.address() + (offset * size_of::<i64>()) as u64;
-        self.copy(source, address, stream, events)?;
-        if dtype != DType::I64 {
-            self.narrow.push((offset, count, dtype));
-        }
-        Ok((offset, count))
-    }
-
-    /// Copy a `uint8` tensor into the byte region at the back of the buffer
-    /// and return the host view of the captured bytes, readable once the
-    /// buffer's fences completed and retained by the caller as a CPU reader.
-    pub fn capture_bytes(
-        &mut self,
-        source: &StorageView,
+        count: usize,
+        device: Option<DeviceId>,
         stream: impl Issue,
         events: &EventPool,
     ) -> Result<StorageView> {
-        if source.dtype() != DType::U8 {
-            return Err(Error::Invalid(
-                "byte captures require a uint8 tensor".into(),
-            ));
-        }
-        let count = source.numel() as usize;
         let offset = self.reserve_bytes(count)?;
         let storage = self.storage()?;
         let memory: Arc<dyn Backing> = Arc::clone(&storage.memory) as Arc<dyn Backing>;
-        let capture = StorageView::contiguous(
+        let view = StorageView::contiguous(
             memory,
             storage.byte_offset() + offset,
             DType::U8,
-            source.shape(),
+            &[count as i64],
         )?;
-        self.copy(source, capture.address(), stream, events)?;
-        Ok(capture)
+        self.begin_copy(device, stream, events)?;
+        Ok(view)
     }
 
-    /// Copy `source` into host storage at `address`: on `stream` for a
-    /// device source (after fencing its device for timing), as a host copy
-    /// in `stream`'s order for host memory.
-    fn copy(
-        &mut self,
-        source: &StorageView,
-        address: u64,
-        stream: impl Issue,
-        events: &EventPool,
-    ) -> Result<()> {
-        let memory: Arc<dyn Backing> = Arc::clone(&self.storage()?.memory) as Arc<dyn Backing>;
-        let base = memory.address();
-        let target = StorageView::contiguous(
-            memory,
-            (address - base) as usize,
-            source.dtype(),
-            source.shape(),
-        )?;
-        let target = Spans::single(target)?;
-        let source_spans = Spans::single(source.clone())?;
-
-        match source.device() {
-            MemoryKind::Cuda(device) => {
-                let producer = stream.stream().ok_or_else(|| {
-                    Error::Invalid("a device capture requires its producing stream".into())
-                })?;
-                if producer.device() != device {
-                    return Err(Error::Invalid(
-                        "a capture stream must belong to its source device".into(),
-                    ));
-                }
-                self.begin_copy(Some(device), stream, events)?;
-                let mut plan = copy_planner(Some(device), SourceOrder::Stream)?;
-                target.plan_copy(&source_spans, &mut plan)?;
-                // SAFETY: the pinned destination stays allocated until the
-                // seal fences complete; the source is the producer's storage,
-                // which the producer keeps until its stream passes this copy.
-                unsafe { stream.copy_strided(&plan) }?;
-            }
-            MemoryKind::Host | MemoryKind::PinnedHost => {
-                self.register_device(None)?;
-                self.copying.get_or_insert_with(Instant::now);
-                let mut plan = copy_planner(None, SourceOrder::Stream)?;
-                target.plan_copy(&source_spans, &mut plan)?;
-                // SAFETY: both operands are host memory; the reserved words
-                // belong to this buffer and no device copy writes them. The
-                // producer keeps its storage until the copy ran.
-                unsafe { stream.host().copy_strided(&plan) }?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reserve opposing word and byte ranges before submitting a copy. A failed
-    /// copy abandons its batch, so its range must remain occupied until retirement.
-    pub(crate) fn reserve_tokens(&mut self, count: usize) -> Result<usize> {
-        self.require_open()?;
-        let available = (self.storage()?.words * 8 - self.bytes) / 8;
-        let end = self
-            .tokens
-            .checked_add(count)
-            .filter(|&end| end <= available)
-            .ok_or(Error::Resource(
-                "completion capture exceeds pinned output capacity",
-            ))?;
-        let offset = self.tokens;
-        self.tokens = end;
-        Ok(offset)
-    }
-
-    pub(crate) fn reserve_bytes(&mut self, count: usize) -> Result<usize> {
+    /// Reserve `count` bytes at the back of the buffer, which bound the
+    /// token words lent from its front. A failed copy abandons its batch,
+    /// so the range remains occupied until retirement.
+    fn reserve_bytes(&mut self, count: usize) -> Result<usize> {
         self.require_open()?;
         let capacity = self.storage()?.words * 8;
         self.bytes = self
@@ -291,7 +190,8 @@ impl OutputBuffer {
         Ok(capacity - self.bytes)
     }
 
-    pub(crate) fn token_range(&self, offset: usize, count: usize) -> Result<()> {
+    /// Refuse a read outside the words lent and written so far.
+    fn token_range(&self, offset: usize, count: usize) -> Result<()> {
         if !offset
             .checked_add(count)
             .is_some_and(|end| end <= self.tokens)
@@ -304,8 +204,7 @@ impl OutputBuffer {
     }
 
     /// Snapshot completed words once, before the host allocation can be
-    /// recycled. Token captures narrower than 64 bits are widened here; byte
-    /// captures retain their separate CPU-reader lifetime.
+    /// recycled; lent bytes retain their separate CPU-reader lifetime.
     pub fn readback(&mut self) -> Result<()> {
         if self.readback.is_some() {
             return Ok(());
@@ -327,26 +226,6 @@ impl OutputBuffer {
                 self.tokens,
             );
         }
-        for &(offset, count, dtype) in &self.narrow {
-            // The capture packed `count` 4-byte values at its first word.
-            let packed: Vec<u32> = words[offset..offset + count.div_ceil(2)]
-                .iter()
-                .flat_map(|word| {
-                    let bytes = word.to_ne_bytes();
-                    [
-                        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                        u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-                    ]
-                })
-                .take(count)
-                .collect();
-            for (word, value) in words[offset..offset + count].iter_mut().zip(packed) {
-                *word = match dtype {
-                    DType::I32 => i64::from(value as i32),
-                    _ => i64::from(value),
-                };
-            }
-        }
         self.readback = Some(words);
         Ok(())
     }
@@ -359,16 +238,82 @@ impl OutputBuffer {
             .ok_or(Error::State("completion words have not been read back"))
     }
 
-    pub fn register_logprobs(
-        &mut self,
-        offset: usize,
-        count: usize,
-        layout: LogprobLayout,
-    ) -> Result<()> {
+    /// Lend every token word the buffer has left to a producer that writes
+    /// them itself: the executor copies its device values in on the lease's
+    /// stream, in its own order, and states afterwards what it wrote
+    /// ([`Self::register_lent`]). Returns the offset of the first lent word
+    /// and a host `int64` view of the lent words, pinned for a device lease.
+    ///
+    /// The words count as written until then, so no bytes can be lent
+    /// beside them.
+    pub fn lend_words(&mut self) -> Result<(usize, StorageView)> {
         self.require_open()?;
-        self.token_range(offset, count)?;
-        layout.validate(count)?;
-        self.logprob_layouts.insert((offset, count), layout);
+        if self.lent.is_some() {
+            return Err(Error::Invariant(
+                "output words are lent to one producer at a time".into(),
+            ));
+        }
+        let storage = self.storage()?;
+        let available = (storage.words * 8 - self.bytes) / 8;
+        let offset = self.tokens;
+        let memory: Arc<dyn Backing> = Arc::clone(&storage.memory) as Arc<dyn Backing>;
+        let view = StorageView::contiguous(
+            memory,
+            storage.byte_offset() + offset * size_of::<i64>(),
+            DType::I64,
+            &[(available - offset) as i64],
+        )?;
+        self.tokens = available;
+        self.lent = Some(offset..available);
+        Ok((offset, view))
+    }
+
+    /// State what the producer of the lent words wrote: the first `written`
+    /// of them, and the packed logprob columns among them as `(offset,
+    /// count, layout)`, offsets counted from the first lent word. Called
+    /// once the lease is sealed and before it is read back; the lent words
+    /// past `written` are released from the capture, so readback copies
+    /// only what was written.
+    ///
+    /// Fails without changing the buffer when no words are lent, when the
+    /// buffer was read back, or when a count or column lies outside the
+    /// written words or disagrees with its layout.
+    pub fn register_lent(
+        &mut self,
+        written: usize,
+        columns: Vec<(usize, usize, LogprobLayout)>,
+    ) -> Result<()> {
+        let lent = self
+            .lent
+            .clone()
+            .ok_or_else(|| Error::Invariant("no output words are lent".into()))?;
+        if self.readback.is_some() {
+            return Err(Error::Invariant(
+                "lent output words are registered before they are read back".into(),
+            ));
+        }
+        if written > lent.len() {
+            return Err(Error::Invariant(format!(
+                "{written} output words were written into {} lent words",
+                lent.len()
+            )));
+        }
+        let end = lent.start + written;
+        let mut layouts = Vec::with_capacity(columns.len());
+        for (offset, count, layout) in columns {
+            let offset = lent.start + offset;
+            if !offset.checked_add(count).is_some_and(|last| last <= end) {
+                return Err(Error::Invariant(
+                    "a logprob column lies outside the written output words".into(),
+                ));
+            }
+            layout.validate(count)?;
+            layouts.push(((offset, count), layout));
+        }
+
+        self.lent = None;
+        self.tokens = end;
+        self.logprob_layouts.extend(layouts);
         Ok(())
     }
 
@@ -790,113 +735,80 @@ impl OutputPool {
     }
 }
 
-impl crate::executor::lifecycle::RequestStorage for OutputPool {
-    fn admit_slots(
-        &mut self,
-        _admitted: &[crate::executor::lifecycle::AdmittedSlot<'_>],
-        _jobs: &crate::executor::lifecycle::LaneJobs,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn release_buffers(
-        &mut self,
-        _buffers: &std::collections::HashSet<ipc::BufferId>,
-        _jobs: &crate::executor::lifecycle::LaneJobs,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn release_requests(
-        &mut self,
-        _requests: &std::collections::HashSet<ipc::RequestKey>,
-        _retained: &std::collections::HashSet<ipc::BufferId>,
-        _jobs: &crate::executor::lifecycle::LaneJobs,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn retirement_ready(
-        &mut self,
-        _buffers: &std::collections::HashSet<ipc::BufferId>,
-        _requests: &std::collections::HashSet<ipc::RequestKey>,
-        _retained: &std::collections::HashSet<ipc::BufferId>,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-
-    fn retire_slots(
-        &mut self,
-        _slots: &[usize],
-        _jobs: &crate::executor::lifecycle::LaneJobs,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Return the storage of retired leases to the pool.
-    fn reap(&mut self) -> Result<()> {
-        OutputPool::reap(self);
-        Ok(())
-    }
-
-    fn close(&mut self, _aborted: bool) -> Result<()> {
-        self.begin_close();
-        self.finish_close();
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{OutputBuffer, OutputPool};
-    use crate::ffi::{Backing, DType};
-    use crate::memory::allocation::{Storage, StorageView};
+    use super::{LogprobLayout, OutputBuffer, OutputPool};
+    use crate::ffi::DType;
+    use crate::memory::allocation::StorageView;
     use crate::{EventPool, Result, lock};
 
-    /// A host column holding `values`, as a CPU lane's sampler produces it.
-    fn column(values: &[i64]) -> Result<StorageView> {
-        let memory = Storage::host(size_of_val(values));
-        // SAFETY: fresh host memory of exactly this size, owned by the test.
+    /// Write `values` into the lent host words `lent`, as the executor
+    /// does.
+    fn write(lent: &StorageView, values: &[i64]) {
+        assert!(values.len() as i64 <= lent.shape()[0]);
+        // SAFETY: the lent host words belong to the test's lease and nothing
+        // else writes them.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
-                memory.address() as *mut i64,
+                lent.address() as *mut i64,
                 values.len(),
             );
         }
-        StorageView::contiguous(
-            memory as Arc<dyn Backing>,
-            0,
-            DType::I64,
-            &[values.len() as i64],
-        )
+    }
+
+    /// Lent bytes come from the back of the buffer and bound the words
+    /// lent from its front: the executor writes both itself.
+    #[test]
+    fn lent_bytes_fill_from_the_back_and_bound_token_capacity() -> Result<()> {
+        let mut pool = OutputPool::new(None, 1, 2)?;
+        let lease = pool.lease(1, 2, &[], false)?;
+        let mut buffer = lock(&lease);
+        let events = EventPool::default();
+        let lent = buffer.lend_bytes(5, None, None::<&cuda::Stream>, &events)?;
+        assert_eq!(lent.shape(), &[5]);
+        assert_eq!(lent.dtype(), DType::U8);
+        // Five bytes from the back leave one whole token word.
+        let (offset, words) = buffer.lend_words()?;
+        assert_eq!((offset, words.shape()), (0, &[1_i64][..]));
+        assert!(
+            buffer
+                .lend_bytes(4, None, None::<&cuda::Stream>, &events)
+                .is_err()
+        );
+        Ok(())
     }
 
     /// Lease `words` words of `pool` for a one-row batch, with `value`
-    /// captured in each word.
+    /// written in each word.
     fn lease_filled(
         pool: &mut OutputPool,
         words: usize,
         value: i64,
     ) -> Result<Arc<Mutex<OutputBuffer>>> {
         let lease = pool.lease(1, words, &[], false)?;
-        lock(&lease).capture(&column(&vec![value; words])?, None, &EventPool::default())?;
+        {
+            let mut buffer = lock(&lease);
+            let (_, lent) = buffer.lend_words()?;
+            write(&lent, &vec![value; words]);
+        }
         Ok(lease)
     }
 
-    /// Complete a leased batch and give its words back: its copies finished
-    /// and its row was observed.
-    fn retire(lease: &Arc<Mutex<OutputBuffer>>) -> Result<Vec<i64>> {
+    /// Complete a leased batch of `words` written words and give them
+    /// back: its copies finished and its row was observed.
+    fn retire(lease: &Arc<Mutex<OutputBuffer>>, words: usize) -> Result<Vec<i64>> {
         let mut buffer = lock(lease);
-        // Host captures are sealed on no stream.
+        // Host leases are sealed on no stream.
         buffer.seal::<&cuda::Stream>(&[], &EventPool::default())?;
+        buffer.register_lent(words, Vec::new())?;
         buffer.copies_finished();
         buffer.readback()?;
-        let words = buffer.read_tokens(0, buffer.storage()?.words())?.to_vec();
+        let read = buffer.read_tokens(0, words)?.to_vec();
         buffer.discard(0);
-        Ok(words)
+        Ok(read)
     }
 
     #[test]
@@ -908,10 +820,10 @@ mod tests {
         let first = lease_filled(&mut pool, 8, 1)?;
         let second = lease_filled(&mut pool, 8, 2)?;
         assert!(pool.lease(1, 1, &[], false).is_err());
-        assert_eq!(retire(&first)?, [1; 8]);
+        assert_eq!(retire(&first, 8)?, [1; 8]);
         let third = lease_filled(&mut pool, 8, 3)?;
-        assert_eq!(retire(&second)?, [2; 8]);
-        assert_eq!(retire(&third)?, [3; 8]);
+        assert_eq!(retire(&second, 8)?, [2; 8]);
+        assert_eq!(retire(&third, 8)?, [3; 8]);
 
         // Batches take their own words only: sixteen batches of one word fill
         // the storage of the two largest, each keeping its own value.
@@ -920,17 +832,75 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         assert!(pool.lease(1, 1, &[], false).is_err());
         for (value, lease) in small.iter().enumerate() {
-            assert_eq!(retire(lease)?, [value as i64]);
+            assert_eq!(retire(lease, 1)?, [value as i64]);
         }
 
         // A small batch still live leaves room for one of the largest.
         let small = lease_filled(&mut pool, 3, 4)?;
         let large = lease_filled(&mut pool, 8, 5)?;
         assert!(pool.lease(1, 8, &[], false).is_err());
-        assert_eq!(retire(&small)?, [4; 3]);
+        assert_eq!(retire(&small, 3)?, [4; 3]);
         let other = lease_filled(&mut pool, 8, 6)?;
-        assert_eq!(retire(&large)?, [5; 8]);
-        assert_eq!(retire(&other)?, [6; 8]);
+        assert_eq!(retire(&large, 8)?, [5; 8]);
+        assert_eq!(retire(&other, 8)?, [6; 8]);
+        Ok(())
+    }
+
+    /// A producer that writes the lent words itself: they are reserved
+    /// whole until it states what it wrote, and readback then holds exactly
+    /// those words and decodes the logprob column among them.
+    #[test]
+    fn lent_words_read_back_as_far_as_their_producer_wrote() -> Result<()> {
+        let events = EventPool::default();
+        let mut pool = OutputPool::new(None, 1, 16)?;
+        let lease = pool.lease(2, 10, &[], false)?;
+        let mut buffer = lock(&lease);
+        let (offset, lent) = buffer.lend_words()?;
+        assert_eq!((offset, lent.shape()), (0, &[10_i64][..]));
+        assert!(buffer.lend_words().is_err());
+        assert!(
+            buffer
+                .lend_bytes(1, None, None::<&cuda::Stream>, &events)
+                .is_err()
+        );
+
+        // One sampled row (token 42, score 0.5, rank 1) with one top token
+        // (token 3, score 0.25, rank 2): a six-word column at lent word 1.
+        let words = [
+            9_i64,
+            42,
+            i64::from(0.5_f32.to_bits()),
+            1,
+            3,
+            i64::from(0.25_f32.to_bits()),
+            2,
+        ];
+        write(&lent, &words);
+        buffer.seal::<&cuda::Stream>(&[], &events)?;
+        let layout = || LogprobLayout {
+            rows: vec![0],
+            counts: vec![1],
+        };
+        // Columns outside what was written, or of another length than their
+        // layout, are refused and leave the lent words registered as lent.
+        assert!(buffer.register_lent(11, vec![]).is_err());
+        assert!(buffer.register_lent(6, vec![(1, 6, layout())]).is_err());
+        assert!(buffer.register_lent(7, vec![(1, 5, layout())]).is_err());
+        buffer.register_lent(7, vec![(1, 6, layout())])?;
+        assert!(buffer.register_lent(7, vec![]).is_err());
+
+        buffer.copies_finished();
+        buffer.readback()?;
+        assert_eq!(buffer.read_tokens(0, 7)?, &words);
+        assert!(buffer.read_tokens(0, 8).is_err());
+        let values = buffer.logprob_values((1, 6, 0))?;
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| (entry.token_id, entry.logprob, entry.rank))
+                .collect::<Vec<_>>(),
+            [(42, 0.5, 1), (3, 0.25, 2)]
+        );
         Ok(())
     }
 
@@ -944,16 +914,16 @@ mod tests {
         let beyond = lease_filled(&mut pool, 9, 2)?;
         let other = lease_filled(&mut pool, 8, 3)?;
         assert!(pool.lease(1, 1, &[], false).is_err());
-        assert_eq!(retire(&beyond)?, [2; 9]);
-        assert_eq!(retire(&largest)?, [1; 8]);
-        assert_eq!(retire(&other)?, [3; 8]);
+        assert_eq!(retire(&beyond, 9)?, [2; 9]);
+        assert_eq!(retire(&largest, 8)?, [1; 8]);
+        assert_eq!(retire(&other, 8)?, [3; 8]);
 
         // Its storage goes with it: the pool again holds two of the largest.
         assert_eq!(pool.reap(), 3);
         let first = lease_filled(&mut pool, 8, 4)?;
         let second = lease_filled(&mut pool, 8, 5)?;
-        assert_eq!(retire(&first)?, [4; 8]);
-        assert_eq!(retire(&second)?, [5; 8]);
+        assert_eq!(retire(&first, 8)?, [4; 8]);
+        assert_eq!(retire(&second, 8)?, [5; 8]);
         Ok(())
     }
 }

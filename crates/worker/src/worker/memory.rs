@@ -3,8 +3,9 @@
 //! Startup allocates them on the capacity plan: the device event pool, the
 //! product store (relay lanes and the buffer pool), the product transports
 //! and, for a text model, the prefix cache (unit planes, block tables and import
-//! workspaces). Capability runtimes borrow them to execute calls; lifecycle
-//! commands release their request storage through [`RequestStorage`].
+//! workspaces). The executor's lanes and the transfer runtime borrow them to
+//! execute calls; lifecycle commands release their request storage through
+//! [`RequestStorage`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use super::cache_width;
 use crate::Result;
 use crate::capacity::plan::Plan;
 use crate::config::{WorkerConfig, WorkerLaunch};
-use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::memory::{BufferPool, PrefixCache, ProductStore};
 use crate::stream::{CUDAStream, EventPool, Streams};
 use crate::transfer::{TransferCapacity, TransportKind, TransportOptions, Transports};
@@ -69,14 +70,48 @@ impl WorkerMemory {
         }
         Ok(())
     }
+
+    /// Whether a remote acknowledgment without a wake source is outstanding.
+    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
+        self.transports.awaiting_acknowledgment()
+    }
+
+    /// Install (or clear) the service wake fired by asynchronous
+    /// completions while the rank serves.
+    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
+        self.events.set_wake(wake.clone());
+        self.transports.set_wake(wake.clone());
+        if let Some(prefix_cache) = &self.prefix_cache {
+            prefix_cache.set_wake(wake);
+        }
+    }
+
+    /// Release the storage at shutdown, after the executor drained. An
+    /// aborted close keeps whatever device work may still address.
+    pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
+        if aborted {
+            // Device work may still address the pool and the staging.
+            crate::leak(self.prefix_cache.take());
+            return Ok(());
+        }
+        // Revoke every published product, stop the imports reading through
+        // the transports, then close the transports, which retires the
+        // exports they still register (the prefix cache requires its exports
+        // retired before it closes).
+        let mut result = self.tensors.revoke_exports();
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            result = result.and(prefix_cache.stop_imports());
+        }
+        result = result.and(self.transports.close());
+        if let Some(prefix_cache) = &mut self.prefix_cache {
+            result = result.and(prefix_cache.close());
+        }
+        self.tensors.close();
+        result.and(self.events.close())
+    }
 }
 
 impl RequestStorage for WorkerMemory {
-    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
-        // Block tables are installed per batch; a new slot has no state.
-        Ok(())
-    }
-
     fn release_buffers(&mut self, buffers: &HashSet<BufferId>, jobs: &LaneJobs) -> Result<()> {
         self.tensors.release_buffers(buffers, jobs.job().on(None))?;
         if let Some(prefix_cache) = &mut self.prefix_cache {
@@ -146,40 +181,6 @@ impl RequestStorage for WorkerMemory {
             prefix_cache.reap_imports()?;
         }
         Ok(())
-    }
-
-    fn awaiting_acknowledgment(&self) -> bool {
-        self.transports.awaiting_acknowledgment()
-    }
-
-    fn set_wake(&self, wake: Option<Wake>) {
-        self.events.set_wake(wake.clone());
-        self.transports.set_wake(wake.clone());
-        if let Some(prefix_cache) = &self.prefix_cache {
-            prefix_cache.set_wake(wake);
-        }
-    }
-
-    fn close(&mut self, aborted: bool) -> Result<()> {
-        if aborted {
-            // Device work may still address the pool and the staging.
-            crate::leak(self.prefix_cache.take());
-            return Ok(());
-        }
-        // Revoke every published product, stop the imports reading through
-        // the transports, then close the transports, which retires the
-        // exports they still register (the prefix cache requires its exports
-        // retired before it closes).
-        let mut result = self.tensors.revoke_exports();
-        if let Some(prefix_cache) = &mut self.prefix_cache {
-            result = result.and(prefix_cache.stop_imports());
-        }
-        result = result.and(self.transports.close());
-        if let Some(prefix_cache) = &mut self.prefix_cache {
-            result = result.and(prefix_cache.close());
-        }
-        self.tensors.close();
-        result.and(self.events.close())
     }
 }
 

@@ -546,10 +546,10 @@ impl Scheduler {
     /// - The canvas pass that follows the prefill completing a context (a
     ///   readout's pass or a block's first step), since the prefill cannot
     ///   stop the request. The pass reads the prefix cache the prefill writes, and only
-    ///   the worker's device order puts the write first: forwards run in
-    ///   submission order on one stream, and a forward on an execution lane
-    ///   forks from and joins back into the device's control stream
-    ///   (the worker runtime's text runner).
+    ///   the worker's device order puts the write first: the worker's lanes
+    ///   over the prefix cache run their forwards in submission order on the
+    ///   device's lane stream, and work on another stream orders behind
+    ///   their batches (`crates/worker/src/executor/pages.rs`).
     /// - A stopped block's commit queued behind the block's steps still in
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the

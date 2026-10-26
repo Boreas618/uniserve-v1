@@ -12,11 +12,11 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use crate::executor::image_inputs::{ImagePreparation, PreparedImage, Tower};
 use crate::ffi::DType;
 use crate::host::HostAction;
 use crate::memory::allocation::StorageView;
 use crate::memory::{OutputLease, PinnedPool};
-use crate::runner::encoder::{ImagePreparation, PreparedImage, Tower};
 use crate::{Error, Outcome, Result, lock};
 
 /// Encode `pixels` (`height * width * 3` bytes, HWC) as a base64 PNG of at

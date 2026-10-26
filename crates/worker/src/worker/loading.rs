@@ -13,7 +13,8 @@
 //!
 //! The rank reads what it needs of a loaded model from the owner of each
 //! fact: the loaded model's own (its attention backend and numerical
-//! formats) here, a capability's from that capability's runner.
+//! formats) here, what its lanes serve from the executor's manifest
+//! (`crate::worker::lanes`).
 
 use std::collections::BTreeSet;
 

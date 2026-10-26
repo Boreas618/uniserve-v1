@@ -2,16 +2,13 @@
 
 One runner serves one decoder module on one stream: a video decoder at one
 clip output (the native frames and raster a media unit's clip decodes to),
-an audio decoder at one track length, an image decoder of a bound component at
-every image size (:meth:`DecoderRunner.bound`). The tensors of a forward are
+or an audio decoder at one track length; an image model's decoder is the
+image executor's (``uniserve.executor.image``). The tensors of a forward are
 parameters of :meth:`DecoderRunner.decode`; the parameters depend on the
 decoder's capability class and are documented there. A video decoder's
 forward has shapes fixed by its scalar arguments and takes every changing
 value as the contents of a tensor, so it is captured into one CUDA graph
 per kind of unit and round size.
-
-The static methods answer a deployment's sizing questions from the model's
-configuration alone, so a rank without the decoders' weights asks them too.
 """
 
 from __future__ import annotations
@@ -26,19 +23,14 @@ from uniserve.bindings.workspace import TensorBuffers
 from uniserve.errors import SetupError
 from uniserve.loading.rank import capability
 from uniserve.media import image, video
-from uniserve.media.pixels import quantize_image_hwc
 from uniserve.models import (
     AudioDecoder,
-    ImageDecoder,
     VideoDecoder,
     VideoPostprocessor,
 )
 from uniserve.runner.context import (
     execution_context,
     kernel_records,
-    local,
-    scope,
-    write,
 )
 from uniserve.tensors import BufferConfig
 
@@ -70,13 +62,6 @@ def _video(frames: int, width: int, height: int) -> video.Config:
     return video.Config(int(frames), image.Config(int(height), int(width)))
 
 
-def _elements(shape: Sequence[int]) -> int:
-    count = 1
-    for extent in shape:
-        count *= int(extent)
-    return count
-
-
 def _first_frames(decoder: VideoDecoder, frames: int = 1) -> int:
     """The shortest video of at least ``frames`` the decoder reconstructs.
 
@@ -105,13 +90,6 @@ class DecoderRunner:
         size: ``[frames, width, height]`` of a video decoder's clip output,
             or ``[latent_frames]`` of an audio decoder's track.
     """
-
-    # An image decoder and its caller's tensors (see :meth:`bound`).
-    _image: ImageDecoder
-    _latents: torch.Tensor
-    _staging: torch.Tensor
-    _inputs: torch.Tensor
-    _values: torch.Tensor
 
     def __init__(
         self,
@@ -187,81 +165,6 @@ class DecoderRunner:
                 f"{type(module).__qualname__} is not a video or audio decoder"
             )
 
-    @classmethod
-    def image(
-        cls,
-        loaded,
-        path: str,
-        stream: int,
-        device: int,
-        scratch,
-        latents: torch.Tensor,
-        staging: torch.Tensor,
-        inputs: torch.Tensor,
-        values: torch.Tensor,
-    ) -> DecoderRunner:
-        """A runner of an image model's decoder.
-
-        Args:
-            loaded: The loaded model.
-            path: The decoder module's path in the model.
-            stream: The CUDA stream handle every forward enqueues on (0 on
-                the host).
-            device: The CUDA ordinal ``stream`` belongs to, -1 for the
-                host. A decoder placed on a generation tower computes
-                there and returns its results to the caller's tensors.
-            scratch: The stream's shared work areas.
-            latents: The latent pool's step workspace ``[units, width]``,
-                into which the caller gathers each completed trajectory's
-                pages before decoding.
-            staging: uint8 bytes receiving each image's quantized HWC
-                pixels, which the caller copies to the host and encodes.
-            inputs: ``[units, width]`` latent rows of the largest image the
-                denoiser captured, into which the caller copies one
-                image's rows for :meth:`decode_one`.
-            values: flat BF16 elements of that image's decoded values,
-                which :meth:`decode_one` writes and :meth:`quantize_one`
-                reads, as an image product holds them.
-        """
-        path = str(path)
-        decoder = loaded.module.get_submodule(path) if path else loaded.module
-        if not isinstance(decoder, ImageDecoder):
-            raise SetupError(
-                f"{type(decoder).__qualname__} is not an image decoder"
-            )
-        context = execution_context(
-            decoder,
-            int(stream),
-            loaded.attention,
-            scratch,
-            device=int(device),
-            derive_host_lengths=True,
-        )
-        context.prepare(None)
-        runner = cls.__new__(cls)
-        runner._image = decoder
-        runner._context = context
-        runner._device = context.device
-        runner._latents = latents
-        runner._staging = staging
-        runner._inputs = inputs
-        runner._values = values
-        runner._decode = runner._decode_image
-        return runner
-
-    # Sizing, answered from configuration.
-
-    @staticmethod
-    def value_range(loaded) -> list[float]:
-        """The image decoder's ``[low, high]`` pixel range.
-
-        Empty without an image decoder.
-        """
-        decoder = capability(loaded.module, ImageDecoder)
-        if decoder is None:
-            return []
-        return [float(value) for value in decoder.decoder.value_range]
-
     # Forward.
 
     def decode(self, *arguments: Any) -> Any:
@@ -287,121 +190,8 @@ class DecoderRunner:
         ``total`` of a track of ``samples`` samples. ``latent`` is the
         request's complete audio latent timeline; the units' samples, which
         abut, land in ``out`` (``[span, 2]`` int16) in order.
-
-        An image decoder takes ``(rows, *images)``: ``rows`` holds one
-        ``[offset, units, height, width, staging]`` row per image,
-        flattened: its latent rows ``latents[offset:offset + units]``, its
-        size and the staging offset of its pixels. It decodes every image
-        (one numerical call per size), writes image ``i`` to the product
-        tensor ``images[i]`` unless that is None (the decoded values in the
-        product's dtype), quantizes it into the staging bytes and returns
-        each image's byte count, ``height * width * 3``.
         """
         return self._decode(*arguments)
-
-    def decode_one(self, units: int, height: int, width: int) -> int:
-        """Decode one ``height`` x ``width`` image from the ``units`` latent
-        rows at the head of the runner's inputs into its values and the head
-        of the staging bytes; the staged byte count.
-
-        Every tensor it reads and writes keeps its address, so a CUDA graph
-        captured at one size replays the decode of every image of that
-        size, the caller copying each image's rows in and its values out.
-        """  # noqa: D205
-        decoder, context = self._image, self._context
-        low, high = (float(value) for value in decoder.decoder.value_range)
-        with scope(context):
-            value = decoder.decode(
-                (
-                    self._inputs[: int(units)].to(
-                        context.device, non_blocking=True
-                    ),
-                ),
-                sizes=(image.Config(int(height), int(width)),),
-            )[0]
-            write(self._values, value)
-            return self._stage(value, low, high, 0)
-
-    def quantize_one(
-        self, height: int, width: int, low: float, high: float
-    ) -> int:
-        """Quantize the ``[3, height, width]`` image the caller copied to
-        the head of the runner's values, holding values in ``[low,
-        high]``, into the head of the staging bytes; the staged byte count.
-        A CUDA graph captured at one size replays it.
-        """  # noqa: D205
-        count = 3 * int(height) * int(width)
-        with scope(self._context):
-            return self._stage(
-                self._values[:count].view(3, int(height), int(width)),
-                float(low),
-                float(high),
-                0,
-            )
-
-    def quantize(
-        self, image: torch.Tensor, low: float, high: float, offset: int
-    ) -> int:
-        """Quantize a resident image product into the staging bytes.
-
-        ``image`` holds values in ``[low, high]``; its HWC pixels land at
-        ``offset`` of the staging bytes. Returns their byte count.
-        """
-        with scope(self._context):
-            return self._stage(
-                image,
-                float(low),
-                float(high),
-                int(offset),
-            )
-
-    def _stage(
-        self, value: torch.Tensor, low: float, high: float, offset: int
-    ) -> int:
-        """Quantize one image into the staging bytes at ``offset``."""
-        staging = self._staging
-        pixels = quantize_image_hwc(value, value_range=(low, high))
-        count = pixels.numel()
-        if offset < 0 or offset + count > staging.numel():
-            raise ValueError("image pixels exceed the decoder staging")
-        staging[offset : offset + count].copy_(
-            local(pixels.reshape(-1), staging.device)
-        )
-        return count
-
-    def _decode_image(
-        self, rows: Sequence[int], *images: torch.Tensor | None
-    ) -> list[int]:
-        decoder, context = self._image, self._context
-        flat = [int(value) for value in rows]
-        described = [
-            tuple(flat[start : start + 5]) for start in range(0, len(flat), 5)
-        ]
-        if len(described) != len(images):
-            raise ValueError("decoder rows and image products must align")
-        low, high = (float(value) for value in decoder.decoder.value_range)
-        with scope(context):
-            # A decoder placed on a generation tower reads its latents there.
-            values = decoder.decode(
-                tuple(
-                    self._latents[offset : offset + units].to(
-                        context.device, non_blocking=True
-                    )
-                    for offset, units, *_ in described
-                ),
-                sizes=tuple(
-                    image.Config(height, width)
-                    for _, _, height, width, _ in described
-                ),
-            )
-            counts = []
-            for value, row, product in zip(
-                values, described, images, strict=True
-            ):
-                if product is not None:
-                    write(product, value)
-                counts.append(self._stage(value, low, high, row[4]))
-            return counts
 
     def _decode_video(
         self,

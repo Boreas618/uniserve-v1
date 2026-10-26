@@ -1,7 +1,8 @@
-//! Capacity planning of a loaded rank ([`plan`]): the block size, request slots,
-//! cache units and latent pages its device budget holds, agreed over the group,
-//! with a video rank's slot layout, and the planned capacity reported once for
-//! operators.
+//! Capacity planning of a loaded rank: the block size and the cache's layout
+//! ([`block_size`], [`cache_plan`]), which the executor's token lanes are
+//! sized by, then ([`plan`]) the request slots, cache units and latent pages
+//! its device budget holds, agreed over the group, with a video rank's slot
+//! layout, and the planned capacity reported once for operators.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,22 +10,18 @@ use std::sync::Arc;
 use cuda::HandleType;
 use ipc::{CallKind, ComponentInfo};
 
+use super::image::ImageManifest;
+use super::lanes::PageManifest;
 use super::loading::LoadedModel;
-use super::{endpoint, expert_exchange, exports_device_products};
+use super::{endpoint, exports_device_products};
 use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::{Plan, Report, TokenFacts, TokenLayout, resolve_block_size};
 use crate::capacity::video::{VideoCapacity, VideoManifest};
 use crate::config::placement::Capability;
 use crate::config::placement::Components;
 use crate::config::{Device, WorkerConfig, WorkerLaunch};
-use crate::ffi::DType;
 use crate::memory::{CachePlan, GroupShape, LatentPlan, PrefixCache, UnitColumn};
 use crate::parallel::world::World;
-use crate::runner::causal_lm::start::reserved_bytes;
-use crate::runner::denoiser::image_model::ImageModel;
-use crate::runner::diffusion_lm::{self};
-use crate::runner::encoder::EncoderInfo;
-use crate::runner::start::reserved_bytes as image_reserved_bytes;
 use crate::{Error, Result};
 
 /// Block-table width that holds the longest admitted sequence in every
@@ -70,53 +67,18 @@ pub(super) fn log_capacity(config: &WorkerConfig, plan: &Plan) {
     );
 }
 
-/// Bytes of the largest vision feature product the image policy admits: the
-/// feature rows of its largest image at the vision encoder's output width.
-/// Zero for a model without a vision encoder or an understanding transform.
-fn vision_feature_bytes(model: &LoadedModel) -> Result<u64> {
-    let declarations = &model.declarations;
-    let Some(call) = declarations
-        .names()
-        .flat_map(|name| declarations.calls(name))
-        .find(|call| call.is(Capability::PatchEncoder))
-    else {
-        return Ok(0);
-    };
-    let EncoderInfo::Vision(vision) = EncoderInfo::describe(model.handle(), &call.path)? else {
-        return Ok(0);
-    };
-
-    // The encoder merges `downsample` patches on each axis into one feature.
-    let rows = u64::from(vision.image_patches / (vision.downsample * vision.downsample));
-    Ok(rows * u64::from(vision.output_size) * vision.output_dtype.bytes() as u64)
-}
-
 /// Unit columns the rank's lane binds beside the import workers'.
 const LANE_COLUMNS: usize = 1;
 
-/// Resolve the rank's capacity on the loaded model.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the loaded rank's owners that capacity planning reads"
-)]
-pub(super) fn plan(
-    launch: &WorkerLaunch,
+/// Resolve the rank's KV block size into `config`: the largest of at most
+/// 64 tokens every resident cache layer's attention reads, agreed over the
+/// worker group. Collective, at the same point of every rank's startup.
+pub(super) fn block_size(
     config: &mut WorkerConfig,
     model: &LoadedModel,
-    image: &ImageModel,
     world: &World,
-    budget: Option<&DeviceBudget>,
-    components: &Components,
-    video: Option<(&str, VideoManifest)>,
-) -> Result<(Plan, Option<VideoCapacity>)> {
-    let device = config.device;
-    if let (Device::Cuda(index), Some(budget)) = (device, budget) {
-        config.pool_storage_bytes =
-            Some(budget.budget(index, config.mem_fraction_static)?.available as usize);
-    }
-
-    let declarations = &model.declarations;
-    let text = declarations.has(Capability::CausalLm);
+) -> Result<()> {
+    let text = model.declarations.has(Capability::CausalLm);
     let prefix_cache_dtype = config.prefix_cache_dtype.clone();
     let block_size = resolve_block_size(
         config.block_size,
@@ -135,7 +97,72 @@ pub(super) fn plan(
         &world.host,
     )?;
     config.block_size = Some(block_size);
+    Ok(())
+}
 
+/// The cache layout of a rank of a worker holding a causal language model
+/// component, at the resolved block size ([`block_size`]); `None` for any
+/// other rank.
+///
+/// Every rank of such a worker keeps the same cache pool, including ranks
+/// that hold only its other components: the worker advertises token work
+/// for all of its ranks, and they agree on one pool capacity.
+pub(super) fn cache_plan(
+    launch: &WorkerLaunch,
+    config: &WorkerConfig,
+    model: &LoadedModel,
+) -> Result<Option<CachePlan>> {
+    let declarations = &model.declarations;
+    let holds_text = launch.components.keys().any(|name| {
+        declarations
+            .calls(name)
+            .iter()
+            .any(|call| call.is(Capability::CausalLm))
+    });
+    if config.role == "experts" || !declarations.has(Capability::CausalLm) || !holds_text {
+        return Ok(None);
+    }
+    let block_size = config.block_size.ok_or(Error::State(
+        "the cache is planned at the resolved block size",
+    ))?;
+    Ok(Some(CachePlan::plan(
+        model.handle(),
+        block_size,
+        config.prefix_cache_dtype.as_deref(),
+    )?))
+}
+
+/// Resolve the rank's capacity on the loaded model, at the block size and
+/// with the `cache` layout resolved before: what the executor's manifest
+/// states its lanes over the prefix cache allocate (`pages`), and a video
+/// model's `video` manifest.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loaded rank's owners that capacity planning reads"
+)]
+pub(super) fn plan(
+    launch: &WorkerLaunch,
+    config: &mut WorkerConfig,
+    model: &LoadedModel,
+    image: Option<&ImageManifest>,
+    image_processor: bool,
+    world: &World,
+    budget: Option<&DeviceBudget>,
+    components: &Components,
+    cache: Option<CachePlan>,
+    pages: Option<&PageManifest>,
+    video: Option<(&str, VideoManifest)>,
+) -> Result<(Plan, Option<VideoCapacity>)> {
+    let device = config.device;
+    if let (Device::Cuda(index), Some(budget)) = (device, budget) {
+        config.pool_storage_bytes =
+            Some(budget.budget(index, config.mem_fraction_static)?.available as usize);
+    }
+    let block_size = config
+        .block_size
+        .ok_or(Error::State("planning follows the block size's resolution"))?;
+
+    let declarations = &model.declarations;
     let dedicated = config.role == "experts";
     let held: Vec<&str> = launch.components.keys().map(String::as_str).collect();
     // A rank serves every call kind its placed components implement, which
@@ -212,44 +239,29 @@ pub(super) fn plan(
         return Ok((plan, Some(capacity)));
     }
 
-    let latent_dtype = DType::from_name(&config.model_dtype).ok_or_else(|| {
-        Error::Unsupported(format!("unsupported latent dtype {:?}", config.model_dtype))
-    })?;
-    // The longest image sequence an image denoiser accepts, in latent rows.
-    let image_tokens = image
-        .denoiser
-        .map_or(0, |layout| layout.max_sequence_tokens as usize);
-    let latent = image.denoiser.map(|layout| {
-        LatentPlan::image(
-            config.max_request_pool_size,
-            image_tokens,
-            config.max_total_tokens,
-            block_size,
-            layout.width() as usize,
-            latent_dtype,
-        )
-    });
+    // An image denoiser's latent pool holds its longest image sequence, in
+    // latent rows, at the executor's latent dtype.
+    let latent = image
+        .and_then(|image| image.latent.as_ref())
+        .map(|latent| {
+            LatentPlan::image(
+                config.max_request_pool_size,
+                latent.rows,
+                config.max_total_tokens,
+                block_size,
+                latent.width,
+                latent.dtype()?,
+            )
+        })
+        .transpose()?;
     let token_facts = TokenFacts {
-        image_processor: image.processing.is_some(),
-        vision_feature_bytes: vision_feature_bytes(model)?,
-        latent_feature_bytes: latent.map_or(0, |plan| {
-            image_tokens as u64 * plan.latent_width as u64 * plan.dtype.bytes() as u64
-        }),
+        image_processor,
+        vision_feature_bytes: image.map_or(0, |image| image.vision_feature_bytes),
+        latent_feature_bytes: image.map_or(0, |image| image.latent_feature_bytes),
         latent,
     };
     let mut layout = TokenLayout::new(report, config, launch.ipc.queue_depth, &token_facts)?;
-    // Every rank of a worker holding a causal LM component keeps the same
-    // cache pool, including ranks that hold only its other components: the
-    // worker advertises token work for all of its ranks, and they agree on
-    // one pool capacity.
-    let holds_text = held.iter().any(|name| {
-        declarations
-            .calls(name)
-            .iter()
-            .any(|call| call.is(Capability::CausalLm))
-    });
-    let cache = if text && !dedicated && holds_text {
-        let cache = CachePlan::plan(model.handle(), block_size, prefix_cache_dtype.as_deref())?;
+    let cache = if let Some(cache) = cache {
         let total = match device {
             Device::Cuda(index) => total_bytes(index)?,
             Device::Cpu => 0,
@@ -268,40 +280,21 @@ pub(super) fn plan(
             LANE_COLUMNS,
         )?;
         layout.reserve(config.device, fixed);
-        // The text runners' columns and the slot continuation state.
-        layout.reserve(
-            config.device,
-            reserved_bytes(
-                model,
-                config,
-                layout.info().request_slots as usize,
-                &cache,
-                image.processing.is_some(),
-            )?,
-        );
-        // The image denoiser's columns and the image decoder's staging.
-        if image.denoiser.is_some() {
+        // The buffers of the lanes over the prefix cache and their request
+        // slots' state.
+        if let Some(pages) = pages {
             layout.reserve(
                 config.device,
-                image_reserved_bytes(
-                    config,
-                    layout.info().request_slots as usize,
-                    image.denoiser.as_ref(),
-                ),
+                pages.reserved_bytes(layout.info().request_slots as usize),
             );
         }
-        // The diffusion LM runners' buffers, banks and sampler workspaces.
-        layout.reserve(
-            config.device,
-            diffusion_lm::reserved_bytes(
-                model,
-                components,
-                expert_exchange(launch),
-                config,
-                layout.info().request_slots as usize,
-                &cache,
-            )?,
-        );
+        // The image lanes' buffers and their request slots' state.
+        if let Some(image) = image {
+            layout.reserve(
+                config.device,
+                image.reserved_bytes(layout.info().request_slots as usize),
+            );
+        }
         // Every unit column holds one index per unit, charged with each unit:
         // the import workers', the lane's and the copy lane's of a rank that
         // copies pages through the host KV cache.

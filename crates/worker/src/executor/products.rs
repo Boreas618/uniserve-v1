@@ -1,43 +1,51 @@
 //! Publication of a batch's products to the ranks and workers that read
 //! them.
 //!
-//! A runtime exports a product once the producer has written it: the
-//! tensor store exports its value through every export mechanism that
-//! reaches the producing call's consumers, retains each location's
-//! retirement on the product's buffer, and the product's descriptor joins
-//! the call's completion (and so the batch result the engine routes to the
+//! A batch exports a product once the producer has written it: the tensor
+//! store exports its value through every export mechanism that reaches the
+//! producing call's consumers, retains each location's retirement on the
+//! product's buffer, and the product's descriptor joins the call's
+//! completion (and so the batch result the engine routes to the
 //! consumers). The locations become the buffer's registered exports at the
 //! batch's commit point and are revoked when the buffer is released; a
 //! batch that fails before committing revokes them at once. The same rules
-//! hold for every runtime, so this module is the one place that applies
-//! them.
+//! hold for every batch, a lane's, a transfer's or what host tasks wrote,
+//! so this module is the one place that applies them.
 //!
-//! The products a video batch's calls read and publish:
-//!
-//! A call reads products other calls published (`Call::inputs`, a
-//! predicate) and publishes its own (`Call::outputs`, a completion scalar).
+//! A call of a lane that prepares reads products other calls published
+//! (`Call::inputs`, a predicate) and publishes its own (`Call::outputs`, a
+//! completion scalar).
 //! Products live in the rank's [`ProductStore`]: imports from other ranks
 //! reach it before the batch executes ([`crate::executor::inputs`]), and
-//! every input is then leased from it
-//! ([`crate::executor::video::MediaBatch::read`]); host codecs read some
-//! inputs in place from their shared-memory exports instead.
-//! [`bind_outputs`] reserves a call's outputs at their scheduler placement
-//! and [`export`] publishes a written one.
+//! every input the executor's preparation names is then leased from it
+//! ([`bind_prepared`]); host codecs read some inputs in place from their
+//! shared-memory exports instead. [`bind_outputs`] reserves a call's
+//! outputs at their scheduler placement and [`export`] publishes a written
+//! one.
 
 use crate::executor::PendingOutput;
-use crate::ffi::MemoryKind;
-use crate::memory::{OutputPlacement, ProductBuffer, ProductExport, ProductStore};
-use crate::stream::Issue;
-use crate::transfer::Transports;
+use crate::executor::batch::{Batch, CallState};
+use crate::executor::lanes::LaneCall;
+use crate::executor::latents::LatentLedger;
+use crate::executor::reports::Publication;
+use crate::ffi::{Backing, DType, MemoryKind};
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::{
+    LatentUpdate, OutputPlacement, ProductBuffer, ProductExport, ProductRead, ProductStore,
+};
+use crate::stream::{CUDAStream, Issue};
 use crate::transfer::exports::{self, Location};
+use crate::transfer::{SharedMapping, SharedRead, TransportKind, Transports};
 use crate::{Error, Result};
 use cuda::Stream;
 use ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, Call, RequestKey, TensorExport, TensorRef,
-    TransferHandle,
+    Batch as BatchPlan, BufferAllocation, BufferId, Call, CallId, CallKind, MediaCall, RequestKey,
+    TensorExport, TensorRef, TransferHandle, TransferTransport, WorkerInfo,
 };
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 /// The product exports a batch accepted before its commit point.
 #[derive(Default)]
@@ -240,4 +248,529 @@ pub(crate) fn tensor(export: &TensorExport) -> Result<&ipc::TensorTransfer> {
             "a media input is not a latent trajectory".into(),
         )),
     }
+}
+
+/// What a call contributes to its batch's products beside the state every
+/// batch keeps of it: what the executor's preparation bound of it.
+#[derive(Default)]
+pub(crate) struct ProductCall {
+    /// The trajectory commit the call's forward recorded, applied to the
+    /// ledger at the commit point.
+    pub(crate) latent: Option<LatentUpdate>,
+    /// The exports the call's forward issued, located when the batch
+    /// commits: their device work is performed by then.
+    pub(crate) exports: Vec<(ProductBuffer, ProductExport)>,
+    /// The reports the executor's host tasks of the call send.
+    pub(crate) reports: usize,
+    /// How the call publishes what its tasks wrote once they finished.
+    pub(crate) publication: Option<Publication>,
+    /// Inputs read in place from their shared-memory exports, released once
+    /// the call's host tasks finished.
+    pub(crate) borrowed: Vec<Arc<Mutex<SharedRead>>>,
+}
+
+/// One output a call writes, as the executor prepared it.
+#[derive(Debug, Deserialize)]
+struct PreparedWrite {
+    output: usize,
+    shape: Vec<u64>,
+    region: Option<Vec<[u64; 2]>>,
+    /// `host` or `device`.
+    memory: String,
+    /// A host task fills it after the batch commits.
+    deferred: bool,
+    /// Host readers read its export.
+    host_export: bool,
+}
+
+/// What one call reads and writes, as the executor prepared it.
+#[derive(Debug, Deserialize)]
+struct Prepared {
+    /// Indices into the call's inputs.
+    reads: Vec<usize>,
+    writes: Vec<PreparedWrite>,
+    /// `products`, `encoded` or `media`.
+    publication: Option<String>,
+    /// For a call reading rows of a round's decoded frames: the round
+    /// position each read takes, read in place from its shared-memory
+    /// export or leased.
+    #[serde(default)]
+    read_rows: Option<Vec<u32>>,
+    /// Each input is a round's framed rows, read from the exports that
+    /// reach this rank.
+    #[serde(default)]
+    exported_rows: bool,
+    /// The product rows an encoding call's tasks frame into.
+    #[serde(default)]
+    rows: Vec<u64>,
+    /// The reports the call's host tasks send.
+    #[serde(default)]
+    reports: usize,
+    /// An image model's call: what it reads and writes of its own product
+    /// fields and trajectory (`crate::executor::image`).
+    #[serde(default)]
+    image: Option<serde_json::Value>,
+}
+
+/// The name of a call's output product.
+fn product_name<'a>(info: &'a WorkerInfo, call: &Call, output: &TensorRef) -> Result<&'a str> {
+    info.components
+        .iter()
+        .find(|component| component.name == call.component)
+        .and_then(|component| component.outputs.get(output.output_index as usize))
+        .map(|output| output.name.as_str())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "component {} declares no output {}",
+                call.component, output.output_index
+            ))
+        })
+}
+
+/// The JSON step the executor prepares and executes on a lane that
+/// prepares: every call with what the worker knows of it.
+pub(crate) fn prepared_step(
+    plan: &BatchPlan,
+    info: &WorkerInfo,
+    lane: usize,
+    calls: &[CallState<LaneCall>],
+) -> Result<serde_json::Value> {
+    let encode = |error: serde_json::Error| Error::Invalid(format!("encoding a batch: {error}"));
+    let mut entries = Vec::with_capacity(plan.calls.len());
+    for (index, (call, state)) in plan.calls.iter().zip(calls).enumerate() {
+        let range = plan
+            .decode_ranges
+            .iter()
+            .find(|range| range.request_key == call.request_key && range.call_id == call.call_id);
+        let names = call
+            .outputs
+            .iter()
+            .map(|output| product_name(info, call, output).map(str::to_owned))
+            .collect::<Result<Vec<_>>>()?;
+        entries.push(serde_json::json!({
+            "index": index,
+            "slot": state.slot,
+            "active": state.active,
+            "refused": state.refused(),
+            "call": serde_json::to_value(call).map_err(encode)?,
+            "range": serde_json::to_value(range).map_err(encode)?,
+            "output_names": names,
+            "latent": serde_json::Value::Null,
+        }));
+    }
+    Ok(serde_json::json!({
+        "batch_id": plan.batch_id,
+        "lane": lane,
+        "calls": entries,
+    }))
+}
+
+/// What binding a prepared batch's products borrows.
+pub(crate) struct PreparedOwners<'a> {
+    pub(crate) owners: ProductOwners<'a>,
+    pub(crate) info: &'a WorkerInfo,
+    /// The trajectory ledger of a lane that names the `latents` resource.
+    pub(crate) ledger: Option<&'a LatentLedger>,
+    /// The stream device products host tasks wrote are fenced on.
+    pub(crate) host_stream: Option<Arc<CUDAStream>>,
+    /// The inputs host codecs read in place from their shared-memory
+    /// exports instead of leasing them from the product store.
+    pub(crate) borrowed: &'a HashSet<BufferId>,
+}
+
+/// What a prepared batch's execution publishes behind it: each write that
+/// no host task defers, with its call and whether host readers read it.
+pub(crate) struct Published {
+    writes: Vec<(usize, TensorRef, ProductBuffer, bool)>,
+}
+
+/// Lease what every call of `batch` reads, bind what it writes and take
+/// each trajectory's banks from the ledger, as the executor prepared them
+/// (`step["prepared"]`, one entry per call), noting the banks in `step`.
+/// Returns the tensors the executor's execution reads and writes, in call
+/// order, and the writes [`publish`] publishes behind it.
+pub(crate) fn bind_prepared(
+    owners: &PreparedOwners<'_>,
+    plan: &BatchPlan,
+    batch: &mut Batch<LaneCall>,
+    step: &mut serde_json::Value,
+    issue: impl Issue,
+) -> Result<(Vec<StorageView>, Published)> {
+    let prepared = step
+        .get("prepared")
+        .cloned()
+        .ok_or_else(|| Error::Invariant("a prepared batch has no preparation".into()))?;
+    let prepared: Vec<Prepared> = serde_json::from_value(prepared)
+        .map_err(|error| Error::Interface(format!("the executor's preparation: {error}")))?;
+    if prepared.len() != plan.calls.len() {
+        return Err(Error::Interface(
+            "the executor prepared another number of calls".into(),
+        ));
+    }
+    let slots = batch.slots(plan);
+    let allocations: HashMap<BufferId, BufferAllocation> = plan
+        .buffer_allocations
+        .iter()
+        .map(|allocation| (allocation.buffer, *allocation))
+        .collect();
+    let placement = Placement {
+        allocations: &allocations,
+        slots: &slots,
+    };
+    let store = owners.owners.store;
+    let target = batch.target();
+    let mut tensors = Vec::new();
+    let mut published = Vec::new();
+    for (index, (call, prepared)) in plan.calls.iter().zip(&prepared).enumerate() {
+        let state = &batch.calls[index];
+        if state.refused() {
+            continue;
+        }
+        let slot = state.slot;
+
+        // Reads.
+        for (position, &input_index) in prepared.reads.iter().enumerate() {
+            let input = call.inputs.get(input_index).ok_or_else(|| {
+                Error::Interface("the executor prepared a read of an undeclared input".into())
+            })?;
+            if prepared.exported_rows {
+                tensors.push(exported_rows(owners, plan, input)?);
+                continue;
+            }
+            if let Some(rows) = &prepared.read_rows {
+                let row = *rows
+                    .get(position)
+                    .ok_or_else(|| Error::Interface("a prepared row read names no row".into()))?;
+                if owners.borrowed.contains(&input.buffer_id()) {
+                    let read = borrow_row(owners, plan, input, u64::from(row))?;
+                    tensors.push(row_view(&read)?);
+                    batch.calls[index]
+                        .forward
+                        .products
+                        .borrowed
+                        .push(Arc::new(Mutex::new(read)));
+                } else {
+                    let read = lease(store, batch, input, call.call_id, MemoryKind::Host, None)?;
+                    tensors.push(read.value().select(0, i64::from(row))?);
+                }
+                continue;
+            }
+            let read = lease(store, batch, input, call.call_id, target, issue)?;
+            tensors.push(read.value().clone());
+        }
+
+        // Writes.
+        let mut deferred = Vec::new();
+        for write in &prepared.writes {
+            let product = call.outputs.get(write.output).ok_or_else(|| {
+                Error::Interface("the executor prepared an undeclared output".into())
+            })?;
+            let memory = match write.memory.as_str() {
+                "host" => MemoryKind::Host,
+                "device" => target,
+                other => {
+                    return Err(Error::Interface(format!(
+                        "the executor prepared an output in {other:?} memory"
+                    )));
+                }
+            };
+            let bound = bind_outputs(
+                store,
+                &[OutputShape {
+                    product: product.clone(),
+                    shape: write.shape.clone(),
+                    region: write
+                        .region
+                        .as_ref()
+                        .map(|region| region.iter().map(|&[a, b]| a..b).collect()),
+                }],
+                memory,
+                &placement,
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invariant("a prepared output was not bound".into()))?;
+            tensors.push(bound.view());
+            if write.deferred {
+                store.defer_write(&bound)?;
+                deferred.push((product.clone(), bound));
+            } else {
+                batch.writes.push(bound.clone());
+                published.push((index, product.clone(), bound, write.host_export));
+            }
+        }
+        let forward = &mut batch.calls[index].forward.products;
+        forward.reports = prepared.reports;
+        forward.publication = publication(prepared, deferred, owners.host_stream.as_ref())?;
+
+        // The trajectory ledger. An image model's call binds its scheduled
+        // trajectory itself (`crate::executor::image::bind`).
+        let trajectory = prepared
+            .image
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null)
+            && matches!(
+                call.kind,
+                CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
+            );
+        if let (true, true, CallKind::Media(kind)) =
+            (trajectory, batch.calls[index].active, call.kind)
+        {
+            let ledger = owners
+                .ledger
+                .ok_or_else(|| Error::Invalid("this rank keeps no latent trajectories".into()))?;
+            let (banks, update) = ledger.bind(slot, call, kind)?;
+            step["calls"][index]["latent"] = serde_json::json!({
+                "read": banks.read,
+                "write": banks.write,
+                "step": banks.step,
+            });
+            batch.calls[index].forward.products.latent = Some(update);
+        }
+    }
+    Ok((tensors, Published { writes: published }))
+}
+
+/// How a call publishes what its host tasks write into `deferred`, its
+/// writes the executor prepared as deferred: `None` for a call without
+/// host tasks' products.
+fn publication(
+    prepared: &Prepared,
+    deferred: Vec<(TensorRef, ProductBuffer)>,
+    host_stream: Option<&Arc<CUDAStream>>,
+) -> Result<Option<Publication>> {
+    Ok(match prepared.publication.as_deref() {
+        None => None,
+        Some("products") => Some(Publication::Products {
+            written: deferred,
+            stream: host_stream.cloned(),
+        }),
+        Some("encoded") => {
+            let (product, write) = deferred.into_iter().next().ok_or_else(|| {
+                Error::Interface("an encoding call prepared no encoded rows".into())
+            })?;
+            Some(Publication::Encoded {
+                product,
+                write,
+                rows: prepared.rows.clone(),
+            })
+        }
+        Some("media") => Some(Publication::Media),
+        Some(other) => {
+            return Err(Error::Interface(format!(
+                "the executor prepared the unknown publication {other:?}"
+            )));
+        }
+    })
+}
+
+/// Lease one input for `consumer`, whole, in `memory`; what `stream`
+/// issues next waits on its writer. The lease ends with the batch's other
+/// reads, when it commits or retires.
+fn lease(
+    store: &ProductStore,
+    batch: &mut Batch<LaneCall>,
+    product: &TensorRef,
+    consumer: CallId,
+    memory: MemoryKind,
+    stream: impl Issue,
+) -> Result<Arc<ProductRead>> {
+    let read = store.consume(product, consumer, Some(memory), stream)?;
+    // Kept before the check below, so a refused read still ends.
+    batch.reads.push(Arc::clone(&read));
+    if read.region().is_some() {
+        return Err(Error::Invalid(
+            "a prepared computation requires complete input coverage".into(),
+        ));
+    }
+    Ok(read)
+}
+
+/// Record into `issue` the producer fences and the exports of what the
+/// executor's execution wrote, behind it.
+pub(crate) fn publish(
+    owners: ProductOwners<'_>,
+    plan: &BatchPlan,
+    batch: &mut Batch<LaneCall>,
+    published: Published,
+    issue: impl Issue,
+) -> Result<()> {
+    for (index, product, write, host) in published.writes {
+        owners.store.write(&write, &write.view(), issue, None)?;
+        let export = owners.store.export_buffer(
+            &plan.calls[index],
+            &product,
+            &write,
+            owners.transports,
+            host,
+            None,
+            issue,
+        )?;
+        batch.calls[index]
+            .forward
+            .products
+            .exports
+            .push((write, export));
+    }
+    Ok(())
+}
+
+/// A borrowed shared-memory row as host bytes, viewed as long as the read
+/// lives.
+struct MappedBytes {
+    mapping: Arc<SharedMapping>,
+    offset: usize,
+    bytes: usize,
+}
+
+impl Backing for MappedBytes {
+    fn device(&self) -> MemoryKind {
+        MemoryKind::Host
+    }
+
+    fn address(&self) -> u64 {
+        (self.mapping.address() + self.offset) as u64
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// A host uint8 view of a borrowed row's bytes.
+fn row_view(read: &SharedRead) -> Result<StorageView> {
+    let bytes = read.nbytes();
+    let backing = MappedBytes {
+        mapping: read.mapping()?,
+        offset: read.offset(),
+        bytes,
+    };
+    StorageView::contiguous(
+        Arc::new(backing) as Arc<dyn Backing>,
+        0,
+        DType::U8,
+        &[bytes as i64],
+    )
+}
+
+/// Row `row` of a round's decoded frames, read in place from its
+/// shared-memory export on this host.
+fn borrow_row(
+    owners: &PreparedOwners<'_>,
+    plan: &BatchPlan,
+    product: &TensorRef,
+    row: u64,
+) -> Result<SharedRead> {
+    let export = supplied(plan, product)
+        .ok_or_else(|| Error::Invalid("a borrowed input has no export".into()))?;
+    let tensor = tensor(export)?;
+    let transport = owners
+        .owners
+        .transports
+        .get(TransportKind::PosixShm)
+        .ok_or_else(|| Error::Invalid("borrowed rows require local shared storage".into()))?;
+    let location = tensor
+        .locations
+        .iter()
+        .find(|location| {
+            matches!(location.transport, TransferTransport::PosixShm { .. })
+                && location.source.host == owners.info.endpoint.host
+                && location.offset[0] <= row
+                && row < location.offset[0] + location.shape[0]
+        })
+        .ok_or_else(|| Error::Invalid("a borrowed row has no local shared storage".into()))?;
+    let region: Vec<Range<u64>> = std::iter::once(row..row + 1)
+        .chain(tensor.shape[1..].iter().map(|&extent| 0..extent))
+        .collect();
+    transport.borrow(location, Some(&region))
+}
+
+/// A round's framed unit rows, `[rows, width]` host uint8, read from the
+/// exports that reach this rank.
+fn exported_rows(
+    owners: &PreparedOwners<'_>,
+    plan: &BatchPlan,
+    product: &TensorRef,
+) -> Result<StorageView> {
+    let export = supplied(plan, product).ok_or_else(|| {
+        Error::Invalid("artifact assembly input has no transfer locations".into())
+    })?;
+    let tensor = tensor(export)?;
+    if tensor.shape.len() != 2
+        || tensor
+            .locations
+            .iter()
+            .any(|location| location.dtype != "uint8")
+    {
+        return Err(Error::Invalid("encoded units require byte rows".into()));
+    }
+    let (count, width) = (tensor.shape[0] as usize, tensor.shape[1] as usize);
+    let memory = Storage::host((count * width).max(1));
+    let mut filled = vec![false; count];
+    for location in &tensor.locations {
+        if location.offset.get(1).copied().unwrap_or(0) != 0 {
+            return Err(Error::Invalid(
+                "encoded unit location lacks its length prefix".into(),
+            ));
+        }
+        let first = location.offset[0] as usize;
+        let rows = location.shape[0] as usize;
+        let row_bytes = location.shape.get(1).copied().unwrap_or(0) as usize;
+        if first + rows > count || filled[first..first + rows].iter().all(|&done| done) {
+            continue;
+        }
+        let bytes: Vec<u8> = match &location.transport {
+            TransferTransport::Channel { payload, .. } => payload.clone(),
+            TransferTransport::PosixShm { .. }
+                if location.source.host == owners.info.endpoint.host =>
+            {
+                let Some(transport) = owners.owners.transports.get(TransportKind::PosixShm) else {
+                    continue;
+                };
+                let mut read = transport.borrow(location, None)?;
+                let mapping = read.mapping()?;
+                // SAFETY: the claimed range is mapped and ready until the
+                // read is released below.
+                let payload = unsafe {
+                    std::slice::from_raw_parts(
+                        (mapping.address() + read.offset()) as *const u8,
+                        read.nbytes(),
+                    )
+                }
+                .to_vec();
+                read.release();
+                payload
+            }
+            _ => continue,
+        };
+        if row_bytes == 0 || row_bytes > width || bytes.len() != rows * row_bytes {
+            return Err(Error::Invalid(
+                "encoded unit rows disagree with their location".into(),
+            ));
+        }
+        for (offset, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            let target = (first + offset) * width;
+            // SAFETY: the host allocation holds `count * width` bytes, this
+            // row's range lies inside it and nothing else references it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    (memory.address() as *mut u8).add(target),
+                    row.len(),
+                );
+            }
+            filled[first + offset] = true;
+        }
+    }
+    if filled.iter().any(|&done| !done) {
+        return Err(Error::Invalid(
+            "artifact assembly requires every encoded media unit".into(),
+        ));
+    }
+    StorageView::contiguous(
+        memory as Arc<dyn Backing>,
+        0,
+        DType::U8,
+        &[count as i64, width as i64],
+    )
 }

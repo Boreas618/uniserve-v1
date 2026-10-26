@@ -3,7 +3,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{BlockTables, GroupShape, GroupTable};
+use super::{BlockTables, GroupTable};
 use crate::{Error, Result};
 
 /// Host lengths and placement of one numerical attention row.
@@ -14,35 +14,13 @@ pub(crate) struct AttentionRow {
     pub write: bool,
 }
 
-/// Borrowed pages for one numerical block table, in batch row order.
-/// Device gathers need only the lengths and first pages. Physical units are
-/// expanded only for callers that build an attention tensor on the host.
+/// The pages one numerical block table selects, in batch row order: each
+/// row's first visible page (counted from the table's first page, not from
+/// its start) and its number of pages. Device gathers read the physical
+/// units from the installed tables.
 pub(crate) struct TablePages {
-    pub shape: GroupShape,
     pub starts: Vec<u32>,
     pub lengths: Vec<usize>,
-    position: usize,
-    tables: Vec<Arc<GroupTable>>,
-}
-
-impl TablePages {
-    pub(crate) fn width(&self) -> usize {
-        self.lengths.iter().copied().max().unwrap_or(0).max(1)
-    }
-
-    pub(crate) fn rows(&self) -> impl Iterator<Item = impl Iterator<Item = u32> + '_> + '_ {
-        self.tables.iter().enumerate().map(|(row, table)| {
-            let first = (self.starts[row] - table.start_page) as usize;
-            let step = self.shape.units_per_page as usize;
-            table
-                .units
-                .iter()
-                .skip(first * step + self.position)
-                .step_by(step)
-                .take(self.lengths[row])
-                .map(|unit| unit.0)
-        })
-    }
 }
 
 impl GroupTable {
@@ -55,8 +33,7 @@ impl GroupTable {
 
     fn visible_pages(&self, prefix: u32, query: u32) -> Result<Range<u64>> {
         let first = u64::from(self.first_page(prefix));
-        // The table no longer holds pages before its start, and the page
-        // selection counts from the start (`TablePages::rows`), so a row
+        // The table no longer holds pages before its start, so a row
         // reaching back before it has no pages to read.
         if first < u64::from(self.start_page) {
             return Err(Error::Invalid(
@@ -100,7 +77,6 @@ fn table_pages(
     for (group, table) in first.iter().enumerate() {
         let mut starts = Vec::with_capacity(tables.len());
         let mut lengths = Vec::with_capacity(tables.len());
-        let mut rows = Vec::with_capacity(tables.len());
         for ((row, &prefix), &query) in tables.iter().zip(prefixes).zip(queries) {
             let row_table = &row[group];
             if row_table.shape != table.shape {
@@ -111,16 +87,14 @@ fn table_pages(
             let pages = row_table.visible_pages(prefix, query)?;
             starts.push(pages.start as u32);
             lengths.push((pages.end - pages.start) as usize);
-            rows.push(Arc::clone(row_table));
         }
 
-        for position in 0..table.shape.units_per_page as usize {
+        // A group holds one numerical table per unit of its pages, all
+        // selecting the same pages.
+        for _ in 0..table.shape.units_per_page {
             selected.push(TablePages {
-                shape: table.shape,
                 starts: starts.clone(),
                 lengths: lengths.clone(),
-                position,
-                tables: rows.clone(),
             });
         }
     }
@@ -164,6 +138,7 @@ impl BlockTables {
 
 #[cfg(test)]
 mod tests {
+    use super::super::GroupShape;
     use super::*;
     use ipc::UnitId;
 
@@ -188,23 +163,15 @@ mod tests {
 
         // Token 8 reaches page 1; token 12 reaches page 2. The latter row
         // extends beyond the stored prefix, as a read-only block may do.
+        // The window group's two units per page are two numerical tables.
         let pages = table_pages(&tables, &[8, 12], &[1, 16])?;
-        let values: Vec<Vec<Vec<u32>>> = pages
-            .iter()
-            .map(|table| table.rows().map(Iterator::collect).collect())
-            .collect();
-        assert_eq!(
-            values,
-            vec![
-                vec![vec![10, 12], vec![12, 14, 16]],
-                vec![vec![11, 13], vec![13, 15, 17]],
-                vec![vec![21, 22, 23], vec![21, 22, 23]],
-            ]
-        );
-        assert_eq!(pages[0].starts, [1, 2]);
-        assert_eq!(pages[0].lengths, [2, 3]);
-        assert_eq!(pages[0].width(), 3);
+        assert_eq!(pages.len(), 3);
+        for window in &pages[..2] {
+            assert_eq!(window.starts, [1, 2]);
+            assert_eq!(window.lengths, [2, 3]);
+        }
         assert_eq!(pages[2].starts, [0, 0]);
+        assert_eq!(pages[2].lengths, [3, 3]);
 
         // A retired history page cannot be reconstructed from later units.
         assert!(table_pages(&tables, &[7, 12], &[1, 1]).is_err());

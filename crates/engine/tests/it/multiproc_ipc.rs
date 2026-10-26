@@ -1424,6 +1424,9 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
     );
     verifier.calls[0].input_token_ids = vec![900, 901];
     verifier.calls[0].predicate = Some(successor.calls[0].token_output.clone().unwrap());
+    // Five initialized cache positions are the verifier's maximum. Its first
+    // rejected draft must leave only three positions visible to the next
+    // decode, whose forward row attends to those three and its query.
     let mut resumed = token_batch(
         12,
         4,
@@ -1433,17 +1436,11 @@ fn same_batch_successor_consumes_the_unobserved_device_token() -> anyhow::Result
         CallKind::Forward(ForwardMode::Decode),
         &[0],
         UnitId(1),
-        5,
+        3,
     );
     resumed.calls[0].input_token_ids.clear();
     resumed.calls[0].predicate = Some(verifier.calls[0].token_output.clone().unwrap());
-    // Five initialized cache positions are the verifier's maximum. Its first
-    // rejected draft must leave only three positions visible to the next decode.
-    resumed.calls[0].coordinates = CallCoordinates {
-        logical_position: 3,
-        cache_visible_len: 3,
-        cache_computed_len: 5,
-    };
+    resumed.calls[0].coordinates.cache_computed_len = 5;
     for mut batch in [first, successor, verifier, resumed] {
         let batch_id = batch.batch_id;
         let commands = std::mem::take(&mut batch.commands);
@@ -2786,7 +2783,6 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         decode_graph_batch_sizes: None,
         prefill_outputs: true,
         prefill_graph_token_sizes: None,
-        flow_graph_batch_sizes: None,
         flow_graph_shapes: None,
         video_text_capacities: None,
         video_resolutions: Vec::new(),

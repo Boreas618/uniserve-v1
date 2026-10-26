@@ -162,9 +162,9 @@ class Registry:
         """Choose each worker's CUDA graphs: ``function`` is called with
         the worker's models and its configured policy, a dict of ``mode``
         (``auto``, ``full`` or ``off``) and the buckets of each execution
-        path: ``decode`` batch sizes, ``prefill`` token sizes,
-        ``flow_batches`` and ``flow_shapes`` (``[height, width]`` pixels) of
-        image denoising; it returns a dict of the entries it changes. The
+        path: ``decode`` batch sizes, ``prefill`` token sizes and
+        ``flow_shapes`` (``[height, width]`` pixels) of image generation; it
+        returns a dict of the entries it changes. The
         worker checks the result as it checks the configuration.
 
         Raises:

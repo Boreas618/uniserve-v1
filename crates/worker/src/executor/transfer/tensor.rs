@@ -22,7 +22,7 @@ use ipc::{BufferAllocation, BufferId, DType as ProductDType, TensorRef};
 
 use super::TransferBatch;
 use super::latents;
-use crate::executor::image::ImageParts;
+use crate::executor::latents::LatentLedger;
 use crate::ffi::{DType, MemoryKind};
 use crate::memory::{OutputPlacement, ProductBuffer, TrajectoryVersion};
 use crate::worker::WorkerMemory;
@@ -42,8 +42,8 @@ enum Placement {
 impl TransferBatch<'_> {
     /// Copy every active call's input product into its output product and
     /// export the copy; export trajectory transfers' versions from the
-    /// latent pool of `image`.
-    pub(super) fn copy_products(&mut self, image: Option<&mut ImageParts<'_>>) -> Result<()> {
+    /// latent pool of `ledger`.
+    pub(super) fn copy_products(&mut self, ledger: Option<&mut LatentLedger>) -> Result<()> {
         let plan = self.plan;
         let target = self.target();
         let allocations: HashMap<BufferId, BufferAllocation> = plan
@@ -81,10 +81,10 @@ impl TransferBatch<'_> {
             transfers.push((index, input, output, placement));
         }
         if !trajectories.is_empty() {
-            let image = image.ok_or_else(|| {
+            let ledger = ledger.ok_or_else(|| {
                 Error::Unsupported("trajectory transfers require a latent pool".into())
             })?;
-            self.export_trajectories(image, &trajectories)?;
+            self.export_trajectories(ledger, &trajectories)?;
         }
         let writes = self.bind(&transfers, &allocations, target)?;
 
@@ -119,10 +119,10 @@ impl TransferBatch<'_> {
     /// Export the committed trajectory version each of `calls` names (its
     /// latent input) as its latent output, ordered after the latent pool's
     /// previous user in the batch's job.
-    fn export_trajectories(&mut self, image: &mut ImageParts<'_>, calls: &[usize]) -> Result<()> {
+    fn export_trajectories(&mut self, ledger: &mut LatentLedger, calls: &[usize]) -> Result<()> {
         let plan = self.plan;
         let issue = self.issue();
-        image.enter_latents(issue)?;
+        ledger.enter(issue)?;
         let exported = (|| -> Result<()> {
             for &index in calls {
                 let call = &plan.calls[index];
@@ -146,7 +146,7 @@ impl TransferBatch<'_> {
                         Error::Invalid("latent transfer has no bound parameters".into())
                     })?;
                 let slot = self.recorded.batch.calls[index].slot;
-                let (pool, storage) = image.latent_pool()?;
+                let (pool, storage) = ledger.parts();
                 let pages: Vec<usize> = params
                     .page_table
                     .iter()
@@ -181,7 +181,7 @@ impl TransferBatch<'_> {
             }
             Ok(())
         })();
-        exported.and(image.leave_latents(issue))
+        exported.and(ledger.leave(issue))
     }
 
     /// Bind every transfer's output, in transfer order: features in their

@@ -21,7 +21,7 @@ from uniserve.nn.mlp import GatedMLP
 from uniserve.nn.moe import FusedMoE, TopK
 from uniserve.nn.norm import RMSNorm
 from uniserve.nn.rope import RotaryEmbedding
-from uniserve.nn.routing import RoutedTensor, RouteSpan
+from uniserve.nn.routing import IndexedRoutes, SparseRoute
 from uniserve.nn.timestep import TimestepEmbedding
 from uniserve.nn.vae.layers import (
     AttentionBlock,
@@ -48,6 +48,7 @@ __all__ = [
     "FusedMoE",
     "GELUAndMul",
     "GatedMLP",
+    "IndexedRoutes",
     "Linear",
     "MLPConnector",
     "MergedColumnParallelLinear",
@@ -59,10 +60,9 @@ __all__ = [
     "RMSNorm",
     "ResidualBlock",
     "RotaryEmbedding",
-    "RouteSpan",
-    "RoutedTensor",
     "RowParallelLinear",
     "SiLUAndMul",
+    "SparseRoute",
     "TimestepEmbedding",
     "TopK",
     "TubeletEmbed",

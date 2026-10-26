@@ -7,12 +7,18 @@ and holds that token's ``stride x stride`` RGB block in pixel, then channel
 order (``uniserve.nn.functional.patchify``). There is no VAE: the model's
 ``ImageDecoder`` only unfolds the patch rows back into pixels.
 
-Each step re-encodes the current sample through this module's own
-``vision.Encoder``, adds timestep (and optionally noise-scale) embeddings, and
-runs every image token through the ``flow`` experts of the backbone shared
-with the text model. The image tokens attend to their guidance branch's
-prefix in the prefix cache. A velocity head then turns the backbone output into
-the solver's velocity (``flow.Velocity``).
+Each step re-encodes the current sample through this module's own vision
+tower (``vision.TokenEncoder``), adds timestep (and optionally noise-scale)
+embeddings, and runs every image token through the ``flow`` experts of the
+backbone shared with the text model. The image tokens attend to their
+guidance branch's prefix in the prefix cache. A velocity head then turns the
+backbone output into the solver's velocity (``flow.Velocity``).
+
+A packed forward is row-local: each token's sample row is its own pixel
+block, which the encoder reads alone (``vision.TokenEncoder``),
+and the MLP velocity heads act on each token alone. The convolutional pixel
+decoder (``use_pixel_head``) is the exception, an eager per-image region
+over each image's token grid (``flow.Velocity.decode``).
 """
 
 from __future__ import annotations
@@ -27,20 +33,23 @@ from uniserve.diffusion import (
     make_schedule,
 )
 from uniserve.models import ImageDenoiser
-from uniserve.nn.functional import unpatchify
+from uniserve.models.inputs import PackedImageInput
 from uniserve.nn.linear import Linear
-from uniserve.nn.routing import RouteSpan
+from uniserve.nn.routing import IndexedRoutes
 from uniserve.nn.timestep import TimestepEmbedding
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from . import flow, vision
 from .config import Config
-from .inputs import DenoiserInput, ImageConditioning
 from .transformer import Transformer
 
 
-class Denoiser(ImageDenoiser[DenoiserInput]):
-    """Predict image velocity from pixels through the shared text/flow backbone."""  # noqa: E501
+class Denoiser(ImageDenoiser):
+    """Predict image velocity from pixels through the shared backbone.
+
+    The backbone is the text model's, whose ``flow`` experts the image
+    tokens take.
+    """
 
     # The prompt's ``<img>`` token sits at the position before the image, the
     # patches share the next one and ``</img>`` takes the one after.
@@ -52,59 +61,6 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         # the image's patch tokens alone; the opening ``<img>`` token belongs
         # to the prompt prefix (``processing.flow_prompt``).
         return self.config.max_image_seq_len
-
-    def bind_inputs(
-        self,
-        *,
-        latents,
-        sizes,
-        step,
-        positions,
-        sequence_lengths,
-        attention,
-    ) -> DenoiserInput:
-        """Assemble one denoising step's typed input and per-step conditioning.
-
-        The network input is the current solver sample itself, so the image
-        conditioning is rebuilt from ``latents`` on every step: each sample is
-        unpatchified to ``[1, 3, H, W]`` pixels in the sample dtype, paired
-        with its int64 vision patch grid ``[[H // patch, W // patch]]`` and
-        with the resolution-dependent noise scale that ``prepare_latents``
-        applied to its initial draw. The image tokens only read the
-        trajectory's prefix in the prefix cache; the worker's denoising rows
-        (``flow_rows``) do not write them into it. The conditioning derives
-        from the samples on the device, so a captured step binds it too.
-        """
-        images = []
-        for latent, size in zip(latents["image"], sizes, strict=True):
-            sample = latent.tensor
-            pixels = unpatchify(
-                sample.unsqueeze(0),
-                size,
-                patch_size=self.patch_size,
-                channels=self.latent_channels,
-            )
-            patch = self.config.vision.patch_size
-            # Device fills rather than host copies, so a CUDA graph can
-            # capture the binding with the step that reads it.
-            grid = sample.new_full(
-                (1, 2), size.height // patch, dtype=torch.int64
-            )
-            grid[:, 1].fill_(size.width // patch)
-            scale = sample.new_full(
-                (1,), self.noise_scale.scale(sample.shape[0])
-            )
-            images.append(ImageConditioning(pixels, grid, scale))
-
-        return DenoiserInput(
-            latents=latents,
-            sizes=sizes,
-            step=step,
-            positions=positions,
-            sequence_lengths=sequence_lengths,
-            attention=attention,
-            images=tuple(images),
-        )
 
     def __init__(self, config: Config, backbone: Transformer):
         # Output pixels per backbone token on each spatial axis. Samples are
@@ -126,7 +82,7 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         # ``weights.checkpoint_mappings``. The input encoder has its own
         # generation weights, distinct from ``Model.vision_encoder``.
         self.config, self.backbone = config, backbone
-        self.input = vision.Encoder(config.vision)
+        self.input = vision.TokenEncoder(config.vision)
         self.time_embedding = TimestepEmbedding(config.text.hidden_size)
         self.noise_embedding = (
             TimestepEmbedding(config.text.hidden_size)
@@ -187,46 +143,28 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
             text_scale, image_scale, interval, renorm, renorm_min
         )
 
-    def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
-        """Predict each image's velocity for one homogeneous denoising batch.
+    def forward(self, inputs: PackedImageInput, *, state, constants, workspace):
+        """Predict every token's velocity for one packed forward.
 
-        Returns ``{"image": outputs}`` with one entry per sample: a
-        ``TensorOutput`` holding the FP32 velocity in the sample's canonical
-        ``[tokens, 3 * stride**2]`` shape on the last pipeline stage, and
-        ``None`` on every other stage, where the worker's
-        ``DiffusionRunner.batch_forward`` receives the prediction by broadcast
-        from the last stage. ``state``, ``constants`` and ``workspace`` are
-        unused.
+        Returns ``{"image": (velocity,)}``: a ``TensorOutput`` holding the
+        FP32 ``[tokens, 3 * stride**2]`` velocity on the last pipeline
+        stage, and ``None`` on every other stage, which receives the
+        prediction by broadcast from the last stage. A latent token's row is
+        its velocity from its sample row; framing and padding tokens' rows
+        are finite and unspecified. ``state``, ``constants`` and
+        ``workspace`` are unused.
 
         Raises:
-            ValueError: Among others, if the latents are not exactly the
-                ``image`` modality, an image size holds no latent patch, or a
-                sample, its declared token count or its conditioning pixels
-                disagree with the sample's image size. The backbone and
-                velocity head raise their own shape errors.
+            ValueError: The source rows are not canonical patch rows, or the
+                pixel decoder evaluates without the rows' host regions. The
+                backbone and velocity head raise their own shape errors.
         """
-        if set(inputs.latents) != {"image"}:
-            raise ValueError("SenseNova predicts the image latent modality")
-        if not inputs.batch_size:
-            return {"image": ()}
-
-        for latent, size, conditioning, count in zip(
-            inputs.latents["image"],
-            inputs.sizes,
-            inputs.images,
-            inputs.sequence_lengths,
-            strict=True,
-        ):
-            shape = self.latent_shape("image", size)
-            if (
-                latent.tensor.shape != shape
-                or shape[0] != count
-                or conditioning.pixels.shape[-2:] != (size.height, size.width)
-            ):
-                raise ValueError(
-                    "SenseNova samples and conditioning must cover "
-                    "their declared image dimensions"
-                )
+        rows = inputs.rows
+        if inputs.source.shape[1] != 3 * self.patch_size**2:
+            raise ValueError("SenseNova reads canonical pixel patch rows")
+        # Each token's sample row; tokens other than latent ones read source
+        # row 0, whose results nothing reads.
+        samples = inputs.source.index_select(0, rows.sample_index.clamp_min(0))
 
         # Only the first pipeline stage builds input embeddings; later stages
         # pass None and the backbone receives hidden states from the previous
@@ -234,100 +172,43 @@ class Denoiser(ImageDenoiser[DenoiserInput]):
         pipeline = self.mesh.get_group("pp" if "pp" in self.mesh.axes else ())
         hidden = None
         if pipeline.rank == 0:
-            patch = self.config.vision.patch_size
-            shapes = tuple(
-                (size.height // patch, size.width // patch)
-                for size in inputs.sizes
-            )
-            # [1, 3, H, W] pixels -> [(H/patch)*(W/patch), 3*patch*patch]
-            # flattened CHW vision patches in raster order, the packed layout
-            # vision.Encoder accepts. These are vision patches, not backbone
-            # tokens: the encoder's dense reduction merges them into tokens.
-            pixels = torch.cat(
-                tuple(
-                    value.pixels.reshape(1, 3, height, patch, width, patch)
-                    .permute(0, 2, 4, 1, 3, 5)
-                    .reshape(-1, 3 * patch**2)
-                    for value, (height, width) in zip(
-                        inputs.images, shapes, strict=True
-                    )
-                )
-            )
-            hidden = self.input(
-                pixels,
-                torch.cat(tuple(value.grid for value in inputs.images)),
-                shapes,
-            )
+            # Each token's pixel block at its (row, column) in its image's
+            # token grid.
+            hidden = self.input(samples, rows.positions[1:].T)
 
-            # Every token of an image receives its sample's timestep and, when
-            # the checkpoint enables it, its noise scale normalized by the
-            # configured maximum.
-            times = torch.cat(
-                tuple(
-                    latent.timestep.reshape(1).expand(count)
-                    for latent, count in zip(
-                        inputs.latents["image"],
-                        inputs.sequence_lengths,
-                        strict=True,
-                    )
-                )
-            )
-            hidden = hidden + self.time_embedding(times)
+            # Every token receives its row's timestep and, when the
+            # checkpoint enables it, its row's noise scale normalized by the
+            # configured maximum, in the samples' dtype.
+            hidden = hidden + self.time_embedding(rows.timesteps)
             if self.noise_embedding is not None:
-                scales = torch.cat(
-                    tuple(
-                        value.noise_scale.reshape(1).expand(count)
-                        for value, count in zip(
-                            inputs.images, inputs.sequence_lengths, strict=True
-                        )
-                    )
-                )
+                scales = rows.noise_scale.to(samples.dtype)[rows.token_row]
                 hidden = hidden + self.noise_embedding(
                     scales / self.noise_scale.maximum
                 )
 
-        # Every packed image token takes the flow experts; text tokens exist
-        # only as the cached prefix the shared attention reads.
+        # Every packed token takes the flow experts; text tokens exist only
+        # as the cached prefix the shared attention reads.
         hidden = self.backbone(
             hidden,
-            torch.cat(inputs.positions, dim=1),
+            rows.positions,
             inputs.attention,
-            routes=(RouteSpan("flow", 0, sum(inputs.sequence_lengths)),),
+            routes=IndexedRoutes("flow"),
         )
         if pipeline.rank != pipeline.size - 1:
-            return {"image": (None,) * inputs.batch_size}
+            return {"image": (None,)}
 
-        outputs = []
-        for features, latent, size, conditioning in zip(
-            hidden.split(inputs.sequence_lengths),
-            inputs.latents["image"],
-            inputs.sizes,
-            inputs.images,
-            strict=True,
-        ):
-            from uniserve.nn.functional import unpatchify
-
-            # The conditioning pixels feed the network, while the velocity's
-            # origin is always the solver sample ``latent.tensor``.
-            # ``bind_inputs`` derives both from the same sample, but a
-            # directly constructed input may supply different conditioning.
-            sample = unpatchify(
-                latent.tensor, size, patch_size=self.patch_size, channels=3
-            ).unsqueeze(0)
-            velocity = self.prediction(
-                features,
-                latent.timestep,
-                ImageConditioning(
-                    sample, conditioning.grid, conditioning.noise_scale
-                ),
-            )
-            shape = self.latent_shape("image", size)
-            outputs.append(
+        # The velocity's origin is each token's solver sample.
+        velocity = self.prediction(
+            hidden, rows.timesteps, samples, rows.regions
+        )
+        shape = (rows.tokens, 3 * self.patch_size**2)
+        return {
+            "image": (
                 TensorOutput(
                     velocity,
                     OutputLayout(
                         shape, velocity.dtype, tuple(slice(0, n) for n in shape)
                     ),
-                )
+                ),
             )
-        return {"image": tuple(outputs)}
+        }

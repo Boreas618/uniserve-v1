@@ -168,13 +168,15 @@ def test_patch_order_preserves_pixels_then_channels():
     )
 
 
-def test_public_image_step_uses_borrowed_sample_and_input_time():
-    from uniserve.diffusion import DenoisingStep
+def test_image_latents_scale_the_native_draw_before_patching():
     from uniserve.media import image
-    from uniserve.models import DenoiserInput, ImageDenoiser, LatentInput
-    from uniserve.tensors import OutputLayout, TensorOutput
+    from uniserve.models import ImageDenoiser
 
-    class Expansion(ImageDenoiser):
+    class Scaled(ImageDenoiser):
+        """An image denoiser whose constant noise scale is two."""
+
+        rope_advance = 1
+
         def __init__(self):
             super().__init__(
                 patch_size=2,
@@ -186,15 +188,56 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
             )
 
         def make_schedules(self, steps, *, shift, device):
-            return {
-                "image": make_schedule(
-                    steps,
-                    shift=1 if shift is None else shift,
-                    direction="ascending",
-                    shift_domain="time",
-                    device=device,
-                )
-            }
+            raise NotImplementedError
+
+        def make_guidance(self, **guidance):
+            raise NotImplementedError
+
+        def forward(self, inputs, *, state, constants, workspace):
+            raise NotImplementedError
+
+    network = Scaled()
+    size = image.Config(2, 4)
+    noise = torch.ones(1, *network.noise_shape("image", size))
+    sample = torch.empty(1, *network.latent_shape("image", size))
+    network.prepare_latents(
+        (size,),
+        noise={"image": noise},
+        state={"image": sample},
+        constants={},
+        workspace={},
+    )
+    torch.testing.assert_close(
+        sample, torch.full_like(sample, 2), rtol=0, atol=0
+    )
+    # The conversion reads the caller's draw without writing it.
+    torch.testing.assert_close(noise, torch.ones_like(noise), rtol=0, atol=0)
+
+
+def test_public_step_uses_borrowed_sample_and_input_time():
+    from uniserve.diffusion import DenoisingStep
+    from uniserve.media import image
+    from uniserve.models import Denoiser, DenoiserInput, LatentInput
+    from uniserve.tensors import OutputLayout, TensorOutput
+
+    class Expansion(Denoiser[DenoiserInput[image.Config], image.Config]):
+        """Predicts dx/dt = 2x for one value per pixel."""
+
+        def __init__(self):
+            super().__init__(
+                modalities=("image",),
+                prediction_dtype=torch.float32,
+                solver=EulerSolver(),
+            )
+
+        def latent_shape(self, modality, size):
+            return (size.height, size.width)
+
+        def noise_shape(self, modality, size):
+            return self.latent_shape(modality, size)
+
+        def prepare_latents(self, sizes, *, noise, state, constants, workspace):
+            state["image"].copy_(noise["image"])
 
         def forward(self, inputs, *, state, constants, workspace):
             outputs = []
@@ -212,28 +255,19 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
 
     network = Expansion()
     size = image.Config(2, 4)
-    noise = torch.ones(1, *network.noise_shape("image", size))
-    sample = torch.empty(1, *network.latent_shape("image", size))
-    network.prepare_latents(
-        (size,),
-        noise={"image": noise},
-        state={"image": sample},
-        constants={},
-        workspace={},
+    sample = torch.full((1, *network.latent_shape("image", size)), 2.0)
+    schedule = make_schedule(
+        1, shift=1, direction="ascending", shift_domain="time", device="cpu"
     )
-    torch.testing.assert_close(
-        sample, torch.full_like(sample, 2), rtol=0, atol=0
-    )
-    schedules = network.make_schedules(1, shift=None, device="cpu")
     inputs = DenoiserInput(
         {"image": (LatentInput(sample[0], torch.tensor(0.5)),)},
         (size,),
-        schedules["image"].step(0),
+        schedule.step(0),
     )
     step = DenoisingStep(
         network,
         inputs,
-        schedules,
+        {"image": schedule},
         {"image": sample},
         {},
         {},
@@ -244,7 +278,6 @@ def test_public_image_step_uses_borrowed_sample_and_input_time():
     torch.testing.assert_close(
         sample, torch.full_like(sample, 4), rtol=0, atol=0
     )
-    torch.testing.assert_close(noise, torch.ones_like(noise), rtol=0, atol=0)
 
 
 def test_image_decoder_restores_different_rasters_in_input_order():

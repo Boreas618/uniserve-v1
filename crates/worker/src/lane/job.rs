@@ -2,22 +2,22 @@
 //! back.
 //!
 //! A [`Job`] is an ordered list of operations on streams: copies, fills,
-//! event records and waits, a graph launch, an eager call, output reads, a
-//! host function, a wait for the stream, an expert step. The control thread
-//! builds it: a runner and the storage owners it calls record what they
-//! would issue ([`Job::on`], an [`Issue`]), and do their host bookkeeping
-//! as they are called. Every operation owns its data, so the job moves to
-//! the lane's execution thread, which performs the operations in order and
+//! event records and waits, an eager call, output reads, a host function,
+//! a host check of what the job's calls returned, a wait for the stream.
+//! The control thread builds it: a batch's lane and the storage owners it
+//! uses record what they would issue ([`Job::on`], an [`Issue`]) and the
+//! executor calls the batch makes, and do their host bookkeeping as they
+//! are called. Every operation owns its data, so the job moves to the
+//! lane's execution thread, which performs the operations in order and
 //! posts a [`Completion`] with what the eager calls returned and what the
 //! output reads produced. The control thread does not wait for it.
 //!
 //! An operation names its stream, so one job orders work across the lane's
-//! stream and the streams forked from it (expert microbatches), and a job
-//! of a rank without a CUDA device (no stream) is plain memory writes and
-//! calls.
+//! stream and the streams forked from it, and a job of a rank without a
+//! CUDA device (no stream) is plain memory writes and calls.
 //!
 //! A job is performed completely or it fails at one operation. After a
-//! failure the remaining copies, fills, launches, calls, reads, host
+//! failure the remaining copies, fills, calls, reads, host
 //! functions and waits are not performed, but the remaining event
 //! operations are: an event a job
 //! records fences storage its owner already retains on it, and that
@@ -29,11 +29,8 @@ use std::sync::Arc;
 
 use cuda::{CopyBatch, DeviceId, Event, SourceOrder, Stream, StridedCopy};
 
-use crate::cuda_graph::{CUDAGraph, GraphBreaks};
+use crate::ffi::MethodCall;
 use crate::ffi::{DeferredCall, Handle};
-use crate::parallel::joins::GraphFunctions;
-use crate::parallel::{ExpertUnion, MicrobatchForward};
-use crate::runner::methods::MethodCall;
 use crate::stream::{Deferral, Deferred, EventPool, Fill, HostFunction, Issue, RowFill};
 use crate::{Error, Result};
 
@@ -84,11 +81,6 @@ pub(super) enum Operation {
         stream: Stream,
         event: Arc<Event>,
     },
-    /// Every segment of a captured forward, and the breaks between them.
-    Launch {
-        stream: Stream,
-        graph: CUDAGraph,
-    },
     Call(Call),
     /// Copy `bytes` at `source` to the host and wait for them.
     Read {
@@ -105,85 +97,29 @@ pub(super) enum Operation {
     Synchronize {
         stream: Option<Stream>,
     },
-    ExpertStep(ExpertStep),
-    /// The union's next step for a rank with no forward of its own: one
-    /// round of the agreement and, when a step was agreed, its join.
-    ExpertJoin {
-        union: Arc<ExpertUnion>,
-        /// The rank is shutting down and leaves the union.
-        leaving: bool,
-    },
-    /// The end of the union's startup warmup on this rank: the announced
-    /// steps it follows, then the capture of its joins.
-    ExpertWarmup(Arc<ExpertUnion>),
+    /// Check what the calls before it returned, on the thread performing
+    /// the job; a refusal fails the job here.
+    Check(Check),
 }
+
+/// A host check of a job's completion so far ([`Job::check`]): it reads what
+/// the calls recorded before it returned and the host memory they wrote,
+/// touches no stream, and refuses with an error.
+pub(crate) type Check = Box<dyn FnOnce(&Completion) -> Result<()> + Send>;
 
 /// Work the execution thread hands to the builder thread and waits for, or
 /// runs itself where it enters Python on its own.
 pub(super) enum Call {
-    /// A runner method.
+    /// A library method.
     Method(MethodCall),
-    /// A runner method whose integers the completion carries.
+    /// A library method whose integers the completion carries.
     Returning(MethodCall),
-    /// A runner method whose returned object the completion carries.
+    /// A library method whose returned object the completion carries.
     Handle(MethodCall),
-    /// A runner method whose returned list the completion carries, value
-    /// by value.
-    Values(MethodCall),
     /// A function whose returned strings the completion carries.
     Texts(MethodCall),
     /// A library function over values that are no tensors.
     Function(DeferredCall),
-    Capture(Capture),
-}
-
-/// The capture of one runner method into a graph: `capture_begin`, the
-/// method, `capture_end`, on the builder thread.
-pub(crate) struct Capture {
-    pub(crate) functions: GraphFunctions,
-    /// The pool the captured allocations on the stream's device live in.
-    pub(crate) pool: Handle,
-    /// The pool of each other device the method's modules run on (a
-    /// generation tower), with its device; empty for a method on one
-    /// device.
-    pub(crate) peers: Vec<(DeviceId, Handle)>,
-    /// The raw handle and device of the stream the method issues on.
-    pub(crate) stream: usize,
-    pub(crate) device: DeviceId,
-    pub(crate) method: MethodCall,
-    /// Where the method's graph breaks are noted while it is captured.
-    pub(crate) breaks: Option<GraphBreaks>,
-}
-
-/// One expert step: the union's agreement on the step's capacity, then the
-/// forward of every populated microbatch and the join of every empty one at
-/// that capacity.
-pub(crate) struct ExpertStep {
-    pub(crate) union: Arc<ExpertUnion>,
-    /// The lane's stream, which every microbatch stream forks from and
-    /// joins.
-    pub(crate) lane: Stream,
-    /// Tokens this rank's forwards send to each expert layer, and the kind
-    /// of forward, for the agreement.
-    pub(crate) tokens: usize,
-    pub(crate) kind: i64,
-    /// The capacity a warmup step runs at.
-    pub(crate) forced: Option<usize>,
-    /// The step at every capacity it can be agreed at.
-    pub(crate) variants: Vec<ExpertVariant>,
-    /// What each populated microbatch runs behind its forward in the same
-    /// turn, whatever the capacity (the selection of rows that sample).
-    pub(crate) after: Vec<Option<Job>>,
-}
-
-/// An expert step at one capacity.
-pub(crate) struct ExpertVariant {
-    pub(crate) capacity: usize,
-    /// One forward per microbatch; an empty microbatch joins.
-    pub(crate) forwards: Vec<Option<MicrobatchForward>>,
-    /// What follows the step on the execution thread at this capacity (the
-    /// captures of forwards that ran as their warmup).
-    pub(crate) then: Job,
 }
 
 /// The operation a job failed at.
@@ -200,21 +136,12 @@ pub(crate) struct Failure {
 /// operations: each accessor takes the next one of its kind.
 #[derive(Default)]
 pub(crate) struct Completion {
-    /// The graph of each capture.
-    pub(super) captured: VecDeque<CUDAGraph>,
     /// The bytes of each output read.
     pub(super) reads: VecDeque<Vec<u8>>,
-    /// The capacity each expert step was agreed at.
-    pub(super) capacities: VecDeque<usize>,
-    /// For each expert join: whether a step ran, and whether every rank
-    /// has left the union.
-    pub(super) joins: VecDeque<(bool, bool)>,
     /// The integers each returning call returned.
     pub(super) returned: VecDeque<Vec<i64>>,
     /// The object each handle call returned.
     pub(super) handles: VecDeque<Handle>,
-    /// The values of the list each value call returned.
-    pub(super) values: VecDeque<Vec<Value>>,
     /// The strings each text call returned.
     pub(super) texts: VecDeque<Vec<String>>,
     /// Where the job stopped, when it did not run to its end.
@@ -230,44 +157,27 @@ impl Completion {
         }
     }
 
-    /// The graph of the next capture.
-    pub(crate) fn captured(&mut self) -> Result<CUDAGraph> {
-        self.captured.pop_front().ok_or(MISSING)
-    }
-
     /// The bytes of the next output read.
     pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
         self.reads.pop_front().ok_or(MISSING)
     }
 
-    /// The capacity the next expert step was agreed at.
-    pub(crate) fn capacity(&mut self) -> Result<usize> {
-        self.capacities.pop_front().ok_or(MISSING)
-    }
-
-    /// The next expert join: whether a step ran, and whether every rank
-    /// has left the union.
-    pub(crate) fn joined(&mut self) -> Result<(bool, bool)> {
-        self.joins.pop_front().ok_or(MISSING)
-    }
-
     /// The integers the next returning call returned
     /// ([`Job::call_returning`]): one for a call that returns an integer,
-    /// and for a call that returns lists of integers (shapes) each list's
-    /// length followed by its integers.
+    /// the list's for a call that returns a list of integers.
     pub(crate) fn returned(&mut self) -> Result<Vec<i64>> {
         self.returned.pop_front().ok_or(MISSING)
+    }
+
+    /// The integers the returning call performed last returned, without
+    /// taking them: what a [`Check`] recorded behind that call reads.
+    pub(crate) fn last_returned(&self) -> Option<&[i64]> {
+        self.returned.back().map(Vec::as_slice)
     }
 
     /// The object the next handle call returned ([`Job::call_handle`]).
     pub(crate) fn handle(&mut self) -> Result<Handle> {
         self.handles.pop_front().ok_or(MISSING)
-    }
-
-    /// The values of the list the next value call returned
-    /// ([`Job::call_values`]), in the list's order.
-    pub(crate) fn values(&mut self) -> Result<Vec<Value>> {
-        self.values.pop_front().ok_or(MISSING)
     }
 
     /// The strings the next text call returned ([`Job::call_texts`]): one
@@ -279,46 +189,6 @@ impl Completion {
 
 pub(super) const MISSING: Error =
     Error::State("a job's completion lacks a result its builder recorded");
-
-/// One value of the list a value call returned ([`Job::call_values`]): a
-/// list of numbers.
-///
-/// The list is converted on the thread that made the call, so its reader
-/// holds plain numbers.
-pub(crate) enum Value {
-    /// A shape or a list of integers.
-    Integers(Vec<i64>),
-    /// A list of numbers that are not all integers.
-    Floats(Vec<f64>),
-}
-
-impl Value {
-    /// Convert one value of the list `name` returned.
-    fn new(value: tvm_ffi::Any, name: &str) -> Result<Self> {
-        let numerical = |error: tvm_ffi::Error| Error::numerical(name, &error);
-        if value.type_index() == tvm_ffi::TypeIndex::kTVMFFIShape as i32 {
-            return crate::ffi::integers(value)
-                .map(Self::Integers)
-                .map_err(numerical);
-        }
-        let Ok(numbers) = tvm_ffi::Array::<tvm_ffi::Any>::try_from(value.clone()) else {
-            return Err(Error::Interface(format!("{name} returns lists of numbers")));
-        };
-
-        let integer = tvm_ffi::TypeIndex::kTVMFFIInt as i32;
-        if numbers.iter().all(|number| number.type_index() == integer) {
-            return crate::ffi::integers(value)
-                .map(Self::Integers)
-                .map_err(numerical);
-        }
-        numbers
-            .iter()
-            .map(f64::try_from)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map(Self::Floats)
-            .map_err(numerical)
-    }
-}
 
 impl Default for Job {
     fn default() -> Self {
@@ -352,9 +222,9 @@ impl Job {
         std::mem::take(&mut self.deferrals.borrow_mut())
     }
 
-    /// The import path of the first runner method the job calls or
-    /// captures, which names the job when its lane is reported stalled;
-    /// `None` for a job that calls none (a graph launch, copies, waits).
+    /// The import path of the first library method the job calls, which
+    /// names the job when its lane is reported stalled; `None` for a job
+    /// that calls none (copies, waits).
     pub(crate) fn method(&self) -> Option<String> {
         self.operations
             .borrow()
@@ -364,10 +234,8 @@ impl Job {
                     Call::Method(method)
                     | Call::Returning(method)
                     | Call::Handle(method)
-                    | Call::Values(method)
                     | Call::Texts(method),
                 ) => Some(method.name().to_owned()),
-                Operation::Call(Call::Capture(capture)) => Some(capture.method.name().to_owned()),
                 _ => None,
             })
     }
@@ -392,31 +260,23 @@ impl Job {
         Recorder { job: self, stream }
     }
 
-    /// An eager call of a runner method.
+    /// An eager call of a library method.
     pub(crate) fn call(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Method(method)));
     }
 
-    /// An eager call of a runner method that returns an integer, a list of
-    /// integers (the counts of what it wrote, say) or a list of such lists
-    /// (the shapes of what it wrote), which the job's completion carries
-    /// ([`Completion::returned`]).
+    /// An eager call of a library method that returns an integer or a list
+    /// of integers (the record words an execution wrote, say), which the
+    /// job's completion carries ([`Completion::returned`]).
     pub(crate) fn call_returning(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Returning(method)));
     }
 
-    /// An eager call of a runner method that returns an object the library
-    /// holds (a prepared image), which the job's completion carries
-    /// ([`Completion::handle`]).
+    /// An eager call of a library method that returns an object the
+    /// library holds (a profiler session), which the job's completion
+    /// carries ([`Completion::handle`]).
     pub(crate) fn call_handle(&self, method: MethodCall) {
         self.push(Operation::Call(Call::Handle(method)));
-    }
-
-    /// An eager call of a runner method that returns a list of objects
-    /// the library holds and lists of numbers (a plan and its schedule),
-    /// which the job's completion carries ([`Completion::values`]).
-    pub(crate) fn call_values(&self, method: MethodCall) {
-        self.push(Operation::Call(Call::Values(method)));
     }
 
     /// An eager call of a function that returns a string or a list of
@@ -426,26 +286,12 @@ impl Job {
         self.push(Operation::Call(Call::Texts(function)));
     }
 
-    /// The capture of a runner method. Its completion carries the graph.
-    pub(crate) fn capture(&self, capture: Capture) {
-        self.push(Operation::Call(Call::Capture(capture)));
-    }
-
-    pub(crate) fn expert_step(&self, step: ExpertStep) {
-        self.push(Operation::ExpertStep(step));
-    }
-
-    /// End the union's startup warmup on this rank
-    /// ([`ExpertUnion::finish_warmup`]).
-    pub(crate) fn expert_warmup(&self, union: Arc<ExpertUnion>) {
-        self.push(Operation::ExpertWarmup(union));
-    }
-
-    /// The union's next step for a rank with no forward of its own. The
-    /// job's completion says whether a step ran and whether every rank has
-    /// left the union.
-    pub(crate) fn expert_join(&self, union: Arc<ExpertUnion>, leaving: bool) {
-        self.push(Operation::ExpertJoin { union, leaving });
+    /// A host check of what the calls recorded before it returned and
+    /// wrote, performed in the job's order on the thread performing it. A
+    /// check that refuses fails the job at this operation, so nothing
+    /// recorded after it is performed but its event operations.
+    pub(crate) fn check(&self, check: Check) {
+        self.push(Operation::Check(check));
     }
 
     /// Post the job's completion only once `events`, recorded on streams of
@@ -457,20 +303,8 @@ impl Job {
         *self.after.borrow_mut() = Some((device, events));
     }
 
-    /// Continue this job with the operations and the deferred work of
-    /// `other`.
-    pub(crate) fn append(&self, other: Job) {
-        self.operations
-            .borrow_mut()
-            .append(&mut other.operations.into_inner());
-        self.deferrals
-            .borrow_mut()
-            .append(&mut other.deferrals.into_inner());
-    }
-
     /// Perform every operation in order on the calling thread, outside a
-    /// lane: a microbatch thread in its turn of an expert step, or the
-    /// submitter itself on a rank without a lane.
+    /// lane: the submitter itself on a rank without a lane.
     pub(crate) fn perform(self) -> Completion {
         self.perform_operations().0
     }
@@ -529,7 +363,6 @@ impl Operation {
             Self::RowFill { stream, fill } => unsafe { stream.as_ref().memset_2d(fill) },
             Self::Record { stream, event } => (&stream).record(&event),
             Self::Wait { stream, event } => (&stream).wait(&event),
-            Self::Launch { stream, graph } => graph.launch(&stream),
             Self::Call(call) => call.perform(completion),
             Self::Read {
                 stream,
@@ -561,12 +394,7 @@ impl Operation {
             }
             Self::HostFunction { stream, function } => stream.as_ref().launch_host_fn(function),
             Self::Synchronize { stream } => Issue::synchronize(&stream.as_ref()),
-            Self::ExpertStep(step) => step.perform(completion),
-            Self::ExpertJoin { union, leaving } => {
-                completion.joins.push_back(union.idle(leaving)?);
-                Ok(())
-            }
-            Self::ExpertWarmup(union) => union.finish_warmup(),
+            Self::Check(check) => check(completion),
         }
     }
 }
@@ -578,23 +406,15 @@ impl Call {
             Self::Returning(method) => {
                 let name = method.name().to_owned();
                 let value = method.invoke()?;
-                completion
-                    .returned
-                    .push_back(integers(value).map_err(|error| Error::numerical(&name, &error))?);
+                let integers = i64::try_from(value.clone())
+                    .map(|integer| vec![integer])
+                    .or_else(|_| crate::ffi::integers(value))
+                    .map_err(|error| Error::numerical(&name, &error))?;
+                completion.returned.push_back(integers);
             }
             Self::Handle(method) => {
                 let object = Handle::new(method.invoke()?)?;
                 completion.handles.push_back(object);
-            }
-            Self::Values(method) => {
-                let name = method.name().to_owned();
-                let list: tvm_ffi::Array<tvm_ffi::Any> = tvm_ffi::Array::try_from(method.invoke()?)
-                    .map_err(|error| Error::numerical(&name, &error))?;
-                let values = list
-                    .iter()
-                    .map(|value| Value::new(value, &name))
-                    .collect::<Result<Vec<_>>>()?;
-                completion.values.push_back(values);
             }
             Self::Texts(function) => {
                 let name = function.name().to_owned();
@@ -608,80 +428,8 @@ impl Call {
                 completion.texts.push_back(texts);
             }
             Self::Function(function) => function.invoke()?,
-            Self::Capture(capture) => {
-                let Capture {
-                    functions,
-                    pool,
-                    peers,
-                    stream,
-                    device,
-                    method,
-                    breaks,
-                } = capture;
-                let captured = functions.capture_with_peers(&pool, &peers, stream, device, || {
-                    method.invoke().map(drop)
-                });
-
-                // The breaks the method reached belong to this capture,
-                // whether or not it succeeded.
-                let breaks = breaks.as_ref().map_or_else(Vec::new, GraphBreaks::take);
-                completion.captured.push_back(captured?.with_breaks(breaks));
-            }
         }
         Ok(())
-    }
-}
-
-/// The integers a returning call returned: an integer alone, a list of
-/// integers as it is, and a list of lists as each list's length followed by
-/// its integers.
-pub(super) fn integers(value: tvm_ffi::Any) -> std::result::Result<Vec<i64>, tvm_ffi::Error> {
-    if let Ok(integer) = i64::try_from(value.clone()) {
-        return Ok(vec![integer]);
-    }
-    if let Ok(flat) = crate::ffi::integers(value.clone()) {
-        return Ok(flat);
-    }
-    let lists: tvm_ffi::Array<tvm_ffi::Any> = tvm_ffi::Array::try_from(value)?;
-    let mut flat = Vec::new();
-    for list in lists.iter() {
-        let values = crate::ffi::integers(list)?;
-        flat.push(values.len() as i64);
-        flat.extend(values);
-    }
-    Ok(flat)
-}
-
-impl ExpertStep {
-    /// Agree on the step's capacity over the union's host group, run the
-    /// step's forwards and joins at it, then what follows it on the lane's
-    /// execution thread.
-    fn perform(self, completion: &mut Completion) -> Result<()> {
-        let capacity = self.union.capacity(self.tokens, self.kind, self.forced)?;
-        let variant = self
-            .variants
-            .into_iter()
-            .find(|variant| variant.capacity == capacity)
-            .ok_or_else(|| {
-                Error::Invariant(format!(
-                    "an expert step was agreed at capacity {capacity}, which its job has no forward for"
-                ))
-            })?;
-        for (forward, after) in variant.forwards.iter().zip(self.after) {
-            if let (Some(forward), Some(after)) = (forward, after) {
-                forward.job.append(after);
-            }
-        }
-        {
-            let _range = crate::profiling::range(c"uniserve.expert.step", None);
-            self.union.run(&self.lane, variant.forwards, capacity)?;
-        }
-        completion.capacities.push_back(capacity);
-
-        let (then, _) = variant.then.perform_operations();
-        completion.captured.extend(then.captured);
-        completion.reads.extend(then.reads);
-        then.failure.map_or(Ok(()), |failure| Err(failure.error))
     }
 }
 
@@ -695,18 +443,6 @@ pub(crate) struct Recorder<'r> {
 impl Recorder<'_> {
     fn owned(&self) -> Option<Stream> {
         self.stream.cloned()
-    }
-
-    /// The launch of `graph`.
-    pub(crate) fn launch(&self, graph: &CUDAGraph) -> Result<()> {
-        let stream = self
-            .owned()
-            .ok_or(Error::State("a graph is launched on a CUDA stream"))?;
-        self.job.push(Operation::Launch {
-            stream,
-            graph: graph.clone(),
-        });
-        Ok(())
     }
 
     /// An output read of `bytes` bytes at `source`, which stay valid until
@@ -972,19 +708,6 @@ mod tests {
         job.call_returning(MethodCall::new(&count, Vec::new()));
         job.call(MethodCall::new(&count, Vec::new()));
         job.call_returning(MethodCall::new(&counts, Vec::new()));
-
-        // Lists of integers (shapes) come back as each list's length and
-        // its integers.
-        let shapes = Function::new(
-            "test.shapes",
-            tvm_ffi::Function::from_packed(|_| {
-                Ok(tvm_ffi::Any::from(crate::ffi::list([
-                    tvm_ffi::Any::from(crate::ffi::integer_list([4, 8])),
-                    tvm_ffi::Any::from(crate::ffi::integer_list([2, 16, 3])),
-                ])))
-            }),
-        );
-        job.call_returning(MethodCall::new(&shapes, Vec::new()));
         // An object the library holds comes back as its handle.
         job.call_handle(MethodCall::new(&counts, Vec::new()));
 
@@ -992,7 +715,6 @@ mod tests {
         let mut completion = job.perform().check().unwrap();
         assert_eq!(completion.returned()?, vec![48]);
         assert_eq!(completion.returned()?, vec![12, 36]);
-        assert_eq!(completion.returned()?, vec![2, 4, 8, 3, 2, 16, 3]);
         assert!(completion.returned().is_err());
         assert!(completion.handle().is_ok());
         assert!(completion.handle().is_err());
@@ -1000,46 +722,32 @@ mod tests {
     }
 
     #[test]
-    fn a_value_call_hands_its_list_to_the_completion_value_by_value() -> Result<()> {
-        let plan = Function::new(
-            "test.plan",
-            tvm_ffi::Function::from_packed(|_| {
-                Ok(tvm_ffi::Any::from(crate::ffi::list([
-                    tvm_ffi::Any::from(crate::ffi::list([
-                        tvm_ffi::Any::from(1.0_f64),
-                        tvm_ffi::Any::from(0.5_f64),
-                    ])),
-                    tvm_ffi::Any::from(crate::ffi::integer_list([3, 1])),
-                ])))
-            }),
+    fn a_check_reads_what_the_calls_before_it_returned_and_its_refusal_stops_the_job() -> Result<()>
+    {
+        let count = Function::new(
+            "test.count",
+            tvm_ffi::Function::from_packed(|_| Ok(tvm_ffi::Any::from(5_i64))),
         );
+        let mut written = [0_u8; 1];
+        let seen = Arc::new(std::sync::Mutex::new(None));
         let job = Job::new();
-        job.call_values(MethodCall::new(&plan, Vec::new()));
+        job.call_returning(MethodCall::new(&count, Vec::new()));
+        let noted = Arc::clone(&seen);
+        job.check(Box::new(move |completion| {
+            *crate::lock(&noted) = completion.last_returned().map(<[i64]>::to_vec);
+            Ok(())
+        }));
+        job.check(Box::new(|_| Err(Error::Invalid("refused".into()))));
+        // SAFETY: a byte of the test's array, which outlives the job.
+        unsafe { job.on(None).fill(byte(&raw mut written[0], 1)) }?;
 
-        let mut completion = job.perform().check().unwrap();
-        let values = completion.values()?;
-        assert!(matches!(
-            &values[..],
-            [Value::Floats(times), Value::Integers(masks)]
-                if times == &[1.0, 0.5] && masks == &[3, 1]
-        ));
-        assert!(completion.values().is_err());
+        // The first check saw the call's integers; the second stopped the
+        // job before the fill behind it.
+        let failure = job.perform().check().err().unwrap();
+        assert_eq!(failure.operation, 2);
+        assert_eq!(*crate::lock(&seen), Some(vec![5]));
+        assert_eq!(written, [0]);
         Ok(())
-    }
-
-    #[test]
-    fn a_value_call_returning_an_object_fails_its_job() {
-        let plan = Function::new(
-            "test.plan",
-            tvm_ffi::Function::from_packed(|_| {
-                Ok(tvm_ffi::Any::from(crate::ffi::list([tvm_ffi::Any::from(
-                    tvm_ffi::String::from("schedule"),
-                )])))
-            }),
-        );
-        let job = Job::new();
-        job.call_values(MethodCall::new(&plan, Vec::new()));
-        assert!(job.perform().check().is_err());
     }
 
     #[test]

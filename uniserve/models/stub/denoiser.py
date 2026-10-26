@@ -20,11 +20,11 @@ from uniserve.models import (
     ImageDenoiser,
     TransformerDecoder,
 )
+from uniserve.models.inputs import PackedImageInput
 from uniserve.nn.attention import Attention
 from uniserve.tensors import OutputLayout, TensorOutput
 
 from .config import Config
-from .inputs import DenoiserInput
 
 
 class Denoiser(ImageDenoiser):
@@ -41,29 +41,6 @@ class Denoiser(ImageDenoiser):
     @property
     def max_sequence_tokens(self) -> int:
         return 1024
-
-    def bind_inputs(
-        self,
-        *,
-        latents,
-        sizes,
-        step,
-        positions,
-        sequence_lengths,
-        attention,
-    ) -> DenoiserInput:
-        """Assemble one denoising step's typed input from resident tensors.
-
-        ``positions`` and ``sequence_lengths`` are accepted for the
-        ``ImageDenoiser`` contract and unused: the zero prediction depends on
-        neither.
-        """
-        return DenoiserInput(
-            latents=latents,
-            sizes=sizes,
-            step=step,
-            attention=attention,
-        )
 
     def __init__(self, config: Config, backbone: TransformerDecoder):
         super().__init__(
@@ -94,20 +71,17 @@ class Denoiser(ImageDenoiser):
             text_scale, image_scale, interval, renorm, renorm_min
         )
 
-    def forward(self, inputs: DenoiserInput, *, state, constants, workspace):
-        if set(inputs.latents) != {"image"}:
-            raise ValueError("simulation predicts the image latent modality")
-
-        # The host query token total sizes the K/V rows written below; dense
-        # inputs and inputs without host lengths cannot supply it.
-        queries = inputs.attention.queries
-        if queries is None or queries.num_tokens is None:
+    def forward(self, inputs: PackedImageInput, *, state, constants, workspace):
+        # The packed tokens size the K/V rows written below.
+        tokens = inputs.rows.tokens
+        width = self.patch_size**2 * self.latent_channels
+        if inputs.source.shape[1] != width:
             raise ValueError(
-                "simulation denoising requires packed host query lengths"
+                "simulation latents must be canonical image patch rows"
             )
+
         # [query tokens, kv heads, head dim] for the one-head, width-one cache.
-        reference = inputs.latents["image"][0].tensor
-        values = reference.new_zeros((queries.num_tokens, 1, 1))
+        values = inputs.source.new_zeros((tokens, 1, 1))
 
         # The step's zero K/V publish through the backbone's single attention
         # layer, the cache ``model._Layer`` writes for text tokens. The
@@ -121,28 +95,17 @@ class Denoiser(ImageDenoiser):
             )
         cache.update_cache(values, values, inputs.attention)
 
-        # The prediction is exactly zero; only the shape must match each
-        # latent's canonical patch grid.
-        outputs = []
-        for latent, size in zip(
-            inputs.latents["image"], inputs.sizes, strict=True
-        ):
-            shape = self.latent_shape("image", size)
-            if tuple(latent.tensor.shape) != shape:
-                raise ValueError(
-                    "simulation latents must match their canonical "
-                    "image patches"
-                )
-            outputs.append(
+        # The prediction is exactly zero on every token.
+        shape = (tokens, width)
+        return {
+            "image": (
                 TensorOutput(
-                    torch.zeros_like(
-                        latent.tensor, dtype=self.prediction_dtype
-                    ),
+                    inputs.source.new_zeros(shape, dtype=self.prediction_dtype),
                     OutputLayout(
                         shape,
                         self.prediction_dtype,
                         tuple(slice(0, n) for n in shape),
                     ),
-                )
+                ),
             )
-        return {"image": tuple(outputs)}
+        }

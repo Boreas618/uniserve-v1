@@ -259,64 +259,6 @@ impl LatentPool {
         Ok(pages.iter().map(|&page| page as usize).collect())
     }
 
-    /// Return page tables and their contiguous scratch offset. Occupied views
-    /// supply their logical pages and offset in the shared page-index buffer;
-    /// callers retain them through numerical completion.
-    pub(crate) fn bind(
-        &self,
-        page_tables: &[Vec<i64>],
-        latent_units: &[i64],
-        occupied: &[(Vec<usize>, usize)],
-    ) -> Result<(Vec<Vec<usize>>, usize)> {
-        if page_tables.is_empty() || page_tables.len() != latent_units.len() {
-            return Err(Error::Invalid(
-                "latent buffer columns are not aligned".into(),
-            ));
-        }
-        let tables = page_tables
-            .iter()
-            .zip(latent_units)
-            .map(|(pages, &units)| self.validate_pages(pages, units))
-            .collect::<Result<Vec<_>>>()?;
-        let total: usize = tables.iter().map(Vec::len).sum();
-        if total >= self.num_pages {
-            return Err(Error::Invalid(
-                "latent buffer exceeds the fixed step buffer".into(),
-            ));
-        }
-
-        let mut pages = HashSet::new();
-        for &page in tables.iter().flatten() {
-            if !pages.insert(page) {
-                return Err(Error::Invalid("latent buffer page tables overlap".into()));
-            }
-        }
-        let mut ranges = Vec::with_capacity(occupied.len());
-        for (held, start) in occupied {
-            if held.iter().any(|page| pages.contains(page)) {
-                return Err(Error::Invalid(
-                    "latent buffer page tables overlap live calls".into(),
-                ));
-            }
-            ranges.push((*start, held.len()));
-        }
-
-        ranges.sort_unstable();
-        let mut offset = 0;
-        for (start, count) in ranges {
-            if offset + total <= start {
-                break;
-            }
-            offset = offset.max(start + count);
-        }
-        if offset + total >= self.num_pages {
-            return Err(Error::Resource(
-                "live latent buffer exceeds the fixed step buffer",
-            ));
-        }
-        Ok((tables, offset))
-    }
-
     pub(crate) fn exports(&self) -> impl Iterator<Item = &Arc<LatentExport>> {
         self.exports.values()
     }
@@ -938,20 +880,22 @@ mod tests {
     }
 
     #[test]
-    fn buffers_preserve_page_order_and_rejected_commits_leave_slots_available() -> Result<()> {
+    fn pages_keep_their_order_and_rejected_commits_leave_slots_available() -> Result<()> {
         let mut pool = LatentPool::new(2, 5, 4)?;
-        let (first, offset) = pool.bind(&[vec![3, 1]], &[7], &[])?;
-        let occupied = [(first[0].clone(), offset)];
-        let (second, second_offset) = pool.bind(&[vec![4, 2]], &[7], &occupied)?;
-        assert_eq!(first, [vec![3, 1]]);
-        assert_eq!(second, [vec![4, 2]]);
-        assert!(second_offset >= offset + 2);
-        assert!(pool.bind(&[vec![1]], &[4], &occupied).is_err());
+        let first = pool.validate_pages(&[3, 1], 7)?;
+        let second = pool.validate_pages(&[4, 2], 7)?;
+        assert_eq!(first, [3, 1]);
+        assert_eq!(second, [4, 2]);
+        // Too few pages for the units, the padding page and repeated pages
+        // are refused.
+        assert!(pool.validate_pages(&[1], 7).is_err());
+        assert!(pool.validate_pages(&[0, 1], 7).is_err());
+        assert!(pool.validate_pages(&[2, 2], 7).is_err());
 
         let rejected = [initial(1, &[3, 1], 7), initial(2, &[1], 4)];
         assert!(pool.validate_updates(&rejected).is_err());
-        pool.require_initial(1, &first[0])?;
-        pool.require_initial(2, &second[0])?;
+        pool.require_initial(1, &first)?;
+        pool.require_initial(2, &second)?;
 
         let updates = [initial(1, &[3, 1], 7), initial(2, &[4, 2], 7)];
         pool.validate_updates(&updates)?;

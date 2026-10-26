@@ -8,7 +8,7 @@ runner's forwards run on its stream with its prepared operators
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -29,7 +29,7 @@ def execution_context(
     cache=None,
     experts=None,
     weights=None,
-    collectives: Sequence[Any] | None = None,
+    collectives: Mapping[str, Any] | None = None,
     tiles: Mapping[Any, Any] | None = None,
 ) -> ExecutionContext:
     """An execution context of ``module`` on a caller's stream.
@@ -53,9 +53,10 @@ def execution_context(
         cache: The prefix cache view object attention layers read.
         experts: The expert exchange routed experts communicate through.
         weights: The distributed expert weights' prefetch object.
-        collectives: The ``NativeCollectives`` of each of the module's
-            communicators on ``stream``; ``None`` when the module
-            communicates over no multi-member group.
+        collectives: The process group of each of the module's
+            multi-member communicators on ``stream``, by communicator name
+            (``group_collectives``); ``None`` when the module communicates
+            over no multi-member group.
         tiles: Borrowed tile operators of ``TiledEncoder`` modules
             (``ExecutionContext``).
     """

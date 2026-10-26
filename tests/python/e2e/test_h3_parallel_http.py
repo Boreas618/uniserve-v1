@@ -159,9 +159,11 @@ def _follower(leader_log: Path, log: Path, address: str) -> Iterator[None]:
     when the leader's connection closes.
     """  # noqa: D205
     assert FOLLOWER is not None
+    # The second host runs the same checkout's environment, including a
+    # package path that shadows the installed one.
     environment = " ".join(
         f"{name}={shlex.quote(os.environ.get(name, ''))}"
-        for name in ("PATH", "LD_LIBRARY_PATH")
+        for name in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH")
     )
     remote = (
         f"cd {shlex.quote(str(Path.cwd()))} && echo follower pid $$ && "

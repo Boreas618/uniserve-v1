@@ -18,6 +18,14 @@
 //!    name lists, and each selection's fibers in topology order.
 //! 4. One group per distinct member set within one mesh binding; two
 //!    bindings of the same membership are distinct ordering domains.
+//!
+//! Stream groups follow in a plan of their own ([`GroupPlan::streams`]),
+//! created at bind: a computation that runs its collectives on its own
+//! stream (a token lane, each expert microbatch of it) gets its own torch
+//! group per multi-member group of its component's mesh, so collectives of
+//! two streams never share a communicator. Components in alphabetical
+//! order, then each component's stream copies, then the mesh's groups in
+//! the order above.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -173,6 +181,21 @@ pub(crate) struct GroupPlan {
     pub components: Vec<ComponentGroups>,
 }
 
+/// One stream group of a stream plan ([`GroupPlan::streams`]) that this
+/// rank belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamEntry {
+    pub component: String,
+    /// The component's stream copy the group serves: its expert
+    /// microbatch, zero without microbatches.
+    pub copy: usize,
+    /// The communicator names (`tp`, `pp.tp`) whose fiber on this rank the
+    /// group's members form; selections of one member set share a group.
+    pub names: Vec<String>,
+    /// Index into the stream plan's entries.
+    pub entry: usize,
+}
+
 /// Inputs that fix the plan; identical on every rank except `rank`.
 pub(crate) struct PlanInputs<'a> {
     /// This rank's world rank.
@@ -248,6 +271,95 @@ impl GroupPlan {
             });
         }
         Ok((plan, owns))
+    }
+
+    /// Plan the stream groups: for every component with `copies` stream
+    /// copies, in component order, each copy's own group of every
+    /// multi-member fiber of the component's numerical mesh, in mesh order.
+    /// Every rank plans every group, members or not, under the same
+    /// `local_sync` rule as the component groups; this rank keeps the
+    /// groups of its own fibers, which the returned entries name.
+    ///
+    /// A temporally distributed component computes on a rank-local mesh
+    /// and a host component on no device: neither has stream groups.
+    pub(crate) fn streams(
+        inputs: &PlanInputs<'_>,
+        copies: &BTreeMap<String, usize>,
+    ) -> Result<(Vec<GroupEntry>, Vec<StreamEntry>)> {
+        let mut entries = Vec::new();
+        let mut streams = Vec::new();
+        for (name, placement) in inputs.placements {
+            let copies = copies.get(name).copied().unwrap_or(0);
+            if copies == 0 || placement.distribution.is_some() || is_host_component(name) {
+                continue;
+            }
+            let dimensions = placement.parallel_config.dimensions();
+            let mesh = Mesh::new(placement.ranks.clone(), &dimensions)?;
+            if mesh.ranks.iter().any(|&rank| rank >= inputs.physical.len()) {
+                return Err(Error::Invalid(
+                    "mesh ranks disagree with the process world".into(),
+                ));
+            }
+            let selections: BTreeSet<Vec<String>> = match inputs.selections {
+                None => dimensions
+                    .iter()
+                    .map(|(axis, _)| vec![(*axis).to_owned()])
+                    .collect(),
+                Some(selections) => selections.get(name).cloned().unwrap_or_default(),
+            };
+
+            // The mesh's distinct multi-member fibers in creation order,
+            // each with its physical members and the names it serves on
+            // this rank.
+            let mut fibers: Vec<(Vec<usize>, Vec<usize>, Vec<String>)> = Vec::new();
+            for selection in &selections {
+                for fiber in mesh.members(selection)? {
+                    if fiber.len() < 2 {
+                        continue;
+                    }
+                    let mut ordered = fiber.clone();
+                    ordered.sort_unstable();
+                    let position = match fibers.iter().position(|(set, ..)| *set == ordered) {
+                        Some(position) => position,
+                        None => {
+                            let mut members: Vec<usize> =
+                                fiber.iter().map(|&rank| inputs.physical[rank]).collect();
+                            members.sort_unstable();
+                            fibers.push((ordered, members, Vec::new()));
+                            fibers.len() - 1
+                        }
+                    };
+                    if fiber.contains(&inputs.rank) {
+                        let group = MeshGroup {
+                            axes: selection.clone(),
+                            members: Vec::new(),
+                            entry: None,
+                        };
+                        fibers[position].2.push(group.name());
+                    }
+                }
+            }
+
+            for copy in 0..copies {
+                for (logical, members, names) in &fibers {
+                    let keep = logical.contains(&inputs.rank);
+                    if keep {
+                        streams.push(StreamEntry {
+                            component: name.clone(),
+                            copy,
+                            names: names.clone(),
+                            entry: entries.len(),
+                        });
+                    }
+                    entries.push(GroupEntry {
+                        members: members.clone(),
+                        local_sync: inputs.local_sync,
+                        keep,
+                    });
+                }
+            }
+        }
+        Ok((entries, streams))
     }
 
     /// Plan this rank's binding of `mesh`: the communicators of the
@@ -420,6 +532,82 @@ mod tests {
         assert_eq!(decoder.mesh.as_ref().unwrap().mesh.ranks, vec![2]);
         let text = &plan.components[2];
         assert!(!text.member && text.mesh.is_none());
+    }
+
+    #[test]
+    fn every_stream_copy_plans_its_own_groups_on_every_rank() {
+        let text = ComponentConfig::parallel(
+            vec![0, 1, 2, 3],
+            ParallelConfig {
+                tensor_parallel_size: 2,
+                pipeline_parallel_size: 2,
+                ..ParallelConfig::default()
+            },
+        );
+        let decoder = ComponentConfig {
+            ranks: vec![2, 3],
+            parallel_config: ParallelConfig::default(),
+            distribution: Some(ComponentDistribution::TemporalUnits),
+            units_per_rank: 1,
+            weights: Default::default(),
+        };
+        let placements =
+            BTreeMap::from([("text".to_owned(), text), ("decoder".to_owned(), decoder)]);
+        // The text component communicates over tp and over pp with tp; two
+        // stream copies (expert microbatches) run it, and the decoder has
+        // none.
+        let selections = BTreeMap::from([(
+            "text".to_owned(),
+            BTreeSet::from([axes(&["tp"]), axes(&["pp", "tp"])]),
+        )]);
+        let copies = BTreeMap::from([("text".to_owned(), 2), ("decoder".to_owned(), 1)]);
+        let plans: Vec<_> = (0..4)
+            .map(|rank| {
+                GroupPlan::streams(
+                    &PlanInputs {
+                        rank,
+                        physical: &[0, 1, 2, 3],
+                        local_sync: false,
+                        placements: &placements,
+                        selections: Some(&selections),
+                    },
+                    &copies,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Every rank creates the same groups: per copy the whole mesh,
+        // then the two tp fibers; the temporally distributed decoder none.
+        let expected = [vec![0, 1, 2, 3], vec![0, 1], vec![2, 3]]
+            .concat()
+            .repeat(2);
+        for (entries, _) in &plans {
+            let members: Vec<usize> = entries
+                .iter()
+                .flat_map(|entry| entry.members.clone())
+                .collect();
+            assert_eq!(members, expected);
+            assert_eq!(entries.len(), 6);
+        }
+
+        // Rank 2 keeps each copy's whole-mesh group and its tp fiber.
+        let (entries, streams) = &plans[2];
+        let keep: Vec<_> = entries.iter().map(|entry| entry.keep).collect();
+        assert_eq!(keep, [true, false, true, true, false, true]);
+        let named: Vec<_> = streams
+            .iter()
+            .map(|stream| (stream.copy, stream.names.clone(), stream.entry))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (0, axes(&["pp.tp"]), 0),
+                (0, axes(&["tp"]), 2),
+                (1, axes(&["pp.tp"]), 3),
+                (1, axes(&["tp"]), 5),
+            ]
+        );
     }
 
     #[test]

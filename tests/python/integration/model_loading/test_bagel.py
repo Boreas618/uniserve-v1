@@ -8,7 +8,8 @@ from tests.python.fixtures.checkpoints import bagel_checkpoint, load_bagel
 from uniserve.bindings.context import ExecutionContext
 from uniserve.diffusion import normal_noise
 from uniserve.media import image
-from uniserve.models import LatentInput, TextInput, TextSize
+from uniserve.models import TextInput, TextSize
+from uniserve.models.inputs import PackedImageRows, TokenKind
 from uniserve.nn.attention import (
     AttentionBatch,
     PagedInput,
@@ -62,8 +63,7 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
     model = load_bagel(tmp_path, config)
     size = image.Config(8, 8)
     # The initial latent is the seeded draw in the denoiser's native noise
-    # shape, converted by ``prepare_latents`` (the denoiser binding's
-    # ``initial_latent``).
+    # shape, converted by ``prepare_latents``.
     sample = torch.empty((4, 8), dtype=torch.bfloat16)
     noise = torch.empty(
         (1, *model.denoiser.noise_shape("image", size)), dtype=sample.dtype
@@ -84,17 +84,29 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
     torch.testing.assert_close(sample, expected_noise, rtol=0, atol=0)
     timestep = torch.tensor(0.5)
     lengths = SequenceLengths.from_lengths((6,), device="cpu")
-    # Framed positions of a 2x2 latent grid at temporal position 9: the
-    # markers keep zero spatial coordinates.
-    positions = torch.tensor(
-        [[9, 9, 9, 9, 9, 9], [0, 0, 0, 1, 1, 0], [0, 0, 1, 0, 1, 0]]
+    # One framed row of a 2x2 latent grid at temporal position 9: the
+    # markers keep zero spatial coordinates, read no sample and route as
+    # text.
+    rows = PackedImageRows(
+        sample_index=torch.tensor([-1, 0, 1, 2, 3, -1]),
+        kind=torch.tensor(
+            [
+                TokenKind.OPEN,
+                *[TokenKind.LATENT] * 4,
+                TokenKind.CLOSE,
+            ]
+        ),
+        positions=torch.tensor(
+            [[9, 9, 9, 9, 9, 9], [0, 0, 0, 1, 1, 0], [0, 0, 1, 0, 1, 0]]
+        ),
+        timesteps=timestep.expand(6).clone(),
+        token_row=torch.zeros(6, dtype=torch.int64),
+        row_grid=torch.tensor([[2, 2]]),
+        noise_scale=torch.ones(1),
     )
-    inputs = model.denoiser.bind_inputs(
-        latents={"image": (LatentInput(sample, timestep),)},
-        sizes=(size,),
-        step=torch.zeros(1, dtype=torch.int64),
-        positions=(positions,),
-        sequence_lengths=(6,),
+    inputs = model.denoiser.bind_packed(
+        source=sample,
+        rows=rows,
         attention=AttentionBatch.single(
             VarlenInput(lengths, lengths, (False,))
         ),
@@ -130,6 +142,8 @@ def test_image_markers_use_text_expert_and_flow_preserves_residual(tmp_path):
         prediction = model.denoiser(
             inputs, state={}, constants={}, workspace={}
         )["image"][0]
-    torch.testing.assert_close(prediction.tensor, expected, rtol=0, atol=0)
+    # The packed prediction holds every token; the latent tokens' rows are
+    # the image's predictions.
+    torch.testing.assert_close(prediction.tensor[1:5], expected, rtol=0, atol=0)
     torch.testing.assert_close(sample, before, rtol=0, atol=0)
-    assert prediction.layout.shape == sample.shape
+    assert prediction.layout.shape == (6, sample.shape[1])

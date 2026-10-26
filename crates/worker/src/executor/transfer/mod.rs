@@ -50,11 +50,13 @@ use ipc::{Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, Tran
 
 use super::backend::{WorkerBackend, WorkerBatch};
 use super::batch::{Batch, Failure, Launched, Opening, Stage, fail};
-use super::image::ImageParts;
 use super::inputs::{Inputs, component_device};
+use super::lanes::ExecutorLanes;
+use super::latents::LatentLedger;
+use super::pages::Pages;
 use super::products::Publications;
 use crate::error::WorkerError;
-use crate::executor::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
+use crate::executor::lifecycle::{LaneJobs, RequestStorage};
 use crate::ffi::MemoryKind;
 use crate::lane::{Completion, Job, Recorder};
 use crate::lock;
@@ -123,10 +125,6 @@ impl TransferRuntime {
 }
 
 impl RequestStorage for TransferRuntime {
-    fn admit_slots(&mut self, _admitted: &[AdmittedSlot<'_>], _jobs: &LaneJobs) -> Result<()> {
-        Ok(())
-    }
-
     fn release_buffers(
         &mut self,
         _buffers: &std::collections::HashSet<BufferId>,
@@ -172,6 +170,14 @@ fn transfers_cache(kind: CallKind) -> bool {
     kind != CallKind::Transfer(TransferMode::Tensor)
 }
 
+/// What the lanes over the prefix cache share, for `component`'s cache
+/// transfers, which order with their batches.
+fn cache_pages<'a>(lanes: Option<&'a ExecutorLanes>, component: &str) -> Result<&'a Pages> {
+    lanes
+        .ok_or_else(|| Error::Unsupported("cache transfers require a text lane".into()))?
+        .pages_of(component)
+}
+
 /// The device and stream the transfers of `plan`'s component run on.
 fn placement(
     backend: &mut WorkerBackend,
@@ -194,20 +200,17 @@ fn placement(
     if transfers_cache(kind) {
         // Cache transfers read and write the pages text batches use, on their
         // stream.
-        let text = backend
-            .parts()
-            .text
-            .ok_or_else(|| Error::Unsupported("cache transfers require the text runtime".into()))?;
-        let (device, stream, _) = text.placement(&first.component)?;
-        Ok((device, stream))
+        let pages = cache_pages(backend.lanes(), &first.component)?;
+        Ok((pages.device(), pages.stream().cloned()))
     } else {
         let device = component_device(backend, &first.component)?;
         Ok((device.cuda(), backend.transfer_stream(device)?))
     }
 }
 
-/// Bind the batch's outputs and record in `job` its order after the text
-/// runtime's batches (cache transfers) and the reads of its predicates.
+/// Bind the batch's outputs and record in `job` its order after the
+/// batches over the prefix cache (cache transfers) and the reads of its
+/// predicates.
 fn open(
     backend: &mut WorkerBackend,
     plan: &BatchPlan,
@@ -221,10 +224,9 @@ fn open(
         return Err(Error::Unsupported("transfers require rank storage".into()));
     };
     if transfers_cache(kind) {
-        let text = parts
-            .text
-            .ok_or_else(|| Error::Unsupported("cache transfers require the text runtime".into()))?;
-        text.order().wait(job.on(stream))?;
+        cache_pages(parts.lanes.as_deref(), &plan.calls[0].component)?
+            .order()
+            .wait(job.on(stream))?;
     }
     Opening::open(
         parts.requests,
@@ -291,30 +293,35 @@ fn record(
     let result = (|| -> Result<()> {
         batch.bind_flags()?;
         if cache {
-            let text = parts.text.as_deref().ok_or_else(|| {
-                Error::Unsupported("cache transfers require the text runtime".into())
-            })?;
-            let component = &plan.calls[0].component;
-            batch.reserve_cache(text.unit_column(component)?, inputs)?;
+            let pages = cache_pages(parts.lanes.as_deref(), &plan.calls[0].component)?;
+            batch.reserve_cache(pages.unit_column(), inputs)?;
         }
         match kind {
-            CallKind::Transfer(TransferMode::Tensor) => {
-                batch.copy_products(parts.image.as_mut())?
-            }
+            CallKind::Transfer(TransferMode::Tensor) => batch.copy_products(
+                parts
+                    .lanes
+                    .as_deref_mut()
+                    .and_then(ExecutorLanes::ledger_mut),
+            )?,
             CallKind::Transfer(TransferMode::CacheExport) => batch.export_cache()?,
             CallKind::Transfer(TransferMode::CacheInstall) => batch.install_cache(inputs)?,
             _ => {
                 return Err(Error::Unsupported(format!(
-                    "{} is served by another runtime",
+                    "{} is no transfer",
                     kind.as_str()
                 )));
             }
         }
         batch.seal()?;
-        if cache && let Some(text) = parts.text.as_deref_mut() {
-            // Later text batches on other streams order after the
-            // installed tables, pages and verified lengths.
-            text.order_mut().record(batch.issue())?;
+        if cache
+            && let Some(pages) = parts
+                .lanes
+                .as_deref_mut()
+                .and_then(|lanes| lanes.pages_mut())
+        {
+            // Later batches over the prefix cache on other streams order
+            // after the installed tables, pages and verified lengths.
+            pages.order_mut().record(batch.issue())?;
         }
         Ok(())
     })();
@@ -419,7 +426,10 @@ pub(crate) fn complete(
             let committed = recorded.commit(
                 storage,
                 parts.requests,
-                parts.image.as_mut(),
+                parts
+                    .lanes
+                    .as_deref_mut()
+                    .and_then(ExecutorLanes::ledger_mut),
                 &plan,
                 completed.map(drop),
             );
@@ -434,7 +444,13 @@ pub(crate) fn complete(
         }
         (Some(Pending::Discarding(recorded, failure)), completed) => {
             let retired = match (recorded, parts.storage) {
-                (Some(recorded), Some(storage)) => recorded.discard(storage, parts.image.as_mut()),
+                (Some(recorded), Some(storage)) => recorded.discard(
+                    storage,
+                    parts
+                        .lanes
+                        .as_deref_mut()
+                        .and_then(ExecutorLanes::ledger_mut),
+                ),
                 (Some(_), None) => Err(Error::Invariant(
                     "a transfer batch lost its rank storage".into(),
                 )),
@@ -603,16 +619,16 @@ impl Recorded {
         mut self,
         storage: &mut WorkerMemory,
         requests: &mut RequestPool,
-        mut image: Option<&mut ImageParts<'_>>,
+        mut ledger: Option<&mut LatentLedger>,
         plan: &BatchPlan,
         completed: Result<()>,
     ) -> std::result::Result<Launched, Failure> {
         let mut located = Located::default();
         let accepted = completed
-            .and_then(|()| self.locate(storage, image.as_deref_mut(), &mut located))
+            .and_then(|()| self.locate(storage, ledger.as_deref_mut(), &mut located))
             .and_then(|()| self.validate(storage, plan, &located));
         if let Err(error) = accepted {
-            return Err(match self.retire(storage, image, located) {
+            return Err(match self.retire(storage, ledger, located) {
                 Ok(()) => Failure::new(PHASE)(error),
                 // Storage the cleanup could not retire stays reserved; the
                 // rank cannot reuse it safely.
@@ -641,8 +657,8 @@ impl Recorded {
 
     /// Retire every reservation of a batch that failed while it recorded
     /// its job, once that job completed.
-    fn discard(self, storage: &mut WorkerMemory, image: Option<&mut ImageParts<'_>>) -> Result<()> {
-        self.retire(storage, image, Located::default())
+    fn discard(self, storage: &mut WorkerMemory, ledger: Option<&mut LatentLedger>) -> Result<()> {
+        self.retire(storage, ledger, Located::default())
     }
 
     /// The locations of the batch's exports, now that their device work is
@@ -650,7 +666,7 @@ impl Recorded {
     fn locate(
         &mut self,
         storage: &mut WorkerMemory,
-        image: Option<&mut ImageParts<'_>>,
+        ledger: Option<&mut LatentLedger>,
         located: &mut Located,
     ) -> Result<()> {
         let calls = &mut self.batch.calls;
@@ -662,11 +678,11 @@ impl Recorded {
         }
 
         if !self.versions.is_empty() {
-            let (pool, _) = image
+            let pool = ledger
                 .ok_or_else(|| {
                     Error::Invariant("exported trajectory versions lost their latent pool".into())
                 })?
-                .latent_pool()?;
+                .pool();
             while let Some((index, version)) = self.versions.pop_front() {
                 // The version stays the pool's until the batch commits.
                 located.versions.push(version.buffer());
@@ -705,13 +721,13 @@ impl Recorded {
 
     /// Retire every reservation after a failure before the commit point:
     /// the exports located so far and those that were not, the versions
-    /// exported from `image`'s latent pool, the batch's writes and its
+    /// exported from `ledger`'s pool, the batch's writes and its
     /// lease. The batch's job completed, so its fences are recorded and
     /// storage returns once they complete.
     fn retire(
         mut self,
         storage: &mut WorkerMemory,
-        image: Option<&mut ImageParts<'_>>,
+        ledger: Option<&mut LatentLedger>,
         located: Located,
     ) -> Result<()> {
         let Located {
@@ -730,11 +746,12 @@ impl Recorded {
             versions.push(version.buffer());
             version.revoke();
         }
-        let released = match (versions.is_empty(), image) {
+        let released = match (versions.is_empty(), ledger) {
             (true, _) => Ok(()),
-            (false, Some(image)) => image
-                .latent_pool()
-                .map(|(pool, _)| pool.release_exports(&versions)),
+            (false, Some(ledger)) => {
+                ledger.pool().release_exports(&versions);
+                Ok(())
+            }
             (false, None) => Err(Error::Invariant(
                 "exported trajectory versions lost their latent pool".into(),
             )),

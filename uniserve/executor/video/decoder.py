@@ -22,17 +22,19 @@ from __future__ import annotations
 import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import prod
 
 import torch
 
 from uniserve.cuda_graph import BreakableCUDAGraph, capture
-from uniserve.executor.video.denoiser import EAGER, REPLAY
+from uniserve.executor.video.denoiser import EAGER, REPLAY, close_all
 from uniserve.executor.video.plan import (
     Canvas,
     MediaPlan,
     VideoModel,
     VideoSize,
 )
+from uniserve.media import image, video
 from uniserve.runner.decoder import DecoderRunner
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "VideoDecoder",
     "clip",
     "overlap",
+    "overlap_bytes",
     "units",
 ]
 
@@ -55,15 +58,16 @@ def units(
     cursor: int,
     count: int,
 ) -> range:
-    """This rank's media units of a round covering units ``[cursor, cursor +
-    count)``: all of them for an undistributed component, otherwise the
-    rank's run of ``units_per_rank`` units from its position among the ranks
-    the round is ``dealt`` to, or among the component's ``ranks`` in
-    configured order when it names none.
+    """This rank's media units of a round of units ``[cursor, cursor + count)``.
+
+    All of them for an undistributed component, otherwise the rank's run of
+    ``units_per_rank`` units from its position among the ranks the round is
+    ``dealt`` to, or among the component's ``ranks`` in configured order
+    when it names none.
 
     Raises:
         ValueError: The rank is not a member of the component.
-    """  # noqa: D205
+    """
     if not distributed:
         return range(cursor, cursor + count)
     if rank not in ranks:
@@ -79,10 +83,11 @@ def units(
 
 @dataclass(frozen=True)
 class UnitShape:
-    """What fixes a video decoding forward's computation: the unit's clip
-    output, whether the unit is its video's first and last, and how many
-    ring members hold a unit of its round.
-    """  # noqa: D205
+    """What fixes a video decoding forward's computation.
+
+    The unit's clip output, whether the unit is its video's first and last,
+    and how many ring members hold a unit of its round.
+    """
 
     # ``(frames, canvas)`` of the clip output.
     clip_output: tuple[int, Canvas]
@@ -128,7 +133,6 @@ class VideoDecoder:
         self.scratch = scratch
         self.pool = pool
         device = stream.device
-        decoder = model.decoder
         overlap_elements = 0
         overlap_dtype = torch.float16
         rows = width = 0
@@ -148,7 +152,6 @@ class VideoDecoder:
             width = int(shape[1])
             height = max(height, canvas.height)
             canvas_width = max(canvas_width, canvas.width)
-        del decoder
         with torch.cuda.device(device):
             # The retained overlap of each request slot: the decoded tail a
             # request's previous round left for its next.
@@ -191,9 +194,10 @@ class VideoDecoder:
         self.sealed = False
 
     def prepare(self, plan: MediaPlan) -> None:
-        """Read every admitted video's clip outputs and clip rows and
-        construct the runner of every clip output, the largest first.
-        """  # noqa: D205
+        """Construct the runner of every clip output, the largest first.
+
+        Every admitted video's clip outputs and clip rows are read first.
+        """
         for canvas in plan.canvases:
             for frames in reversed(plan.frame_counts):
                 for unit in range(len(self.model.unit_frames(frames))):
@@ -254,11 +258,12 @@ class VideoDecoder:
         written: int,
         out: torch.Tensor,
     ) -> int:
-        """Decode and reconstruct media unit ``unit`` of a ``frames``-frame
-        video into the leading ``written`` frames of ``out`` (``[longest,
-        height, width, 3]`` uint8); the frames past them become zero.
-        ``latent`` is the request's complete packed latent.
-        """  # noqa: D205
+        """Decode media unit ``unit`` of a ``frames``-frame video into ``out``.
+
+        The unit's frames are the leading ``written`` frames of ``out``
+        (``[longest, height, width, 3]`` uint8); the frames past them become
+        zero. ``latent`` is the request's complete packed latent.
+        """
         rows = self.clip_rows.get((frames, canvas, unit))
         if rows is None:
             raise ValueError("the rank admits no video with this media unit")
@@ -287,11 +292,13 @@ class VideoDecoder:
         distributed: bool,
         rank: int,
     ) -> None:
-        """Warm one round of each shape of the unit ring: a round's shape is
-        its canvas, whether it holds the video's first and last units, and
-        how many members hold a unit. Every member derives the same rounds
-        in the same order, because rounds exchange overlaps.
-        """  # noqa: D205
+        """Warm one round of each shape of the unit ring.
+
+        A round's shape is its canvas, whether it holds the video's first
+        and last units, and how many members hold a unit. Every member
+        derives the same rounds in the same order, because rounds exchange
+        overlaps.
+        """
         width = len(ranks) * max(units_per_rank, 1)
         warmed: set[tuple[Canvas, bool, bool, int]] = set()
         for canvas in plan.canvases:
@@ -359,15 +366,16 @@ class VideoDecoder:
     def close(self, aborted: bool) -> None:
         if aborted:
             return
-        _close(self.graphs.values(), self.runners.values())
+        close_all(self.graphs.values(), self.runners.values())
         self.graphs.clear()
 
 
 @dataclass(frozen=True)
 class TrackUnits:
-    """What fixes an audio decoding forward's computation: the track's
-    samples and which of how many units the forward decodes.
-    """  # noqa: D205
+    """What fixes an audio decoding forward's computation.
+
+    The track's samples and which of how many units the forward decodes.
+    """
 
     samples: int
     # Latent frames of the track.
@@ -452,9 +460,10 @@ class AudioDecoder:
     def track(
         self, samples: int, count: int
     ) -> tuple[int, list[tuple[int, int]]]:
-        """The latent frames of an admitted ``samples``-sample track and the
-        samples of each of its ``count`` audio units.
-        """  # noqa: D205
+        """An admitted track's latent frames and its audio units' samples.
+
+        The track has ``samples`` samples and is decoded in ``count`` units.
+        """
         track = self.tracks.get((samples, count))
         if track is None:
             raise ValueError("the rank admits no track of this length")
@@ -487,8 +496,9 @@ class AudioDecoder:
         self, latent: torch.Tensor, track: TrackUnits, out: torch.Tensor
     ) -> int:
         """Decode ``track``'s units into ``out`` (``[span, 2]`` int16).
+
         ``latent`` is the request's complete audio latent.
-        """  # noqa: D205
+        """
         rows = latent.shape[0]
         if (
             latent.dtype != torch.float32
@@ -511,10 +521,12 @@ class AudioDecoder:
         distributed: bool,
         rank: int,
     ) -> None:
-        """Construct the runner of every admitted track, read its unit spans
-        for every number of units a round decodes it in, and warm one
-        decode of this rank's units of each track.
-        """  # noqa: D205
+        """Construct the runner of every admitted track and warm it.
+
+        Each track's unit spans are read for every number of units a round
+        decodes it in, and one decode of this rank's units of each track
+        warms.
+        """
         audio = self.model.audio
         total = len(ranks) * max(units_per_rank, 1) if distributed else 1
         canvas = plan.canvases[0]
@@ -585,18 +597,18 @@ class AudioDecoder:
     def close(self, aborted: bool) -> None:
         if aborted:
             return
-        _close(self.graphs.values(), self.runners.values())
+        close_all(self.graphs.values(), self.runners.values())
         self.graphs.clear()
 
 
-def _video(frames: int, canvas: Canvas):
-    from uniserve.media import image, video
-
+def _video(frames: int, canvas: Canvas) -> video.Config:
     return video.Config(int(frames), image.Config(canvas.height, canvas.width))
 
 
 def overlap(model: VideoModel, canvas: Canvas) -> tuple[int, torch.dtype]:
     """Elements and dtype of the overlap a canvas's unit carries to the next."""
+    # The post-processor's state is read at the fewest frames the decoder
+    # cuts into clips.
     decoder = model.decoder
     frames = 1
     while True:
@@ -607,20 +619,18 @@ def overlap(model: VideoModel, canvas: Canvas) -> tuple[int, torch.dtype]:
             continue
         break
     state = model.clock.state_buffers(_video(frames, canvas))["video_overlap"]
-    count = 1
-    for extent in state.shape:
-        count *= int(extent)
-    return count, state.dtype
+    return prod(int(extent) for extent in state.shape), state.dtype
 
 
 def clip(
     model: VideoModel, frames: int, canvas: Canvas, unit: int
 ) -> tuple[tuple[int, Canvas], list[int]]:
-    """The clip output media unit ``unit`` of a ``frames``-frame video at
-    ``canvas`` decodes to, ``(frames, raster)``, and the rows of the video's
-    complete packed latent its clip input reads, in the order the decoder
-    reads them.
-    """  # noqa: D205
+    """A media unit's clip output and the latent rows its clip input reads.
+
+    Unit ``unit`` of a ``frames``-frame video at ``canvas`` decodes to the
+    clip output ``(frames, raster)``; its clip input reads rows of the
+    video's complete packed latent, in the order the decoder reads them.
+    """
     decoder = model.decoder
     size = _video(frames, canvas)
     unit_clip = decoder.clips(int(frames))[int(unit)]
@@ -637,19 +647,3 @@ def overlap_bytes(model: VideoModel, plan: MediaPlan) -> int:
         elements, dtype = overlap(model, canvas)
         largest = max(largest, elements * dtype.itemsize)
     return largest
-
-
-def _close(graphs, runners) -> None:
-    failure: BaseException | None = None
-    for graph in list(graphs):
-        try:
-            graph.release()
-        except Exception as error:  # noqa: BLE001 - release every graph
-            failure = failure or error
-    for runner in list(runners):
-        try:
-            runner.close(False)
-        except Exception as error:  # noqa: BLE001 - close every runner
-            failure = failure or error
-    if failure is not None:
-        raise failure

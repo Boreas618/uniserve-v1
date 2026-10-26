@@ -1,34 +1,24 @@
-"""A packed vision call serves every packing of its image slots.
+"""A packed vision call serves every packing of its patch rows.
 
-``PatchEncoder.encode_packed`` encodes images laid out in fixed slots of
-``max_patches`` patch rows (``packed_grids``). Each image's soft tokens must
-equal the features ``encode`` returns for it alone, whatever the images'
-aspect ratios, and one CUDA graph captured over empty slots must replay any
-later packing with those same features. The worker's encoder runner packs
-a batch's images into captured slot counts and replays them. The
-DiffusionGemma vision tower runs on the SM100 kernels at the released head
-width.
+``PatchEncoder.encode_segments`` encodes images packed back to back and
+described by device segment grids (``uniserve.executor.image.plan.
+segment_grids``). Each image's soft tokens must equal the features
+``encode`` returns for it alone, whatever the images' aspect ratios, and one
+CUDA graph captured over padding alone must replay any later packing of its
+patch rows and segments with those same features. The DiffusionGemma vision
+tower runs on the SM100 kernels at the released head width.
 """
 
-import base64
-import io
-
-import numpy as np
 import pytest
 import torch
-import tvm_ffi
-from PIL import Image
 
 from tests.python.fixtures.checkpoints import diffusion_gemma_checkpoint
-from tests.python.fixtures.image_harness import image_harness
-from tests.python.fixtures.stub import load_model, read_config
 from uniserve import cuda_graph
 from uniserve.bindings.context import ExecutionContext
+from uniserve.executor.image.plan import segment_grids
 from uniserve.loading import weights
-from uniserve.media.pixels import prepare_host_image
 from uniserve.models import VisionInput
 from uniserve.models import registry as models
-from uniserve.worker import import_path
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -56,22 +46,27 @@ def _encoder(root):
 
 
 def _pack(encoder, pixels, images, shapes, slots):
-    """Write ``images`` into the leading slots of ``pixels``; return grids."""
-    capacity = encoder.max_patches
-    for index, image in enumerate(images):
-        pixels[index * capacity : index * capacity + image.shape[0]] = image
+    """Write ``images`` back to back into ``pixels``; return their grids."""
+    offset = 0
+    for image in images:
+        pixels[offset : offset + image.shape[0]] = image
+        offset += image.shape[0]
     return torch.tensor(
-        encoder.packed_grids(shapes, slots), dtype=torch.long, device=DEVICE
+        segment_grids(shapes, slots, pixels.shape[0], encoder.downsample),
+        dtype=torch.long,
+        device=DEVICE,
     )
 
 
 def _features(encoder, output, shapes):
-    """Each packed image's soft tokens, which lead its slot."""
-    tokens = encoder.max_patches // encoder.downsample**2
-    return tuple(
-        output[index * tokens : index * tokens + rows * columns // 9]
-        for index, (rows, columns) in enumerate(shapes)
-    )
+    """Each packed image's soft tokens, in packing order."""
+    unit = encoder.downsample**2
+    tokens, offset = [], 0
+    for rows, columns in shapes:
+        count = rows * columns // unit
+        tokens.append(output[offset : offset + count])
+        offset += count
+    return tuple(tokens)
 
 
 @torch.inference_mode()
@@ -99,24 +94,29 @@ def test_packed_images_encode_as_they_do_alone(tmp_path):
             for image, shape in zip(images, SHAPES, strict=True)
         )
 
-        # Four slots hold the three images and one empty slot of padding.
+        # Four segments hold the three images and one empty segment, then
+        # the padding rows.
         slots = 4
         pixels = torch.zeros(slots * encoder.max_patches, 48, device=DEVICE)
         grids = _pack(encoder, pixels, images, SHAPES, slots)
         packed = _features(
-            encoder, encoder.encode_packed(pixels, grids), SHAPES
+            encoder, encoder.encode_segments(pixels, grids), SHAPES
         )
         for actual, expected in zip(packed, alone, strict=True):
             torch.testing.assert_close(actual, expected)
 
-        # A graph captured over empty slots replays two later packings.
+        # A graph captured over padding alone replays two later packings.
         static_pixels = torch.zeros_like(pixels)
         static_grids = torch.tensor(
-            encoder.packed_grids((), slots), dtype=torch.long, device=DEVICE
+            segment_grids(
+                (), slots, static_pixels.shape[0], encoder.downsample
+            ),
+            dtype=torch.long,
+            device=DEVICE,
         )
-        encoder.encode_packed(static_pixels, static_grids)
+        encoder.encode_segments(static_pixels, static_grids)
         graph = cuda_graph.capture(
-            lambda: encoder.encode_packed(static_pixels, static_grids),
+            lambda: encoder.encode_segments(static_pixels, static_grids),
             stream=stream,
         )
         try:
@@ -136,86 +136,3 @@ def test_packed_images_encode_as_they_do_alone(tmp_path):
                     torch.testing.assert_close(actual, alone[index])
         finally:
             graph.release()
-
-
-def _payload(height: int, width: int, seed: int) -> str:
-    """A random RGB PNG of ``height`` x ``width`` pixels."""
-    raw = np.random.default_rng(seed).integers(
-        0, 256, (height, width, 3), dtype=np.uint8
-    )
-    encoded = io.BytesIO()
-    Image.fromarray(raw).save(encoded, format="PNG")
-    return base64.b64encode(encoded.getvalue()).decode()
-
-
-def _load(root):
-    description = read_config(stub=False, path=str(root), device="cuda:0")
-    return load_model(description, modules=["vision_encoder"], device="cuda:0")
-
-
-@torch.inference_mode()
-def test_worker_packed_vision_preserves_rows_and_reports_replay(tmp_path):
-    diffusion_gemma_checkpoint(tmp_path, vision=VISION)
-    model = _load(tmp_path)
-    # The processor scales each image to the tower's patch budget, so
-    # aspect ratios near one keep every grid side within the fixture's
-    # position table.
-    payloads = [
-        _payload(height, width, seed)
-        for seed, (height, width) in enumerate(((64, 64), (48, 64), (64, 48)))
-    ]
-
-    # Each image encoded alone through the library is the reference.
-    encoder = model.module.vision_encoder
-    expected = []
-    with ExecutionContext(encoder) as context:
-        context.prepare(None)
-        with context.activate():
-            for payload in payloads:
-                host = prepare_host_image(
-                    model.image_processor,
-                    "vit",
-                    payload,
-                    input_images=len(payloads),
-                    pin=False,
-                )
-                pixels = host.pixels.to(DEVICE)
-                (features,) = encoder.encode(
-                    VisionInput(
-                        (pixels,),
-                        (torch.tensor([host.grid_shape], device=DEVICE),),
-                        (host.grid_shape,),
-                    )
-                )
-                expected.append(features)
-
-    # Batches of three images (one replay), of seventeen images (sixteen
-    # captured slots, then one) and of two images (one replay). Mixed patch
-    # counts share packed calls.
-    orders = [[0, 1, 2], [0, 1, 2] * 5 + [2, 0], [2, 0]]
-    results = list(
-        image_harness().encode(
-            tvm_ffi.convert(
-                {
-                    "import": import_path,
-                    "loaded": model,
-                    "component": "model",
-                    "root": "vision_encoder",
-                    "path": "",
-                    "tower": "vit",
-                    "payloads": payloads,
-                    "orders": orders,
-                    "device": 0,
-                    "capture": True,
-                }
-            )
-        )
-    )
-    for order, replays in zip(orders, (1, 2, 1), strict=True):
-        features, counts = results[: len(order)], results[len(order)]
-        results = results[len(order) + 1 :]
-        assert list(counts) == [replays, 0]
-        for value, index in zip(features, order, strict=True):
-            torch.testing.assert_close(
-                torch.from_dlpack(value), expected[index]
-            )

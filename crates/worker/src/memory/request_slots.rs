@@ -100,18 +100,6 @@ impl RequestSlots {
             .map(|bank| (bank.field.name.clone(), bank.view.clone()))
             .collect()
     }
-
-    /// A field's whole bank.
-    pub(crate) fn bank(&self, name: &str) -> Result<&StorageView> {
-        self.find(name).map(|bank| &bank.view)
-    }
-
-    fn find(&self, name: &str) -> Result<&Bank> {
-        self.banks
-            .iter()
-            .find(|bank| bank.field.name == name)
-            .ok_or_else(|| Error::Invalid(format!("request slots have no field {name}")))
-    }
 }
 
 #[cfg(test)]
@@ -137,9 +125,15 @@ mod tests {
         assert_eq!(RequestSlots::bytes(&fields, 2)?, (3 * 16, 3 * 8));
 
         let slots = RequestSlots::allocate(&fields, 2, None)?;
-        assert_eq!(slots.bank("tokens")?.shape(), &[3, 4]);
-        assert_eq!(slots.bank("seed")?.shape(), &[3]);
-        assert!(slots.bank("missing").is_err());
+        let shapes: Vec<(String, Vec<i64>)> = slots
+            .views()
+            .into_iter()
+            .map(|(name, view)| (name, view.shape().to_vec()))
+            .collect();
+        assert_eq!(
+            shapes,
+            [("tokens".into(), vec![3, 4]), ("seed".into(), vec![3])]
+        );
         Ok(())
     }
 }

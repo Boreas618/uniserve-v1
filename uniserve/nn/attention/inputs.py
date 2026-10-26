@@ -17,11 +17,16 @@ class SequenceLengths:
 
     Callers keep host and device values consistent while an invocation uses
     them. Construction validates representation without synchronizing a device.
+    ``bound`` is a host bound on every length that holds for any lengths the
+    device columns may later carry, such as a captured computation's static
+    bound; ``maximum`` reports it in place of the mirror's longest length, so
+    launches sized by ``maximum`` serve every length up to it.
     """
 
     values: torch.Tensor
     offsets: torch.Tensor
     host: tuple[int, ...] | None = None
+    bound: int | None = None
 
     def __post_init__(self) -> None:
         if self.host is not None and (
@@ -46,6 +51,10 @@ class SequenceLengths:
             raise ValueError(
                 "host lengths must match the device sequence count"
             )
+        if self.bound is not None and (
+            type(self.bound) is not int or self.bound < max(self.host or (0,))
+        ):
+            raise ValueError("a length bound must hold every host length")
         if (
             self.num_tokens is not None
             and self.num_tokens > torch.iinfo(torch.int32).max
@@ -62,6 +71,8 @@ class SequenceLengths:
 
     @property
     def maximum(self) -> int | None:
+        if self.bound is not None:
+            return self.bound
         return None if self.host is None else max(self.host, default=0)
 
     @classmethod

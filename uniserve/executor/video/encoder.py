@@ -41,11 +41,18 @@ from math import prod
 import torch
 
 from uniserve.cuda_graph import BreakableCUDAGraph, capture
-from uniserve.executor.video.denoiser import CAPTURE, EAGER, REPLAY
+from uniserve.executor.video.denoiser import EAGER, REPLAY, close_all
+from uniserve.executor.video.plan import (
+    CANVAS_MULTIPLE,
+    Canvas,
+    rows_per_frame,
+)
 from uniserve.runner.encoder import EncoderRunner
 
 __all__ = [
     "ConditionEncoders",
+    "ConditionUnit",
+    "PromptVision",
     "TextEncoders",
     "text_capacity",
 ]
@@ -55,18 +62,16 @@ __all__ = [
 # 230 MB of page-locked memory.
 POSTERIORS = 16
 
-# Pixels per side of a latent patch of the condition encoders.
-_CANVAS_MULTIPLE = 32
-
 
 def text_capacity(capacities: Sequence[int], tokens: int) -> int:
-    """The text capacity a prompt of ``tokens`` is encoded at: the smallest
-    configured capacity holding it, or the prompt's own length without
-    configured capacities.
+    """The text capacity a prompt of ``tokens`` is encoded at.
+
+    The smallest configured capacity holding it, or the prompt's own length
+    without configured capacities.
 
     Raises:
         ValueError: The prompt is empty or exceeds every capacity.
-    """  # noqa: D205
+    """
     if tokens == 0:
         raise ValueError("text encoding requires a token")
     if not capacities:
@@ -92,10 +97,12 @@ class PromptVision:
 
 
 class _Blocks:
-    """The vision tower's buffers under CUDA graphs: each block's patch rows
-    are copied into ``rows``, its grid into ``grid`` (``[1, 3]`` int64), and
-    the graph captured at its grid writes its features into ``features``.
-    """  # noqa: D205
+    """The vision tower's buffers under CUDA graphs.
+
+    Each block's patch rows are copied into ``rows``, its grid into ``grid``
+    (``[1, 3]`` int64), and the graph captured at its grid writes its
+    features into ``features``.
+    """
 
     def __init__(
         self,
@@ -256,10 +263,11 @@ class TextEncoders:
         out: torch.Tensor,
         vision: PromptVision | None,
     ) -> int:
-        """Encode one prompt into ``out``, its ``[tokens, hidden]`` feature
-        rows; a pipeline stage that emits no features writes nothing.
-        Returns how the forward ran.
-        """  # noqa: D205
+        """Encode one prompt into ``out``, its ``[tokens, hidden]`` features.
+
+        A pipeline stage that emits no features writes nothing. Returns how
+        the forward ran.
+        """
         capacity = text_capacity(self.capacities, len(tokens))
         if capacity > self.tokens.shape[0]:
             raise ValueError("text encoder input exceeds its token capacity")
@@ -345,11 +353,12 @@ class TextEncoders:
         grids: Sequence[tuple[int, int, int]],
         out: torch.Tensor,
     ) -> int:
-        """Encode vision blocks whose patch rows are packed back to back in
-        ``rows``, each of its ``(time, height, width)`` grid, into ``out``'s
-        rows in block order. Returns how the forwards ran: replay when every
-        block replayed.
-        """  # noqa: D205
+        """Encode vision blocks into ``out``'s rows in block order.
+
+        The blocks' patch rows are packed back to back in ``rows``, each
+        block of its ``(time, height, width)`` grid. Returns how the forwards
+        ran: replay when every block replayed.
+        """
         tower = self.tower
         if tower is None:
             raise ValueError("this rank's text encoder reads no vision")
@@ -405,12 +414,12 @@ class TextEncoders:
         )
 
     def capture(self) -> None:
-        """Warm and, with a graph pool, capture every graph the encoders
-        launch: the prompt capacities, largest first (with and without
-        vision rows), then the tower's block grids, largest first. Without
-        a pool the same forwards run once, so lazy initialization precedes
-        serving.
-        """  # noqa: D205
+        """Warm and, with a graph pool, capture every graph the encoders run.
+
+        The prompt capacities, largest first (with and without vision rows),
+        then the tower's block grids, largest first. Without a pool the same
+        forwards run once, so lazy initialization precedes serving.
+        """
         with torch.cuda.stream(self.stream):
             # Every capacity encodes the zero prompt, and under graphs with
             # zero vision rows at zero coordinates.
@@ -453,26 +462,16 @@ class TextEncoders:
         return list(self.runner.kernels())
 
     def close(self, aborted: bool) -> None:
-        """Release the graphs, then the execution context the prompt
-        encoder owns; the caller drained the stream.
-        """  # noqa: D205
+        """Release the graphs, then the prompt encoder's execution context.
+
+        The caller drained the stream.
+        """
         if aborted:
             return
         graphs = [*self.graphs.values(), *self.vision_graphs.values()]
         if self.blocks is not None:
             graphs.extend(self.blocks.graphs.values())
-        failure: BaseException | None = None
-        for graph in graphs:
-            try:
-                graph.release()
-            except Exception as error:  # noqa: BLE001 - release every graph
-                failure = failure or error
-        try:
-            self.runner.close(False)
-        except Exception as error:  # noqa: BLE001 - report the first failure
-            failure = failure or error
-        if failure is not None:
-            raise failure
+        close_all(graphs, [self.runner])
 
 
 # One visual unit as the encoder takes it: ``[pixel_offset, frames, width,
@@ -484,11 +483,12 @@ ConditionUnit = tuple[int, int, int, int, int, int, int]
 
 
 class _Keyframes:
-    """The keyframe encodings startup captured under CUDA graphs, by input
-    shapes (``[1, height, width, 3]`` per keyframe): a call copies its
-    keyframes' pixels into ``pixels``, back to back, replays the graph of
-    its shapes and copies its rows out of ``rows``.
-    """  # noqa: D205
+    """The keyframe encodings startup captured under CUDA graphs.
+
+    They are keyed by input shapes (``[1, height, width, 3]`` per keyframe):
+    a call copies its keyframes' pixels into ``pixels``, back to back,
+    replays the graph of its shapes and copies its rows out of ``rows``.
+    """
 
     def __init__(self, pixels: torch.Tensor, rows: torch.Tensor) -> None:
         self.pixels = pixels
@@ -600,10 +600,11 @@ class ConditionEncoders:
         size: tuple[int, int, int],
         current: Sequence[tuple[int, int, int]],
     ) -> torch.Tensor | None:
-        """A condition size's posterior draw, filled on first use and held
-        for the most recently used sizes; a size ``current`` reads or a
-        captured keyframe encoding reads is never released.
-        """  # noqa: D205
+        """A condition size's posterior draw, filled on first use.
+
+        Draws are held for the most recently used sizes; a size ``current``
+        reads or a captured keyframe encoding reads is never released.
+        """
         if size in self.posteriors:
             self.posteriors.move_to_end(size)
             return self.posteriors[size]
@@ -646,9 +647,10 @@ class ConditionEncoders:
         units: Sequence[ConditionUnit],
         out: torch.Tensor,
     ) -> int:
-        """Encode visual units into consecutive rows of ``out``. Returns how
-        the forward ran.
-        """  # noqa: D205
+        """Encode visual units into consecutive rows of ``out``.
+
+        Returns how the forward ran.
+        """
         shapes = self._shapes(units)
         keyframes = self.keyframes
         with torch.cuda.stream(self.stream):
@@ -685,9 +687,7 @@ class ConditionEncoders:
     def encode_tracks(
         self, samples: torch.Tensor, lengths: Sequence[int], out: torch.Tensor
     ) -> int:
-        """Encode audio tracks of ``lengths`` samples into consecutive rows
-        of ``out``.
-        """  # noqa: D205
+        """Encode audio tracks of ``lengths`` samples into rows of ``out``."""
         shapes = tuple(
             value for length in lengths for value in (int(length), 2)
         )
@@ -700,10 +700,11 @@ class ConditionEncoders:
     # Startup.
 
     def capture_tile(self) -> None:
-        """Capture the encoding of one still-frame tile; nothing is captured
-        for a video encoder that does not tile still frames or without a
-        graph pool.
-        """  # noqa: D205
+        """Capture the encoding of one still-frame tile.
+
+        Nothing is captured for a video encoder that does not tile still
+        frames or without a graph pool.
+        """
         if (
             self.pool is None
             or not self.still_tile
@@ -732,20 +733,18 @@ class ConditionEncoders:
         row_width: int,
         row_dtype: torch.dtype,
     ) -> None:
-        """Capture the encoding of ``1..=per_call`` keyframes of each of
-        ``canvases`` (``(width, height)``), rows of ``row_width`` values of
-        ``row_dtype``. A size's posterior draw is filled here and held for
-        the graphs' life.
-        """  # noqa: D205
+        """Capture the encoding of ``1..=per_call`` keyframes per canvas.
+
+        ``canvases`` are ``(width, height)``; the encodings write rows of
+        ``row_width`` values of ``row_dtype``. A size's posterior draw is
+        filled here and held for the graphs' life.
+        """
         if self.pool is None:
             return
         ordered = sorted(canvases, key=lambda canvas: -canvas[0] * canvas[1])
         largest = ordered[0][0] * ordered[0][1] if ordered else 0
         most_rows = max(
-            (
-                (width // _CANVAS_MULTIPLE) * (height // _CANVAS_MULTIPLE)
-                for width, height in ordered
-            ),
+            (rows_per_frame(Canvas(*canvas)) for canvas in ordered),
             default=0,
         )
         per_call = max(per_call, 1)
@@ -766,9 +765,7 @@ class ConditionEncoders:
         for width, height in ordered:
             size = (1, width, height)
             noise = self._posterior(size, [size])
-            rows_per_frame = (width // _CANVAS_MULTIPLE) * (
-                height // _CANVAS_MULTIPLE
-            )
+            frame_rows = rows_per_frame(Canvas(width, height))
             for count in range(per_call, 0, -1):
                 shapes = tuple(
                     value
@@ -795,11 +792,11 @@ class ConditionEncoders:
                         height,
                         0,
                         0,
-                        height // _CANVAS_MULTIPLE,
+                        height // CANVAS_MULTIPLE,
                     )
                 ]
                 pixels = keyframes.pixels[: count * width * height]
-                rows = keyframes.rows[: count * rows_per_frame]
+                rows = keyframes.rows[: count * frame_rows]
                 draws = [noise] * count if noise is not None else []
 
                 def encode(
@@ -830,12 +827,13 @@ class ConditionEncoders:
         return kernels
 
     def close(self, aborted: bool) -> None:
-        """Close the runners, then the tile runner and its graph, which the
-        video runners replay; the caller drained the stream.
-        """  # noqa: D205
+        """Release the graphs, then close the runners, the tile runner last.
+
+        The video runners replay the tile's graph; the caller drained the
+        stream.
+        """
         if aborted:
             return
-        failure: BaseException | None = None
         graphs: list[BreakableCUDAGraph] = []
         runners = [*self.video_runners.values(), *self.audio_runners.values()]
         if self.keyframes is not None:
@@ -845,18 +843,4 @@ class ConditionEncoders:
             graphs.append(self.tile_graph)
         if self.tile_runner is not None:
             runners.append(self.tile_runner)
-        for graph in graphs:
-            try:
-                graph.release()
-            except Exception as error:  # noqa: BLE001 - release every graph
-                failure = failure or error
-        for runner in runners:
-            try:
-                runner.close(False)
-            except Exception as error:  # noqa: BLE001 - close every runner
-                failure = failure or error
-        if failure is not None:
-            raise failure
-
-
-__all__ += ["CAPTURE", "PromptVision", "ConditionUnit"]
+        close_all(graphs, runners)

@@ -1756,6 +1756,93 @@ fn image_requests_are_admitted_only_at_captured_steps() {
     }
 }
 
+/// Workers report the rows and tokens their image denoising step holds;
+/// the engine admits an image request only when every guidance branch's
+/// framed latent sequence fits them, and refuses the others naming the
+/// exceeded extent.
+#[test]
+fn image_requests_are_admitted_only_within_the_step_capacity() {
+    let mut sim = SimEngine::new();
+    // A 512x512 image is 32x32 latent rows and two markers: two branches
+    // take 2052 tokens.
+    sim.mut_info_for_test().image_capacity = Some(ipc::ImageCapacity {
+        max_step_tokens: 2100,
+        max_step_rows: 2,
+        max_condition_tokens: 4096,
+        max_condition_rows: 2,
+        max_vision_patch_rows: 4096,
+        max_vision_images: 1,
+    });
+    let scheduler =
+        support::scheduler(Box::new(SimExecutor::new(sim)), special_tokens(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    let terminal = |id: u64, height: u32, cfg_text_scale: f32, cfg_img_scale: f32| {
+        let request = generation_request(
+            RequestId(id),
+            text_input(vec![4, 5, 6]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 2,
+                cfg_text_scale,
+                cfg_img_scale,
+                height,
+                ..Default::default()
+            },
+            GenerationConstraint::GenOnly,
+            0,
+        );
+        let mut events = handle.submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(event @ (Event::Rejected { .. } | Event::Finished { .. })) => {
+                    return Some(event);
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        None
+    };
+    let guided = terminal(1, 512, 4.0, 1.0);
+    // 768x512 takes 1538 tokens per branch: one fits, two do not.
+    let unguided = terminal(2, 768, 1.0, 1.0);
+    let too_many_tokens = terminal(3, 768, 4.0, 1.0);
+    // Text and image guidance evaluate three branches.
+    let too_many_rows = terminal(4, 512, 4.0, 2.0);
+    handle.shutdown();
+    let _ = scheduler_thread.join();
+
+    for admitted in [&guided, &unguided] {
+        assert!(
+            matches!(
+                admitted,
+                Some(Event::Finished {
+                    reason: FinishReason::ImageDone,
+                    ..
+                })
+            ),
+            "{admitted:?}"
+        );
+    }
+    for (refused, extent) in [
+        (&too_many_tokens, "max_step_tokens"),
+        (&too_many_rows, "max_step_rows"),
+    ] {
+        let Some(Event::Rejected {
+            kind: RejectionKind::Invalid,
+            message,
+        }) = refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert!(message.contains(extent), "{message}");
+    }
+}
+
 /// Workers that encode latents under CUDA graphs report the image sizes
 /// they captured; the engine admits an input image's latent block only at
 /// one of them, and refuses a block of another size, or of no stated size,

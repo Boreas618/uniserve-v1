@@ -163,12 +163,6 @@ impl BlockTableStorage {
         Ok(storage)
     }
 
-    /// Per-slot verified cache lengths; the decode state reads and advances
-    /// them as well.
-    pub(crate) fn verified_lengths(&self) -> &StorageView {
-        &self.verified_lengths
-    }
-
     /// The tables keyed as numerical bindings receive them.
     pub fn views(&self) -> Vec<(String, StorageView)> {
         [
@@ -387,7 +381,7 @@ mod tests {
         assert_eq!(read(&storage.alloced_lens), vec![0, 0, 12]);
 
         storage.set_verified(2, 7, None)?;
-        assert_eq!(read(storage.verified_lengths()), vec![0, 0, 7]);
+        assert_eq!(read(&storage.verified_lengths), vec![0, 0, 7]);
         storage.clear(&[2], None)?;
         assert!(read(&storage.unit_tables).iter().all(|&unit| unit == 0));
         assert!(
@@ -396,7 +390,7 @@ mod tests {
                 .all(|&length| length == 0)
         );
         assert!(
-            read(storage.verified_lengths())
+            read(&storage.verified_lengths)
                 .iter()
                 .all(|&length| length == 0)
         );

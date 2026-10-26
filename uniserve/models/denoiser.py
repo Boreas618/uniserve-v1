@@ -4,21 +4,31 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 import torch
 from torch import nn
 
-from uniserve.diffusion import Branch, NoiseScale, Schedule, Solver
+from uniserve.diffusion import (
+    Branch,
+    Guidance,
+    NoiseScale,
+    Renorm,
+    Schedule,
+    Solver,
+)
 from uniserve.distributed import DeviceMesh
 from uniserve.media import image, video
+from uniserve.nn.attention import AttentionBatch
 from uniserve.nn.functional import patchify
 from uniserve.processing import BranchSource
 from uniserve.tensors import BufferConfig, OutputLayout, TensorOutput
 
-from .inputs import DenoiserInput, LatentInput
+from .inputs import LatentInput, PackedImageInput, PackedImageRows
 
-InputT = TypeVar("InputT", bound=DenoiserInput)
+# The typed input a denoiser's forward consumes: a ``DenoiserInput`` of
+# per-sample latents (video), or a ``PackedImageInput`` of packed rows.
+InputT = TypeVar("InputT")
 SizeT = TypeVar("SizeT")
 
 
@@ -136,9 +146,9 @@ VideoSizeT = TypeVar("VideoSizeT", bound=VideoSize)
 
 
 class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
-    """A network prediction.
+    """A network that predicts its samples under an explicit solver.
 
-    With explicit solver and mathematical partitioning.
+    ``mesh`` states the network's mathematical partitioning.
     """
 
     def __init__(
@@ -175,10 +185,7 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
 
     @abstractmethod
     def noise_shape(self, modality: str, size: SizeT) -> tuple[int, ...]:
-        """Describe a complete native random draw.
-
-        Before numerical conversion.
-        """
+        """Describe one complete native random draw, before conversion."""
         raise NotImplementedError
 
     def layout_size(self, size: SizeT) -> SizeT:
@@ -225,25 +232,23 @@ class Denoiser(nn.Module, Generic[InputT, SizeT], ABC):
     def prepare_latents(
         self, sizes: tuple[SizeT, ...], *, noise, state, constants, workspace
     ) -> None:
-        """Convert caller-supplied native draws.
-
-        Into canonical sample storage.
-        """
+        """Convert caller-supplied native draws into canonical samples."""
         raise NotImplementedError
 
     @abstractmethod
     def forward(
         self, inputs: InputT, *, state, constants, workspace
     ) -> Mapping[str, tuple[TensorOutput | None, ...]]:
-        """Predict each sample.
+        """Predict each sample without advancing it.
 
-        Without committing a solver step or request progress. ``inputs.sizes``
-        are layouts (see ``layout_size``) and ``inputs.latents`` carry the
-        samples. ``state`` names the device fields ``prepare_state`` fills for
-        the request being advanced, which a captured step reads through fixed
-        buffers rather than at the request's own addresses; storage a request
-        draws on the host, as ``prepare_latents`` receives, is the
-        preparation's and is absent here.
+        The forward commits no solver step or request progress.
+        ``inputs.sizes`` are layouts (see ``layout_size``) and
+        ``inputs.latents`` carry the samples. ``state`` names the device
+        fields ``prepare_state`` fills for the request being advanced, which
+        a captured step reads through fixed buffers rather than at the
+        request's own addresses; storage a request draws on the host, as
+        ``prepare_latents`` receives, is the preparation's and is absent
+        here.
         """
         raise NotImplementedError
 
@@ -445,7 +450,7 @@ class VideoDenoiser(Denoiser[InputT, VideoSizeT]):
         raise NotImplementedError
 
 
-class ImageDenoiser(Denoiser[InputT, image.Config]):
+class ImageDenoiser(Denoiser[PackedImageInput, image.Config]):
     """Shared image patch dimensions and scale-before-patch noise conversion.
 
     downsample measures output pixels per canonical patch token. Native spatial
@@ -460,10 +465,22 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
     this, and a framed image's closing token sits this far past the position
     before it. ``guidance_branches`` is the most branches one denoising
     step's guidance evaluates (the conditioned prediction and each
-    unconditional one, ``uniserve.diffusion.Branch``), so execution prepares
-    one call shape for every count from one to it. Execution owns the buffers
-    and the stepping; the network states these layout facts and assembles its
-    own typed input.
+    unconditional one, ``uniserve.diffusion.Branch``). Execution owns the
+    buffers and the stepping; the network states these layout facts.
+
+    **Packed rows.** One forward evaluates any number of *rows*, each an
+    image's framed sequence of one guidance branch (or one latent image
+    written as conditioning), packed into a static token count with padding
+    (``PackedImageRows``). Its outputs are one packed ``[tokens, width]``
+    prediction: each latent token's canonical patch row, unspecified values
+    on framing and padding tokens, which the caller does not read. A forward
+    is *row-local*: each token's result depends only on its own row and on
+    the cache prefix its row attends to, never on another row or on padding,
+    and every shape follows from the static token and row counts, so one
+    captured computation serves every set of rows that fits. A spatial
+    operation over an image's token grid is not row-local; a network that
+    needs one declares it an eager per-image region, which reads the rows'
+    host ``regions`` and runs between the captured segments around it.
     """
 
     framing_tokens: int = 0
@@ -477,8 +494,29 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
     ) -> Mapping[str, Schedule]:
         """Construct complete schedules of ``steps`` evaluations.
 
-        Using this network's time parameterization; ``None`` keeps the
-        network's default shift.
+        They follow this network's time parameterization; a ``shift`` of
+        ``None`` keeps the network's default shift.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def make_guidance(
+        self,
+        *,
+        text_scale: float,
+        image_scale: float,
+        interval: tuple[float, float],
+        renorm: Renorm,
+        renorm_min: float,
+    ) -> Guidance:
+        """Construct one trajectory's classifier-free guidance.
+
+        ``text_scale`` and ``image_scale`` weigh the text and image
+        conditioning, ``interval`` holds the inclusive schedule coordinates
+        where guidance is active, and ``renorm`` and ``renorm_min`` are the
+        request's renormalization. The guidance selects the branches each
+        solver step evaluates (``Guidance.branches``) and combines their
+        predictions.
         """
         raise NotImplementedError
 
@@ -491,21 +529,36 @@ class ImageDenoiser(Denoiser[InputT, image.Config]):
         """
         raise NotImplementedError
 
-    def bind_inputs(
+    def bind_packed(
         self,
         *,
-        latents: Mapping[str, tuple[LatentInput, ...]],
-        sizes: tuple[image.Config, ...],
-        step: torch.Tensor,
-        positions: tuple[torch.Tensor, ...],
-        sequence_lengths: tuple[int, ...],
-        attention: Any,
-    ) -> InputT:
-        """Assemble this network's typed input for one denoising step.
+        source: torch.Tensor,
+        rows: PackedImageRows,
+        attention: AttentionBatch,
+    ) -> PackedImageInput:
+        """Assemble one packed forward's typed input from borrowed tensors.
 
-        The caller supplies borrowed numerical views; the network selects the
-        fields its own forward consumes and derives any per-step conditioning
-        from them.
+        ``source`` holds the ``[U, width]`` canonical latent rows that latent
+        tokens read (``rows.sample_index``), ``rows`` the forward's
+        per-token metadata, network times included, and ``attention`` the
+        attention metadata of the packed sequences. The input borrows every
+        tensor, so a captured forward reads the values the caller writes
+        into them before each launch.
+        """
+        return PackedImageInput(source=source, rows=rows, attention=attention)
+
+    @abstractmethod
+    def forward(
+        self, inputs: PackedImageInput, *, state, constants, workspace
+    ) -> Mapping[str, tuple[TensorOutput | None, ...]]:
+        """Predict every token of a packed forward.
+
+        Returns ``{"image": (prediction,)}``: one ``TensorOutput`` of shape
+        ``[tokens, width]`` in ``prediction_dtype`` on the last pipeline
+        stage, ``None`` on the others. A latent token's row is its canonical
+        patch prediction; the rows of framing and padding tokens are finite
+        and unspecified. ``state``, ``constants`` and ``workspace`` are
+        unused by image denoisers.
         """
         raise NotImplementedError
 

@@ -26,10 +26,8 @@ padding sentinel). The tensors of one forward are parameters of its method.
 Every value that changes between forwards is the contents of a tensor, the
 sampler derives its random bits on the device from the seed, block and step
 columns, and no method keeps state between calls. The caller captures a
-method into one CUDA graph per shape by calling it between
-``uniserve.cuda_graph.capture_begin`` and ``capture_end`` after one eager call
-of
-the same shape, and launches the graph without Python.
+method into one CUDA graph per shape with ``uniserve.cuda_graph.capture``
+after one eager call of the same shape, and replays the graph.
 
 Attention operators that plan a launch on the host read the host mirrors of
 the lengths; :meth:`DiffusionLMRunner.plan_attention` builds their plans
@@ -65,29 +63,13 @@ __all__ = [
     "STEP_SKIPPED",
     "STEP_STOPPED",
     "DiffusionLMRunner",
-    "attend_widths",
-    "compute_dtype",
-    "embedding_dtype",
-    "exchanges_finish",
-    "generates",
-    "hidden_size",
-    "sequence_length",
-    "stage",
-    "vocab_size",
-    "workspace_bytes",
+    "model_at",
+    "tail_exchanges",
 ]
 
 # The first value of a denoising step's result row: the step left its block
 # running, stopped it, or was skipped because an earlier step stopped it.
 STEP_CONTINUED, STEP_STOPPED, STEP_SKIPPED = 0, 1, 2
-
-
-def _model(module) -> DiffusionLM:
-    if not isinstance(module, DiffusionLM):
-        raise ValueError(
-            f"a diffusion LM runner serves a DiffusionLM, not {type(module)}"
-        )
-    return module
 
 
 def _table(embedding: nn.Module) -> torch.Tensor:
@@ -96,7 +78,7 @@ def _table(embedding: nn.Module) -> torch.Tensor:
     return cast(torch.Tensor, embedding.weight)
 
 
-def _tail_exchanges(
+def tail_exchanges(
     model: DiffusionLM, *, exchange: bool, attention_ranks: int
 ) -> bool:
     """Whether a model's ``finish`` exchanges tokens across ranks.
@@ -119,100 +101,19 @@ def _tail_exchanges(
     )
 
 
-def _placed(loaded, path: str) -> DiffusionLM:
-    """The diffusion LM at ``path`` of a loaded model."""
-    path = str(path)
+def model_at(loaded, path: str) -> DiffusionLM:
+    """The diffusion LM at ``path`` of a loaded model.
+
+    Raises:
+        ValueError: The module at ``path`` is not a ``DiffusionLM``.
+    """
     root = loaded.module
-    return _model(root.get_submodule(path) if path else root)
-
-
-# Facts of the diffusion LM at ``path`` of a loaded model, which a caller
-# sizes its tensors from before a runner exists. Each is the model's own
-# read-only method of the same name; the functions exist because a rank
-# reaches the library by import path with values it can hold, and a module
-# is not one (a callable object crosses as a function).
-
-
-def sequence_length(loaded, path: str) -> int:
-    """Tokens of one generated block."""
-    return _placed(loaded, path).sequence_length()
-
-
-def vocab_size(loaded, path: str) -> int:
-    """Real vocabulary entries, the same on every pipeline stage."""
-    return _placed(loaded, path).vocab_size()
-
-
-def hidden_size(loaded, path: str) -> int:
-    """The width of the hidden states and token embeddings."""
-    return _placed(loaded, path).hidden_size()
-
-
-def compute_dtype(loaded, path: str) -> str:
-    """The name of the element type the layers compute in."""
-    return _placed(loaded, path).compute_dtype()
-
-
-def embedding_dtype(loaded, path: str) -> str:
-    """The name of the token embedding's element type."""
-    return _placed(loaded, path).embedding_dtype()
-
-
-def attend_widths(loaded, path: str) -> list[int]:
-    """Per-token widths of the state ``attend`` writes on the last stage."""
-    return _placed(loaded, path).attend_widths()
-
-
-def stage(loaded, path: str) -> list[int]:
-    """``[rank, size]`` of this rank in the model's pipeline."""
-    return _placed(loaded, path).stage()
-
-
-def generates(loaded, path: str) -> bool:
-    """Whether this rank can denoise blocks."""
-    return _placed(loaded, path).generates()
-
-
-def exchanges_finish(
-    loaded, path: str, exchange: bool, attention_ranks: int
-) -> bool:
-    """Whether ``finish`` of the model exchanges tokens across ranks.
-
-    ``exchange`` says routed experts communicate through an expert exchange
-    and ``attention_ranks`` counts the attention ranks of a disaggregated
-    expert union (zero when every rank holds its experts). A ``finish``
-    that exchanges completes the expert step of its readout's ``attend``;
-    one that does not follows the step and has no expert capacity.
-    """
-    return _tail_exchanges(
-        _placed(loaded, path),
-        exchange=bool(exchange),
-        attention_ranks=int(attention_ranks),
-    )
-
-
-def workspace_bytes(
-    rows: int,
-    sequence_length: int,
-    vocab_size: int,
-    hidden_size: int,
-    dtype: str,
-    cuda: bool,
-) -> int:
-    """Bytes of the sampler workspace a generating runner allocates.
-
-    The workspace of ``rows`` blocks stepped at a time
-    (``CanvasWorkspace.nbytes``); ``dtype`` names the embedding dtype. The
-    caller plans device memory before the runner exists.
-    """
-    return sampler.CanvasWorkspace.nbytes(
-        int(rows),
-        int(sequence_length),
-        int(vocab_size),
-        int(hidden_size),
-        dtype=getattr(torch, str(dtype)),
-        device_type="cuda" if cuda else "cpu",
-    )
+    module = root.get_submodule(path) if path else root
+    if not isinstance(module, DiffusionLM):
+        raise ValueError(
+            f"a diffusion LM runner serves a DiffusionLM, not {type(module)}"
+        )
+    return module
 
 
 def _rows(state: sampler.CanvasState, start: int, stop: int):
@@ -268,8 +169,9 @@ class DiffusionLMRunner:
             ``None``.
         weights: The distributed expert weights' prefetch object, or
             ``None``.
-        collectives: The ``NativeCollectives`` of the model's communicators
-            on the stream, or ``None``.
+        collectives: The process group of each of the model's
+            multi-member communicators on the stream, by communicator name,
+            or ``None``.
         tokens: The most tokens one forward evaluates.
         rows: The most sequences one forward evaluates.
         block_size: Tokens per page of each numerical block table.
@@ -318,7 +220,7 @@ class DiffusionLMRunner:
         bank_self_conditioning: torch.Tensor | None = None,
         bank_live: torch.Tensor | None = None,
     ) -> None:
-        self._model = _placed(loaded, path)
+        self._model = model_at(loaded, path)
         context = execution_context(
             self._model,
             int(stream),
@@ -346,7 +248,7 @@ class DiffusionLMRunner:
         # experts to ``finish``, which starts with every earlier expert
         # layer reached.
         exchange = context.experts
-        self._exchanging = _tail_exchanges(
+        self._exchanging = tail_exchanges(
             self._model,
             exchange=exchange is not None,
             attention_ranks=0 if exchange is None else exchange.attention_ranks,

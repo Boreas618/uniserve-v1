@@ -17,14 +17,10 @@
 //! the streams or the context that released objects use) waits for the
 //! queue once ([`Interpreter::synchronize`]).
 //!
-//! Three cases make a call on the calling thread instead:
+//! Two cases make a call on the calling thread instead:
 //!
 //! - the caller is the interpreter thread itself (a Python function called
 //!   back into Rust, which calls another function);
-//! - the caller runs a cooperative turn ([`cooperative`]): an eager expert
-//!   forward stays suspended inside Python at its dispatch points, so each
-//!   microbatch needs a thread of its own, and exactly one of them runs at
-//!   a time;
 //! - no interpreter was started: the library is used from Python (tests,
 //!   harnesses), where the caller's thread already is the builder thread.
 //!
@@ -81,9 +77,8 @@ impl Interpreter {
     }
 
     /// The Python callable at a dotted import path, for example
-    /// `uniserve.runner.causal_lm.CausalLMRunner.decode`: a function, a
-    /// class (called to construct it) or a method (called with the object
-    /// first). Resolving imports the path's module on the builder thread.
+    /// `uniserve.executor.Executor.execute`: a function, a class (called to
+    /// construct it) or a method (called with the object first). Resolving imports the path's module on the builder thread.
     ///
     /// Fails when no import function was installed, when the path does not
     /// resolve (the library's error, which names the path) or when it names
@@ -226,19 +221,6 @@ impl Released {
     fn release(self) {
         drop(self.0);
     }
-}
-
-/// Run `body` with this thread's Python calls made on this thread.
-///
-/// For the threads of eager expert microbatches only: their forwards take
-/// turns explicitly and exactly one runs at a time, so they do not contend
-/// for the GIL, and a forward suspended at a dispatch point keeps its
-/// thread's Python frames.
-pub fn cooperative<T>(body: impl FnOnce() -> T) -> T {
-    let previous = CALLS_HERE.replace(true);
-    let result = body();
-    CALLS_HERE.set(previous);
-    result
 }
 
 // Work handed from one thread to another, whose submitter waits for it.

@@ -8,9 +8,10 @@
 //!
 //! A forward runs as jobs of the lane ([`JobQueues::start`]). A [`Job`] is
 //! the ordered list of what the forward puts on the stream; the lane's
-//! execution thread performs it: it writes the forward's inputs, launches
-//! its graph or hands its Python call to the builder thread and waits for
-//! it, and reads its outputs, so the stream's order is the thread's order.
+//! execution thread performs it: it issues the forward's copies, fills and
+//! event operations, hands its executor calls to the builder thread and
+//! waits for them, and reads its outputs, so the stream's order is the
+//! thread's order.
 //! The thread posts a [`Completion`] per job under the job's [`JobId`], to
 //! the one place the control thread takes completions from
 //! ([`JobQueues::take`]), and fires the control thread's wake behind it.
@@ -60,7 +61,7 @@ use crate::stream::CUDAStream;
 use crate::{Error, Result, lock};
 
 pub(crate) use job::Completion;
-pub(crate) use job::{Capture, ExpertStep, ExpertVariant, Job, Recorder, Value};
+pub(crate) use job::{Job, Recorder};
 pub(crate) use queue::{JobId, JobQueue};
 
 /// One execution lane.
@@ -147,7 +148,7 @@ struct Shared {
 struct Running {
     /// The lane's name in a stall report; `None` for the builder thread.
     lane: Option<String>,
-    /// Each job, when it was submitted and the runner method it calls.
+    /// Each job, when it was submitted and the library method it calls.
     jobs: VecDeque<(JobId, Instant, Option<String>)>,
     /// When the last completion of one of its jobs arrived.
     completed: Option<Instant>,
@@ -260,7 +261,7 @@ impl JobQueues {
     }
 
     /// The lane performing job `id`, `None` for the builder thread, and the
-    /// runner method the job calls; `None` when the job is not in flight.
+    /// library method the job calls; `None` when the job is not in flight.
     pub(crate) fn performing(&self, id: JobId) -> Option<(Option<String>, Option<String>)> {
         self.running().iter().find_map(|running| {
             running

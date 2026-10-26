@@ -1,8 +1,5 @@
 //! Request slots, call dependencies, and accepted execution progress.
 
-pub(crate) mod decode_state;
-pub(crate) mod diffusion;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -35,9 +32,6 @@ struct RequestState {
     state_call: CallId,
     // Insertion order is submission order, which need not equal call-id order.
     pending: IndexMap<CallId, bool>,
-    // Latent encodings recorded so far: the index of the next one's
-    // posterior noise draw.
-    posterior_draws: u64,
     closed: bool,
     retired: bool,
     // Why this rank refuses the request, decided from its size when it was
@@ -93,17 +87,6 @@ impl Request {
 
     pub(crate) fn progress(&self) -> Result<RequestProgress> {
         Ok(self.state()?.progress)
-    }
-
-    /// The posterior noise draw index of the request's next latent
-    /// encoding: its latent encodings recorded before it. A request's
-    /// encodings are recorded in their call order, so the index does not
-    /// depend on batching.
-    pub(crate) fn posterior_draw(&self) -> Result<u64> {
-        let mut state = self.state()?;
-        let index = state.posterior_draws;
-        state.posterior_draws += 1;
-        Ok(index)
     }
 
     pub(crate) fn retired(&self) -> Result<bool> {

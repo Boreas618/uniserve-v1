@@ -24,15 +24,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::os::fd::OwnedFd;
 
 use cuda::{
-    CopyBatch, DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
-    SegmentedMapping, ShareableHandle, SourceOrder, Strided,
+    DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
+    SegmentedMapping, ShareableHandle, Strided,
 };
 use tvm_ffi::{Any, AnyView};
 
 use crate::ffi::{
     Backing, DType, Function, Handle, Interpreter, MemoryKind, Tensor, contiguous_strides, export,
 };
-use crate::stream::{Fill, Issue};
 use crate::{Error, Result, lock};
 
 /// One allocation owned by the worker: device memory, page-locked or
@@ -736,20 +735,6 @@ impl StorageView {
         Ok(bytes)
     }
 
-    /// The leading `count` entries along dimension 0.
-    pub(crate) fn prefix(&self, count: i64) -> Result<Self> {
-        let extent = *self
-            .shape
-            .first()
-            .ok_or_else(|| Error::Invariant("a scalar view has no leading dimension".to_owned()))?;
-        if count > extent {
-            return Err(Error::Invariant(format!(
-                "prefix of {count} exceeds the leading extent {extent}"
-            )));
-        }
-        self.narrow(0, 0, count)
-    }
-
     /// Elements `[start, start + length)` of `axis`. The whole axis is this
     /// view itself.
     pub(crate) fn narrow(&self, axis: usize, start: i64, length: i64) -> Result<Self> {
@@ -794,22 +779,6 @@ impl StorageView {
                 return Err(Error::Invalid("a region range is reversed".to_owned()));
             }
             view = view.narrow(axis, range.start as i64, (range.end - range.start) as i64)?;
-        }
-        Ok(view)
-    }
-
-    /// The same bytes reinterpreted as a contiguous `shape` of `dtype`.
-    pub(crate) fn reshape(&self, dtype: DType, shape: &[i64]) -> Result<Self> {
-        if !self.is_contiguous() {
-            return Err(Error::Invariant(
-                "only contiguous views can be reshaped".to_owned(),
-            ));
-        }
-        let view = Self::contiguous(Arc::clone(&self.memory), self.offset, dtype, shape)?;
-        if view.byte_len()? > self.byte_len()? {
-            return Err(Error::Invariant(
-                "a reshape cannot grow its view".to_owned(),
-            ));
         }
         Ok(view)
     }
@@ -873,75 +842,6 @@ impl StorageView {
             .collect();
         intervals.sort_unstable_by_key(|interval| interval.start);
         intervals
-    }
-
-    /// Write `bytes` into the leading bytes of this contiguous view, after
-    /// the work `stream` issued before (it has a stream exactly for device
-    /// memory). The source is read before the call returns, so the caller
-    /// may reuse it at once.
-    ///
-    /// # Safety
-    ///
-    /// The write runs when `stream` runs it: during the call for host
-    /// memory without a stream, after the stream's earlier work on a
-    /// stream, when the job runs for a job's recorder. Until it ran, nothing
-    /// reads or writes the destination bytes except work ordered after it
-    /// (behind it on `stream`, or behind a fence of `stream`), and the
-    /// view's allocation keeps a reference: the caller retires the write
-    /// before dropping the allocation's last reference, as for any device
-    /// access.
-    pub(crate) unsafe fn upload(&self, bytes: &[u8], stream: impl Issue) -> Result<()> {
-        if !self.is_contiguous() || bytes.len() as u64 > self.nbytes() {
-            return Err(Error::Invariant(
-                "an upload writes a prefix of a contiguous view".to_owned(),
-            ));
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        if matches!(self.device(), MemoryKind::Cuda(_)) != stream.stream().is_some() {
-            return Err(Error::Invariant(
-                "uploads use a stream exactly for device memory".to_owned(),
-            ));
-        }
-
-        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-        batch.push(self.address(), bytes.as_ptr() as u64, bytes.len());
-        // SAFETY: the destination lies in this view; the caller keeps it
-        // allocated and unaccessed until the copy ran. The pageable source
-        // is consumed during the call.
-        unsafe { stream.copy(&batch) }
-    }
-
-    /// Zero this contiguous view, in the order of what `stream` issues for
-    /// device memory (a stream at once, or a job's recorder).
-    ///
-    /// # Safety
-    ///
-    /// As for [`Self::upload`], over the whole view: until the fill ran, no
-    /// access that is not ordered after it reads or writes the view, and
-    /// the view's allocation keeps a reference.
-    pub(crate) unsafe fn zero(&self, stream: impl Issue) -> Result<()> {
-        if !self.is_contiguous() {
-            return Err(Error::Invariant(
-                "only a contiguous view is zeroed".to_owned(),
-            ));
-        }
-        if matches!(self.device(), MemoryKind::Cuda(_)) != stream.stream().is_some() {
-            return Err(Error::Invariant(
-                "fills use a stream exactly for device memory".to_owned(),
-            ));
-        }
-        // SAFETY: the bytes lie in this view, which the caller keeps
-        // allocated and unaccessed until the fill ran.
-        unsafe {
-            stream.fill(Fill {
-                address: self.address(),
-                value: 0,
-                width: 1,
-                count: self.nbytes() as usize,
-            })
-        }
     }
 
     /// The view as a TVM-FFI tensor: a DLPack export retaining the
@@ -1017,10 +917,8 @@ mod tests {
         assert!(StorageView::contiguous(Arc::clone(&memory), 4, DType::F32, &[4, 4]).is_err());
 
         let rows = StorageView::contiguous(Arc::clone(&memory), 0, DType::I64, &[8])?;
-        assert_eq!(rows.prefix(3)?.byte_len()?, 24);
-        assert!(rows.prefix(9).is_err());
-        assert_eq!(rows.reshape(DType::I32, &[16])?.byte_len()?, 64);
-        assert!(rows.reshape(DType::I32, &[17]).is_err());
+        assert_eq!(rows.narrow(0, 0, 3)?.byte_len()?, 24);
+        assert!(rows.narrow(0, 0, 9).is_err());
         Ok(())
     }
 

@@ -14,7 +14,7 @@ from uniserve.distributed.tokens import TokenShard
 from uniserve.nn.attention import AttentionBatch, AttentionParallelConfig
 from uniserve.nn.functional import add_rms_norm
 from uniserve.nn.norm import RMSNorm
-from uniserve.nn.routing import RoutedTensor, RouteSpan
+from uniserve.nn.routing import IndexedRoutes
 from uniserve.prefix_cache import mha
 
 
@@ -195,13 +195,15 @@ class TransformerDecoder(nn.Module):
         positions: torch.Tensor,
         attention: AttentionBatch,
         *,
-        routes: tuple[RouteSpan, ...] = (),
+        routes: IndexedRoutes | None = None,
         deepstack: Mapping[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Evaluate every layer and, on the final stage, the output norm.
 
-        Returns the final stage's normalized ``[tokens, hidden]`` rows, or
-        the activations an earlier stage forwards.
+        ``routes`` assign the packed tokens of a routed decoder to its
+        experts; without them every token takes the default route. Returns
+        the final stage's normalized ``[tokens, hidden]`` rows, or the
+        activations an earlier stage forwards.
         """
         traversal = self._traverse(
             embeddings,
@@ -217,7 +219,7 @@ class TransformerDecoder(nn.Module):
             traversal.routes,
         )
         if self._pipeline.rank != self._pipeline.size - 1:
-            return self._forward_stage(hidden, residual, local_routes)
+            return self._forward_stage(hidden, residual)
         return traversal.partition.gather(
             self._normalize(hidden, residual, local_routes)
         )
@@ -228,7 +230,7 @@ class TransformerDecoder(nn.Module):
         positions: torch.Tensor,
         attention: AttentionBatch,
         *,
-        routes: tuple[RouteSpan, ...] = (),
+        routes: IndexedRoutes | None = None,
     ) -> None:
         """Write every layer's prefix cache without evaluating any output.
 
@@ -241,9 +243,7 @@ class TransformerDecoder(nn.Module):
             embeddings, positions, attention, routes, split=True
         )
         if self._pipeline.rank != self._pipeline.size - 1:
-            self._forward_stage(
-                traversal.hidden, traversal.residual, traversal.routes
-            )
+            self._forward_stage(traversal.hidden, traversal.residual)
         elif traversal.final is not None:
             traversal.final.write_cache(
                 traversal.hidden,
@@ -269,11 +269,11 @@ class TransformerDecoder(nn.Module):
         if self._default_route is not None:
             raise ValueError("routed decoders evaluate their layers whole")
         traversal = self._traverse(
-            embeddings, positions, attention, (), split=True
+            embeddings, positions, attention, None, split=True
         )
         hidden, residual = traversal.hidden, traversal.residual
         if self._pipeline.rank != self._pipeline.size - 1:
-            return (self._forward_stage(hidden, residual, ()),)
+            return (self._forward_stage(hidden, residual),)
         if traversal.final is not None:
             state = traversal.final.attend(
                 hidden, residual, traversal.positions, attention
@@ -316,7 +316,7 @@ class TransformerDecoder(nn.Module):
             hidden, residual = layer.feed_forward(*selected)
         else:
             hidden, residual = selected[0], (selected[1:] or (None,))[0]
-        return self._normalize(hidden, residual, ())
+        return self._normalize(hidden, residual, None)
 
     def _traverse(
         self, embeddings, positions, attention, routes, *, split, deepstack=None
@@ -328,17 +328,18 @@ class TransformerDecoder(nn.Module):
         returning it as ``final`` with the streams it would receive.
         """
         count = positions.shape[-1]
-        if not routes and self._default_route is not None:
-            routes = (RouteSpan(self._default_route, 0, count),)
-        if deepstack and routes:
+        if routes is None and self._default_route is not None:
+            routes = IndexedRoutes(self._default_route)
+        if routes is not None and self._default_route is None:
+            raise ValueError("only a routed decoder takes token routes")
+        if deepstack and routes is not None:
             raise ValueError("DeepStack features require one packed stream")
         partition = TokenShard(count, self._tokens)
         positions = partition.local(positions, dim=positions.ndim - 1)
 
-        # Routes replace each packed stream with its per-route tensors; the
-        # first stage starts without a residual stream.
-        hidden: torch.Tensor | RoutedTensor
-        residual: torch.Tensor | RoutedTensor | None
+        # The first stage starts without a residual stream.
+        hidden: torch.Tensor
+        residual: torch.Tensor | None
         if self._pipeline.rank == 0:
             if embeddings is None or embeddings.shape != (
                 count,
@@ -359,39 +360,25 @@ class TransformerDecoder(nn.Module):
                 if value is not None:
                     self._pipeline.recv(src=self._pipeline.rank - 1, out=value)
 
-        # Clip route spans to this rank's token shard, in shard-local offsets.
-        local_routes: tuple[RouteSpan, ...] = ()
-        if routes:
-            local_routes = tuple(
-                RouteSpan(
-                    span.route,
-                    max(span.start, partition.token_slice.start)
-                    - partition.token_slice.start,
-                    min(span.stop, partition.token_slice.stop)
-                    - max(span.start, partition.token_slice.start),
-                )
-                for span in routes
-                if span.stop > partition.token_slice.start
-                and span.start < partition.token_slice.stop
-            )
-            keys = frozenset(span.route for span in routes)
-            hidden = RoutedTensor.from_packed(hidden, local_routes, routes=keys)
-            if residual is not None:
-                residual = RoutedTensor.from_packed(
-                    residual, local_routes, routes=keys
-                )
+        # Sparse route rows become local to this rank's token shard; rows
+        # outside it route nothing here (``IndexedRoutes.shard``).
+        local_routes = (
+            None
+            if routes is None
+            else routes.shard(partition.token_slice.start, partition.count)
+        )
 
         layers = tuple(self.layers.items())
         final = None
         if (
             split
-            and not routes
+            and routes is None
             and self._pipeline.rank == self._pipeline.size - 1
             and isinstance(layers[-1][1], PhasedLayer)
         ):
             final, layers = layers[-1][1], layers[:-1]
         for key, layer in layers:
-            if routes:
+            if local_routes is not None:
                 hidden, residual = layer(
                     hidden, residual, positions, attention, routes=local_routes
                 )
@@ -402,8 +389,7 @@ class TransformerDecoder(nn.Module):
             if features is not None:
                 # DeepStack adds to the complete residual stream, after the
                 # decoder layer's own residual addition has rounded.
-                assert isinstance(hidden, torch.Tensor)
-                assert isinstance(residual, torch.Tensor)
+                assert residual is not None
                 residual = residual + hidden
                 residual = residual + partition.local(features).to(
                     residual.dtype
@@ -420,48 +406,29 @@ class TransformerDecoder(nn.Module):
             hidden, residual, positions, partition, local_routes, final
         )
 
-    def _forward_stage(self, hidden, residual, local_routes):
+    def _forward_stage(self, hidden, residual):
         """Send an earlier stage's streams on and return its hidden stream."""
         for stream in (hidden, residual):
-            if stream is None:
-                continue
-            packed = (
-                stream.packed(local_routes)
-                if isinstance(stream, RoutedTensor)
-                else stream
-            )
-            self._pipeline.send(packed, dst=self._pipeline.rank + 1)
-        return (
-            hidden.packed(local_routes)
-            if isinstance(hidden, RoutedTensor)
-            else hidden
-        )
+            if stream is not None:
+                self._pipeline.send(stream, dst=self._pipeline.rank + 1)
+        return hidden
 
     def _normalize(self, hidden, residual, local_routes):
         """Fold the residual into the final stage's output norm."""
-        # Only the final stage retains the norm. Layers keep both streams in
-        # one form.
+        # Only the final stage retains the norm. A routed decoder applies
+        # each route's norm to its own tokens.
         norm = self.norm
         assert norm is not None
-        if residual is None:
-            if isinstance(hidden, RoutedTensor):
-                assert isinstance(norm, nn.ModuleDict)
-                result = hidden.apply(norm).packed(local_routes)
-            else:
-                result = norm(hidden)
-        elif isinstance(hidden, RoutedTensor):
-            assert isinstance(residual, RoutedTensor)
+        if local_routes is not None:
             assert isinstance(norm, nn.ModuleDict)
-            result = hidden.add(residual).apply(norm).packed(local_routes)
-        else:
-            assert isinstance(residual, torch.Tensor)
-            if isinstance(norm, RMSNorm):
-                result, _ = add_rms_norm(
-                    hidden, residual, norm.weight, norm.eps
-                )
-            else:
-                result = norm(hidden + residual)
-        return result
+            stream = hidden if residual is None else hidden + residual
+            return local_routes.apply(norm, stream)
+        if residual is None:
+            return norm(hidden)
+        if isinstance(norm, RMSNorm):
+            result, _ = add_rms_norm(hidden, residual, norm.weight, norm.eps)
+            return result
+        return norm(hidden + residual)
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,11 +439,11 @@ class _Traversal:
     ``partition``; ``final`` is the unevaluated final layer of a split pass.
     """
 
-    hidden: torch.Tensor | RoutedTensor
-    residual: torch.Tensor | RoutedTensor | None
+    hidden: torch.Tensor
+    residual: torch.Tensor | None
     positions: torch.Tensor
     partition: TokenShard
-    routes: tuple[RouteSpan, ...]
+    routes: IndexedRoutes | None
     final: PhasedLayer | None
 
 

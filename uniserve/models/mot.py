@@ -4,8 +4,10 @@ A mixture-of-transformers (MoT) backbone gives every route (``text`` and
 ``flow``) its own input norm, attention projections, output projection,
 post-attention norm and gated MLP, while one attention call covers the packed
 tokens of all routes, so every route reads and writes the same prefix cache
-layer. ``RouteSpan`` values assign packed token ranges to routes; calls
-without spans run every token through the first route.
+layer. ``IndexedRoutes`` assign the packed tokens to routes: every token
+takes a dense route and a sparse route takes over a static list of rows
+(BAGEL's image markers, which take the ``text`` route among ``flow``
+latents); calls without routes run every token through the first route.
 
 ``MoTLayer`` owns that composition and the residual flow. A subclass states
 what is model-specific: how its projections are built and rotated
@@ -25,7 +27,7 @@ from torch import nn
 from uniserve.models.transformer import TransformerDecoder
 from uniserve.nn.attention import Attention, AttentionBatch
 from uniserve.nn.norm import RMSNorm
-from uniserve.nn.routing import RoutedTensor, RouteSpan
+from uniserve.nn.routing import IndexedRoutes
 
 __all__ = [
     "MoTDecoder",
@@ -35,7 +37,7 @@ __all__ = [
     "backbone_names",
 ]
 
-# The first route is the one calls without route spans take.
+# The first route is the one calls without routes take.
 ROUTES = ("text", "flow")
 
 
@@ -43,11 +45,13 @@ class MoTLayer(nn.Module):
     """Run per-route experts around one shared attention call.
 
     ``projection``, ``output`` and ``mlp`` each build one route's module; the
-    layer calls them once per route. ``attention`` is the shared module, so
-    its ``cache_name`` addresses one prefix cache layer for every route.
-    Experts run on their own tokens: Q/K/V are repacked into sequence order
-    for the attention call and its result is split again for the output
-    projections.
+    layer applies them through its ``IndexedRoutes``. ``attention`` is the
+    shared module, so its ``cache_name`` addresses one prefix cache layer for
+    every route. Every token stays in its packed position: each routed
+    module evaluates the dense route over all tokens and the sparse routes
+    over their rows, whose results replace the dense ones before the
+    attention call mixes tokens, so a dense result at a sparse row never
+    reaches another token.
     With ``mlp_dtype`` the experts' MLPs consume the post-attention norm
     results cast to that dtype, as a checkpoint whose experts were trained in
     that precision expects even when the surrounding accumulation is wider.
@@ -94,62 +98,40 @@ class MoTLayer(nn.Module):
 
     def forward(
         self,
-        hidden: RoutedTensor,
-        residual: RoutedTensor | None,
+        hidden: torch.Tensor,
+        residual: torch.Tensor | None,
         positions: torch.Tensor,
         attention: AttentionBatch,
         *,
-        routes: tuple[RouteSpan, ...],
-    ) -> tuple[RoutedTensor, RoutedTensor]:
-        """Apply one layer to this rank's routed token shard.
+        routes: IndexedRoutes,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply one layer to this rank's packed token shard.
 
-        ``routes`` are shard-local spans. Returns the MLP output and the
-        residual stream it has not yet been added to, the pair
-        ``TransformerDecoder`` carries between layers.
+        ``routes`` are the shard's (``IndexedRoutes.shard``). Returns the MLP
+        output and the residual stream it has not yet been added to, the
+        pair ``TransformerDecoder`` carries between layers.
         """
-        hidden = hidden if residual is None else hidden.add(residual)
-        normalized = hidden.apply(self.input_norms)
+        hidden = hidden if residual is None else hidden + residual
+        normalized = routes.apply(self.input_norms, hidden)
 
-        names = frozenset(hidden.values)
-        cos, sin = (
-            tuple(
-                RoutedTensor.from_packed(table, routes, routes=names)
-                for table in tables
-            )
-            for tables in self.position_embeddings(positions)
-        )
-        projected = {
-            route: self.projections[route](
-                value,
-                tuple(axis.values[route] for axis in cos),
-                tuple(axis.values[route] for axis in sin),
-            )
-            for route, value in normalized.values.items()
-        }
-        query, key, value = (
-            RoutedTensor(
-                {route: values[index] for route, values in projected.items()}
-            ).packed(routes)
-            for index in range(3)
-        )
+        # Each route's projection rotates its own rows by their positions.
+        cos, sin = self.position_embeddings(positions)
+        query, key, value = routes.apply(self.projections, normalized, cos, sin)
 
         attended = self.attention(query, key, value, attention).flatten(1)
-        update = RoutedTensor.from_packed(attended, routes, routes=names).apply(
-            self.outputs
-        )
-        residual = hidden.add(update)
+        residual = hidden + routes.apply(self.outputs, attended)
 
-        normalized = residual.apply(self.post_attention_norms)
+        normalized = routes.apply(self.post_attention_norms, residual)
         if self.mlp_dtype is not None:
             normalized = normalized.to(self.mlp_dtype)
-        return normalized.apply(self.mlps), residual
+        return routes.apply(self.mlps, normalized), residual
 
 
 class MoTDecoder(TransformerDecoder):
     """Stack ``MoTLayer`` modules over a shared embedding.
 
-    Every route has its own output norm, and calls without route spans run
-    every token through the first route.
+    Every route has its own output norm, and calls without routes run every
+    token through the first route.
     """
 
     def __init__(

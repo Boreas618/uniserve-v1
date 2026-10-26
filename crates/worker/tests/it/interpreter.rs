@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use tvm_ffi::{Any, AnyView};
-use worker::ffi::{Function, Handle, Interpreter, cooperative};
+use worker::ffi::{Function, Handle, Interpreter};
 
 /// A function that increments its argument and records the thread that
 /// executes it.
@@ -44,12 +44,6 @@ fn calls_and_releases_from_other_threads_run_on_the_interpreter_thread() {
     let argument = Any::from(41_i64);
     assert_eq!(function.call_as::<i64>(&[(&argument).into()]).unwrap(), 42);
     assert_eq!(*seen.lock().unwrap(), Some(python));
-
-    // A cooperative turn calls in place.
-    let here = std::thread::current().id();
-    let value = cooperative(|| function.call_as::<i64>(&[(&argument).into()]));
-    assert_eq!(value.unwrap(), 42);
-    assert_eq!(*seen.lock().unwrap(), Some(here));
 
     // A handle dropped here is released by the interpreter thread, in the
     // order of its queue, without the dropping thread waiting: while the
@@ -90,6 +84,7 @@ fn calls_and_releases_from_other_threads_run_on_the_interpreter_thread() {
 
     // With the interpreter stopped, a call and submitted work run on their
     // caller's thread.
+    let here = std::thread::current().id();
     assert_eq!(function.call_as::<i64>(&[(&argument).into()]).unwrap(), 42);
     assert_eq!(*seen.lock().unwrap(), Some(here));
     let (ran, result) = crossbeam_channel::bounded(1);

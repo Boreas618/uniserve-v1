@@ -106,10 +106,6 @@ impl ProductBuffer {
         lock(&self.0.views).region.clone()
     }
 
-    pub(crate) fn metadata(&self) -> Option<Metadata> {
-        lock(&self.0.views).metadata
-    }
-
     pub(super) fn views(&self) -> MutexGuard<'_, BufferViews> {
         lock(&self.0.views)
     }

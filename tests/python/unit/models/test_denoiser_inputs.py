@@ -1,6 +1,6 @@
 """Image denoisers assemble their own typed input from borrowed views.
 
-Execution calls `bind_inputs` on whichever denoiser a model exposes and passes
+Execution calls `bind_packed` on whichever denoiser a model exposes and passes
 the same borrowed numerical views to each. These run on CPU so an implementation
 that reads a field the contract does not carry is caught without a GPU.
 """
@@ -13,9 +13,9 @@ import pytest
 import torch
 
 from tests.python.fixtures.model_metadata import neo_metadata
+from uniserve.executor.image.layout import ImageLayout
+from uniserve.executor.image.rows import ImageRow, RowColumns, expand_rows
 from uniserve.loading import Config as IOConfig
-from uniserve.media import image
-from uniserve.models import LatentInput
 from uniserve.nn.attention import (
     AttentionBatch,
     SequenceLengths,
@@ -44,50 +44,59 @@ def _stub_denoiser(tmp_path):
 
 
 def _bind(denoiser):
-    """Bind one two-by-two patch image and its framed attention sequence."""
-    size = image.Config(
-        height=denoiser.downsample * 2, width=denoiser.downsample * 2
+    """Bind one two-by-two patch image's framed row and its attention."""
+    layout = ImageLayout.of(denoiser)
+    side = denoiser.downsample * 2
+    columns = RowColumns.of(
+        layout, [ImageRow(0, 0, side, side, (3, 3, 3), 0.5)]
     )
-    rows, width = denoiser.latent_shape("image", size)
-    sample = torch.zeros((rows, width), dtype=torch.float32)
-    length = rows + denoiser.framing_tokens
-    lengths = SequenceLengths.from_lengths((length,), device="cpu")
-
-    step = torch.zeros(1, dtype=torch.int64)
-    bound = denoiser.bind_inputs(
-        latents={"image": (LatentInput(sample, torch.zeros(())),)},
-        sizes=(size,),
-        step=step,
-        positions=(torch.zeros((3, length), dtype=torch.int64),),
-        sequence_lengths=(length,),
+    expanded = expand_rows(*columns.tensors(), tokens=columns.tokens, dump=4)
+    source = torch.zeros((4, layout.width), dtype=torch.float32)
+    lengths = SequenceLengths.from_lengths((columns.tokens,), device="cpu")
+    bound = denoiser.bind_packed(
+        source=source,
+        rows=expanded.rows,
         attention=AttentionBatch.single(
             VarlenInput(lengths, lengths, (False,))
         ),
     )
-    return bound, sample, size, step
+    return bound, source, expanded.rows
 
 
 @pytest.mark.parametrize(
     "build", [_sensenova_denoiser, _stub_denoiser], ids=["sensenova_u1", "stub"]
 )
-def test_image_denoisers_bind_borrowed_latents(build, tmp_path):
-    bound, sample, size, step = _bind(build(tmp_path))
+def test_image_denoisers_bind_borrowed_rows(build, tmp_path):
+    bound, source, rows = _bind(build(tmp_path))
 
-    # Solver updates write the resident latent in place, and a captured step
-    # reads the step index as device data, so the bound input must borrow
-    # both rather than hold copies.
-    assert bound.latents["image"][0].tensor is sample
-    assert bound.sizes == (size,)
-    assert bound.step is step
+    # Solver updates write the step workspace in place, and a captured step
+    # reads its rows as device data, so the bound input must borrow them
+    # rather than hold copies.
+    assert bound.source is source
+    assert bound.rows is rows
 
 
-def test_bound_input_drives_one_prediction_per_latent(tmp_path):
+def test_bound_input_drives_one_packed_prediction(tmp_path):
     denoiser = _stub_denoiser(tmp_path)
-    bound, sample, _, _ = _bind(denoiser)
+    bound, source, rows = _bind(denoiser)
 
-    prediction = denoiser(bound, state={}, constants={}, workspace={})
+    (output,) = denoiser(bound, state={}, constants={}, workspace={})["image"]
 
-    (output,) = prediction["image"]
-    assert output.tensor.shape == sample.shape
+    assert output.tensor.shape == (rows.tokens, source.shape[1])
     assert output.tensor.dtype == denoiser.prediction_dtype
-    assert output.layout.shape == tuple(sample.shape)
+    assert output.layout.shape == (rows.tokens, source.shape[1])
+
+
+def test_packed_inputs_cover_their_attention_queries(tmp_path):
+    denoiser = _stub_denoiser(tmp_path)
+    bound, source, rows = _bind(denoiser)
+    lengths = SequenceLengths.from_lengths((rows.tokens + 1,), device="cpu")
+
+    with pytest.raises(ValueError, match="cover"):
+        denoiser.bind_packed(
+            source=source,
+            rows=rows,
+            attention=AttentionBatch.single(
+                VarlenInput(lengths, lengths, (False,))
+            ),
+        )
