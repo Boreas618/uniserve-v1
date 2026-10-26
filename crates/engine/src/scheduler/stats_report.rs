@@ -242,6 +242,18 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let lane_us = stats
+        .worker
+        .lane_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let blocking_calls = stats
+        .worker
+        .blocking_calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let attention_backend_counts = stats
         .worker
         .attention_backend_counts
@@ -259,6 +271,8 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         mode_tokens,
         mode_us,
         component_us,
+        lane_us,
+        blocking_calls,
         attention_launches: stats.worker.attention_launches.load(Ordering::Relaxed),
         attention_us: stats.worker.attention_us.load(Ordering::Relaxed),
         attention_backend_counts,
@@ -343,6 +357,8 @@ fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -
         mode_tokens: delta_map(&current.mode_tokens, &previous.mode_tokens),
         mode_us: delta_map(&current.mode_us, &previous.mode_us),
         component_us: delta_map(&current.component_us, &previous.component_us),
+        lane_us: delta_map(&current.lane_us, &previous.lane_us),
+        blocking_calls: delta_map(&current.blocking_calls, &previous.blocking_calls),
         attention_launches: current
             .attention_launches
             .saturating_sub(previous.attention_launches),

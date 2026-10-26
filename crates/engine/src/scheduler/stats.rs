@@ -198,6 +198,12 @@ pub struct WorkerStats {
     pub forward_mode_us: Mutex<BTreeMap<String, u64>>,
     /// Forward execution time keyed by worker component, in microseconds.
     pub forward_component_us: Mutex<BTreeMap<String, u64>>,
+    /// Worker lane stream time keyed `{lane}/{state}`, in microseconds
+    /// (`ForwardStats::lane_us`).
+    pub lane_us: Mutex<BTreeMap<String, u64>>,
+    /// Worker driver calls that waited for the device, keyed
+    /// `{thread}/{call}` (`ForwardStats::blocking_calls`).
+    pub blocking_calls: Mutex<BTreeMap<String, u64>>,
     /// Cumulative attention kernel launches.
     pub attention_launches: AtomicU64,
     /// Cumulative attention execution time, in microseconds.

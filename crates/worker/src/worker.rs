@@ -796,7 +796,12 @@ impl Worker {
         executor.backend().set_storage_wake(Some(channel.wake()));
         let mut pools = self.graphs.pools();
         pools.extend(self.scratches.pools());
-        let maintenance = crate::service::Maintenance {
+        let lanes = self
+            .streams
+            .lanes()
+            .map(|(name, lane)| Ok((name, lane.stream()?.clone())))
+            .collect::<Result<Vec<_>>>()?;
+        let mut maintenance = crate::service::Maintenance {
             retained: Some(Arc::clone(&self.retained)),
             weights: Some(update::WeightUpdate {
                 launch: self.launch.clone(),
@@ -807,7 +812,15 @@ impl Worker {
             }),
             pools,
             asleep: false,
+            cupti: crate::profiling::cupti::Cupti::new(lanes),
         };
+        // The rank serves with CUPTI attached (`crate::profiling::cupti`),
+        // unless a profiler holds it; the control thread's (this one's)
+        // waits for the device are counted while it is.
+        if let Err(error) = maintenance.cupti.attach() {
+            tracing::warn!("CUPTI is not attached: {error}");
+        }
+        let _control = cuda::cupti::Watched::enter();
         let served = Service::new(
             executor,
             channel,

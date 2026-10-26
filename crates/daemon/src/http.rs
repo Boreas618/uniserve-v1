@@ -701,6 +701,33 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// `/admin/cupti` has every worker attach or detach CUPTI and answers
+    /// each worker's state; a body that does not choose is refused.
+    #[tokio::test]
+    async fn cupti_is_attached_and_detached_on_every_worker() {
+        let app = router(sim_engine(ModelParameters::Qwen3));
+        for attached in [false, true] {
+            let (status, _, body) = send(
+                &app,
+                post_json("/admin/cupti", &json!({ "attached": attached })),
+            )
+            .await;
+            assert_eq!(
+                (status, &body["state"]),
+                (StatusCode::OK, &json!("succeeded")),
+                "{body}"
+            );
+            // The simulated worker has no device, and no CUPTI to attach.
+            assert_eq!(
+                body["result"]["results"],
+                json!([{ "attached": false, "lane_activity": false }]),
+                "{body}"
+            );
+        }
+        let (status, _, _) = send(&app, post_json("/admin/cupti", &json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// A loaded LoRA adapter is listed and served under its name until it
     /// is unloaded; a name is loaded once, and the served model's name is
     /// no adapter's.

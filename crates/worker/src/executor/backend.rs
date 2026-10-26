@@ -59,6 +59,9 @@ pub(crate) struct WorkerBackend {
     joining: Option<JobId>,
     /// How the last such join ended, until the service takes it.
     joined: Option<std::result::Result<(bool, bool), WorkerError>>,
+    /// The control thread's counts of driver calls that waited for the
+    /// device when the last batch result left ([`cuda::cupti::Calls`]).
+    control_calls: cuda::cupti::Calls,
 }
 
 /// What serves a rank's components and the storage it owns: the rank's
@@ -135,6 +138,7 @@ impl WorkerBackend {
             lifecycle_jobs: HashSet::new(),
             joining: None,
             joined: None,
+            control_calls: cuda::cupti::Calls::default(),
         })
     }
 

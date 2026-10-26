@@ -176,6 +176,7 @@ impl PythonExecutor {
     /// `NewRequest`s), whose completion's text is the JSON of the refused.
     pub(crate) fn start(&self, requests: String) -> MethodCall {
         self.call(&self.functions.start, vec![Argument::Text(requests)])
+            .serving()
     }
 
     /// The call that prepares a batch of lane `lane` (`step`: JSON), whose
@@ -185,6 +186,7 @@ impl PythonExecutor {
             &self.functions.prepare,
             vec![Argument::from(lane), Argument::Text(step)],
         )
+        .serving()
     }
 
     /// The call that executes a batch of lane `lane` (`step`: JSON) on
@@ -199,13 +201,14 @@ impl PythonExecutor {
     ) -> MethodCall {
         let mut arguments = vec![Argument::from(lane), Argument::Text(step)];
         arguments.extend(tensors.into_iter().map(Argument::Tensor));
-        self.call(&self.functions.execute, arguments)
+        self.call(&self.functions.execute, arguments).serving()
     }
 
     /// The call that advances lane `lane`'s slot state on the device by its
     /// last executed batch, past that batch's commit point.
     pub(crate) fn commit(&self, lane: usize) -> MethodCall {
         self.call(&self.functions.commit, vec![Argument::from(lane)])
+            .serving()
     }
 
     /// Configure the expert union's step agreement over the union's host
@@ -247,6 +250,7 @@ impl PythonExecutor {
             &self.functions.join_expert_step,
             vec![Argument::Bool(leaving)],
         )
+        .serving()
     }
 
     /// Release the expert transports' workspaces while a standby parks,
@@ -278,12 +282,14 @@ impl PythonExecutor {
     /// Forget retired slots. The release is queued on the builder thread
     /// behind every call made before it; nothing waits for it.
     pub(crate) fn release(&self, slots: &[usize]) {
-        let call = self.call(
-            &self.functions.release,
-            vec![Argument::Integers(
-                slots.iter().map(|&slot| slot as i64).collect(),
-            )],
-        );
+        let call = self
+            .call(
+                &self.functions.release,
+                vec![Argument::Integers(
+                    slots.iter().map(|&slot| slot as i64).collect(),
+                )],
+            )
+            .serving();
         Interpreter::submit(move || {
             if let Err(error) = call.invoke() {
                 tracing::error!("releasing retired slots failed: {error}");

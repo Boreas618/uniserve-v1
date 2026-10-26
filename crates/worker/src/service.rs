@@ -93,6 +93,9 @@ pub(crate) struct Maintenance {
     /// Whether the worker sleeps: its graph memory suspended and its cache
     /// given back.
     pub(crate) asleep: bool,
+    /// CUPTI's attachment to the rank, which `uniserve.attach_cupti` and
+    /// `uniserve.detach_cupti` change.
+    pub(crate) cupti: crate::profiling::cupti::Cupti,
 }
 
 /// A standby worker parked until its promotion: its retained storages,
@@ -570,7 +573,10 @@ impl Service<'_> {
     /// - `uniserve.update_weights` (`{"model_path": path}`): rewrites the
     ///   weights in place from the checkpoint at `path`
     ///   (`crate::worker::update`), and answers the rank's worker group and
-    ///   the new key seed of each host page pool.
+    ///   the new key seed of each host page pool;
+    /// - `uniserve.attach_cupti`, `uniserve.detach_cupti`: attach CUPTI to
+    ///   the process and detach it (`crate::profiling::cupti`), and answer
+    ///   whether it is attached and records the lanes' device time.
     fn built_in(&mut self, name: &str, payload: &str) -> crate::Result<String> {
         let payload: serde_json::Value = if payload.is_empty() {
             serde_json::Value::Null
@@ -684,6 +690,14 @@ impl Service<'_> {
                     }
                     _ => serde_json::json!({ "group": null, "page_contents": [] }),
                 }
+            }
+            "uniserve.attach_cupti" => {
+                self.maintenance.cupti.attach()?;
+                self.maintenance.cupti.state()
+            }
+            "uniserve.detach_cupti" => {
+                self.maintenance.cupti.detach()?;
+                self.maintenance.cupti.state()
             }
             other => {
                 return Err(Error::Unsupported(format!(
@@ -860,6 +874,7 @@ mod tests {
                 weights: None,
                 pools: Vec::new(),
                 asleep: false,
+                cupti: crate::profiling::cupti::Cupti::new(Vec::new()),
             },
         )
         .run()

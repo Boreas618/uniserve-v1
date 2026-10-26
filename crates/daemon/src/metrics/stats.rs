@@ -17,9 +17,9 @@ use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use crate::metrics::{
-    EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
-    EngineLabels, EngineModeLabels, EnginePathLabels, FinishedReasonLabels, METRICS,
-    RequestMetrics, SchedulerMetrics,
+    EngineBackendLabels, EngineBlockingLabels, EngineComponentLabels, EngineDomainKindLabels,
+    EngineDomainLabels, EngineLabels, EngineLaneLabels, EngineModeLabels, EnginePathLabels,
+    FinishedReasonLabels, METRICS, RequestMetrics, SchedulerMetrics,
 };
 use futures::{Stream, StreamExt as _};
 use tracing::info;
@@ -188,6 +188,32 @@ pub(crate) fn record_scheduler_stats(
                     component: component.clone(),
                 })
                 .inc_by(*us);
+        }
+        for (key, us) in &worker_stats.lane_us {
+            // Keys are `{lane}/{state}` (`ForwardStats::lane_us`).
+            let (lane, state) = key.rsplit_once('/').unwrap_or((key.as_str(), ""));
+            metrics
+                .worker_lane_us
+                .get_or_create(&EngineLaneLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    lane: lane.to_owned(),
+                    state: state.to_owned(),
+                })
+                .inc_by(*us);
+        }
+        for (key, count) in &worker_stats.blocking_calls {
+            // Keys are `{thread}/{call}` (`ForwardStats::blocking_calls`).
+            let (thread, call) = key.split_once('/').unwrap_or((key.as_str(), ""));
+            metrics
+                .worker_blocking_calls
+                .get_or_create(&EngineBlockingLabels {
+                    model_name: model_name.clone(),
+                    engine,
+                    thread: thread.to_owned(),
+                    call: call.to_owned(),
+                })
+                .inc_by(*count);
         }
         for (backend, count) in &worker_stats.attention_backend_counts {
             metrics

@@ -9,8 +9,8 @@
 use tvm_ffi::Any;
 
 use super::{Function, Handle, Interpreter, Shape};
-use crate::Result;
 use crate::memory::allocation::StorageView;
+use crate::{Error, Result};
 
 /// One argument of a method call.
 #[derive(Clone)]
@@ -39,6 +39,9 @@ impl From<usize> for Argument {
 pub(crate) struct MethodCall {
     function: Function,
     arguments: Vec<Argument>,
+    /// A serving call: its run on the builder thread must not make the host
+    /// wait for the device ([`Self::serving`]).
+    serving: bool,
 }
 
 impl MethodCall {
@@ -48,7 +51,18 @@ impl MethodCall {
         Self {
             function: function.clone(),
             arguments,
+            serving: false,
         }
+    }
+
+    /// Mark a serving call: its run on the builder thread is watched for
+    /// driver calls that make the host wait for the device
+    /// ([`cuda::cupti`]); such a call is counted
+    /// ([`crate::profiling::blocking`]) and fails the call, before or past
+    /// its batch's commit point as any failure of the call would.
+    pub(crate) fn serving(mut self) -> Self {
+        self.serving = true;
+        self
     }
 
     /// The import path of the method called.
@@ -80,7 +94,28 @@ impl MethodCall {
                     })
                 })
                 .collect::<Result<Vec<Any>>>()?;
-            self.function.call_values(&values)
+            let watched = self.serving.then(cuda::cupti::Watched::enter);
+            let result = self.function.call_values(&values);
+            let Some(watched) = watched else {
+                return result;
+            };
+            let blocking = watched.calls();
+            if blocking.is_empty() {
+                return result;
+            }
+            crate::profiling::blocking::add("builder", &blocking);
+            result?;
+            let calls = blocking
+                .iter()
+                .map(|(call, count)| format!("{call} x{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::Numerical {
+                function: self.function.name().to_owned(),
+                kind: "InvariantViolation".into(),
+                message: format!("the serving call made the host wait for the device: {calls}"),
+                traceback: String::new(),
+            })
         })
     }
 }

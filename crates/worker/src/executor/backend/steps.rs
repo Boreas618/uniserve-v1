@@ -625,10 +625,51 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<BatchResult, WorkerError> {
-        batch
+        let mut result = batch
             .output
             .take()
-            .ok_or_else(|| WorkerError::from(Error::State("batch output is not resolved")))
+            .ok_or_else(|| WorkerError::from(Error::State("batch output is not resolved")))?;
+        // The lanes' stream time and the serving threads' driver calls that
+        // waited for the device, since the last result, travel with this
+        // one; the engine adds every result's into its counters. This runs
+        // on the control thread, whose own calls are counted here.
+        let control = cuda::cupti::Calls::current();
+        crate::profiling::blocking::add("control", &control.since(&self.control_calls));
+        self.control_calls = control;
+        let activity = cuda::cupti::activity::take();
+        if activity.dropped_records > 0 {
+            tracing::warn!(
+                "CUPTI dropped {} activity records; the lanes' device time misses their operations",
+                activity.dropped_records
+            );
+        }
+        let lane_us: Vec<(String, u64)> = activity
+            .streams
+            .iter()
+            .flat_map(|stream| {
+                [
+                    ("busy", stream.busy_us),
+                    ("gap", stream.gap_us),
+                    ("late", stream.late_us),
+                ]
+                .map(|(state, us)| (format!("{}/{state}", stream.name), us))
+            })
+            .filter(|&(_, us)| us > 0)
+            .collect();
+        let blocking = crate::profiling::blocking::take();
+        if !lane_us.is_empty() || !blocking.is_empty() {
+            let stats = result
+                .output
+                .forward_stats
+                .get_or_insert_with(Default::default);
+            for (key, us) in lane_us {
+                *stats.lane_us.entry(key).or_default() += us;
+            }
+            for (key, count) in blocking {
+                *stats.blocking_calls.entry(key).or_default() += count;
+            }
+        }
+        Ok(result)
     }
 
     pub(crate) fn close_batch(
