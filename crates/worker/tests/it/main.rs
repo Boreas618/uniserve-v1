@@ -5,6 +5,7 @@
 
 mod buffer;
 mod config;
+mod device;
 mod gpu_storage;
 mod interpreter;
 mod output;
