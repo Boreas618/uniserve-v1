@@ -9,8 +9,8 @@
 //!
 //! Token workers (text, diffusion LM, image) place a cache pool beside fixed storage:
 //! the buffer pool, the tensor store's products, the latent pool and the
-//! storage each capability runtime reserves (input buffers, block tables,
-//! decode state, importer scratch). Automatic cache sizing gives the pool the
+//! storage the executor's lanes and the prefix cache reserve (the bytes the
+//! executor's manifest states, block tables, importer scratch). Automatic cache sizing gives the pool the
 //! grant left after those and a graph-capture reservation. Media workers
 //! (video) size request slots instead, because every resident request keeps
 //! its whole media state.
@@ -44,8 +44,15 @@ pub(crate) fn product_bytes(outputs: &[OutputInfo]) -> u64 {
         .sum()
 }
 
-/// The largest block size of at most 64 tokens that every resident layer's
-/// attention reads, agreed over `group` as the minimum.
+/// The largest KV block size the rank resolves to unless the launch
+/// presets one ([`resolve_block_size`]). It also bounds the latent rows of
+/// an image denoiser's latent page, one KV block of them
+/// ([`LatentPlan::image`]), by which the executor sizes its denoising
+/// workspace (`uniserve.executor.image._MAX_PAGE_UNITS`).
+pub(crate) const MAX_BLOCK_SIZE: usize = 64;
+
+/// The largest block size of at most [`MAX_BLOCK_SIZE`] tokens that every
+/// resident layer's attention reads, agreed over `group` as the minimum.
 ///
 /// A preset size is used unchanged and needs no agreement: every rank was
 /// launched with it. `readable` plans the pool for one candidate size.
@@ -57,13 +64,13 @@ pub(crate) fn resolve_block_size(
     if let Some(size) = preset {
         return Ok(size);
     }
-    let mut size = 64;
+    let mut size = MAX_BLOCK_SIZE;
     while !readable(size)? {
         size /= 2;
         if size == 0 {
-            return Err(Error::Unsupported(
-                "no KV block size of at most 64 tokens is read by the attention of every resident cache layer".into(),
-            ));
+            return Err(Error::Unsupported(format!(
+                "no KV block size of at most {MAX_BLOCK_SIZE} tokens is read by the attention of every resident cache layer"
+            )));
         }
     }
     let agreed = group.all_reduce_min(&[size as i64])?;
@@ -107,7 +114,10 @@ pub(crate) fn request_slots(
 
 impl LatentPlan {
     /// The pool of an image flow: pages of `block_size` units holding the
-    /// longest image (or the configured token budget, when larger).
+    /// longest image (or the configured token budget, when larger). The
+    /// executor keeps the step workspace its forwards read beside it, which
+    /// it sizes for pages of at most [`MAX_BLOCK_SIZE`] units: a larger
+    /// block size is refused.
     pub(crate) fn image(
         slots: usize,
         max_tokens: usize,
@@ -115,20 +125,26 @@ impl LatentPlan {
         block_size: usize,
         width: usize,
         dtype: crate::ffi::DType,
-    ) -> Self {
+    ) -> Result<Self> {
+        if block_size > MAX_BLOCK_SIZE {
+            return Err(Error::Unsupported(format!(
+                "an image denoiser's latent page holds one KV block of at most \
+                 {MAX_BLOCK_SIZE} latent rows, which its executor sizes its denoising \
+                 workspace by; kv_cache_config.block_size {block_size} exceeds it"
+            )));
+        }
         let units = if max_tokens == 0 {
             0
         } else {
             max_tokens.max(max_total_tokens.unwrap_or(max_tokens))
         };
-        Self {
+        Ok(Self {
             request_pool_size: slots,
             num_pages: units.div_ceil(block_size) + 1,
             page_units: block_size,
             latent_width: width,
             dtype,
-            with_workspace: true,
-        }
+        })
     }
 }
 
@@ -220,6 +236,7 @@ fn base_info(report: Report, config: &WorkerConfig) -> Result<WorkerInfo> {
         image_warmups: Vec::new(),
         captured_images: None,
         captured_latents: None,
+        image_capacity: None,
         diffusion_lm_step_rows: 0,
         image_unconditional_token_ids: None,
     })
@@ -300,7 +317,7 @@ impl TokenLayout {
         &self.info
     }
 
-    /// Record fixed storage a capability runtime allocates on `device`.
+    /// Record fixed storage an owner of the rank allocates on `device`.
     pub(crate) fn reserve(&mut self, device: Device, bytes: u64) {
         *self.fixed.entry(device).or_default() += bytes;
     }
@@ -475,11 +492,9 @@ pub(crate) fn slot_requirements(
         })?;
         let latent_bytes = match media.stored_latent() {
             Some(plan) => {
-                let pages = if plan.with_workspace {
-                    plan.num_pages
-                } else {
-                    count * ((plan.num_pages - 1) / plan.request_pool_size) + 1
-                };
+                // Every request slot owns the same run of pages after the
+                // padding page.
+                let pages = count * ((plan.num_pages - 1) / plan.request_pool_size) + 1;
                 LatentPlan {
                     request_pool_size: count,
                     num_pages: pages,
@@ -547,7 +562,6 @@ pub(crate) mod tests {
             decode_graph_batch_sizes: crate::config::default_decode_sizes(),
             prefill_outputs: true,
             prefill_graph_token_sizes: crate::config::default_prefill_sizes(),
-            flow_graph_batch_sizes: crate::config::DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
             flow_graph_shapes: crate::config::DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
         }
     }
@@ -703,14 +717,9 @@ pub(crate) mod tests {
             image_processor: true,
             vision_feature_bytes: 1024,
             latent_feature_bytes: 512,
-            latent: Some(LatentPlan::image(
-                8,
-                1000,
-                None,
-                64,
-                12,
-                crate::ffi::DType::BF16,
-            )),
+            latent: Some(
+                LatentPlan::image(8, 1000, None, 64, 12, crate::ffi::DType::BF16).unwrap(),
+            ),
         };
         let mut layout = TokenLayout::new(report(), &config, 2, &facts).unwrap();
         let capacity = layout
@@ -724,6 +733,16 @@ pub(crate) mod tests {
         // 1000 tokens in 64-unit pages, plus the sentinel page.
         assert_eq!(plan.info.latent_pages, 17);
         assert_eq!(plan.info.latent_page_units, 64);
+    }
+
+    /// An image denoiser's latent page is one KV block, which the
+    /// executor's workspace bounds: a preset block size beyond it is
+    /// refused at planning.
+    #[test]
+    fn an_image_latent_page_holds_at_most_the_largest_block() {
+        let plan = |block| LatentPlan::image(8, 1000, None, block, 12, crate::ffi::DType::BF16);
+        assert_eq!(plan(MAX_BLOCK_SIZE).unwrap().page_units, MAX_BLOCK_SIZE);
+        assert!(plan(2 * MAX_BLOCK_SIZE).is_err());
     }
 
     #[test]
@@ -773,7 +792,6 @@ pub(crate) mod tests {
             page_units: 1024,
             latent_width: 1,
             dtype: crate::ffi::DType::F32,
-            with_workspace: false,
         };
         let facts = |stores_latent| MediaFacts {
             video_denoiser: None,

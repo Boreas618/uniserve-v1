@@ -26,7 +26,7 @@ for.
 from __future__ import annotations
 
 import functools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,40 +34,44 @@ import torch
 
 from uniserve.cuda_graph import BreakableCUDAGraph, capture
 from uniserve.executor.video.plan import (
+    Canvas,
     ConditionShape,
     Layout,
     LayoutFields,
     MediaPlan,
     SampleLayout,
     SamplePages,
+    SampleRows,
     StateEnvelope,
     VideoModel,
     VideoSize,
+    rows_per_frame,
 )
 from uniserve.models import ConditionRole
 from uniserve.runner.denoiser import DenoiserRunner
 from uniserve.runner.encoder import EncoderRunner
 
-__all__ = ["Conditioning", "Denoiser", "EAGER", "REPLAY", "CAPTURE"]
+__all__ = [
+    "EAGER",
+    "REPLAY",
+    "Conditioning",
+    "Denoiser",
+    "close_all",
+    "keyframe_sets",
+]
 
-# How a forward ran, as a batch's statistics count it.
+# How a forward ran, as the worker's batch statistics count it (2, a
+# capture, is never reported: startup captures before serving).
 EAGER = 0
 REPLAY = 1
-CAPTURE = 2
-
-# A keyframe's latent is one latent frame of its canvas: rows of 32-pixel
-# latent patches (``models::video::plan::rows_per_frame``).
-_CANVAS_MULTIPLE = 32
-
-
-def _rows_per_frame(width: int, height: int) -> int:
-    return (width // _CANVAS_MULTIPLE) * (height // _CANVAS_MULTIPLE)
 
 
 def size_values(size: VideoSize) -> tuple[list[int], list[int], list[int]]:
-    """A size's flat descriptors: ``[frames, width, height, tokens]``, the
-    conditions and the vision spans (``uniserve.runner.denoiser``).
-    """  # noqa: D205
+    """A size's flat descriptors (``uniserve.runner.denoiser``).
+
+    ``[frames, width, height, tokens]``, the conditions and the vision
+    spans.
+    """
     roles = {
         ConditionRole.FIRST_FRAME: 0,
         ConditionRole.LAST_FRAME: 1,
@@ -127,9 +131,10 @@ class _Prepared:
 
 
 class _Conditioner:
-    """The text conditioner of a pipeline stage that holds it: one runner
-    per prompt capacity over the same input and output.
-    """  # noqa: D205
+    """The text conditioner of a pipeline stage that holds it.
+
+    One runner per prompt capacity over the same input and output.
+    """
 
     def __init__(
         self,
@@ -322,9 +327,6 @@ class Denoiser:
 
     # Layouts.
 
-    def prepared(self, layout: Layout) -> bool:
-        return layout in self.layouts
-
     def _install(self, layout: Layout, startup: bool) -> _Prepared:
         fields = self.model.fields(layout)
         samples = SampleLayout.of(fields, self.pages.page_units)
@@ -380,13 +382,12 @@ class Denoiser:
         return prepared
 
     def acquire(self, layout: Layout) -> None:
-        """Hold layout ``layout`` for one more request, preparing it as a
-        transient layout when it is not prepared.
+        """Hold layout ``layout`` for one more request.
 
-        Unused transient layouts beyond the capacity give way; their
-        constants outlive their last step because the stream is drained
-        first.
-        """  # noqa: D205
+        A layout not prepared yet is prepared as a transient layout. Unused
+        transient layouts beyond the capacity give way; their constants
+        outlive their last step because the stream is drained first.
+        """
         prepared = self.layouts.get(layout)
         if prepared is None:
             evicted = []
@@ -429,9 +430,11 @@ class Denoiser:
     def prepare_latents(
         self, layout: Layout, slot: int, size: VideoSize, seed: int
     ) -> None:
-        """Draw a request's noise from ``seed`` and fill its slot's host
-        sources for its layout. Host work only.
-        """  # noqa: D205
+        """Draw a request's noise and fill its slot's host sources.
+
+        The noise is drawn from ``seed``; the sources are its layout's. Host
+        work only.
+        """
         prepared = self.layouts[layout]
         size_list, conditions, spans = size_values(size)
         noise = [
@@ -461,10 +464,11 @@ class Denoiser:
         )
 
     def initialize(self, layout: Layout, slot: int, bank: int) -> None:
-        """Copy a request's prepared host sources into its slot: each
-        modality's sample into ``bank`` of its pages and each table into its
-        slot rows.
-        """  # noqa: D205
+        """Copy a request's prepared host sources into its slot.
+
+        Each modality's sample goes into ``bank`` of its pages and each table
+        into its slot rows.
+        """
         prepared = self.layouts[layout]
         pages = self.banks[bank][self._slot_pages(slot)].view(-1)
         with torch.cuda.stream(self.stream):
@@ -487,19 +491,21 @@ class Denoiser:
 
     @property
     def conditions(self) -> bool:
-        """Whether this rank retains a request's conditioning: whether it
-        holds the text conditioner. A later pipeline stage receives the
-        refined prompt among the preceding stage's hidden rows.
-        """  # noqa: D205
+        """Whether this rank retains a request's conditioning.
+
+        It does when it holds the text conditioner. A later pipeline stage
+        receives the refined prompt among the preceding stage's hidden rows.
+        """
         return self.conditioner is not None
 
     def condition(
         self, layout: Layout, slot: int, features: torch.Tensor
     ) -> int:
-        """Refine a request's prompt features and retain them in its slot's
-        conditioning: the rows of the layout's conditioning past the prompt
-        become zero. Returns how the conditioner ran.
-        """  # noqa: D205
+        """Refine a request's prompt features into its slot's conditioning.
+
+        The rows of the layout's conditioning past the prompt become zero.
+        Returns how the conditioner ran.
+        """
         conditioner = self.conditioner
         if conditioner is None:
             raise AssertionError(
@@ -551,14 +557,15 @@ class Denoiser:
         size: VideoSize,
         latents: Sequence[Sequence[torch.Tensor]],
     ) -> int:
-        """Write a request's encoded conditions into its slot's
-        conditioning, after the prompt's rows. ``latents`` are the condition
+        """Write a request's encoded conditions into its slot's conditioning.
+
+        They follow the prompt's rows. ``latents`` are the condition
         latents in request order, a condition's visual rows before its audio
         rows, each as the row tensors that together hold its rows in order.
 
         A condition set startup captured replays its encoding; any other is
         encoded eagerly.
-        """  # noqa: D205
+        """
         prepared = self.layouts[layout]
         target = self.slot_state["text_condition"][slot]
         noise = self.sources["condition_noise"][slot]
@@ -608,10 +615,11 @@ class Denoiser:
     def denoise(
         self, layout: Layout, slot: int, read: int, write: int, step: int
     ) -> int:
-        """Advance a request's trajectory by one solver step: from its
-        samples in bank ``read`` to bank ``write``, at evaluation ``step``.
-        Returns how the step ran.
-        """  # noqa: D205
+        """Advance a request's trajectory by one solver step.
+
+        The step reads its samples in bank ``read`` and writes them to bank
+        ``write``, at evaluation ``step``. Returns how the step ran.
+        """
         prepared = self.layouts[layout]
         span = self._slot_pages(slot)
         count = prepared.samples.pages * self.pages.page_units
@@ -652,10 +660,11 @@ class Denoiser:
         )
 
     def final_samples(self, layout: Layout) -> list[torch.Tensor | None]:
-        """The final step's local sample of each modality, as ``[rows,
-        width]`` views of the scratch (``None`` for a modality this rank
-        holds no rows of), in modality order.
-        """  # noqa: D205
+        """The final step's local sample of each modality, in modality order.
+
+        Each is a ``[rows, width]`` view of the scratch, ``None`` for a
+        modality this rank holds no rows of.
+        """
         prepared = self.layouts[layout]
         result: list[torch.Tensor | None] = []
         for index, (_, rows) in enumerate(prepared.fields.samples):
@@ -671,18 +680,20 @@ class Denoiser:
             )
         return result
 
-    def sample_rows(self, layout: Layout):
+    def sample_rows(self, layout: Layout) -> list[SampleRows]:
         """The rows of each modality's complete sample in a layout."""
         return [rows for _, rows in self.layouts[layout].fields.samples]
 
     # Startup.
 
     def warm(self, layout: Layout, slot: int = 1) -> None:
-        """Run one placeholder step of startup layout ``layout`` from slot
-        ``slot``'s host sources, filled before (:meth:`prepare_latents`), to
-        prepare its kernels and plans before any capture, then wait for the
-        stream. The scratch's values are discarded.
-        """  # noqa: D205
+        """Run one placeholder step of startup layout ``layout``.
+
+        The step reads slot ``slot``'s host sources, filled before
+        (:meth:`prepare_latents`), to prepare its kernels and plans before
+        any capture, then waits for the stream. The scratch's values are
+        discarded.
+        """
         prepared = self.layouts[layout]
         with torch.cuda.stream(self.stream):
             for index, (name, _) in enumerate(prepared.fields.samples):
@@ -708,9 +719,7 @@ class Denoiser:
         prepared.warmed = True
 
     def capture(self, layout: Layout) -> bool:
-        """Capture a warmed startup layout's step into the graph pool;
-        whether it captured one.
-        """  # noqa: D205
+        """Capture a warmed startup layout's step; whether it captured one."""
         if self.pool is None or layout in self.graphs:
             return False
         prepared = self.layouts[layout]
@@ -722,9 +731,11 @@ class Denoiser:
         return True
 
     def warm_conditioner(self, capture_graphs: bool) -> None:
-        """Warm the conditioner at every capacity (largest first) on zero
-        features, then, with ``capture_graphs``, capture each capacity.
-        """  # noqa: D205
+        """Warm the conditioner at every capacity, largest first.
+
+        It runs on zero features, then, with ``capture_graphs``, each
+        capacity is captured.
+        """
         conditioner = self.conditioner
         if conditioner is None:
             return
@@ -747,10 +758,11 @@ class Denoiser:
     def capture_conditions(
         self, layout: Layout, conditions: tuple[ConditionShape, ...]
     ) -> bool:
-        """Capture the encoding of keyframe ``conditions`` into the
-        conditioning of startup layout ``layout``, behind its eager
-        encoding, which warms it; whether it captured one.
-        """  # noqa: D205
+        """Capture the encoding of keyframe ``conditions``.
+
+        It encodes into the conditioning of startup layout ``layout``, behind
+        its eager encoding, which warms it. Returns whether it captured one.
+        """
         if (
             self.pool is None
             or self.condition_rows is None
@@ -769,8 +781,8 @@ class Denoiser:
                 or condition.audio_samples
             ):
                 raise ValueError("only keyframe conditions are captured")
-            canvas = condition.pixels[1]
-            rows = _rows_per_frame(canvas.width, canvas.height)
+            # A keyframe's latent is one latent frame of its canvas.
+            rows = rows_per_frame(condition.pixels[1])
             parts.append([self.condition_rows[row : row + rows]])
             row += rows
         size = VideoSize(layout.frames, layout.canvas, 1, conditions)
@@ -801,15 +813,17 @@ class Denoiser:
         return True
 
     def seal(self) -> None:
-        """Refuse eager steps of startup layouts: serving replays what
-        startup captured.
-        """  # noqa: D205
+        """Refuse eager steps of startup layouts.
+
+        Serving replays what startup captured.
+        """
         self.sealed = True
 
     def kernels(self) -> list[str]:
-        """The kernels the denoiser's operators selected: the denoiser's,
-        then the conditioner's at each capacity.
-        """  # noqa: D205
+        """The kernels the denoiser's operators selected.
+
+        The denoiser's, then the conditioner's at each capacity.
+        """
         kernels = list(self.runner.kernels())
         if self.conditioner is not None:
             for runner in self.conditioner.runners.values():
@@ -824,38 +838,41 @@ class Denoiser:
         """
         if aborted:
             return
-        failure: BaseException | None = None
-        graphs = [
-            *self.graphs.values(),
-            *self.condition_graphs.values(),
-            *(
-                ()
-                if self.conditioner is None
-                else self.conditioner.graphs.values()
-            ),
-        ]
-        self.graphs.clear()
-        self.condition_graphs.clear()
-        if self.conditioner is not None:
-            self.conditioner.graphs.clear()
-        for graph in graphs:
-            try:
-                graph.release()
-            except Exception as error:  # noqa: BLE001 - release every graph
-                failure = failure or error
+        graphs = [*self.graphs.values(), *self.condition_graphs.values()]
         runners: list[Any] = [self.runner]
         if self.conditioner is not None:
+            graphs.extend(self.conditioner.graphs.values())
             runners.extend(self.conditioner.runners.values())
-        for runner in runners:
-            try:
-                runner.close(False)
-            except Exception as error:  # noqa: BLE001 - close every runner
-                failure = failure or error
-        if failure is not None:
-            raise failure
+            self.conditioner.graphs.clear()
+        self.graphs.clear()
+        self.condition_graphs.clear()
+        close_all(graphs, runners)
 
 
-def keyframe_sets(canvas) -> list[tuple[ConditionShape, ...]]:
+def close_all(
+    graphs: Iterable[BreakableCUDAGraph], runners: Iterable[Any]
+) -> None:
+    """Release ``graphs``, then close ``runners``, each in order.
+
+    Every release and close is attempted before the first failure is
+    raised. The caller drained the streams the graphs and runners use.
+    """
+    failure: BaseException | None = None
+    for graph in list(graphs):
+        try:
+            graph.release()
+        except Exception as error:
+            failure = failure or error
+    for runner in list(runners):
+        try:
+            runner.close(False)
+        except Exception as error:
+            failure = failure or error
+    if failure is not None:
+        raise failure
+
+
+def keyframe_sets(canvas: Canvas) -> list[tuple[ConditionShape, ...]]:
     """Every keyframe set a request may bring on ``canvas``."""
 
     def keyframe(role: ConditionRole) -> ConditionShape:

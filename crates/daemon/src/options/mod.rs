@@ -522,10 +522,6 @@ pub struct CudaGraphOptions {
     /// catalog when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
     pub prefill_token_sizes: Option<Vec<NonZeroU32>>,
-    /// Image denoising batch sizes captured, strictly increasing; 1 to 4
-    /// when unset.
-    #[serde(deserialize_with = "values::optional_list::deserialize")]
-    pub flow_batch_sizes: Option<Vec<NonZeroU32>>,
     /// Distinct `HEIGHTxWIDTH` image sizes captured; `1152x2048` and
     /// `2048x1152` when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
@@ -538,7 +534,6 @@ impl Default for CudaGraphOptions {
             policy: GraphPolicy::Auto,
             decode_batch_sizes: None,
             prefill_token_sizes: None,
-            flow_batch_sizes: None,
             flow_shapes: None,
         }
     }
@@ -1084,10 +1079,6 @@ impl ServeConfig {
                 prefill_token_sizes: increasing(
                     "cuda_graph_config.prefill_token_sizes",
                     &graphs.prefill_token_sizes,
-                )?,
-                flow_batch_sizes: increasing(
-                    "cuda_graph_config.flow_batch_sizes",
-                    &graphs.flow_batch_sizes,
                 )?,
                 flow_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
             }),

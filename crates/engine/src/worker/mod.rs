@@ -170,9 +170,6 @@ pub struct WorkerProcessArgs {
     /// Strictly increasing prefill token counts captured as CUDA graphs;
     /// `None` keeps the rank's catalog.
     pub prefill_graph_token_sizes: Option<Vec<u32>>,
-    /// Strictly increasing image denoising batch sizes captured as CUDA
-    /// graphs; `None` keeps the rank's catalog.
-    pub flow_graph_batch_sizes: Option<Vec<u32>>,
     /// Distinct image capture sizes, `[height, width]` in pixels; `None`
     /// keeps the rank's catalog.
     pub flow_graph_shapes: Option<Vec<[u32; 2]>>,

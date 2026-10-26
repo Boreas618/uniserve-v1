@@ -7,8 +7,8 @@ encoders, the denoiser, the video and audio decoders and the host media
 each admitted request (its size, conditions, layout, media units and MP4
 under assembly) from the request's start to its slot's release.
 
-A batch is served in two calls. :meth:`VideoExecutor.plan` states what each
-call reads and writes: which inputs, and every output's shape, region and
+A batch is served in two calls. :meth:`VideoExecutor.prepare` states what
+each call reads and writes: which inputs, and every output's shape, region and
 memory, whether a host task fills it after the batch commits and how it is
 published. The worker leases the reads and binds the writes, then
 :meth:`VideoExecutor.execute` runs the calls on the batch's stream with
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import prod
 from typing import Any
 
 import torch
@@ -31,6 +32,7 @@ from uniserve.executor.video.decoder import (
     TrackUnits,
     UnitShape,
     VideoDecoder,
+    overlap_bytes,
     units,
 )
 from uniserve.executor.video.denoiser import (
@@ -45,7 +47,6 @@ from uniserve.executor.video.encoder import (
     TextEncoders,
 )
 from uniserve.executor.video.media import (
-    DONE,
     Conditions,
     HostLane,
     MuxSession,
@@ -56,8 +57,10 @@ from uniserve.executor.video.media import (
     encoded_unit_bytes,
     read_unit,
     run_reported,
+    soundtrack,
 )
 from uniserve.executor.video.plan import (
+    CANVAS_MULTIPLE,
     OUTSIDE_PLAN,
     Admission,
     Canvas,
@@ -69,16 +72,26 @@ from uniserve.executor.video.plan import (
     VideoModel,
     VideoSize,
     admitted_canvases,
+    decode_conditioning,
     vision_spans,
 )
-from uniserve.executor.video.plan import conditioning as decode_conditioning
 from uniserve.runner.denoiser import DenoiserRunner
+from uniserve.runner.encoder import EncoderRunner
+from uniserve.worker import library
 
-__all__ = ["VideoExecutor"]
+__all__ = ["VideoExecutor", "VideoRequest", "condition_spans"]
 
-# Pixels per side of a latent patch.
-_CANVAS_MULTIPLE = 32
+# The media calls a host component serves: they run host tasks, so the
+# worker hands them to the rank whether or not they are active.
+_HOST_CALLS = frozenset(
+    ("media_reading", "video_encoding", "audio_encoding", "muxing")
+)
 
+# The most keyframes a request brings: its first and its last frame
+# (:func:`~uniserve.executor.video.denoiser.keyframe_sets`).
+_KEYFRAMES = 2
+
+# The ``ipc::DType`` name of each torch dtype a product takes.
 _DTYPES = {
     "uint8": "u8",
     "int32": "i32",
@@ -142,6 +155,7 @@ class Placed:
     def units(
         self, dealt: Sequence[int], rank: int, cursor: int, count: int
     ) -> range:
+        """This rank's media units of a round (:func:`~.decoder.units`)."""
         return units(
             self.distributed,
             self.ranks,
@@ -176,6 +190,7 @@ class VideoRequest:
 
     @property
     def longest(self) -> int:
+        """Frames of the request's longest media unit."""
         return max(self.units)
 
 
@@ -252,6 +267,8 @@ class VideoExecutor:
         self.reports: Reports | None = None
         # The layout each admitted slot holds on the denoiser.
         self.held: dict[int, Layout] = {}
+        # The manifest's products, read once by startup.
+        self._outputs: dict[str, list[dict[str, Any]]] | None = None
 
     def _component(self, capability: str) -> Placed | None:
         for placed in self.placed.values():
@@ -306,8 +323,6 @@ class VideoExecutor:
             )
             for infos in _output_infos(reader.owned).values():
                 products.setdefault("media_reader", []).extend(infos)
-        from uniserve.executor.video.decoder import overlap_bytes
-
         return {
             "outputs": products,
             "denoiser": {
@@ -350,7 +365,8 @@ class VideoExecutor:
         """Construct the rank's runners.
 
         ``settings`` holds the ``slots``, the ``reports`` pipe host tasks
-        report through, the ``ffmpeg`` executable and the denoiser's
+        report through (``None`` on a rank without host components), the
+        ``ffmpeg`` executable and the denoiser's
         ``transient_layouts``; ``streams`` maps the first call kind of each
         component the rank holds to its stream and ``scratches`` to the
         shared work areas of the contexts serialized on it; ``pools`` each
@@ -359,7 +375,11 @@ class VideoExecutor:
         """
         slots = int(settings["slots"])
         ffmpeg = str(settings["ffmpeg"])
-        self.reports = Reports(int(settings["reports"]))
+
+        # Only a rank holding a host component runs host tasks, so only it
+        # is given a pipe to report them through.
+        reports = settings["reports"]
+        self.reports = None if reports is None else Reports(int(reports))
 
         plan, model = self.plan, self.model
         text = self._component("text_encoder")
@@ -459,8 +479,6 @@ class VideoExecutor:
         path = placed.paths.get("encoder")
         if path is None:
             return None
-        from uniserve.runner.encoder import EncoderRunner
-
         if not EncoderRunner.holds(self.loaded, path):
             return None
         features = self._output("conditioning")
@@ -477,9 +495,11 @@ class VideoExecutor:
         )
 
     def _condition_latents(self) -> tuple[int, torch.dtype] | None:
-        """Under graphs, the condition latent rows the captured condition
-        encodings read: ``(width, dtype)``.
-        """  # noqa: D205
+        """``(width, dtype)`` of the condition latent rows encodings read.
+
+        Under CUDA graphs the captured condition encodings read them;
+        ``None`` without conditions.
+        """
         output = self._output("condition_video_latents")
         if output is None or self.plan.condition_rows == 0:
             return None
@@ -488,44 +508,42 @@ class VideoExecutor:
             _torch_dtype(output["dtype"]),
         )
 
-    def _output(self, name: str) -> dict[str, Any] | None:
-        for outputs in self.manifest_outputs().values():
+    def _output(
+        self, name: str, owner: str | None = None
+    ) -> dict[str, Any] | None:
+        """The manifest's product ``name``, of component ``owner`` if named."""
+        if self._outputs is None:
+            self._outputs = self.manifest()["outputs"]
+        for component, outputs in self._outputs.items():
+            if owner is not None and component != owner:
+                continue
             for output in outputs:
                 if output["name"] == name:
                     return output
         return None
 
-    def manifest_outputs(self) -> dict[str, list[dict[str, Any]]]:
-        cached = getattr(self, "_outputs", None)
-        if cached is None:
-            cached = self.manifest()["outputs"]
-            self._outputs = cached
-        return cached
-
     def _vision_rows(self) -> tuple[int, torch.dtype] | None:
         """``(width, dtype)`` of the vision rows the media reader packs."""
-        for output in self.manifest_outputs().get("media_reader", []):
-            if output["name"] == "vision_pixels":
-                return (
-                    _extent(output["shape_bound"]["dims"][1]),
-                    _torch_dtype(output["dtype"]),
-                )
-        return None
+        output = self._output("vision_pixels", "media_reader")
+        if output is None:
+            return None
+        return (
+            _extent(output["shape_bound"]["dims"][1]),
+            _torch_dtype(output["dtype"]),
+        )
 
     def _vision_row_count(self) -> int:
         """The most vision patch rows one request carries."""
-        for output in self.manifest_outputs().get("media_reader", []):
-            if output["name"] == "vision_pixels":
-                return _extent(output["shape_bound"]["dims"][0])
-        return 0
+        output = self._output("vision_pixels", "media_reader")
+        if output is None:
+            return 0
+        return _extent(output["shape_bound"]["dims"][0])
 
     def _keyframe_grids(self) -> list[tuple[int, int, int]]:
-        """The vision grid of an fl2va keyframe at each admitted canvas, as
-        the server plans it with the checkpoint's processor configs.
-        """  # noqa: D205
-        from uniserve.runner.encoder import EncoderRunner
-        from uniserve.worker import library
+        """The vision grid of an fl2va keyframe at each admitted canvas.
 
+        The server derives it with the checkpoint's processor configs.
+        """
         processor = EncoderRunner.vision_processor(self.loaded)
         if len(processor) != 2:
             raise ValueError(
@@ -543,9 +561,11 @@ class VideoExecutor:
         return grids
 
     def warmup(self) -> None:
-        """Prepare, warm and capture every component, in the order every
-        rank shares: encoders, the denoiser, the decoders.
-        """  # noqa: D205
+        """Prepare, warm and capture every component.
+
+        In the order every rank shares: encoders, the denoiser, the
+        decoders.
+        """
         plan = self.plan
         if self.text is not None:
             self.text.capture()
@@ -555,8 +575,12 @@ class VideoExecutor:
             if output is not None and self.graphs:
                 placed = self._component("video_encoder")
                 assert placed is not None
+                # A distributed encoder deals a request's keyframes out at
+                # most ``units_per_rank`` to a rank.
                 per_call = (
-                    min(placed.units_per_rank, 2) if placed.distributed else 2
+                    min(placed.units_per_rank, _KEYFRAMES)
+                    if placed.distributed
+                    else _KEYFRAMES
                 )
                 self.conditions.capture_keyframes(
                     [
@@ -623,11 +647,12 @@ class VideoExecutor:
     def start(
         self, requests: Sequence[Mapping[str, Any]]
     ) -> list[tuple[tuple[int, int, int], str]]:
-        """Admit started video requests with their exact sizes; on a
-        denoising rank select each one's layout and hold it, preparing a
-        transient layout the denoiser lacks. Returns the refused requests
-        with their reasons.
-        """  # noqa: D205
+        """Admit started video requests with their exact sizes.
+
+        On a denoising rank each one's layout is selected and held,
+        preparing a transient layout the denoiser lacks. Returns the refused
+        requests with their reasons.
+        """
         refused = []
         for request in requests:
             media, video = request.get("diffusion"), request.get("video")
@@ -644,12 +669,7 @@ class VideoExecutor:
             frames = int(media["num_frames"])
             duration = self.durations.get(frames)
             if duration is None or canvas not in self.plan.canvases:
-                refused.append(
-                    (
-                        key,
-                        OUTSIDE_PLAN,
-                    )
-                )
+                refused.append((key, OUTSIDE_PLAN))
                 continue
             conditions = list(conditioning["conditions"])
             size = VideoSize(
@@ -702,7 +722,7 @@ class VideoExecutor:
 
     # Batches.
 
-    def plan_batch(self, step: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def prepare(self, step: Mapping[str, Any]) -> list[dict[str, Any]]:
         """What each call of a batch reads and writes, in call order.
 
         Each entry: ``reads`` (input indices), ``writes`` (each output's
@@ -723,16 +743,10 @@ class VideoExecutor:
                 continue
             call = entry["call"]
             kind = call["kind"]
-            host_call = kind in (
-                "media_reading",
-                "video_encoding",
-                "audio_encoding",
-                "muxing",
-            )
-            if not entry["active"] and not host_call:
+            if not entry["active"] and kind not in _HOST_CALLS:
                 result.append(_nothing())
                 continue
-            handler = getattr(self, f"_plan_{kind}", None)
+            handler = getattr(self, f"_prepare_{kind}", None)
             if handler is None:
                 raise NotImplementedError(
                     f"{kind} is not a video model's media call"
@@ -743,41 +757,39 @@ class VideoExecutor:
     def execute(
         self, step: Mapping[str, Any], tensors: Sequence[torch.Tensor]
     ) -> list[int]:
-        """Run a batch's calls with the tensors the worker leased and bound,
-        in the order :meth:`plan_batch` named them, call by call: its reads,
-        then its writes. Returns how each call's forward ran.
-        """  # noqa: D205
+        """Run a batch's calls with the tensors the worker leased and bound.
+
+        The tensors follow the order :meth:`prepare` named them, call by
+        call: its reads, then its writes. Returns how each call's forward
+        ran.
+        """
         modes = []
         cursor = 0
-        for entry, planned in zip(step["calls"], step["planned"], strict=True):
-            count = len(planned["reads"]) + len(planned["writes"])
+        for entry, prepared in zip(
+            step["calls"], step["prepared"], strict=True
+        ):
+            count = len(prepared["reads"]) + len(prepared["writes"])
             own = list(tensors[cursor : cursor + count])
             cursor += count
             if entry["refused"]:
                 modes.append(EAGER)
                 continue
             kind = entry["call"]["kind"]
-            host_call = kind in (
-                "media_reading",
-                "video_encoding",
-                "audio_encoding",
-                "muxing",
-            )
-            if not entry["active"] and not host_call:
+            if not entry["active"] and kind not in _HOST_CALLS:
                 modes.append(EAGER)
                 continue
-            reads = own[: len(planned["reads"])]
-            writes = own[len(planned["reads"]) :]
+            reads = own[: len(prepared["reads"])]
+            writes = own[len(prepared["reads"]) :]
             modes.append(
                 getattr(self, f"_run_{kind}")(
-                    entry, step, planned, reads, writes
+                    entry, step, prepared, reads, writes
                 )
             )
         return modes
 
     # Text encoding.
 
-    def _plan_text_encoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_text_encoding(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         if len(call["outputs"]) != 1 or len(call["inputs"]) > 1:
             raise ValueError(
@@ -796,7 +808,7 @@ class VideoExecutor:
             "publication": None,
         }
 
-    def _run_text_encoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_text_encoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.text is not None
         record = self._request(entry["slot"], entry["call"]["request_key"])
         vision = None
@@ -807,20 +819,15 @@ class VideoExecutor:
                 block = condition.get("vision")
                 if block is None:
                     continue
-                grid = (
-                    int(block["grid"]["t"]),
-                    int(block["grid"]["h"]),
-                    int(block["grid"]["w"]),
-                )
                 (videos if "video" in condition["media"] else images).append(
-                    grid
+                    _grid(block)
                 )
             vision = PromptVision(tuple(images), tuple(videos), reads[0])
         return self.text.encode_text(record.tokens, writes[0], vision)
 
     # Vision encoding.
 
-    def _plan_vision_encoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_vision_encoding(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         if len(call["inputs"]) != 1 or len(call["outputs"]) != 1:
             raise ValueError(
@@ -840,29 +847,24 @@ class VideoExecutor:
             "publication": None,
         }
 
-    def _run_vision_encoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_vision_encoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.text is not None
         record = self._request(entry["slot"], entry["call"]["request_key"])
         grids = [
-            (
-                int(block["grid"]["t"]),
-                int(block["grid"]["h"]),
-                int(block["grid"]["w"]),
-            )
-            for block in (
-                condition.get("vision") for condition in record.conditions
-            )
-            if block is not None
+            _grid(condition["vision"])
+            for condition in record.conditions
+            if condition.get("vision") is not None
         ]
         return self.text.encode_patches(reads[0], grids, writes[0])
 
     # Condition encoding.
 
     def _condition_input(self, entry) -> dict[str, Any] | None:
-        """What a condition encoding call encodes on this rank: a round of
-        visual units, this rank's of them, or every audio track. None for an
-        audio call on a rank that is not the round's first.
-        """  # noqa: D205
+        """What a condition encoding call encodes on this rank.
+
+        This rank's visual units of a round, or every audio track; ``None``
+        for an audio call on a rank that is not the round's first.
+        """
         call = entry["call"]
         if len(call["inputs"]) != 1 or len(call["outputs"]) != 1:
             raise ValueError(
@@ -897,7 +899,7 @@ class VideoExecutor:
             offsets, pixels = [], 0
             for condition in record.conditions:
                 offsets.append(pixels)
-                pixels += _pixel_bytes(condition) // 3
+                pixels += _pixel_rows(condition)
             units_list = []
             for condition_index, unit, _ in round_units[run.start : run.stop]:
                 condition = record.conditions[condition_index]
@@ -923,20 +925,14 @@ class VideoExecutor:
             # The audio call is one unit, the first of its dealt ranks'.
             if len(placed.units(decode["ranks"], self.rank, 0, 1)) == 0:
                 return None
-            lengths = [
-                int(track["samples"])
-                for track in (
-                    _track(condition) for condition in record.conditions
-                )
-                if track is not None
-            ]
+            lengths = _track_samples(record.conditions)
             rows = sum(
                 int(condition["audio_rows"]) for condition in record.conditions
             )
             return {"tracks": lengths, "rows": rows, "region": None}
         raise ValueError(f"latent encoding does not produce {name}")
 
-    def _plan_latent_encoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_latent_encoding(self, entry, step) -> dict[str, Any]:
         found = self._condition_input(entry)
         if found is None:
             return _nothing()
@@ -952,9 +948,9 @@ class VideoExecutor:
             "input": found,
         }
 
-    def _run_latent_encoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_latent_encoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.conditions is not None
-        found = planned.get("input")
+        found = prepared.get("input")
         if found is None:
             return EAGER
         if "units" in found:
@@ -967,7 +963,7 @@ class VideoExecutor:
 
     # The trajectory.
 
-    def _plan_latent_preparation(self, entry, step) -> dict[str, Any]:
+    def _prepare_latent_preparation(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         record = self._request(entry["slot"], call["request_key"])
         conditioned = bool(record.conditions)
@@ -988,7 +984,7 @@ class VideoExecutor:
         return {"reads": reads, "writes": [], "publication": None}
 
     def _run_latent_preparation(
-        self, entry, step, planned, reads, writes
+        self, entry, step, prepared, reads, writes
     ) -> int:
         assert self.denoiser is not None
         call = entry["call"]
@@ -1022,7 +1018,7 @@ class VideoExecutor:
             )
         return mode
 
-    def _plan_denoising(self, entry, step) -> dict[str, Any]:
+    def _prepare_denoising(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         record = self._request(entry["slot"], call["request_key"])
         if record.admission is None:
@@ -1059,7 +1055,7 @@ class VideoExecutor:
             )
         return {"reads": [], "writes": writes, "publication": None}
 
-    def _run_denoising(self, entry, step, planned, reads, writes) -> int:
+    def _run_denoising(self, entry, step, prepared, reads, writes) -> int:
         assert self.denoiser is not None
         record = self._request(entry["slot"], entry["call"]["request_key"])
         admission = record.admission
@@ -1081,22 +1077,22 @@ class VideoExecutor:
             int(entry["slot"]),
             int(latent["read"]),
             int(latent["write"]),
-            int(latent["step"]),
+            step_index,
         )
         if writes:
             samples = self.denoiser.final_samples(layout)
             with torch.cuda.stream(self.denoiser.stream):
-                for write, planned_write in zip(
-                    writes, planned["writes"], strict=True
+                for write, prepared_write in zip(
+                    writes, prepared["writes"], strict=True
                 ):
-                    sample = samples[planned_write["modality"]]
+                    sample = samples[prepared_write["modality"]]
                     assert sample is not None
                     write.copy_(sample)
         return mode
 
     # Decoding.
 
-    def _plan_video_decoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_video_decoding(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         record = self._request(entry["slot"], call["request_key"])
         decode = entry["range"]
@@ -1137,9 +1133,9 @@ class VideoExecutor:
             "unit": run.start,
         }
 
-    def _run_video_decoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_video_decoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.decoder is not None
-        unit = planned.get("unit")
+        unit = prepared.get("unit")
         if unit is None:
             return EAGER
         record = self._request(entry["slot"], entry["call"]["request_key"])
@@ -1165,7 +1161,7 @@ class VideoExecutor:
             writes[0][0],
         )
 
-    def _plan_audio_decoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_audio_decoding(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         record = self._request(entry["slot"], call["request_key"])
         if len(call["inputs"]) != 1 or len(call["outputs"]) != 1:
@@ -1207,16 +1203,16 @@ class VideoExecutor:
             ],
         }
 
-    def _run_audio_decoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_audio_decoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.audio is not None
-        track = planned.get("track")
+        track = prepared.get("track")
         if track is None:
             return EAGER
         return self.audio.decode(reads[0], TrackUnits(*track), writes[0])
 
     # Host media.
 
-    def _plan_media_reading(self, entry, step) -> dict[str, Any]:
+    def _prepare_media_reading(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         record = self._request(entry["slot"], call["request_key"])
         if not record.conditions:
@@ -1227,30 +1223,19 @@ class VideoExecutor:
         writes = []
         for index, name in enumerate(entry["output_names"]):
             if name == "condition_pixels":
-                rows = sum(
-                    _pixel_bytes(condition) // 3
-                    for condition in record.conditions
-                )
+                # One RGB24 pixel per row.
+                rows = sum(map(_pixel_rows, record.conditions))
                 width = 3
             elif name == "condition_samples":
-                rows = sum(
-                    int(track["samples"])
-                    for track in (
-                        _track(condition) for condition in record.conditions
-                    )
-                    if track is not None
-                )
+                # One stereo sample per row.
+                rows = sum(_track_samples(record.conditions))
                 width = 2
             elif name == "vision_pixels":
+                # One patch per row.
                 rows = sum(
-                    int(block["grid"]["t"])
-                    * int(block["grid"]["h"])
-                    * int(block["grid"]["w"])
-                    for block in (
-                        condition.get("vision")
-                        for condition in record.conditions
-                    )
-                    if block is not None
+                    prod(_grid(condition["vision"]))
+                    for condition in record.conditions
+                    if condition.get("vision") is not None
                 )
                 width = _row_width(call["outputs"][index])
             else:
@@ -1271,7 +1256,7 @@ class VideoExecutor:
             "reports": 1,
         }
 
-    def _run_media_reading(self, entry, step, planned, reads, writes) -> int:
+    def _run_media_reading(self, entry, step, prepared, reads, writes) -> int:
         assert (
             self.reader is not None
             and self.lane is not None
@@ -1279,9 +1264,9 @@ class VideoExecutor:
         )
         record = self._request(entry["slot"], entry["call"]["request_key"])
         products = {
-            planned_write["name"]: write
-            for planned_write, write in zip(
-                planned["writes"], writes, strict=True
+            prepared_write["name"]: write
+            for prepared_write, write in zip(
+                prepared["writes"], writes, strict=True
             )
         }
         reader, staging = self.reader, self.staging
@@ -1309,7 +1294,7 @@ class VideoExecutor:
         )
         return EAGER
 
-    def _plan_video_encoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_video_encoding(self, entry, step) -> dict[str, Any]:
         call = entry["call"]
         decode = entry["range"]
         if len(call["inputs"]) != 1 or len(call["outputs"]) != 1:
@@ -1344,13 +1329,15 @@ class VideoExecutor:
             "reports": len(run),
         }
 
-    def _run_video_encoding(self, entry, step, planned, reads, writes) -> int:
-        """Encode this rank's media units of a round into its rows of the
-        round's encoded product. ``reads`` hold one host tensor of each of
-        the rank's units' frames, in unit order.
-        """  # noqa: D205
+    def _run_video_encoding(self, entry, step, prepared, reads, writes) -> int:
+        """Encode this rank's media units of a round into its encoded rows.
+
+        The rows are this rank's of the round's encoded product. ``reads``
+        hold one host tensor of each of the rank's units' frames, in unit
+        order.
+        """
         assert self.lane is not None and self.reports is not None
-        if not planned["writes"]:
+        if not prepared["writes"]:
             return EAGER
         record = self._request(entry["slot"], entry["call"]["request_key"])
         decode = entry["range"]
@@ -1358,7 +1345,7 @@ class VideoExecutor:
         batch, call = int(step["batch_id"]), int(entry["index"])
         frame_rate = self.model.frame_rate
         canvas = record.canvas
-        for local, position in enumerate(planned["read_rows"]):
+        for local, position in enumerate(prepared["read_rows"]):
             unit = int(decode["cursor"]) + position
             if unit >= len(record.units):
                 raise ValueError(
@@ -1380,12 +1367,12 @@ class VideoExecutor:
             )
         return EAGER
 
-    def _plan_audio_encoding(self, entry, step) -> dict[str, Any]:
+    def _prepare_audio_encoding(self, entry, step) -> dict[str, Any]:
         if len(entry["call"]["inputs"]) != 1:
             raise ValueError("audio encoding requires one PCM input")
         return {"reads": [0], "writes": [], "publication": None, "reports": 1}
 
-    def _run_audio_encoding(self, entry, step, planned, reads, writes) -> int:
+    def _run_audio_encoding(self, entry, step, prepared, reads, writes) -> int:
         assert self.lane is not None and self.reports is not None
         session = self._mux(entry)
         pcm = reads[0]
@@ -1406,7 +1393,7 @@ class VideoExecutor:
         )
         return EAGER
 
-    def _plan_muxing(self, entry, step) -> dict[str, Any]:
+    def _prepare_muxing(self, entry, step) -> dict[str, Any]:
         # Each input round's framed rows arrive from the exports that reach
         # this rank, as ``[rows, width]`` host bytes.
         finalize = not entry["call"]["inputs"]
@@ -1418,11 +1405,12 @@ class VideoExecutor:
             "reports": 1,
         }
 
-    def _run_muxing(self, entry, step, planned, reads, writes) -> int:
+    def _run_muxing(self, entry, step, prepared, reads, writes) -> int:
         """Append a request's encoded rounds to its MP4, or finish it.
+
         ``reads`` hold each input round's framed rows as ``[rows, width]``
         uint8 host tensors.
-        """  # noqa: D205
+        """
         assert self.lane is not None and self.reports is not None
         session = self._mux(entry)
         batch, call = int(step["batch_id"]), int(entry["index"])
@@ -1446,9 +1434,7 @@ class VideoExecutor:
         return EAGER
 
     def _mux(self, entry) -> MuxSession:
-        """The MP4 session of a request on the muxer rank, created on first
-        use.
-        """  # noqa: D205
+        """The MP4 session of a request on the muxer rank, made on first use."""
         record = self._request(entry["slot"], entry["call"]["request_key"])
         if record.mux is None:
             record.mux = MuxSession(
@@ -1477,7 +1463,10 @@ class VideoExecutor:
         return kernels
 
     def close(self, aborted: bool) -> None:
-        """Release every runner; the caller drained the streams."""
+        """Release every runner; the caller drained the streams.
+
+        Every owner is closed before the first failure is raised.
+        """
         failure: BaseException | None = None
         if self.lane is not None and not aborted:
             self.lane.close()
@@ -1492,7 +1481,7 @@ class VideoExecutor:
                 continue
             try:
                 owner.close(aborted)
-            except Exception as error:  # noqa: BLE001 - close every owner
+            except Exception as error:
                 failure = failure or error
         for record in self.requests.values():
             if record.mux is not None:
@@ -1579,36 +1568,42 @@ def _pixels(condition: Mapping[str, Any]) -> tuple[int, Canvas]:
     return 0, Canvas(0, 0)
 
 
-def _pixel_bytes(condition: Mapping[str, Any]) -> int:
+def _pixel_rows(condition: Mapping[str, Any]) -> int:
+    """A condition's rows of ``condition_pixels``: its encoded pixels."""
     frames, canvas = _pixels(condition)
-    return frames * canvas.width * canvas.height * 3
+    return frames * canvas.width * canvas.height
 
 
-def _track(condition: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    media = condition["media"]
-    if "video" in media:
-        return media["video"].get("soundtrack")
-    return media.get("audio")
+def _track_samples(conditions: Sequence[Mapping[str, Any]]) -> list[int]:
+    """Samples of each condition's audio track, of those carrying one."""
+    tracks = (soundtrack(condition["media"]) for condition in conditions)
+    return [int(track["samples"]) for track in tracks if track is not None]
+
+
+def _grid(vision: Mapping[str, Any]) -> tuple[int, int, int]:
+    """A vision block's ``(time, height, width)`` patch grid."""
+    grid = vision["grid"]
+    return int(grid["t"]), int(grid["h"]), int(grid["w"])
 
 
 def _unit_rows(
     condition, unit: int, frames: int, canvas: Canvas
 ) -> tuple[int, range]:
-    """The encoder window and the rows of 32-pixel latent patches unit
-    ``unit`` of a condition encodes.
+    """The encoder window and the latent patch rows a condition unit encodes.
 
-    A still frame planned as several units is encoded in bands of its patch
+    Unit ``unit`` encodes rows of 32-pixel latent patches. A still frame
+    the request splits into several units is encoded in bands of its patch
     rows, each band reading the whole frame: a band's first row follows the
     rows of the bands before it. Any other unit is its encoder window, over
     every patch row.
-    """  # noqa: D205
-    patch_rows = canvas.height // _CANVAS_MULTIPLE
-    planned = [int(rows) for rows in condition["latent_units"]]
-    if frames != 1 or len(planned) < 2:
+    """
+    patch_rows = canvas.height // CANVAS_MULTIPLE
+    latent_units = [int(rows) for rows in condition["latent_units"]]
+    if frames != 1 or len(latent_units) < 2:
         return unit, range(0, patch_rows)
-    per_row = canvas.width // _CANVAS_MULTIPLE
-    before = sum(planned[:unit])
-    rows = planned[unit]
+    per_row = canvas.width // CANVAS_MULTIPLE
+    before = sum(latent_units[:unit])
+    rows = latent_units[unit]
     if per_row == 0 or before % per_row or rows % per_row:
         raise ValueError("an image band is not whole rows of latent patches")
     first = before // per_row
@@ -1631,13 +1626,13 @@ def condition_spans(
     before its audio rows, each as ``(read, first row, rows)`` spans.
 
     Raises:
-        ValueError: The reads hold other rows than the request planned.
+        ValueError: The reads hold other rows than the conditions take.
     """
     visual = sum(rows for rows, _ in conditions)
     audio = sum(rows for _, rows in conditions)
     if sum(rounds) != visual or (tracks or 0) != audio:
         raise ValueError(
-            "condition latents disagree with the request's planned rows"
+            "condition latents disagree with the request's condition rows"
         )
     track_read = len(rounds)
     result: list[list[tuple[int, int, int]]] = []
@@ -1650,7 +1645,7 @@ def condition_spans(
                 if round_index >= len(rounds):
                     raise ValueError(
                         "condition latents disagree with the request's "
-                        "planned rows"
+                        "condition rows"
                     )
                 available = rounds[round_index] - row
                 taken = min(available, needed)
@@ -1671,9 +1666,10 @@ def condition_spans(
 def _condition_latents(
     conditions: Sequence[Mapping[str, Any]], reads: Sequence[torch.Tensor]
 ) -> list[list[torch.Tensor]]:
-    """The condition latents of latent preparation's condition reads, each a
-    list of row tensors that together hold its rows.
-    """  # noqa: D205
+    """The condition latents of latent preparation's condition reads.
+
+    Each latent is a list of row tensors that together hold its rows.
+    """
     audio = any(int(condition["audio_rows"]) > 0 for condition in conditions)
     if audio:
         if not reads:
@@ -1681,7 +1677,7 @@ def _condition_latents(
         rounds, tracks = list(reads[:-1]), reads[-1]
     else:
         rounds, tracks = list(reads), None
-    planned = [
+    condition_rows = [
         (
             sum(int(rows) for rows in condition["latent_units"]),
             int(condition["audio_rows"]),
@@ -1689,7 +1685,7 @@ def _condition_latents(
         for condition in conditions
     ]
     spans = condition_spans(
-        planned,
+        condition_rows,
         [read.shape[0] for read in rounds],
         None if tracks is None else tracks.shape[0],
     )
@@ -1698,6 +1694,3 @@ def _condition_latents(
         [every[read][first : first + count] for read, first, count in latent]
         for latent in spans
     ]
-
-
-__all__ += ["DONE", "VideoRequest", "condition_spans"]

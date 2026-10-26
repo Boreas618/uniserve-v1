@@ -3,6 +3,12 @@
 The denoiser's backbone produces one hidden row per image token. The modules
 here turn those rows into a clean-image prediction in canonical patch rows and
 convert it into the flow-matching velocity the Euler solver consumes.
+
+The MLP heads act on each token alone, so the velocity of a packed forward
+is row-local. The convolutional ``Decoder`` mixes neighbouring tokens of
+one image's token grid: it is an eager per-image region, evaluated from the
+rows' host regions (``PackedImageRows.regions``), which a captured forward
+runs between the graph segments around it.
 """
 
 import math
@@ -13,6 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve.diffusion import NoiseScale
+from uniserve.nn.functional import patchify
 from uniserve.nn.linear import Linear
 from uniserve.nn.timestep import TimestepEmbedding
 
@@ -130,7 +137,7 @@ class Head(nn.Module):
     ``[tokens, output_size]``. The head embeds the timestep with its own
     ``TimestepEmbedding``, separate from the one the denoiser adds to the
     backbone input, and uses it to modulate every block.
-    """  # noqa: E501
+    """
 
     def __init__(
         self, config: HeadConfig, *, input_size: int, output_size: int
@@ -198,11 +205,10 @@ class Decoder(nn.Module):
 class Velocity(nn.Module):
     """Convert clean image predictions into velocity in canonical patch order.
 
-    ``patches.pixels`` is the complete noisy image ``[1, 3, height, width]``
-    that the velocity starts from. The predictor can be an adaptive Head, a
-    shallow ordinary MLP, or Identity followed by the convolutional Decoder.
-    The velocity is ``(prediction - sample) / (1 - t)`` with ``1 - t`` clamped
-    to at least 0.02, the reference implementation's default endpoint epsilon.
+    The predictor can be an adaptive Head, a shallow ordinary MLP, or
+    Identity followed by the convolutional Decoder. The velocity is
+    ``(prediction - sample) / (1 - t)`` with ``1 - t`` clamped to at least
+    0.02, the reference implementation's default endpoint epsilon.
     """
 
     def __init__(self, head: nn.Module, decoder: nn.Module, *, patch_size: int):
@@ -210,48 +216,73 @@ class Velocity(nn.Module):
         self.head, self.decoder, self.patch_size = head, decoder, patch_size
 
     def forward(
-        self, hidden: torch.Tensor, timestep: torch.Tensor, patches
+        self,
+        hidden: torch.Tensor,
+        timesteps: torch.Tensor,
+        sample: torch.Tensor,
+        regions: tuple[tuple[int, int, int], ...] | None,
     ) -> torch.Tensor:
-        from uniserve.nn.functional import patchify
+        """Predict each token's FP32 velocity.
 
-        pixels = patches.pixels
-        if pixels.ndim != 4 or pixels.shape[:2] != (1, 3):
-            raise ValueError(
-                "image conditioning requires one complete NCHW RGB image"
-            )
-        height, width = pixels.shape[-2:]
-        rows, columns = height // self.patch_size, width // self.patch_size
-        if hidden.ndim != 2 or hidden.shape[0] != rows * columns:
-            raise ValueError("flow hidden rows must cover the image patch grid")
+        ``hidden`` is ``[tokens, text_hidden]``, ``timesteps`` the
+        ``[tokens]`` FP32 network time of each token's row and ``sample``
+        the ``[tokens, 3 * patch_size**2]`` canonical patch rows each token's
+        velocity starts from. ``regions`` are the host ``(first token, grid
+        rows, grid columns)`` of each image's tokens, which only the
+        convolutional decoder reads; tokens outside every region predict
+        zero there.
 
-        # hidden is [rows*columns, text_hidden]; predictions are per-patch
-        # clean values in the same canonical patch order as the sample below.
-        # The pixel decoder needs the token grid as an NCHW map and returns
-        # full-resolution pixels; the MLP heads emit patch rows directly.
+        Raises:
+            ValueError: The decoder evaluates without host regions, or a
+                region lies outside the tokens.
+        """
         if isinstance(self.decoder, Decoder):
+            prediction = self.decode(hidden, regions)
+        elif isinstance(self.head, Head):
+            prediction = self.decoder(self.head(hidden, timesteps))
+        else:
+            prediction = self.decoder(self.head(hidden))
+
+        # Schedules hold FP32 timesteps, so the division returns FP32 even
+        # when the difference is BF16. FP32 is the declared
+        # ``prediction_dtype``, the dtype of the buffers in which the other
+        # pipeline stages receive the broadcast prediction.
+        return (prediction - sample) / (1 - timesteps[:, None]).clamp_min(0.02)
+
+    def decode(
+        self,
+        hidden: torch.Tensor,
+        regions: tuple[tuple[int, int, int], ...] | None,
+    ) -> torch.Tensor:
+        """Reconstruct each image's clean patch rows with the pixel decoder.
+
+        An eager per-image region: each image's token rows form its
+        ``[1, text_hidden, rows, columns]`` grid, which the decoder turns
+        into pixels and ``patchify`` back into its tokens' patch rows.
+        """
+        if regions is None:
+            raise ValueError(
+                "the pixel decoder is an eager per-image region and reads "
+                "the rows' host regions"
+            )
+        tokens = hidden.shape[0]
+        prediction = None
+        for first, rows, columns in regions:
+            if first < 0 or first + rows * columns > tokens:
+                raise ValueError("an image region lies outside the tokens")
             spatial = (
-                self.head(hidden)
+                self.head(hidden[first : first + rows * columns])
                 .reshape(1, rows, columns, -1)
                 .permute(0, 3, 1, 2)
                 .contiguous()
             )
-            prediction = patchify(
+            patches = patchify(
                 self.decoder(spatial), patch_size=self.patch_size
             )[0]
-        else:
-            time = timestep.reshape(1).expand(hidden.shape[0])
-            prediction = (
-                self.head(hidden, time)
-                if isinstance(self.head, Head)
-                else self.head(hidden)
-            )
-            prediction = self.decoder(prediction)
-
-        sample = patchify(pixels, patch_size=self.patch_size)[0]
-        # Schedules hold FP32 timesteps. A zero-dimensional float tensor does
-        # not raise the result dtype of a dimensioned float operand, so the
-        # one-dimensional view makes the division return FP32 even when the
-        # difference is BF16. FP32 is the declared ``prediction_dtype``, the
-        # dtype of the buffers in which the other pipeline stages receive the
-        # broadcast prediction.
-        return (prediction - sample) / (1 - timestep.reshape(1)).clamp_min(0.02)
+            if prediction is None:
+                prediction = patches.new_zeros((tokens, patches.shape[1]))
+            prediction[first : first + rows * columns] = patches
+        if prediction is None:
+            # No image: every token is padding.
+            return hidden.new_zeros((tokens, 3 * self.patch_size**2))
+        return prediction

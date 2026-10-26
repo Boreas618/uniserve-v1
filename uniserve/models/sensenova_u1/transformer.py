@@ -3,8 +3,8 @@
 The backbone is a mixture-of-transformers (MoT): every layer holds separate
 ``text`` and ``flow`` weights for its norms, Q/K/V and output projections and
 MLP, but runs one attention call over the packed sequence, so both routes
-share each layer's prefix cache. ``RouteSpan`` values assign packed token ranges
-to routes. Text calls take the decoder's default ``text`` route, and
+share each layer's prefix cache. ``IndexedRoutes`` assign packed tokens to
+routes. Text calls take the decoder's default ``text`` route, and
 ``Denoiser.forward`` routes every image token through ``flow``.
 
 Attention heads carry three rotary axes: temporal over the first half of the

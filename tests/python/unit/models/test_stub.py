@@ -6,9 +6,11 @@ import pytest
 import torch
 
 from uniserve.bindings.context import ExecutionContext
+from uniserve.executor.image.layout import ImageLayout
+from uniserve.executor.image.rows import ImageRow, RowColumns, expand_rows
 from uniserve.media import image
-from uniserve.models import LatentInput, TextInput, TextSize, VisionInput
-from uniserve.models.stub import DenoiserInput, Model
+from uniserve.models import TextInput, TextSize, VisionInput
+from uniserve.models.stub import Model
 from uniserve.nn.attention import AttentionBatch, PagedInput
 from uniserve.prefix_cache.units import UnitPool
 
@@ -100,31 +102,56 @@ def test_zero_velocity_preserves_each_raster_through_solver_and_decoder():
         device="cpu",
     )
     batch = AttentionBatch.single(replace(batch, slot_mapping=None))
+    # Both images' framed rows packed in one forward, reading their
+    # latents from one source.
+    source = torch.cat(patches)
+    starts = (0, patches[0].shape[0])
     for index in range(schedule.num_steps):
-        inputs = DenoiserInput(
-            {
-                "image": tuple(
-                    LatentInput(value, schedule.timesteps[index])
-                    for value in patches
+        columns = RowColumns.of(
+            ImageLayout.of(model.denoiser),
+            [
+                ImageRow(
+                    image=number,
+                    sample=start,
+                    height=size.height,
+                    width=size.width,
+                    positions=(0, 0, 0),
+                    timestep=float(schedule.timesteps[index]),
+                    prediction=start,
                 )
-            },
-            sizes,
-            schedule.step(index),
-            batch,
+                for number, (start, size) in enumerate(
+                    zip(starts, sizes, strict=True)
+                )
+            ],
         )
-        predictions = model.denoiser(
+        expanded = expand_rows(
+            *columns.tensors(), tokens=columns.tokens, dump=source.shape[0]
+        )
+        inputs = model.denoiser.bind_packed(
+            source=source,
+            rows=expanded.rows,
+            attention=batch,
+        )
+        (output,) = model.denoiser(
             inputs, state={}, constants={}, workspace={}
         )["image"]
-        for value, output in zip(patches, predictions, strict=True):
-            torch.testing.assert_close(output.tensor, torch.zeros_like(value))
+        torch.testing.assert_close(
+            output.tensor, torch.zeros_like(output.tensor)
+        )
+        # Each latent token's prediction row, then the dump row of the
+        # framing tokens.
+        predictions = source.new_zeros((source.shape[0] + 1, source.shape[1]))
+        predictions.index_copy_(0, expanded.prediction_index, output.tensor)
+        for start, value in zip(starts, patches, strict=True):
             model.denoiser.solver.step_(
-                output.tensor,
+                predictions[start : start + value.shape[0]],
                 value,
                 schedule.timesteps[index],
                 schedule.timesteps[index + 1],
                 sigma=schedule.sigmas[index],
                 next_sigma=schedule.sigmas[index + 1],
             )
+        source = torch.cat(patches)
     for actual, expected in zip(patches, before, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual, expected in zip(

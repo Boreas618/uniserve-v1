@@ -1,28 +1,17 @@
-"""CUDA graph capture and release shared by every binding.
+"""CUDA graph capture, replay and release shared by every binding.
 
-Rust owns graph policy: shapes, buckets, capture order, allocator pools and
-the decision to capture or run a captured graph. It owns the graphs it
-serves as well: :func:`capture_begin` and :func:`capture_end` capture the
-work between them (runner methods Rust calls, or work it submits itself,
-possibly from several host threads on streams forked from the capturing one,
-as the expert joins of all microbatches do) and return the captured graph of
-each segment, which Rust instantiates into executables it owns; then
-:func:`handover` releases the captured graphs, and the
-:class:`BreakableCUDAGraph` keeps only the step's output until
-:func:`release`. Where such a forward reaches work a graph cannot record,
-:func:`break_graph` ends the segment and begins the next, and Rust performs
-the work between the two at every launch. The graph's inputs are the
-binding's fixed buffers, so running it needs no copies.
+The executor captures every graph it serves with :func:`capture` and
+replays it with :meth:`BreakableCUDAGraph.replay`; a Python caller outside
+a worker does the same. Where a captured step reaches work a graph cannot
+record (a distributed expert layer's weight copy), :func:`break_graph`
+ends the segment, begins the next and records the work, which every replay
+performs between the two segments.
 
-:func:`pool` creates the allocator pools Rust assigns to graph owners: in a
-worker, a pool allocates from the device memory Rust owns for it, through
-the worker library's allocator entry points for the pool's slot, so the
-memory keeps its addresses for as long as Rust's graphs address it.
-
-A Python caller outside a worker captures a step with :func:`capture`, which
-instantiates the graph in torch, and replays it with
-:meth:`BreakableCUDAGraph.replay`. Importing this module does not
-initialize CUDA.
+:func:`pool` creates the allocator pools graphs capture into: in a worker,
+a pool allocates from the device memory Rust reserved for it, through the
+worker library's allocator entry points for the pool's slot, so the memory
+keeps its addresses for as long as a graph captured in it lives. Importing
+this module does not initialize CUDA.
 """
 
 from __future__ import annotations
@@ -38,12 +27,12 @@ __all__ = [
     "BreakableCUDAGraph",
     "break_graph",
     "capture",
-    "export",
     "pool",
     "pool_bytes",
 ]
 
-# The capture begun by ``capture_begin`` and not yet ended.
+# The capture in progress (:func:`capture`), which :func:`break_graph`
+# reaches.
 _capturing: Capture | None = None
 
 # Caching-allocator option that lets a capture reuse a freed block another
@@ -92,8 +81,8 @@ def pool(device: int, slot: int | None = None, library: str = "") -> list[Any]:
 
     Returns:
         ``[pool, id_a, id_b, total_bytes]``: the pool (an opaque handle Rust
-        passes back to captures), its allocator id pair (which names the
-        pool in :func:`pool_bytes`) and the device's total memory,
+        passes to the executor's captures), its allocator id pair (which
+        names the pool in :func:`pool_bytes`) and the device's total memory,
         from which Rust derives the default graph budget.
     """
     device = int(device)
@@ -142,14 +131,11 @@ class BreakableCUDAGraph:
 
     A step is usually one CUDA graph. Work a graph cannot record splits it
     into several graphs, its segments, with a graph break between two of
-    them: a break op the worker notes and performs natively at every
-    launch (:func:`break_graph`). A graph Rust serves hands its captured
-    segments over (:meth:`raw_cuda_graphs`, :meth:`handover`) and keeps
-    only the step's output; a graph without breaks that :func:`capture`
-    instantiated replays in torch (:meth:`replay`). The graph keeps its
-    private capture stream: PyTorch frees a capture stream's workspaces
-    when the graph resets, so a stream shared with other graphs could
-    invalidate their inputs.
+    them (:func:`break_graph`). Each break carries the work performed there
+    at every launch, a callable that :meth:`replay` invokes between the two
+    segments. The graph keeps its private capture stream: PyTorch frees a
+    capture stream's workspaces when the graph resets, so a stream shared
+    with other graphs could invalidate their inputs.
     """
 
     def __init__(
@@ -157,56 +143,40 @@ class BreakableCUDAGraph:
         graphs: Sequence[torch.cuda.CUDAGraph],
         output: Any,
         capture_stream: torch.cuda.Stream,
+        breaks: Sequence[Callable[[], Any]] = (),
     ) -> None:
+        if len(graphs) != len(breaks) + 1:
+            raise ValueError(
+                "a captured step has one break between each two segments"
+            )
         self._graphs = tuple(graphs)
+        self._breaks = tuple(breaks)
         self._capture_stream = capture_stream
         self.output = output
+
+    @property
+    def segments(self) -> int:
+        """The step's segments: one more than its graph breaks."""
+        return len(self._graphs)
 
     def replay(self) -> Any:
         """Submit the graph on the stream that captured the step.
 
-        Only a graph :func:`capture` instantiated replays. Replay also
-        advances the philox offsets of every generator the capture
-        registered, so random draws continue as an eager sequence would.
-        Returns the captured output (views into fixed buffers or the
-        graph's pool, overwritten by the next replay).
-
-        Raises:
-            RuntimeError: The graph has breaks, whose ops only the worker
-                that noted them performs.
+        Segments launch in submission order with each break's work invoked
+        between its two segments, so the work runs on the host after the
+        segment before it is enqueued and before the segment after it; the
+        caller keeps the captured stream current. Replay also advances the
+        philox offsets of every generator the capture registered, so random
+        draws continue as an eager sequence would. Returns the captured
+        output (views into fixed buffers or the graph's pool, overwritten by
+        the next replay).
         """
-        if len(self._graphs) != 1:
-            raise RuntimeError(
-                "a graph with breaks launches in the worker that noted "
-                "its break ops"
-            )
-        self._graphs[0].replay()
+        first, *rest = self._graphs
+        first.replay()
+        for work, graph in zip(self._breaks, rest, strict=True):
+            work()
+            graph.replay()
         return self.output
-
-    def raw_cuda_graphs(self) -> list[int]:
-        """The captured graph of each segment, in submission order.
-
-        Each is the ``cudaGraph_t`` of one ``torch.cuda.CUDAGraph`` (its
-        ``raw_cuda_graph``), which Rust instantiates; valid until
-        :meth:`handover`.
-        """
-        return [graph.raw_cuda_graph() for graph in self._graphs]
-
-    def handover(self) -> None:
-        """Release the captured graphs once Rust instantiated them.
-
-        The step's output stays until :meth:`release`; nothing replays the
-        graph in torch afterwards.
-        """
-        graphs, self._graphs = self._graphs, ()
-        failure = None
-        for graph in graphs:
-            try:
-                graph.reset()
-            except Exception as error:  # noqa: BLE001 - reset every graph
-                failure = failure or error
-        if failure is not None:
-            raise failure
 
     def release(self) -> None:
         """Drop the captured graphs and the captured output.
@@ -214,6 +184,9 @@ class BreakableCUDAGraph:
         The caller has drained every stream this graph ran on.
         """
         graphs, self._graphs = self._graphs, ()
+        # Break work may hold worker storage (weight copies); it goes with
+        # the graphs.
+        self._breaks = ()
         self.output = None
         failure = None
         for graph in graphs:
@@ -231,7 +204,9 @@ class _Segments:
     ``begin`` starts a graph on the private capture stream and joins the
     computation stream into the capture; ``end`` joins it back and ends the
     graph. ``break_graph`` ends the current segment and begins the next in
-    the same pool, so allocations stay shared across the step.
+    the same pool, so allocations stay shared across the step, and records
+    the work performed between the two (``breaks[i]`` follows
+    ``graphs[i]``).
     """
 
     def __init__(
@@ -246,6 +221,7 @@ class _Segments:
         self.pool = pool_handle
         self.generators = tuple(generators)
         self.graphs: list[torch.cuda.CUDAGraph] = []
+        self.breaks: list[Callable[[], Any]] = []
         self._active: torch.cuda.CUDAGraph | None = None
 
     def begin(self) -> None:
@@ -269,9 +245,10 @@ class _Segments:
             # Later segments share the first segment's private pool.
             self.pool = graph.pool()
 
-    def break_graph(self) -> None:
-        """End the current segment and begin the next in the same pool."""
+    def break_graph(self, work: Callable[[], Any]) -> None:
+        """End the current segment, record ``work``, begin the next."""
         self.end()
+        self.breaks.append(work)
         self.begin()
 
     def reset(self) -> None:
@@ -286,6 +263,7 @@ class _Segments:
         for graph in self.graphs:
             graph.reset()
         self.graphs.clear()
+        self.breaks.clear()
 
 
 @contextmanager
@@ -326,9 +304,9 @@ class Capture:
     :meth:`begin` starts capturing work enqueued on ``stream`` (and on streams
     that wait on it and are joined back before :meth:`end`); :meth:`end`
     instantiates the :class:`BreakableCUDAGraph`. Both run on the same host
-    thread; work between them may be submitted from other threads. ``peers``
-    pairs each other device the work allocates on with the pool receiving those
-    allocations.
+    thread; work between them may be submitted from other threads (expert
+    microbatches). ``peers`` pairs each other device the work allocates on
+    with the pool receiving those allocations.
     """
 
     def __init__(
@@ -364,17 +342,10 @@ class Capture:
             self._scopes.close()
             raise
 
-    def end(
-        self,
-        output: Any = None,
-        failure: BaseException | None = None,
-        instantiate: bool = True,
-    ):
+    def end(self, output: Any = None, failure: BaseException | None = None):
         """End the capture; with ``failure`` discard it and raise.
 
-        With ``instantiate``, torch instantiates every segment for
-        :meth:`BreakableCUDAGraph.replay`; without, the captured segments
-        wait for Rust to instantiate them.
+        Every segment is instantiated for :meth:`BreakableCUDAGraph.replay`.
 
         Raises:
             RuntimeError: Capture failed; every partial graph was reset and
@@ -387,9 +358,8 @@ class Capture:
                 self._scopes.close()
             if failure is not None:
                 raise failure
-            if instantiate:
-                for graph in self.segments.graphs:
-                    graph.instantiate()
+            for graph in self.segments.graphs:
+                graph.instantiate()
         except Exception as error:
             self.segments.reset()
             raise RuntimeError(
@@ -399,6 +369,7 @@ class Capture:
             self.segments.graphs,
             output,
             self.capture_stream,
+            self.segments.breaks,
         )
 
 
@@ -421,8 +392,8 @@ def capture(
     Args:
         body: The step; its return value is the graph's ``output``.
         stream: The binding's computation stream.
-        pool: The allocator pool Rust assigned to this graph's owner;
-            ``None`` creates a private pool.
+        pool: The allocator pool of the graph's owner (in a worker, one
+            Rust reserved); ``None`` creates a private pool.
         generators: Generators the body draws from besides the device's
             default generator, which every capture registers. Replay
             advances each registered generator's offset.
@@ -442,83 +413,38 @@ def capture(
         (torch.device("cuda", int(ordinal)), handle)
         for ordinal, handle in peers
     )
+    global _capturing
+    if _capturing is not None:
+        raise RuntimeError("a graph capture is already in progress")
     recording = Capture(stream, pool, generators, placed)
     recording.begin()
+    # The body reaches :func:`break_graph` through the module's capture in
+    # progress: process-wide rather than per thread, because a body may
+    # submit from microbatch threads while this thread waits.
+    _capturing = recording
     try:
         with torch.cuda.stream(stream):
             output = body()
     except Exception as error:
+        _capturing = None
         recording.end(failure=error)
         raise
+    _capturing = None
     return recording.end(output)
 
 
-def export(graph: BreakableCUDAGraph) -> list[Any]:
-    """Return a captured graph to the worker.
-
-    The worker receives ``[graph, graphs]``: the graph as an opaque handle
-    it passes back to :func:`handover` and :func:`release`, and the
-    captured graph of each segment in submission order, which it
-    instantiates.
-    """
-    return [graph, graph.raw_cuda_graphs()]
-
-
-def capture_begin(
-    pool, stream: int, device: int, peers: Sequence[Sequence[Any]] = ()
-) -> Capture:
-    """Begin capturing work Rust submits on ``stream`` into ``pool``.
-
-    ``peers`` are ``[device, pool]`` pairs: the allocator pool receiving the
-    work's allocations on each other device its modules run on (see
-    :func:`capture`).
-    """
-    global _capturing
-    computation = torch.cuda.ExternalStream(
-        int(stream), device=torch.device("cuda", int(device))
-    )
-    placed = tuple(
-        (torch.device("cuda", int(ordinal)), handle)
-        for ordinal, handle in peers
-    )
-    recording = Capture(computation, pool, peers=placed)
-    recording.begin()
-    _capturing = recording
-    return recording
-
-
-def capture_end(recording: Capture, instantiate: bool = False) -> list[Any]:
-    """End a capture begun by :func:`capture_begin` and export its graph.
-
-    The worker instantiates the exported segments; a Python caller that
-    replays the graph in torch passes ``instantiate``.
-    """
-    global _capturing
-    _capturing = None
-    return export(recording.end(instantiate=instantiate))
-
-
-def handover(graph: BreakableCUDAGraph) -> None:
-    """Release the captured segments of a graph the worker instantiated."""
-    graph.handover()
-
-
-def break_graph() -> None:
+def break_graph(work: Callable[[], Any]) -> None:
     """End the capturing graph's segment and begin its next.
 
-    Called where the forward captured between :func:`capture_begin` and
-    :func:`capture_end` reaches work a graph cannot record. The caller
-    performs that work between the two segments at every launch; nothing is
-    recorded for it here.
+    Called where the step being captured by :func:`capture` reaches work a
+    graph cannot record. ``work`` performs it:
+    :meth:`BreakableCUDAGraph.replay` calls it between the two segments at
+    every launch, on the host, with the captured stream current (a
+    distributed expert layer's weight copy).
 
     Raises:
         RuntimeError: No capture is in progress.
     """
     if _capturing is None:
         raise RuntimeError("break_graph is called while a graph is captured")
-    _capturing.segments.break_graph()
-
-
-def release(graph: BreakableCUDAGraph) -> None:
-    """Release a graph after every stream it ran on drained."""
-    graph.release()
+    _capturing.segments.break_graph(work)

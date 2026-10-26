@@ -1,892 +1,1030 @@
-//! An image model's batch: the parts of the backend it executes with
-//! ([`ImageParts`]), what it reserves and commits beside the shared batch
-//! skeleton ([`ImageBatch`]), and the dispatch of its calls to the encoder,
-//! denoiser and decoder forwards ([`forward`], [`complete`]).
+//! What the worker keeps for an image model's prepared lanes: the image
+//! products, inline pixels, latent trajectories and guidance prefixes of
+//! their batches.
 //!
-//! The opening job reads the batch's host-gated predicates (a false one
-//! skips its call, which only publishes false flags), then
-//! [`ImageBatch::open`] leases the batch's output storage on its stream and
-//! binds the completion flags the calls publish. After a kind's
-//! computation, [`ImageBatch::issue_commit`] validates every owner's update
-//! (products, latent trajectories, pending calls) and records the device
-//! half of the commit; [`ImageBatch::apply_commit`] makes them visible
-//! together from the job's completion. A failure before that point retires
-//! everything the batch reserved ([`ImageBatch::discard`]); a failure after
-//! it is fatal.
+//! An image model's encoders, denoiser and decoder serve prepared lanes
+//! ([`crate::executor::lanes`]) that run through the one batch state machine:
+//! the executor states in its preparation what each call reads and writes,
+//! then executes the batch on what the worker reserved. Its calls name their
+//! products in fields of their own (`image_input`, `encoder_output`,
+//! `image_output`, `latent_input`, `latent_output`), so the lane's hooks here
+//! handle them beside the generic products:
+//!
+//! - [`describe`] adds to the preparation's step each call's input image (its
+//!   host-prepared facts, or a resident image product's shape and metadata),
+//!   its request's input image count and its progress;
+//! - [`bind`], in the batch's last job, leases what each call reads (a
+//!   resident image), passes its prepared pixels, reserves its feature and
+//!   image products at their prepared shapes, lends its decoded bytes from
+//!   the batch's output lease and binds its trajectory in the latent ledger
+//!   ([`LatentLedger::bind_image`]); a denoising batch over the prefix cache
+//!   also reserves its rows' slots (the guidance prefixes) and passes its
+//!   attention rows ([`reserve_rows`]);
+//! - [`publish`], behind the execution, fences what the calls wrote with
+//!   its metadata and issues the exports remote readers import (features,
+//!   trajectory versions), configures the PNG encodings of decoded images,
+//!   releases a finished trajectory's guidance prefixes and records the
+//!   batch's place in the prefix cache's and the ledger's stream orders;
+//! - [`accept`] publishes the trajectory exports once their work was
+//!   performed, [`retire`] withdraws what a failed batch issued, and
+//!   [`host_stage`] encodes the decoded images after the batch's fences.
+//!
+//! Tensors the executor receives for a call, after the generic ones of every
+//! call (image calls have none), in call order: the resident image read, the
+//! prepared pixels, each prepared write, the lent bytes; then, for a
+//! denoising batch over the prefix cache, one `int64 [5 + 2G, R]` host
+//! tensor of its attention rows ([`reserve_rows`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
-use ipc::ImageParams;
 use ipc::{
-    Batch as BatchPlan, BufferAllocation, BufferId, CallKind, CallStatus, ErrorCode, ForwardStats,
-    MediaCall, RequestKey,
+    Batch as BatchPlan, BufferAllocation, BufferId, Call, CallKind, CallStatus, ErrorCode,
+    LatentParams, MediaCall,
 };
+use serde::Deserialize;
 
-use crate::error::WorkerError;
 use crate::executor::PendingOutput;
-use crate::executor::backend::{Parts, WorkerBackend, WorkerBatch};
-use crate::executor::batch::{
-    Batch, Failure, HostStage, Launched, Opening, Stage, fail, unsupported,
-};
+use crate::executor::batch::{Batch, CallState, HostStage};
+use crate::executor::columns::{FORWARD_FIELDS, ForwardRows, field_major, host_tensor};
+use crate::executor::image_inputs::{ImageFacts, Images, InlineImages};
+use crate::executor::lanes::{LaneCall, Resources};
+use crate::executor::latents::{Banks, LatentLedger};
+use crate::executor::pages::{Pages, attention_pages};
 use crate::executor::products::{ProductOwners, Publications};
 use crate::executor::transfer::latents::{self, PendingExport};
 use crate::ffi::MemoryKind;
-use crate::host::image::ImageResult;
-use crate::host::image::ImageTask;
-use crate::host::{HostLane, HostTask};
-use crate::lane::{Completion, Job};
-use crate::memory::LatentPool;
+use crate::host::HostTask;
+use crate::host::image::{ImageResult, ImageTask, ImageWork};
+use crate::lane::{Job, Recorder};
+use crate::memory::allocation::StorageView;
 use crate::memory::{
-    LatentCache, LatentStorage, LatentUpdate, OutputPool, ProductBuffer, ProductExport,
+    AttentionRow, Metadata, OutputPlacement, PrefixCache, ProductBuffer, ProductStore, ValueRange,
 };
-use crate::request::RequestPool;
-use crate::request::diffusion::{BranchSource, Prefix, Trajectories};
-use crate::runner::decoder::DecoderRunner;
-use crate::runner::decoder::runners::DecoderRunners;
-use crate::runner::denoiser::DenoiserRunner;
-use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
-use crate::runner::denoiser::runners::DenoiserRunners;
-use crate::runner::encoder::inputs::Inputs;
-use crate::runner::encoder::runners::EncoderRunners;
-use crate::stream::Issue;
-use crate::worker::WorkerMemory;
-use crate::{Error, Outcome, Result};
+use crate::request::{RequestPool, RequestProgress};
+use crate::stream::{EventPool, Issue as _};
+use crate::transfer::Transports;
+use crate::{Error, Outcome, Result, lock};
 
-/// A decoded image's encoding, run once its pixels reached the host.
-pub(crate) struct Encoding {
-    /// The call's index in the batch.
-    pub(crate) call: usize,
-    pub(crate) task: Arc<HostTask<ImageTask>>,
+/// Whether a lane serves an image model's calls: it names the image host
+/// resource, or it is a prepared lane over the prefix cache (an image
+/// denoiser, whose guidance prefixes and conditioning live there).
+pub(crate) fn serves(resources: Resources, prepares: bool) -> bool {
+    resources.images || (prepares && resources.pages)
 }
 
-/// A batch's persistent buffer allocations by buffer.
-pub(crate) fn allocations(plan: &BatchPlan) -> HashMap<BufferId, BufferAllocation> {
-    plan.buffer_allocations
-        .iter()
-        .map(|allocation| (allocation.buffer, *allocation))
-        .collect()
+/// The name a value range takes in the executor's step.
+fn value_range_name(range: Option<ValueRange>) -> Option<&'static str> {
+    range.map(|range| match range {
+        ValueRange::Unit => "unit",
+        ValueRange::SignedUnit => "signed_unit",
+    })
 }
 
-/// What an image batch's issued commit leaves to apply once its work was
-/// performed: the trajectory commits.
-pub(crate) struct Commit {
-    updates: Vec<LatentUpdate>,
-}
-
-/// The step an image batch's failure is reported in.
-const PHASE: &str = "image batch";
-
-/// A trajectory the batch's job asks the library to plan: it opens from
-/// the job's completion, with the guidance plan and the prefixes the calls
-/// recorded for it returned.
-pub(crate) struct Planned {
-    pub(crate) slot: usize,
-    pub(crate) key: RequestKey,
-    /// Image height and width in pixels.
-    pub(crate) size: (u32, u32),
-    /// The image parameters the trajectory was admitted with.
-    pub(crate) params: Arc<ImageParams>,
-    /// The sources a guidance branch may condition on, each with its
-    /// prefix where the request gives it (admitted negative tokens); the
-    /// others were asked for, in this order.
-    pub(crate) prefixes: Vec<(BranchSource, Option<Prefix>)>,
-}
-
-/// What an image batch owns between two of its jobs: everything of
-/// [`ImageBatch`] but the owners it borrows and its job.
-pub(crate) struct Parked {
-    batch: Batch,
-    updates: Vec<(usize, LatentUpdate)>,
-    encodings: Vec<Encoding>,
-    publications: Publications,
-    latent_exports: Vec<BufferId>,
-    exports: Vec<(usize, PendingExport)>,
-    features: Vec<(usize, ProductBuffer, ProductExport)>,
-    returns: Vec<Vec<i64>>,
-    plans: Vec<Planned>,
-    latents_entered: bool,
-}
-
-/// How far recording a forward got.
-pub(crate) enum Progress {
-    /// The forward is recorded to its end.
-    Done(Box<ForwardStats>),
-    /// The job recorded so far ends here: the forward continues from its
-    /// completion.
-    Boundary(Resume),
-}
-
-impl Progress {
-    /// A forward recorded to its end, with its statistics.
-    pub(crate) fn done(stats: ForwardStats) -> Self {
-        Self::Done(Box::new(stats))
-    }
-}
-
-/// A forward between two of its jobs.
-pub(crate) enum Resume {
-    Encode(crate::runner::encoder::EncodeResume),
-    /// A denoising that opens trajectories waits for their guidance plans.
-    Plan(Box<crate::runner::denoiser::image::PlanResume>),
-    Denoise(Box<crate::runner::denoiser::image::DenoiseResume>),
-}
-
-/// An image batch between two of its jobs.
-pub(crate) enum Pending {
-    /// The job on the lane reads the batch's host-gated predicates.
-    Predicates(Opening),
-    /// The predicates are known: the batch leases its storage and records
-    /// its forward next.
-    Opened(Opening),
-    /// The job on the lane ends inside the batch's forward.
-    Resuming(Box<(Parked, Resume)>),
-    /// That job completed: the forward continues from its completion next.
-    Resumed(Box<(Parked, Resume, Completion)>),
-    /// The job on the lane is the batch's last: the rest of its forward
-    /// and the issued commit.
-    Committing(Box<(Parked, Commit, ForwardStats)>),
-    /// Recording failed, or a job failed before the commit was applied.
-    /// What the batch had recorded is performed; it retires what it
-    /// reserved next.
-    Failing(Box<Parked>, Failure),
-    /// The job on the lane retires what the failed batch reserved, or
-    /// performs what a batch that reserved nothing had recorded.
-    Discarding(Failure),
-}
-
-/// An image batch's borrowed owners, the batch and what it reserves beside
-/// the skeleton.
-pub(crate) struct ImageBatch<'a> {
-    pub(crate) parts: ImageParts<'a>,
-    pub(crate) storage: &'a mut WorkerMemory,
-    pub(crate) requests: &'a mut RequestPool,
-    pub(crate) plan: &'a BatchPlan,
-    /// What the batch's own steps issue on its stream: the start of its
-    /// lease, its flags, its commit and its retirement after a failure.
-    pub(crate) job: Job,
-    pub(crate) batch: Batch,
-    /// Trajectory commits and releases by call index, applied at the
-    /// commit point.
-    pub(crate) updates: Vec<(usize, LatentUpdate)>,
-    /// Image encodings to run once the batch's pixels reached the host.
-    pub(crate) encodings: Vec<Encoding>,
-    /// Product exports (encoder features, trajectory versions),
-    /// registered once the batch commits.
-    pub(crate) publications: Publications,
-    /// Trajectory versions exported from the latent pool, released from it
-    /// if the batch fails before committing.
-    pub(crate) latent_exports: Vec<BufferId>,
-    /// The version exports the batch's forwards issued, by call index,
-    /// located when the commit is applied.
-    pub(crate) exports: Vec<(usize, PendingExport)>,
-    /// The feature exports the batch's forward issued, by call index, with
-    /// the product each exports; located when the commit is applied.
-    pub(crate) features: Vec<(usize, ProductBuffer, ProductExport)>,
-    /// What each returning call the batch recorded must return, in order
-    /// (the byte counts a decoder stages), checked when the commit is
-    /// applied.
-    pub(crate) returns: Vec<Vec<i64>>,
-    /// The trajectories the batch's latent preparations planned, in the
-    /// order their plan calls were recorded; opened when the commit is
-    /// applied.
-    pub(crate) plans: Vec<Planned>,
-    /// The batch uses the latent pool on its stream (see
-    /// `LatentCache::enter`).
-    pub(crate) latents_entered: bool,
-}
-
-impl<'a> ImageBatch<'a> {
-    /// Lease the opened batch's output storage on `stream`, `words` payload
-    /// words beside one completion word per call, and bind the completion
-    /// flags the calls publish.
-    #[expect(clippy::too_many_arguments, reason = "the batch's borrowed owners")]
-    pub(crate) fn open(
-        parts: ImageParts<'a>,
-        storage: &'a mut WorkerMemory,
-        requests: &'a mut RequestPool,
-        plan: &'a BatchPlan,
-        opening: Opening,
-        device: Option<DeviceId>,
-        stream: Option<Stream>,
-        words: usize,
-    ) -> Result<Self> {
-        let first = plan
-            .calls
-            .first()
-            .ok_or_else(|| Error::Invariant("an image batch has calls".into()))?;
-        if plan
-            .calls
-            .iter()
-            .any(|call| call.component != first.component)
-        {
-            return Err(Error::Invalid("an image batch serves one component".into()));
-        }
-        let job = Job::new();
-        let batch = Batch::lease(
-            opening,
-            parts.outputs,
-            plan.calls.len() + words,
-            stream,
-            device,
-            &storage.events,
-            &job,
-        )?;
-        let mut batch = Self::resume(
-            parts,
-            storage,
-            requests,
-            plan,
-            Parked {
-                batch,
-                updates: Vec::new(),
-                encodings: Vec::new(),
-                publications: Publications::default(),
-                latent_exports: Vec::new(),
-                exports: Vec::new(),
-                features: Vec::new(),
-                returns: Vec::new(),
-                plans: Vec::new(),
-                latents_entered: false,
-            },
-        );
-        batch.job = job;
-        batch
-            .batch
-            .bind_flags(plan, &batch.storage.tensors, &batch.job)?;
-        Ok(batch)
-    }
-
-    /// The batch's product device.
-    pub(crate) fn target(&self) -> MemoryKind {
-        self.batch.target()
-    }
-
-    /// Indices of the calls that execute.
-    pub(crate) fn active(&self) -> Vec<usize> {
-        self.batch.active()
-    }
-
-    /// Part the batch from the owners it borrows: its next job and the
-    /// state it owns between two jobs.
-    pub(crate) fn park(self) -> (Job, Parked) {
-        (
-            self.job,
-            Parked {
-                batch: self.batch,
-                updates: self.updates,
-                encodings: self.encodings,
-                publications: self.publications,
-                latent_exports: self.latent_exports,
-                exports: self.exports,
-                features: self.features,
-                returns: self.returns,
-                plans: self.plans,
-                latents_entered: self.latents_entered,
-            },
-        )
-    }
-
-    /// The parked batch on the owners it borrows again, with an empty job.
-    pub(crate) fn resume(
-        parts: ImageParts<'a>,
-        storage: &'a mut WorkerMemory,
-        requests: &'a mut RequestPool,
-        plan: &'a BatchPlan,
-        parked: Parked,
-    ) -> Self {
-        Self {
-            parts,
-            storage,
-            requests,
-            plan,
-            job: Job::new(),
-            batch: parked.batch,
-            updates: parked.updates,
-            encodings: parked.encodings,
-            publications: parked.publications,
-            latent_exports: parked.latent_exports,
-            exports: parked.exports,
-            features: parked.features,
-            returns: parked.returns,
-            plans: parked.plans,
-            latents_entered: parked.latents_entered,
-        }
-    }
-
-    /// Validate every owner's update and record the device half of the
-    /// commit: the end of the read leases, the completion flags, the end of
-    /// the latent pool's use and the seal of the output. The returned
-    /// commit is applied once that work was performed
-    /// ([`Self::apply_commit`]).
-    pub(crate) fn issue_commit(&mut self) -> std::result::Result<Commit, Failure> {
-        let failed = Failure::new(PHASE);
-        let tensors = &self.storage.tensors;
-        self.batch
-            .end_reads(tensors, &self.job, &[])
-            .map_err(&failed)?;
-        self.batch.set_flags(tensors, &self.job).map_err(&failed)?;
-        self.batch.validate(self.plan, tensors).map_err(&failed)?;
-        let updates: Vec<LatentUpdate> = self
-            .updates
-            .iter()
-            .map(|(_, update)| update.clone())
-            .collect();
-        if !updates.is_empty() {
-            self.parts
-                .latents()
-                .and_then(|latents| latents.pool.validate_updates(&updates))
-                .map_err(&failed)?;
-        }
-        self.leave_latents().map_err(&failed)?;
-        self.batch
-            .seal(&self.storage.events, &self.job)
-            .map_err(&failed)?;
-        for (index, update) in &self.updates {
-            self.batch.calls[*index]
-                .output
-                .apply_latent_update(update)
-                .map_err(&failed)?;
-        }
-        self.requests
-            .validate_pending(&Batch::<()>::pending(self.plan))
-            .map_err(&failed)?;
-        Ok(Commit { updates })
-    }
-
-    /// Apply an issued commit from the `completion` of the job that
-    /// performed it: check what the forwards' calls returned, read the
-    /// guidance plans they asked for, publish the exports they issued,
-    /// then apply the trajectory commits, open the planned trajectories,
-    /// register the exports, make the writes visible and record the calls
-    /// as pending. A failure after the exports' check is fatal.
-    pub(crate) fn apply_commit(
-        &mut self,
-        commit: Commit,
-        completion: &mut Completion,
-    ) -> std::result::Result<(), Failure> {
-        let failed = Failure::new(PHASE);
-        let Commit { updates } = commit;
-        for expected in std::mem::take(&mut self.returns) {
-            let returned = completion.returned().map_err(&failed)?;
-            if returned != expected {
-                return Err(failed(Error::Interface(format!(
-                    "a decoding call staged {returned:?} bytes of images of {expected:?} bytes"
-                ))));
-            }
-        }
-        let mut planned = Vec::new();
-        for plan in std::mem::take(&mut self.plans) {
-            planned.push(self.planned_trajectory(plan, completion).map_err(&failed)?);
-        }
-        for (index, export) in std::mem::take(&mut self.exports) {
-            let pool = &self.parts.latents().map_err(&failed)?.pool;
-            latents::locate_export(
-                pool,
-                export,
-                &mut self.publications,
-                &mut self.batch.calls[index].output,
-            )
-            .map_err(&failed)?;
-        }
-        for (index, write, export) in std::mem::take(&mut self.features) {
-            self.publications
-                .locate(
-                    &self.storage.tensors,
-                    &write,
-                    export,
-                    &mut self.batch.calls[index].output,
-                )
-                .map_err(&failed)?;
-        }
-        self.publications
-            .validate(&self.storage.tensors)
-            .map_err(&failed)?;
-
-        // Every owner accepted its update. Any failure from here is fatal.
-        let fatal = Failure::fatal(PHASE);
-        if !updates.is_empty() {
-            let cancelled = self
-                .parts
-                .latents_mut()
-                .map_err(&fatal)?
-                .pool
-                .apply_updates(&updates);
-            for transfer in cancelled {
-                // Released trajectories' pending imports end; their pages
-                // retire with the transfer.
-                transfer.read().cancel().map_err(&fatal)?;
-            }
-        }
-        for (slot, trajectory) in planned {
-            self.parts.trajectories.open(slot, trajectory);
-        }
-        self.publications
-            .register(&self.storage.tensors)
-            .map_err(&fatal)?;
-        self.batch
-            .commit(self.plan, &self.storage.tensors, self.requests)
-    }
-
-    /// End the batch's use of the latent pool on its stream.
-    fn leave_latents(&mut self) -> Result<()> {
-        if std::mem::take(&mut self.latents_entered) {
-            self.parts
-                .latents_mut()?
-                .leave(self.batch.issue(&self.job))?;
-        }
-        Ok(())
-    }
-
-    /// Retire every reservation after a failure before the commit point,
-    /// recording the fences that end them; storage returns once those
-    /// fences were performed and complete.
-    pub(crate) fn discard(&mut self) -> Result<()> {
-        let left = self.leave_latents();
-        self.exports
-            .drain(..)
-            .for_each(|(_, export)| export.revoke());
-        self.features
-            .drain(..)
-            .for_each(|(_, _, export)| export.revoke());
-        let revoked = self.publications.revoke();
-        let exported = std::mem::take(&mut self.latent_exports);
-        if !exported.is_empty()
-            && let Ok(latents) = self.parts.latents()
-        {
-            // The versions retire once their transports drop them.
-            latents.pool.release_exports(&exported);
-        }
-        for encoding in self.encodings.drain(..) {
-            // Unconfigured encodings return their lane capacity.
-            let _ = encoding.task.cancel(true);
-        }
-        let discarded = self
-            .batch
-            .discard(&self.storage.tensors, &self.storage.events, &self.job);
-        left.and(revoked).and(discarded)
-    }
-}
-
-/// The parts of the backend an image batch executes with: the image
-/// model's facts and host policy, the rank's runners, and the storage its
-/// trajectories and products live in.
-pub(crate) struct ImageParts<'a> {
-    pub(crate) model: &'a ImageModel,
-    pub(crate) policy: &'a ImagePolicy,
-    pub(crate) encoders: &'a mut EncoderRunners,
-    pub(crate) denoisers: &'a mut DenoiserRunners,
-    pub(crate) decoders: &'a mut DecoderRunners,
-    pub(crate) latents: Option<&'a mut LatentCache>,
-    pub(crate) trajectories: &'a mut Trajectories,
-    /// The output leases of image batches.
-    pub(crate) outputs: &'a mut OutputPool,
-    pub(crate) host: &'a HostLane<ImageTask>,
-}
-
-impl ImageParts<'_> {
-    pub(crate) fn facts(&self) -> &ImageModel {
-        self.model
-    }
-
-    pub(crate) fn policy(&self) -> &ImagePolicy {
-        self.policy
-    }
-
-    /// The image denoiser.
-    pub(crate) fn denoiser(&self) -> Option<&DenoiserRunner> {
-        self.denoisers.image.as_ref().map(|(_, runner)| runner)
-    }
-
-    pub(crate) fn denoiser_mut(&mut self) -> Option<&mut DenoiserRunner> {
-        self.denoisers.image.as_mut().map(|(_, runner)| runner)
-    }
-
-    pub(crate) fn latents(&self) -> Result<&LatentCache> {
-        self.latents
-            .as_deref()
-            .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
-    }
-
-    fn latents_mut(&mut self) -> Result<&mut LatentCache> {
-        self.latents
-            .as_deref_mut()
-            .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))
-    }
-
-    /// The latent pool and its storage, for trajectory transfers.
-    pub(crate) fn latent_pool(&mut self) -> Result<(&mut LatentPool, &LatentStorage)> {
-        let latents = self.latents_mut()?;
-        Ok((&mut latents.pool, &latents.storage))
-    }
-
-    /// Order work on `stream` that reads the latent pool's pages after the
-    /// pool's previous user; [`Self::leave_latents`] ends it.
-    pub(crate) fn enter_latents(&self, stream: impl Issue) -> Result<()> {
-        self.latents()?.enter(stream)
-    }
-
-    /// End work on `stream` that used the latent pool's pages.
-    pub(crate) fn leave_latents(&mut self, stream: impl Issue) -> Result<()> {
-        self.latents_mut()?.leave(stream)
-    }
-
-    /// The image decoder.
-    pub(crate) fn decoder(&self) -> Option<&DecoderRunner> {
-        self.decoders.image.as_ref().map(|(_, runner)| runner)
-    }
-}
-
-/// The next job of an image batch: the read of its host-gated predicates
-/// when it has any, then its forward with the issued commit, and after a
-/// failure the retirement of what it reserved. `None` when the batch
-/// failed without needing the lane again.
-pub(crate) fn forward(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    kind: CallKind,
-) -> std::result::Result<Option<Job>, WorkerError> {
-    let step = {
-        let (plan, pending, inputs) = batch.image_parts();
-        let step = record(backend.parts(), plan, kind, pending.take(), inputs)?;
-        match step {
-            Step::Job(job, state) => {
-                *pending = Some(state);
-                return Ok(Some(job));
-            }
-            Step::Failed(failure) => failure,
-        }
-    };
-    fail(backend, batch, step).map(|()| None)
-}
-
-/// What recording an image batch's next job leaves.
-enum Step {
-    /// The job to submit, and the batch's state while it is on the lane.
-    Job(Job, Pending),
-    /// The batch failed and holds nothing.
-    Failed(Failure),
-}
-
-/// The encoder, denoiser or decoder serving a batch of `kind`: its device,
-/// its stream and the payload words the batch reads back.
-fn placement(
-    kind: CallKind,
-    image: &ImageParts<'_>,
-    plan: &BatchPlan,
-) -> Result<(Option<DeviceId>, Option<Stream>, usize)> {
-    match kind {
-        CallKind::Media(MediaCall::VisionEncoding | MediaCall::LatentEncoding) => {
-            crate::runner::encoder::image_placement(image, plan)
-        }
-        CallKind::Media(MediaCall::LatentPreparation | MediaCall::Denoising) => {
-            crate::runner::denoiser::image::image_placement(image)
-        }
-        CallKind::Media(MediaCall::ImageDecoding) => {
-            crate::runner::decoder::image_placement(image, plan)
-        }
-        _ => Err(Error::Unsupported(format!(
-            "{} is served by another runtime",
-            kind.as_str()
+/// The value range a prepared write names.
+fn value_range(name: Option<&str>) -> Result<Option<ValueRange>> {
+    match name {
+        None => Ok(None),
+        Some("unit") => Ok(Some(ValueRange::Unit)),
+        Some("signed_unit") => Ok(Some(ValueRange::SignedUnit)),
+        Some(other) => Err(Error::Interface(format!(
+            "the executor prepared the unknown value range {other:?}"
         ))),
     }
 }
 
-/// Record the batch's next job from its state between jobs.
-fn record(
-    parts: Parts<'_>,
+/// Add to the preparation's step, per call of an image lane, what the
+/// executor reads of it before anything is leased (`calls[i].image`): its
+/// input image, the host-prepared facts of an inline one (`inputs`) or the
+/// shape and metadata of a resident product, its request's input image
+/// count and its progress.
+pub(crate) fn describe(
+    step: &mut serde_json::Value,
     plan: &BatchPlan,
-    kind: CallKind,
-    state: Option<Pending>,
-    inputs: &mut Option<Inputs>,
-) -> std::result::Result<Step, WorkerError> {
-    let Parts {
-        placement: group,
-        rank,
-        requests,
-        storage,
-        text,
-        image,
-        experts,
-        ..
-    } = parts;
-    let (Some(image), Some(storage)) = (image, storage) else {
-        return Err(unsupported(kind, "image"));
-    };
+    calls: &[CallState<LaneCall>],
+    requests: &RequestPool,
+    tensors: &ProductStore,
+    inputs: Option<&InlineImages>,
+) -> Result<()> {
+    for (index, (call, state)) in plan.calls.iter().zip(calls).enumerate() {
+        let input = if state.refused() || !state.active {
+            Input::None
+        } else if call.input_image.is_some() {
+            let image = inputs
+                .map(|inputs| inputs.image(index))
+                .transpose()?
+                .flatten()
+                .ok_or_else(|| Error::Invariant("an inline image was not prepared".into()))?;
+            Input::Inline(image.facts)
+        } else if let Some(reference) = &call.image_input {
+            let (shape, metadata) = tensors.metadata(reference)?;
+            Input::Resident(shape, metadata)
+        } else {
+            Input::None
+        };
+        let input_images = requests
+            .get(call.request_key.request_id.0)
+            .map(|request| request.admission().input_images)
+            .unwrap_or(0);
+        // The host prepared an inline image's pixels already: the executor
+        // reads its facts, not its payload.
+        if call.input_image.is_some() {
+            step["calls"][index]["call"]["input_image"] = serde_json::Value::Null;
+        }
+        step["calls"][index]["image"] = described(input, input_images, &state.output.progress)?;
+    }
+    Ok(())
+}
 
-    let opened = match state {
-        Some(Pending::Opened(opening)) => Some(opening),
-        None => None,
-        Some(Pending::Failing(parked, failure)) => {
-            // What the batch recorded was performed: retire what it
-            // reserved, behind that work.
-            let mut batch = ImageBatch::resume(image, storage, requests, plan, *parked);
-            let discarded = batch.discard();
-            let (job, _) = batch.park();
-            let failure = match discarded {
-                Ok(()) => failure,
-                // Storage the cleanup could not retire stays reserved; the
-                // rank cannot reuse it safely.
-                Err(cleanup) => Failure::fatal(PHASE)(cleanup),
-            };
-            return Ok(Step::Job(job, Pending::Discarding(failure)));
-        }
-        Some(Pending::Resumed(resumed)) => {
-            // The forward continues from the completion of its last job.
-            let (parked, resume, mut completion) = *resumed;
-            let mut batch = ImageBatch::resume(image, storage, requests, plan, parked);
-            let progressed = match resume {
-                Resume::Encode(resume) => batch.resume_encode(resume, &mut completion),
-                Resume::Plan(resume) => {
-                    batch.resume_planned(*resume, &mut completion, text, experts)
-                }
-                Resume::Denoise(resume) => {
-                    batch.resume_denoise(*resume, &mut completion, text, experts)
-                }
-            };
-            return Ok(advance(batch, progressed.map_err(Failure::new(PHASE))));
-        }
-        Some(
-            Pending::Predicates(_)
-            | Pending::Resuming(_)
-            | Pending::Committing(_)
-            | Pending::Discarding(_),
-        ) => {
-            return Err(WorkerError::classify(
-                Error::Invariant(
-                    "an image batch's job was prepared before its last completed".into(),
-                ),
-                Some("image batch"),
+/// A call's input image as [`describe`] states it.
+enum Input {
+    None,
+    /// An inline image's host-prepared facts.
+    Inline(ImageFacts),
+    /// A resident image product's value shape and metadata.
+    Resident(Vec<u64>, Option<Metadata>),
+}
+
+/// One call's `image` entry of the preparation's step.
+fn described(
+    input: Input,
+    input_images: u32,
+    progress: &RequestProgress,
+) -> Result<serde_json::Value> {
+    let input = match input {
+        Input::None => serde_json::Value::Null,
+        Input::Inline(facts) => serde_json::json!({"inline": facts.to_json()}),
+        Input::Resident(
+            shape,
+            Some(Metadata::Image {
+                height,
+                width,
+                value_range,
+            }),
+        ) => serde_json::json!({"resident": {
+            "shape": shape,
+            "height": height,
+            "width": width,
+            "value_range": value_range_name(value_range),
+        }}),
+        Input::Resident(..) => {
+            return Err(Error::Invalid(
+                "a resident image input requires image product metadata".into(),
             ));
         }
     };
-    let (device, stream, words) = match placement(kind, &image, plan) {
-        Ok(placed) => placed,
-        Err(error) => return Ok(Step::Failed(Failure::new(PHASE)(error))),
-    };
+    Ok(serde_json::json!({
+        "input": input,
+        "input_images": input_images,
+        "progress": {
+            "logical": progress.logical_position,
+            "visible": progress.cache_visible_len,
+        },
+    }))
+}
 
-    // The batch's first job binds its calls and reads its host-gated
-    // predicates: they decide which calls it reserves for.
-    let opening = match opened {
-        Some(opening) => opening,
-        None => {
-            let job = Job::new();
-            let opened = Opening::open(
-                requests,
-                &storage.tensors,
-                group,
-                rank,
-                plan,
-                device,
-                job.on(stream.as_ref()),
-                |_| true,
-            );
-            match opened {
-                Ok(opening) if opening.reads_predicates() => {
-                    return Ok(Step::Job(job, Pending::Predicates(opening)));
-                }
-                Ok(opening) => opening,
-                // The reads recorded so far are performed; the batch
-                // reserved nothing.
-                Err(error) if !job.is_empty() => {
-                    return Ok(Step::Job(
-                        job,
-                        Pending::Discarding(Failure::new(PHASE)(error)),
-                    ));
-                }
-                Err(error) => return Ok(Step::Failed(Failure::new(PHASE)(error))),
-            }
-        }
-    };
+/// The product field a prepared image write names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Field {
+    EncoderOutput,
+    ImageOutput,
+}
 
-    let opened = ImageBatch::open(
-        image, storage, requests, plan, opening, device, stream, words,
-    );
-    let mut batch = match opened {
-        Ok(batch) => batch,
-        Err(error) => return Ok(Step::Failed(Failure::new(PHASE)(error))),
-    };
-    let progressed = (|| -> Result<Progress> {
-        Ok(match kind {
-            CallKind::Media(call @ (MediaCall::VisionEncoding | MediaCall::LatentEncoding)) => {
-                let images = inputs
-                    .take()
-                    .map(Inputs::take)
-                    .transpose()?
-                    .unwrap_or_default();
-                batch.encode(call, images)?
-            }
-            CallKind::Media(MediaCall::LatentPreparation) => {
-                Progress::done(batch.prepare_latents()?)
-            }
-            CallKind::Media(MediaCall::Denoising) => batch.denoise(text, experts)?,
-            CallKind::Media(MediaCall::ImageDecoding) => Progress::done(batch.decode()?),
-            _ => Progress::done(ForwardStats::default()),
+/// The metadata a prepared image write publishes with.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PreparedMetadata {
+    Feature {
+        height: u32,
+        width: u32,
+    },
+    Image {
+        height: u32,
+        width: u32,
+        value_range: Option<String>,
+    },
+}
+
+impl PreparedMetadata {
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(match self {
+            Self::Feature { height, width } => Metadata::Feature {
+                height: *height,
+                width: *width,
+            },
+            Self::Image {
+                height,
+                width,
+                value_range: range,
+            } => Metadata::Image {
+                height: *height,
+                width: *width,
+                value_range: value_range(range.as_deref())?,
+            },
         })
-    })()
-    .map_err(Failure::new(PHASE));
-    Ok(advance(batch, progressed))
+    }
 }
 
-/// Park the batch behind what its forward recorded: its last job with the
-/// issued commit when the forward is recorded to its end, the job that
-/// ends inside the forward otherwise, and what a failed recording had
-/// recorded.
-fn advance(mut batch: ImageBatch<'_>, progressed: std::result::Result<Progress, Failure>) -> Step {
-    // The commit is issued behind a forward recorded to its end.
-    let progressed = progressed.and_then(|progress| match progress {
-        Progress::Done(stats) => batch
-            .issue_commit()
-            .map(|commit| Recorded::Whole(commit, stats)),
-        Progress::Boundary(resume) => Ok(Recorded::Part(resume)),
-    });
-
-    let (job, parked) = batch.park();
-    let state = match progressed {
-        Ok(Recorded::Whole(commit, stats)) => {
-            Pending::Committing(Box::new((parked, commit, *stats)))
-        }
-        Ok(Recorded::Part(resume)) => Pending::Resuming(Box::new((parked, resume))),
-        // What the batch recorded before it failed is performed before its
-        // reservations are retired: the events it queued are due, and its
-        // writes are abandoned only behind its work.
-        Err(failure) => Pending::Failing(Box::new(parked), failure),
-    };
-    Step::Job(job, state)
+/// One image product a call writes, as the executor prepared it.
+#[derive(Clone, Debug, Deserialize)]
+struct PreparedWrite {
+    field: Field,
+    shape: Vec<u64>,
+    #[serde(default)]
+    metadata: Option<PreparedMetadata>,
 }
 
-/// What a batch's job holds of its forward.
-enum Recorded {
-    /// The rest of the forward, with the issued commit.
-    Whole(Commit, Box<ForwardStats>),
-    /// The forward up to a job boundary.
-    Part(Resume),
+/// What an image call reads and writes, as the executor prepared it
+/// (`prepared[i].image`).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct Prepared {
+    /// Lease the call's resident image (`image_input`).
+    #[serde(default)]
+    read: bool,
+    /// Pass the call's host-prepared inline pixels.
+    #[serde(default)]
+    pixels: bool,
+    #[serde(default)]
+    writes: Vec<PreparedWrite>,
+    /// Decoded RGB bytes lent from the batch's output lease.
+    #[serde(default)]
+    bytes: u64,
+    /// Bind the call's trajectory in the latent ledger.
+    #[serde(default)]
+    latent: bool,
 }
 
-/// Apply the completion of the job [`forward`] prepared last.
-pub(crate) fn complete(
-    backend: &mut WorkerBackend,
-    batch: &mut WorkerBatch,
-    kind: CallKind,
-    completion: Completion,
-) -> std::result::Result<(), WorkerError> {
-    /// What the completion leaves to do on the worker batch.
-    enum Done {
-        Next(Pending),
-        Launched(Box<Launched>),
-        Failed(Failure),
+/// Each call's prepared image entry, `None` for a call the executor
+/// prepared nothing of the image's for.
+fn prepared(step: &serde_json::Value) -> Result<Vec<Option<Prepared>>> {
+    let entries = step
+        .get("prepared")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Invariant("a prepared batch has no preparation".into()))?;
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("image")
+                .filter(|image| !image.is_null())
+                .map(|image| {
+                    serde_json::from_value::<Prepared>(image.clone()).map_err(|error| {
+                        Error::Interface(format!("the executor's image preparation: {error}"))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+/// Output words a prepared batch lends for its calls' decoded bytes.
+pub(crate) fn lease_words(step: &serde_json::Value) -> Result<usize> {
+    let bytes: u64 = prepared(step)?
+        .iter()
+        .flatten()
+        .map(|prepared| prepared.bytes)
+        .sum();
+    usize::try_from(bytes.div_ceil(size_of::<i64>() as u64))
+        .map_err(|_| Error::Invalid("decoded images exceed the output words".into()))
+}
+
+/// Bytes of one decoded pixel: its RGB channels.
+const PIXEL_BYTES: u64 = 3;
+
+/// One image product a call writes, bound at its prepared shape.
+struct ImageWrite {
+    field: Field,
+    write: ProductBuffer,
+    shape: Vec<u64>,
+    metadata: Option<Metadata>,
+}
+
+/// What one call of an image lane holds through its batch.
+#[derive(Default)]
+pub(crate) struct ImageCall {
+    /// The image products it writes.
+    writes: Vec<ImageWrite>,
+    /// Its trajectory's banks and pages in the latent ledger.
+    latent: Option<(Banks, LatentParams)>,
+    /// The trajectory exports it issued, published once their work was
+    /// performed.
+    exports: Vec<PendingExport>,
+    /// The bytes its decoded image is staged in, with its size.
+    bytes: Option<(StorageView, u32, u32)>,
+    /// The PNG encoding of its decoded image.
+    encoding: Option<Arc<HostTask<ImageTask>>>,
+    /// The slots of its guidance prefixes (rows on slots other than its
+    /// own).
+    alternates: Vec<u32>,
+}
+
+/// What an image lane's batch holds through its last job.
+#[derive(Default)]
+pub(crate) struct ImageBatch {
+    /// The batch uses the ledger's banks on its stream
+    /// ([`LatentLedger::enter`]).
+    entered: bool,
+    /// It reserved rows over the prefix cache, whose place in the cache's
+    /// stream order it records.
+    ordered: bool,
+    /// The host pixels its execution copies from, kept until the stream
+    /// passed that work.
+    pixels: Vec<StorageView>,
+    /// The trajectory versions it exported from the ledger's pool, released
+    /// from it if the batch fails before committing.
+    versions: Vec<BufferId>,
+}
+
+/// The rank's owners an image lane's batch binds and publishes through.
+pub(crate) struct Owners<'a> {
+    pub(crate) store: &'a ProductStore,
+    pub(crate) transports: &'a Transports,
+    pub(crate) events: &'a EventPool,
+    pub(crate) requests: &'a RequestPool,
+    pub(crate) prefix_cache: Option<&'a mut PrefixCache>,
+    pub(crate) pages: Option<&'a mut Pages>,
+    pub(crate) ledger: Option<&'a mut LatentLedger>,
+    pub(crate) images: Option<&'a Images>,
+}
+
+impl Owners<'_> {
+    fn ledger(&mut self) -> Result<&mut LatentLedger> {
+        self.ledger
+            .as_deref_mut()
+            .ok_or_else(|| Error::Invalid("this rank keeps no latent trajectories".into()))
     }
 
-    let done = {
-        let (plan, pending, _) = batch.image_parts();
-        match (pending.take(), completion.check()) {
-            // A predicate that could not be read fails the batch, which
-            // has reserved nothing yet.
-            (Some(Pending::Predicates(_)), Err(failure)) => {
-                Done::Failed(Failure::new(PHASE)(failure.error))
+    fn prefix_cache(&mut self) -> Result<&mut PrefixCache> {
+        self.prefix_cache
+            .as_deref_mut()
+            .ok_or_else(|| Error::Unsupported("image trajectories require a prefix cache".into()))
+    }
+}
+
+/// `view`'s leading elements as `shape`.
+fn shaped(view: &StorageView, shape: &[u64]) -> Result<StorageView> {
+    let elements = shape.iter().try_fold(1_u64, |count, &extent| {
+        count
+            .checked_mul(extent)
+            .ok_or_else(|| Error::Invalid("a prepared shape overflows".into()))
+    })?;
+    if !view.is_contiguous() || elements > view.numel() {
+        return Err(Error::Invalid(
+            "a prepared image write exceeds its product's storage".into(),
+        ));
+    }
+    let signed: Vec<i64> = shape.iter().map(|&extent| extent as i64).collect();
+    StorageView::contiguous(
+        Arc::clone(view.memory()),
+        view.offset(),
+        view.dtype(),
+        &signed,
+    )
+}
+
+/// The scheduler's latent parameters of `call`.
+fn latent_params<'p>(plan: &'p BatchPlan, call: &Call) -> Result<&'p LatentParams> {
+    plan.latent_params
+        .iter()
+        .find(|params| params.request_key == call.request_key && params.call_id == call.call_id)
+        .ok_or_else(|| Error::Invalid("trajectory call has no latent allocation".into()))
+}
+
+/// Bind every image call of `batch` as the executor prepared it
+/// (`step["prepared"]`), recording the stream work into `job`, and note
+/// each bound trajectory in `step` (`calls[i].latent`) and a denoising
+/// batch's slots (`calls[i].image.allocated`). Returns the tensors the
+/// execution reads and writes, in the module's order.
+pub(crate) fn bind(
+    owners: &mut Owners<'_>,
+    plan: &BatchPlan,
+    batch: &mut Batch<LaneCall>,
+    record: &mut ImageBatch,
+    step: &mut serde_json::Value,
+    job: &Job,
+    inputs: Option<&InlineImages>,
+) -> Result<Vec<StorageView>> {
+    let prepared = prepared(step)?;
+    if prepared.len() != plan.calls.len() {
+        return Err(Error::Interface(
+            "the executor prepared another number of calls".into(),
+        ));
+    }
+    let stream = batch.stream.clone();
+    let issue = job.on(stream.as_ref());
+    let target = batch.target();
+    let allocations: HashMap<BufferId, BufferAllocation> = plan
+        .buffer_allocations
+        .iter()
+        .map(|allocation| (allocation.buffer, *allocation))
+        .collect();
+    let mut tensors = Vec::new();
+    for (index, (call, prepared)) in plan.calls.iter().zip(&prepared).enumerate() {
+        let Some(prepared) = prepared else {
+            continue;
+        };
+        if batch.calls[index].refused() {
+            continue;
+        }
+        let active = batch.calls[index].active;
+        let slot = batch.calls[index].slot;
+
+        // The resident image it reads, whose size a decoding stages.
+        let mut size = None;
+        if prepared.read {
+            let reference = call.image_input.as_ref().ok_or_else(|| {
+                Error::Interface("the executor prepared a read of no resident image".into())
+            })?;
+            let read = owners
+                .store
+                .consume(reference, call.call_id, Some(target), issue)?;
+            batch.reads.push(Arc::clone(&read));
+            if read.region().is_some() {
+                return Err(Error::Invalid("a resident image is read whole".into()));
             }
-            (Some(Pending::Predicates(mut opening)), Ok(mut completion)) => {
-                match opening.predicates(&mut completion) {
-                    Ok(()) => Done::Next(Pending::Opened(opening)),
-                    Err(error) => Done::Failed(Failure::new(PHASE)(error)),
-                }
+            if let Some(Metadata::Image { height, width, .. }) = read.metadata() {
+                size = Some((height, width));
             }
-            // A job that ends inside the forward completed: the forward
-            // continues from its completion in the next job.
-            (Some(Pending::Resuming(resuming)), Ok(completion)) => {
-                let (parked, resume) = *resuming;
-                Done::Next(Pending::Resumed(Box::new((parked, resume, completion))))
+            tensors.push(read.value().clone());
+        }
+
+        // Its inline pixels, prepared on the host.
+        if prepared.pixels {
+            let image = inputs
+                .map(|inputs| inputs.image(index))
+                .transpose()?
+                .flatten()
+                .ok_or_else(|| Error::Invariant("an inline image was not prepared".into()))?;
+            record.pixels.push(image.pixels.clone());
+            tensors.push(image.pixels);
+        }
+
+        // Its products, at their prepared shapes.
+        for write in &prepared.writes {
+            let metadata = write
+                .metadata
+                .as_ref()
+                .map(PreparedMetadata::metadata)
+                .transpose()?;
+            let bound = reserve_write(owners.store, call, write, target, &allocations)?;
+            batch.writes.push(bound.clone());
+            tensors.push(shaped(&bound.view(), &write.shape)?);
+            batch.calls[index].forward.image.writes.push(ImageWrite {
+                field: write.field,
+                write: bound,
+                shape: write.shape.clone(),
+                metadata,
+            });
+        }
+
+        // Its trajectory in the ledger. A trajectory opens on its request's
+        // exported conditioning context.
+        if prepared.latent
+            && active
+            && call.kind == CallKind::Media(MediaCall::LatentPreparation)
+            && let Some(prefix_cache) = owners.prefix_cache.as_deref()
+        {
+            let buffer = call.cache_input.ok_or_else(|| {
+                Error::Invalid("image trajectory requires its conditioning prefix cache".into())
+            })?;
+            let visible = batch.calls[index].output.progress.cache_visible_len;
+            prefix_cache.tables().coordinates(slot as u32, visible)?;
+            prefix_cache.validate_conditioning(call.request_key, buffer, slot as u32, visible)?;
+        }
+        if prepared.latent && active {
+            let params = latent_params(plan, call)?;
+            let request = owners.requests.get(call.request_key.request_id.0)?;
+            let image = request.admission().image.as_ref().ok_or_else(|| {
+                Error::Invalid("an image trajectory requires image parameters".into())
+            })?;
+            let ledger = owners.ledger()?;
+            if !record.entered {
+                ledger.enter(issue)?;
+                record.entered = true;
             }
-            (Some(Pending::Resuming(resuming)), Err(failure)) => {
-                let (parked, _) = *resuming;
-                Done::Next(Pending::Failing(
-                    Box::new(parked),
-                    Failure::new(PHASE)(failure.error),
-                ))
+            let bound = ledger.bind_image(slot, call, params, image)?;
+            step["calls"][index]["latent"] = bound.to_json();
+            size = Some((bound.params.height, bound.params.width));
+            let state = &mut batch.calls[index];
+            state.forward.products.latent = Some(bound.update);
+            state.forward.image.latent = Some((bound.banks, bound.params));
+        }
+
+        // Its decoded bytes, lent from the batch's output lease, and their
+        // PNG encoding on a reporting rank.
+        if prepared.bytes > 0 {
+            let (height, width) =
+                size.ok_or_else(|| Error::Invalid("a decoded image's size is unknown".into()))?;
+            let bytes = prepared.bytes;
+            if bytes != PIXEL_BYTES * u64::from(height) * u64::from(width) {
+                return Err(Error::Interface(format!(
+                    "a {height}x{width} image stages {bytes} bytes"
+                )));
             }
-            // The job failed on its lane, which still made its event
-            // records: the batch retires what it reserved.
-            (Some(Pending::Committing(committing)), Err(failure)) => {
-                let (parked, _, _) = *committing;
-                Done::Next(Pending::Failing(
-                    Box::new(parked),
-                    Failure::new(PHASE)(failure.error),
-                ))
-            }
-            (Some(Pending::Committing(committing)), Ok(mut completion)) => {
-                let (parked, commit, mut stats) = *committing;
-                let Parts {
-                    requests,
-                    storage,
-                    image,
-                    ..
-                } = backend.parts();
-                let (Some(image), Some(storage)) = (image, storage) else {
-                    return Err(unsupported(kind, "image"));
-                };
-                let mut resumed = ImageBatch::resume(image, storage, requests, plan, parked);
-                match resumed.apply_commit(commit, &mut completion) {
-                    Ok(()) => {
-                        let elapsed = resumed.batch.started.elapsed().as_micros() as u64;
-                        stats.component_us.insert("image_execute".into(), elapsed);
-                        let encodings = std::mem::take(&mut resumed.encodings);
-                        let host = (!encodings.is_empty()).then(|| {
-                            Box::new(Encodings {
-                                encodings,
-                                submitted: false,
-                            }) as Box<dyn HostStage>
-                        });
-                        let (_, parked) = resumed.park();
-                        Done::Launched(Box::new(parked.batch.launch(
-                            stats,
-                            "image_materialize",
-                            host,
-                        )))
-                    }
-                    Err(failure) if failure.committed => Done::Failed(failure),
-                    Err(failure) => {
-                        let (_, parked) = resumed.park();
-                        Done::Next(Pending::Failing(Box::new(parked), failure))
-                    }
-                }
-            }
-            // The lane performed what the failed batch had recorded;
-            // whether that failed again changes nothing of what follows.
-            (Some(Pending::Failing(parked, failure)), _) => {
-                Done::Next(Pending::Failing(parked, failure))
-            }
-            (Some(Pending::Discarding(failure)), Ok(_)) => Done::Failed(failure),
-            // Fences the retirement recorded were not all made.
-            (Some(Pending::Discarding(_)), Err(cleanup)) => {
-                Done::Failed(Failure::fatal(PHASE)(cleanup.error))
-            }
-            (Some(Pending::Opened(_) | Pending::Resumed(_)) | None, _) => {
-                return Err(WorkerError::classify(
-                    Error::State("an image batch has no job on its lane"),
-                    Some("image batch"),
+            if bytes > call.bounds.max_completion_bytes {
+                return Err(Error::Invalid(
+                    "image pixels exceed the call's completion byte bound".into(),
                 ));
             }
+            let count = usize::try_from(bytes)
+                .map_err(|_| Error::Invalid("decoded bytes exceed the host range".into()))?;
+            let view = lock(&batch.buffer).lend_bytes(count, batch.device, issue, owners.events)?;
+            if batch.reports {
+                let images = owners.images.ok_or_else(|| {
+                    Error::Unsupported("image encoding requires the image host lane".into())
+                })?;
+                batch.calls[index].forward.image.encoding = Some(images.host.reserve()?);
+            }
+            tensors.push(view.clone());
+            batch.calls[index].forward.image.bytes = Some((view, height, width));
         }
-    };
-    match done {
-        Done::Next(state) => {
-            *batch.image_parts().1 = Some(state);
-            Ok(())
-        }
-        Done::Launched(launched) => {
-            batch.launch(*launched);
-            batch.set_stage(Stage::Done);
-            Ok(())
-        }
-        Done::Failed(failure) => fail(backend, batch, failure),
     }
+
+    // A denoising batch's attention rows.
+    let denoising = plan
+        .calls
+        .first()
+        .is_some_and(|call| call.kind == CallKind::Media(MediaCall::Denoising));
+    if denoising
+        && owners.pages.is_some()
+        && let Some(columns) = reserve_rows(owners, plan, batch, step, issue)?
+    {
+        record.ordered = true;
+        tensors.push(columns);
+    }
+    Ok(tensors)
+}
+
+/// Reserve the product `write` names of `call` in `target` memory: a
+/// feature in the encoder cache, or an image at the scheduler's placement
+/// (`allocations`) and the prepared shape.
+fn reserve_write(
+    store: &ProductStore,
+    call: &Call,
+    write: &PreparedWrite,
+    target: MemoryKind,
+    allocations: &HashMap<BufferId, BufferAllocation>,
+) -> Result<ProductBuffer> {
+    match write.field {
+        Field::EncoderOutput => {
+            let product = call.encoder_output.clone().ok_or_else(|| {
+                Error::Interface("the executor prepared an undeclared feature".into())
+            })?;
+            store
+                .reserve_features(
+                    &[(product, target)],
+                    allocations,
+                    OutputPlacement::default(),
+                )?
+                .pop()
+                .ok_or_else(|| Error::Invariant("a feature was not reserved".into()))
+        }
+        Field::ImageOutput => {
+            let product = call.image_output.clone().ok_or_else(|| {
+                Error::Interface("the executor prepared an undeclared image".into())
+            })?;
+            let shapes = HashMap::from([(product.buffer_id(), write.shape.clone())]);
+            store
+                .bind_outputs(
+                    &[(product, target)],
+                    OutputPlacement {
+                        allocations: Some(allocations),
+                        shapes: Some(&shapes),
+                        ..OutputPlacement::default()
+                    },
+                )?
+                .pop()
+                .ok_or_else(|| Error::Invariant("an image was not bound".into()))
+        }
+    }
+}
+
+/// Reserve what a denoising batch's active calls use of the prefix cache,
+/// recording the stream work into `issue`, and return the host
+/// `int64 [5 + 2G, R]` columns of their attention rows; `None` without an
+/// active call.
+///
+/// Every slot the calls' forward rows address and each call's own slot get
+/// their block tables installed and their new units reset; a row on another
+/// slot holds one of the call's guidance prefixes, which the slot keeps
+/// until the trajectory finishes; every row's extent is retained until the
+/// batch's device work retires (writers their prefix and queries, readers
+/// their prefix). Each call's conditioning is its request's exported
+/// context.
+///
+/// The rows, per active call in call order: its forward rows in the plan's
+/// order, then one conditioning row. Fields: call index, slot, sequence
+/// length, query length, cache write, then per cache group the first
+/// selected page and the page count. A row reads `seq_len - query_len`
+/// tokens of its slot, but a read-only row on a slot the call also
+/// prefills (a write row whose sequence is its query) reads that prefill's
+/// tokens; the conditioning row reads the request's visible context on its
+/// own slot, with no query of its own.
+fn reserve_rows(
+    owners: &mut Owners<'_>,
+    plan: &BatchPlan,
+    batch: &mut Batch<LaneCall>,
+    step: &mut serde_json::Value,
+    issue: Recorder<'_>,
+) -> Result<Option<StorageView>> {
+    let active: Vec<usize> = (0..plan.calls.len())
+        .filter(|&index| batch.calls[index].active)
+        .collect();
+    if active.is_empty() {
+        return Ok(None);
+    }
+    let forward = &plan.forward;
+    let rows = ForwardRows::new(&forward.call_indices, plan.calls.len())?;
+
+    // Conditioning K/V and earlier prefixes were written by batches over
+    // the prefix cache, possibly on another stream.
+    if let Some(pages) = owners.pages.as_deref() {
+        pages.order().wait(issue)?;
+    }
+
+    // Install every addressed slot's tables and reset their new units.
+    let slots: BTreeSet<u32> = active
+        .iter()
+        .flat_map(|&index| {
+            rows.of(index)
+                .iter()
+                .map(|&row| forward.request_pool_indices[row])
+                .chain(std::iter::once(batch.calls[index].slot as u32))
+        })
+        .collect();
+    let pages = owners
+        .pages
+        .as_deref()
+        .ok_or_else(|| Error::Invariant("a denoising lane lost its pages".into()))?;
+    let prefix_cache = owners
+        .prefix_cache
+        .as_deref_mut()
+        .ok_or_else(|| Error::Unsupported("image trajectories require a prefix cache".into()))?;
+    pages.install(prefix_cache, plan, |slot| slots.contains(&slot), issue)?;
+
+    let mut attention = Vec::new();
+    let mut described: Vec<[i64; FORWARD_FIELDS]> = Vec::new();
+    for &index in &active {
+        let call = &plan.calls[index];
+        let key = call.request_key;
+        let own = batch.calls[index].slot as u32;
+        let visible = batch.calls[index].output.progress.cache_visible_len;
+
+        // The request's own conditioning prefix: the context it exported.
+        let buffer = call.cache_input.ok_or_else(|| {
+            Error::Invalid("image trajectory requires its conditioning prefix cache".into())
+        })?;
+        prefix_cache.tables().coordinates(own, visible)?;
+        prefix_cache.validate_conditioning(key, buffer, own, visible)?;
+
+        let call_rows = rows.of(index);
+        let mut alternates = BTreeSet::new();
+        for &row in call_rows {
+            let slot = forward.request_pool_indices[row];
+            let (seq_len, query_len) = (forward.seq_lens[row], forward.query_lens[row]);
+            if seq_len < query_len {
+                return Err(Error::Invalid(
+                    "a forward row's query exceeds its sequence".into(),
+                ));
+            }
+            if slot != own {
+                if seq_len - query_len > prefix_cache.tables().allocated_length(slot) {
+                    return Err(Error::Invalid(
+                        "forward row exceeds alternative-prefix capacity".into(),
+                    ));
+                }
+                prefix_cache.retain_prefix(key, slot);
+                alternates.insert(slot);
+            }
+            // Readers retain their prefix, writers also their query tokens.
+            let length = u64::from(if forward.write_cache[row] {
+                seq_len
+            } else {
+                seq_len - query_len
+            });
+            prefix_cache.retain(key, slot, length, &batch.retirement)?;
+        }
+
+        for &row in call_rows {
+            let slot = forward.request_pool_indices[row];
+            let (seq_len, query_len, write) = (
+                forward.seq_lens[row],
+                forward.query_lens[row],
+                forward.write_cache[row],
+            );
+            let prefix = if write {
+                seq_len - query_len
+            } else {
+                prefill_prefix(forward, call_rows, slot).unwrap_or(seq_len - query_len)
+            };
+            attention.push(AttentionRow {
+                slot,
+                prefix,
+                query: query_len,
+                write,
+            });
+            described.push([
+                index as i64,
+                i64::from(slot),
+                i64::from(seq_len),
+                i64::from(query_len),
+                i64::from(write),
+            ]);
+        }
+        let visible32 = u32::try_from(visible)
+            .map_err(|_| Error::Invalid("a conditioning prefix exceeds the token range".into()))?;
+        let query = call_rows
+            .last()
+            .map_or(1, |&row| forward.query_lens[row].max(1));
+        attention.push(AttentionRow {
+            slot: own,
+            prefix: visible32,
+            query,
+            write: false,
+        });
+        described.push([index as i64, i64::from(own), i64::from(visible32), 0, 0]);
+
+        let allocated: Vec<[u32; 2]> = alternates
+            .iter()
+            .copied()
+            .chain(std::iter::once(own))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|slot| [slot, prefix_cache.tables().allocated_length(slot)])
+            .collect();
+        step["calls"][index]["image"]["allocated"] = serde_json::json!(allocated);
+        batch.calls[index].forward.image.alternates = alternates.into_iter().collect();
+    }
+
+    // Field-major, each cache group's first selected page and page count of
+    // every row follow the rows' own fields.
+    let selected = attention_pages(prefix_cache, &attention)?;
+    let mut columns = field_major(&described);
+    for group in &selected {
+        columns.extend(group.starts.iter().chain(&group.counts));
+    }
+    let fields = FORWARD_FIELDS + 2 * selected.len();
+    host_tensor(&columns, &[fields as i64, attention.len() as i64]).map(Some)
+}
+
+/// The tokens a call prefills into `slot` in this batch: the query of its
+/// write row on `slot` whose sequence is its query (a guidance prefix
+/// written from position zero), which a read-only row on `slot` reads.
+fn prefill_prefix(forward: &ipc::ForwardBatch, rows: &[usize], slot: u32) -> Option<u32> {
+    rows.iter().copied().find_map(|row| {
+        (forward.write_cache[row]
+            && forward.request_pool_indices[row] == slot
+            && forward.seq_lens[row] == forward.query_lens[row])
+            .then_some(forward.query_lens[row])
+    })
+}
+
+/// Record, behind the batch's execution, the publication of what its image
+/// calls wrote: each product fenced at its prepared shape with its metadata
+/// and, for a feature, its export to other ranks and workers; each
+/// trajectory version's export; the PNG encodings of decoded images; the
+/// release of a finished trajectory's guidance prefixes; and the batch's
+/// place in the prefix cache's and the ledger's stream orders. The host
+/// pixels the execution copied from return to their pool once the stream
+/// passed it.
+pub(crate) fn publish(
+    owners: &mut Owners<'_>,
+    plan: &BatchPlan,
+    batch: &mut Batch<LaneCall>,
+    record: &mut ImageBatch,
+    job: &Job,
+) -> Result<()> {
+    let stream = batch.stream.clone();
+    let issue = job.on(stream.as_ref());
+    release_pixels(record, owners.events, issue)?;
+    let exports = owners.transports.exports_remotely() && batch.reports;
+    for (index, call) in plan.calls.iter().enumerate() {
+        let state = &mut batch.calls[index];
+        // Products, then their exports.
+        let writes = std::mem::take(&mut state.forward.image.writes);
+        for image in &writes {
+            owners
+                .store
+                .produced(&image.write, &image.shape, issue, image.metadata)?;
+            if image.field == Field::EncoderOutput
+                && let Some(export) = Publications::issue_feature(
+                    owners.store,
+                    owners.transports,
+                    call,
+                    &image.write,
+                    batch.reports,
+                    issue,
+                )?
+            {
+                state
+                    .forward
+                    .products
+                    .exports
+                    .push((image.write.clone(), export));
+            }
+        }
+        state.forward.image.writes = writes;
+
+        // The trajectory version the call wrote, for readers elsewhere.
+        if let (Some((banks, params)), Some(product), true) = (
+            state.forward.image.latent.clone(),
+            call.latent_output.as_ref(),
+            exports,
+        ) {
+            let step_index = match call.kind {
+                CallKind::Media(MediaCall::LatentPreparation) => 0,
+                CallKind::Media(MediaCall::Denoising) => banks.step + 1,
+                _ => continue,
+            };
+            let step_index = u32::try_from(step_index)
+                .map_err(|_| Error::Invariant("a latent step exceeds u32".into()))?;
+            let slot = state.slot;
+            let ledger = owners
+                .ledger
+                .as_deref_mut()
+                .ok_or_else(|| Error::Invariant("a trajectory lost its ledger".into()))?;
+            let (pool, storage) = ledger.parts();
+            let export = latents::issue_export(
+                pool,
+                storage,
+                owners.transports,
+                call,
+                product,
+                slot,
+                &params,
+                banks.write,
+                step_index,
+                issue,
+            )?;
+            record.versions.push(export.buffer());
+            batch.calls[index].forward.image.exports.push(export);
+        }
+    }
+
+    // PNG encodings of decoded images, read from the lease once its fences
+    // completed.
+    for (index, call) in plan.calls.iter().enumerate() {
+        let image = &batch.calls[index].forward.image;
+        if let (Some(task), Some((pixels, height, width))) = (&image.encoding, &image.bytes) {
+            // The encoding reads the lease after its fences, as a CPU reader
+            // the task releases when it ends.
+            lock(&batch.buffer).retain_reader()?;
+            task.configure(ImageTask::new(ImageWork::Encode {
+                pixels: pixels.clone(),
+                lease: Arc::clone(&batch.buffer),
+                height: *height,
+                width: *width,
+                maximum: usize::try_from(call.bounds.max_completion_bytes).unwrap_or(usize::MAX),
+            }))?;
+        }
+    }
+
+    // A finished trajectory's guidance prefixes retire with it.
+    for (index, call) in plan.calls.iter().enumerate() {
+        let state = &batch.calls[index];
+        let (Some((banks, _)), false) = (
+            &state.forward.image.latent,
+            state.forward.image.alternates.is_empty(),
+        ) else {
+            continue;
+        };
+        if call.kind != CallKind::Media(MediaCall::Denoising) {
+            continue;
+        }
+        let steps = owners
+            .requests
+            .get(call.request_key.request_id.0)?
+            .admission()
+            .image
+            .as_ref()
+            .map_or(0, |image| i64::from(image.steps));
+        if banks.step + 1 < steps {
+            continue;
+        }
+        let alternates = state.forward.image.alternates.clone();
+        owners
+            .prefix_cache()?
+            .release_prefixes(call.request_key, &alternates, issue)?;
+    }
+    if std::mem::take(&mut record.ordered)
+        && let Some(pages) = owners.pages.as_deref_mut()
+    {
+        // Later batches over the prefix cache on other streams order after
+        // the guidance prefixes this batch wrote and the slots it released.
+        pages.order_mut().record(issue)?;
+    }
+
+    if std::mem::take(&mut record.entered) {
+        owners.ledger()?.leave(issue)?;
+    }
+    Ok(())
+}
+
+/// Return the host pixels the batch's execution copies from to their pool
+/// once the stream passed the work `issue` issued before (the execution).
+fn release_pixels(record: &mut ImageBatch, events: &EventPool, issue: Recorder<'_>) -> Result<()> {
+    let pixels = std::mem::take(&mut record.pixels);
+    if pixels.is_empty() || issue.stream().is_none() {
+        return Ok(());
+    }
+    let fence = events.fence(issue, false)?;
+    issue.defer(
+        events,
+        vec![fence],
+        Box::new(move || {
+            drop(pixels);
+            Ok(())
+        }),
+    )
+}
+
+/// Publish the trajectory exports the batch's calls issued, now that their
+/// work was performed: their locations register with the batch's
+/// publications and their descriptors join the calls' completions.
+pub(crate) fn accept(
+    ledger: Option<&LatentLedger>,
+    calls: &mut [CallState<LaneCall>],
+    publications: &mut Publications,
+) -> Result<()> {
+    for state in calls {
+        let exports = std::mem::take(&mut state.forward.image.exports);
+        if exports.is_empty() {
+            continue;
+        }
+        let pool = ledger
+            .ok_or_else(|| Error::Invariant("exported trajectories lost their ledger".into()))?
+            .pool();
+        for export in exports {
+            latents::locate_export(pool, export, publications, &mut state.output)?;
+        }
+    }
+    Ok(())
+}
+
+/// Withdraw what a batch that failed before its commit point issued for its
+/// image calls, recording the stream work into `issue`: unpublished
+/// trajectory exports are revoked and every version it exported is released
+/// from the ledger's pool, its PNG encodings are cancelled, its host pixels
+/// return to their pool behind what the stream performed, and its use of
+/// the ledger's banks ends.
+pub(crate) fn retire(
+    ledger: Option<&mut LatentLedger>,
+    events: &EventPool,
+    calls: &mut [CallState<LaneCall>],
+    record: &mut ImageBatch,
+    issue: Recorder<'_>,
+) -> Result<()> {
+    for state in calls.iter_mut() {
+        for export in std::mem::take(&mut state.forward.image.exports) {
+            export.revoke();
+        }
+        if let Some(task) = state.forward.image.encoding.take() {
+            // An unconfigured encoding returns its lane capacity.
+            let _ = task.cancel(true);
+        }
+    }
+    let versions = std::mem::take(&mut record.versions);
+    let entered = std::mem::take(&mut record.entered);
+    release_pixels(record, events, issue)?;
+    match ledger {
+        Some(ledger) => {
+            if !versions.is_empty() {
+                ledger.pool().release_exports(&versions);
+            }
+            if entered {
+                ledger.leave(issue)?;
+            }
+            Ok(())
+        }
+        None if versions.is_empty() && !entered => Ok(()),
+        None => Err(Error::Invariant(
+            "a failed image batch lost its latent ledger".into(),
+        )),
+    }
+}
+
+/// The host work of a batch's decoded images: their PNG encodings, run
+/// once its fences completed; `None` without one.
+pub(crate) fn host_stage(calls: &mut [CallState<LaneCall>]) -> Option<Box<dyn HostStage>> {
+    let encodings: Vec<(usize, Arc<HostTask<ImageTask>>)> = calls
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, state)| Some((index, state.forward.image.encoding.take()?)))
+        .collect();
+    (!encodings.is_empty()).then(|| {
+        Box::new(Encodings {
+            encodings,
+            submitted: false,
+        }) as Box<dyn HostStage>
+    })
 }
 
 /// The PNG encodings of a decoding batch's images, run once their pixels
 /// reached the host.
 struct Encodings {
-    encodings: Vec<Encoding>,
+    /// Each call's index in the batch and its encoding.
+    encodings: Vec<(usize, Arc<HostTask<ImageTask>>)>,
     submitted: bool,
 }
 
@@ -894,15 +1032,15 @@ impl HostStage for Encodings {
     fn poll(&mut self) -> Result<bool> {
         if !self.submitted {
             // The output fences completed: the pixels are on the host.
-            for encoding in &self.encodings {
-                encoding.task.submit()?;
+            for (_, task) in &self.encodings {
+                task.submit()?;
             }
             self.submitted = true;
         }
         Ok(self
             .encodings
             .iter()
-            .all(|encoding| encoding.task.completion.done()))
+            .all(|(_, task)| task.completion.done()))
     }
 
     fn finish(
@@ -913,11 +1051,11 @@ impl HostStage for Encodings {
     ) -> Result<()> {
         // The encoded images are delivered as media; nothing is published
         // as a product.
-        for encoding in std::mem::take(&mut self.encodings) {
+        for (call, task) in std::mem::take(&mut self.encodings) {
             let output = outputs
-                .get_mut(encoding.call)
+                .get_mut(call)
                 .ok_or_else(|| Error::Invariant("an image encoding names no call".into()))?;
-            match encoding.task.completion.outcome() {
+            match task.completion.outcome() {
                 Some(Outcome::Success(result)) => {
                     if let ImageResult::Encoded(bytes) = &*result
                         && output.reports_output
@@ -945,8 +1083,151 @@ impl HostStage for Encodings {
     }
 
     fn cancel(&mut self) {
-        for encoding in &self.encodings {
-            let _ = encoding.task.cancel(false);
+        for (_, task) in &self.encodings {
+            let _ = task.cancel(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A preparation's image entries parse per call: absent and null
+    /// entries are calls without image work; writes name their product
+    /// field, shape and metadata; and the decoded bytes of every call add up
+    /// to the words the batch leases.
+    #[test]
+    fn prepared_image_entries_parse_per_call() -> Result<()> {
+        let step = serde_json::json!({"prepared": [
+            {"reads": [], "writes": [], "publication": null},
+            {"reads": [], "writes": [], "publication": null, "image": null},
+            {"reads": [], "writes": [], "publication": null, "image": {
+                "read": true,
+                "writes": [
+                    {"field": "encoder_output", "shape": [4, 8],
+                     "metadata": {"feature": {"height": 32, "width": 32}}},
+                    {"field": "image_output", "shape": [3, 2, 2],
+                     "metadata": {"image": {"height": 2, "width": 2, "value_range": "signed_unit"}}}
+                ],
+                "bytes": 12,
+                "latent": true
+            }},
+            {"image": {"pixels": true, "bytes": 5}}
+        ]});
+        let entries = prepared(&step)?;
+        assert!(entries[0].is_none() && entries[1].is_none());
+        let image = entries[2].as_ref().ok_or(Error::State("an image entry"))?;
+        assert!(image.read && image.latent && !image.pixels);
+        assert_eq!(image.writes[0].field, Field::EncoderOutput);
+        assert_eq!(image.writes[1].shape, [3, 2, 2]);
+        assert_eq!(
+            image.writes[1]
+                .metadata
+                .as_ref()
+                .map(PreparedMetadata::metadata)
+                .transpose()?,
+            Some(Metadata::Image {
+                height: 2,
+                width: 2,
+                value_range: Some(ValueRange::SignedUnit),
+            })
+        );
+        // 12 + 5 bytes take three words.
+        assert_eq!(lease_words(&step)?, 3);
+
+        let unknown = serde_json::json!({"prepared": [{"image": {"writes": [
+            {"field": "latent_output", "shape": [1]}
+        ]}}]});
+        assert!(prepared(&unknown).is_err());
+        Ok(())
+    }
+
+    /// A call's entry states its inline image's facts or a resident
+    /// image's shape, size and value range, its request's input images and
+    /// its progress; a resident image without image metadata is refused.
+    #[test]
+    fn a_call_describes_its_input_image_and_progress() -> Result<()> {
+        let progress = RequestProgress {
+            logical_position: 40,
+            cache_visible_len: 38,
+            ..RequestProgress::default()
+        };
+        let facts = ImageFacts {
+            shape: vec![1024, 588],
+            grid: Some([32, 32]),
+            height: 448,
+            width: 448,
+        };
+        let inline = described(Input::Inline(facts), 2, &progress)?;
+        assert_eq!(
+            inline,
+            serde_json::json!({
+                "input": {"inline": {
+                    "shape": [1024, 588], "grid": [32, 32], "height": 448, "width": 448
+                }},
+                "input_images": 2,
+                "progress": {"logical": 40, "visible": 38},
+            })
+        );
+
+        let metadata = Metadata::Image {
+            height: 64,
+            width: 32,
+            value_range: Some(ValueRange::SignedUnit),
+        };
+        let resident = described(
+            Input::Resident(vec![3, 64, 32], Some(metadata)),
+            0,
+            &progress,
+        )?;
+        assert_eq!(
+            resident["input"],
+            serde_json::json!({"resident": {
+                "shape": [3, 64, 32], "height": 64, "width": 32, "value_range": "signed_unit"
+            }})
+        );
+        assert_eq!(
+            described(Input::None, 0, &progress)?["input"],
+            serde_json::Value::Null
+        );
+        let feature = Metadata::Feature {
+            height: 64,
+            width: 32,
+        };
+        assert!(described(Input::Resident(vec![4, 8], Some(feature)), 0, &progress).is_err());
+        Ok(())
+    }
+
+    fn forward(rows: &[(u32, u32, u32, bool)]) -> ipc::ForwardBatch {
+        ipc::ForwardBatch {
+            call_indices: vec![0; rows.len()],
+            request_pool_indices: rows.iter().map(|row| row.0).collect(),
+            seq_lens: rows.iter().map(|row| row.1).collect(),
+            query_lens: rows.iter().map(|row| row.2).collect(),
+            write_cache: rows.iter().map(|row| row.3).collect(),
+        }
+    }
+
+    /// A read-only row on a slot its call prefills in the same batch reads
+    /// the prefilled tokens; a row on a slot without such a prefill reads
+    /// its scheduler context.
+    #[test]
+    fn a_branch_reads_the_prefix_its_call_prefills() {
+        // A six-token prefill of slot 3, then branch rows on slots 3 and 4
+        // and the call's own slot 1.
+        let rows = forward(&[
+            (3, 6, 6, true),
+            (3, 20, 20, false),
+            (4, 29, 20, false),
+            (1, 31, 20, false),
+        ]);
+        let all: Vec<usize> = (0..4).collect();
+        assert_eq!(prefill_prefix(&rows, &all, 3), Some(6));
+        assert_eq!(prefill_prefix(&rows, &all, 4), None);
+        assert_eq!(prefill_prefix(&rows, &all, 1), None);
+        // A write row that continues a resident prefix is no prefill.
+        let continued = forward(&[(3, 8, 2, true)]);
+        assert_eq!(prefill_prefix(&continued, &[0], 3), None);
     }
 }

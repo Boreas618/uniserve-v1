@@ -37,16 +37,23 @@
 
 pub(crate) mod backend;
 pub(crate) mod batch;
+pub(crate) mod columns;
+pub(crate) mod experts;
 pub(crate) mod image;
+pub(crate) mod image_inputs;
 pub(crate) mod inputs;
+pub(crate) mod lanes;
+pub(crate) mod latents;
 pub(crate) mod lifecycle;
+pub(crate) mod pages;
 mod pending;
 pub(crate) mod products;
 pub(crate) mod python;
+pub(crate) mod records;
+pub(crate) mod reports;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod transfer;
-pub(crate) mod video;
 
 pub(crate) use pending::{BatchResult, PendingOutput, request_output};
 

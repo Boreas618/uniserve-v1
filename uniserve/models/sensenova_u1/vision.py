@@ -4,8 +4,13 @@
 rotation of the patch features and a strided convolution that merges each
 ``factor x factor`` block of patches into one backbone token. The model
 instantiates it twice with separate weights: as the network wrapped by
-``Model.vision_encoder`` for input images, and as ``Denoiser.input`` for the
-image being denoised.
+``Model.vision_encoder`` for input images, and, as a ``TokenEncoder``, as
+``Denoiser.input`` for the image being denoised.
+
+Both convolutions have a stride equal to their kernel and the rotary
+rotation acts on one patch, so a backbone token's features depend only on
+its own ``stride x stride`` pixel block and its position in the token grid:
+``TokenEncoder`` encodes token blocks with no image extent at all.
 """
 
 import math
@@ -82,21 +87,12 @@ class Config:
             raise ValueError("NEO rotary theta must be finite and positive")
 
 
-class Encoder(nn.Module):
-    """Encode NCHW pixels or flattened CHW patches with explicit image grids.
+class _Network(nn.Module):
+    """The parameters of the NEO vision tower, which both encoders share.
 
-    Columns rotate the first channel half and rows rotate the second, using
-    interleaved pairs in FP32 before returning to the patch convolution dtype.
-    Spatial reduction never crosses an image boundary.
-
-    ``pixels`` is either ``[images, channels, H, W]`` or packed patches
-    ``[patches, channels * patch_size**2]`` in CHW order, raster order within
-    each image. ``grids`` holds the same ``(rows, columns)`` patch grids as
-    the host ``grid_shapes``: the device copy yields rotary coordinates
-    without a host readback, which keeps that step capturable in a CUDA
-    graph, and the host copy drives validation and reshapes. Returns
-    ``[tokens, output_size]`` with each image's downsampled grid in raster
-    order, images concatenated.
+    A patch convolution, the rotary embedding of patch-grid coordinates and
+    a strided convolution reducing each ``factor x factor`` block of patches
+    to one backbone token.
     """
 
     def __init__(self, config: Config):
@@ -117,6 +113,24 @@ class Encoder(nn.Module):
         )
         self.activation = nn.GELU()
 
+
+class Encoder(_Network):
+    """Encode NCHW pixels or flattened CHW patches with explicit image grids.
+
+    Columns rotate the first channel half and rows rotate the second, using
+    interleaved pairs in FP32 before returning to the patch convolution dtype.
+    Spatial reduction never crosses an image boundary.
+
+    ``pixels`` is either ``[images, channels, H, W]`` or packed patches
+    ``[patches, channels * patch_size**2]`` in CHW order, raster order within
+    each image. ``grids`` holds the same ``(rows, columns)`` patch grids as
+    the host ``grid_shapes``: the device copy yields rotary coordinates
+    without a host readback, which keeps that step capturable in a CUDA
+    graph, and the host copy drives validation and reshapes. Returns
+    ``[tokens, output_size]`` with each image's downsampled grid in raster
+    order, images concatenated.
+    """
+
     def forward(
         self,
         pixels: torch.Tensor,
@@ -130,7 +144,7 @@ class Encoder(nn.Module):
         them in order (images and the padding segments of a packed batch,
         a ``(0, 0)`` grid an empty segment, every side a multiple of the
         reduction factor), and the shapes depend only on the number of rows
-        and grids, so a padded packing (``PatchEncoder.encode_packed``)
+        and grids, so a padded packing (``PatchEncoder.encode_segments``)
         replays one captured call. Each image's tokens are those it has
         alone.
         """
@@ -260,3 +274,88 @@ class Encoder(nn.Module):
                 .reshape(-1, self.config.output_size)
             )
         return torch.cat(outputs)
+
+
+class TokenEncoder(_Network):
+    """The vision tower over packed token blocks rather than whole images.
+
+    The same network as :class:`Encoder`, with the same parameters, whose
+    call encodes each backbone token from its own pixel block, so any
+    packing of images' tokens encodes in one call of static shape. A module
+    call, it reaches a tower placed on another device through the execution
+    context's transfers.
+    """
+
+    def forward(
+        self, token_pixels: torch.Tensor, token_rc: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode each backbone token from its own pixel block.
+
+        ``token_pixels`` is ``[tokens, channels * stride**2]``: each token's
+        ``stride x stride`` pixel block (``stride`` the patch size times the
+        reduction factor) in pixel, then channel order, the layout of
+        ``uniserve.nn.functional.patchify``. ``token_rc`` is ``[tokens, 2]``
+        integer ``(row, column)`` coordinates of each token in its image's
+        token grid. Returns ``[tokens, output_size]`` features, each equal
+        to what ``Encoder.forward`` gives that token of its whole image: the
+        token's ``factor x factor`` patches rotate by their patch-grid
+        coordinates ``(row * factor + i, column * factor + j)``. Tokens are
+        independent, so any packing of any images' tokens, with arbitrary
+        finite padding tokens, encodes in one call of static shape.
+        """
+        config = self.config
+        factor = round(1 / config.downsample_ratio)
+        patch, channels = config.patch_size, config.num_channels
+        tokens = token_pixels.shape[0]
+        if (
+            token_pixels.ndim != 2
+            or token_pixels.shape[1] != channels * (factor * patch) ** 2
+            or token_rc.shape != (tokens, 2)
+        ):
+            raise ValueError(
+                "NEO token blocks require [tokens, channels * stride**2] "
+                "pixels and [tokens, 2] grid coordinates"
+            )
+
+        # [tokens, (i, a), (j, b), channels] pixel blocks, with i, j a patch
+        # of the block and a, b a pixel of the patch, into one CHW patch per
+        # (token, i, j) in raster order.
+        patches = (
+            token_pixels.reshape(tokens, factor, patch, factor, patch, channels)
+            .permute(0, 1, 3, 5, 2, 4)
+            .reshape(-1, channels, patch, patch)
+        )
+        features = self.activation(
+            self.patch_embedding(patches.to(self.patch_embedding.weight.dtype))
+        ).reshape(-1, config.hidden_size)
+
+        # Patch-grid coordinates of every (token, i, j) patch.
+        offsets = torch.arange(factor, device=token_rc.device)
+        rows = token_rc[:, 0, None, None] * factor + offsets[None, :, None]
+        columns = token_rc[:, 1, None, None] * factor + offsets[None, None, :]
+        parts = []
+        for hidden, coordinates in zip(
+            features.float().chunk(2, dim=-1),
+            (
+                columns.expand(-1, factor, factor).reshape(-1),
+                rows.expand(-1, factor, factor).reshape(-1),
+            ),
+            strict=True,
+        ):
+            cosine, sine = self.rotary(
+                coordinates,
+                dtype=torch.float32,
+                sequence_length=features.shape[0],
+            )
+            parts.append(
+                apply_rotary(
+                    hidden.unsqueeze(1), cosine, sine, rotation="interleaved"
+                ).squeeze(1)
+            )
+        features = torch.cat(parts, dim=-1).to(features.dtype)
+
+        # Each token's factor x factor patches reduce to one feature row.
+        blocks = features.reshape(
+            tokens, factor, factor, config.hidden_size
+        ).permute(0, 3, 1, 2)
+        return self.dense_embedding(blocks).reshape(tokens, config.output_size)

@@ -57,18 +57,26 @@ enum PendingResponse {
 /// nothing for a standby that keeps its memory resident.
 #[derive(Default)]
 pub(crate) struct Suspension {
-    /// The warmup work of the runtimes that run expert steps, when the
-    /// expert transports freed workspaces that cannot keep their
-    /// addresses: the promotion rebuilds them and captures those runtimes'
-    /// graphs again.
-    pub(crate) recapture: Vec<Box<dyn crate::warmup::WarmupHooks>>,
     /// The graph pools and scratch whose contents it moved to host memory.
     pub(crate) pools: Vec<Arc<crate::cuda_graph::GraphPool>>,
-    /// The expert union whose transport workspaces it released.
-    pub(crate) experts: Option<Arc<crate::parallel::ExpertUnion>>,
-    /// The torch world whose NCCL communicators it suspended, with those of
-    /// the runners' collectives.
+    /// What the executor released of the expert transports' workspaces.
+    pub(crate) experts: ParkedExperts,
+    /// The torch world whose NCCL communicators it suspended, the stream
+    /// groups' included.
     pub(crate) world: Option<crate::ffi::Handle>,
+}
+
+/// What a parked standby's executor released of its expert union's
+/// transport workspaces (`park_experts`).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ParkedExperts {
+    /// Workspaces that keep their addresses were suspended: the promotion
+    /// maps them back (`promote_experts`).
+    pub(crate) suspended: bool,
+    /// Workspaces that cannot keep their addresses were freed: the
+    /// promotion rebuilds them (`rebuild_experts`) and captures the lanes'
+    /// graphs that address them again.
+    pub(crate) released: bool,
 }
 
 /// What the engine's built-in worker hooks (`uniserve.*`) reach: the
@@ -99,15 +107,15 @@ impl Parked {
     /// access to the retained storages: the captured graphs run again.
     /// Restoring the expert transports is collective over the union: the
     /// engine asks every rank of the standby world to promote before it
-    /// awaits any. Transports that freed their workspaces are rebuilt, and
-    /// the graphs that run expert steps captured again, as warmup captured
-    /// them: collectively, on the scratch units, with write access.
+    /// awaits any. Transports that freed their workspaces are rebuilt and
+    /// the executor's graphs captured again, as warmup captured them:
+    /// collectively, on the scratch units, with write access; the executor
+    /// then refuses further captures.
     fn promote(self, executor: &mut Executor) -> std::result::Result<(), WorkerError> {
         let Parked {
             retained,
             suspension:
                 Suspension {
-                    recapture,
                     pools,
                     experts,
                     world,
@@ -121,32 +129,24 @@ impl Parked {
             tracing::info!("the promoted standby worker restored its graph memory");
         }
         if let Some(world) = &world {
-            for collectives in backend.collectives() {
-                collectives.resume()?;
-            }
             crate::ffi::Interpreter::import("uniserve.distributed.world.resume")?
                 .invoke(&[world.view()])?;
             tracing::info!("the promoted standby worker resumed its communicators");
         }
-        if let Some(experts) = &experts {
-            experts.restore()?;
+        let python = backend.executor().cloned();
+        if experts.suspended
+            && let Some(python) = &python
+        {
+            python.promote_experts()?;
             tracing::info!("the promoted standby worker restored its expert transports");
         }
         retained.promote()?;
-        if recapture.is_empty() {
+        let Some(python) = python.filter(|_| experts.released) else {
             return Ok(());
-        }
-        // The union's only holder now is the backend.
-        drop(experts);
-        let backend = executor.backend_mut();
-        if let Some(union) = backend.experts_mut()? {
-            union.rebuild()?;
-        }
-        backend.reopen_expert_graphs()?;
-        for mut hooks in recapture {
-            hooks.capture(backend)?;
-        }
-        backend.seal_expert_graphs();
+        };
+        python.rebuild_experts()?;
+        crate::worker::warm_lanes(executor.backend_mut())?;
+        python.seal()?;
         tracing::info!("the promoted standby worker captured its expert graphs again");
         Ok(())
     }

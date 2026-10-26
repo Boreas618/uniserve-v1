@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8, memset_d32};
+use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8};
 use ipc::BlockTable;
 use ipc::{PrefixCacheDtype, UnitId};
 use worker::ffi::{Backing, DType, Handle};
@@ -127,14 +127,13 @@ fn block_table_installs_and_clears_write_device_tables() -> Result<()> {
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn output_readback_waits_for_device_copies_and_widens_tokens() -> Result<()> {
+fn output_readback_waits_for_device_copies_into_lent_words() -> Result<()> {
     let stream = Stream::new(DEVICE)?;
     let events = EventPool::default();
-    let tokens = Storage::device(DEVICE, 12)?;
+    let tokens = Storage::device(DEVICE, 3 * size_of::<i64>())?;
     // SAFETY: the allocation holds three words; the stream drains before
     // the readback reads them.
-    unsafe { memset_d32(tokens.address(), 0xFFFF_FFFE, 3, &stream) }?;
-    let column = StorageView::contiguous(tokens as Arc<dyn Backing>, 0, DType::I32, &[3])?;
+    unsafe { memset_d8(tokens.address(), 0xFF, 3 * size_of::<i64>(), &stream) }?;
 
     let mut output = OutputBuffer::new(
         OutputStorage::allocate(Some(DEVICE), 4)?,
@@ -142,16 +141,23 @@ fn output_readback_waits_for_device_copies_and_widens_tokens() -> Result<()> {
         &[DEVICE],
         true,
     );
-    let (offset, count) = output.capture(&column, Some(&stream), &events)?;
+    // The producer copies its device words into the lent ones on its stream.
+    let (offset, lent) = output.lend_words()?;
+    let mut copy = CopyBatch::new(SourceOrder::Stream);
+    copy.push(lent.address(), tokens.address(), 3 * size_of::<i64>());
+    // SAFETY: both ranges hold three words; the lease keeps its pinned
+    // words and the test its device words until the stream drained.
+    unsafe { copy.submit(&stream) }?;
     assert!(output.readback().is_err(), "readback before sealing");
     output.seal(&[&stream], &events)?;
+    output.register_lent(3, Vec::new())?;
     // The lease does not ask the driver: its fences have completed once
     // it is told so, here by the test that waited for the stream.
     assert!(output.readback().is_err(), "readback before its fences");
     stream.synchronize()?;
     output.fences_completed();
     output.readback()?;
-    assert_eq!(output.read_tokens(offset, count)?, [-2, -2, -2]);
+    assert_eq!(output.read_tokens(offset, 3)?, [-1, -1, -1]);
     let timing = output.observe(0)?;
     assert!(timing.iter().all(|&micros| micros < 60_000_000));
     Ok(())

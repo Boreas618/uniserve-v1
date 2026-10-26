@@ -261,7 +261,7 @@ class Encoder(nn.Module):
 
         The computation reads the grids only as device values, so its shapes
         depend only on the number of patch rows and grids, and a padded
-        packing (``PatchEncoder.encode_packed``) replays one captured call.
+        packing (``PatchEncoder.encode_segments``) replays one captured call.
 
         Args:
             pixels: ``[total_patches, 3 * patch_size**2]`` patch rows with

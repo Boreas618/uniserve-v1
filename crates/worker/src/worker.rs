@@ -9,27 +9,30 @@
 //!    checkpoint narrowing.
 //! 3. The process world: host groups, the torch world, component groups
 //!    and meshes.
-//! 4. Loading, model facts, execution streams.
-//! 5. Capacity: block size, request slots, cache units and latent pages, all
-//!    agreed over the group; the auxiliary-device check.
-//! 6. Request storage and the runners, created by the storage and
-//!    capability runtimes on the plan and handed to the backend.
-//! 7. The executor and the profiler.
+//! 4. Loading, model facts, the block size and cache layout, the rank's
+//!    executor and its manifest, execution streams and the expert union.
+//! 5. Capacity: request slots, cache units and latent pages, all agreed over
+//!    the group; the auxiliary-device check.
+//! 6. Request storage, the stream groups and the executor's lanes bound on
+//!    the plan, handed to the backend; an image model's ranks agree on their
+//!    graph keys.
+//! 7. The batch executor and the profiler.
 //!
-//! [`Worker::warmup`] runs the warmup phases ([`crate::warmup`]) before the
-//! rank reports; the engine then warms the serving path with real requests
-//! of the shapes the report states. [`Worker::run`] serves the channel, and
-//! [`Worker::close`] consumes the rank and releases its owners in dependency
-//! order: execution, runners, streams, requests, the process world, then
-//! deferred device memory. The launch closes every rank that started,
+//! [`Worker::warmup`] runs the warmup before the rank reports; the engine
+//! then warms the serving path with real requests of the shapes the report
+//! states. [`Worker::run`] serves the channel, and [`Worker::close`]
+//! consumes the rank and releases its owners in dependency order:
+//! execution, the executor and its lanes, streams, requests, the process
+//! world, then deferred device memory. The launch closes every rank that started,
 //! unless the rank abandoned work its threads may wait in for good, which
 //! ends the process at once.
 
+mod image;
+mod lanes;
 mod loading;
 mod memory;
 mod planning;
 pub(crate) mod update;
-mod video;
 
 pub(crate) use loading::LoadedModel;
 pub(crate) use memory::WorkerMemory;
@@ -47,13 +50,13 @@ use ipc::{CallKind, Channel, WorkerEndpoint, WorkerInfo};
 use crate::capacity::checks;
 use crate::capacity::device::{DeviceBudget, total_bytes};
 use crate::capacity::plan::Plan;
-use crate::config::placement::{Components, GroupPlacement};
-use crate::config::{Device, WorkerConfig, WorkerLaunch};
-use crate::cuda_graph::reserve_pools;
+use crate::config::placement::{Capability, Components, GroupPlacement};
+use crate::config::{Device, ExpertUnion, WorkerConfig, WorkerLaunch};
 use crate::cuda_graph::{GraphStorage, graph_storage_budget_bytes};
 use crate::error::WorkerError;
 use crate::executor::Executor;
 use crate::executor::backend::WorkerBackend;
+use crate::executor::experts::{ExpertMember, ExpertStart};
 use crate::executor::transfer::TransferRuntime;
 use crate::ffi::{Handle, Interpreter};
 use crate::lane::BLOCK_ON_TIMEOUT;
@@ -62,31 +65,21 @@ use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
 use crate::memory::weights::{self, WeightKeys};
 use crate::parallel::world::{World, startup_timeout};
-use crate::parallel::{
-    DwdpManager, ExpertStart, ExpertUnion, ExpertWarmup, HostRetention, HostWeights, PeerGroup,
-};
+use crate::parallel::{DwdpManager, HostRetention, HostWeights};
 use crate::profiling::kernels::{KernelRecords, KernelWatch};
 use crate::profiling::profiler::{ProfileConfig, Profiler};
 use crate::profiling::range;
-use crate::runner::causal_lm::CausalLMRunners;
-use crate::runner::causal_lm::start::{Startup, expert_tokens};
-use crate::runner::causal_lm::warmup::CausalLMWarmup;
-use crate::runner::decoder::warmup::DecoderWarmup;
-use crate::runner::denoiser::image_model::ImageModel;
-use crate::runner::denoiser::warmup::DenoiserWarmup;
-use crate::runner::diffusion_lm::{self, DiffusionLMRunner, DiffusionLMWarmup};
-use crate::runner::encoder::warmup::EncoderWarmup;
-use crate::runner::scratch::Scratches;
-use crate::runner::start::{ImageOwners, Startup as ImageStartup};
-use crate::service::{Ending, Parked, Service, Suspension};
-use crate::stream::{CUDAStream, Streams};
+use crate::service::{Ending, Parked, ParkedExperts, Service, Suspension};
+use crate::stream::Scratches;
+use crate::stream::Streams;
 use crate::transfer::TransportKind;
-use crate::warmup::WarmupHooks;
 use crate::{Error, Result};
 use loading::{ComponentMesh, Description, ExpertPartition, head_projection, sequence_kind};
 
+use lanes::LaneStart;
+pub(crate) use lanes::warm as warm_lanes;
 use memory::allocate_storage;
-use planning::{cache_width, log_capacity, plan};
+use planning::{block_size, cache_plan, cache_width, log_capacity, plan};
 
 /// One caching-allocator segment: device, graph pool id and bytes.
 type Segment = (DeviceId, (u64, u64), u64);
@@ -130,13 +123,15 @@ pub(crate) struct Worker {
     budget: Option<DeviceBudget>,
     streams: Streams,
     graphs: GraphStorage,
-    /// The shared work areas of every stream runners construct their
-    /// execution contexts on.
+    /// The shared work areas of the lanes' streams, which the executor's
+    /// execution contexts borrow.
     scratches: Scratches,
     /// How the worker, parked as a standby, keeps its graph memory.
     standby_memory: ipc::StandbyMemory,
     executor: Executor,
-    hooks: Vec<Box<dyn WarmupHooks>>,
+    /// The executor runs warmup phases: the rank has executor lanes or an
+    /// expert union member.
+    lane_warmup: bool,
     /// Retained for the rank's lifetime: torch, the driver owners and the
     /// reclaimer all use the device's primary context.
     context: Option<PrimaryContext>,
@@ -313,25 +308,75 @@ impl Worker {
                 .for_media_slots(launch.ipc.queue_depth)
                 .map_err(phase("load"))?;
         }
-        let image = ImageModel::describe(model.handle()).map_err(phase("load"))?;
-        // A video model's executor states what capacity planning sizes the
-        // rank by.
-        let video = if model.video_decoder {
-            let denoiser =
-                video::placed_denoiser(&model.declarations, &config.deployment_components)
-                    .map_err(phase("load"))?;
-            let (executor, manifest) = video::executor(
-                model.handle(),
-                &config,
-                &components,
-                &denoiser,
-                &model.attention_backend,
+        // How the lanes over the prefix cache lay out a model's image
+        // features: a model without image capabilities places none.
+        let image_capable = [
+            Capability::ImageDenoiser,
+            Capability::PatchEncoder,
+            Capability::PatchAutoencoder,
+            Capability::ImageDecoder,
+        ]
+        .into_iter()
+        .any(|capability| model.declarations.has(capability));
+        let text_facts = if image_capable {
+            image::TextFacts::of(model.handle()).map_err(phase("load"))?
+        } else {
+            image::TextFacts::default()
+        };
+        // The executor's token lanes are sized by the cache's layout, so the
+        // block size is resolved first, collectively over the worker group.
+        block_size(&mut config, &model, &world).map_err(phase("capacity"))?;
+        let cache = cache_plan(&launch, &config, &model).map_err(phase("capacity"))?;
+        // The rank's executor states what capacity planning sizes the rank
+        // by: a video model's slot layout, the storage of its lanes over the
+        // prefix cache.
+        let video_denoiser = if model.video_decoder {
+            Some(
+                lanes::placed_denoiser(&model.declarations, &config.deployment_components)
+                    .map_err(phase("load"))?,
             )
-            .map_err(phase("load"))?;
-            Some((denoiser, executor, manifest))
         } else {
             None
         };
+        let sections = lanes::Sections {
+            video: video_denoiser
+                .as_deref()
+                .map(|denoiser| lanes::video_settings(&config, denoiser)),
+            image: image::holds(&components, video_denoiser.is_some())
+                .then(|| image::settings(&config)),
+            pages: lanes::page_settings(
+                &launch,
+                &config,
+                &components,
+                cache.as_ref(),
+                text_facts.image_processor,
+                text_facts.media_axes,
+            )
+            .map_err(phase("load"))?,
+            experts: lanes::expert_settings(&launch),
+        };
+        let executor = lanes::construct(
+            model.handle(),
+            &config,
+            &components,
+            &model.attention_backend,
+            sections,
+        )
+        .map_err(phase("load"))?;
+        let (executor, manifest) = match executor {
+            Some((executor, manifest)) => (Some(executor), manifest),
+            None => (None, lanes::Manifest::default()),
+        };
+        let video = match (video_denoiser, &manifest.video) {
+            (Some(denoiser), Some(video)) => Some((denoiser, video.clone())),
+            (Some(_), None) => {
+                return Err(phase("load")(Error::Interface(
+                    "the executor's manifest states no video section".into(),
+                )));
+            }
+            (None, _) => None,
+        };
+
         drop(loading);
 
         let devices: Vec<Device> = config.devices().collect();
@@ -339,15 +384,17 @@ impl Worker {
         let host = launch.host.clone();
         // Expert transports map their device workspaces before capacity
         // planning measures free memory.
-        let mut experts = ExpertUnion::start(ExpertStart {
-            launch: &launch,
-            world: &world,
-            model: &model,
-            streams: &mut streams,
-            max_tokens: expert_tokens(&config),
-            host: &host,
-        })
-        .map_err(phase("experts"))?;
+        let experts = match &executor {
+            Some(executor) => ExpertMember::start(ExpertStart {
+                launch: &launch,
+                world: &world,
+                executor,
+                streams: &mut streams,
+                host: &host,
+            })
+            .map_err(phase("experts"))?,
+            None => None,
+        };
         let weights = DwdpManager::start(&launch, &world, &model, &streams, &host)
             .map_err(phase("experts"))?;
         // Host-resident layer weights release their device storage before
@@ -391,13 +438,16 @@ impl Worker {
             &launch,
             &mut config,
             &model,
-            &image,
+            manifest.image.as_ref(),
+            text_facts.image_processor,
             &world,
             budget.as_ref(),
             &components,
+            cache,
+            manifest.pages.as_ref(),
             video
                 .as_ref()
-                .map(|(denoiser, _, manifest)| (denoiser.as_str(), manifest.clone())),
+                .map(|(denoiser, manifest)| (denoiser.as_str(), manifest.clone())),
         )
         .map_err(phase("capacity"))?;
         if let Some(budget) = &budget {
@@ -461,131 +511,69 @@ impl Worker {
                 .map_err(phase("storage"))?;
             reported.page_pools = pools;
         }
-        let mut components = components;
-        let preparation = device.cuda().and_then(|cuda| streams.preparation(cuda));
-        let preparation = preparation
-            .map(CUDAStream::stream)
-            .transpose()
-            .map_err(phase("bind"))?;
-        // Numerical collectives of each runner run on NCCL communicators
-        // bound to its stream, over its component's mesh groups.
-        let first = launch
-            .expert_parallel
-            .as_ref()
-            .map_or(0, |union| union.rank - launch.execution.rank);
-        let peers = PeerGroup {
-            group: &world.host,
-            collectives: launch
-                .components
-                .keys()
-                .map(|name| (name.clone(), world.collective_groups(name, first)))
-                .collect(),
-        };
-        let text = CausalLMRunners::start(Startup {
-            config: &config,
-            request_slots: info.request_slots as usize,
-            queue_depth: launch.ipc.queue_depth,
-            model: &model,
-            image_processor: image.processing.is_some(),
-            media_axes: image
-                .processing
-                .and_then(|processing| processing.injection)
-                .map(|_| if image.spatial_positions() { 3 } else { 1 }),
-            streams: &streams,
-            prefix_cache: storage.prefix_cache.as_ref(),
-            components: &components,
-            scratches: &mut scratches,
-            graphs: &mut graphs,
-            preparation,
-            experts: experts.as_mut(),
-            peers: Some(&peers),
-            weights: weights.as_ref(),
-        })
-        .map_err(phase("bind"))?;
-        // A video model's encoders and denoiser run as media batches.
-        let image = if video.is_some() {
-            None
+        // Each stream a component's collectives run on gets torch groups of
+        // its own, created by every rank at this point of its startup.
+        let collectives = if dedicated {
+            Vec::new()
         } else {
-            ImageOwners::start(ImageStartup {
+            world
+                .bind_stream_groups(
+                    &launch,
+                    &model.declarations,
+                    &lanes::stream_copies(&launch, &model.declarations),
+                )
+                .map_err(phase("bind"))?
+        };
+        // The executor's lanes and expert union bind, in this order on every
+        // rank.
+        let bound = match &executor {
+            Some(executor) => lanes::bind(LaneStart {
+                executor,
+                loaded: model.handle(),
+                manifest: &manifest,
+                experts: experts.as_ref(),
                 config: &config,
+                components: &components,
                 request_slots: info.request_slots as usize,
                 queue_depth: launch.ipc.queue_depth,
-                host_capacity: info.host_lane_capacity as usize,
-                model: &model,
-                streams: &streams,
-                storage: &storage,
+                streams: &mut streams,
+                prefix_cache: storage.prefix_cache.as_ref(),
+                video: video_capacity.as_ref(),
                 latent: plan.latent,
-                components: &components,
+                host_capacity: info.host_lane_capacity as usize,
                 scratches: &mut scratches,
                 graphs: &mut graphs,
-                preparation,
+                collectives: &collectives,
+                prefetch: weights.as_ref().map(DwdpManager::prefetch),
                 memory: &mut &*retained,
             })
-            .map_err(phase("bind"))?
+            .map_err(phase("bind"))?,
+            None => lanes::Bound {
+                lanes: None,
+                step_rows: 0,
+                image: None,
+            },
         };
-        let diffusion_lm = DiffusionLMRunner::start(diffusion_lm::Startup {
-            config: &config,
-            request_slots: info.request_slots as usize,
-            queue_depth: launch.ipc.queue_depth,
-            model: &model,
-            experts: expert_exchange(&launch),
-            streams: &streams,
-            prefix_cache: storage.prefix_cache.as_ref(),
-            components: &mut components,
-            scratches: &mut scratches,
-            graphs: &mut graphs,
-            preparation,
-            peers: Some(&peers),
-            expert_runtime: experts.as_mut(),
-            weights: weights.as_ref(),
-        })
+        // Every rank of an image model captures the same graph keys in the
+        // same order, which warmup's collectives require.
+        image::agree(
+            &bound
+                .image
+                .as_ref()
+                .map(|image| image.digests.clone())
+                .unwrap_or_default(),
+            &world.host,
+        )
         .map_err(phase("bind"))?;
-        if let Some(experts) = experts.as_mut() {
-            if dedicated {
-                experts
-                    .bind_experts(&model, &mut scratches)
-                    .map_err(phase("bind"))?;
-            }
-            reserve_join_pools(&config, experts, &mut graphs).map_err(phase("bind"))?;
-        }
-        let mut streams = streams;
-        let video_owners = match (video, video_capacity) {
-            (Some((_, executor, _)), Some(capacity)) => Some(
-                video::start(video::VideoStart {
-                    executor,
-                    capacity: &capacity,
-                    info: &info,
-                    config: &config,
-                    components: &components,
-                    streams: &mut streams,
-                    graphs: &mut graphs,
-                    scratches: &mut scratches,
-                    queue_depth: launch.ipc.queue_depth,
-                    memory: &mut &*retained,
-                })
-                .map_err(phase("storage"))?,
-            ),
-            _ => None,
-        };
         // The shapes the engine warms the serving path with, through its
-        // scheduler, once the rank reported, and the image-unconditional
-        // guidance prefix it reserves.
+        // scheduler, once the rank reported, the image-unconditional
+        // guidance prefix it reserves and the image extents it admits.
         let info = {
             let mut info = info;
-            if let Some(image) = &image {
-                info.image_warmups = image
-                    .warmups(info.request_slots, info.latent_capacity_units())
-                    .map_err(phase("bind"))?;
-                info.captured_images = image.captured_images();
-                info.captured_latents = image.encoders.captured_latents();
-                info.image_unconditional_token_ids =
-                    image.image_unconditional_prefix().map_err(phase("bind"))?;
+            if let Some(image) = &bound.image {
+                image.apply(&mut info);
             }
-            info.diffusion_lm_step_rows = diffusion_lm
-                .iter()
-                .map(DiffusionLMRunner::step_rows)
-                .max()
-                .unwrap_or(0);
+            info.diffusion_lm_step_rows = bound.step_rows;
             info
         };
         let placement = GroupPlacement {
@@ -596,27 +584,19 @@ impl Worker {
             .map_err(phase("storage"))?;
         backend.set_worker_storage(storage);
         backend.set_job_queues(streams.job_queues());
-        let text_warmup = text.is_some();
-        let video_warmup = video_owners.is_some();
-        if let Some((runtime, outputs)) = video_owners {
-            backend.set_video(runtime, outputs);
+        if let Some(executor) = executor {
+            backend.set_executor(executor);
         }
-        if let Some(text) = text {
-            backend.set_text(text);
-        }
-        let image_warmup = image.is_some();
-        if let Some(image) = image {
-            backend.set_image(image);
-        }
-        let diffusion_lm_warmup = !diffusion_lm.is_empty();
-        if diffusion_lm_warmup {
-            backend.set_diffusion_lm(diffusion_lm);
+        // The executor's lanes and the expert union warm through the
+        // executor's phases.
+        let lane_warmup = bound.lanes.is_some() || experts.is_some();
+        if let Some(lanes) = bound.lanes {
+            backend.set_lanes(lanes);
         }
         if let Some(weights) = weights {
             backend.set_weights(weights);
         }
         backend.set_host_weights(host_weights);
-        let expert_warmup = experts.is_some();
         if let Some(experts) = experts {
             backend.set_experts(experts);
         }
@@ -657,29 +637,6 @@ impl Worker {
             collective,
         )
         .map_err(|error| error.with_phase("executor"))?;
-        let mut hooks: Vec<Box<dyn WarmupHooks>> = Vec::new();
-        if video_warmup {
-            hooks.push(Box::new(video::VideoWarmup));
-        }
-        if image_warmup {
-            // Prepared and captured in this order on every rank.
-            hooks.push(Box::new(EncoderWarmup));
-            hooks.push(Box::new(DenoiserWarmup));
-            hooks.push(Box::new(DecoderWarmup));
-        }
-        if text_warmup {
-            hooks.push(Box::new(CausalLMWarmup {
-                row_tokens: config.max_model_len.min(config.max_batch_tokens).max(1),
-            }));
-        }
-        if diffusion_lm_warmup {
-            hooks.push(Box::new(DiffusionLMWarmup));
-        }
-        if expert_warmup {
-            // After the text captures, whose eager warmups were announced
-            // expert steps.
-            hooks.push(Box::new(ExpertWarmup));
-        }
 
         // Every owner took its memory: retained storages of the scope that
         // none took any more are released.
@@ -697,7 +654,7 @@ impl Worker {
             scratches,
             standby_memory: launch.storage.standby_memory,
             executor,
-            hooks,
+            lane_warmup,
             context,
             retained,
             weights: weight_storages,
@@ -709,7 +666,12 @@ impl Worker {
         })
     }
 
-    /// Run warmup once, before the first serving submission.
+    /// Run warmup once, before the first serving submission, in an order
+    /// identical on every rank, since captures run collectives: bind each
+    /// CUDA device's graph budget (what its graph pools hold now plus the
+    /// grant left after product storage not yet resident), run the
+    /// executor's warmup phases ([`warm_lanes`]), then check graph
+    /// residency, report the kernels and seal the graph storage.
     pub(crate) fn warmup(&mut self) -> std::result::Result<(), WorkerError> {
         if self.warmed {
             return Ok(());
@@ -732,14 +694,9 @@ impl Worker {
             self.bind_graph_budgets().map_err(phase("warmup"))?;
         }
         let executor = &mut self.executor;
-        for hooks in &mut self.hooks {
-            hooks.prepare(executor.backend_mut())?;
-        }
-        {
+        if self.lane_warmup {
             let _capture = range(c"uniserve.worker.capture", None);
-            for hooks in &mut self.hooks {
-                hooks.capture(executor.backend_mut())?;
-            }
+            warm_lanes(executor.backend_mut())?;
         }
         let backend = executor.backend();
         if backend.components().holds_host() {
@@ -875,11 +832,11 @@ impl Worker {
     /// that park together (the expert union the rank belongs to, else its
     /// worker group) take one mode: one rank's crowded device suspends them
     /// all. Suspending copies the graph pools and scratch to host memory,
-    /// releases the expert transports' workspaces that keep their addresses
-    /// ([`ExpertUnion::suspend`]) and frees those that cannot
-    /// ([`ExpertUnion::release`]), whose graphs the promotion captures
-    /// again, and suspends every NCCL communicator of the runners'
-    /// collectives and of the torch world. Returns what it released.
+    /// has the executor release the expert transports' workspaces
+    /// (`park_experts`: those that keep their addresses are suspended, the
+    /// others freed and their graphs captured again at the promotion), and
+    /// suspends every NCCL communicator of the torch world, the stream
+    /// groups' included. Returns what it released.
     ///
     /// # Errors
     ///
@@ -927,35 +884,34 @@ impl Worker {
             pool.suspend().map_err(phase("standby"))?;
         }
         tracing::info!(bytes, "the standby worker suspended its graph memory");
-        let experts = match self.executor.backend().experts() {
-            Some(union) if union.suspend().map_err(phase("standby"))? => {
-                tracing::info!("the standby worker suspended its expert transports");
-                Some(Arc::clone(union))
+        // The expert transports release their workspaces: those that keep
+        // their addresses are suspended, which the promotion maps back; the
+        // others are freed, and the promotion rebuilds them and captures the
+        // lanes' graphs that address them again.
+        let experts = match (
+            self.executor.backend().experts(),
+            self.executor.backend().executor(),
+        ) {
+            (Some(_), Some(executor)) => {
+                let (suspended, released) = executor.park_experts().map_err(phase("standby"))?;
+                if suspended {
+                    tracing::info!("the standby worker suspended its expert transports");
+                }
+                if released {
+                    tracing::info!(
+                        "the standby worker released its expert workspaces, which its promotion rebuilds"
+                    );
+                }
+                ParkedExperts {
+                    suspended,
+                    released,
+                }
             }
-            _ => None,
+            _ => ParkedExperts::default(),
         };
-        // A workspace that cannot keep its addresses is freed: the promotion
-        // rebuilds it and captures the graphs that run expert steps again,
-        // with the warmup work of their runtimes, which the worker hands
-        // over.
-        let recapture = match self.executor.backend().experts() {
-            Some(union) if union.release().map_err(phase("standby"))? => {
-                tracing::info!(
-                    "the standby worker released its expert workspaces, which its promotion rebuilds"
-                );
-                let (recapture, keep) = std::mem::take(&mut self.hooks)
-                    .into_iter()
-                    .partition(|hooks| hooks.steps_experts());
-                self.hooks = keep;
-                recapture
-            }
-            _ => Vec::new(),
-        };
-        // NCCL releases its communicators' buffers; the graphs that captured
-        // their collectives replay once they resume.
-        for collectives in self.executor.backend().collectives() {
-            collectives.suspend().map_err(phase("standby"))?;
-        }
+        // NCCL releases its communicators' buffers, the stream groups'
+        // among them; the graphs that captured their collectives replay once
+        // they resume.
         let world = self.world.torch().clone();
         Interpreter::import("uniserve.distributed.world.suspend")
             .and_then(|suspend| suspend.invoke(&[world.view()]))
@@ -979,7 +935,6 @@ impl Worker {
             pools,
             experts,
             world: Some(world),
-            recapture,
         })
     }
 
@@ -1012,8 +967,9 @@ impl Worker {
         if !aborted {
             record(executor.close());
         }
-        // Each runner releases its graphs, then its execution context.
-        let closed = executor.backend_mut().close_runtimes(aborted);
+        // The executor releases its lanes' graphs and execution contexts,
+        // then the lanes their output storage.
+        let closed = executor.backend_mut().close_executor(aborted);
         record(closed.map_err(WorkerError::from));
         // Transports retire after every context and graph using them;
         // their close is collective over the expert union.
@@ -1149,28 +1105,18 @@ impl Worker {
 
         let executor = &mut self.executor;
         let mut records = KernelRecords::new().map_err(phase("warmup"))?;
-        for (label, device, kernels) in executor.backend().kernels().map_err(phase("warmup"))? {
-            records.add(&label, &device, &kernels);
-        }
-        if let Some(video) = executor.backend().video() {
-            for (label, kernels) in video.executor.kernels().map_err(phase("warmup"))? {
+        if let Some(python) = executor.backend().executor() {
+            for (label, kernels) in python.kernels().map_err(phase("warmup"))? {
                 records.add(&label, &self.config.device.to_string(), &kernels);
             }
-        }
-        for runner in executor.backend_mut().diffusion_lm_mut() {
-            let (label, kernels) = runner.kernels().map_err(phase("warmup"))?;
-            records.add(&label, &self.config.device.to_string(), &kernels);
-            runner.seal();
         }
         records
             .log("startup", self.config.rank, &self.config.device.to_string())
             .map_err(phase("warmup"))?;
-        if let Some(text) = executor.backend_mut().text_mut() {
-            text.seal();
-        }
-        if let Some(image) = executor.backend_mut().parts().image {
-            image.encoders.seal_image();
-            image.denoisers.seal_image().map_err(phase("warmup"))?;
+        // Every graph the executor captured is resident: it refuses
+        // further captures.
+        if let Some(python) = executor.backend().executor() {
+            python.seal().map_err(phase("warmup"))?;
         }
         let kernel_choices =
             Interpreter::import("uniserve.backends.kernel_choices").map_err(phase("warmup"))?;
@@ -1280,7 +1226,7 @@ fn weight_keys(
     let moved = launch
         .expert_parallel
         .as_ref()
-        .is_some_and(|union| union.exchange == "dwdp");
+        .is_some_and(ExpertUnion::prefetches_weights);
     let Some(fingerprints) = fingerprints.filter(|_| !moved) else {
         return Ok(None);
     };
@@ -1295,30 +1241,6 @@ fn weight_keys(
         &weights::placement(launch)?,
         &devices,
     )?))
-}
-
-/// Graph pools for an expert union member's captured joins, one per microbatch,
-/// when no text runner shares its pools on the microbatch streams.
-fn reserve_join_pools(
-    config: &WorkerConfig,
-    experts: &mut ExpertUnion,
-    graphs: &mut GraphStorage,
-) -> Result<()> {
-    if config.graph_policy == "off" || experts.has_pools() {
-        return Ok(());
-    }
-    let Device::Cuda(device) = config.device else {
-        return Ok(());
-    };
-    let create = Interpreter::import("uniserve.cuda_graph.pool")?;
-    let mut pools = Vec::new();
-    for peer in 0..experts.microbatches() {
-        let stream = experts.stream(peer).raw();
-        let reserved = reserve_pools(graphs, &create, stream, &[device], None)?;
-        pools.extend(reserved.first().map(|pool| pool.value.clone()));
-    }
-    experts.set_pools(pools);
-    Ok(())
 }
 
 /// The worker's identity for transfers: the deployment's name of its host,
@@ -1380,7 +1302,6 @@ struct GraphChoice {
     mode: String,
     decode: Vec<usize>,
     prefill: Vec<usize>,
-    flow_batches: Vec<usize>,
     flow_shapes: Vec<[usize; 2]>,
 }
 
@@ -1391,7 +1312,6 @@ impl GraphChoice {
             mode: config.graph_policy.clone(),
             decode: config.decode_graph_batch_sizes.clone(),
             prefill: config.prefill_graph_token_sizes.clone(),
-            flow_batches: config.flow_graph_batch_sizes.clone(),
             flow_shapes: config
                 .flow_graph_shapes
                 .iter()
@@ -1409,11 +1329,7 @@ impl GraphChoice {
         if !["auto", "full", "off"].contains(&self.mode.as_str()) {
             return invalid(format!("chooses the unknown mode {:?}", self.mode));
         }
-        for (name, sizes) in [
-            ("decode", &self.decode),
-            ("prefill", &self.prefill),
-            ("flow_batches", &self.flow_batches),
-        ] {
+        for (name, sizes) in [("decode", &self.decode), ("prefill", &self.prefill)] {
             if sizes.first() == Some(&0) || !sizes.windows(2).all(|pair| pair[0] < pair[1]) {
                 return invalid(format!(
                     "chooses {name} sizes that are not positive and strictly increasing: {sizes:?}"
@@ -1435,7 +1351,6 @@ impl GraphChoice {
         config.graph_policy = self.mode;
         config.decode_graph_batch_sizes = self.decode;
         config.prefill_graph_token_sizes = self.prefill;
-        config.flow_graph_batch_sizes = self.flow_batches;
         config.flow_graph_shapes = self
             .flow_shapes
             .into_iter()
@@ -1491,26 +1406,6 @@ fn exports_device_products(launch: &WorkerLaunch) -> bool {
         .exports
         .iter()
         .any(|name| name == TransportKind::CudaVmm.name())
-}
-
-/// Whether routed experts use an expert exchange, and the attention ranks of
-/// a disaggregated expert union (zero when every rank holds its experts).
-fn expert_exchange(launch: &WorkerLaunch) -> (bool, usize) {
-    // Weight prefetch moves no tokens.
-    let exchanging = launch
-        .expert_parallel
-        .as_ref()
-        .filter(|union| union.exchange != "dwdp");
-    exchanging.map_or((false, 0), |union| {
-        (
-            true,
-            if union.disaggregated() {
-                union.attention_ranks
-            } else {
-                0
-            },
-        )
-    })
 }
 
 #[cfg(test)]

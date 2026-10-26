@@ -2,9 +2,8 @@
 
 A decode's tokens are its rows, each reading its slot's adapter; a
 prefill's packed tokens read the adapter of their row's slot, through the
-row columns the worker packs (`crates/worker/src/runner/attention.rs`,
-`pack_rows`): each row's slot in the first section, and each token's row in
-the last.
+row columns the executor packs (`uniserve.executor.text.rows.pack_rows`):
+each row's slot in the first section, and each token's row in the last.
 """
 
 import torch

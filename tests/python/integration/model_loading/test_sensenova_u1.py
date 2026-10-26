@@ -11,8 +11,9 @@ from uniserve.bindings.context import ExecutionContext
 from uniserve.diffusion import normal_noise
 from uniserve.loading import checkpoint, weights
 from uniserve.media import image
-from uniserve.models import LatentInput, TextInput, TextSize, VisionInput
+from uniserve.models import TextInput, TextSize, VisionInput
 from uniserve.models import sensenova_u1 as u1
+from uniserve.models.inputs import PackedImageRows, TokenKind
 from uniserve.nn.attention import (
     AttentionBatch,
     PagedInput,
@@ -214,22 +215,21 @@ def test_images_and_velocity_follow_independent_equations(
 ):
     model, state = sensenova_checkpoint(tmp_path, torch.bfloat16)
     pixels = torch.linspace(-1, 1, 3 * 8 * 8).reshape(1, 3, 8, 8).bfloat16()
-    grid = torch.tensor([[4, 4]])
     actual = model.vision_encoder.encode(
         VisionInput((pixels[0],), (None,), (None,))
     )[0]
     torch.testing.assert_close(
         actual, _vision(pixels, state, "vision_model"), rtol=0, atol=0
     )
-    # The numerical conditioning and current solver sample are independent
-    # inputs. Their difference catches subtracting the conditioning by mistake.
+    # The network reads each token's pixel block from the current solver
+    # sample, which is also the velocity's origin.
     sample = torch.linspace(0.5, -0.5, 4 * 48).reshape(4, 48).bfloat16()
     timestep = torch.tensor(0.99)
     scale = torch.tensor(2.0)
     size = image.Config(8, 8)
     if worker_inputs:
         # The seeded draw in the native noise shape, converted by
-        # ``prepare_latents`` (the denoiser binding's ``initial_latent``).
+        # ``prepare_latents``.
         noise = torch.empty(
             (1, *model.denoiser.noise_shape("image", size)), dtype=sample.dtype
         )
@@ -252,12 +252,23 @@ def test_images_and_velocity_follow_independent_equations(
             .reshape(4, 48)
         )
         torch.testing.assert_close(sample, patches, rtol=0, atol=0)
-        scale = torch.tensor(1.0)
+        scale = torch.tensor(model.denoiser.noise_scale.scale(4))
+    # The image the sample's 4x4-pixel token blocks tile, in canonical patch
+    # order (row, column, pixel row, pixel column, channel).
+    pixels = (
+        sample.reshape(1, 2, 2, 4, 4, 3)
+        .permute(0, 5, 1, 3, 2, 4)
+        .reshape(1, 3, 8, 8)
+    )
     hidden = _vision(pixels, state, "fm_modules.vision_model_mot_gen")
     hidden = (
         hidden
         + _time(timestep.expand(4), state, "fm_modules.timestep_embedder")
-        + _time((scale / 8).expand(4), state, "fm_modules.noise_scale_embedder")
+        + _time(
+            (scale.bfloat16() / 8).expand(4),
+            state,
+            "fm_modules.noise_scale_embedder",
+        )
     )
     hidden = _rms(hidden, state["language_model.model.norm_mot_gen.weight"])
     predicted = _linear(
@@ -267,27 +278,23 @@ def test_images_and_velocity_follow_independent_equations(
     )
     expected = (predicted - sample) / (1 - timestep.reshape(1)).clamp_min(0.02)
     lengths = SequenceLengths.from_lengths((4,), device="cpu")
-    inputs = u1.DenoiserInput(
-        {"image": (LatentInput(sample, timestep),)},
-        (image.Config(8, 8),),
-        torch.zeros(1, dtype=torch.int64),
-        (u1.ImageConditioning(pixels, grid, scale),),
-        (torch.tensor([[9, 9, 9, 9], [0, 0, 1, 1], [0, 1, 0, 1]]),),
-        (4,),
-        AttentionBatch.single(VarlenInput(lengths, lengths, (False,))),
+    # One unframed row of a 2x2 token grid at temporal position 9.
+    rows = PackedImageRows(
+        sample_index=torch.arange(4),
+        kind=torch.full((4,), TokenKind.LATENT),
+        positions=torch.tensor([[9, 9, 9, 9], [0, 0, 1, 1], [0, 1, 0, 1]]),
+        timesteps=timestep.expand(4).clone(),
+        token_row=torch.zeros(4, dtype=torch.int64),
+        row_grid=torch.tensor([[2, 2]]),
+        noise_scale=scale.reshape(1).float(),
     )
-    if worker_inputs:
-        # The binding derives the conditioning from the current sample.
-        inputs = model.denoiser.bind_inputs(
-            latents={"image": (LatentInput(sample, timestep),)},
-            sizes=(size,),
-            step=torch.zeros(1, dtype=torch.int64),
-            positions=(inputs.positions[0],),
-            sequence_lengths=(4,),
-            attention=AttentionBatch.single(
-                VarlenInput(lengths, lengths, (False,))
-            ),
-        )
+    inputs = model.denoiser.bind_packed(
+        source=sample,
+        rows=rows,
+        attention=AttentionBatch.single(
+            VarlenInput(lengths, lengths, (False,))
+        ),
+    )
     with torch.no_grad():
         prediction = model.denoiser(
             inputs, state={}, constants={}, workspace={}

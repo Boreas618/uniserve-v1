@@ -11,8 +11,9 @@
 //! routes it advertises and which placements are legal.
 //!
 //! [`Components`] records the components this rank holds once start has
-//! built their meshes; the runners look up the components serving a call
-//! kind or runner family there.
+//! built their meshes; the executor's settings and lanes, capacity
+//! planning and batch validation look up the components serving a call
+//! kind there.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -101,16 +102,6 @@ pub(crate) enum Stage {
     Last,
 }
 
-/// The numerical runner family that serves a call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum RunnerKind {
-    Text,
-    Diffusion,
-    DiffusionLM,
-    Decoder,
-    Encoder,
-}
-
 /// One declared numerical call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallDecl {
@@ -182,45 +173,12 @@ impl CallDecl {
         kinds
     }
 
-    /// Helper methods a runner calls beside a serving method: a causal LM's
-    /// embedding and logits, and a token denoiser's logits.
+    /// Helper methods the executor calls beside a serving method: a causal
+    /// LM's embedding and logits, and a token denoiser's logits.
     fn auxiliary(&self) -> bool {
         (self.is(Capability::CausalLm)
             && matches!(self.method.as_str(), "embed_input_ids" | "compute_logits"))
             || (self.is(Capability::DiffusionLm) && self.method == "compute_logits")
-    }
-
-    /// The runner family that serves this call's module, if any.
-    pub(crate) fn runner(&self) -> Option<RunnerKind> {
-        if self.is(Capability::CausalLm) {
-            Some(RunnerKind::Text)
-        } else if self.is(Capability::Denoiser) {
-            Some(RunnerKind::Diffusion)
-        } else if self.is(Capability::DiffusionLm) {
-            Some(RunnerKind::DiffusionLM)
-        } else if [
-            Capability::AudioDecoder,
-            Capability::ImageDecoder,
-            Capability::VideoDecoder,
-            Capability::VideoPostprocessor,
-        ]
-        .iter()
-        .any(|capability| self.is(*capability))
-        {
-            Some(RunnerKind::Decoder)
-        } else if [
-            Capability::Encoder,
-            Capability::PatchAutoencoder,
-            Capability::VideoEncoder,
-            Capability::AudioEncoder,
-        ]
-        .iter()
-        .any(|capability| self.is(*capability))
-        {
-            Some(RunnerKind::Encoder)
-        } else {
-            None
-        }
     }
 }
 
@@ -259,8 +217,8 @@ impl Declarations {
     /// Read the declarations of the `description` that `read_config`
     /// returned.
     ///
-    /// A call no runner can execute (other than a runner's helper methods)
-    /// is refused. A model that reconstructs video also declares the host
+    /// A call that serves no call kind (other than a capability's helper
+    /// methods) is refused. A model that reconstructs video also declares the host
     /// components that encode and assemble its units.
     pub(crate) fn read(description: &Handle) -> Result<Self> {
         let call = |method: &str, component: Option<&str>| -> Result<Any> {
@@ -358,10 +316,6 @@ impl Declarations {
             entries,
             axes: BTreeMap::new(),
         })
-    }
-
-    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
     }
 
     pub(crate) fn calls(&self, name: &str) -> &[CallDecl] {
@@ -582,11 +536,6 @@ impl Placed {
         is_host_component(&self.name)
     }
 
-    /// The runner families serving this component's calls.
-    pub(crate) fn runners(&self) -> BTreeSet<RunnerKind> {
-        self.calls.iter().filter_map(CallDecl::runner).collect()
-    }
-
     pub(crate) fn has(&self, capability: Capability) -> bool {
         self.calls.iter().any(|call| call.is(capability))
     }
@@ -665,13 +614,6 @@ impl Components {
 
     pub(crate) fn get(&self, name: &str) -> Option<&Placed> {
         self.placed.iter().find(|placed| placed.name == name)
-    }
-
-    /// Components a runner family serves on this rank.
-    pub(crate) fn for_runner(&self, runner: RunnerKind) -> impl Iterator<Item = &Placed> {
-        self.placed
-            .iter()
-            .filter(move |placed| placed.runners().contains(&runner))
     }
 
     /// Whether this rank holds a host component (media reading, video
@@ -774,7 +716,7 @@ mod tests {
             ],
         )])
         .unwrap();
-        let names: Vec<&str> = model.names().collect();
+        let names: Vec<&str> = model.iter().map(|(name, _)| name).collect();
         assert_eq!(
             names,
             vec!["video_decoder", "media_reader", "video_codec", "muxer"]

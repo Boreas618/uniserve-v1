@@ -146,6 +146,21 @@ impl ProductStore {
         Ok(resolved.into_iter().map(|(_, read)| read).collect())
     }
 
+    /// The value shape and metadata of a committed product, without leasing
+    /// it: what a consumer's preparation reads before its batch leases the
+    /// product.
+    pub(crate) fn metadata(&self, reference: &TensorRef) -> Result<(Vec<u64>, Option<Metadata>)> {
+        let state = lock(&self.state);
+        let buffer = Self::require_reference(&state, reference)?;
+        let shape = lock(&buffer)
+            .value_shape
+            .iter()
+            .map(|&extent| extent as u64)
+            .collect();
+        let metadata = buffer.views().metadata;
+        Ok((shape, metadata))
+    }
+
     /// Lease one committed product.
     pub fn consume(
         &self,

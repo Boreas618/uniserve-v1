@@ -130,7 +130,6 @@ impl VideoCapacity {
             page_units: pages.page_units as usize,
             latent_width: 1,
             dtype: crate::ffi::DType::F32,
-            with_workspace: false,
         }
     }
 

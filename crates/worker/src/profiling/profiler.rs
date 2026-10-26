@@ -25,9 +25,9 @@ use std::path::PathBuf;
 use crossbeam_channel::{Receiver, Sender};
 use cuda::DeviceId;
 
+use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Handle};
 use crate::lane::{Completion, Job, JobId, JobQueues};
-use crate::runner::methods::{Argument, MethodCall};
 use crate::stream::Issue;
 use crate::{Error, Result};
 

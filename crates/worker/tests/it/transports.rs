@@ -841,7 +841,6 @@ fn resident_pages_larger_than_the_vmm_pool_export_over_vmm() -> Result<()> {
             page_units: 768,
             latent_width: 2048,
             dtype: DType::F32,
-            with_workspace: false,
         },
         Some(DEVICE),
         Some(&stream),

@@ -1,14 +1,14 @@
 //! Inputs a batch imports from other calls, prepared before it executes.
 //!
-//! Every capability runtime reads its tensor inputs from the rank's tensor
-//! store, and its trajectories from the rank's latent pool. Products
+//! Every batch reads its tensor inputs from the rank's tensor store, and
+//! its trajectories from the lanes' latent ledger. Products
 //! another rank or worker published reach this rank as descriptors
 //! (`Batch::input_products`): tensors are read into the tensor store,
 //! latent trajectory versions into the consuming request's pages; cache
 //! transfers its install calls name arrive as `Batch::cache_inputs` or are
 //! resident exports of this rank. This module materializes them while
-//! other batches execute, so a runtime consumes imported values exactly
-//! like values its own rank produced.
+//! other batches execute, so a lane consumes imported values exactly like
+//! values its own rank produced.
 //!
 //! Preparation runs on the executor thread in phases, each resumed by the
 //! readiness notice of what blocked it ([`admit`], [`prepare`],
@@ -35,7 +35,7 @@
 //! When the batch executes, [`complete`] publishes each imported product on
 //! its consumers' device stream (a new product is committed, a widened
 //! shard is fenced over its union, a trajectory version is adopted as its
-//! slot's committed one) before the runtime consumes it; imports only
+//! slot's committed one) before the lane consumes it; imports only
 //! predicated-off calls read are left unpublished. [`close`] ends the
 //! import leases and abandons every import the batch did not consume, on
 //! success and on failure alike.
@@ -186,7 +186,8 @@ pub(crate) struct Inputs {
     resident: Vec<Arc<CacheTransfer>>,
     /// The read-credit return sequence a refused import waits past.
     backpressure: Option<u64>,
-    /// Preparation stopped on these inputs (not on another runtime's).
+    /// Preparation stopped on these inputs (not on an inline image's
+    /// host preparation).
     waiting: bool,
     /// A product import was refused for read credits while the admission
     /// job held work: the batch's start from that job's completion admits
@@ -376,7 +377,8 @@ fn advance(backend: &mut WorkerBackend, batch: &mut WorkerBatch, plan: &BatchPla
 /// Arrange a readiness notice for `submission` once what stopped the
 /// batch's preparation can advance: returned read credits, retired storage
 /// hazards, or finished reads and cache copies. Nothing is subscribed when
-/// another runtime's inputs stopped the batch.
+/// an inline image's host preparation stopped the batch, which notifies
+/// `submission` itself.
 pub(crate) fn subscribe(
     backend: &WorkerBackend,
     batch: &WorkerBatch,
@@ -460,8 +462,8 @@ pub(crate) fn subscribe(
     Ok(())
 }
 
-/// The next job publishing the batch's imported products before its
-/// runtime executes, or `None` when nothing is left to issue: predicates
+/// The next job publishing the batch's imported products before its lane
+/// executes, or `None` when nothing is left to issue: predicates
 /// first, then the imports some call that executes reads (a call whose host
 /// predicate is false reads nothing). Each import is published on its
 /// consumers' stream; consumers order after its fence.
@@ -663,20 +665,19 @@ fn publish(
     }
 }
 
-/// The latent pool trajectory transfers use.
+/// The latent pool trajectory transfers use: the lanes' ledger's.
 fn latent_pool(
     backend: &mut WorkerBackend,
 ) -> Result<(
     &mut crate::memory::LatentPool,
     &crate::memory::LatentStorage,
 )> {
-    let latents = backend
+    let ledger = backend
         .parts()
-        .image
-        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?
-        .latents
-        .ok_or_else(|| Error::Unsupported("image trajectories require a latent pool".into()))?;
-    Ok((&mut latents.pool, &latents.storage))
+        .lanes
+        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
+        .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
+    Ok(ledger.parts())
 }
 
 /// The call kind of a product's consumers, whose stream publishes it.

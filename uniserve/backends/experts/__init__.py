@@ -58,6 +58,9 @@ class HostBootstrap:
         split: ``(color, key)`` returns the arguments of the
             ``HostBootstrap`` over the members of equal ``color``, in this
             order.
+        all_gather_fixed: ``(bytes) -> bytes``, every member's record of
+            one width back to back in member order; the worker's expert
+            agreement reads it, and a split passes it on.
     """
 
     def __init__(
@@ -68,6 +71,7 @@ class HostBootstrap:
         broadcast: Callable[..., Any],
         barrier: Callable[..., Any],
         split: Callable[..., Any],
+        all_gather_fixed: Callable[..., Any],
     ) -> None:
         self._rank = int(rank)
         self._size = int(size)
@@ -75,6 +79,7 @@ class HostBootstrap:
         self._broadcast = broadcast
         self._barrier = barrier
         self._split = split
+        self._all_gather_fixed = all_gather_fixed
 
     def Get_rank(self) -> int:  # noqa: N802 - FlashInfer's CommBackend
         return self._rank

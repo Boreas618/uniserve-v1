@@ -1,9 +1,10 @@
 """Distributed routed experts: expert exchanges and distributed weights.
 
-The worker runtime owns the expert step protocol: agreement on each step's
-per-rank token capacity over its host group, microbatch threads and their
-rotation, join graphs and close ordering. It reaches these functions by
-import path to construct the numerical side:
+The executor's expert union (``uniserve.executor.experts.ExpertUnion``) owns
+the expert step protocol: agreement on each step's per-rank token capacity
+over the worker's host group, microbatch threads and their rotation, join
+graphs and close ordering. It uses these functions to construct and drive
+the numerical side:
 
 * ``layers(model, disaggregated)`` describes the expert layers that
   exchange tokens, in collective (traversal) order.
@@ -20,30 +21,37 @@ import path to construct the numerical side:
   rank.
 * ``warm_thread(device)`` prepares a microbatch thread's thread-local
   numerical state (cuBLAS handle) before graph capture.
-* ``close_exchange(exchange)`` releases an exchange; collective for
-  exchanges with device communicators.
+
+An exchange's ``close``, ``suspend``, ``restore``, ``release`` and
+``rebuild`` (``uniserve.backends.experts.ExpertTransport``) are called on it
+directly; ``close`` is collective for exchanges with device communicators.
 
 Distributed weight data parallelism (DWDP) exchanges weights instead of
 tokens: ``weight_fields(model)`` places each expert layer's weights for its
 kernels and returns this rank's shards, the caller publishes them and maps
 every field's full extent, ``bind_weights`` installs the full views as the
-layer's parameters, and ``bind_prefetch`` returns the object a prepared
-component's expert calls prefetch peers' weights through.
+layer's parameters, and ``bind_prefetch`` takes the caller's submission of
+each layer's peer reads and returns the :class:`WeightPrefetch` schedule a
+prepared component's expert calls prefetch peers' weights through.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
 from torch import nn
 
 from uniserve.backends import experts as transports
+from uniserve.cuda_graph import break_graph
 from uniserve.distributed import Communicator
 from uniserve.nn.moe import FusedMoE
 from uniserve.quantization import QuantizedTensor
+from uniserve.weight_prefetch import SlotCopies
 
 
 def _module(model) -> nn.Module:
@@ -142,8 +150,9 @@ def create_exchange(
         device: The CUDA ordinal.
         stream: The microbatch's CUDA stream handle; construction enqueues
             its device work there.
-        yield_turn: The worker's function handing the host turn to the next
-            microbatch after a dispatch; ``None`` with one microbatch.
+        yield_turn: The microbatch rotation's function handing the host turn
+            to the next microbatch after a dispatch; it releases the
+            interpreter lock while it waits. ``None`` with one microbatch.
         storage: Split MegaMoE's mapped storage as an int8 tensor, else
             ``None``.
         pointers: Every member's address of that storage; empty without it.
@@ -164,12 +173,6 @@ def create_exchange(
             "storage": storage,
             "pointers": [int(value) for value in pointers],
         }
-    if yield_turn is not None:
-        # The worker's function waits for this microbatch's next turn. Other
-        # microbatch threads run numerical code meanwhile, so the wait must
-        # never hold the interpreter lock, whatever the process default for
-        # native calls is.
-        yield_turn.release_gil = True
     with torch.cuda.device(target), torch.cuda.stream(computation):
         return transports.create(
             str(transport),
@@ -268,49 +271,6 @@ def warm_thread(device: int) -> None:
     # thread, which the handle creation requires.
     torch.empty(0, device=target)
     torch.cuda.current_blas_handle()
-
-
-def close_exchange(exchange) -> None:
-    """Release a transport after every binding and graph using it retired."""
-    exchange.close()
-
-
-def suspend_exchange(exchange) -> bool:
-    """Release a parked standby's transport workspace, keeping its addresses.
-
-    Collective over the union: every member suspends its transport while no
-    step runs. Returns whether the transport released memory; a transport
-    whose workspace cannot be released keeps it.
-    """
-    return bool(exchange.suspend())
-
-
-def restore_exchange(exchange) -> None:
-    """Map a suspended transport workspace back at its addresses.
-
-    Collective over the union, at the promotion of the members' standby
-    world, before any step runs.
-    """
-    exchange.restore()
-
-
-def release_exchange(exchange) -> bool:
-    """Free a parked standby's workspace that cannot keep its addresses.
-
-    Collective over the union, after :func:`suspend_exchange`, while no step
-    runs. Returns whether the transport freed it: the graphs captured over
-    it are captured again after :func:`rebuild_exchange`.
-    """
-    return bool(exchange.release())
-
-
-def rebuild_exchange(exchange) -> None:
-    """Create a released transport workspace again, collectively.
-
-    Called at the promotion of the members' standby world, after every
-    restore and before the graphs that use it are captured again.
-    """
-    exchange.rebuild()
 
 
 def _prefetched_layers(model) -> list[FusedMoE]:
@@ -435,77 +395,162 @@ def bind_weights(
     module.expert_slice = slice(0, module.num_experts)
 
 
+@dataclass
+class _Invocation:
+    """The prefetch state of one invocation (an activation)."""
+
+    # Whether an expert layer was reached: the first one orders every slot's
+    # next copy after the stream's earlier work.
+    started: bool = False
+    # The layer the previous layer prefetched, whose copy is submitted.
+    queued: int | None = None
+    # The layer whose copy was submitted last, which the invocation's end
+    # joins even if its expert call never ran.
+    last: int | None = None
+
+
 class WeightPrefetch:
-    """A binding's view of the worker's distributed expert weights.
+    """The prefetch schedule of a rank's distributed expert weights.
+
+    Every distributed expert layer reads its full weights through views of
+    this rank's resident shard and of two reusable slots, which the worker
+    maps. Layer ``i`` reads the other ranks' shards from slot ``i % 2``
+    (:class:`uniserve.weight_prefetch.SlotCopies`): the worker's ``copy``
+    submits one layer's peer reads into its slot on a stream it names.
 
     Expert calls bracket their computation with :meth:`before` and
-    :meth:`after`; an activation brackets one invocation. The worker's
-    hooks submit peer reads and order them by events against the calling
-    stream. Under graph capture a read cannot be recorded: the worker's
-    ``before`` ends the current graph segment and performs the read between
-    segments at every launch.
+    :meth:`after`, on their computing stream; an activation brackets one
+    invocation (:meth:`activate`). ``before`` makes the layer readable and
+    prefetches the next layer into the other slot, ``after`` releases the
+    layer's slot after its last reader, and the invocation's end joins the
+    last copy it submitted. Inference waits on local copy and compute events
+    alone. Under graph capture a copy cannot be recorded: it becomes the
+    graph's break work (:func:`uniserve.cuda_graph.break_graph`), which
+    every replay submits between the two segments, and the wait for a
+    layer's slot is captured after the break that submits its copy.
 
-    The hooks are the worker's functions, as :func:`bind_prefetch` receives
-    them.
+    Invocations serialize on their computing stream.
+
+    Args:
+        layers: The distributed expert layers in traversal order.
+        device: Their CUDA device.
+        copy: ``copy(layer, stream)`` submits every peer read of ``layer``
+            on the CUDA stream handle ``stream``.
     """
 
     def __init__(
         self,
-        layers: list[FusedMoE],
-        begin: Callable[..., Any],
-        end: Callable[..., Any],
-        before: Callable[..., Any],
-        after: Callable[..., Any],
-    ):
+        layers: Sequence[nn.Module],
+        device: torch.device,
+        copy: Callable[[int, int], Any],
+    ) -> None:
         self._ordinals = {
             id(layer): index for index, layer in enumerate(layers)
         }
-        self.device = layers[0].up_gate.weight.device
-        self._begin = begin
-        self._end = end
-        self._before = before
-        self._after = after
-
-    def _stream(self) -> int:
-        return torch.cuda.current_stream(self.device).cuda_stream
+        self.device = torch.device(device)
+        self._slots = SlotCopies(
+            self.device,
+            2,
+            len(self._ordinals),
+            lambda layer, stream: copy(layer, stream.cuda_stream),
+        )
+        # Open invocations, innermost last.
+        self._invocations: list[_Invocation] = []
 
     def contains(self, module) -> bool:
+        """Whether ``module`` is one of the distributed expert layers."""
         return id(module) in self._ordinals
+
+    def _ordinal(self, module) -> int:
+        ordinal = self._ordinals.get(id(module))
+        if ordinal is None:
+            raise ValueError("module has no prefetched expert weights")
+        return ordinal
+
+    def _invocation(self) -> _Invocation:
+        if not self._invocations:
+            raise RuntimeError(
+                "a distributed expert call requires an active invocation"
+            )
+        return self._invocations[-1]
+
+    def _compute(self) -> torch.cuda.Stream:
+        return torch.cuda.current_stream(self.device)
 
     @contextmanager
     def activate(self) -> Iterator[None]:
-        """Bracket one eager or captured invocation."""
-        self._begin()
+        """Bracket one eager or captured invocation on the current stream.
+
+        Raises:
+            RuntimeError: The weights are closed.
+        """
+        if self._slots.closed:
+            raise RuntimeError("distributed expert weights are closed")
+        self._invocations.append(_Invocation())
         try:
             yield
         finally:
-            self._end(self._stream())
+            last = self._invocations.pop().last
+            if last is not None:
+                self._slots.wait(last, self._compute())
 
     def before(self, module) -> None:
         """Wait for this layer's weights and prefetch the next layer's."""
-        self._before(self._ordinals[id(module)], self._stream())
+        index = self._ordinal(module)
+        invocation = self._invocation()
+        compute = self._compute()
+        capturing = torch.cuda.is_current_stream_capturing()
+
+        if not invocation.started:
+            invocation.started = True
+            # The stream's earlier work may still read either slot.
+            self._slots.release_all(compute)
+        if invocation.queued != index:
+            self._prefetch(invocation, index, capturing)
+        self._slots.wait(index, compute)
+
+        following = index + 1
+        if following < self._slots.layers:
+            invocation.queued = following
+            self._prefetch(invocation, following, capturing)
+        else:
+            invocation.queued = None
+
+    def _prefetch(
+        self, invocation: _Invocation, index: int, capturing: bool
+    ) -> None:
+        """Copy ``index`` into its slot now, or at every replay."""
+        invocation.last = index
+        if capturing:
+            break_graph(partial(self._slots.copy, index))
+        else:
+            self._slots.copy(index)
 
     def after(self, module) -> None:
-        """Release the layer's slots after its last reader."""
-        self._after(self._ordinals[id(module)], self._stream())
+        """Release the layer's slot after its last reader."""
+        self._slots.release(self._ordinal(module), self._compute())
+
+    def close(self) -> None:
+        """Drain the copies once every invocation and graph retired.
+
+        The worker releases the weights' memory after this returns.
+
+        Raises:
+            RuntimeError: An invocation is active.
+        """
+        if self._invocations:
+            raise RuntimeError("cannot close an active weight prefetch")
+        self._slots.close()
 
 
-def bind_prefetch(
-    model,
-    begin: Callable[..., Any],
-    end: Callable[..., Any],
-    before: Callable[..., Any],
-    after: Callable[..., Any],
-) -> WeightPrefetch:
+def bind_prefetch(model, copy: Callable[[int, int], Any]) -> WeightPrefetch:
     """The prefetch object execution contexts pass to their expert calls.
 
     Args:
-        model: The loaded model.
-        begin: ``()`` opens one invocation.
-        end: ``(stream)`` closes it on the calling CUDA stream handle.
-        before: ``(layer, stream)`` waits for a layer's weights and
-            prefetches the next layer's.
-        after: ``(layer, stream)`` releases the layer's slots after its
-            last reader.
+        model: The loaded model, whose distributed expert layers
+            :func:`bind_weights` installed.
+        copy: The worker's ``copy(layer, stream)``, which submits every
+            peer read of a layer on a CUDA stream handle.
     """
-    return WeightPrefetch(_prefetched_layers(model), begin, end, before, after)
+    layers = _prefetched_layers(model)
+    return WeightPrefetch(layers, layers[0].up_gate.weight.device, copy)

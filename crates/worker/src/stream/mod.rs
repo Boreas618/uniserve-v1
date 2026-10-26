@@ -3,15 +3,17 @@
 
 mod events;
 mod issue;
+mod scratch;
 
 pub(crate) use events::Deferral;
 pub(crate) use events::Deferred;
 pub use events::EventPool;
 pub(crate) use issue::HostFunction;
-pub use issue::{Fill, Issue, RowFill};
+pub(crate) use issue::{Fill, Issue, RowFill};
+pub(crate) use scratch::Scratches;
 
 use crossbeam_channel::{Receiver, Sender};
-use cuda::{DeviceGuard, DeviceId, Event, EventFlags, Stream};
+use cuda::{DeviceId, Stream};
 
 use crate::config::Device;
 use crate::lane::{Completion, JobId, JobQueues, Lane};
@@ -38,13 +40,9 @@ pub(crate) unsafe fn external(device: DeviceId, handle: usize) -> Result<Stream>
 }
 
 /// An execution stream of a rank.
-pub struct CUDAStream {
+pub(crate) struct CUDAStream {
     device: DeviceId,
     stream: Option<Stream>,
-    /// The fence [`Self::wait`] orders this stream after a producer with.
-    /// One event serves every wait: a wait captures the record made just
-    /// before it, and exclusive access keeps two waits from interleaving.
-    ingress: Event,
 }
 
 impl CUDAStream {
@@ -52,13 +50,12 @@ impl CUDAStream {
         Self {
             device,
             stream: Some(stream),
-            ingress: Event::new(EventFlags::default()),
         }
     }
 
     /// Own a new non-blocking stream on `device`'s full device, in its
     /// primary context.
-    pub fn create(device: DeviceId) -> Result<Self> {
+    pub(crate) fn create(device: DeviceId) -> Result<Self> {
         Ok(Self::new(device, Stream::new(device)?))
     }
 
@@ -70,37 +67,13 @@ impl CUDAStream {
         self.device
     }
 
-    pub fn handle(&self) -> Result<usize> {
-        Ok(self.stream()?.raw())
-    }
-
-    pub fn stream(&self) -> Result<&Stream> {
+    pub(crate) fn stream(&self) -> Result<&Stream> {
         self.stream
             .as_ref()
             .ok_or(Error::State("CUDA stream is closed"))
     }
 
-    /// Order this stream's later work after the work `producer` holds now,
-    /// without waiting for the producer on the host.
-    ///
-    /// The wait takes the stream exclusively: it records the producer on
-    /// the stream's one ingress fence and enqueues the wait on that record,
-    /// and a second wait recording between the two would replace the
-    /// producer this one waits for.
-    pub(crate) fn wait(&mut self, producer: &Stream) -> Result<()> {
-        let stream = self.stream()?;
-        if stream.raw() == producer.raw() {
-            return Ok(());
-        }
-
-        // A default-stream producer records in the thread's current context.
-        let _device = DeviceGuard::new(self.device)?;
-        self.ingress.record(producer)?;
-        stream.wait_event(&self.ingress)?;
-        Ok(())
-    }
-
-    pub fn synchronize(&self) -> Result<()> {
+    pub(crate) fn synchronize(&self) -> Result<()> {
         self.stream()?.synchronize()?;
         Ok(())
     }
@@ -110,20 +83,14 @@ impl CUDAStream {
     /// handle has dropped its clone. Failed collective
     /// execution retains resources until process exit.
     pub(crate) fn close(&mut self, aborted: bool) -> Result<()> {
-        // A closed stream keeps an unrecorded fence, which holds no driver
-        // event.
-        let unrecorded = Event::new(EventFlags::default());
         if aborted {
             crate::leak(self.stream.take());
-            crate::leak(std::mem::replace(&mut self.ingress, unrecorded));
             return Ok(());
         }
 
         if let Some(stream) = &self.stream {
             stream.synchronize()?;
         }
-
-        self.ingress = unrecorded;
         self.stream = None;
         Ok(())
     }
@@ -139,8 +106,9 @@ impl Drop for CUDAStream {
 
 /// Every stream of a rank: its lane's, its copy lane's, each device's
 /// preparation stream for startup work outside the lane, the full-device
-/// streams of its other devices, and the module and microbatch streams
-/// capability runtimes fork from the lane's. They close in dependency
+/// streams of its other devices, the module streams executor lanes that
+/// run beside the lane's fork, and the expert microbatch streams forked
+/// from the lane's. They close in dependency
 /// order: preparation, modules, microbatches, the copy lane, the lane,
 /// devices, each newest first.
 pub(crate) struct Streams {
@@ -262,12 +230,6 @@ impl Streams {
         self.microbatches
             .last()
             .ok_or(Error::State("microbatch stream was not registered"))
-    }
-
-    /// The owned stream whose handle is `handle`.
-    pub(crate) fn owner(&self, handle: usize) -> Option<&CUDAStream> {
-        self.iter()
-            .find(|stream| stream.handle().is_ok_and(|raw| raw == handle))
     }
 
     /// Every owned stream, for synchronization before teardown.

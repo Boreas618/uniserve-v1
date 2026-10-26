@@ -4,9 +4,9 @@
 //! [`WorkerBackend`] does the work of each step the [`super::Executor`]
 //! orders and answers the rank service. It owns the request pool, the
 //! request storage owners (through [`RequestStorage`]) and the placed
-//! components with their bindings, and dispatches each batch's calls to the
-//! runner that serves them, whose forward it runs as jobs of the batch's
-//! lane.
+//! components, and dispatches each batch's calls to what serves their kind
+//! (an executor lane or the transfers), whose forward it runs as jobs of
+//! the batch's lane.
 //! Lifecycle commands (Start, Finish, Free), batch admission, dependencies,
 //! retirement and result delivery are handled here for every batch, with or
 //! without calls.
@@ -18,26 +18,18 @@ use std::sync::Arc;
 
 use ipc::{Batch as BatchPlan, BatchCommand, RequestKind, Stall, WorkerInfo, WorkerResponseError};
 
-use super::image::ImageParts;
-use super::lifecycle::{AdmittedSlot, LaneJobs, RequestStorage};
+use super::experts::ExpertMember;
+use super::lanes::ExecutorLanes;
+use super::lifecycle::{LaneJobs, RequestStorage};
+use super::python::PythonExecutor;
 use crate::config::placement::{Components, GroupPlacement};
 use crate::error::WorkerError;
-use crate::host::HostLane;
-use crate::host::image::ImageTask;
 use crate::lane::{Job, JobId, JobQueues};
-use crate::memory::LatentCache;
-use crate::profiling::kernels::{KernelCalls, KernelRecord, KernelWatch};
+use crate::profiling::kernels::KernelWatch;
 use crate::profiling::profiler::Profiler;
 use crate::request::RequestPool;
-use crate::request::diffusion::Trajectories;
-use crate::runner::decoder::runners::DecoderRunners;
-use crate::runner::denoiser::image_model::{ImageModel, ImagePolicy};
-use crate::runner::denoiser::runners::DenoiserRunners;
-use crate::runner::encoder::runners::EncoderRunners;
-use crate::runner::methods::list_kernels;
-use crate::runner::start::{ImageOwners, ImageRunner};
 use crate::worker::WorkerMemory;
-use crate::{Error, OutputPool, Result};
+use crate::{Error, Result};
 
 pub(crate) use steps::WorkerBatch;
 use steps::lane_lost;
@@ -51,7 +43,7 @@ pub(crate) struct WorkerBackend {
     requests: RequestPool,
     /// What serves the rank's components, beside the request pool and the
     /// lifecycle jobs every lifecycle command borrows with its owners.
-    runtimes: Runtimes,
+    owners: Owners,
     components: Components,
     profiler: Option<Profiler>,
     kernels: Option<KernelWatch>,
@@ -62,103 +54,53 @@ pub(crate) struct WorkerBackend {
     lifecycle: LaneJobs,
     /// The submitted lifecycle jobs whose completions have not arrived.
     lifecycle_jobs: HashSet<JobId>,
-    /// The expert union's step this rank joins without a forward of its
-    /// own, while its job is in flight.
+    /// The job that joins the expert union's step this rank runs no
+    /// forward of, while it is in flight.
     joining: Option<JobId>,
     /// How the last such join ended, until the service takes it.
     joined: Option<std::result::Result<(bool, bool), WorkerError>>,
 }
 
-/// The runtimes serving a rank's components and the storage they own: the
-/// rank's storage owners, each capability's runners and an image or video
-/// model's state.
+/// What serves a rank's components and the storage it owns: the rank's
+/// storage owners, the executor and its lanes, an expert union's member,
+/// the weights streamed ahead of their layers and the transfer runtime.
 #[derive(Default)]
-pub(crate) struct Runtimes {
+pub(crate) struct Owners {
     /// The rank's storage owners (events, products, transports, prefix cache).
     worker_storage: Option<WorkerMemory>,
-    /// The text runtime, on ranks holding a causal language model.
-    text: Option<crate::runner::causal_lm::CausalLMRunners>,
-    /// An image model's facts and host policy, on ranks holding encoders,
-    /// image denoisers or image decoders of a model that is not a video
-    /// model.
-    image: Option<(ImageModel, ImagePolicy)>,
-    /// The latent pool of a rank holding an image denoiser.
-    latents: Option<LatentCache>,
-    /// The open image trajectory of each request slot.
-    trajectories: Trajectories,
-    /// The lane preparing input images and encoding output images.
-    image_host: Option<HostLane<ImageTask>>,
-    /// An image model's runners with their names, in construction order.
-    image_order: Vec<(ImageRunner, String)>,
-    /// The runner of each diffusion LM component placed on the rank.
-    diffusion_lm: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
-    /// This rank's member of its expert union, shared with the jobs that
-    /// run an expert step: the lane's execution thread agrees on the step
-    /// and runs it.
-    experts: Option<Arc<crate::parallel::ExpertUnion>>,
+    /// The rank's executor, shared by the lanes, the expert union member
+    /// and warmup, and closed after them.
+    executor: Option<Arc<PythonExecutor>>,
+    /// The executor's lanes and the resources the worker keeps for them.
+    lanes: Option<ExecutorLanes>,
+    /// This rank's member of its expert union, whose steps the executor
+    /// agrees on and runs.
+    experts: Option<ExpertMember>,
     /// Distributed expert weights, on ranks that prefetch them.
     weights: Option<crate::parallel::DwdpManager>,
     /// Layer stacks streamed from host memory, on ranks of components that
     /// keep their weights there.
-    host_weights: Vec<std::sync::Arc<crate::parallel::HostWeights>>,
+    host_weights: Vec<crate::parallel::HostWeights>,
     /// The transfer runtime: tensor transfers, cache exports and installs, and
     /// the streams batch imports run on.
     transfer: Option<super::transfer::TransferRuntime>,
-    /// What serves a video model on its ranks: the executor and the
-    /// trajectory ledger.
-    video: Option<super::video::VideoRuntime>,
-    /// An image model's encoder, denoiser and decoder runners.
-    encoders: EncoderRunners,
-    denoisers: DenoiserRunners,
-    decoders: DecoderRunners,
-    /// The output leases of media batches.
-    media_outputs: Option<OutputPool>,
-    /// Other capability runtimes' request storage.
-    storage: Vec<Box<dyn RequestStorage>>,
 }
 
-impl Runtimes {
+impl Owners {
     /// Every request storage owner, in lifecycle order: rank storage, the
-    /// text runners, an image model's trajectories, output leases and
-    /// latent pool, the diffusion LM runners, the transfer runtime, a video
-    /// model's runtime and output leases, then the other runtimes' owners.
-    pub(crate) fn owners(&mut self) -> impl Iterator<Item = &mut dyn RequestStorage> {
+    /// executor's lanes (their output leases and latent ledger), then the
+    /// transfer runtime.
+    pub(crate) fn request_storage(&mut self) -> impl Iterator<Item = &mut dyn RequestStorage> {
         fn owner<T: RequestStorage>(owner: &mut T) -> &mut dyn RequestStorage {
             owner
         }
-
-        // The output leases are an image model's where the rank holds one,
-        // otherwise a video model's.
-        let image = self.image.is_some();
-        let video = self.video.is_some();
-        let (image_outputs, video_outputs) = match self.media_outputs.as_mut() {
-            Some(outputs) if image => (Some(outputs), None),
-            Some(outputs) if video => (None, Some(outputs)),
-            _ => (None, None),
-        };
-        let (trajectories, latents) = if image {
-            (Some(&mut self.trajectories), self.latents.as_mut())
-        } else {
-            (None, None)
-        };
 
         self.worker_storage
             .as_mut()
             .map(owner)
             .into_iter()
-            .chain(self.text.as_mut().map(owner))
-            .chain(trajectories.map(owner))
-            .chain(image_outputs.map(owner))
-            .chain(latents.map(owner))
-            .chain(self.diffusion_lm.iter_mut().map(owner))
+            .chain(self.lanes.as_mut().map(owner))
             .chain(self.transfer.as_mut().map(owner))
-            .chain(self.video.as_mut().map(owner))
-            .chain(video_outputs.map(owner))
-            .chain(
-                self.storage
-                    .iter_mut()
-                    .map(|owner| &mut **owner as &mut dyn RequestStorage),
-            )
     }
 }
 
@@ -168,10 +110,7 @@ pub(crate) struct Parts<'a> {
     pub rank: usize,
     pub requests: &'a mut RequestPool,
     pub storage: Option<&'a mut WorkerMemory>,
-    pub text: Option<&'a mut crate::runner::causal_lm::CausalLMRunners>,
-    pub image: Option<ImageParts<'a>>,
-    pub diffusion_lm: &'a mut [crate::runner::diffusion_lm::DiffusionLMRunner],
-    pub experts: Option<&'a Arc<crate::parallel::ExpertUnion>>,
+    pub lanes: Option<&'a mut ExecutorLanes>,
     pub transfer: Option<&'a mut super::transfer::TransferRuntime>,
 }
 
@@ -187,7 +126,7 @@ impl WorkerBackend {
             info,
             rank,
             placement,
-            runtimes: Runtimes::default(),
+            owners: Owners::default(),
             components,
             profiler: None,
             kernels: None,
@@ -225,7 +164,7 @@ impl WorkerBackend {
         let deferrals = job.deferrals();
         let submitted = self.jobs.start(job, wake)?;
         if !deferrals.is_empty() {
-            let storage = self.runtimes.worker_storage.as_ref().ok_or(Error::State(
+            let storage = self.owners.worker_storage.as_ref().ok_or(Error::State(
                 "a job defers work on a rank without an event pool",
             ))?;
             let jobs = &self.jobs;
@@ -239,7 +178,7 @@ impl WorkerBackend {
     /// Have the rank's event pool start the jobs its deferred work waits
     /// for on the lane, from this thread, the control thread.
     fn serve_events(&self) {
-        let Some(storage) = &self.runtimes.worker_storage else {
+        let Some(storage) = &self.owners.worker_storage else {
             return;
         };
         let jobs = self.jobs.clone();
@@ -288,205 +227,78 @@ impl WorkerBackend {
 
     /// Install the rank's storage owners.
     pub(crate) fn set_worker_storage(&mut self, storage: WorkerMemory) {
-        self.runtimes.worker_storage = Some(storage);
+        self.owners.worker_storage = Some(storage);
         self.serve_events();
     }
 
     pub(crate) fn worker_storage(&self) -> Option<&WorkerMemory> {
-        self.runtimes.worker_storage.as_ref()
+        self.owners.worker_storage.as_ref()
     }
 
     pub(crate) fn worker_storage_mut(&mut self) -> Option<&mut WorkerMemory> {
-        self.runtimes.worker_storage.as_mut()
+        self.owners.worker_storage.as_mut()
     }
 
-    /// Install the text runtime.
-    pub(crate) fn set_text(&mut self, text: crate::runner::causal_lm::CausalLMRunners) {
-        self.runtimes.text = Some(text);
+    /// Install the rank's executor, which the backend closes after the
+    /// lanes and the expert union that call it.
+    pub(crate) fn set_executor(&mut self, executor: Arc<PythonExecutor>) {
+        self.owners.executor = Some(executor);
     }
 
-    pub(crate) fn text_mut(&mut self) -> Option<&mut crate::runner::causal_lm::CausalLMRunners> {
-        self.runtimes.text.as_mut()
+    /// The rank's executor.
+    pub(crate) fn executor(&self) -> Option<&Arc<PythonExecutor>> {
+        self.owners.executor.as_ref()
     }
 
-    /// Install what serves an image model on this rank.
-    pub(crate) fn set_image(&mut self, owners: ImageOwners) {
-        self.runtimes.image = Some((owners.model, owners.policy));
-        self.runtimes.encoders = owners.encoders;
-        self.runtimes.denoisers = owners.denoisers;
-        self.runtimes.decoders = owners.decoders;
-        self.runtimes.latents = owners.latents;
-        self.runtimes.media_outputs = Some(owners.outputs);
-        self.runtimes.image_host = Some(owners.host);
-        self.runtimes.image_order = owners.order;
+    /// Install the executor's lanes.
+    pub(crate) fn set_lanes(&mut self, lanes: ExecutorLanes) {
+        self.owners.lanes = Some(lanes);
     }
 
-    /// The kernels each text and image runner's operators selected, as
-    /// `(label, device, kernels)`: text runners first, then the image
-    /// runners in construction order. Each listing is a call made now,
-    /// which startup waits for.
-    pub(crate) fn kernels(&self) -> Result<Vec<(String, String, Vec<KernelRecord>)>> {
-        kernel_calls(
-            self.runtimes.text.as_ref(),
-            &self.runtimes.image_order,
-            &self.runtimes.encoders,
-            &self.runtimes.denoisers,
-            &self.runtimes.decoders,
-        )
-        .into_iter()
-        .map(|(label, device, calls)| Ok((label, device, list_kernels(calls)?)))
-        .collect()
+    /// The executor's lanes.
+    pub(crate) fn lanes(&self) -> Option<&ExecutorLanes> {
+        self.owners.lanes.as_ref()
     }
 
-    /// Release what serves an image model: its runners, the host lane and
-    /// the output storage, after the lanes drained.
-    fn close_image(&mut self, aborted: bool) -> Result<()> {
-        let Some(image) = self.runtimes.image.take() else {
-            return Ok(());
-        };
-        // Each runner releases its graphs and then the execution context
-        // its Python half constructed, newest first.
-        let mut result = Ok(());
-        for (runner, _) in std::mem::take(&mut self.runtimes.image_order)
-            .into_iter()
-            .rev()
-        {
-            let closed = match runner {
-                ImageRunner::Encoder(index) => self
-                    .runtimes
-                    .encoders
-                    .image
-                    .get_mut(index)
-                    .map_or(Ok(()), |runner| runner.close(aborted)),
-                ImageRunner::Denoiser => self
-                    .runtimes
-                    .denoisers
-                    .image
-                    .as_mut()
-                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
-                ImageRunner::Decoder => self
-                    .runtimes
-                    .decoders
-                    .image
-                    .as_mut()
-                    .map_or(Ok(()), |(_, runner)| runner.close(aborted)),
-            };
-            result = result.and(closed);
-        }
-        if let Some(host) = self.runtimes.image_host.take() {
-            if aborted {
-                host.abort();
-            } else if let Some(error) = host.close().into_iter().next() {
-                result = result.and(Err(error));
-            }
-        }
-        if let Some(mut outputs) = self.runtimes.media_outputs.take() {
-            outputs.begin_close();
-            if !aborted {
-                outputs.finish_close();
-            }
-        }
-        // The owners end here, as the model's facts do.
-        drop(image);
-        self.release_media();
-        result
+    /// Whether an executor lane serves calls of `kind` on this rank.
+    pub(crate) fn executes(&self, kind: ipc::CallKind) -> bool {
+        self.owners
+            .lanes
+            .as_ref()
+            .is_some_and(|lanes| lanes.serves(kind))
     }
 
-    /// Drop the rank's media runners and the storage their forwards use.
-    fn release_media(&mut self) {
-        self.runtimes.encoders = EncoderRunners::default();
-        self.runtimes.denoisers = DenoiserRunners::default();
-        self.runtimes.decoders = DecoderRunners::default();
-        self.runtimes.latents = None;
-        self.runtimes.trajectories = Trajectories::default();
+    /// The parts a lane's batch executes with; `None` on a rank without
+    /// executor lanes or storage owners.
+    pub(crate) fn lane_parts(&mut self) -> Option<super::lanes::Parts<'_>> {
+        Some(super::lanes::Parts {
+            placement: &self.placement,
+            rank: self.rank,
+            info: &self.info,
+            requests: &mut self.requests,
+            storage: self.owners.worker_storage.as_mut()?,
+            lanes: self.owners.lanes.as_mut()?,
+        })
     }
 
-    /// Install the diffusion LM runners.
-    pub(crate) fn set_diffusion_lm(
-        &mut self,
-        runners: Vec<crate::runner::diffusion_lm::DiffusionLMRunner>,
-    ) {
-        self.runtimes.diffusion_lm = runners;
+    /// Install this rank's member of its expert union.
+    pub(crate) fn set_experts(&mut self, experts: ExpertMember) {
+        self.owners.experts = Some(experts);
     }
 
-    pub(crate) fn diffusion_lm_mut(
-        &mut self,
-    ) -> &mut [crate::runner::diffusion_lm::DiffusionLMRunner] {
-        &mut self.runtimes.diffusion_lm
-    }
-
-    /// Install the expert-parallel runtime.
-    pub(crate) fn set_experts(&mut self, experts: crate::parallel::ExpertUnion) {
-        self.runtimes.experts = Some(Arc::new(experts));
+    /// This rank's member of its expert union.
+    pub(crate) fn experts(&self) -> Option<&ExpertMember> {
+        self.owners.experts.as_ref()
     }
 
     /// Install the distributed expert weights.
     pub(crate) fn set_weights(&mut self, weights: crate::parallel::DwdpManager) {
-        self.runtimes.weights = Some(weights);
+        self.owners.weights = Some(weights);
     }
 
     /// Install the layer stacks streamed from host memory.
-    pub(crate) fn set_host_weights(
-        &mut self,
-        weights: Vec<std::sync::Arc<crate::parallel::HostWeights>>,
-    ) {
-        self.runtimes.host_weights = weights;
-    }
-
-    /// Release the graphs of every runtime that runs expert steps and accept
-    /// their captures again, once the expert transports were rebuilt at new
-    /// addresses. The lanes are idle.
-    pub(crate) fn reopen_expert_graphs(&mut self) -> Result<()> {
-        if let Some(text) = self.runtimes.text.as_mut() {
-            text.reopen()?;
-        }
-        for runner in &mut self.runtimes.diffusion_lm {
-            runner.reopen()?;
-        }
-        Ok(())
-    }
-
-    /// Refuse further captures of the runtimes that run expert steps, once
-    /// they were captured again.
-    pub(crate) fn seal_expert_graphs(&mut self) {
-        if let Some(text) = self.runtimes.text.as_mut() {
-            text.seal();
-        }
-        for runner in &mut self.runtimes.diffusion_lm {
-            runner.seal();
-        }
-    }
-
-    /// The NCCL communicators of every runner's collectives, which a parked
-    /// standby suspends.
-    pub(crate) fn collectives(&self) -> impl Iterator<Item = &crate::parallel::StreamCollectives> {
-        let text = self
-            .runtimes
-            .text
-            .iter()
-            .flat_map(|text| text.collectives());
-        let diffusion = self
-            .runtimes
-            .diffusion_lm
-            .iter()
-            .flat_map(|runner| runner.collectives());
-        text.chain(diffusion)
-    }
-
-    pub(crate) fn experts(&self) -> Option<&Arc<crate::parallel::ExpertUnion>> {
-        self.runtimes.experts.as_ref()
-    }
-
-    /// The member, to change it between jobs: a job holds it only until
-    /// its completion is posted, so holding it now is an error, not a
-    /// reason to skip the change.
-    pub(crate) fn experts_mut(&mut self) -> Result<Option<&mut crate::parallel::ExpertUnion>> {
-        match &mut self.runtimes.experts {
-            Some(experts) => Arc::get_mut(experts)
-                .map(Some)
-                .ok_or(Error::State("the expert union is held by a job")),
-            None => Ok(None),
-        }
+    pub(crate) fn set_host_weights(&mut self, weights: Vec<crate::parallel::HostWeights>) {
+        self.owners.host_weights = weights;
     }
 
     /// The lanes' job queues, for work that runs as jobs outside a batch
@@ -495,35 +307,34 @@ impl WorkerBackend {
         &self.jobs
     }
 
-    /// Release the expert runtime and the weights copied ahead of their
-    /// layers after the bindings and graphs using them retired; collective
-    /// unless `aborted`.
+    /// Release the expert union member's storage and the weights copied
+    /// ahead of their layers after the executor closed the bindings,
+    /// graphs and exchanges using them.
     pub(crate) fn close_experts(&mut self, aborted: bool) -> Result<()> {
-        let experts = match self.experts_mut() {
-            Ok(Some(experts)) => experts.close(aborted),
-            Ok(None) => Ok(()),
-            Err(error) => Err(error),
-        };
-        let weights = match &mut self.runtimes.weights {
+        if let Some(mut experts) = self.owners.experts.take() {
+            experts.close(aborted);
+        }
+        let weights = match &mut self.owners.weights {
             Some(weights) => weights.close(aborted),
             None => Ok(()),
         };
-        // Host weights' copies run on their own streams; an aborted close
-        // keeps their memory until exit, since copies may still be queued.
+        // Host weights' copies run on the library's streams, which a close
+        // drains; an aborted close keeps their memory until exit, since
+        // copies may still be queued.
         let mut host = Ok(());
-        for streamed in std::mem::take(&mut self.runtimes.host_weights) {
+        for streamed in std::mem::take(&mut self.owners.host_weights) {
             if aborted {
                 crate::leak(streamed);
             } else {
                 host = host.and(streamed.close());
             }
         }
-        experts.and(weights).and(host)
+        weights.and(host)
     }
 
     /// Install the transfer runtime.
     pub(crate) fn set_transfer(&mut self, transfer: super::transfer::TransferRuntime) {
-        self.runtimes.transfer = Some(transfer);
+        self.owners.transfer = Some(transfer);
     }
 
     /// The lane's stream on `device` (none on host devices): imports are
@@ -535,7 +346,7 @@ impl WorkerBackend {
         if !matches!(device, crate::ffi::MemoryKind::Cuda(_)) {
             return Ok(None);
         }
-        self.runtimes
+        self.owners
             .transfer
             .as_ref()
             .ok_or_else(|| {
@@ -550,29 +361,9 @@ impl WorkerBackend {
             placement: &self.placement,
             rank: self.rank,
             requests: &mut self.requests,
-            storage: self.runtimes.worker_storage.as_mut(),
-            text: self.runtimes.text.as_mut(),
-            image: match (
-                &self.runtimes.image,
-                &mut self.runtimes.media_outputs,
-                &self.runtimes.image_host,
-            ) {
-                (Some((model, policy)), Some(outputs), Some(host)) => Some(ImageParts {
-                    model,
-                    policy,
-                    encoders: &mut self.runtimes.encoders,
-                    denoisers: &mut self.runtimes.denoisers,
-                    decoders: &mut self.runtimes.decoders,
-                    latents: self.runtimes.latents.as_mut(),
-                    trajectories: &mut self.runtimes.trajectories,
-                    outputs,
-                    host,
-                }),
-                _ => None,
-            },
-            diffusion_lm: &mut self.runtimes.diffusion_lm,
-            experts: self.runtimes.experts.as_ref(),
-            transfer: self.runtimes.transfer.as_mut(),
+            storage: self.owners.worker_storage.as_mut(),
+            lanes: self.owners.lanes.as_mut(),
+            transfer: self.owners.transfer.as_mut(),
         }
     }
 
@@ -585,80 +376,26 @@ impl WorkerBackend {
         self.kernels = Some(watch);
     }
 
-    /// Whether the rank serves a video model: its calls run as media
-    /// batches on the executor.
-    pub(crate) fn serves_video(&self) -> bool {
-        self.runtimes.video.is_some()
-    }
-
-    /// Install what serves a video model on this rank: the executor with
-    /// the trajectory ledger, and the output leases of its batches.
-    pub(crate) fn set_video(&mut self, video: super::video::VideoRuntime, outputs: OutputPool) {
-        self.runtimes.video = Some(video);
-        self.runtimes.media_outputs = Some(outputs);
-    }
-
-    /// What serves a video model on this rank.
-    pub(crate) fn video(&self) -> Option<&super::video::VideoRuntime> {
-        self.runtimes.video.as_ref()
-    }
-
-    /// The parts a video batch executes with.
-    pub(crate) fn media_parts(&mut self) -> Result<super::video::Parts<'_>> {
-        let unserved =
-            || Error::Unsupported("video calls are served on a video model's rank".into());
-        Ok(super::video::Parts {
-            requests: &mut self.requests,
-            storage: self
-                .runtimes
-                .worker_storage
-                .as_ref()
-                .ok_or_else(|| Error::Invariant("the rank has no storage owners".into()))?,
-            info: &self.info,
-            placement: &self.placement,
-            rank: self.rank,
-            video: self.runtimes.video.as_mut().ok_or_else(unserved)?,
-            outputs: self.runtimes.media_outputs.as_mut().ok_or_else(unserved)?,
-        })
-    }
-
     /// Install every Start, then follow each call's predecessor.
     fn admit_requests(&mut self, batch: &mut WorkerBatch) -> Result<()> {
-        let mut admitted = Vec::new();
         let mut installed = Vec::new();
         let started = (|| -> Result<()> {
             for command in &batch.plan.commands {
                 if let BatchCommand::Start { request } = command
-                    && let Some(slot) = self.requests.start(request.as_ref().clone())?
+                    && self.requests.start(request.as_ref().clone())?.is_some()
                 {
-                    admitted.push(slot);
                     installed.push(request);
                 }
             }
             Ok(())
         })();
-        // Reset every admitted slot even when a later Start failed.
-        if !admitted.is_empty() {
-            let slots: Vec<AdmittedSlot<'_>> = admitted
-                .iter()
-                .zip(&installed)
-                .map(|(&slot, request)| AdmittedSlot {
-                    slot,
-                    request: request.as_ref(),
-                })
-                .collect();
-            for owner in self.runtimes.owners() {
-                owner.admit_slots(&slots, &self.lifecycle)?;
-            }
-            self.perform_lifecycle()?;
-        }
         started?;
-        // The executor admits a video model's started requests in a job
-        // before the batch opens (`admit_inputs`); one whose size it does not
-        // serve is refused alone, and its calls report the refusal.
-        if let Some(video) = &mut self.runtimes.video {
+        // The executor admits the started requests in a job before the
+        // batch opens (`admit_inputs`); one it does not serve is refused
+        // alone, and its calls report the refusal.
+        if let Some(lanes) = &mut self.owners.lanes {
             for request in installed {
-                video.start(request)?;
+                lanes.start(request)?;
             }
         }
 
@@ -723,62 +460,45 @@ impl WorkerBackend {
     /// owner.
     pub(crate) fn set_storage_wake(&self, wake: Option<ipc::Wake>) {
         self.jobs.set_wake(wake.clone());
-        if let Some(storage) = &self.runtimes.worker_storage {
+        if let Some(storage) = &self.owners.worker_storage {
             storage.set_wake(wake.clone());
         }
-        if let Some(host) = &self.runtimes.image_host {
-            host.set_wake(wake.clone());
-        }
-        if let Some(video) = &self.runtimes.video {
-            video.set_wake(wake.clone());
-        }
-        for owner in &self.runtimes.storage {
-            owner.set_wake(wake.clone());
+        if let Some(lanes) = &self.owners.lanes {
+            lanes.set_wake(wake);
         }
     }
 
-    /// Close every storage owner, newest first (other runtimes, a video
-    /// model's owners, the transfer runtime, then rank storage), after the
-    /// executor drained and [`Self::close_runtimes`] closed the diffusion
-    /// LM, image and text runtimes; returns the first failure.
+    /// Close every storage owner, newest first (the transfer runtime, then
+    /// rank storage), after the executor drained and
+    /// [`Self::close_executor`] closed what computes; returns the first
+    /// failure.
     pub(crate) fn close_storage(&mut self, aborted: bool) -> Result<()> {
         let mut result = Ok(());
-        while let Some(mut owner) = self.runtimes.storage.pop() {
-            result = result.and(owner.close(aborted));
-        }
-        // A video model's owners close before the rank storage their
-        // products live in: the executor, then the output leases.
-        if let Some(mut video) = self.runtimes.video.take() {
-            result = result.and(video.close(aborted));
-            if let Some(mut outputs) = self.runtimes.media_outputs.take() {
-                result = result.and(outputs.close(aborted));
-            }
-            self.release_media();
-        }
-        if let Some(mut transfer) = self.runtimes.transfer.take() {
+        if let Some(mut transfer) = self.owners.transfer.take() {
             result = result.and(transfer.close(aborted));
         }
-        if let Some(mut storage) = self.runtimes.worker_storage.take() {
+        if let Some(mut storage) = self.owners.worker_storage.take() {
             result = result.and(storage.close(aborted));
         }
         result
     }
 
-    /// Close the diffusion LM, image and text runtimes (graphs, then steps)
-    /// before the bindings they run close; attempts every one before
+    /// Close what computes after the lanes drained: the executor, which
+    /// releases its lanes and the expert union, then the lanes' output
+    /// storage, image host lane and report pipe; attempts every one before
     /// returning the first failure.
-    pub(crate) fn close_runtimes(&mut self, aborted: bool) -> Result<()> {
-        let mut diffusion_lm = Ok(());
-        for mut runner in std::mem::take(&mut self.runtimes.diffusion_lm) {
-            diffusion_lm = diffusion_lm.and(runner.close(aborted));
-        }
-        let image = self.close_image(aborted);
-        let text = self
-            .runtimes
-            .text
+    pub(crate) fn close_executor(&mut self, aborted: bool) -> Result<()> {
+        let executor = self
+            .owners
+            .executor
             .take()
-            .map_or(Ok(()), |mut text| text.close(aborted));
-        diffusion_lm.and(image).and(text)
+            .map_or(Ok(()), |executor| executor.close(aborted));
+        let lanes = self
+            .owners
+            .lanes
+            .take()
+            .map_or(Ok(()), |mut lanes| lanes.close(aborted));
+        executor.and(lanes)
     }
 
     /// Release the outputs of the predecessors this batch's calls follow.
@@ -787,7 +507,7 @@ impl WorkerBackend {
     /// early; once the batch executed, the predecessors it read retire too.
     /// The admission root (batch 0) has no outputs.
     fn release_predecessors(&mut self, batch: &WorkerBatch, inputs_acquired: bool) -> Result<()> {
-        let Some(storage) = self.runtimes.worker_storage.as_mut() else {
+        let Some(storage) = self.owners.worker_storage.as_mut() else {
             return Ok(());
         };
         let mut consumed = HashSet::new();
@@ -845,37 +565,6 @@ impl WorkerBackend {
     }
 }
 
-/// The kernel listings of the text runners and of an image model's
-/// runners, in the order `order` names those: each with its runner's
-/// label and device.
-fn kernel_calls(
-    text: Option<&crate::runner::causal_lm::CausalLMRunners>,
-    order: &[(ImageRunner, String)],
-    encoders: &EncoderRunners,
-    denoisers: &DenoiserRunners,
-    decoders: &DecoderRunners,
-) -> Vec<KernelCalls> {
-    let mut listed = text.map_or_else(Vec::new, |text| text.kernel_calls());
-    for (runner, name) in order {
-        let (device, calls) = match runner {
-            ImageRunner::Encoder(index) => match encoders.image.get(*index) {
-                Some(runner) => (runner.device().to_string(), runner.kernel_calls()),
-                None => continue,
-            },
-            ImageRunner::Denoiser => match &denoisers.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernel_calls()),
-                None => continue,
-            },
-            ImageRunner::Decoder => match &decoders.image {
-                Some((_, runner)) => (runner.device().to_string(), runner.kernel_calls()),
-                None => continue,
-            },
-        };
-        listed.push((name.clone(), device, calls));
-    }
-    listed
-}
-
 /// What the rank service asks of the backend beyond the executor's steps.
 impl WorkerBackend {
     pub(crate) fn response_error(
@@ -914,15 +603,10 @@ impl WorkerBackend {
 
     pub(crate) fn awaiting_acknowledgment(&self) -> std::result::Result<bool, WorkerError> {
         Ok(self
-            .runtimes
+            .owners
             .worker_storage
             .as_ref()
-            .is_some_and(|storage| storage.awaiting_acknowledgment())
-            || self
-                .runtimes
-                .storage
-                .iter()
-                .any(|owner| owner.awaiting_acknowledgment()))
+            .is_some_and(WorkerMemory::awaiting_acknowledgment))
     }
 
     pub(crate) fn join_expert_step(
@@ -935,17 +619,23 @@ impl WorkerBackend {
         if self.joining.is_some() {
             return Ok(None);
         }
-        let experts = self.experts().ok_or_else(|| {
-            WorkerError::classify(
-                Error::State("expert-step participation requires an expert union"),
-                None,
-            )
-        })?;
+        let executor = self
+            .owners
+            .executor
+            .as_ref()
+            .filter(|_| self.owners.experts.is_some())
+            .ok_or_else(|| {
+                WorkerError::classify(
+                    Error::State("expert-step participation requires an expert union"),
+                    None,
+                )
+            })?;
 
-        // A join launches on the lane the union's forwards run on, whose
-        // execution thread takes part in the agreement.
+        // A join is a job of the lane the union's steps run on: the
+        // executor agrees on the union's next step and, when one was
+        // agreed, joins it on the lane's stream.
         let job = Job::new();
-        job.expert_join(Arc::clone(experts), leaving);
+        job.call_returning(executor.join_expert_step(leaving));
         let submitted = self.jobs.start(job, true).map_err(lane_lost)?;
         self.joining = Some(submitted);
         Ok(None)

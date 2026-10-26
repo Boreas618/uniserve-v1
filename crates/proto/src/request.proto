@@ -794,10 +794,12 @@ message CudaGraphs {
   string policy = 1;
   // Prefill and image denoising always capture under graphs.
   reserved 2, 3;
+  // Image denoising captures the row buckets its executor derives.
+  reserved 6;
+  reserved "flow_batch_sizes";
   // Each list is absent for the worker's catalog.
   Sizes decode_batch_sizes = 4;
   Sizes prefill_token_sizes = 5;
-  Sizes flow_batch_sizes = 6;
   Shapes flow_shapes = 7;
 }
 

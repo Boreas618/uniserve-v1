@@ -4,9 +4,10 @@
 //! `uniserve worker` command loads this library and calls its exported
 //! [`worker_main`], which runs the control thread on the process's main
 //! thread and the interpreter on its builder thread. Rust owns
-//! request state, storage, streams, graphs policy, transfers and the IPC
-//! service; Python computes through the library functions Rust imports by
-//! path.
+//! request state, storage, streams, the CUDA graph policy and graph memory,
+//! transfers and the IPC service; one Python executor per rank
+//! (`uniserve.executor.Executor`) computes every model family's numerics
+//! through the library functions Rust imports by path.
 //!
 //! The library also exports the video request rules of the `models` crate to
 //! the Python library, which plans MiniMax-H3 requests with them.
@@ -14,9 +15,8 @@
 //! Besides that entry point the crate exposes only what its integration
 //! tests (`tests/`), its test harnesses (`examples/`) and its benchmark drive:
 //! the launch configuration and registration, the interpreter and DLPack
-//! export, the storage owners, the transfer mechanisms, the host groups and
-//! collectives, and the image runners. Everything else is internal to the
-//! worker runtime.
+//! export, the storage owners, the transfer mechanisms and the host groups.
+//! Everything else is internal to the worker runtime.
 
 mod capacity;
 mod completion;
@@ -34,32 +34,21 @@ pub mod parallel;
 mod profiling;
 mod request;
 mod rules;
-mod runner;
-mod sampling;
 mod service;
 mod stream;
 pub mod transfer;
-mod warmup;
 mod worker;
 
 use std::os::unix::ffi::OsStrExt;
 
 pub use completion::{Completion, Outcome};
-pub use cuda_graph::GraphPool;
 pub use error::{Error, ErrorCode, Result, WorkerError};
-pub use runner::ImageSetup;
-pub use runner::decoder::{DecodeImage, DecoderRunner};
-pub use runner::encoder::{
-    Encoded, EncoderConfig, EncoderInfo, EncoderRunner, ImagePreparation, LatentEncoder,
-    PreparedImage, Tower, VisionEncoder,
-};
-pub use stream::{CUDAStream, EventPool, Fill, Issue, RowFill};
+pub use stream::EventPool;
 
 pub(crate) use executor::{Batch, Executor, Submission};
 pub(crate) use host::HostTask;
 pub(crate) use memory::{
-    BlockTables, BufferBinding, LatentPool, LatentStorage, LatentUpdate, OutputBuffer, OutputPool,
-    ProductBuffer, ProductRead, ProductStore,
+    BlockTables, BufferBinding, LatentPool, LatentStorage, LatentUpdate, OutputBuffer, ProductStore,
 };
 pub(crate) use request::{RequestPool, RequestProgress};
 pub(crate) use transfer::DescriptorGrants;

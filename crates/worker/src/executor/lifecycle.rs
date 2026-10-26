@@ -12,9 +12,10 @@
 //!   release never waits behind an allocation-dependent batch; existing
 //!   readers keep their leases.
 //!
-//! Request storage (tensor store, prefix cache, latent pool, block tables,
-//! decode and diffusion LM state) is owned by the storage and capability runtimes
-//! and takes part through [`RequestStorage`].
+//! Request storage (the product store, the prefix cache and its block
+//! tables, the lanes' output leases and latent ledger, the transfer
+//! runtime's output leases) takes part through [`RequestStorage`]; slot
+//! state the executor keeps is released through its `release`.
 //!
 //! Lifecycle commands run on the control thread, which issues no stream
 //! work itself: what an owner's command needs on a device (a slot's reset,
@@ -24,9 +25,9 @@
 
 use std::collections::HashSet;
 
-use ipc::{Batch, BatchCommand, BufferId, NewRequest, RequestKey};
+use ipc::{Batch, BatchCommand, BufferId, RequestKey};
 
-use super::backend::Runtimes;
+use super::backend::Owners;
 use crate::Result;
 use crate::lane::Job;
 use crate::request::RequestPool;
@@ -51,19 +52,9 @@ impl LaneJobs {
     }
 }
 
-/// A request slot a batch's `Start` admitted, and the admission it holds.
-pub(crate) struct AdmittedSlot<'a> {
-    pub(crate) slot: usize,
-    pub(crate) request: &'a NewRequest,
-}
-
 /// Storage that request epochs and products own, driven by lifecycle
 /// commands. Methods run on the executor thread.
 pub(crate) trait RequestStorage {
-    /// Reset per-slot state of newly admitted request slots; the resets a
-    /// device makes are recorded into `jobs`.
-    fn admit_slots(&mut self, admitted: &[AdmittedSlot<'_>], jobs: &LaneJobs) -> Result<()>;
-
     /// Revoke explicitly freed products and those of finished requests.
     /// Existing readers keep their physical leases. What follows a
     /// released product's outstanding fences is recorded into `jobs`.
@@ -94,21 +85,6 @@ pub(crate) trait RequestStorage {
 
     /// Progress asynchronous completions (event pools, remote readers).
     fn reap(&mut self) -> Result<()>;
-
-    /// Whether a remote acknowledgment without a wake source is outstanding.
-    fn awaiting_acknowledgment(&self) -> bool {
-        false
-    }
-
-    /// Install (or clear) the service wake fired by asynchronous
-    /// completions while the rank serves.
-    fn set_wake(&self, _wake: Option<ipc::Wake>) {}
-
-    /// Release the owner's storage at shutdown, after the executor drained.
-    /// An aborted close keeps whatever device work may still address.
-    fn close(&mut self, _aborted: bool) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// One batch's Finish and Free commands.
@@ -153,11 +129,11 @@ impl Retirement {
     }
 
     /// Revoke explicitly freed products before the batch waits for storage.
-    pub(crate) fn admit(&self, runtimes: &mut Runtimes, jobs: &LaneJobs) -> Result<()> {
+    pub(crate) fn admit(&self, owners: &mut Owners, jobs: &LaneJobs) -> Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
-        for owner in runtimes.owners() {
+        for owner in owners.request_storage() {
             owner.release_buffers(&self.buffers, jobs)?;
         }
         Ok(())
@@ -167,7 +143,7 @@ impl Retirement {
     pub(crate) fn begin(
         &mut self,
         requests: &RequestPool,
-        runtimes: &mut Runtimes,
+        owners: &mut Owners,
         jobs: &LaneJobs,
     ) -> Result<()> {
         if self.requests.is_empty() && self.buffers.is_empty() {
@@ -185,7 +161,7 @@ impl Retirement {
                     .is_some_and(|request| request.key() == *key)
             })
             .collect();
-        for owner in runtimes.owners() {
+        for owner in owners.request_storage() {
             owner.release_requests(&self.requests, &self.retained, jobs)?;
             owner.release_buffers(&self.buffers, jobs)?;
         }
@@ -197,7 +173,7 @@ impl Retirement {
     pub(crate) fn poll(
         &mut self,
         requests: &mut RequestPool,
-        runtimes: &mut Runtimes,
+        owners: &mut Owners,
         jobs: &LaneJobs,
     ) -> Result<bool> {
         if self.complete {
@@ -208,7 +184,7 @@ impl Retirement {
                 return Ok(false);
             }
         }
-        for owner in runtimes.owners() {
+        for owner in owners.request_storage() {
             if !owner.retirement_ready(&self.buffers, &self.requests, &self.retained)? {
                 return Ok(false);
             }
@@ -226,7 +202,7 @@ impl Retirement {
             }
         }
         if !slots.is_empty() {
-            for owner in runtimes.owners() {
+            for owner in owners.request_storage() {
                 owner.retire_slots(&slots, jobs)?;
             }
         }

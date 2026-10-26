@@ -1,18 +1,17 @@
-//! One batch in flight: the skeleton every capability's batch is built on,
-//! and the dispatch of a batch's jobs to the capability that serves it.
+//! One batch in flight: the skeleton every batch is built on, and the
+//! dispatch of a batch's jobs to what serves its kind.
 //!
 //! A batch carries calls of one kind on one component. Its forward is a
 //! sequence of jobs of its lane: [`forward`] prepares the next one and
 //! [`complete`] applies its completion. The first job completes the batch's
 //! imported inputs ([`crate::executor::inputs`]); the others belong to what
-//! serves the kind: the causal LM and diffusion LM runners, an image model's
-//! batches ([`crate::executor::image`]), a video model's media batches
-//! ([`crate::executor::video`]) and transfers ([`crate::executor::transfer`]).
+//! serves the kind: the executor's lanes ([`crate::executor::lanes`]) and
+//! transfers ([`crate::executor::transfer`]).
 //! No forward issues its own stream work: the jobs of every batch are
 //! operations its owner recorded.
 //!
-//! Every capability's batch goes through the same steps, which this module
-//! implements once:
+//! Every batch goes through the same steps, which this module implements
+//! once:
 //!
 //! 1. **Open** ([`Opening::open`]). Bind every call's pending output to its
 //!    request and record in the opening job the read of every host-gated
@@ -35,9 +34,9 @@
 //!    its progress accepted.
 //!
 //! A failed batch reports its calls failed under the failure's code
-//! ([`fail`]); a fatal failure stops the rank. A kind no capability of the
-//! rank serves is reported unsupported ([`unsupported`]), which fails the
-//! batch with `UnsupportedSetup` and leaves the rank serving. A capability
+//! ([`fail`]); a fatal failure stops the rank. A kind no executor lane of
+//! the rank serves is reported unsupported ([`unserved`]), which fails
+//! the batch with `UnsupportedSetup` and leaves the rank serving. A batch
 //! whose results need host work after the device finished (encoding
 //! decoded images, publishing what host media tasks wrote) attaches it to
 //! its launch as a [`HostStage`].
@@ -49,11 +48,11 @@ use std::time::Instant;
 use cuda::{DeviceId, Stream};
 use ipc::CallId;
 use ipc::{
-    Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardMode,
-    ForwardStats, MediaCall, RequestKey, TensorRef,
+    Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardStats,
+    RequestKey, TensorRef,
 };
 
-use crate::config::placement::{Capability, GroupPlacement};
+use crate::config::placement::GroupPlacement;
 use crate::error::WorkerError;
 use crate::executor::backend::{WorkerBackend, WorkerBatch};
 use crate::executor::products::ProductOwners;
@@ -74,7 +73,7 @@ pub(crate) enum Stage {
     /// Its imported inputs are not resident yet.
     #[default]
     Inputs,
-    /// Its capability's forward has jobs to run.
+    /// Its lane's forward has jobs to run.
     Forward,
     /// Nothing is left for its lane.
     Done,
@@ -109,8 +108,8 @@ impl Failure {
     }
 }
 
-/// One call's state through its batch: what every capability tracks, and
-/// `forward`, what the call contributes to its capability's forward.
+/// One call's state through its batch: what every batch tracks, and
+/// `forward`, what the call contributes to its lane's forward.
 pub(crate) struct CallState<F = ()> {
     pub(crate) output: PendingOutput,
     /// The request slot of the call's request.
@@ -222,12 +221,6 @@ impl<F> Opening<F> {
         &self.calls
     }
 
-    /// The calls' states, for a capability that sets what they contribute
-    /// to its forward.
-    pub(crate) fn calls_mut(&mut self) -> &mut [CallState<F>] {
-        &mut self.calls
-    }
-
     /// Whether the opening job reads predicates, so the batch continues
     /// only once that job completed.
     pub(crate) fn reads_predicates(&self) -> bool {
@@ -306,11 +299,6 @@ impl<F> Batch<F> {
             reports,
             started,
         })
-    }
-
-    /// Where the batch issues its stream work: `job`, on its stream.
-    pub(crate) fn issue<'j>(&'j self, job: &'j Job) -> Recorder<'j> {
-        job.on(self.stream.as_ref())
     }
 
     /// The device the batch's products live on.
@@ -650,15 +638,12 @@ pub(crate) fn fail(
     Ok(())
 }
 
-/// The error of a call kind whose capability is not served on this rank.
-pub(crate) fn unsupported(kind: CallKind, capability: &str) -> WorkerError {
-    WorkerError::classify(
-        Error::Unsupported(format!(
-            "{} is served by the {capability} capability",
-            kind.as_str()
-        )),
-        None,
-    )
+/// The error of a call kind no executor lane of this rank serves.
+pub(crate) fn unserved(kind: CallKind) -> Error {
+    Error::Unsupported(format!(
+        "no executor lane of this rank serves {} calls",
+        kind.as_str()
+    ))
 }
 
 /// Materialize a launched batch once its output fences completed: finish
@@ -756,9 +741,10 @@ fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Resul
     Ok(())
 }
 
-/// Orders one runner family's per-slot state across the streams of its
-/// runners: each batch waits for the previous batch recorded on another
-/// stream.
+/// Orders the batches that share per-slot state or storage across the
+/// streams they run on (the lanes over the prefix cache, the users of a
+/// latent ledger): each batch waits for the previous batch recorded on
+/// another stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
     last: Option<(usize, Arc<cuda::Event>)>,
@@ -820,8 +806,9 @@ pub(crate) fn abandon(
 }
 
 /// The next job of a batch's forward at its stage: the completion of its
-/// imported inputs, then the jobs of the runtime serving `kind`. `None`
-/// when the stage advanced without needing the lane.
+/// imported inputs, then the jobs of what serves `kind` (a transfer or an
+/// executor lane). `None` when the stage advanced without needing the
+/// lane.
 pub(crate) fn forward(
     backend: &mut WorkerBackend,
     batch: &mut WorkerBatch,
@@ -837,27 +824,13 @@ pub(crate) fn forward(
             Err(error) => imported(backend, batch, Err(error)).map(|()| None),
         },
         Stage::Forward => match kind {
-            Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
-                crate::runner::causal_lm::forward(backend, batch, kind)
-            }
-            Forward(ForwardMode::TokenDenoising) => {
-                crate::runner::diffusion_lm::forward(backend, batch, kind)
-            }
             CallKind::Transfer(_) => crate::executor::transfer::forward(backend, batch, kind),
-            _ if records(backend, kind) => crate::executor::video::forward(backend, batch),
-            // A video model's rank records its media calls ([`records`]);
-            // no other rank serves these kinds.
-            CallKind::Media(
-                MediaCall::MediaReading
-                | MediaCall::VideoEncoding
-                | MediaCall::AudioEncoding
-                | MediaCall::Muxing
-                | MediaCall::VideoDecoding
-                | MediaCall::AudioDecoding,
-            ) => Err(unsupported(kind, "video")),
-            // The remaining kinds are an image model's: its encoders, its
-            // denoiser and its decoder.
-            _ => crate::executor::image::forward(backend, batch, kind),
+            _ if backend.executes(kind) => crate::executor::lanes::forward(backend, batch, kind),
+            // Only an executor lane serves the other kinds: a call no lane of
+            // this rank serves fails with its batch, and the rank serves on.
+            Forward(_) | CallKind::Media(_) => {
+                fail(backend, batch, Failure::new("lanes")(unserved(kind))).map(|()| None)
+            }
         },
         Stage::Done => Ok(None),
     }
@@ -870,8 +843,6 @@ pub(crate) fn complete(
     kind: CallKind,
     completion: Completion,
 ) -> std::result::Result<(), WorkerError> {
-    use CallKind::Forward;
-
     if batch.stage() == Stage::Inputs {
         return match crate::executor::inputs::complete(batch, completion) {
             // The imports' second job follows.
@@ -881,40 +852,9 @@ pub(crate) fn complete(
         };
     }
     match kind {
-        Forward(ForwardMode::Prefill | ForwardMode::Decode | ForwardMode::Verify) => {
-            crate::runner::causal_lm::complete(backend, batch, completion)
-        }
-        Forward(ForwardMode::TokenDenoising) => {
-            crate::runner::diffusion_lm::complete(backend, batch, completion)
-        }
         CallKind::Transfer(_) => crate::executor::transfer::complete(backend, batch, completion),
-        _ if records(backend, kind) => crate::executor::video::complete(backend, batch, completion),
-        _ => crate::executor::image::complete(backend, batch, kind, completion),
+        _ => crate::executor::lanes::complete(backend, batch, completion),
     }
-}
-
-/// Whether `kind` is served by a video model's media batches on this rank
-/// ([`crate::executor::video::forward`]): its media calls, on its devices
-/// and on its host lane.
-fn records(backend: &WorkerBackend, kind: CallKind) -> bool {
-    use MediaCall::*;
-
-    matches!(
-        kind,
-        CallKind::Media(
-            MediaReading
-                | TextEncoding
-                | VisionEncoding
-                | LatentEncoding
-                | LatentPreparation
-                | Denoising
-                | VideoDecoding
-                | AudioDecoding
-                | VideoEncoding
-                | AudioEncoding
-                | Muxing
-        )
-    ) && backend.serves_video()
 }
 
 /// Continue with the forward once the imported inputs are resident; an
@@ -933,16 +873,6 @@ fn imported(
     Ok(())
 }
 
-/// Whether a component's model decodes video.
-pub(crate) fn decodes_video(capabilities: impl IntoIterator<Item = Capability>) -> bool {
-    capabilities.into_iter().any(|capability| {
-        matches!(
-            capability,
-            Capability::VideoDenoiser | Capability::VideoPostprocessor
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -950,7 +880,9 @@ mod tests {
     use std::time::Duration;
 
     use cuda::{DeviceId, Event, EventFlags, Stream};
-    use ipc::{BufferAllocation, GenerationParams, NewRequest, RequestKey, ShapeBound};
+    use ipc::{
+        BufferAllocation, ForwardMode, GenerationParams, NewRequest, RequestKey, ShapeBound,
+    };
     use ipc::{RequestId, SamplingParams};
 
     use super::*;

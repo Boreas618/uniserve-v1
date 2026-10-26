@@ -12,8 +12,8 @@ use ipc::LaunchDescriptor;
 
 use super::device::{Device, generation_device};
 use super::{
-    DEFAULT_FLOW_GRAPH_BATCH_SIZES, DEFAULT_FLOW_GRAPH_SHAPES, DescriptorError, WorkerConfig,
-    default_decode_sizes, default_prefill_sizes,
+    DEFAULT_FLOW_GRAPH_SHAPES, DescriptorError, WorkerConfig, default_decode_sizes,
+    default_prefill_sizes,
 };
 
 /// Channel and product-publication settings of the rank.
@@ -54,10 +54,27 @@ pub struct ExpertUnion {
     pub exchange: String,
 }
 
+/// The exchange of a union whose ranks prefetch the routed experts'
+/// weights from each other (distributed expert weights) instead of
+/// exchanging tokens.
+const WEIGHT_PREFETCH: &str = "dwdp";
+
+/// The all-to-all token exchange, which a rank without a union states.
+const ALL_TO_ALL: &str = "alltoall";
+
+/// The token exchanges the executor's transports construct.
+const TOKEN_EXCHANGES: [&str; 3] = [ALL_TO_ALL, "deepep", "megamoe"];
+
 impl ExpertUnion {
     /// Experts run on dedicated ranks separate from attention.
     pub(crate) fn disaggregated(&self) -> bool {
         self.attention_ranks > 0
+    }
+
+    /// The union prefetches the routed experts' weights rather than
+    /// exchanging tokens, so it runs no expert steps.
+    pub(crate) fn prefetches_weights(&self) -> bool {
+        self.exchange == WEIGHT_PREFETCH
     }
 }
 
@@ -280,6 +297,13 @@ fn expert_parallel(descriptor: &LaunchDescriptor) -> Result<Option<ExpertUnion>,
     let address = text(value.address.as_deref()).ok_or_else(|| {
         DescriptorError::new("an expert-parallel union requires its store address")
     })?;
+    // A token exchange, or weight prefetch, which exchanges no tokens.
+    if !TOKEN_EXCHANGES.contains(&value.exchange.as_str()) && value.exchange != WEIGHT_PREFETCH {
+        return Err(DescriptorError::new(format!(
+            "unknown expert exchange {:?}",
+            value.exchange
+        )));
+    }
     Ok(Some(ExpertUnion {
         rank: value.rank as usize,
         size: value.size as usize,
@@ -336,7 +360,7 @@ fn execution(
     experts: Option<&ExpertUnion>,
 ) -> Result<WorkerConfig, DescriptorError> {
     let expert_exchange =
-        experts.map_or_else(|| "alltoall".to_owned(), |union| union.exchange.clone());
+        experts.map_or_else(|| ALL_TO_ALL.to_owned(), |union| union.exchange.clone());
     let mut config = WorkerConfig {
         device,
         generation_device: generation,
@@ -371,11 +395,10 @@ fn execution(
         decode_graph_batch_sizes: default_decode_sizes(),
         prefill_outputs: descriptor.prefill_outputs,
         prefill_graph_token_sizes: default_prefill_sizes(),
-        flow_graph_batch_sizes: DEFAULT_FLOW_GRAPH_BATCH_SIZES.to_vec(),
         flow_graph_shapes: DEFAULT_FLOW_GRAPH_SHAPES.to_vec(),
     };
 
-    if config.expert_exchange == "alltoall" && experts.is_some() {
+    if config.expert_exchange == ALL_TO_ALL && experts.is_some() {
         // Each local graph also captures larger transfer capacities.
         // Geometric small buckets, then 512-token spacing, bound that
         // product.
@@ -397,10 +420,6 @@ fn execution(
         (
             &descriptor.prefill_graph_token_sizes,
             &mut config.prefill_graph_token_sizes,
-        ),
-        (
-            &descriptor.flow_graph_batch_sizes,
-            &mut config.flow_graph_batch_sizes,
         ),
         (
             &descriptor.video_text_capacities,

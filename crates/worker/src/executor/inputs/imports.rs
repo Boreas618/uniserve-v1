@@ -252,10 +252,11 @@ fn import_latent(
     let storage = parts
         .storage
         .ok_or_else(|| Error::Unsupported("latent imports require rank storage".into()))?;
-    let mut image = parts
-        .image
+    let ledger = parts
+        .lanes
+        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
         .ok_or_else(|| Error::Invalid("latent transfer requires physical latent storage".into()))?;
-    let (pool, latent) = image.latent_pool()?;
+    let (pool, latent) = ledger.parts();
     let input = latents::import(
         pool,
         latent,

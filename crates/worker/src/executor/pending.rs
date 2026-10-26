@@ -6,13 +6,15 @@ use ipc::{
 };
 use ipc::{CallId, MediaSource};
 
+use crate::executor::records::COMPLETION_FIELDS;
 use crate::{Error, LatentUpdate, OutputBuffer, RequestPool, RequestProgress, Result};
 
-// sampling_columns packs [valid | active | token | accepted draft count],
-// with one word per row in each field. A denoising step's completion starts with
-// its outcome.
-const SAMPLING_FIELDS: usize = 4;
+/// The outcome word that starts a canvas step's completion
+/// (`uniserve.runner.diffusion_lm`): the step stopped its block, whose
+/// tokens follow; a block that continues (0) commits no tokens.
 const STEP_STOPPED: i64 = 1;
+/// The step's row was inactive on the device, its block stopped before:
+/// the call reports itself predicated.
 const STEP_SKIPPED: i64 = 2;
 
 /// A completed batch retains generated media through cleanup and delivery.
@@ -149,23 +151,6 @@ impl PendingOutput {
         }
     }
 
-    /// Advance token execution before numerical state is committed. M-RoPE
-    /// consumers may supply an absolute position instead of a token offset.
-    pub(crate) fn advance_tokens(
-        &mut self,
-        tokens: u64,
-        cache_length: Option<u64>,
-        position: Option<u64>,
-        sampled: bool,
-    ) {
-        self.progress.logical_position =
-            position.unwrap_or_else(|| self.progress.logical_position + tokens);
-        self.progress.rng_counter += u64::from(sampled);
-        if let Some(length) = cache_length {
-            self.set_cache_length(length);
-        }
-    }
-
     /// Ordinary forwards and imported cache expose their complete written extent.
     /// Speculative verification retains its distinct initialized extent.
     pub(crate) fn set_cache_length(&mut self, length: u64) {
@@ -206,7 +191,7 @@ impl PendingOutput {
     /// Check the call's captured output against its declaration. Its byte
     /// bounds are the engine's: a completion's capture is bounded by the
     /// lease the batch sized from its calls' `max_completion_bytes`
-    /// (`OutputBuffer::reserve_tokens`, `reserve_bytes`), and a cache
+    /// (`OutputBuffer::lend_words`, `lend_bytes`), and a cache
     /// export's bytes by the reservation the engine planned from the same
     /// visible extent (`PrefixCacheInfo::transfer_bytes`).
     pub(crate) fn validate_output(&self, call: &Call) -> Result<()> {
@@ -310,8 +295,8 @@ impl PendingOutput {
 
         if let Some((offset, extent, row)) = self.sampling_range {
             let values = buffer.read_tokens(offset, extent)?;
-            let count = extent / SAMPLING_FIELDS;
-            if extent % SAMPLING_FIELDS != 0 || row >= count {
+            let count = extent / COMPLETION_FIELDS;
+            if extent % COMPLETION_FIELDS != 0 || row >= count {
                 return Err(Error::State("sampling completion vectors do not align"));
             }
 
@@ -711,35 +696,23 @@ mod tests {
     /// case says so.
     const DRAFTS: [u32; 3] = [11, 12, 13];
 
-    /// A verification call's completion as a CPU lane's sampler captures
-    /// it: one valid, active row whose sampled token is `token` after
-    /// `accepted` accepted drafts.
+    /// A verification call's completion as the executor writes it into
+    /// the lent words: one valid, active row whose sampled token is `token`
+    /// after `accepted` accepted drafts.
     fn sampling(token: i64, accepted: i64) -> Result<OutputBuffer> {
-        use crate::ffi::{Backing, DType};
-        use crate::memory::{OutputStorage, Storage, StorageView};
+        use crate::memory::OutputStorage;
 
         let words = [1_i64, 1, token, accepted];
-        let memory = Storage::host(size_of_val(&words));
-        // SAFETY: fresh host memory of exactly these words, owned here.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                words.as_ptr(),
-                memory.address() as *mut i64,
-                words.len(),
-            );
-        }
-        let column = StorageView::contiguous(
-            memory as std::sync::Arc<dyn Backing>,
-            0,
-            DType::I64,
-            &[words.len() as i64],
-        )?;
-
         let mut buffer =
             OutputBuffer::new(OutputStorage::allocate(None, words.len())?, 1, &[], false);
-        let events = crate::EventPool::default();
-        buffer.capture(&column, None::<&cuda::Stream>, &events)?;
-        buffer.seal::<&cuda::Stream>(&[], &events)?;
+        let (_, lent) = buffer.lend_words()?;
+        // SAFETY: the lent host words belong to this buffer and nothing
+        // else writes them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), lent.address() as *mut i64, words.len());
+        }
+        buffer.seal::<&cuda::Stream>(&[], &crate::EventPool::default())?;
+        buffer.register_lent(words.len(), Vec::new())?;
         buffer.copies_finished();
         buffer.readback()?;
         Ok(buffer)
@@ -763,7 +736,7 @@ mod tests {
 
         let mut output = PendingOutput::new(&call, previous, 0)?;
         output.set_speculation(DRAFTS.to_vec(), terminal, VISIBLE, initialized);
-        output.sampling_range = Some((0, SAMPLING_FIELDS, 0));
+        output.sampling_range = Some((0, COMPLETION_FIELDS, 0));
         output.resolve(previous, &mut sampling(token, accepted)?)?;
         Ok(output)
     }

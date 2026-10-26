@@ -2,7 +2,7 @@
 //!
 //! [`resolve`] turns the descriptor into a [`WorkerLaunch`]; its
 //! [`WorkerConfig`] holds the execution settings shared by capacity planning,
-//! storage and the runners.
+//! storage and the executor's settings.
 
 mod device;
 mod launch;
@@ -101,13 +101,9 @@ pub struct WorkerConfig {
     pub decode_graph_batch_sizes: Vec<usize>,
     pub prefill_outputs: bool,
     pub prefill_graph_token_sizes: Vec<usize>,
-    pub flow_graph_batch_sizes: Vec<usize>,
     /// Image capture sizes in (height, width) pixels.
     pub flow_graph_shapes: Vec<(usize, usize)>,
 }
-
-/// Image denoising batch sizes captured when the launch names none.
-pub(crate) const DEFAULT_FLOW_GRAPH_BATCH_SIZES: [usize; 4] = [1, 2, 3, 4];
 
 /// Image capture sizes, in (height, width) pixels, when the launch names none.
 pub(crate) const DEFAULT_FLOW_GRAPH_SHAPES: [(usize, usize); 2] = [(1152, 2048), (2048, 1152)];
@@ -126,24 +122,6 @@ pub(crate) fn default_prefill_sizes() -> Vec<usize> {
         .chain((576..=4096).step_by(64))
         .chain((4608..=16384).step_by(512))
         .collect()
-}
-
-/// The prefill row buckets of a runner whose batches carry at most
-/// `max_rows` rows: powers of two from 8, then `max_rows + 1`, so that every
-/// batch the engine forms fits one. A bucket of `n` rows holds batches of
-/// fewer rows, the remaining row being an inert padding sequence; the last
-/// power of two below `max_rows + 1` is merged into it rather than leaving
-/// a bucket that holds a single row count.
-pub(crate) fn prefill_row_buckets(max_rows: usize) -> Vec<usize> {
-    let last = max_rows + 1;
-    let mut buckets = Vec::new();
-    let mut bucket = 8;
-    while 2 * bucket <= last {
-        buckets.push(bucket);
-        bucket *= 2;
-    }
-    buckets.push(last);
-    buckets
 }
 
 impl WorkerConfig {

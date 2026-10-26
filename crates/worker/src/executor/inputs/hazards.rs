@@ -108,12 +108,13 @@ pub(super) fn latent_hazards(
         return Ok(Vec::new());
     }
     let parts = backend.parts();
-    let Some(mut image) = parts.image else {
+    let Some(ledger) = parts
+        .lanes
+        .and_then(crate::executor::lanes::ExecutorLanes::ledger_mut)
+    else {
         return Ok(Vec::new());
     };
-    let Ok((pool, _)) = image.latent_pool() else {
-        return Ok(Vec::new());
-    };
+    let (pool, _) = ledger.parts();
     pool.reap();
     let mut hazards = Vec::new();
     let mut superseded = Vec::new();

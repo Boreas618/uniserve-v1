@@ -220,8 +220,8 @@ pub struct Stall {
     pub batch_id: Option<u64>,
     /// Call kind of that batch (for example `prefill`).
     pub route: Option<String>,
-    /// Import path of the runner method the job calls; `None` for a job
-    /// that calls none, such as a graph launch.
+    /// Import path of the library method the job calls; `None` for a job
+    /// that calls none, such as a copy or a wait.
     pub method: Option<String>,
     /// The calls of that batch.
     pub calls: Vec<ErrorCallIdentity>,

@@ -1,25 +1,26 @@
 //! Kernels selected by numerical layers, logged once at startup and again
 //! when serving selects new ones.
 //!
-//! Each runner reports one record per prepared operator as the text of a
-//! JSON object. The rank does not read the records: it keeps them by runner,
-//! notices when a runner's report changes, and hands them back to the
-//! library, which renders the kernel table (`uniserve.profiling.kernel_table`). The
-//! table is logged as the line `uniserve-kernel-table {json}`.
+//! The executor lists its kernels by label, a served component's
+//! (`Executor.kernels`): one record per prepared operator, as the text of a
+//! JSON object ([`parse_listing`]). The rank does not read the records: it
+//! keeps them by label, notices when a label's report changes, and hands
+//! them back to the library, which renders the kernel table
+//! (`uniserve.profiling.kernel_table`). The table is logged as the line
+//! `uniserve-kernel-table {json}`.
 //!
 //! Startup lists and renders with calls it waits for. While serving, the
 //! control thread waits for none of it ([`KernelWatch`]): the library's
-//! count of kernel choices, the runners' listings and the rendering are
+//! count of kernel choices, the executor's listing and the rendering are
 //! calls submitted to the builder thread, each taken up at its completion.
 
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use tvm_ffi::Any;
 
+use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Interpreter};
 use crate::lane::{Completion, Job, JobId, JobQueues};
-use crate::runner::methods::{Argument, MethodCall};
 use crate::{Error, Result};
 
 const TAG: &str = "uniserve-kernel-table";
@@ -27,36 +28,27 @@ const TAG: &str = "uniserve-kernel-table";
 /// The library function rendering the kernel table.
 const TABLE: &str = "uniserve.profiling.kernel_table";
 
-/// One operator's kernel record, as a runner's `kernels` method reports it:
-/// a JSON object text the rank passes on unread.
+/// One operator's kernel record, as the executor's `kernels` method lists
+/// it: a JSON object text the rank passes on unread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KernelRecord(String);
 
-impl KernelRecord {
-    /// Take the record `value` that `owner` reported.
-    pub(crate) fn new(owner: impl Into<String>, value: Any) -> Result<Self> {
-        tvm_ffi::String::try_from(value)
-            .map(|text| Self(text.as_str().to_owned()))
-            .map_err(|error| Error::numerical(&owner.into(), &error))
-    }
-
-    /// The record whose JSON object text is `text`.
-    pub(crate) fn from_text(text: String) -> Self {
-        Self(text)
-    }
+/// The records of the executor's listing (`Executor.kernels`): the JSON of
+/// each label with its records' texts.
+pub(crate) fn parse_listing(listing: &str) -> Result<Vec<(String, Vec<KernelRecord>)>> {
+    let parsed: Vec<(String, Vec<String>)> = serde_json::from_str(listing)
+        .map_err(|error| Error::Interface(format!("the executor's kernels: {error}")))?;
+    Ok(parsed
+        .into_iter()
+        .map(|(label, records)| (label, records.into_iter().map(KernelRecord).collect()))
+        .collect())
 }
 
-/// The listing of one runner's kernels: the runner's kernel-table label,
-/// its device name and the calls of its Python runners' `kernels` methods,
-/// each of which returns one record text per prepared operator.
-pub(crate) type KernelCalls = (String, String, Vec<MethodCall>);
-
-/// The records of each runner label, with the runner's device name. Runners
-/// sharing a label report under it together.
+/// The records of each label, with the device name they were selected on.
 #[derive(Clone)]
 pub(crate) struct KernelRecords {
     table: Function,
-    runners: IndexMap<String, (String, Vec<KernelRecord>)>,
+    labels: IndexMap<String, (String, Vec<KernelRecord>)>,
 }
 
 impl KernelRecords {
@@ -64,7 +56,7 @@ impl KernelRecords {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             table: Interpreter::import(TABLE)?,
-            runners: IndexMap::new(),
+            labels: IndexMap::new(),
         })
     }
 
@@ -72,14 +64,13 @@ impl KernelRecords {
     pub(crate) fn empty(&self) -> Self {
         Self {
             table: self.table.clone(),
-            runners: IndexMap::new(),
+            labels: IndexMap::new(),
         }
     }
 
-    /// Add one runner's records under `label` (its component and module
-    /// path).
+    /// Add records under `label`, selected on `device`.
     pub(crate) fn add(&mut self, label: &str, device: &str, records: &[KernelRecord]) {
-        self.runners
+        self.labels
             .entry(label.to_owned())
             .or_insert_with(|| (device.to_owned(), Vec::new()))
             .1
@@ -87,22 +78,21 @@ impl KernelRecords {
     }
 
     /// Merge a newer report; returns whether any label's records changed.
-    /// A label the newer report has no records for keeps its last ones, as
-    /// a retired runner reports none.
+    /// A label the newer report has no records for keeps its last ones.
     pub(crate) fn merge(&mut self, current: Self) -> bool {
         let mut changed = false;
-        for (label, (device, records)) in current.runners {
+        for (label, (device, records)) in current.labels {
             if records.is_empty() {
                 continue;
             }
-            match self.runners.get_mut(&label) {
+            match self.labels.get_mut(&label) {
                 Some((_, stored)) if *stored == records => {}
                 Some((_, stored)) => {
                     *stored = records;
                     changed = true;
                 }
                 None => {
-                    self.runners.insert(label, (device, records));
+                    self.labels.insert(label, (device, records));
                     changed = true;
                 }
             }
@@ -113,25 +103,25 @@ impl KernelRecords {
     /// The library call that renders the table for `stage` (`startup` or
     /// `serving`) from the records; it returns the table's text.
     fn table_call(&self, stage: &str, rank: usize, device: &str) -> MethodCall {
-        let devices = self.runners.values().map(|(device, _)| device.clone());
+        let devices = self.labels.values().map(|(device, _)| device.clone());
         let counts = self
-            .runners
+            .labels
             .values()
             .map(|(_, records)| records.len() as i64);
         let records = self
-            .runners
+            .labels
             .values()
             .flat_map(|(_, records)| records)
             .map(|record| record.0.clone());
 
-        // Each runner's records cross back to back, with their counts.
+        // Each label's records cross back to back, with their counts.
         MethodCall::new(
             &self.table,
             vec![
                 Argument::Text(stage.to_owned()),
                 Argument::Integer(rank as i64),
                 Argument::Text(device.to_owned()),
-                Argument::Texts(self.runners.keys().cloned().collect()),
+                Argument::Texts(self.labels.keys().cloned().collect()),
                 Argument::Texts(devices.collect()),
                 Argument::Integers(counts.collect()),
                 Argument::Texts(records.collect()),
@@ -160,16 +150,15 @@ impl KernelRecords {
 enum Pending {
     /// The library's count of kernel choices.
     Count,
-    /// The runners' kernel listings: each listed runner's label, device
-    /// and number of calls, in the order of the job's calls.
-    Listing(Vec<(String, String, usize)>),
+    /// The executor's kernel listing.
+    Listing,
     /// The rendering of the table.
     Table,
 }
 
 /// Serving-time kernel reporting. After each batch's forward the library's
-/// count of kernel choices is asked for; when it has moved, the runners'
-/// kernels are listed, and when a runner's records changed, the table is
+/// count of kernel choices is asked for; when it has moved, the executor's
+/// kernels are listed, and when a label's records changed, the table is
 /// rendered and logged. Each step is a call submitted to the builder thread
 /// and taken up at its completion: none is waited for, and a step that
 /// fails is logged and fails no batch.
@@ -181,8 +170,8 @@ pub(crate) struct KernelWatch {
     rank: usize,
     device: String,
     pending: HashMap<JobId, Pending>,
-    /// Kernels were chosen while a listing was in flight: the runners are
-    /// listed again at its completion.
+    /// Kernels were chosen while a listing was in flight: the executor's
+    /// kernels are listed again at its completion.
     stale: bool,
 }
 
@@ -222,14 +211,15 @@ impl KernelWatch {
     }
 
     /// Apply the completion of `job`, a call this watch submitted, and
-    /// submit what follows it. `runners` lists the rank's runners when
-    /// their kernels are to be listed.
+    /// submit what follows it. `listing` makes the call that lists the
+    /// executor's kernels when they are to be listed; `None` on a rank
+    /// without an executor.
     pub(crate) fn complete(
         &mut self,
         job: JobId,
         completion: Completion,
         jobs: &JobQueues,
-        runners: impl FnOnce() -> Vec<KernelCalls>,
+        listing: impl FnOnce() -> Option<MethodCall>,
     ) {
         let Some(pending) = self.pending.remove(&job) else {
             return;
@@ -240,19 +230,14 @@ impl KernelWatch {
                 let count = completion.returned()?;
                 if count.first().is_some_and(|&count| count != self.last) {
                     self.last = count[0];
-                    self.list(jobs, runners);
+                    self.list(jobs, listing);
                 }
                 Ok(())
             }
-            Pending::Listing(listed) => {
+            Pending::Listing => {
                 let mut current = self.records.empty();
-                for (label, device, calls) in &listed {
-                    let mut records = Vec::new();
-                    for _ in 0..*calls {
-                        let texts = completion.texts()?;
-                        records.extend(texts.into_iter().map(KernelRecord::from_text));
-                    }
-                    current.add(label, device, &records);
+                for (label, records) in parse_listing(&completion.texts()?.concat())? {
+                    current.add(&label, &self.device, &records);
                 }
                 if self.records.merge(current) {
                     let calls = Job::new();
@@ -260,7 +245,7 @@ impl KernelWatch {
                     self.pending.insert(jobs.call(calls, true), Pending::Table);
                 }
                 if std::mem::take(&mut self.stale) {
-                    self.list(jobs, runners);
+                    self.list(jobs, listing);
                 }
                 Ok(())
             }
@@ -275,31 +260,32 @@ impl KernelWatch {
         }
     }
 
-    /// List the runners' kernels, unless a listing is in flight: that one
-    /// may predate the newest choice, so the runners are listed again when
-    /// it completed.
-    fn list(&mut self, jobs: &JobQueues, runners: impl FnOnce() -> Vec<KernelCalls>) {
-        let listing = |pending: &Pending| matches!(pending, Pending::Listing(_));
-        if self.pending.values().any(listing) {
+    /// List the executor's kernels, unless a listing is in flight: that one
+    /// may predate the newest choice, so they are listed again when it
+    /// completed.
+    fn list(&mut self, jobs: &JobQueues, listing: impl FnOnce() -> Option<MethodCall>) {
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Listing))
+        {
             self.stale = true;
             return;
         }
-
+        let Some(call) = listing() else {
+            return;
+        };
         let calls = Job::new();
-        let mut listed = Vec::new();
-        for (label, device, listing) in runners() {
-            listed.push((label, device, listing.len()));
-            for call in listing {
-                calls.call_texts(call);
-            }
-        }
+        calls.call_texts(call);
         self.pending
-            .insert(jobs.call(calls, true), Pending::Listing(listed));
+            .insert(jobs.call(calls, true), Pending::Listing);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tvm_ffi::Any;
+
     use super::*;
 
     fn record(text: &str) -> KernelRecord {
@@ -307,13 +293,13 @@ mod tests {
     }
 
     /// A report over a table function that is never called.
-    fn report(runners: &[(&str, &[&str])]) -> KernelRecords {
+    fn report(labels: &[(&str, &[&str])]) -> KernelRecords {
         let table = tvm_ffi::Function::from_packed(|_| Ok(Any::default()));
         let mut records = KernelRecords {
             table: Function::new(TABLE, table),
-            runners: IndexMap::new(),
+            labels: IndexMap::new(),
         };
-        for (label, texts) in runners {
+        for (label, texts) in labels {
             let texts: Vec<KernelRecord> = texts.iter().map(|text| record(text)).collect();
             records.add(label, "cuda:0", &texts);
         }
@@ -321,34 +307,37 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_report_replaces_its_runners_records() {
+    fn a_changed_report_replaces_its_labels_records() {
         let mut stored = report(&[("model", &["a", "b"]), ("vision", &["c"])]);
 
         // The same records are no change.
         assert!(!stored.merge(report(&[("model", &["a", "b"])])));
-        // A runner selecting another kernel reports different records.
+        // A component selecting another kernel reports different records.
         assert!(stored.merge(report(&[("model", &["a", "d"])])));
-        assert_eq!(stored.runners["model"].1, [record("a"), record("d")]);
-        // A new runner is a change.
+        assert_eq!(stored.labels["model"].1, [record("a"), record("d")]);
+        // A new label is a change.
         assert!(stored.merge(report(&[("decoder", &["e"])])));
     }
 
     #[test]
-    fn a_moved_choice_count_lists_the_runners_and_renders_what_changed() {
+    fn a_moved_choice_count_lists_the_kernels_and_renders_what_changed() {
         use std::sync::atomic::{AtomicI64, Ordering};
         use std::sync::{Arc, Mutex};
 
         use tvm_ffi::AnyView;
 
-        // The library's count, one runner's listing and the renderer, which
-        // keeps the stage and the records it was given.
+        // The library's count, the executor's listing and the renderer,
+        // which keeps the stage and the records it was given.
         let count = Arc::new(AtomicI64::new(3));
         let choices = {
             let count = Arc::clone(&count);
             tvm_ffi::Function::from_packed(move |_| Ok(Any::from(count.load(Ordering::Relaxed))))
         };
-        let kernels =
-            tvm_ffi::Function::from_packed(|_| Ok(Any::from(crate::ffi::strings(["a", "d"]))));
+        let kernels = tvm_ffi::Function::from_packed(|_| {
+            Ok(Any::from(tvm_ffi::String::from(
+                r#"[["model", ["a", "d"]]]"#,
+            )))
+        });
         let rendered = Arc::new(Mutex::new(Vec::new()));
         let table = {
             let rendered = Arc::clone(&rendered);
@@ -370,10 +359,7 @@ mod tests {
             "cuda:0".to_owned(),
         );
         let kernels = Function::new("test.kernels", kernels);
-        let runners = || {
-            let call = MethodCall::new(&kernels, Vec::new());
-            vec![("model".to_owned(), "cuda:0".to_owned(), vec![call])]
-        };
+        let listing = || Some(MethodCall::new(&kernels, Vec::new()));
 
         // A rank without lanes and without a started interpreter performs
         // each call where it is submitted; its completion is taken here as
@@ -384,7 +370,7 @@ mod tests {
                 return false;
             };
             assert!(watch.owns(job));
-            watch.complete(job, completion, &jobs, runners);
+            watch.complete(job, completion, &jobs, listing);
             true
         };
 
@@ -393,7 +379,7 @@ mod tests {
         assert!(take(&mut watch));
         assert!(!take(&mut watch));
 
-        // It moved: the runners are listed, and their changed records are
+        // It moved: the kernels are listed, and the changed records are
         // rendered for the serving stage.
         count.store(4, Ordering::Relaxed);
         watch.count(&jobs);
@@ -412,9 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_runner_keeps_its_last_records() {
+    fn a_label_listed_without_records_keeps_its_last_ones() {
         let mut stored = report(&[("model", &["a"])]);
         assert!(!stored.merge(report(&[("model", &[])])));
-        assert_eq!(stored.runners["model"].1, [record("a")]);
+        assert_eq!(stored.labels["model"].1, [record("a")]);
     }
 }

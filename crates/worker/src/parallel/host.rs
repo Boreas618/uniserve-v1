@@ -23,10 +23,12 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::{Error, Result};
+use tvm_ffi::{Any, AnyView};
+
+use crate::{Error, Result, lock};
 
 /// How long startup waits for every member to join the mesh: torch's
 /// default collective timeout.
@@ -37,8 +39,9 @@ pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 /// every member cannot deadlock.
 const INLINE_SEND_BYTES: usize = 32 << 10;
 
-/// The widest record [`HostGroup::all_gather_fixed`] carries.
-pub(crate) const FIXED_RECORD_BYTES: usize = 56;
+/// The widest record [`HostGroup::all_gather_fixed`] carries: with its
+/// 8-byte length prefix, one 64-byte frame.
+pub const FIXED_RECORD_BYTES: usize = 56;
 
 const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -217,17 +220,12 @@ impl HostGroup {
     }
 
     /// This member's index.
-    pub(crate) fn rank(&self) -> usize {
+    pub fn rank(&self) -> usize {
         self.rank
     }
 
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.ranks.len()
-    }
-
-    /// Members' global ranks, in member order.
-    pub(crate) fn ranks(&self) -> &[usize] {
-        &self.ranks
     }
 
     /// Bound every subsequent read and write; `None` waits indefinitely.
@@ -311,7 +309,7 @@ impl HostGroup {
     /// [`FIXED_RECORD_BYTES`]. Each record travels to each peer as one write
     /// of its length prefix and payload, so a small record such as an expert
     /// step agreement occupies one TCP segment per peer.
-    pub(crate) fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
+    pub fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
         let width = local.len();
         if width > FIXED_RECORD_BYTES || records.len() != width * self.size() {
             return Err(Error::Invalid(format!(
@@ -567,6 +565,104 @@ pub(crate) fn bind_beside(rendezvous: &str) -> Result<(TcpListener, String)> {
     Ok((listener, format!("{host}:{port}")))
 }
 
+/// Host collectives over `host` as TVM-FFI values, for the executor's
+/// expert union: its step agreement and the numerical transports that
+/// bootstrap their own device communicators (FlashInfer's communication
+/// backend, DeepEP and NVSHMEM unique ids, barriers).
+///
+/// In the library's order (`uniserve.backends.experts.HostBootstrap` takes
+/// them in this order): the member's `rank`, the group's `size`, then the
+/// functions `all_gather(bytes) -> [bytes]`, `broadcast(bytes or None,
+/// root) -> bytes`, `barrier()`, `split(color, key)`, which returns these
+/// values for the subgroup, and `all_gather_fixed(bytes) -> bytes`, every
+/// member's record of one width (at most [`FIXED_RECORD_BYTES`]) back to
+/// back in member order, which carries each expert step's agreement in one
+/// write per peer.
+///
+/// Callers run the functions in the same order on every member and never
+/// concurrently, since they share the group's connections. They block the
+/// calling thread on peers; TVM-FFI releases the GIL while they do when the
+/// library marks them so.
+pub(crate) fn bootstrap(host: &Arc<Mutex<HostGroup>>) -> Vec<Any> {
+    let (rank, size) = {
+        let group = lock(host);
+        (group.rank(), group.size())
+    };
+    type HostCall = dyn Fn(&HostGroup, &[AnyView<'_>]) -> Result<Any>;
+    let function = |call: Box<HostCall>| {
+        let host = Arc::clone(host);
+        tvm_ffi::Function::from_packed(move |args: &[AnyView<'_>]| {
+            call(&lock(&host), args).map_err(|error| {
+                tvm_ffi::Error::new(tvm_ffi::RUNTIME_ERROR, &error.to_string(), "")
+            })
+        })
+    };
+    let bytes = |value: &AnyView<'_>, name: &str| {
+        tvm_ffi::Bytes::try_from(*value).map_err(|error| Error::numerical(name, &error))
+    };
+    let all_gather = function(Box::new(move |group, args| {
+        let [value] = args else {
+            return Err(Error::Invalid("all_gather takes one value".into()));
+        };
+        let values = group.all_gather_bytes(bytes(value, "host.all_gather")?.as_slice())?;
+        Ok(Any::from(crate::ffi::list(
+            values
+                .into_iter()
+                .map(|value| Any::from(tvm_ffi::Bytes::from(value))),
+        )))
+    }));
+    let broadcast = function(Box::new(move |group, args| {
+        let [value, root] = args else {
+            return Err(Error::Invalid("broadcast takes a value and a root".into()));
+        };
+        let root = i64::try_from(*root)
+            .ok()
+            .and_then(|root| usize::try_from(root).ok())
+            .ok_or_else(|| Error::Invalid("broadcast root is not a member index".into()))?;
+        let value = if crate::ffi::is_none(&Any::from(*value)) {
+            None
+        } else {
+            Some(bytes(value, "host.broadcast")?)
+        };
+        let received = group.broadcast_bytes(value.as_ref().map(|value| value.as_slice()), root)?;
+        Ok(Any::from(tvm_ffi::Bytes::from(received)))
+    }));
+    let barrier = function(Box::new(|group, _| {
+        group.barrier()?;
+        Ok(Any::default())
+    }));
+    let split = function(Box::new(|group, args| {
+        let [color, key] = args else {
+            return Err(Error::Invalid("split takes a color and a key".into()));
+        };
+        let integer = |value: &AnyView<'_>| {
+            i64::try_from(*value).map_err(|error| Error::numerical("host.split", &error))
+        };
+        let subgroup = group.split(integer(color)?, integer(key)?)?;
+        Ok(Any::from(crate::ffi::list(bootstrap(&Arc::new(
+            Mutex::new(subgroup),
+        )))))
+    }));
+    let all_gather_fixed = function(Box::new(move |group, args| {
+        let [value] = args else {
+            return Err(Error::Invalid("all_gather_fixed takes one record".into()));
+        };
+        let local = bytes(value, "host.all_gather_fixed")?;
+        let mut records = vec![0_u8; local.len() * group.size()];
+        group.all_gather_fixed(local.as_slice(), &mut records)?;
+        Ok(Any::from(tvm_ffi::Bytes::from(records)))
+    }));
+    vec![
+        Any::from(rank as i64),
+        Any::from(size as i64),
+        Any::from(all_gather),
+        Any::from(broadcast),
+        Any::from(barrier),
+        Any::from(split),
+        Any::from(all_gather_fixed),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,13 +769,13 @@ mod tests {
                 .split(group.rank() as i64 % 2, -(group.rank() as i64))
                 .unwrap();
             let gathered = odd.all_gather_bytes(&[group.rank() as u8]).unwrap();
-            (odd.rank(), odd.ranks().to_vec(), gathered)
+            (odd.rank(), gathered)
         });
         // Keys order members descending by rank within each color.
-        assert_eq!(results[0], (1, vec![2, 0], vec![vec![2], vec![0]]));
-        assert_eq!(results[1], (1, vec![3, 1], vec![vec![3], vec![1]]));
-        assert_eq!(results[2], (0, vec![2, 0], vec![vec![2], vec![0]]));
-        assert_eq!(results[3], (0, vec![3, 1], vec![vec![3], vec![1]]));
+        assert_eq!(results[0], (1, vec![vec![2], vec![0]]));
+        assert_eq!(results[1], (1, vec![vec![3], vec![1]]));
+        assert_eq!(results[2], (0, vec![vec![2], vec![0]]));
+        assert_eq!(results[3], (0, vec![vec![3], vec![1]]));
     }
 
     #[test]

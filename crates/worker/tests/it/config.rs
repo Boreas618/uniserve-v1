@@ -63,7 +63,6 @@ fn defaults() -> Value {
         "decode_graph_batch_sizes": null,
         "prefill_outputs": true,
         "prefill_graph_token_sizes": null,
-        "flow_graph_batch_sizes": null,
         "flow_graph_shapes": null,
         "video_text_capacities": null,
         "video_resolutions": [],

@@ -31,18 +31,6 @@ impl GroupShape {
             .div_ceil(u64::from(self.block_size))
     }
 
-    /// A windowed call selects its history and queries plus the partial page
-    /// at their starting offset. Full attention selects the whole sequence.
-    pub(crate) fn table_width(&self, max_sequence_tokens: u64, max_query_tokens: u64) -> u64 {
-        let resident = self.resident_width(max_sequence_tokens);
-        self.window.map_or(resident, |window| {
-            resident.min(
-                (u64::from(window) + max_query_tokens.max(1)).div_ceil(u64::from(self.block_size))
-                    + 1,
-            )
-        })
-    }
-
     pub fn new(block_size: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
         if block_size == 0 || units_per_page == 0 {
             return Err(Error::Invalid(

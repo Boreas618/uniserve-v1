@@ -18,10 +18,10 @@ const POOL_ADDRESSES: usize = 1 << 38;
 /// One allocator pool on a device: the device memory Rust owns
 /// ([`GraphMemory`]), the numerical library's pool that allocates from it
 /// (`uniserve.cuda_graph.pool`) and its allocator id.
-pub struct GraphPool {
-    pub device: DeviceId,
-    pub id: (u64, u64),
-    pub value: Handle,
+pub(crate) struct GraphPool {
+    pub(crate) device: DeviceId,
+    pub(crate) id: (u64, u64),
+    pub(crate) value: Handle,
     pub(crate) memory: GraphMemory,
 }
 
@@ -61,7 +61,7 @@ impl GraphPool {
 
     /// A new pool on `device`, created by the numerical library's
     /// `uniserve.cuda_graph.pool`; see [`Self::create`].
-    pub fn new(device: DeviceId) -> Result<Self> {
+    pub(crate) fn new(device: DeviceId) -> Result<Self> {
         let create = crate::ffi::Interpreter::import("uniserve.cuda_graph.pool")?;
         Ok(Self::create(&create, device)?.0)
     }

@@ -1,0 +1,86 @@
+//! Calls into the library with owned arguments ([`MethodCall`]): a method
+//! of the executor or a library function, which a job hands to the builder
+//! thread.
+//!
+//! A method takes its object first, then its scalar arguments and the
+//! tensors it reads and writes; the Python contract of each is its
+//! docstring.
+
+use tvm_ffi::Any;
+
+use super::{Function, Handle, Interpreter, Shape};
+use crate::Result;
+use crate::memory::allocation::StorageView;
+
+/// One argument of a method call.
+#[derive(Clone)]
+pub(crate) enum Argument {
+    Bool(bool),
+    Integer(i64),
+    Integers(Vec<i64>),
+    Text(String),
+    Texts(Vec<String>),
+    Tensor(StorageView),
+    Handle(Handle),
+    None,
+}
+
+impl From<usize> for Argument {
+    fn from(value: usize) -> Self {
+        Self::Integer(value as i64)
+    }
+}
+
+/// A method or library function and its owned arguments, called later,
+/// possibly on another thread (a job a lane's execution thread performs
+/// hands it to the builder thread). A view crosses as its torch tensor
+/// ([`StorageView::handle`]), wrapped by the first call that passes it.
+#[derive(Clone)]
+pub(crate) struct MethodCall {
+    function: Function,
+    arguments: Vec<Argument>,
+}
+
+impl MethodCall {
+    /// A call of `function` with `arguments`: for a method, its Python
+    /// object first.
+    pub(crate) fn new(function: &Function, arguments: Vec<Argument>) -> Self {
+        Self {
+            function: function.clone(),
+            arguments,
+        }
+    }
+
+    /// The import path of the method called.
+    pub(crate) fn name(&self) -> &str {
+        self.function.name()
+    }
+
+    /// Make the call. The arguments' values, the first wrapping of a view
+    /// no earlier call passed and the call itself take one handoff to the
+    /// builder thread, where the call's references to Python objects are
+    /// dropped too.
+    pub(crate) fn invoke(self) -> Result<Any> {
+        Interpreter::execute(move || {
+            // The values reference the arguments' handles, which outlive
+            // them: `self` drops after this closure's locals.
+            let values = self
+                .arguments
+                .iter()
+                .map(|argument| {
+                    Ok(match argument {
+                        Argument::Bool(value) => Any::from(*value),
+                        Argument::Integer(value) => Any::from(*value),
+                        Argument::Integers(values) => Any::from(Shape::from(values.as_slice())),
+                        Argument::Tensor(view) => view.handle()?.to_any(),
+                        Argument::Text(text) => Any::from(tvm_ffi::String::from(text.as_str())),
+                        Argument::Texts(texts) => Any::from(crate::ffi::strings(texts)),
+                        Argument::Handle(handle) => handle.to_any(),
+                        Argument::None => Any::default(),
+                    })
+                })
+                .collect::<Result<Vec<Any>>>()?;
+            self.function.call_values(&values)
+        })
+    }
+}

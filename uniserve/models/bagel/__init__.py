@@ -10,7 +10,6 @@ declaring ``BagelForConditionalGeneration``.
 
 from .config import Config, TransformerConfig, config_sources, read_config
 from .denoiser import Denoiser
-from .inputs import DenoiserInput
 from .model import Model, entry_points
 from .processing import flow_prompt, image_processor
 from .transformer import Transformer, TransformerLayer
@@ -28,7 +27,6 @@ __all__ = [
     "Config",
     "TransformerConfig",
     "read_config",
-    "DenoiserInput",
     "Denoiser",
     "Model",
     "entry_points",

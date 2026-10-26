@@ -1,76 +1,40 @@
 """Backend collectives behind the logical model communicators.
 
-Numerical code calls :class:`uniserve.distributed.Communicator`,
-which orders logical members. This module resolves each call to the
-stream-bound collectives selected by the active execution scope (the
-serving worker's NCCL communicators on the binding's stream) or, without
-one, to the initialized process group of direct library use, and owns
-asynchronous completion. Each function takes the borrowed process group
-itself: a captured graph records the collective launches, not dispatcher
-calls, so no group name has to survive a graph boundary.
+Numerical code calls :class:`uniserve.distributed.Communicator`, which
+orders logical members. This module resolves each call to the process group
+the active execution scope binds for that communicator (the serving
+executor's NCCL group created for the binding's stream) or, without a scope,
+to the communicator's own initialized process group, and owns asynchronous
+completion. Each function takes the borrowed process group itself: a
+captured graph records the collective launches, not dispatcher calls, so no
+group name has to survive a graph boundary.
+
+Collectives on one process group run in issue order on that group's NCCL
+stream, so a synchronous collective issued after a started one is ordered
+behind it without further bookkeeping; a started collective's consumer joins
+it with :meth:`Transfer.wait` on its own stream.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
 from uniserve.profiling import profile_range, ranges_active
 
-
-class StreamCollectives(Protocol):
-    """Ordered collectives for one computation binding.
-
-    Ordered collectives and deferred transfers for one computation binding.
-    """
-
-    def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None: ...
-    def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None: ...
-    def start_all_gather(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> Any: ...
-    def start_all_to_all(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> Any: ...
-    def start_exchange(
-        self,
-        transfers: list[tuple[int, torch.Tensor | None, torch.Tensor | None]],
-    ) -> Any: ...
-    def all_to_all(
-        self,
-        output: torch.Tensor,
-        value: torch.Tensor,
-        output_splits: list[int],
-        input_splits: list[int],
-    ) -> None: ...
-    def gather(
-        self, outputs: list[torch.Tensor] | None, value: torch.Tensor, root: int
-    ) -> None: ...
-    def broadcast(self, value: torch.Tensor, root: int) -> None: ...
-    def reduce_scatter(
-        self, output: torch.Tensor, value: torch.Tensor
-    ) -> None: ...
-
-    def send(self, value: torch.Tensor, peer: int) -> None: ...
-    def recv(self, value: torch.Tensor, peer: int) -> None: ...
-    def send_recv(
-        self, output: torch.Tensor, value: torch.Tensor, dst: int, src: int
-    ) -> None: ...
-
-
-# The communication resources of the running numerical invocation, by
-# communicator name; an execution context installs its ``collectives`` here
-# for each activation. ``None`` selects initialized process-group
-# communication on an ordinary device stream. A mapping selects explicit
-# stream bindings and must cover every used communicator, including when it
-# is empty.
-stream_bindings: ContextVar[Mapping[str, StreamCollectives] | None] = (
-    ContextVar("stream_collectives", default=None)
+# The process group each communicator's collectives run on during the running
+# numerical invocation, by the logical communicator's process-group name; an
+# execution context installs its ``collectives`` here for each activation.
+# ``None`` selects each communicator's own initialized process group on the
+# current stream. A mapping selects explicit stream bindings and must cover
+# every used multi-member communicator, including when it is empty.
+stream_bindings: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "stream_groups", default=None
 )
 
 _NO_RANGE = nullcontext()
@@ -90,24 +54,24 @@ def _launch_range(kind: str, group_name: str) -> AbstractContextManager[None]:
     )
 
 
-def stream_collectives(group_name: str) -> StreamCollectives | None:
-    """Resolve a stream provider.
+def _bound(group):
+    """The process group a collective on ``group`` runs on.
 
-    Resolve a stream provider, rejecting incomplete explicit execution
-    bindings.
+    An unscoped numerical caller uses ``group`` itself. Once a caller selects
+    an explicit stream scope, every used group must belong to it: falling
+    back would enqueue communication on another binding's stream.
 
-    An unscoped numerical caller may use the initialized process group. Once a
-    caller selects an explicit stream scope, every used group must belong to it;
-    falling back would enqueue communication on a different execution stream.
+    Raises:
+        RuntimeError: The active scope binds no group for ``group``.
     """
     bindings = stream_bindings.get()
     if bindings is None:
-        return None
+        return group
     try:
-        return bindings[group_name]
+        return bindings[group.group_name]
     except KeyError:
         raise RuntimeError(
-            f"stream scope has no binding for communicator {group_name!r}"
+            f"stream scope has no binding for communicator {group.group_name!r}"
         ) from None
 
 
@@ -137,13 +101,9 @@ def start_all_gather(
 ) -> Transfer:
     """Publish a gather into backend-ordered ``output`` and return it."""
     with _launch_range("all_gather_start", group.group_name):
-        bound = stream_collectives(group.group_name)
-        if bound is not None:
-            work = bound.start_all_gather(output, input)
-        else:
-            work = dist.all_gather_into_tensor(
-                output, input, group=group, async_op=True
-            )
+        work = dist.all_gather_into_tensor(
+            output, input, group=_bound(group), async_op=True
+        )
     return Transfer(work, input.device)
 
 
@@ -151,11 +111,9 @@ def start_all_to_all(
     output: torch.Tensor, input: torch.Tensor, group
 ) -> Transfer:
     """Publish an equal-split exchange in backend member order."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        work = bound.start_all_to_all(output, input)
-    else:
-        work = dist.all_to_all_single(output, input, group=group, async_op=True)
+    work = dist.all_to_all_single(
+        output, input, group=_bound(group), async_op=True
+    )
     return Transfer(work, input.device)
 
 
@@ -183,24 +141,18 @@ def start_exchange(
 
     Each ``(peer, send, receive)`` names a global rank of ``group`` with the
     contiguous tensor sent to it and the one received from it, either of
-    which may be ``None``. With stream collectives the grouped transfer runs
-    on the communicator's transfer stream; otherwise as one batch of
-    process-group point-to-point calls.
+    which may be ``None``. The transfers run as one batch of point-to-point
+    calls on the bound group.
     """
     with _launch_range("exchange_start", group.group_name):
-        bound = stream_collectives(group.group_name)
-        if bound is not None:
-            work = bound.start_exchange(transfers)
-        else:
-            operations = [
-                dist.P2POp(call, value, peer, group)
-                for peer, send, receive in transfers
-                for call, value in ((dist.isend, send), (dist.irecv, receive))
-                if value is not None and value.numel()
-            ]
-            work = _Works(
-                dist.batch_isend_irecv(operations) if operations else []
-            )
+        bound = _bound(group)
+        operations = [
+            dist.P2POp(call, value, peer, bound)
+            for peer, send, receive in transfers
+            for call, value in ((dist.isend, send), (dist.irecv, receive))
+            if value is not None and value.numel()
+        ]
+        work = _Works(dist.batch_isend_irecv(operations) if operations else [])
     return Transfer(work, device)
 
 
@@ -219,12 +171,7 @@ def all_gather(output: torch.Tensor, input: torch.Tensor, group) -> None:
         flat = output.view(-1)
         local = flat.narrow(0, group.rank() * input.numel(), input.numel())
         local.view_as(input).copy_(input)
-        bound = stream_collectives(group.group_name)
-        if bound is not None:
-            # Immediate consumers need no fork onto the transport stream.
-            bound.all_gather(flat, local)
-        else:
-            start_all_gather(flat, local, group).wait()
+        start_all_gather(flat, local, group).wait()
 
 
 def all_to_all(
@@ -236,10 +183,6 @@ def all_to_all(
 ) -> None:
     """Exchange leading-axis partitions in backend rank order."""
     with _launch_range("all_to_all", group.group_name):
-        bound = stream_collectives(group.group_name)
-        if bound is not None:
-            bound.all_to_all(output, input, output_splits, input_splits)
-            return
         # Empty split lists select the native equal-count collective. Explicit
         # lists select variable-count send/recv, including when counts match.
         equal_counts = (
@@ -251,7 +194,7 @@ def all_to_all(
             input,
             output_split_sizes=None if equal_counts else output_splits,
             input_split_sizes=None if equal_counts else input_splits,
-            group=group,
+            group=_bound(group),
             async_op=True,
         )
         Transfer(work, input.device).wait()
@@ -266,16 +209,13 @@ def send_recv(
 ) -> None:
     """Send ``value`` bytes to ``dst`` and receive ``output`` from ``src``."""
     with _launch_range("send_recv", group.group_name):
-        bound = stream_collectives(group.group_name)
-        if bound is not None:
-            bound.send_recv(output, value, dst, src)
-            return
+        bound = _bound(group)
         calls = [
             dist.P2POp(
-                dist.isend, value.reshape(-1).view(torch.uint8), dst, group
+                dist.isend, value.reshape(-1).view(torch.uint8), dst, bound
             ),
             dist.P2POp(
-                dist.irecv, output.reshape(-1).view(torch.uint8), src, group
+                dist.irecv, output.reshape(-1).view(torch.uint8), src, bound
             ),
         ]
         for work in dist.batch_isend_irecv(calls):
@@ -291,11 +231,7 @@ _REDUCTIONS = {
 
 def all_reduce(value: torch.Tensor, op: str, group) -> None:
     """Reduce ``value`` in place over ``group``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.all_reduce(value, op)
-    else:
-        dist.all_reduce(value, op=_REDUCTIONS[op], group=group)
+    dist.all_reduce(value, op=_REDUCTIONS[op], group=_bound(group))
 
 
 def gather(
@@ -305,198 +241,61 @@ def gather(
     group,
 ) -> None:
     """Gather ``value`` into ``gather_list`` on global rank ``dst``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.gather(gather_list, value, dst)
-        return
     work = dist.gather(
-        value, gather_list=gather_list, dst=dst, group=group, async_op=True
+        value,
+        gather_list=gather_list,
+        dst=dst,
+        group=_bound(group),
+        async_op=True,
     )
     Transfer(work, value.device).wait()
 
 
 def broadcast(value: torch.Tensor, src: int, group) -> None:
     """Broadcast ``value`` in place from global rank ``src``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.broadcast(value, src)
-    else:
-        dist.broadcast(value, src=src, group=group)
+    dist.broadcast(value, src=src, group=_bound(group))
 
 
 def reduce_scatter(output: torch.Tensor, value: torch.Tensor, group) -> None:
     """Sum backend-ordered partitions of ``value`` into ``output``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.reduce_scatter(output, value)
-    else:
-        dist.reduce_scatter_tensor(output, value, group=group)
+    dist.reduce_scatter_tensor(output, value, group=_bound(group))
 
 
 def send(payload: torch.Tensor, dst: int, group) -> None:
     """Send contiguous bytes to global rank ``dst``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.send(payload, dst)
-    else:
-        dist.send(payload, dst=dst, group=group)
+    dist.send(payload, dst=dst, group=_bound(group))
 
 
 def recv(payload: torch.Tensor, src: int, group) -> None:
     """Receive contiguous bytes from global rank ``src``."""
-    bound = stream_collectives(group.group_name)
-    if bound is not None:
-        bound.recv(payload, src)
-    else:
-        dist.recv(payload, src=src, group=group)
+    dist.recv(payload, src=src, group=_bound(group))
 
 
-class _Transfer:
-    """A started native collective; its consumer joins it on its stream."""
-
-    def __init__(self, wait: Callable[..., Any], token: int) -> None:
-        self._wait = wait
-        # Cleared once the consumer has joined the collective.
-        self._token: int | None = token
-
-    def block_current_stream(self) -> None:
-        token, self._token = self._token, None
-        if token is not None:
-            self._wait(token, torch.cuda.current_stream().cuda_stream)
-
-
-class NativeCollectives:
-    """One group's collectives on the worker's NCCL communicator.
-
-    The worker binds one communicator per stream and group and constructs
-    this object over its functions; every call enqueues on that stream
-    (asynchronous ones on its transfer fork, joined by the consumer). The
-    worker owns the communicator and destroys it; this object owns nothing.
-    Members are ordered by ascending world rank, the backend order
-    ``Communicator`` assumes; roots and peers are world ranks.
-
-    Args:
-        name: The communicator's name: its mesh axes joined by ``.``.
-        all_reduce: ``(value, op)`` with ``op`` 0 for sum, 2 for max and 3
-            for min.
-        all_gather, reduce_scatter: ``(output, value)``.
-        start_all_gather, start_all_to_all: ``(output, value)``, returning
-            the token ``wait`` joins.
-        wait: ``(token, stream)`` joins a started collective on the CUDA
-            stream handle ``stream``.
-        all_to_all: ``(output, value, output_splits, input_splits)``.
-        gather: ``(outputs, value, root)``.
-        broadcast: ``(value, root)``.
-        send, recv: ``(value, peer)``.
-        send_recv: ``(output, value, destination, source)``.
-        start_exchange: ``(values, peers, sends)``: one grouped transfer of
-            every ``values[i]``, sent to world rank ``peers[i]`` when
-            ``sends[i]`` is 1 and received from it when 0, on the transfer
-            fork; returns the token ``wait`` joins.
-    """
-
-    _REDUCTIONS = {"sum": 0, "max": 2, "min": 3}
-
-    def __init__(
-        self,
-        name: str,
-        all_reduce: Callable[..., Any],
-        all_gather: Callable[..., Any],
-        start_all_gather: Callable[..., Any],
-        start_all_to_all: Callable[..., Any],
-        wait: Callable[..., Any],
-        all_to_all: Callable[..., Any],
-        gather: Callable[..., Any],
-        broadcast: Callable[..., Any],
-        reduce_scatter: Callable[..., Any],
-        send: Callable[..., Any],
-        recv: Callable[..., Any],
-        send_recv: Callable[..., Any],
-        start_exchange: Callable[..., Any],
-    ) -> None:
-        self.name = str(name)
-        self._all_reduce = all_reduce
-        self._all_gather = all_gather
-        self._start_all_gather = start_all_gather
-        self._start_all_to_all = start_all_to_all
-        self._wait = wait
-        self._all_to_all = all_to_all
-        self._gather = gather
-        self._broadcast = broadcast
-        self._reduce_scatter = reduce_scatter
-        self._send = send
-        self._recv = recv
-        self._send_recv = send_recv
-        self._start_exchange = start_exchange
-
-    def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None:
-        self._all_reduce(value, self._REDUCTIONS[op])
-
-    def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None:
-        self._all_gather(output, value)
-
-    def start_all_gather(self, output, value) -> _Transfer:
-        return _Transfer(self._wait, self._start_all_gather(output, value))
-
-    def start_all_to_all(self, output, value) -> _Transfer:
-        return _Transfer(self._wait, self._start_all_to_all(output, value))
-
-    def all_to_all(self, output, value, output_splits, input_splits) -> None:
-        self._all_to_all(output, value, list(output_splits), list(input_splits))
-
-    def gather(self, outputs, value, root: int) -> None:
-        self._gather(list(outputs or ()), value, int(root))
-
-    def broadcast(self, value: torch.Tensor, root: int) -> None:
-        self._broadcast(value, int(root))
-
-    def reduce_scatter(self, output, value) -> None:
-        self._reduce_scatter(output, value)
-
-    def send(self, value: torch.Tensor, peer: int) -> None:
-        self._send(value, int(peer))
-
-    def recv(self, value: torch.Tensor, peer: int) -> None:
-        self._recv(value, int(peer))
-
-    def send_recv(self, output, value, dst: int, src: int) -> None:
-        self._send_recv(output, value, int(dst), int(src))
-
-    def start_exchange(self, transfers) -> _Transfer:
-        # The native call takes flat lists: each nonempty tensor with its
-        # peer and its direction (1 sends, 0 receives).
-        values, peers, sends = [], [], []
-        for peer, send, receive in transfers:
-            for value, direction in ((send, 1), (receive, 0)):
-                if value is not None and value.numel():
-                    values.append(value)
-                    peers.append(int(peer))
-                    sends.append(direction)
-        return _Transfer(self._wait, self._start_exchange(values, peers, sends))
-
-
-def group_collectives(groups, collectives: Sequence[NativeCollectives]) -> dict:
-    """The stream collectives of ``groups`` by group name.
+def group_collectives(groups, stream_groups: Mapping[str, Any]) -> dict:
+    """The stream binding of ``groups``: each communicator's process group.
 
     The result is the ``collectives`` an execution context installs into
     :data:`stream_bindings` for each activation.
 
-    ``collectives`` holds one stream's collectives of each communicator.
-    Every multi-member communicator of ``groups`` must have one: within an
-    activation, a collective never falls back to another stream.
+    Args:
+        groups: The logical communicators a module calls.
+        stream_groups: One stream binding's process group of each
+            multi-member communicator, by communicator name (its mesh axes
+            joined by ``.``). The serving executor creates them in the
+            worker's planned order; each runs its collectives on its own
+            NCCL stream behind the binding's current stream.
 
     Raises:
-        ValueError: A communicator has no stream collectives.
+        ValueError: A multi-member communicator has no stream group: within
+            an activation, a collective never falls back to another
+            binding's group.
     """
-    named = {native.name: native for native in collectives}
     bound = {}
     for group in groups:
         if group.size == 1:
             continue
-        native = named.get(group.name)
-        if native is None:
-            raise ValueError(
-                f"communicator {group.name!r} has no stream collectives"
-            )
-        bound[group._require().group_name] = native
+        stream_group = stream_groups.get(group.name)
+        if stream_group is None:
+            raise ValueError(f"communicator {group.name!r} has no stream group")
+        bound[group._require().group_name] = stream_group
     return bound

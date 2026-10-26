@@ -428,6 +428,7 @@ impl WorkerGroup {
         let mut image_warmups = Vec::new();
         let mut captured_images = None;
         let mut captured_latents = None;
+        let mut image_capacity = None;
         let mut diffusion_lm_step_rows = 0;
         let mut image_unconditional = None;
         for (rank, worker) in workers.iter().enumerate() {
@@ -463,6 +464,13 @@ impl WorkerGroup {
                 );
                 captured_latents = Some(sizes.clone());
             }
+            if let Some(capacity) = stated.image_capacity {
+                anyhow::ensure!(
+                    image_capacity.is_none_or(|known| known == capacity),
+                    "physical rank {rank} states another image capacity than another image rank"
+                );
+                image_capacity = Some(capacity);
+            }
             if stated.diffusion_lm_step_rows > 0 {
                 anyhow::ensure!(
                     diffusion_lm_step_rows == 0
@@ -475,6 +483,7 @@ impl WorkerGroup {
         info.image_warmups = image_warmups;
         info.captured_images = captured_images;
         info.captured_latents = captured_latents;
+        info.image_capacity = image_capacity;
         info.diffusion_lm_step_rows = diffusion_lm_step_rows;
         info.image_unconditional_token_ids = image_unconditional;
 

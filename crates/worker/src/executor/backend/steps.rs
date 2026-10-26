@@ -10,13 +10,14 @@ use std::sync::Arc;
 use ipc::CallId;
 use ipc::{Batch as BatchPlan, BatchCommand, BatchOutput, CallKind, ErrorCallIdentity};
 
-use super::{WorkerBackend, kernel_calls};
+use super::WorkerBackend;
 use crate::error::WorkerError;
 use crate::executor::batch::{self, Launched};
+use crate::executor::image_inputs::InlineImages;
 use crate::executor::lifecycle::Retirement;
+use crate::executor::python::PythonExecutor;
 use crate::executor::{BatchResult, Submission};
 use crate::lane::{Completion, Job, JobId};
-use crate::runner::encoder::inputs::Inputs;
 use crate::{Error, Result};
 
 /// Where a batch's host KV cache copies stand on the copy lane
@@ -51,14 +52,8 @@ pub(crate) struct WorkerBatch {
     retirement: Retirement,
     /// Where the batch's forward stands between its jobs.
     stage: batch::Stage,
-    /// What a forward that issues itself kept for its submitter: how the
-    /// completion of the imported inputs, or a forward inside a converted
-    /// batch, ended.
-    issued: Option<Result<()>>,
-    /// A token batch between its jobs.
-    tokens: Option<crate::runner::causal_lm::Pending>,
-    /// A diffusion LM batch between its jobs.
-    denoising: Option<crate::runner::diffusion_lm::Pending>,
+    /// An executor lane's batch between its jobs.
+    lane: Option<crate::executor::lanes::Pending>,
     /// A transfer batch between its jobs.
     transfer: Option<crate::executor::transfer::Pending>,
     /// The batch's profiler step is open: its forward began and has not
@@ -66,21 +61,18 @@ pub(crate) struct WorkerBatch {
     pub(super) stepping: bool,
     /// The job of the profiler's window this batch's forward waits for.
     profiling: Option<JobId>,
-    /// A capability runtime's launched work awaiting materialization.
+    /// The lane's or the transfer runtime's launched work awaiting
+    /// materialization.
     running: Option<Launched>,
     /// The host preparation of an image encoding batch's inline images.
-    image_inputs: Option<Inputs>,
-    /// An image batch between two of its jobs.
-    image: Option<crate::executor::image::Pending>,
-    /// The executor admits the video requests the batch started: the job
-    /// that asks it is on its lane.
+    image_inputs: Option<InlineImages>,
+    /// The executor admits the requests the batch started: the job that
+    /// asks it is in flight.
     starting: bool,
     /// Products and cache transfers imported from other calls.
     inputs: crate::executor::inputs::Inputs,
     /// The batch's host KV cache copies.
     pages: Pages,
-    /// A video model's media batch between two of its jobs.
-    media: Option<crate::executor::video::Pending>,
     output: Option<BatchResult>,
 }
 
@@ -101,19 +93,15 @@ impl WorkerBatch {
             predecessors: Vec::new(),
             retirement,
             stage: batch::Stage::default(),
-            issued: None,
-            tokens: None,
-            denoising: None,
+            lane: None,
             transfer: None,
             stepping: false,
             profiling: None,
             running: None,
             image_inputs: None,
-            image: None,
             starting: false,
             inputs: crate::executor::inputs::Inputs::default(),
             pages: Pages::default(),
-            media: None,
             output: None,
         }
     }
@@ -160,27 +148,34 @@ impl WorkerBatch {
         self.stage = stage;
     }
 
-    /// The batch's plan, its token batch between jobs and where a forward
-    /// inside it keeps its result, borrowed apart.
-    pub(crate) fn token_parts(
+    /// The batch's plan, its imported inputs and its lane batch between
+    /// jobs, borrowed apart.
+    pub(crate) fn lane_parts(
         &mut self,
     ) -> (
         &BatchPlan,
-        &mut Option<crate::runner::causal_lm::Pending>,
-        &mut Option<Result<()>>,
+        &crate::executor::inputs::Inputs,
+        &mut Option<crate::executor::lanes::Pending>,
     ) {
-        (&self.plan, &mut self.tokens, &mut self.issued)
+        (&self.plan, &self.inputs, &mut self.lane)
     }
 
-    /// The batch's plan and its diffusion LM batch between jobs, borrowed
-    /// apart.
-    pub(crate) fn denoising_parts(
+    /// The batch's plan, its imported inputs, its host-prepared inline
+    /// images and its lane batch between jobs, borrowed apart.
+    pub(crate) fn lane_inputs(
         &mut self,
     ) -> (
         &BatchPlan,
-        &mut Option<crate::runner::diffusion_lm::Pending>,
+        &crate::executor::inputs::Inputs,
+        Option<&InlineImages>,
+        &mut Option<crate::executor::lanes::Pending>,
     ) {
-        (&self.plan, &mut self.denoising)
+        (
+            &self.plan,
+            &self.inputs,
+            self.image_inputs.as_ref(),
+            &mut self.lane,
+        )
     }
 
     /// The batch's plan, its imported inputs and its transfer batch between
@@ -195,8 +190,8 @@ impl WorkerBatch {
         (&self.plan, &self.inputs, &mut self.transfer)
     }
 
-    /// Set the batch's result; capability runtimes call this once their
-    /// outputs are materialized.
+    /// Set the batch's result once its outputs are materialized, or its
+    /// calls failed.
     pub(crate) fn complete(&mut self, result: BatchResult) {
         self.output = Some(result);
     }
@@ -206,36 +201,12 @@ impl WorkerBatch {
         self.running = Some(running);
     }
 
-    pub(crate) fn image_inputs(&self) -> Option<&Inputs> {
+    pub(crate) fn image_inputs(&self) -> Option<&InlineImages> {
         self.image_inputs.as_ref()
     }
 
-    pub(crate) fn set_image_inputs(&mut self, inputs: Inputs) {
+    pub(crate) fn set_image_inputs(&mut self, inputs: InlineImages) {
         self.image_inputs = Some(inputs);
-    }
-
-    /// The batch's plan, its image batch between jobs and the inline
-    /// images prepared for it, borrowed apart.
-    pub(crate) fn image_parts(
-        &mut self,
-    ) -> (
-        &BatchPlan,
-        &mut Option<crate::executor::image::Pending>,
-        &mut Option<Inputs>,
-    ) {
-        (&self.plan, &mut self.image, &mut self.image_inputs)
-    }
-
-    /// The batch's plan, its imported inputs and its media batch between
-    /// jobs, borrowed apart.
-    pub(crate) fn media_parts(
-        &mut self,
-    ) -> (
-        &BatchPlan,
-        &crate::executor::inputs::Inputs,
-        &mut Option<crate::executor::video::Pending>,
-    ) {
-        (&self.plan, &self.inputs, &mut self.media)
     }
 
     /// The batch's imported inputs.
@@ -257,9 +228,7 @@ impl WorkerBackend {
     ) -> std::result::Result<(), WorkerError> {
         // Explicit revocation must not wait behind an allocation-dependent
         // batch; existing readers retain their leases.
-        batch
-            .retirement
-            .admit(&mut self.runtimes, &self.lifecycle)?;
+        batch.retirement.admit(&mut self.owners, &self.lifecycle)?;
         Ok(self.perform_lifecycle()?)
     }
 
@@ -292,19 +261,16 @@ impl WorkerBackend {
             return Ok(Some(job));
         }
 
-        // The executor admits the video requests this batch started: it
-        // sizes each and selects the layout it evaluates in. The batch goes
-        // on from the job's completion, and so do the requests' later
-        // calls, which start behind this batch. Preparing a layout the
-        // denoiser lacks works on its stream, so on a denoising rank the job
-        // belongs on the denoiser's lane; elsewhere it is a job of the
-        // builder thread alone.
-        if let Some(video) = &mut self.runtimes.video
-            && let Some(call) = video.take_started()
+        // The executor admits the requests this batch started: it sizes
+        // each, resets its slot state and may refuse it. The batch goes on
+        // from the job's completion, and so do the requests' later calls,
+        // which start behind this batch. Work on a lane's stream (slot state
+        // over the prefix cache, a trajectory's layout) belongs on the lane;
+        // anything else is a job of the builder thread alone.
+        if let Some(lanes) = &mut self.owners.lanes
+            && let Some((job, on_lane)) = lanes.take_started()?
         {
-            let job = Job::new();
-            job.call_texts(call);
-            let submitted = if video.denoising() {
+            let submitted = if on_lane {
                 self.jobs.start(job, true).map_err(lane_lost)?
             } else {
                 self.jobs.call(job, true)
@@ -313,7 +279,7 @@ impl WorkerBackend {
             return Ok(Some(submitted));
         }
 
-        // Products other calls published are imported for every runtime
+        // Products other calls published are imported for every batch
         // alike. What the imports recorded for the lane is performed even
         // when an import failed after it: the fences are due either way.
         let (job, admitted) = crate::executor::inputs::admit(self, batch);
@@ -336,7 +302,7 @@ impl WorkerBackend {
             return Ok(None);
         }
         let prefix_cache = self
-            .runtimes
+            .owners
             .worker_storage
             .as_mut()
             .and_then(|storage| storage.prefix_cache.as_mut())
@@ -383,9 +349,9 @@ impl WorkerBackend {
                 serde_json::from_str::<Vec<(ipc::RequestKey, String)>>(&texts.concat())
                     .map_err(|error| Error::Interface(format!("the executor's refusals: {error}")))
             })
-            .map_err(|error| WorkerError::classify(error, Some("video request admission")))?;
+            .map_err(|error| WorkerError::classify(error, Some("request admission")))?;
         for (key, reason) in refused {
-            tracing::info!(request = ?key, "refused video request: {reason}");
+            tracing::info!(request = ?key, "refused request: {reason}");
             self.requests.refuse(key, &reason)?;
         }
         Ok(())
@@ -403,13 +369,10 @@ impl WorkerBackend {
             return Ok(false);
         }
         // Inline images of an image encoding batch are decoded on the image
-        // runtime's host lane while other batches execute; the batch
-        // launches once they are ready (the lane notifies `submission`).
-        // Other batches' inputs are prepared when their runtime executes.
-        if self.runtimes.image.is_some() && !self.serves_video() {
-            return crate::runner::encoder::inputs::prepare_inputs(self, batch, submission);
-        }
-        Ok(true)
+        // host lane while other batches execute; the batch launches once
+        // they are ready (the lane notifies `submission`). Other batches'
+        // inputs are prepared when their lane executes.
+        crate::executor::image_inputs::prepare_inputs(self, batch, submission)
     }
 
     pub(crate) fn await_inputs(
@@ -444,9 +407,9 @@ impl WorkerBackend {
         loop {
             let stage = batch.stage();
             match stage {
-                // Imported values become resident before the runtime
-                // consumes them like local ones; an import that failed
-                // fails the batch's calls.
+                // Imported values become resident before the lane consumes
+                // them like local ones; an import that failed fails the
+                // batch's calls.
                 batch::Stage::Inputs => {}
                 // Each executed batch with calls is one profiler step.
                 batch::Stage::Forward if !batch.stepping => {
@@ -576,7 +539,7 @@ impl WorkerBackend {
             // deferred work, a lifecycle command's device work, the expert
             // union's step this rank joined, the kernel watch's calls.
             let events = self
-                .runtimes
+                .owners
                 .worker_storage
                 .as_ref()
                 .map(|storage| &storage.events);
@@ -595,21 +558,25 @@ impl WorkerBackend {
                 })?;
             } else if self.joining == Some(job) {
                 self.joining = None;
+                // The executor returns whether a step ran and whether every
+                // rank has left the union.
                 let joined = completion
                     .check()
                     .map_err(|failure| failure.error)
-                    .and_then(|mut completion| completion.joined())
+                    .and_then(|mut completion| completion.returned())
+                    .and_then(|returned| match returned[..] {
+                        [ran, released] => Ok((ran != 0, released != 0)),
+                        _ => Err(Error::Interface(
+                            "join_expert_step returns whether a step ran and whether the union released"
+                                .into(),
+                        )),
+                    })
                     .map_err(|error| WorkerError::classify(error, Some("expert step")));
                 self.joined = Some(joined);
             } else if let Some(watch) = self.kernels.as_mut().filter(|watch| watch.owns(job)) {
+                let executor = &self.owners.executor;
                 watch.complete(job, completion, &self.jobs, || {
-                    kernel_calls(
-                        self.runtimes.text.as_ref(),
-                        &self.runtimes.image_order,
-                        &self.runtimes.encoders,
-                        &self.runtimes.denoisers,
-                        &self.runtimes.decoders,
-                    )
+                    executor.as_deref().map(PythonExecutor::kernels_call)
                 });
             } else {
                 return Ok(Some((job, completion)));
@@ -624,7 +591,7 @@ impl WorkerBackend {
     ) -> std::result::Result<(), WorkerError> {
         batch
             .retirement
-            .begin(&self.requests, &mut self.runtimes, &self.lifecycle)?;
+            .begin(&self.requests, &mut self.owners, &self.lifecycle)?;
         Ok(self.perform_lifecycle()?)
     }
 
@@ -647,7 +614,7 @@ impl WorkerBackend {
         let retired =
             batch
                 .retirement
-                .poll(&mut self.requests, &mut self.runtimes, &self.lifecycle)?;
+                .poll(&mut self.requests, &mut self.owners, &self.lifecycle)?;
         self.perform_lifecycle()?;
         Ok((advanced || retired, retired))
     }
@@ -668,9 +635,9 @@ impl WorkerBackend {
         &mut self,
         batch: &mut WorkerBatch,
     ) -> std::result::Result<(), WorkerError> {
-        // Calls become pending only when a capability runtime commits them;
-        // unresolved launched work cancels its pending calls. Lifecycle
-        // commands hold no resource beyond their retirement.
+        // Calls become pending only when their batch commits; unresolved
+        // launched work cancels its pending calls. Lifecycle commands hold
+        // no resource beyond their retirement.
         let abandoned = batch
             .running
             .take()
@@ -682,7 +649,7 @@ impl WorkerBackend {
     }
 
     pub(crate) fn reap(&mut self) -> std::result::Result<(), WorkerError> {
-        for owner in self.runtimes.owners() {
+        for owner in self.owners.request_storage() {
             owner.reap()?;
         }
         Ok(())

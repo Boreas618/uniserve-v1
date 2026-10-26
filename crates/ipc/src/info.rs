@@ -433,6 +433,42 @@ impl ImageWarmup {
     }
 }
 
+/// The extents an image model's forwards serve on a rank: its captured
+/// buckets' largest live rows and tokens, the same under graphs and in eager
+/// execution, which bound what the engine admits. A forward the rank does
+/// not serve has zero tokens and rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageCapacity {
+    /// Tokens one denoising step evaluates at most: every guidance branch's
+    /// framed latent sequence of every stepping image.
+    pub max_step_tokens: u64,
+    /// Guidance branch rows one denoising step evaluates at most.
+    pub max_step_rows: u32,
+    /// Tokens of latent images one text batch writes as conditioning at
+    /// most.
+    pub max_condition_tokens: u64,
+    /// Latent images one text batch writes as conditioning at most.
+    pub max_condition_rows: u32,
+    /// Patch rows one vision encoding packs at most.
+    pub max_vision_patch_rows: u64,
+    /// Images one vision encoding packs at most.
+    pub max_vision_images: u32,
+}
+
+impl ImageCapacity {
+    /// Checks that each forward's tokens and rows are both zero, a forward
+    /// the rank does not serve, or both positive.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            (self.max_step_tokens == 0) == (self.max_step_rows == 0)
+                && (self.max_condition_tokens == 0) == (self.max_condition_rows == 0)
+                && (self.max_vision_patch_rows == 0) == (self.max_vision_images == 0),
+            "an image capacity states tokens without rows or rows without tokens"
+        );
+        Ok(())
+    }
+}
+
 /// An image denoising step a rank captured: one image of `height` x
 /// `width` pixels evaluating `branches` guidance branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -475,6 +511,11 @@ pub struct WorkerInfo {
     /// that encodes eagerly or holds no latent encoder.
     #[serde(default)]
     pub captured_latents: Option<Vec<[u32; 2]>>,
+    /// The extents this rank's image forwards serve; the engine admits an
+    /// image request only within them. `None` on a rank without an image
+    /// model's forwards.
+    #[serde(default)]
+    pub image_capacity: Option<ImageCapacity>,
     /// Blocks one sampler chunk of this rank's diffusion LM denoising step
     /// covers, every row count of which the engine warms; zero when the rank
     /// generates no blocks.
@@ -597,6 +638,9 @@ impl WorkerInfo {
         for shape in &self.image_warmups {
             shape.validate()?;
         }
+        if let Some(capacity) = &self.image_capacity {
+            capacity.validate()?;
+        }
         ensure_valid!(
             self.captured_images.iter().flatten().all(|shape| {
                 shape.height > 0 && shape.width > 0 && (1..=3).contains(&shape.branches)
@@ -657,6 +701,7 @@ impl Default for WorkerInfo {
             image_warmups: Vec::new(),
             captured_images: None,
             captured_latents: None,
+            image_capacity: None,
             diffusion_lm_step_rows: 0,
             image_unconditional_token_ids: None,
             fabric_handles: false,

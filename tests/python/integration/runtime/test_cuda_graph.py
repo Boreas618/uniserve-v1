@@ -1,19 +1,11 @@
-"""Graph capture, replay, export and release shared by every binding."""
+"""Graph capture, replay and release shared by every binding."""
 
-import ctypes
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 
-from uniserve.cuda_graph import (
-    break_graph,
-    capture,
-    capture_begin,
-    capture_end,
-    export,
-    pool,
-)
+from uniserve.cuda_graph import break_graph, capture, pool
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -141,101 +133,31 @@ def test_replay_advances_registered_generators():
         graph.release()
 
 
-class _Executable:
-    """A graph executable instantiated through the driver.
-
-    The worker instantiates the captured graphs a capture exports this way.
-    """
-
-    def __init__(self, graph: int) -> None:
-        self._driver = ctypes.CDLL("libcuda.so.1")
-        self._driver.cuGraphInstantiateWithFlags.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_void_p,
-            ctypes.c_ulonglong,
-        ]
-        self._driver.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        self._driver.cuGraphExecDestroy.argtypes = [ctypes.c_void_p]
-        self._raw = ctypes.c_void_p()
-        status = self._driver.cuGraphInstantiateWithFlags(
-            ctypes.byref(self._raw), graph, 0
-        )
-        assert status == 0
-
-    def launch(self, stream: torch.cuda.Stream) -> None:
-        assert self._driver.cuGraphLaunch(self._raw, stream.cuda_stream) == 0
-
-    def destroy(self) -> None:
-        assert self._driver.cuGraphExecDestroy(self._raw) == 0
-
-
 @torch.inference_mode()
-def test_exported_graphs_launch_to_the_replayed_output():
-    """An exported segment, instantiated outside torch, equals a replay.
+def test_a_graph_broken_once_replays_its_work_between_segments():
+    """The work recorded at a break runs between the two segments.
 
-    The instantiated graph stays valid once torch releases its captured
-    graph.
-    """
-    device = torch.device("cuda:0")
-    stream = torch.cuda.Stream(device=device)
-    module = _linear(device)
-    x = torch.empty(64, 256, device=device, dtype=torch.bfloat16)
-    with torch.cuda.stream(stream):
-        module(x)
-    graph = capture(lambda: module(x), stream=stream)
-    executable = None
-    try:
-        exported, graphs = export(graph)
-        assert exported is graph
-        assert len(graphs) == 1
-        executable = _Executable(graphs[0])
-
-        outputs = []
-        for run in (graph.replay, lambda: executable.launch(stream)):
-            # The same input before each run, and a cleared output, so the
-            # output read afterwards was written by that run.
-            with torch.cuda.stream(stream):
-                x.copy_(torch.linspace(-1, 1, x.numel()).view_as(x))
-                graph.output.zero_()
-                run()
-                outputs.append(graph.output.clone())
-            stream.synchronize()
-            # Once the first output is read, torch releases its captured
-            # graph; the instantiated one runs on.
-            graph.handover()
-        assert outputs[0].abs().sum() > 0
-        assert torch.equal(outputs[0], outputs[1])
-    finally:
-        stream.synchronize()
-        if executable is not None:
-            executable.destroy()
-        graph.release()
-
-
-@torch.inference_mode()
-def test_export_names_one_graph_per_segment():
-    """A graph broken once exports two segments, which only Rust launches.
-
-    The work between them is a break op the worker notes and performs, so
-    torch replays no graph with breaks.
+    The work doubles the value the first segment wrote on the captured
+    stream, so a replay computes ``(x + 1) * 2 + 3`` only when the work runs
+    after the first segment and before the second.
     """
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
     value = torch.ones(16, device=device)
 
-    recording = capture_begin(None, stream.cuda_stream, device.index)
+    def step():
+        value.add_(1)
+        break_graph(lambda: value.mul_(2))
+        value.add_(3)
+
+    graph = capture(step, stream=stream)
     try:
+        assert graph.segments == 2
         with torch.cuda.stream(stream):
-            value.add_(1)
-            break_graph()
-            value.add_(3)
-    except BaseException as error:
-        recording.end(failure=error)
-        raise
-    graph, graphs = capture_end(recording, instantiate=True)
-    try:
-        assert len(graphs) == 2 and len(set(graphs)) == 2
-        with pytest.raises(RuntimeError, match="break ops"):
+            value.fill_(5)
             graph.replay()
+        stream.synchronize()
+        assert torch.equal(value, torch.full_like(value, (5 + 1) * 2 + 3))
     finally:
+        stream.synchronize()
         graph.release()

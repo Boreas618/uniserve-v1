@@ -82,11 +82,12 @@ def qwen_moe_checkpoint(root, *, norm_topk_prob=True, **overrides):
     return model
 
 
-def bagel_checkpoint(root):
+def bagel_checkpoint(root, head_dim=8):
     """Write a two-layer BAGEL checkpoint with a zero-update flow expert.
 
-    Returns the Hugging Face Qwen reference for the text expert, the saved
-    state and the matching typed config.
+    ``head_dim`` is the attention heads' width. Returns the Hugging Face
+    Qwen reference for the text expert, the saved state and the matching
+    typed config.
     """
     torch.manual_seed(662)
     config = Qwen3Config(
@@ -96,7 +97,7 @@ def bagel_checkpoint(root):
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=head_dim,
         tie_word_embeddings=False,
         attention_bias=True,
         max_position_embeddings=64,
@@ -140,7 +141,7 @@ def bagel_checkpoint(root):
     save_file(state, root / "ema.safetensors")
     config = bagel.Config(
         bagel.TransformerConfig(
-            32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, 8, True, 64
+            32, 48, 2, 4, 2, 37, 1e-6, 1_000_000.0, head_dim, True, 64
         ),
         siglip.Config(2, 8, 3, siglip.TransformerConfig(32, 4, 48, 1, 1e-6)),
         vae.Config(8, 3, 2, 32, 3, (1, 1), 1, 2, 0.5, 0.25),
@@ -154,7 +155,7 @@ def bagel_checkpoint(root):
     return reference, state, config
 
 
-def load_bagel(root, config):
+def load_bagel(root, config, device="cpu"):
     """Load the text and denoiser capabilities of :func:`bagel_checkpoint`."""
     return loading.load_model(
         bagel.Model,
@@ -165,14 +166,14 @@ def load_bagel(root, config):
             ).resolve(root, io=loading.Config()),
         ),
         mapping=bagel.checkpoint_mappings,
-        device="cpu",
+        device=device,
         weights=weights.Config(),
         modules=frozenset(("text", "denoiser")),
     ).model
 
 
-def sensenova_checkpoint(root, dtype):
-    """Write a two-layer SenseNova U1 checkpoint and load it on CPU.
+def sensenova_checkpoint(root, dtype, device="cpu"):
+    """Write a two-layer SenseNova U1 checkpoint and load it on ``device``.
 
     Generation-expert projections are zero so the image branch residual is
     observable. Returns the loaded model and the saved state.
@@ -248,7 +249,7 @@ def sensenova_checkpoint(root, dtype):
         ),
         mapping=u1.checkpoint_mappings,
         weights=weights.Config(dtype=dtype),
-        device="cpu",
+        device=device,
     ).model
     return model, state
 

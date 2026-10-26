@@ -192,12 +192,15 @@ class _Session:
             )
         ]
 
+    @property
+    def denoiser(self):
+        """The fixture's diffusion LM."""
+        return self.loaded.module.get_submodule("denoiser")
+
     def attend_state(self) -> list[torch.Tensor]:
         return [
             self.buffers[f"attend_state.{index}"]
-            for index in range(
-                len(diffusion_lm.attend_widths(self.loaded, "denoiser"))
-            )
+            for index in range(len(self.denoiser.attend_widths()))
         ]
 
     def attend_arguments(
@@ -306,7 +309,7 @@ class _Session:
         """Allocate the tensors of the forwards, as the worker does."""
         tables, tokens, rows = len(self.pool.tables), TOKENS, 2 * ROWS
         setup = self.setup
-        hidden = diffusion_lm.hidden_size(self.loaded, "denoiser")
+        hidden = self.denoiser.hidden_size()
         dtype = setup.dtype
         canvas, device = setup.canvas, setup.device
         long = {"dtype": torch.int64, "device": device}
@@ -332,7 +335,7 @@ class _Session:
                 256, dtype=torch.float32, device=device
             ),
         }
-        widths = diffusion_lm.attend_widths(self.loaded, "denoiser")
+        widths = self.denoiser.attend_widths()
         for index, width in enumerate(widths):
             buffers[f"attend_state.{index}"] = torch.zeros(
                 (tokens, width), dtype=dtype, device=device
@@ -450,11 +453,10 @@ def test_a_readout_reads_every_candidate_of_rows_of_different_lengths(
     tmp_path,
 ):
     session = _Session(tmp_path, sampling=False)
-    loaded = session.loaded
-    assert diffusion_lm.sequence_length(loaded, "denoiser") == CANVAS
-    assert diffusion_lm.vocab_size(loaded, "denoiser") == VOCAB
-    assert diffusion_lm.generates(loaded, "denoiser")
-    assert not diffusion_lm.exchanges_finish(loaded, "denoiser", False, 0)
+    denoiser = session.denoiser
+    assert denoiser.sequence_length() == CANVAS
+    assert denoiser.vocab_size() == VOCAB
+    assert denoiser.generates()
 
     generator = torch.Generator().manual_seed(9)
     canvases = [
@@ -666,9 +668,9 @@ def _capture(
 ) -> cuda_graph.BreakableCUDAGraph:
     """Capture one call of a runner method that already ran eagerly."""
     torch.cuda.synchronize()
-    recording = cuda_graph.capture_begin(pool, session.stream.cuda_stream, 0)
-    method(*arguments)
-    graph, _ = cuda_graph.capture_end(recording, instantiate=True)
+    graph = cuda_graph.capture(
+        lambda: method(*arguments), stream=session.stream, pool=pool
+    )
     torch.cuda.synchronize()
     return graph
 

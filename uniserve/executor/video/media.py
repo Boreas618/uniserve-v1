@@ -33,6 +33,7 @@ finalizes the container when every unit has arrived.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import struct
@@ -50,14 +51,23 @@ from uniserve.media.reader import read_audio, read_image
 from uniserve.runner.encoder import EncoderRunner
 
 __all__ = [
+    "DONE",
+    "FAILED",
     "Conditions",
     "HostLane",
     "MuxSession",
     "Reports",
+    "Staging",
+    "encode_audio",
+    "encode_unit",
     "encoded_unit_bytes",
     "frame_unit",
     "read_unit",
+    "run_reported",
+    "soundtrack",
 ]
+
+_LOG = logging.getLogger(__name__)
 
 # Bytes of an encoded unit's length prefix.
 LENGTH_BYTES = 8
@@ -75,22 +85,22 @@ FAILED = 2
 
 
 def encoded_video_bytes(frames: int, height: int, width: int) -> int:
-    """Bound the MP4 bytes of one unit from the serving encoder (libx264,
-    yuv420p, ``preset=ultrafast``, ``tune=zerolatency``).
+    """Bound the MP4 bytes of one unit from the serving encoder.
 
-    This preset uses baseline CAVLC. A padded 16x16 macroblock has at most
-    27 residual blocks (including the separate DC blocks), each with up to
-    16 coefficients. Baseline level codes occupy at most 28 bits; x264
-    re-encodes CAVLC overflows at a higher QP. Per-block token, zero and run
-    codes need at most 16 + 9 + 15 * 11 bits. A further 1536 bits covers all
-    macroblock headers and 16 pairs of motion-vector differences. NAL
-    escaping adds at most one byte per two source bytes. Each encoder thread
-    writes one slice header per frame of at most 1024 bytes; MP4 sample
-    tables need at most 64 bytes per packet, and parameter sets, encoder SEI
-    and fixed container boxes fit in 64 KiB. These are syntax bounds,
-    independent of image entropy (x264 ``encoder/cavlc.c``,
+    The serving encoder is libx264, yuv420p, ``preset=ultrafast``,
+    ``tune=zerolatency``. This preset uses baseline CAVLC. A padded 16x16
+    macroblock has at most 27 residual blocks (including the separate DC
+    blocks), each with up to 16 coefficients. Baseline level codes occupy at
+    most 28 bits; x264 re-encodes CAVLC overflows at a higher QP. Per-block
+    token, zero and run codes need at most 16 + 9 + 15 * 11 bits. A further
+    1536 bits covers all macroblock headers and 16 pairs of motion-vector
+    differences. NAL escaping adds at most one byte per two source bytes.
+    Each encoder thread writes one slice header per frame of at most 1024
+    bytes; MP4 sample tables need at most 64 bytes per packet, and parameter
+    sets, encoder SEI and fixed container boxes fit in 64 KiB. These are
+    syntax bounds, independent of image entropy (x264 ``encoder/cavlc.c``,
     ``encoder/encoder.c`` and FFmpeg ``libavformat/movenc.c``).
-    """  # noqa: D205
+    """
     blocks = -(-height // 16) * -(-width // 16)
     residual_bits = 27 * (16 + 16 * 28 + 9 + 15 * 11)
     macroblock_bytes = -(-(residual_bits + 1536) // 8)
@@ -101,20 +111,23 @@ def encoded_video_bytes(frames: int, height: int, width: int) -> int:
 
 
 def encoded_unit_bytes(frames: int, height: int, width: int) -> int:
-    """Bytes of one ``encoded_units`` row: the length prefix and the largest
-    encoding of a unit of ``frames`` frames at the raster.
-    """  # noqa: D205
+    """Bytes of one ``encoded_units`` row.
+
+    The length prefix and the largest encoding of a unit of ``frames``
+    frames at the raster.
+    """
     return LENGTH_BYTES + encoded_video_bytes(frames, height, width)
 
 
 def frame_unit(payload: bytes, row: torch.Tensor) -> int:
-    """Write ``payload`` behind its native-endian ``u64`` length into
-    ``row`` (uint8). Returns the framed length; bytes past it stay
+    """Write ``payload`` behind its native-endian ``u64`` length into ``row``.
+
+    ``row`` is uint8. Returns the framed length; bytes past it stay
     untouched, so only that prefix of the row is published.
 
     Raises:
         ValueError: The payload exceeds the row.
-    """  # noqa: D205
+    """
     capacity = row.numel() - LENGTH_BYTES
     if row.numel() < LENGTH_BYTES or len(payload) > capacity:
         raise ValueError(
@@ -164,6 +177,7 @@ class Reports:
         value: int = 0,
         payload: bytes = b"",
     ) -> None:
+        """Write one report; a short write continues where it stopped."""
         message = memoryview(
             _HEADER.pack(batch, call, row, status, value, len(payload))
             + payload
@@ -194,6 +208,7 @@ class HostLane:
             task()
 
     def submit(self, task: Callable[[], None]) -> None:
+        """Queue ``task`` behind every task submitted before it."""
         self._tasks.put(task)
 
     def close(self) -> None:
@@ -250,12 +265,13 @@ class Conditions:
         conditions: Sequence[Mapping[str, Any]],
         products: Mapping[str, torch.Tensor | None],
     ) -> list[_Rows]:
-        """Each condition's rows of each product, taken in request order,
-        which must fill every product exactly.
+        """Each condition's rows of each product, taken in request order.
+
+        The conditions must fill every product exactly.
 
         Raises:
             ValueError: The conditions exceed a product or leave it unfilled.
-        """  # noqa: D205
+        """
         cursor = {"pixels": 0, "samples": 0, "patches": 0}
         names = {
             "pixels": "condition_pixels",
@@ -296,7 +312,7 @@ class Conditions:
                 rows.patches = take(
                     "patches", int(grid["t"]) * int(grid["h"]) * int(grid["w"])
                 )
-            track = _track(media)
+            track = soundtrack(media)
             if track is not None:
                 rows.samples = take("samples", int(track["samples"]))
             taken.append(rows)
@@ -358,7 +374,7 @@ class Conditions:
                         taken.pixels,
                     )
                     self._pack(condition, taken.pixels, taken)
-                track = _track(media)
+                track = soundtrack(media)
                 if track is not None:
                     assert taken.samples is not None
                     read_audio(
@@ -421,20 +437,23 @@ class Conditions:
         clip: Mapping[str, Any],
         result: dict[str, Any],
     ) -> None:
+        # The decoding thread hands any failure to :meth:`read`, which
+        # raises it.
         try:
             result["frames"] = self._read_video(source, clip)
-        except BaseException as error:  # noqa: BLE001 - the reader raises it
+        except BaseException as error:
             result["error"] = error
 
     def _read_video(
         self, source: Mapping[str, Any], clip: Mapping[str, Any]
     ) -> torch.Tensor:
-        """Decode a reference video's kept frames on its planned canvas with
-        one FFmpeg pass: resampled to the model's frame rate, the start
-        frames skipped, then scaled per frame with LANCZOS (the scale
-        follows the trim, so it never sees a skipped frame). Returns host
-        ``[frames, height, width, 3]`` uint8.
-        """  # noqa: D205
+        """Decode a reference video's kept frames with one FFmpeg pass.
+
+        The frames are resampled to the model's frame rate, the start frames
+        skipped, then scaled per frame with LANCZOS to the clip's canvas (the
+        scale follows the trim, so it never sees a skipped frame). Returns
+        host ``[frames, height, width, 3]`` uint8.
+        """
         canvas = clip["canvas"]
         width, height = int(canvas["width"]), int(canvas["height"])
         frames = int(clip["frames"])
@@ -446,13 +465,13 @@ class Conditions:
         try:
             # The shared-memory object is a seekable file FFmpeg reads
             # directly.
-            input_file = open(f"/dev/shm/{name}", "rb")  # noqa: SIM115
+            input_file = open(f"/dev/shm/{name}", "rb")
         except OSError as error:
             raise ValueError(
                 f"condition media {name} cannot be opened: {error}"
             ) from error
         with input_file:
-            process = subprocess.run(  # noqa: S603 - the deployment's FFmpeg
+            process = subprocess.run(
                 [
                     self.ffmpeg,
                     "-v",
@@ -491,17 +510,19 @@ class Conditions:
         ).view(frames, height, width, 3)
 
 
-def _track(media: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    """The audio track a condition carries, if any."""
+def soundtrack(media: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The audio track a condition's ``media`` carries, if any."""
     if "video" in media:
         return media["video"].get("soundtrack")
     return media.get("audio")
 
 
 def audio_samples(frames: int, frame_rate: int, audio_rate: int) -> int:
-    """Samples of the soundtrack at the audio rate: the video's duration,
-    ``frames * audio_rate / frame_rate`` rounded half to even.
-    """  # noqa: D205
+    """Samples of the soundtrack at the audio rate.
+
+    The video's duration, ``frames * audio_rate / frame_rate`` rounded half
+    to even.
+    """
     quotient, remainder = divmod(frames * audio_rate, frame_rate)
     twice = 2 * remainder
     if twice > frame_rate or (twice == frame_rate and quotient % 2 == 1):
@@ -541,15 +562,17 @@ class MuxSession:
 
     @property
     def samples(self) -> int:
+        """Samples of the request's soundtrack at the audio rate."""
         return audio_samples(
             sum(self.unit_frames), self.frame_rate, self.audio_rate
         )
 
     def append(self, units: Sequence[bytes]) -> None:
-        """Append encoded units in request order without decoding their
-        frames. Excess units are rejected before any packet is written; a
-        failed append closes the session.
-        """  # noqa: D205
+        """Append encoded units in request order without decoding them.
+
+        Excess units are rejected before any packet is written; a failed
+        append closes the session.
+        """
         if self.closed:
             raise ValueError("artifact assembly is closed")
         if self.units + len(units) > len(self.unit_frames):
@@ -577,9 +600,10 @@ class MuxSession:
         self.audio = audio
 
     def finish(self) -> bytes:
-        """Add the audio track and finalize a complete request: every unit
-        and the audio must have arrived. Returns the MP4 bytes.
-        """  # noqa: D205
+        """Add the audio track and finalize a complete request's MP4 bytes.
+
+        Every unit and the audio must have arrived.
+        """
         if self.closed:
             raise ValueError("artifact assembly is closed")
         if self.units != len(self.unit_frames):
@@ -609,9 +633,11 @@ class MuxSession:
 def encode_unit(
     frames: torch.Tensor, frame_rate: int, row: torch.Tensor
 ) -> int:
-    """Encode one media unit's ``[frames, height, width, 3]`` uint8 host
-    frames into its encoded row; returns the framed length.
-    """  # noqa: D205
+    """Encode one media unit's host frames into its encoded row.
+
+    ``frames`` is ``[frames, height, width, 3]`` uint8. Returns the framed
+    length.
+    """
     return frame_unit(codec.encode_video_unit(frames, frame_rate), row)
 
 
@@ -622,9 +648,11 @@ def encode_audio(pcm: torch.Tensor, samples: int, rate: int) -> bytes:
 
 @dataclass
 class Staging:
-    """A CUDA media reader's way to its device products: page-locked
-    staging it decodes into and the stream it copies the staging on.
-    """  # noqa: D205
+    """A CUDA media reader's way to its device products.
+
+    Page-locked staging it decodes into and the stream it copies the
+    staging on.
+    """
 
     device: torch.device
     stream: torch.cuda.Stream = field(init=False)
@@ -650,9 +678,10 @@ class Staging:
         staging: Mapping[str, torch.Tensor | None],
         products: Mapping[str, torch.Tensor | None],
     ) -> None:
-        """Copy every staging view into its product and wait for the copies,
-        so the products are complete when the task finishes.
-        """  # noqa: D205
+        """Copy every staging view into its product and wait for the copies.
+
+        The products are complete when the task finishes.
+        """
         with torch.cuda.stream(self.stream):
             for name, product in products.items():
                 source = staging[name]
@@ -668,17 +697,18 @@ def run_reported(
     row: int,
     work: Callable[[], tuple[int, bytes]],
 ) -> Callable[[], None]:
-    """A host task that runs ``work`` and reports its ``(value, payload)``,
-    or its failure, for ``(batch, call, row)``.
-    """  # noqa: D205
+    """A host task that runs ``work`` and reports its outcome.
+
+    It reports ``work``'s ``(value, payload)``, or its failure, for
+    ``(batch, call, row)``.
+    """
 
     def task() -> None:
+        # Any failure reaches the worker as a :data:`FAILED` report.
         try:
             value, payload = work()
-        except BaseException as error:  # noqa: BLE001 - reported to the worker
-            import logging
-
-            logging.getLogger(__name__).error(
+        except BaseException as error:
+            _LOG.error(
                 "host media task of batch %s call %s failed: %s",
                 batch,
                 call,

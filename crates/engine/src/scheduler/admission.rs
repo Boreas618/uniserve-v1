@@ -204,6 +204,9 @@ impl Scheduler {
                 "generation request requires worker feature `{feature}`, but the worker does not support it"
             ));
         }
+        if let Some(refusal) = self.exceeded_image_step(req) {
+            return Err(refusal);
+        }
         if let Some(refusal) = self.uncaptured_image(req) {
             return Err(refusal);
         }
@@ -879,13 +882,45 @@ impl Scheduler {
         Some(format!(
             "the workers serve {width}x{height} images with {branches} guidance branches \
              under CUDA graphs only at the sizes they captured: {}; \
-             cuda_graph_config.flow_shapes names the sizes to capture",
+             cuda_graph_config.flow_shapes names the sizes the decoder captures",
             if sizes.is_empty() {
                 "none".to_owned()
             } else {
                 sizes.join(", ")
             }
         ))
+    }
+
+    /// Why the image denoiser's step cannot hold `req`'s images, if so: a
+    /// step evaluates one framed latent sequence (the image's latent rows
+    /// and its `commit_marker_tokens`) per guidance branch, within the rows
+    /// and tokens the workers' step serves (`WorkerInfo::image_capacity`).
+    fn exceeded_image_step(&self, req: &GenerationRequest) -> Option<String> {
+        let capacity = self.info.image_capacity.as_ref()?;
+        if !req.generates_images() || capacity.max_step_tokens == 0 {
+            return None;
+        }
+        let (height, width) = (req.image.height, req.image.width);
+        let branches = req.image.cfg_branch_count();
+        if u32::from(branches) > capacity.max_step_rows {
+            return Some(format!(
+                "a {width}x{height} image with {branches} guidance branches exceeds the \
+                 max_step_rows of {} guidance branch rows the workers' denoising step holds",
+                capacity.max_step_rows
+            ));
+        }
+        let sequence = self
+            .num_vae(&req.image)
+            .saturating_add(u64::from(self.generation_limits.commit_marker_tokens));
+        let tokens = sequence.saturating_mul(u64::from(branches));
+        (tokens > capacity.max_step_tokens).then(|| {
+            format!(
+                "a {width}x{height} image with {branches} guidance branches needs {tokens} \
+                 denoising step tokens, beyond the max_step_tokens of {} the workers' \
+                 denoising step holds",
+                capacity.max_step_tokens
+            )
+        })
     }
 
     /// Why the latent encoder cannot encode one of `req`'s input images, if

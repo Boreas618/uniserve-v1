@@ -663,8 +663,8 @@ impl Scheduler {
         }
 
         // A text batch of one worker group carries the page offloads the
-        // host KV cache reserved for that group: its runner copies them
-        // before its forward, and its output settles them.
+        // host KV cache reserved for that group: the worker's copy lane
+        // copies them beside its forward, and its output settles them.
         if let Some(kv_offload) = self.kv_offload.as_mut()
             && let Some((_, first)) = batch.requests.first()
             && batch.requests.iter().all(|(call, placement)| {

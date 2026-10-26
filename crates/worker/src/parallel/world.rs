@@ -12,7 +12,11 @@
 //! 3. The component group plan ([`GroupPlan`]): every torch group in plan
 //!    order (`distributed.create_groups`), then one `DeviceMesh` per member
 //!    binding (`distributed.mesh`).
+//!
+//! At bind, the stream groups follow ([`World::bind_stream_groups`]): each
+//! stream a component's collectives run on gets torch groups of its own.
 
+use std::collections::BTreeMap;
 use std::os::fd::IntoRawFd;
 use std::time::Duration;
 
@@ -24,7 +28,7 @@ use crate::ffi::{Handle, Interpreter, integer_list, list, strings};
 use crate::{Error, Result};
 
 use super::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT, bind_beside};
-use super::topology::{ComponentGroups, GroupPlan, MeshBinding, PlanInputs};
+use super::topology::{ComponentGroups, GroupEntry, GroupPlan, MeshBinding, PlanInputs};
 
 /// One component's bound meshes on this rank.
 pub(crate) struct ComponentMeshes {
@@ -33,6 +37,18 @@ pub(crate) struct ComponentMeshes {
     pub mesh: Option<Handle>,
     /// The temporal unit ring's `DeviceMesh` handle, for a member.
     pub units: Option<Handle>,
+}
+
+/// One torch group a component's numerical collectives run on from one of
+/// its stream copies ([`World::bind_stream_groups`]).
+pub(crate) struct CollectiveGroup {
+    pub component: String,
+    /// The stream copy (expert microbatch) whose collectives use it.
+    pub copy: usize,
+    /// The mesh communicators (`tp`, `pp.tp`) whose fiber it spans.
+    pub names: Vec<String>,
+    /// The torch process group.
+    pub handle: Handle,
 }
 
 /// The rank's process world.
@@ -135,54 +151,16 @@ impl World {
         launch: &WorkerLaunch,
         declarations: &Declarations,
     ) -> Result<()> {
-        let execution = &launch.execution;
-        let physical: Vec<usize> = match &launch.expert_parallel {
-            Some(union) => {
-                let start = union.rank - execution.rank;
-                (start..start + execution.world_size).collect()
-            }
-            None => (0..execution.world_size).collect(),
-        };
         let selections = declarations.selections();
+        let physical = physical_ranks(launch);
         let (plan, owns) = GroupPlan::components(&PlanInputs {
-            rank: execution.rank,
+            rank: launch.execution.rank,
             physical: &physical,
             local_sync: self.union.is_some(),
             placements: &launch.components,
             selections: Some(&selections),
         })?;
-
-        // Each planned group's members cross back to back, with their
-        // counts.
-        let entries = &plan.entries;
-        let groups: tvm_ffi::Array<Any> =
-            Interpreter::import("uniserve.distributed.world.create_groups")?
-                .call_values(&[
-                    self.torch.to_any(),
-                    Any::from(integer_list(
-                        entries.iter().map(|entry| entry.members.len() as i64),
-                    )),
-                    Any::from(integer_list(
-                        entries
-                            .iter()
-                            .flat_map(|entry| &entry.members)
-                            .map(|&rank| rank as i64),
-                    )),
-                    Any::from(list(
-                        entries.iter().map(|entry| Any::from(entry.local_sync)),
-                    )),
-                    Any::from(list(entries.iter().map(|entry| Any::from(entry.keep)))),
-                ])?
-                .try_into()
-                .map_err(|error| {
-                    Error::numerical("uniserve.distributed.world.create_groups", &error)
-                })?;
-        if groups.len() != plan.entries.len() {
-            return Err(Error::Interface(
-                "create_groups returns one value per plan entry".into(),
-            ));
-        }
-        let groups: Vec<Handle> = groups.iter().map(Handle::new).collect::<Result<_>>()?;
+        let groups = self.create_groups(&plan.entries)?;
 
         for component in plan.components {
             let mesh = component
@@ -209,26 +187,76 @@ impl World {
         Ok(())
     }
 
-    /// The multi-member groups of `component`'s numerical mesh this rank
-    /// belongs to, in creation order, for stream collectives.
-    /// `first` is the process-world rank of this worker's first rank.
-    pub(crate) fn collective_groups(
+    /// Create the stream groups of every component that runs collectives
+    /// on `copies` streams of its own (its token lane, each expert
+    /// microbatch of it): one torch group per copy and multi-member fiber of
+    /// the component's mesh ([`GroupPlan::streams`]). Collective over the
+    /// process world in plan order, at the same point of every rank's
+    /// startup; returns the groups this rank belongs to, in plan order.
+    pub(crate) fn bind_stream_groups(
         &self,
-        component: &str,
-        first: usize,
-    ) -> Vec<super::CollectiveGroup> {
-        self.components
-            .iter()
-            .filter(|meshes| meshes.plan.name == component && meshes.plan.member)
-            .flat_map(|meshes| meshes.plan.mesh.iter())
-            .flat_map(|binding| &binding.groups)
-            .filter(|group| group.members.len() > 1)
-            .map(|group| super::CollectiveGroup {
-                name: group.name(),
-                members: group.members.iter().map(|&rank| rank - first).collect(),
-                ranks: group.members.clone(),
+        launch: &WorkerLaunch,
+        declarations: &Declarations,
+        copies: &BTreeMap<String, usize>,
+    ) -> Result<Vec<CollectiveGroup>> {
+        let selections = declarations.selections();
+        let physical = physical_ranks(launch);
+        let (entries, streams) = GroupPlan::streams(
+            &PlanInputs {
+                rank: launch.execution.rank,
+                physical: &physical,
+                local_sync: self.union.is_some(),
+                placements: &launch.components,
+                selections: Some(&selections),
+            },
+            copies,
+        )?;
+        let groups = self.create_groups(&entries)?;
+        Ok(streams
+            .into_iter()
+            .map(|stream| CollectiveGroup {
+                component: stream.component,
+                copy: stream.copy,
+                names: stream.names,
+                handle: groups[stream.entry].clone(),
             })
-            .collect()
+            .collect())
+    }
+
+    /// Create the torch groups of `entries` in order
+    /// (`distributed.create_groups`): one value per entry, the group of a
+    /// kept entry.
+    fn create_groups(&self, entries: &[GroupEntry]) -> Result<Vec<Handle>> {
+        // Each planned group's members cross back to back, with their
+        // counts.
+        let groups: tvm_ffi::Array<Any> =
+            Interpreter::import("uniserve.distributed.world.create_groups")?
+                .call_values(&[
+                    self.torch.to_any(),
+                    Any::from(integer_list(
+                        entries.iter().map(|entry| entry.members.len() as i64),
+                    )),
+                    Any::from(integer_list(
+                        entries
+                            .iter()
+                            .flat_map(|entry| &entry.members)
+                            .map(|&rank| rank as i64),
+                    )),
+                    Any::from(list(
+                        entries.iter().map(|entry| Any::from(entry.local_sync)),
+                    )),
+                    Any::from(list(entries.iter().map(|entry| Any::from(entry.keep)))),
+                ])?
+                .try_into()
+                .map_err(|error| {
+                    Error::numerical("uniserve.distributed.world.create_groups", &error)
+                })?;
+        if groups.len() != entries.len() {
+            return Err(Error::Interface(
+                "create_groups returns one value per plan entry".into(),
+            ));
+        }
+        groups.iter().map(Handle::new).collect()
     }
 
     /// The meshes of a component this rank is a member of.
@@ -297,6 +325,19 @@ impl Drop for World {
         // A world dropped without a close (a failed startup) is abandoned:
         // its torch groups stay referenced until the process exits.
         let _ = self.close(true);
+    }
+}
+
+/// The torch world rank of each of this worker's ranks: the union's ranks
+/// of the worker in an expert union, its own ranks otherwise.
+fn physical_ranks(launch: &WorkerLaunch) -> Vec<usize> {
+    let execution = &launch.execution;
+    match &launch.expert_parallel {
+        Some(union) => {
+            let start = union.rank - execution.rank;
+            (start..start + execution.world_size).collect()
+        }
+        None => (0..execution.world_size).collect(),
     }
 }
 

@@ -1,16 +1,14 @@
-"""The forwards of the latent denoisers: :class:`DenoiserRunner`.
+"""The forwards of a video denoiser: :class:`DenoiserRunner`.
 
-One runner serves one denoiser on one stream. A request's state lives in
-tensors the caller owns; every method names the tensors it reads and writes
-as parameters, and a tensor wider than a forward needs is viewed through
-its leading elements. The parameters of :meth:`DenoiserRunner.draw_noise`,
-:meth:`~DenoiserRunner.prepare_latents`,
+One runner serves one video denoiser on one stream; an image model's
+denoiser is the image executor's (``uniserve.executor.image``). A request's
+state lives in tensors the caller owns; every method names the tensors it
+reads and writes as parameters, and a tensor wider than a forward needs is
+viewed through its leading elements. The parameters of
+:meth:`DenoiserRunner.draw_noise`, :meth:`~DenoiserRunner.prepare_latents`,
 :meth:`~DenoiserRunner.encode_conditions` and
-:meth:`~DenoiserRunner.denoise` depend on the denoiser's capability class
-and are documented there.
-
-**Video denoisers** (``VideoDenoiser``). A request's latent samples, state
-tables, retained conditioning and noise are the caller's.
+:meth:`~DenoiserRunner.denoise` are documented there. A request's latent
+samples, state tables, retained conditioning and noise are the caller's.
 
 - ``draw_noise`` fills a request's noise tensors from its seed with the
   library's native draw.
@@ -36,34 +34,6 @@ Sizes cross as flat integer lists:
 - vision spans: ``[start, stop]`` per vision block of the presented prompt;
 - a layout: ``[frames, width, height, text_rows, condition_rows]``.
 
-**Image denoisers** (``ImageDenoiser``), which attend to the prefix cache.
-The caller's resident tensors are the latent pool's step workspace
-(``samples``), its per-slot timesteps, the product arena and the request
-slots' installed block tables; they are passed once, to
-:meth:`DenoiserRunner.bound`. A *row* is one guidance branch of one image,
-``[sample, units, height, width, token, tokens, prediction]``: its latent
-rows ``samples[sample:sample + units]``, its size, its positions
-``positions[:, token:token + tokens]`` and its rows of the predictions;
-row ``i`` reads ``timesteps[i]``. Rows cross flattened.
-
-- ``draw_noise`` fills an image's noise from its seed.
-- ``prepare_latents`` turns that noise into the image's initial samples.
-- ``denoise`` gathers the rows' attention metadata from the slot tables on
-  the device and predicts every row. Its shapes are fixed by its rows and
-  page widths, so it is captured into one CUDA graph per set of rows;
-  :meth:`DenoiserRunner.plan_denoise` builds the plans of attention
-  operators that plan a launch on the host.
-- ``encode_conditions`` writes the keys and values of latent images
-  inserted as conditioning. Under CUDA graphs it writes one image at a
-  time, captured into one graph per image size;
-  :meth:`DenoiserRunner.plan_conditions` builds its attention plans as
-  ``plan_denoise`` does a step's.
-- :meth:`DenoiserRunner.step` combines each image's branch predictions
-  with its trajectory's guidance and advances its samples by one solver
-  step. A trajectory's schedules and guidance are made from the image's
-  parameters, which the caller keeps and passes to :meth:`~DenoiserRunner.plan`
-  and to every step.
-
 The static methods answer a deployment's sizing questions from the model's
 configuration alone, so a rank without the denoiser's weights asks them
 too.
@@ -71,24 +41,17 @@ too.
 
 from __future__ import annotations
 
-import functools
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from math import prod
 from typing import Any, Protocol, cast
 
 import torch
 
-from uniserve.bindings import capturing
 from uniserve.bindings.context import ExecutionContext
 from uniserve.bindings.workspace import TensorBuffers
 from uniserve.diffusion import (
-    Branch,
     DenoisingStep,
-    Guidance,
-    Renorm,
-    Schedule,
-    advance_,
     normal_noise,
 )
 from uniserve.errors import SetupError
@@ -99,25 +62,14 @@ from uniserve.models import (
     AudioEncoder,
     Condition,
     ConditionRole,
-    ImageDenoiser,
     LatentInput,
     PatchEncoder,
     TextEncoder,
-    TextSize,
     VideoDecoder,
     VideoDenoiser,
     VideoEncoder,
     VideoPostprocessor,
 )
-from uniserve.nn.attention import (
-    AttentionBatch,
-)
-from uniserve.nn.rng import flow_noise_seed
-from uniserve.processing import (
-    load_tokenizer,
-    resolve_prefix,
-)
-from uniserve.runner.attention import AttentionMetadata
 from uniserve.runner.context import (
     execution_context,
     held_module,
@@ -127,67 +79,11 @@ from uniserve.tensors import BufferConfig
 
 __all__ = ["DenoiserRunner", "Outputs"]
 
-# Guidance branch mask bits, in evaluation order.
-_BITS = {
-    Branch.CONDITIONED: 1,
-    Branch.TEXT_UNCONDITIONAL: 2,
-    Branch.IMAGE_UNCONDITIONAL: 4,
-}
-
 _ROLES = (
     ConditionRole.FIRST_FRAME,
     ConditionRole.LAST_FRAME,
     ConditionRole.REFERENCE,
 )
-
-
-class _Guided(Protocol):
-    """The guidance an image denoiser makes for one trajectory.
-
-    ``ImageDenoiser`` does not declare the method, so the runner names the
-    signature it calls.
-    """
-
-    def make_guidance(
-        self,
-        *,
-        text_scale: float,
-        image_scale: float,
-        interval: tuple[float, float],
-        renorm: Renorm,
-        renorm_min: float,
-    ) -> Guidance: ...
-
-
-def _trajectory(
-    network,
-    steps: int,
-    shift: float,
-    text_scale: float,
-    image_scale: float,
-    interval_low: float,
-    interval_high: float,
-    renorm: str,
-    renorm_min: float,
-) -> tuple[dict[str, Schedule], Guidance]:
-    """The schedules and guidance of one image trajectory.
-
-    A non-positive ``shift`` keeps the denoiser's default shift.
-    """
-    shift = float(shift)
-    schedules = dict(
-        network.make_schedules(
-            int(steps), shift=shift if shift > 0 else None, device="cpu"
-        )
-    )
-    guidance = cast(_Guided, network).make_guidance(
-        text_scale=float(text_scale),
-        image_scale=float(image_scale),
-        interval=(float(interval_low), float(interval_high)),
-        renorm=Renorm(str(renorm)),
-        renorm_min=float(renorm_min),
-    )
-    return schedules, guidance
 
 
 class _Buffered(Protocol):
@@ -310,36 +206,13 @@ def _layout(denoiser: VideoDenoiser, value: Sequence[int]):
     return layout
 
 
-def _elements(shape: Sequence[int]) -> int:
-    count = 1
-    for extent in shape:
-        count *= int(extent)
-    return count
-
-
 def _view(tensor: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """The leading elements of a flat backing as ``shape``."""
-    return tensor.reshape(-1)[: _elements(shape)].view(tuple(shape))
+    return tensor.reshape(-1)[: prod(shape)].view(tuple(shape))
 
 
 def _dtype(dtype) -> str:
     return str(dtype).removeprefix("torch.")
-
-
-def _image_denoiser(loaded):
-    """The loaded model's image denoiser, or None."""
-    return capability(loaded.module, ImageDenoiser)
-
-
-def _image_rows(values: Sequence[int]) -> list[tuple[int, ...]]:
-    """Flattened image rows as tuples of their seven fields."""
-    flat = [int(value) for value in values]
-    return [tuple(flat[start : start + 7]) for start in range(0, len(flat), 7)]
-
-
-@functools.cache
-def _tokenizer(path: Path):
-    return load_tokenizer(path)
 
 
 @dataclass(frozen=True)
@@ -454,9 +327,6 @@ class _Layout:
 class DenoiserRunner:
     """The forwards of one denoiser on one stream.
 
-    The constructor serves a video denoiser; :meth:`bound` serves an image
-    denoiser of a bound component.
-
     Args:
         loaded: The loaded model.
         component: The declared component of the video denoiser.
@@ -468,17 +338,8 @@ class DenoiserRunner:
             workspace are prepared for.
     """
 
-    # The denoiser, a ``VideoDenoiser`` or an ``ImageDenoiser``.
-    _network: Any
-
-    # An image denoiser's resident tensors and the tensors only its
-    # forwards read and write (see :meth:`bound`).
-    _pipeline: Any
-    _samples: torch.Tensor
-    _slot_timesteps: torch.Tensor
-    _predictions: torch.Tensor
-    _step: torch.Tensor
-    _attention_metadata: AttentionMetadata
+    # The video denoiser.
+    _network: VideoDenoiser
 
     def __init__(
         self,
@@ -499,124 +360,6 @@ class DenoiserRunner:
         self._context.prepare(self._maximum)
         self._schedules = network.make_schedules(device=self._device)
         self._modalities = tuple(network.modalities)
-        self._draw_noise: Callable[..., None] = self._video_draw_noise
-        self._prepare_latents: Callable[..., None] = self._video_prepare_latents
-        self._encode_conditions: Callable[..., None] = (
-            self._video_encode_conditions
-        )
-        self._denoise: Callable[..., None] = self._video_denoise
-
-    @classmethod
-    def image(
-        cls,
-        loaded,
-        path: str,
-        stream: int,
-        device: int,
-        scratch,
-        cache,
-        rows: int,
-        tokens: int,
-        units: int,
-        width: int,
-        block_size: Sequence[int],
-        windowed: Sequence[int],
-        samples: torch.Tensor,
-        slot_timesteps: torch.Tensor,
-        unit_tables: torch.Tensor,
-        start_pages: torch.Tensor,
-        table_shapes: torch.Tensor,
-    ) -> DenoiserRunner:
-        """A runner of an image model's denoiser.
-
-        Args:
-            loaded: The loaded model.
-            path: The denoiser module's path in the model.
-            stream: The CUDA stream handle every forward enqueues on (0 on
-                the host).
-            device: The CUDA ordinal ``stream`` belongs to, -1 for the
-                host. Modules placed on a generation tower compute there
-                between the stream's steps.
-            scratch: The stream's shared work areas.
-            cache: The prefix cache view object the denoiser's attention
-                reads.
-            rows: The most rows one forward evaluates.
-            tokens: The most tokens (framed latent sequences) of a forward;
-                with ``rows``, the size the operators are prepared for.
-            units: The most latent rows one forward predicts.
-            width: The most pages one row selects from a block table.
-            block_size: Tokens per page of each numerical block table.
-            windowed: Whether each numerical block table retires pages
-                behind an attention window.
-            samples: The latent pool's step workspace ``[units, width]``,
-                where the caller gathers each trajectory's committed pages
-                before a step and from which it scatters them after it.
-            slot_timesteps: The latent pool's ``[slots + 1, 1]`` float32
-                per-slot timesteps the solver update reads.
-            unit_tables: ``[tables, S, units]`` int32, each slot's installed
-                units from its installed start page on.
-            start_pages: ``[groups, S]`` int32, each slot's installed start
-                page.
-            table_shapes: ``[tables, 3]`` int32 ``(group, block size,
-                window or -1)``.
-        """
-        path = str(path)
-        network = loaded.module.get_submodule(path) if path else loaded.module
-        if not isinstance(network, ImageDenoiser):
-            raise SetupError(
-                f"{type(network).__qualname__} is not an image denoiser"
-            )
-        # The denoiser receives exact host lengths with each forward.
-        context = execution_context(
-            network,
-            int(stream),
-            loaded.attention,
-            scratch,
-            device=int(device),
-            cache=cache,
-        )
-        context.prepare(TextSize(int(tokens), int(rows)))
-        runner = cls.__new__(cls)
-        runner._network = network
-        runner._context = context
-        runner._device = samples.device
-        runner._samples = samples
-        runner._slot_timesteps = slot_timesteps
-        runner._pipeline = network.mesh.get_group(
-            "pp" if "pp" in network.mesh.axes else ()
-        )
-
-        # The tensors only the forwards read and write: every row's
-        # predictions, packed in row order, the zero evaluation index the
-        # network's input carries, and the attention metadata the gather
-        # derives from the slot tables. Captured graphs address them, so
-        # they live as long as the runner.
-        rows, tokens = int(rows), int(tokens)
-        target = runner._device
-        latent_width = network.patch_size**2 * network.latent_channels
-        with torch.inference_mode(), torch.cuda.stream(context.stream):
-            runner._predictions = torch.zeros(
-                (int(units), latent_width),
-                dtype=network.prediction_dtype,
-                device=target,
-            )
-            runner._step = torch.zeros(1, dtype=torch.int64, device=target)
-            runner._attention_metadata = AttentionMetadata(
-                block_size,
-                windowed,
-                unit_tables,
-                start_pages,
-                table_shapes,
-                rows,
-                tokens,
-                int(width),
-                target,
-            )
-        runner._draw_noise = runner._image_draw_noise
-        runner._prepare_latents = runner._image_prepare_latents
-        runner._encode_conditions = runner._image_encode_conditions
-        runner._denoise = runner._image_denoise
-        return runner
 
     # Sizing, answered from configuration.
 
@@ -840,62 +583,6 @@ class DenoiserRunner:
 
     # Forwards.
 
-    def draw_noise(self, *arguments: Any) -> None:
-        """Fill a request's noise from its seed.
-
-        A video denoiser takes ``(seed, layout, size, conditions, spans,
-        condition_noise, *noise)``; an image denoiser takes ``(seed, index,
-        height, width, noise)`` and draws image ``index`` of the request's
-        seed at the image's native draw shape into the leading elements of
-        ``noise``, a tensor of the samples' device and dtype. ``seed``
-        carries the unsigned 64-bit seed's bits as a signed integer.
-        """
-        self._draw_noise(*arguments)
-
-    def prepare_latents(self, *arguments: Any) -> None:
-        """Write a request's initial samples.
-
-        A video denoiser takes ``(layout, size, conditions, spans,
-        *tensors)``; an image denoiser takes ``(noise, sample, units,
-        padded, height, width)``: it zeroes ``samples[sample:sample +
-        padded]`` and writes the image's initial latent, patched from its
-        drawn ``noise``, into the first ``units`` of those rows.
-        """
-        self._prepare_latents(*arguments)
-
-    def encode_conditions(self, *arguments: Any) -> None:
-        """Write a request's conditions where its denoising reads them.
-
-        A video denoiser takes ``(layout, size, conditions, spans,
-        condition_noise, out, counts, *rows)``. An image denoiser takes
-        the arguments of :meth:`denoise` and ``*features``, one latent
-        feature product tensor per row: row ``i`` reads ``features[i]``
-        instead of samples, at timestep zero, and writes its keys and
-        values after its slot's visible tokens; its prediction is computed
-        and unused.
-        """
-        self._encode_conditions(*arguments)
-
-    def denoise(self, *arguments: Any) -> None:
-        """Evaluate the denoiser.
-
-        A video denoiser takes ``(layout, step, text_condition,
-        *tensors)`` and advances a request by one solver step in place.
-
-        An image denoiser takes ``(row_columns, positions, timesteps, rows,
-        queries, prefixes, starts, widths)`` and predicts every row:
-        ``row_columns`` packs the rows' slots, lengths and selected page
-        counts (``gather_request_rows``), from which the forward gathers
-        the rows' attention metadata on the device; ``positions`` is
-        ``[3, T]`` int64 and ``timesteps`` ``[R, 1]`` float32; ``rows``
-        are the flattened rows; ``queries`` and ``prefixes`` mirror the
-        rows' lengths on the host, ``starts`` each windowed table's first
-        pages (one per row and table) and ``widths`` each table's page
-        width. The host mirrors serve an eager forward and the capture; a
-        launched graph reads the device columns.
-        """
-        self._denoise(*arguments)
-
     def _condition_noise(
         self, flat: torch.Tensor, size
     ) -> tuple[torch.Tensor, ...]:
@@ -903,12 +590,12 @@ class DenoiserRunner:
         # another, each leading with its batch of one.
         views, offset = [], 0
         for shape in self._network.condition_noise_shapes(size):
-            count = _elements(shape)
+            count = prod(shape)
             views.append(flat[offset : offset + count].view(tuple(shape)))
             offset += count
         return tuple(views)
 
-    def _video_draw_noise(
+    def draw_noise(
         self,
         seed: int,
         layout: _Layout,
@@ -944,7 +631,7 @@ class DenoiserRunner:
                 ),
             )
 
-    def _video_prepare_latents(
+    def prepare_latents(
         self,
         layout: _Layout,
         size: Sequence[int],
@@ -955,11 +642,11 @@ class DenoiserRunner:
         """Write a request's initial samples and state tables.
 
         ``tensors`` are each modality's noise (in modality order), then
-        every state field's destination in state order (see
-        :meth:`state_names`): a modality's field receives its initial
-        sample, patched from the noise and restricted to this rank's rows,
-        and every other field its table for the request's size. All are
-        host tensors; the call does no device work.
+        every state field's destination in state order (the layout's
+        ``VideoDenoiser.state_buffers``): a modality's field receives its
+        initial sample, patched from the noise and restricted to this rank's
+        rows, and every other field its table for the request's size. All
+        are host tensors; the call does no device work.
         """
         network = self._network
         resolved = _size(network, size, conditions, spans)
@@ -1000,7 +687,7 @@ class DenoiserRunner:
                 workspace=layout.workspace,
             )
 
-    def _video_encode_conditions(
+    def encode_conditions(
         self,
         layout: _Layout,
         size: Sequence[int],
@@ -1041,7 +728,7 @@ class DenoiserRunner:
                 out=target,
             )
 
-    def _video_denoise(
+    def denoise(
         self,
         layout: _Layout,
         step: torch.Tensor,
@@ -1052,7 +739,8 @@ class DenoiserRunner:
 
         ``step`` is the ``[1]`` int64 evaluation index; ``text_condition``
         the request's retained conditioning; ``tensors`` every state field
-        in state order (see :meth:`state_names`): each modality's sample of
+        in state order (the layout's ``VideoDenoiser.state_buffers``): each
+        modality's sample of
         this rank, which the step updates toward the next timestep, and
         the request's state tables. The step's endpoints are gathered on
         the device from the schedule, so one captured step serves every
@@ -1100,456 +788,6 @@ class DenoiserRunner:
                 layout.constants,
                 layout.workspace,
             )()
-
-    # Image denoisers.
-
-    # Facts of a loaded model's image denoiser, answered before a runner
-    # of it exists.
-
-    @staticmethod
-    def image_layout(loaded) -> list[int]:
-        """The image denoiser's latent layout; empty without one.
-
-        ``[patch_size, latent_channels, downsample, framing_tokens,
-        max_sequence_tokens, rope_advance, guidance_branches]``:
-        ``downsample`` is pixels per latent patch on each axis,
-        ``framing_tokens`` the tokens framing a generated image,
-        ``max_sequence_tokens`` the longest image sequence in latent patch
-        rows, framing excluded, ``rope_advance`` the language positions a
-        generated image spans in its conversation, and ``guidance_branches``
-        the most guidance branches one step evaluates.
-        """
-        denoiser = _image_denoiser(loaded)
-        if denoiser is None:
-            return []
-        return [
-            int(denoiser.patch_size),
-            int(denoiser.latent_channels),
-            int(denoiser.downsample),
-            int(denoiser.framing_tokens),
-            int(denoiser.max_sequence_tokens),
-            int(denoiser.rope_advance),
-            int(denoiser.guidance_branches),
-        ]
-
-    @staticmethod
-    def image_unconditional(loaded) -> str:
-        """What the image-unconditional guidance branch conditions on."""
-        return str(_image_denoiser(loaded).image_unconditional.value)
-
-    @staticmethod
-    def prediction_dtype(loaded) -> str:
-        """The dtype of the image denoiser's predictions."""
-        return _dtype(_image_denoiser(loaded).prediction_dtype)
-
-    @staticmethod
-    def guidance_prefix(loaded, source: str) -> list[int]:
-        """The prefix tokens an unconditional guidance branch conditions on.
-
-        ``source`` names the branch. The model's prompt framing and
-        tokenizer resolve them (see ``uniserve.processing.resolve_prefix``).
-        The rank asks only for a source no admission fixes, the start of a
-        conversation, so no prompt text of the request is framed.
-
-        Raises:
-            ValueError: ``source`` is the conditioned branch, which reads the
-                request's own context.
-        """
-
-        def tokenizer():
-            return (
-                None
-                if loaded.tokenizer is None
-                else _tokenizer(loaded.tokenizer)
-            )
-
-        tokens = resolve_prefix(
-            loaded.flow_prompt,
-            tokenizer,
-            source,
-            negative_prompt="",
-        )
-        return [int(token) for token in tokens]
-
-    def plans_attention(self) -> bool:
-        """Whether an attention operator plans each launch on the host.
-
-        A captured :meth:`denoise` of such a model is launched after
-        :meth:`plan_denoise` built the plans its graph reads.
-        """
-        return self._context.plans_attention()
-
-    def plan(
-        self,
-        steps: int,
-        shift: float,
-        text_scale: float,
-        image_scale: float,
-        interval_low: float,
-        interval_high: float,
-        renorm: str,
-        renorm_min: float,
-    ) -> list:
-        """What one image trajectory evaluates at each solver step.
-
-        The trajectory's schedules and guidance are made from these
-        parameters; :meth:`step` takes them again. A non-positive ``shift``
-        keeps the denoiser's default shift.
-
-        Returns:
-            ``[timesteps, branches]``: each solver step's model timestep and
-            the mask of guidance branches it evaluates (bit 0 conditioned, 1
-            text-unconditional, 2 image-unconditional).
-        """
-        schedules, guidance = _trajectory(
-            self._network,
-            steps,
-            shift,
-            text_scale,
-            image_scale,
-            interval_low,
-            interval_high,
-            renorm,
-            renorm_min,
-        )
-        schedule = schedules["image"]
-        masks = [
-            sum(_BITS[branch] for branch in guidance.branches(schedule, index))
-            for index in range(schedule.num_steps)
-        ]
-        times = [float(value) for value in schedule.timesteps.tolist()]
-        return [times, masks]
-
-    def _image_draw_noise(
-        self,
-        seed: int,
-        index: int,
-        height: int,
-        width: int,
-        noise: torch.Tensor,
-    ) -> None:
-        size = image.Config(int(height), int(width))
-        shape = (1, *self._network.noise_shape("image", size))
-        with torch.inference_mode(), torch.cuda.stream(self._context.stream):
-            normal_noise(
-                (flow_noise_seed(int(seed), int(index)),),
-                out=(_view(noise, shape),),
-            )
-
-    def _image_prepare_latents(
-        self,
-        noise: torch.Tensor,
-        sample: int,
-        units: int,
-        padded: int,
-        height: int,
-        width: int,
-    ) -> None:
-        network, samples = self._network, self._samples
-        sample, units, padded = int(sample), int(units), int(padded)
-        size = image.Config(int(height), int(width))
-        out = samples[sample : sample + units]
-        if (
-            padded < units
-            or sample + padded > samples.shape[0]
-            or tuple(out.shape) != network.latent_shape("image", size)
-        ):
-            raise ValueError(
-                "image trajectory storage must have its canonical patch shape"
-            )
-        shape = (1, *network.noise_shape("image", size))
-        with torch.inference_mode(), torch.cuda.stream(self._context.stream):
-            # Physical page padding past the trajectory's rows stays zero.
-            samples[sample : sample + padded].zero_()
-            network.prepare_latents(
-                (size,),
-                noise={"image": _view(noise, shape)},
-                state={"image": out.unsqueeze(0)},
-                constants={},
-                workspace={},
-            )
-
-    def _attention(
-        self,
-        row_columns: torch.Tensor,
-        count: int,
-        tokens: int,
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-        writes: bool,
-    ) -> AttentionBatch:
-        """Gather ``count`` rows of ``tokens`` tokens and view them.
-
-        The gather fills the block tables, start pages, lengths, offsets
-        and slot mappings from the slot tables in one launch. Rows that
-        write keys and values read paged inputs with a slot mapping;
-        read-only rows read their segments without writing. No row is
-        causal.
-        """
-        metadata = self._attention_metadata
-        metadata.gather(row_columns, count, tokens, widths)
-        return metadata.batch(
-            count,
-            tokens,
-            widths,
-            queries,
-            prefixes,
-            starts,
-            (False,) * count,
-            writes=writes,
-        )
-
-    def _evaluate(
-        self,
-        rows: Sequence[tuple[int, ...]],
-        positions: torch.Tensor,
-        timesteps: torch.Tensor,
-        attention: AttentionBatch,
-        features: Sequence | None = None,
-    ) -> None:
-        """Run the network over ``rows`` and write their predictions."""
-        network, context = self._network, self._context
-        latents = []
-        for index, (offset, units, *_) in enumerate(rows):
-            values = (
-                self._samples[offset : offset + units]
-                if features is None
-                else features[index]
-            )
-            latents.append(LatentInput(values, timesteps[index : index + 1]))
-        # The denoiser binds its inputs inside the forward: whatever it
-        # derives from the samples (conditioning pixels) follows each
-        # launch's samples.
-        typed = network.bind_inputs(
-            latents={"image": tuple(latents)},
-            sizes=tuple(image.Config(row[2], row[3]) for row in rows),
-            step=self._step,
-            positions=tuple(
-                positions[:, row[4] : row[4] + row[5]] for row in rows
-            ),
-            sequence_lengths=tuple(row[5] for row in rows),
-            attention=attention,
-        )
-        result = network(
-            typed,
-            state={},
-            constants=context.constants,
-            workspace=context.workspace_views,
-        )["image"]
-        # Only the last pipeline stage predicts; its broadcast gives every
-        # stage the same values. A mesh without ``pp`` broadcasts locally.
-        pipeline = self._pipeline
-        for prediction, row in zip(result, rows, strict=True):
-            target = self._predictions[row[6] : row[6] + row[1]]
-            if prediction is not None:
-                target.copy_(prediction.tensor.reshape(target.shape))
-            pipeline.broadcast(target, src=pipeline.size - 1)
-
-    def plan_denoise(
-        self,
-        row_columns: torch.Tensor,
-        positions: torch.Tensor,
-        timesteps: torch.Tensor,
-        rows: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-    ) -> None:
-        """Plan the attention launches of the next captured :meth:`denoise`.
-
-        Operators that plan on the host (:meth:`plans_attention`) read the
-        gathered metadata and its host mirrors here; the graph then reads
-        the plans. The arguments are those of :meth:`denoise`.
-        """
-        self._plan(rows, row_columns, queries, prefixes, starts, widths, False)
-
-    def plan_conditions(
-        self,
-        row_columns: torch.Tensor,
-        positions: torch.Tensor,
-        timesteps: torch.Tensor,
-        rows: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-        *features: torch.Tensor,
-    ) -> None:
-        """Plan the attention launches of the next captured image
-        :meth:`encode_conditions`, whose rows write their keys and values;
-        the arguments are its own.
-        """  # noqa: D205
-        self._plan(rows, row_columns, queries, prefixes, starts, widths, True)
-
-    def _plan(
-        self,
-        rows: Sequence[int],
-        row_columns: torch.Tensor,
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-        writes: bool,
-    ) -> None:
-        """Bind the attention plans of rows that read, or write, the cache."""
-        described = _image_rows(rows)
-        tokens = sum(row[5] for row in described)
-        with torch.inference_mode(), self._context.activate():
-            attention = self._attention(
-                row_columns,
-                len(described),
-                tokens,
-                queries,
-                prefixes,
-                starts,
-                widths,
-                writes,
-            )
-            self._context.bind_attention(attention)
-
-    def _image_denoise(
-        self,
-        row_columns: torch.Tensor,
-        positions: torch.Tensor,
-        timesteps: torch.Tensor,
-        rows: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-    ) -> None:
-        described = _image_rows(rows)
-        tokens = sum(row[5] for row in described)
-        with torch.inference_mode(), self._context.activate():
-            attention = self._attention(
-                row_columns,
-                len(described),
-                tokens,
-                queries,
-                prefixes,
-                starts,
-                widths,
-                False,
-            )
-            if not capturing(self._device):
-                self._context.bind_attention(attention)
-            self._evaluate(described, positions, timesteps, attention)
-
-    def _image_encode_conditions(
-        self,
-        row_columns: torch.Tensor,
-        positions: torch.Tensor,
-        timesteps: torch.Tensor,
-        rows: Sequence[int],
-        queries: Sequence[int],
-        prefixes: Sequence[int],
-        starts: Sequence[int],
-        widths: Sequence[int],
-        *features: torch.Tensor,
-    ) -> None:
-        described = _image_rows(rows)
-        if len(features) != len(described):
-            raise ValueError("latent conditioning rows and features must align")
-        tokens = sum(row[5] for row in described)
-        with torch.inference_mode(), self._context.activate():
-            attention = self._attention(
-                row_columns,
-                len(described),
-                tokens,
-                queries,
-                prefixes,
-                starts,
-                widths,
-                True,
-            )
-            if not capturing(self._device):
-                self._context.bind_attention(attention)
-            # Conditioning runs at timestep zero.
-            timesteps[: len(described)].zero_()
-            self._evaluate(described, positions, timesteps, attention, features)
-
-    def step(
-        self,
-        rows: Sequence[int],
-        parameters: Sequence[float],
-        renorms: Sequence[str],
-    ) -> None:
-        """Advance each image's samples by one solver step.
-
-        ``rows`` holds one ``[sample, units, slot, step, prediction,
-        branches]`` row per image, flattened: the solver combines the
-        image's branch predictions (consecutive from ``prediction``, in
-        evaluation order) with its trajectory's guidance and updates
-        ``samples[sample:sample + units]`` in place toward the next
-        timestep. ``parameters`` holds each image's ``[steps, shift,
-        text_scale, image_scale, interval_low, interval_high,
-        renorm_min]``, flattened, and ``renorms`` its renormalization: the
-        parameters :meth:`plan` was given, which make the trajectory's
-        schedules and guidance.
-        """
-        network = self._network
-        described = [
-            tuple(int(value) for value in rows[start : start + 6])
-            for start in range(0, len(rows), 6)
-        ]
-        settings = [
-            tuple(float(value) for value in parameters[start : start + 7])
-            for start in range(0, len(parameters), 7)
-        ]
-        if not len(described) == len(settings) == len(renorms):
-            raise ValueError(
-                "integration rows and trajectory parameters must align"
-            )
-        with torch.inference_mode(), torch.cuda.stream(self._context.stream):
-            for (sample, units, slot, index, first, mask), (
-                steps,
-                shift,
-                text_scale,
-                image_scale,
-                low,
-                high,
-                renorm_min,
-            ), renorm in zip(described, settings, renorms, strict=True):
-                schedules, guidance = _trajectory(
-                    network,
-                    int(steps),
-                    shift,
-                    text_scale,
-                    image_scale,
-                    low,
-                    high,
-                    str(renorm),
-                    renorm_min,
-                )
-                schedule = schedules["image"]
-                branches = guidance.branches(schedule, index)
-                if sum(_BITS[branch] for branch in branches) != mask:
-                    raise ValueError(
-                        "guidance branches disagree with the evaluated rows"
-                    )
-                values = self._samples[sample : sample + units]
-                outputs = {
-                    branch: self._predictions[
-                        first + position * units : first
-                        + (position + 1) * units
-                    ]
-                    for position, branch in enumerate(branches)
-                }
-                guided = guidance.combine(outputs, schedule, index)
-                advance_(
-                    network,
-                    {
-                        "image": (
-                            LatentInput(values, self._slot_timesteps[slot]),
-                        )
-                    },
-                    {"image": (guided,)},
-                    schedules,
-                    schedule.step(index),
-                )
 
     def kernels(self) -> list[str]:
         """The kernels the runner's operators selected, as JSON objects."""
