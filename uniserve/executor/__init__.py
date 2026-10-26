@@ -46,8 +46,9 @@ segments.
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -559,6 +560,7 @@ class Executor:
         self._loaded = loaded
         self._settings = settings
         self._graphs = bool(settings["graphs"])
+        self._sealed = False
         self._served: list[Any] = []
         self._video = None
         self._text = None
@@ -766,9 +768,36 @@ class Executor:
             self._union.finish_warmup()
 
     def seal(self) -> None:
-        """Refuse captures from now on: serving replays only."""
+        """Refuse captures from now on: serving replays only.
+
+        From now on every serving call refuses to synchronize the host with
+        a stream (:meth:`_serving`).
+        """
         for served in self._served:
             served.seal()
+        self._sealed = True
+
+    @contextlib.contextmanager
+    def _serving(self) -> Iterator[None]:
+        """Run a serving call under PyTorch's ``error`` sync debug mode.
+
+        Past the seal a serving call (``start``, ``release``, ``prepare``,
+        ``execute``, ``commit``, an expert step's join) only queues work on
+        the lanes' streams: a PyTorch operation that would make the host
+        wait for a stream (a copy from or to pageable memory, a device
+        scalar read on the host) raises instead, which fails the call. The
+        mode is process-wide, so it is set around the call and restored:
+        startup, warmup and lifecycle calls may synchronize.
+        """
+        if not self._sealed or not torch.cuda.is_available():
+            yield
+            return
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            yield
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
 
     # Requests and batches.
 
@@ -779,8 +808,9 @@ class Executor:
         """
         started = json.loads(str(requests))
         refused: list[tuple[Any, str]] = []
-        for served in self._served:
-            refused.extend(served.start(started) or ())
+        with self._serving():
+            for served in self._served:
+                refused.extend(served.start(started) or ())
         return json.dumps(
             [
                 [
@@ -798,13 +828,15 @@ class Executor:
     def release(self, slots: Sequence[int]) -> None:
         """Forget the retired request slots."""
         retired = [int(slot) for slot in slots]
-        for served in self._served:
-            served.release(retired)
+        with self._serving():
+            for served in self._served:
+                served.release(retired)
 
     def prepare(self, lane: int, step: str) -> str:
         """JSON of what each call of lane ``lane``'s batch reads and writes."""
         served, local = self._lanes[int(lane)]
-        return json.dumps(served.prepare(local, json.loads(str(step))))
+        with self._serving():
+            return json.dumps(served.prepare(local, json.loads(str(step))))
 
     def execute(
         self, lane: int, step: str, *tensors: torch.Tensor
@@ -816,18 +848,21 @@ class Executor:
         words it wrote.
         """
         served, local = self._lanes[int(lane)]
-        return served.execute(local, str(step), tensors)
+        with self._serving():
+            return served.execute(local, str(step), tensors)
 
     def commit(self, lane: int) -> None:
         """Advance lane ``lane``'s slot state past its last batch."""
         served, local = self._lanes[int(lane)]
-        served.commit(local)
+        with self._serving():
+            served.commit(local)
 
     # The expert union outside the rank's own steps.
 
     def join_expert_step(self, leaving: bool) -> list[int]:
         """Join the union's next step; whether one ran and all left."""
-        ran, released = self._require_union().idle(bool(leaving))
+        with self._serving():
+            ran, released = self._require_union().idle(bool(leaving))
         return [int(ran), int(released)]
 
     def park_experts(self) -> list[int]:

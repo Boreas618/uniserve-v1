@@ -60,6 +60,44 @@ def test_guidance_combines_text_and_image_equations(guidance, expected):
     torch.testing.assert_close(out, torch.tensor(expected), rtol=0, atol=0)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+@pytest.mark.parametrize(
+    "guidance,expected",
+    [
+        (AdditiveGuidance, [[15.0, -5.0], [5.0, 17.0]]),
+        (NestedGuidance, [[27.0, -11.0], [11.0, 29.0]]),
+    ],
+)
+def test_guidance_combines_device_predictions_without_waiting_for_the_stream(
+    guidance, expected
+):
+    # A denoising step combines its predictions under the serving calls'
+    # error sync debug mode; the predictions are those of the CPU case.
+    schedule = make_schedule(
+        1, shift=1.0, direction="ascending", shift_domain="time", device="cpu"
+    )
+    outputs = {
+        Branch.CONDITIONED: torch.tensor([[5.0, -1.0], [3.0, 7.0]]),
+        Branch.TEXT_UNCONDITIONAL: torch.tensor([[1.0, 1.0], [1.0, 3.0]]),
+        Branch.IMAGE_UNCONDITIONAL: torch.tensor([[-1.0, 1.0], [3.0, 1.0]]),
+    }
+    outputs = {branch: value.cuda() for branch, value in outputs.items()}
+    options = guidance(3.0, 2.0, (0.0, 1.0), Renorm.NONE, 0.0)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        guided = options.combine(outputs, schedule, 0)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.testing.assert_close(
+        guided.cpu(), torch.tensor(expected), rtol=0, atol=0
+    )
+
+
 def test_guidance_channel_norm_does_not_expand_predictions():
     schedule = make_schedule(
         1, shift=1, direction="ascending", shift_domain="time", device="cpu"
