@@ -709,6 +709,20 @@ class Executor:
         binding = _Binding.parse(json.loads(str(memory)), values)
         if len(binding.computations) != len(self._computations):
             raise ValueError("bind names other computations than the manifest")
+        # PyTorch creates a thread's cuBLAS handle for a device at the
+        # thread's first matmul there, and creating one frees device memory
+        # (``cuMemFree``), which waits for the device. The thread binding the
+        # executor runs every computation, so it creates each bound device's
+        # handle now: no serving call may wait for the device, and with
+        # graphs off no warmup forward runs before the first serving call.
+        devices = {
+            stream.device.index
+            for stream in binding.streams
+            if stream is not None
+        }
+        for device in sorted(devices):
+            with torch.cuda.device(device):
+                torch.cuda.current_blas_handle()
         owned: dict[int, list[int]] = {}
         for index, (served, _) in enumerate(self._computations):
             owned.setdefault(id(served), []).append(index)
