@@ -553,7 +553,7 @@ class Layout:
                     index[key] = len(layout._storages)
                     layout._storages.append(storage)
                     layout._views.append([])
-                offset = value.storage_offset() * value.element_size()
+                offset = int(value.storage_offset()) * value.element_size()
                 layout._views[index[key]].append((entry, name, value, offset))
         return layout
 

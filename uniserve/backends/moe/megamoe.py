@@ -34,6 +34,7 @@ layer on the worker's stream shares it.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -42,6 +43,9 @@ from uniserve.nn.moe import Activation
 from uniserve.quantization import RowOrder
 
 from . import NVFP4Backend, NVFP4Operator, verify
+
+if TYPE_CHECKING:
+    from uniserve_kernels.megamoe import MegaMoESymmBuffer
 
 __all__ = ["Backend", "MegaMoEBuffer"]
 
@@ -147,7 +151,8 @@ class MegaMoEBuffer:
         # Captured launches bind both a stream and a local token extent;
         # all extents retain the same maximum-sized symmetric allocation.
         self._launches: dict[tuple[int, int, int], object] = {}
-        self.symmetric = None
+        # The symmetric allocation; ``None`` while the buffer is released.
+        self.symmetric: MegaMoESymmBuffer | None = None
         self._allocate()
 
     def _allocate(self) -> None:
@@ -211,6 +216,7 @@ class MegaMoEBuffer:
         key = (weights, stream, tokens)
         thunk = self._launches.get(key)
         if thunk is None:
+            assert self.symmetric is not None, "a released buffer launches"
             thunk = nvfp4_mega_launch_thunk(
                 fc1, fc2, self.symmetric, num_tokens=tokens
             )
@@ -287,6 +293,7 @@ class _MegaMoE(NVFP4Operator):
         # Already-encoded rows retain their bytes; BF16 rows use the shared
         # NVFP4 encoder. The launch reads only this call's token extent.
         symmetric = buffer.symmetric
+        assert symmetric is not None, "a released buffer routes no tokens"
         tokens = hidden.shape[0]
         fields = self.encode(hidden).buffers()
         input_scales = symmetric.x_sf.view(torch.uint8)

@@ -162,9 +162,11 @@ def scatter_logprobs(
     report go to ``dump``, which no one reads.
     """
     packed = logprob_details(work, output_rows, targets, int(top))
-    logprobs.index_copy_(
-        0, compact_offsets(*layout, int(top), int(dump)), packed
+    bases, index, rows, prefix, total, counts = layout
+    offsets = compact_offsets(
+        bases, index, rows, prefix, total, counts, int(top), int(dump)
     )
+    logprobs.index_copy_(0, offsets, packed)
 
 
 __all__ = [
